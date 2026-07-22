@@ -1,0 +1,12 @@
+[package]
+name = "dr-strange-mcp"
+description = "MCP server embedding dr-strange-core (arch/06)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "drsg-mcp"
+path = "src/main.rs"
+
+[dependencies]
+dr-strange-core.workspace = true

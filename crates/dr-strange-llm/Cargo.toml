@@ -1,0 +1,8 @@
+[package]
+name = "dr-strange-llm"
+description = "LLM helpers for dr-strange: embeddings, digestion, entity resolution (arch/07)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dr-strange-core.workspace = true

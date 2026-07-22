@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dr-strange-core",
+    "crates/dr-strange-cli",
+    "crates/dr-strange-mcp",
+    "crates/dr-strange-llm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+dr-strange-core = { path = "crates/dr-strange-core" }
+dr-strange-llm = { path = "crates/dr-strange-llm" }
+thiserror = "2"

@@ -1,0 +1,12 @@
+[package]
+name = "dr-strange-cli"
+description = "drsg — command-line tools for dr-strange (arch/05)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "drsg"
+path = "src/main.rs"
+
+[dependencies]
+dr-strange-core.workspace = true
