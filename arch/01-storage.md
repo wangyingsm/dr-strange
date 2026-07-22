@@ -50,7 +50,7 @@ and property-based testing against a model.
   logs and APIs. Allocation counters persist in the `meta` table, bumped in
   batches to avoid a write per allocation.
 - Plane IDs are `u32`s allocated from `meta`; `plane_id = 0` is the default
-  plane (`"main"`). Plane names are unique, stored in the `planes` table.
+  plane (`"startup"`). Plane names are unique, stored in the `planes` table.
 - An optional `external_key → node_id` table (per plane) supports
   user-supplied stable keys (e.g. entity URIs from an extraction pipeline);
   external keys are also the identity thread for cross-plane entity

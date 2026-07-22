@@ -15,5 +15,8 @@ pub mod error;
 pub mod storage;
 pub mod types;
 
+pub use api::{Database, PlaneHandle, WriteTxn};
 pub use error::{Error, Result};
-pub use types::{EdgeId, NodeId, PlaneId, PropDesc, PropValue, Properties};
+pub use types::{
+    Dir, EdgeId, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
+};

@@ -14,7 +14,7 @@ wire protocol later is mechanical.
 let db = Database::open("knowledge.dr")?;          // or Database::in_memory()
 
 // Planes are the scoping object (09-planes.md)
-let main  = db.plane("main")?;                     // default plane, always exists
+let startup = db.plane("startup")?;                     // default plane, always exists
 let paper = db.create_plane("paper-2406.01234", props! {
     "source" => desc("arxiv URL this plane was extracted from", "https://arxiv.org/abs/2406.01234"),
 })?;
@@ -106,8 +106,8 @@ LLMs nearly verbatim.
 
 ```rust
 let sel = Selection::nodes(&ids).with_induced_edges();
-db.copy(&sel, &paper, &main)?;      // new IDs in `main`; external keys carried
-db.move_(&sel, &paper, &main)?;     // copy + delete; boundary-crossing edges reported
+db.copy(&sel, &paper, &startup)?;      // new IDs in `main`; external keys carried
+db.move_(&sel, &paper, &startup)?;     // copy + delete; boundary-crossing edges reported
 
 // Stack read (v1.5): same plan across many planes, rows tagged by plane
 let hits = db.stack(db.planes_matching("paper-*")?)

@@ -44,7 +44,7 @@ Plane {
 can carry a natural-language description of what this canvas *is*, which the
 MCP layer surfaces so an LLM can choose where to read and write.
 
-- A **default plane** (`plane_id = 0`, name `"main"`) exists from creation, so
+- A **default plane** (`plane_id = 0`, name `"startup"`) exists from creation, so
   single-canvas users never think about planes at all.
 - Plane names are unique and interned; all keys carry the `u32` id, never the
   name.
@@ -86,7 +86,7 @@ planes — same bulk-ingest machinery as import).
   similarity search (v1.5, with stack reads) = fan-out + k-way merge of
   per-plane top-k — trivially correct because scores share one metric.
 - **API** ([04-api.md](04-api.md)): a `PlaneHandle` is the scoping object —
-  `db.plane("main")` returns one; all reads/writes hang off it. `db` root
+  `db.plane("startup")` returns one; all reads/writes hang off it. `db` root
   keeps only plane lifecycle + cross-plane ops (`copy`, `move`, stack reads).
 - **Catalog / MCP**: the soft-schema catalog is **per plane** (each canvas
   has its own shape), with a cheap roll-up across planes. MCP tools take a

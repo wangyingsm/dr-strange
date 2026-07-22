@@ -21,6 +21,29 @@ pub enum TableId {
     NodePlane,
 }
 
+impl TableId {
+    pub const ALL: [TableId; 11] = [
+        TableId::Meta,
+        TableId::Planes,
+        TableId::PlaneNames,
+        TableId::Nodes,
+        TableId::Edges,
+        TableId::AdjFwd,
+        TableId::AdjRev,
+        TableId::LabelIdx,
+        TableId::ExtKeys,
+        TableId::PropIdx,
+        TableId::NodePlane,
+    ];
+
+    pub(crate) fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|t| *t == self)
+            .expect("all variants listed")
+    }
+}
+
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
 pub trait StorageEngine: Send + Sync + 'static {
@@ -38,16 +61,20 @@ pub trait StorageEngine: Send + Sync + 'static {
     fn begin_write(&self) -> Result<Self::WriteTxn<'_>>;
 }
 
+/// Reference receivers only, so the trait stays dyn-compatible: graph
+/// operations are written once against `&dyn ReadTransaction` /
+/// `&mut dyn WriteTransaction` instead of being generic per engine.
 pub trait ReadTransaction {
     fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    /// Ordered scan of `[start, end)`. Byte order is scan order — keys are
-    /// encoded big-endian precisely so prefix ranges are contiguous.
+    /// Ordered scan of `[start, end)`; `end = None` scans to the end of the
+    /// table. Byte order is scan order — keys are encoded big-endian
+    /// precisely so prefix ranges are contiguous.
     fn range(
         &self,
         table: TableId,
         start: &[u8],
-        end: &[u8],
+        end: Option<&[u8]>,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + '_>>;
 }
 
@@ -58,5 +85,51 @@ pub trait WriteTransaction: ReadTransaction {
     /// Prefix range-delete; plane drop relies on this being cheap (arch/01 §3).
     fn delete_prefix(&mut self, table: TableId, prefix: &[u8]) -> Result<()>;
 
-    fn commit(self) -> Result<()>;
+    /// Consumes the transaction: write-after-commit and double-commit are
+    /// compile errors. By-value receiver ⇒ excluded from the vtable
+    /// (`Self: Sized`), so it is called on the concrete type — the API
+    /// layer's `WriteTxn`, which owns the engine transaction, is the one
+    /// place that commits.
+    fn commit(self) -> Result<()>
+    where
+        Self: Sized;
+}
+
+/// Smallest byte string strictly greater than every key starting with
+/// `prefix`, or `None` if the prefix is all `0xFF` (then scan to table end).
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        match last.checked_add(1) {
+            Some(bumped) => {
+                *last = bumped;
+                return Some(end);
+            }
+            None => {
+                end.pop();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_successor;
+
+    #[test]
+    fn successor_increments_last_byte() {
+        assert_eq!(prefix_successor(&[1, 2, 3]), Some(vec![1, 2, 4]));
+    }
+
+    #[test]
+    fn successor_carries_past_ff() {
+        assert_eq!(prefix_successor(&[1, 0xFF, 0xFF]), Some(vec![2]));
+    }
+
+    #[test]
+    fn successor_of_all_ff_is_none() {
+        assert_eq!(prefix_successor(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_successor(&[]), None);
+    }
 }

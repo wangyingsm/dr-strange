@@ -13,5 +13,4 @@ edition = "2024"
 
 [workspace.dependencies]
 dr-strange-core = { path = "crates/dr-strange-core" }
-dr-strange-llm = { path = "crates/dr-strange-llm" }
 thiserror = "2"
