@@ -140,6 +140,125 @@ fn m0_redb_survives_reopen() {
 }
 
 #[test]
+fn database_and_records_are_send_and_sync() {
+    // arch/04 §6: Database is Send + Sync (wrappers thread it freely).
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Database>();
+    assert_send_sync::<dr_strange_core::NodeRecord>();
+    assert_send_sync::<dr_strange_core::Error>();
+}
+
+fn stable_reads_while_writer_open(db: &Database) {
+    let plane = db.plane("startup").unwrap();
+    let mut txn = plane.write().unwrap();
+    let committed_before = txn.create_node(&["Seen"], Properties::new()).unwrap();
+    drop(txn);
+    let mut txn = plane.write().unwrap();
+    let committed = txn.create_node(&["Seen"], Properties::new()).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(committed_before, committed, "abort rolled back the counter");
+
+    // While a write transaction is open with uncommitted changes, reads see
+    // only committed state.
+    let mut txn = plane.write().unwrap();
+    let uncommitted = txn.create_node(&["Unseen"], Properties::new()).unwrap();
+    assert!(plane.node(committed).unwrap().is_some());
+    assert!(
+        plane.node(uncommitted).unwrap().is_none(),
+        "snapshot must not see uncommitted writes"
+    );
+    txn.commit().unwrap();
+    assert!(plane.node(uncommitted).unwrap().is_some());
+}
+
+#[test]
+fn stable_reads_memory() {
+    let db = Database::in_memory().unwrap();
+    stable_reads_while_writer_open(&db);
+}
+
+#[test]
+fn stable_reads_redb() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("stable.drsg")).unwrap();
+    stable_reads_while_writer_open(&db);
+}
+
+#[test]
+fn new_plane_supports_full_slice_and_carries_props() {
+    let db = Database::in_memory().unwrap();
+    let plane = db
+        .create_plane(
+            "paper-2406.01234",
+            [(
+                "source".to_string(),
+                PropDesc::described(
+                    "arxiv id this plane was digested from",
+                    PropValue::Str("2406.01234".into()),
+                ),
+            )]
+            .into(),
+        )
+        .unwrap();
+
+    let mut txn = plane.write().unwrap();
+    let a = txn.create_node(&["Chunk"], Properties::new()).unwrap();
+    let b = txn.create_node(&["Chunk"], Properties::new()).unwrap();
+    txn.create_edge(a, b, "NEXT", Properties::new()).unwrap();
+    txn.commit().unwrap();
+
+    let out = plane.neighbors(a, Dir::Out, Some("NEXT")).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].node, b);
+
+    // same handle via lookup
+    let again = db.plane("paper-2406.01234").unwrap();
+    assert_eq!(again.id(), plane.id());
+}
+
+#[test]
+fn handles_have_useful_debug_output() {
+    let db = Database::in_memory().unwrap();
+    assert!(format!("{db:?}").contains("memory"));
+    let dir = tempfile::tempdir().unwrap();
+    let file_db = Database::open(dir.path().join("dbg.drsg")).unwrap();
+    assert!(format!("{file_db:?}").contains("redb"));
+    let plane = db.plane("startup").unwrap();
+    assert!(format!("{plane:?}").contains("PlaneHandle"));
+}
+
+#[test]
+fn io_errors_convert_and_render() {
+    let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
+    let err: Error = io.into();
+    assert!(matches!(err, Error::Io(_)));
+    assert!(err.to_string().contains("nope"));
+}
+
+#[test]
+fn errors_render_readable_messages() {
+    let db = Database::in_memory().unwrap();
+    let msg = db.plane("ghost").unwrap_err().to_string();
+    assert!(msg.contains("ghost"), "got: {msg}");
+
+    db.create_plane("dup", Properties::new()).unwrap();
+    let msg = db
+        .create_plane("dup", Properties::new())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("dup"), "got: {msg}");
+
+    let plane = db.plane("startup").unwrap();
+    let mut txn = plane.write().unwrap();
+    let n = txn.create_node(&[], Properties::new()).unwrap();
+    let msg = txn
+        .create_edge(n, dr_strange_core::NodeId(4242), "X", Properties::new())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("4242"), "got: {msg}");
+}
+
+#[test]
 fn opening_a_non_drsg_file_fails_with_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("other.redb");

@@ -191,4 +191,197 @@ mod tests {
             vec![0x01, 0x01, 0x61, 0x00, 0x02, 0x02]
         );
     }
+
+    #[test]
+    fn realistic_embedding_roundtrips() {
+        // 1536-dim f32 vector — the common text-embedding shape
+        let vec: Vec<f32> = (0..1536).map(|i| (i as f32) * 0.001 - 0.75).collect();
+        let mut p = Properties::new();
+        p.insert(
+            "embedding".into(),
+            PropDesc::described("model: text-embedding-3-small", PropValue::Vector(vec)),
+        );
+        assert_eq!(decode_props(&encode_props(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn deeply_nested_maps_roundtrip() {
+        let mut value = PropValue::Int(0);
+        for depth in 0..64 {
+            let mut m = BTreeMap::new();
+            m.insert(format!("level{depth}"), PropDesc::new(value));
+            value = PropValue::Map(m);
+        }
+        let mut p = Properties::new();
+        p.insert("deep".into(), PropDesc::new(value));
+        assert_eq!(decode_props(&encode_props(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn empty_and_awkward_strings_roundtrip() {
+        let mut p = Properties::new();
+        p.insert(
+            "".into(),
+            PropDesc::described("", PropValue::Str("".into())),
+        );
+        p.insert(
+            "emoji-🔑".into(),
+            PropDesc::new(PropValue::Str("值\u{0}with\u{0}nulls".into())),
+        );
+        assert_eq!(decode_props(&encode_props(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn extreme_numeric_values_roundtrip() {
+        let mut p = Properties::new();
+        for (i, v) in [
+            PropValue::Int(i64::MIN),
+            PropValue::Int(i64::MAX),
+            PropValue::Float(f64::MIN_POSITIVE),
+            PropValue::Float(f64::MAX),
+            PropValue::Float(f64::NEG_INFINITY),
+            PropValue::Vector(vec![f32::MIN, f32::MAX, 0.0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.insert(format!("v{i}"), PropDesc::new(v));
+        }
+        assert_eq!(decode_props(&encode_props(&p)).unwrap(), p);
+        // NaN can't be compared with ==; assert it survives as NaN
+        let mut nan = Properties::new();
+        nan.insert("nan".into(), PropDesc::new(PropValue::Float(f64::NAN)));
+        match &decode_props(&encode_props(&nan)).unwrap()["nan"].value {
+            PropValue::Float(f) => assert!(f.is_nan()),
+            other => panic!("expected float, got {other:?}"),
+        }
+    }
+
+    /// Deterministic xorshift PRNG — no dependency, reproducible failures.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn string(&mut self) -> String {
+            let len = self.below(12);
+            (0..len)
+                .map(|_| char::from_u32(0x61 + (self.below(26) as u32)).unwrap())
+                .collect()
+        }
+
+        fn value(&mut self, depth: u32) -> PropValue {
+            match self.below(if depth == 0 { 7 } else { 9 }) {
+                0 => PropValue::Null,
+                1 => PropValue::Bool(self.below(2) == 0),
+                2 => PropValue::Int(self.next() as i64),
+                3 => PropValue::Float(f64::from_bits(self.next())),
+                4 => PropValue::Str(self.string()),
+                5 => PropValue::Bytes((0..self.below(20)).map(|_| self.next() as u8).collect()),
+                6 => PropValue::Vector(
+                    (0..self.below(20))
+                        .map(|_| f32::from_bits(self.next() as u32))
+                        .collect(),
+                ),
+                7 => PropValue::List((0..self.below(4)).map(|_| self.value(depth - 1)).collect()),
+                _ => PropValue::Map(
+                    (0..self.below(4))
+                        .map(|_| (self.string(), self.prop_desc(depth - 1)))
+                        .collect(),
+                ),
+            }
+        }
+
+        fn prop_desc(&mut self, depth: u32) -> PropDesc {
+            PropDesc {
+                description: if self.below(3) == 0 {
+                    Some(self.string())
+                } else {
+                    None
+                },
+                value: self.value(depth),
+            }
+        }
+
+        fn props(&mut self) -> Properties {
+            (0..self.below(8))
+                .map(|_| (self.string(), self.prop_desc(3)))
+                .collect()
+        }
+    }
+
+    /// Compares while treating NaN == NaN (bitwise identity is preserved by
+    /// the codec; PartialEq is not reflexive for NaN).
+    fn eq_props(a: &Properties, b: &Properties) -> bool {
+        fn eq_value(a: &PropValue, b: &PropValue) -> bool {
+            match (a, b) {
+                (PropValue::Float(x), PropValue::Float(y)) => x.to_bits() == y.to_bits(),
+                (PropValue::Vector(x), PropValue::Vector(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+                }
+                (PropValue::List(x), PropValue::List(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eq_value(p, q))
+                }
+                (PropValue::Map(x), PropValue::Map(y)) => eq_map(x, y),
+                _ => a == b,
+            }
+        }
+        fn eq_map(a: &BTreeMap<String, PropDesc>, b: &BTreeMap<String, PropDesc>) -> bool {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((ka, pa), (kb, pb))| {
+                    ka == kb && pa.description == pb.description && eq_value(&pa.value, &pb.value)
+                })
+        }
+        eq_map(a, b)
+    }
+
+    #[test]
+    fn randomized_roundtrips() {
+        let mut rng = Rng(0xD25C_0DE5_EED1_2345);
+        for i in 0..500 {
+            let props = rng.props();
+            let decoded = decode_props(&encode_props(&props))
+                .unwrap_or_else(|e| panic!("iteration {i}: decode failed: {e}"));
+            assert!(eq_props(&decoded, &props), "iteration {i}: mismatch");
+        }
+    }
+
+    #[test]
+    fn randomized_record_roundtrips() {
+        let mut rng = Rng(0xBEEF_CAFE_1234_5678);
+        for _ in 0..200 {
+            let labels: Vec<u32> = (0..rng.below(5)).map(|_| rng.next() as u32).collect();
+            let props = rng.props();
+            let (l2, p2) = decode_node_record(&encode_node_record(&labels, &props)).unwrap();
+            assert_eq!(l2, labels);
+            assert!(eq_props(&p2, &props));
+
+            let (src, dst, ty) = (NodeId(rng.next()), NodeId(rng.next()), rng.next() as u32);
+            let (s2, d2, t2, ep) =
+                decode_edge_record(&encode_edge_record(src, dst, ty, &props)).unwrap();
+            assert_eq!((s2, d2, t2), (src, dst, ty));
+            assert!(eq_props(&ep, &props));
+        }
+    }
+
+    #[test]
+    fn randomized_garbage_never_panics() {
+        let mut rng = Rng(0x0BAD_F00D_0BAD_F00D);
+        for _ in 0..500 {
+            let len = rng.below(64) as usize;
+            let garbage: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let _ = decode_props(&garbage);
+            let _ = decode_node_record(&garbage);
+            let _ = decode_edge_record(&garbage);
+        }
+    }
 }

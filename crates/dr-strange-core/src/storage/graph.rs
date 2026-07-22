@@ -322,3 +322,446 @@ pub fn neighbors(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::engine::StorageEngine;
+    use crate::storage::memory::MemoryEngine;
+
+    /// Runs `f` in an initialized write transaction and commits.
+    fn with_db<T>(f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>) -> T {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let out = f(&mut txn).unwrap();
+        txn.commit().unwrap();
+        out
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        init(&mut txn).unwrap(); // second init on same data: verify, not clobber
+        // the startup plane exists exactly once
+        assert_eq!(
+            plane_id_by_name(&txn, DEFAULT_PLANE_NAME).unwrap(),
+            Some(PlaneId::STARTUP)
+        );
+    }
+
+    #[test]
+    fn init_rejects_bad_magic() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        txn.put(TableId::Meta, keys::META_MAGIC, b"NOPE").unwrap();
+        assert!(matches!(init(&mut txn), Err(Error::Corrupt(_))));
+    }
+
+    /// A corrupted database must surface `Corrupt` errors, never panic.
+    #[test]
+    fn corrupted_meta_errors_cleanly() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+
+        // garbage node-id counter (wrong width)
+        txn.put(TableId::Meta, keys::META_NEXT_NODE_ID, b"xx")
+            .unwrap();
+        assert!(matches!(
+            create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()),
+            Err(Error::Corrupt(_))
+        ));
+        put_u64(&mut txn, keys::META_NEXT_NODE_ID, 1).unwrap();
+
+        // missing counter
+        txn.delete(TableId::Meta, keys::META_NEXT_EDGE_TYPE_ID)
+            .unwrap();
+        assert!(matches!(
+            intern_edge_type(&mut txn, "T"),
+            Err(Error::Corrupt(_))
+        ));
+
+        // garbage dictionary entry (wrong width)
+        txn.put(TableId::Meta, &keys::dict_label_key("Bad"), b"toolong")
+            .unwrap();
+        assert!(matches!(
+            intern_label(&mut txn, "Bad"),
+            Err(Error::Corrupt(_))
+        ));
+
+        // reverse dictionary entry with invalid utf-8
+        let id = intern_label(&mut txn, "Ok").unwrap();
+        txn.put(TableId::Meta, &keys::dict_label_rev_key(id), &[0xFF, 0xFE])
+            .unwrap();
+        assert!(matches!(resolve_label(&txn, id), Err(Error::Corrupt(_))));
+
+        // garbage plane-name entry (wrong width)
+        txn.put(TableId::PlaneNames, &keys::plane_name_key("bad"), b"12345")
+            .unwrap();
+        assert!(matches!(
+            plane_id_by_name(&txn, "bad"),
+            Err(Error::Corrupt(_))
+        ));
+
+        // garbage node record body
+        let n = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        txn.put(
+            TableId::Nodes,
+            &keys::node_key(PlaneId::STARTUP, n),
+            &[0xFF; 3],
+        )
+        .unwrap();
+        assert!(matches!(
+            get_node(&txn, PlaneId::STARTUP, n),
+            Err(Error::Corrupt(_))
+        ));
+
+        // node referencing a label id with no dictionary entry
+        let m = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        txn.put(
+            TableId::Nodes,
+            &keys::node_key(PlaneId::STARTUP, m),
+            &codec::encode_node_record(&[4040], &Properties::new()),
+        )
+        .unwrap();
+        assert!(matches!(
+            get_node(&txn, PlaneId::STARTUP, m),
+            Err(Error::Corrupt(_))
+        ));
+
+        // malformed adjacency key (wrong length)
+        txn.put(TableId::AdjFwd, b"short", b"").unwrap();
+        let mut prefix_hit = keys::adj_prefix(PlaneId::STARTUP, NodeId(0)).to_vec();
+        prefix_hit.clear(); // scan whole table via empty prefix
+        let _ = prefix_hit;
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        // craft a bad entry under a's own prefix so neighbors() parses it
+        let mut bad_key = keys::adj_prefix(PlaneId::STARTUP, a).to_vec();
+        bad_key.push(0xAB);
+        txn.put(TableId::AdjFwd, &bad_key, b"").unwrap();
+        assert!(matches!(
+            neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, None),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn init_rejects_future_format_version() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        txn.put(
+            TableId::Meta,
+            keys::META_FORMAT_VERSION,
+            &(FORMAT_VERSION + 1).to_be_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(init(&mut txn), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn init_rejects_missing_version() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        txn.delete(TableId::Meta, keys::META_FORMAT_VERSION)
+            .unwrap();
+        assert!(matches!(init(&mut txn), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn interning_is_stable_and_distinct() {
+        with_db(|txn| {
+            let a1 = intern_label(txn, "Person")?;
+            let a2 = intern_label(txn, "Person")?;
+            let b = intern_label(txn, "Paper")?;
+            assert_eq!(a1, a2, "same name → same id");
+            assert_ne!(a1, b, "different names → different ids");
+            assert_eq!(resolve_label(txn, a1)?, "Person");
+            assert_eq!(resolve_label(txn, b)?, "Paper");
+
+            // labels and edge types are separate dictionaries
+            let e = intern_edge_type(txn, "Person")?;
+            assert_eq!(lookup_edge_type(txn, "Person")?, Some(e));
+            assert_eq!(lookup_edge_type(txn, "KNOWS")?, None);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolving_a_dangling_label_id_is_corrupt() {
+        with_db(|txn| {
+            assert!(matches!(resolve_label(txn, 999), Err(Error::Corrupt(_))));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn ids_are_sequential_within_and_across_transactions() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let n1 = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let n2 = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        assert_eq!(n2.0, n1.0 + 1);
+        txn.commit().unwrap();
+
+        let mut txn = eng.begin_write().unwrap();
+        let n3 = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        assert_eq!(n3.0, n2.0 + 1);
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn aborted_transaction_ids_may_be_reused() {
+        // Counter bumps roll back with the transaction: an id handed out by
+        // an aborted txn was never committed, so reuse is safe. This test
+        // documents that semantic.
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        txn.commit().unwrap();
+
+        let mut txn = eng.begin_write().unwrap();
+        let ghost = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        drop(txn); // abort
+
+        let mut txn = eng.begin_write().unwrap();
+        let real = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(ghost, real);
+    }
+
+    #[test]
+    fn node_with_no_labels_and_no_props() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let n = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let rec = get_node(&txn, PlaneId::STARTUP, n).unwrap().unwrap();
+        assert!(rec.labels.is_empty());
+        assert!(rec.properties.is_empty());
+    }
+
+    #[test]
+    fn duplicate_labels_are_preserved_as_given() {
+        // Soft schema: storage does not deduplicate; documents behavior.
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let n = create_node(&mut txn, PlaneId::STARTUP, &["A", "A"], &Properties::new()).unwrap();
+        let rec = get_node(&txn, PlaneId::STARTUP, n).unwrap().unwrap();
+        assert_eq!(rec.labels, vec!["A".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn unicode_names_survive() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let plane = create_plane(&mut txn, "研究-λ", &Properties::new()).unwrap();
+        let n = create_node(&mut txn, plane, &["实体", "Ünïcodé"], &Properties::new()).unwrap();
+        assert_eq!(plane_id_by_name(&txn, "研究-λ").unwrap(), Some(plane));
+        let rec = get_node(&txn, plane, n).unwrap().unwrap();
+        assert_eq!(rec.labels, vec!["实体".to_string(), "Ünïcodé".to_string()]);
+    }
+
+    #[test]
+    fn parallel_edges_coexist() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let b = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let e1 = create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            a,
+            b,
+            "CITES",
+            &Properties::new(),
+        )
+        .unwrap();
+        let e2 = create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            a,
+            b,
+            "CITES",
+            &Properties::new(),
+        )
+        .unwrap();
+        assert_ne!(e1, e2);
+        let out = neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, Some("CITES")).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|n| n.node == b));
+    }
+
+    #[test]
+    fn typed_neighbors_filter_by_edge_type() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let b = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let c = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            a,
+            b,
+            "KNOWS",
+            &Properties::new(),
+        )
+        .unwrap();
+        create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            a,
+            c,
+            "CITES",
+            &Properties::new(),
+        )
+        .unwrap();
+
+        let knows = neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, Some("KNOWS")).unwrap();
+        assert_eq!(knows.len(), 1);
+        assert_eq!(knows[0].node, b);
+        let all = neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, None).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn self_loop_appears_in_both_directions() {
+        // A self-loop writes one adj_fwd and one adj_rev entry, so Dir::Both
+        // reports it twice (once per direction). Documents behavior.
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        create_edge(&mut txn, PlaneId::STARTUP, a, a, "SELF", &Properties::new()).unwrap();
+        assert_eq!(
+            neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            neighbors(&txn, PlaneId::STARTUP, a, Dir::In, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            neighbors(&txn, PlaneId::STARTUP, a, Dir::Both, None)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn neighbors_of_unknown_node_is_empty() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let out = neighbors(&txn, PlaneId::STARTUP, NodeId(999), Dir::Both, None).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn edge_with_missing_endpoint_reports_which_side() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+
+        let err = create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            a,
+            NodeId(999),
+            "X",
+            &Properties::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::PlaneMismatch(m) if m.contains("dst")),
+            "got: {err}"
+        );
+
+        let err = create_edge(
+            &mut txn,
+            PlaneId::STARTUP,
+            NodeId(999),
+            a,
+            "X",
+            &Properties::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::PlaneMismatch(m) if m.contains("src")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adjacency_is_isolated_per_node_and_per_plane() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
+
+        let a = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        let b = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+        create_edge(&mut txn, PlaneId::STARTUP, a, b, "T", &Properties::new()).unwrap();
+
+        let x = create_node(&mut txn, p2, &[], &Properties::new()).unwrap();
+        let y = create_node(&mut txn, p2, &[], &Properties::new()).unwrap();
+        create_edge(&mut txn, p2, x, y, "T", &Properties::new()).unwrap();
+
+        // b has no out-edges; a's expansion does not leak plane 2's edges
+        assert!(
+            neighbors(&txn, PlaneId::STARTUP, b, Dir::Out, None)
+                .unwrap()
+                .is_empty()
+        );
+        let out = neighbors(&txn, PlaneId::STARTUP, a, Dir::Out, None).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].node, b);
+        // and node ids are globally unique across planes
+        assert_ne!(a, x);
+        assert_ne!(b, y);
+    }
+
+    #[test]
+    fn plane_ids_are_distinct_and_names_unique() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let p1 = create_plane(&mut txn, "p1", &Properties::new()).unwrap();
+        let p2 = create_plane(&mut txn, "p2", &Properties::new()).unwrap();
+        assert_ne!(p1, p2);
+        assert_ne!(p1, PlaneId::STARTUP);
+        assert!(matches!(
+            create_plane(&mut txn, "p1", &Properties::new()),
+            Err(Error::PlaneExists(_))
+        ));
+        assert_eq!(plane_id_by_name(&txn, "p1").unwrap(), Some(p1));
+        assert_eq!(plane_id_by_name(&txn, "absent").unwrap(), None);
+    }
+
+    #[test]
+    fn get_node_in_wrong_plane_is_none() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
+        let n = create_node(&mut txn, PlaneId::STARTUP, &["L"], &Properties::new()).unwrap();
+        assert!(get_node(&txn, p2, n).unwrap().is_none());
+        assert!(get_node(&txn, PlaneId::STARTUP, n).unwrap().is_some());
+    }
+}
