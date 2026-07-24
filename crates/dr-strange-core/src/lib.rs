@@ -18,5 +18,5 @@ pub mod types;
 pub use api::{Database, PlaneHandle, WriteTxn};
 pub use error::{Error, Result};
 pub use types::{
-    Dir, EdgeId, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
+    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };

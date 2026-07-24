@@ -79,6 +79,9 @@ pub enum Dir {
 pub struct NodeRecord {
     pub id: NodeId,
     pub plane: PlaneId,
+    /// The caller-supplied stable key this node was created with, if any
+    /// (arch/01 §2). Unique within the plane.
+    pub external_key: Option<String>,
     pub labels: Vec<String>,
     pub properties: Properties,
 }
@@ -88,4 +91,15 @@ pub struct NodeRecord {
 pub struct Neighbor {
     pub node: NodeId,
     pub edge: EdgeId,
+}
+
+/// A fully decoded edge, as returned by reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeRecord {
+    pub id: EdgeId,
+    pub plane: PlaneId,
+    pub src: NodeId,
+    pub dst: NodeId,
+    pub ty: String,
+    pub properties: Properties,
 }

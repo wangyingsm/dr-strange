@@ -101,11 +101,13 @@ boundaries demand it; start unified.
 Each milestone ends with a working vertical slice, not a finished layer.
 
 - **M0 — walking skeleton**: workspace layout; `StorageEngine` trait + redb
-  backend; create node / get node / 1-hop expand, round-tripped through a
-  smoke test.
-- **M1 — real graph storage**: edges + both adjacency tables, property codec,
-  label index, external keys, deletes, ID allocation; property-based tests
-  against an in-memory model.
+  backend; the full node/edge/adjacency encoding (both adjacency tables,
+  label index, property codec) and a create → get → 1-hop-expand vertical
+  slice, round-tripped through a smoke test.
+- **M1 — real graph storage**: deletes (node cascades to incident edges,
+  edge, plane), external keys (`create_node_with_key` / lookup), property
+  mutation (`set_prop`/`remove_prop` on nodes and edges), batched node/edge
+  ID allocation; property-based tests against an in-memory model.
 - **M2 — query engine v0**: logical plan + iterator executor; builder API;
   filters, projections, multi-hop expansion, limits. Cache layer lands here
   (pass-through `NoCache` in M0–M1), sized by traversal benchmarks.

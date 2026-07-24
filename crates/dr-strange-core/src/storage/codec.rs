@@ -37,8 +37,13 @@ fn decode<'a, T: Deserialize<'a>>(buf: &'a [u8]) -> Result<T> {
 }
 
 /// ⚠ On-disk format — field order is the encoding (see module docs).
+///
+/// `external_key` is carried inline (rather than requiring a reverse lookup
+/// through `ext_keys`) so `delete_node` can clean up its `ext_keys` entry
+/// without an extra index (arch/01 §2).
 #[derive(Serialize, Deserialize)]
 struct NodeRecordRaw {
+    external_key: Option<String>,
     labels: Vec<u32>,
     props: Properties,
 }
@@ -60,16 +65,21 @@ pub fn decode_props(buf: &[u8]) -> Result<Properties> {
     decode(buf)
 }
 
-pub fn encode_node_record(labels: &[u32], props: &Properties) -> Vec<u8> {
+pub fn encode_node_record(
+    external_key: Option<&str>,
+    labels: &[u32],
+    props: &Properties,
+) -> Vec<u8> {
     encode(&NodeRecordRaw {
+        external_key: external_key.map(str::to_string),
         labels: labels.to_vec(),
         props: props.clone(),
     })
 }
 
-pub fn decode_node_record(buf: &[u8]) -> Result<(Vec<u32>, Properties)> {
+pub fn decode_node_record(buf: &[u8]) -> Result<(Option<String>, Vec<u32>, Properties)> {
     let raw: NodeRecordRaw = decode(buf)?;
-    Ok((raw.labels, raw.props))
+    Ok((raw.external_key, raw.labels, raw.props))
 }
 
 pub fn encode_edge_record(src: NodeId, dst: NodeId, ty: u32, props: &Properties) -> Vec<u8> {
@@ -135,9 +145,20 @@ mod tests {
     #[test]
     fn node_record_roundtrip() {
         let props = sample_props();
-        let buf = encode_node_record(&[3, 9], &props);
-        let (labels, decoded) = decode_node_record(&buf).unwrap();
+        let buf = encode_node_record(None, &[3, 9], &props);
+        let (key, labels, decoded) = decode_node_record(&buf).unwrap();
+        assert_eq!(key, None);
         assert_eq!(labels, vec![3, 9]);
+        assert_eq!(decoded, props);
+    }
+
+    #[test]
+    fn node_record_with_external_key_roundtrips() {
+        let props = sample_props();
+        let buf = encode_node_record(Some("arxiv:2406.01234"), &[1], &props);
+        let (key, labels, decoded) = decode_node_record(&buf).unwrap();
+        assert_eq!(key.as_deref(), Some("arxiv:2406.01234"));
+        assert_eq!(labels, vec![1]);
         assert_eq!(decoded, props);
     }
 
@@ -163,7 +184,7 @@ mod tests {
 
     #[test]
     fn truncated_and_garbage_inputs_error_not_panic() {
-        let good = encode_node_record(&[1], &sample_props());
+        let good = encode_node_record(None, &[1], &sample_props());
         for cut in 0..good.len() {
             let _ = decode_node_record(&good[..cut]); // must not panic
         }
@@ -361,7 +382,14 @@ mod tests {
         for _ in 0..200 {
             let labels: Vec<u32> = (0..rng.below(5)).map(|_| rng.next() as u32).collect();
             let props = rng.props();
-            let (l2, p2) = decode_node_record(&encode_node_record(&labels, &props)).unwrap();
+            let key = if rng.below(2) == 0 {
+                Some(rng.string())
+            } else {
+                None
+            };
+            let (k2, l2, p2) =
+                decode_node_record(&encode_node_record(key.as_deref(), &labels, &props)).unwrap();
+            assert_eq!(k2, key);
             assert_eq!(l2, labels);
             assert!(eq_props(&p2, &props));
 

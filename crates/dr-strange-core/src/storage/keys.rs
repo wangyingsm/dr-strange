@@ -55,6 +55,22 @@ pub fn node_key(plane: PlaneId, node: NodeId) -> [u8; 12] {
     k
 }
 
+pub fn parse_node_key(key: &[u8]) -> Result<(PlaneId, NodeId)> {
+    if key.len() != 12 {
+        return Err(Error::Corrupt(format!(
+            "node key has length {}, expected 12",
+            key.len()
+        )));
+    }
+    let plane = PlaneId(u32::from_be_bytes(
+        key[..4].try_into().expect("checked length"),
+    ));
+    let node = NodeId(u64::from_be_bytes(
+        key[4..].try_into().expect("checked length"),
+    ));
+    Ok((plane, node))
+}
+
 pub fn edge_key(plane: PlaneId, edge: EdgeId) -> [u8; 12] {
     let mut k = [0u8; 12];
     k[..4].copy_from_slice(&plane.0.to_be_bytes());
@@ -64,6 +80,12 @@ pub fn edge_key(plane: PlaneId, edge: EdgeId) -> [u8; 12] {
 
 pub fn node_plane_key(node: NodeId) -> [u8; 8] {
     node.0.to_be_bytes()
+}
+
+pub fn ext_key_key(plane: PlaneId, external_key: &str) -> Vec<u8> {
+    let mut k = plane.0.to_be_bytes().to_vec();
+    k.extend_from_slice(external_key.as_bytes());
+    k
 }
 
 pub fn label_idx_key(plane: PlaneId, label: u32, node: NodeId) -> [u8; 16] {

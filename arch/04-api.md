@@ -37,18 +37,28 @@ let alice = txn.create_node(
     },
 )?;
 let post = txn.create_node_with_key("arxiv:2406.01234", &["Paper"], props! { ... })?;
-txn.create_edge(alice, post, "AUTHORED", props! { "position" => 1 })?;
+let authored = txn.create_edge(alice, post, "AUTHORED", props! { "position" => 1 })?;
 
 txn.set_prop(alice, "affiliation", desc("current employer, from §1 footnote", "MIT"))?;
 txn.remove_prop(alice, "draft_flag")?;             // soft schema: shrink freely
+txn.set_edge_prop(authored, "verified", desc("checked against ORCID", true))?;
+
+txn.delete_edge(authored)?;   // idempotent: deleting twice is not an error
+txn.delete_node(alice)?;      // cascades to alice's remaining incident edges
 txn.commit()?;
 ```
 
 - `props!` builds `Map<String, PropDesc>`; plain values get
   `description: None`, `desc(text, value)` attaches one. Descriptions are
   data — writable and readable like any value.
+- `create_node_with_key` errors with `Conflict` if the key is already bound
+  to a different node in this plane (arch/01 §2); `delete_node`/`delete_edge`
+  are idempotent — deleting an absent record is `Ok(())`, matching the
+  storage layer's posture (arch/01 §3).
 - Bulk ingest: `txn.bulk()` returns a batching writer (amortized commits,
   cache in invalidate-only mode) used by CLI import and MCP ingest tools.
+  Node/edge id allocation is already batched under the hood (arch/01 §2) —
+  `bulk()` mainly needs to batch *commits*, not ids.
 - Vector index management: `paper.ensure_vector_index("Person", "embedding",
   Metric::Cosine)?` — declarative, idempotent, per plane.
 

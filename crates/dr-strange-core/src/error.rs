@@ -13,6 +13,11 @@ pub enum Error {
     #[error("plane already exists: {0}")]
     PlaneExists(String),
 
+    /// A uniqueness constraint outside plane naming, e.g. an external key
+    /// already bound to a different node in the same plane (arch/01 §2).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 

@@ -258,6 +258,194 @@ fn errors_render_readable_messages() {
     assert!(msg.contains("4242"), "got: {msg}");
 }
 
+// ---- M1: deletes, external keys, property mutation, batched ids ----------
+
+fn m1_slice(db: &Database) {
+    let plane = db.plane("startup").unwrap();
+
+    // external keys
+    let mut txn = plane.write().unwrap();
+    let alice = txn
+        .create_node_with_key(
+            "person:alice",
+            &["Person"],
+            props(&[("name", PropValue::Str("Alice".into()))]),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        plane.node_by_key("person:alice").unwrap().map(|r| r.id),
+        Some(alice)
+    );
+    assert!(plane.node_by_key("nobody").unwrap().is_none());
+
+    let mut txn = plane.write().unwrap();
+    let err = txn
+        .create_node_with_key("person:alice", &["Person"], Properties::new())
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "got: {err:?}");
+    drop(txn);
+
+    // property mutation
+    let mut txn = plane.write().unwrap();
+    txn.set_prop(
+        alice,
+        "affiliation",
+        PropDesc::described("current employer", PropValue::Str("MIT".into())),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    let rec = plane.node(alice).unwrap().unwrap();
+    assert_eq!(
+        rec.properties.get("affiliation").map(|p| &p.value),
+        Some(&PropValue::Str("MIT".into()))
+    );
+
+    let mut txn = plane.write().unwrap();
+    txn.remove_prop(alice, "affiliation").unwrap();
+    txn.commit().unwrap();
+    assert!(
+        !plane
+            .node(alice)
+            .unwrap()
+            .unwrap()
+            .properties
+            .contains_key("affiliation")
+    );
+
+    // edge + edge property mutation
+    let mut txn = plane.write().unwrap();
+    let bob = txn.create_node(&["Person"], Properties::new()).unwrap();
+    let knows = txn
+        .create_edge(alice, bob, "KNOWS", Properties::new())
+        .unwrap();
+    txn.set_edge_prop(knows, "since", PropDesc::new(PropValue::Int(2020)))
+        .unwrap();
+    txn.commit().unwrap();
+    let e = plane.edge(knows).unwrap().unwrap();
+    assert_eq!(e.src, alice);
+    assert_eq!(e.dst, bob);
+    assert_eq!(
+        e.properties.get("since").map(|p| &p.value),
+        Some(&PropValue::Int(2020))
+    );
+
+    let mut txn = plane.write().unwrap();
+    txn.remove_edge_prop(knows, "since").unwrap();
+    txn.commit().unwrap();
+    assert!(plane.edge(knows).unwrap().unwrap().properties.is_empty());
+
+    // delete_edge
+    let mut txn = plane.write().unwrap();
+    txn.delete_edge(knows).unwrap();
+    txn.commit().unwrap();
+    assert!(plane.edge(knows).unwrap().is_none());
+    assert!(
+        plane
+            .neighbors(alice, Dir::Out, Some("KNOWS"))
+            .unwrap()
+            .is_empty()
+    );
+    // both endpoints survive
+    assert!(plane.node(alice).unwrap().is_some());
+    assert!(plane.node(bob).unwrap().is_some());
+
+    // delete_node cascades
+    let mut txn = plane.write().unwrap();
+    let carol = txn.create_node(&["Person"], Properties::new()).unwrap();
+    txn.create_edge(carol, bob, "KNOWS", Properties::new())
+        .unwrap();
+    txn.commit().unwrap();
+    let mut txn = plane.write().unwrap();
+    txn.delete_node(carol).unwrap();
+    txn.commit().unwrap();
+    assert!(plane.node(carol).unwrap().is_none());
+    assert!(
+        plane
+            .neighbors(bob, Dir::In, Some("KNOWS"))
+            .unwrap()
+            .is_empty()
+    );
+
+    // deleting an already-gone node/edge is not an error
+    let mut txn = plane.write().unwrap();
+    txn.delete_node(carol).unwrap();
+    txn.delete_edge(knows).unwrap();
+    txn.commit().unwrap();
+
+    // batched ids: creating many nodes across ID_BATCH_SIZE (64) boundaries
+    // still yields distinct, usable ids
+    let mut txn = plane.write().unwrap();
+    let mut created = Vec::new();
+    for _ in 0..130 {
+        created.push(txn.create_node(&[], Properties::new()).unwrap());
+    }
+    txn.commit().unwrap();
+    let unique: std::collections::BTreeSet<_> = created.iter().collect();
+    assert_eq!(unique.len(), created.len());
+    for id in &created {
+        assert!(plane.node(*id).unwrap().is_some());
+    }
+}
+
+#[test]
+fn m1_slice_memory() {
+    let db = Database::in_memory().unwrap();
+    m1_slice(&db);
+}
+
+#[test]
+fn m1_slice_redb() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("m1.drsg")).unwrap();
+    m1_slice(&db);
+}
+
+#[test]
+fn drop_plane_via_database_wipes_the_plane() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.create_plane("scratch", Properties::new()).unwrap();
+    let mut txn = plane.write().unwrap();
+    let n = txn.create_node(&["L"], Properties::new()).unwrap();
+    txn.commit().unwrap();
+
+    db.drop_plane(plane.id()).unwrap();
+
+    assert!(matches!(
+        db.plane("scratch").unwrap_err(),
+        Error::NotFound(_)
+    ));
+    assert!(
+        plane.node(n).unwrap().is_none(),
+        "stale handle reads see nothing, not stale data"
+    );
+
+    // startup can't be dropped
+    let startup = db.plane("startup").unwrap();
+    assert!(matches!(
+        db.drop_plane(startup.id()).unwrap_err(),
+        Error::InvalidArgument(_)
+    ));
+
+    // dropping an id that was never a plane is a harmless no-op
+    db.drop_plane(PlaneId(999_999)).unwrap();
+}
+
+#[test]
+fn set_prop_on_missing_node_is_not_found() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.plane("startup").unwrap();
+    let mut txn = plane.write().unwrap();
+    let err = txn
+        .set_prop(
+            dr_strange_core::NodeId(99999),
+            "k",
+            PropDesc::new(PropValue::Null),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)));
+}
+
 #[test]
 fn opening_a_non_drsg_file_fails_with_corrupt() {
     let dir = tempfile::tempdir().unwrap();

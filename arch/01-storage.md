@@ -54,7 +54,9 @@ and property-based testing against a model.
 - An optional `external_key → node_id` table (per plane) supports
   user-supplied stable keys (e.g. entity URIs from an extraction pipeline);
   external keys are also the identity thread for cross-plane entity
-  resolution.
+  resolution. The key is also carried inline in the node's own record, so
+  deleting a node can find (and remove) its `ext_keys` entry without a
+  reverse index.
 - Label names and edge-type names are interned to `u32`s in a dictionary
   table shared across planes; all keys store interned IDs, not strings.
   Dictionaries are small and cached in memory.
@@ -69,7 +71,7 @@ All integers big-endian so byte-order sorting gives the scan order we need.
 | `meta` | well-known keys | format version + magic, ID counters, dictionaries, codec version |
 | `planes` | `plane_id` | name + property blob (`Map<String, PropDesc>`) |
 | `plane_names` | `name` | `plane_id` |
-| `nodes` | `plane_id · node_id` | label-id set + property blob |
+| `nodes` | `plane_id · node_id` | optional external key + label-id set + property blob |
 | `edges` | `plane_id · edge_id` | `src · dst · type_id` + property blob |
 | `adj_fwd` | `plane_id · src_id · type_id · dst_id · edge_id` | ∅ |
 | `adj_rev` | `plane_id · dst_id · type_id · src_id · edge_id` | ∅ |
@@ -96,8 +98,17 @@ Notes:
   pipelines produce these routinely.
 - **Deletes**: deleting a node removes its adjacency entries (both
   directions), its `label_idx`/`ext_keys`/`prop_idx`/`node_plane` entries, and
-  all incident edges, in one write transaction. No tombstones at this layer —
-  the KV handles space reclamation.
+  all incident edges — cascading through their own adjacency entries — in one
+  write transaction. No tombstones at this layer — the KV handles space
+  reclamation. Deleting an already-absent node or edge is `Ok(())`, not an
+  error: idempotent, matching `delete_prefix`'s posture.
+- **Property mutation** (`set_prop`/`remove_prop`): since a record's
+  properties live in one blob, mutating a single key is read → decode →
+  modify the map → re-encode → write back. No separate per-property storage
+  cost or migration; adding or removing a key is exactly as cheap as
+  possible given "one blob per record". Mutating a non-existent record is a
+  `NotFound` error; removing an absent *key* from an existing record is not
+  (soft schema — properties shrink freely).
 
 ## 4. Properties: soft schema, self-describing
 
@@ -193,8 +204,11 @@ Inherited from redb in v1:
 
 ## 8. Open questions
 
-1. **Property codec** — MessagePack vs postcard vs custom (benchmark, M1);
-   must support cheap skipping of `description` fields on the hot read path.
+1. ~~**Property codec** — MessagePack vs postcard vs custom.~~ **Resolved
+   (M0/M1): postcard.** bincode was the other leading candidate but is
+   unmaintained (RUSTSEC-2025-0141); postcard has a versioned wire-format
+   spec independent of the crate, which durable on-disk data needs. Revisit
+   only if decode-heavy traversal benchmarks (M2) show it's a bottleneck.
 2. **HNSW library vs hand-rolled** — recall + build/query speed benchmark (M3).
 3. **Overflow storage for large blobs** — needed in v1 or defer?
 4. **Adjacency value payload** — should `adj_fwd` duplicate a few hot edge

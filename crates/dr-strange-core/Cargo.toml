@@ -11,5 +11,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest = "1.11.0"
 redb = "4.1.0"
 tempfile = "3.27.0"
