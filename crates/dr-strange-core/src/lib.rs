@@ -13,6 +13,8 @@ pub mod cache;
 pub mod compute;
 pub mod error;
 pub mod index;
+#[cfg(feature = "json")]
+pub mod json;
 pub mod storage;
 pub mod types;
 

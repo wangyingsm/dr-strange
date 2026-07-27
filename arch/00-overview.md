@@ -123,8 +123,10 @@ Each milestone ends with a working vertical slice, not a finished layer.
   soft-schema catalog + introspection (`plane.catalog()` / `db.catalog()`).
   Deferred: HNSW graph sidecar (open-time speedup), incremental catalog
   maintenance.
-- **M4 — first wrappers**: `drsg` CLI (import/query/stats; `digest` once its
-  design session lands) and MCP server.
+- **M4 — first wrappers** ✅: `drsg` CLI (clap — init/plane/import/export/get/
+  query/catalog/index/stats/check) and `drsg-mcp` MCP server (rmcp SDK, stdio,
+  10 tools over the core API). Shared JSON dialect in the core's feature-gated
+  `json` module. `digest` deferred to its own design session (arch/07).
 - **M5 — hardening**: crash-recovery tests, benchmarks (vs Kùzu/Neo4j on
   LDBC-ish workloads), API polish. Then decide v2: query language, custom
   storage engine, network server.

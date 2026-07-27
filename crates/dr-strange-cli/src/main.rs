@@ -4,7 +4,6 @@
 //! session (arch/05 §3, arch/07).
 
 mod commands;
-mod jsonio;
 
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{Database, Dir, LogicalPlan, Metric, NodeId, PlaneHandle, Properties};
 use serde_json::{Value, json};
 
-use crate::jsonio;
+use dr_strange_core::json as jsonio;
 
 /// Opens (creating if needed) the database at `path`.
 pub fn open(path: &Path) -> Result<Database> {

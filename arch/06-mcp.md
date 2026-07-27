@@ -1,6 +1,15 @@
 # MCP Service Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: draft · `drsg-mcp` built (M4), `digest` deferred · 2026-07-28
+
+**M4 landed** the `drsg-mcp` stdio server on the **official `rmcp` SDK**
+(resolving arch's hand-rolled-vs-SDK question toward the SDK: spec-correct
+handshake/framing). Tools: list_planes, describe_plane (catalog), get_node,
+search (vector), traverse, query (serialized plan), write_nodes, write_edges,
+create_plane, drop_plane (confirm-gated). The sync core runs on
+`spawn_blocking` so scans don't stall the async runtime; core errors surface
+as MCP *tool-level* errors (the caller sees the message). Tool I/O uses the
+shared `dr-strange-core::json` dialect. **`digest` is deferred** (arch/07).
 
 Scope: the `dr-strange-mcp` crate — an MCP server that **embeds `dr-strange-core` directly**
 (stdio transport, zero-ops: the host process owns the database file). This is

@@ -1,16 +1,22 @@
-//! JSON ⇄ dr-strange value conversion for the CLI's import/export/query I/O
-//! (arch/05 §2). A friendly dialect — plain JSON scalars map to the obvious
-//! `PropValue`, with two escape objects for the graph-specific types:
+//! JSON ⇄ value conversion for the wrapper layers (arch/05 §2, arch/06) —
+//! feature `json`. A friendly dialect for CLI import/export and MCP tool I/O,
+//! distinct from postcard (the durable on-disk codec). Plain JSON scalars map
+//! to the obvious [`PropValue`]; graph-specific types use escape objects:
 //!
-//! - `{"$vector": [f32, …]}` → `PropValue::Vector` (embeddings)
-//! - `{"$desc": "…", "$value": <json>}` → a described property (`PropDesc`)
-//! - `{"$bytes": [u8, …]}` → `PropValue::Bytes`
+//! - `{"$vector": [f32, …]}` → [`PropValue::Vector`] (embeddings)
+//! - `{"$desc": "…", "$value": <json>}` → a described property ([`PropDesc`])
+//! - `{"$bytes": [u8, …]}` → [`PropValue::Bytes`]
 //!
 //! Any other JSON object is a nested `Map`; a plain array is a `List`.
 
-use anyhow::{Result, bail};
-use dr_strange_core::{NodeRecord, PropDesc, PropValue, Properties};
 use serde_json::{Value, json};
+
+use crate::error::{Error, Result};
+use crate::types::{NodeRecord, PropDesc, PropValue, Properties};
+
+fn invalid(msg: impl Into<String>) -> Error {
+    Error::InvalidArgument(msg.into())
+}
 
 // ---- JSON → value --------------------------------------------------------
 
@@ -35,7 +41,6 @@ pub fn json_to_value(v: &Value) -> Result<PropValue> {
             } else if let Some(bytes) = o.get("$bytes") {
                 PropValue::Bytes(json_to_u8_vec(bytes)?)
             } else {
-                // a nested map of described properties
                 let mut map = std::collections::BTreeMap::new();
                 for (k, val) in o {
                     map.insert(k.clone(), json_to_propdesc(val)?);
@@ -46,7 +51,7 @@ pub fn json_to_value(v: &Value) -> Result<PropValue> {
     })
 }
 
-/// A property value, possibly wrapped with a description.
+/// A property value, optionally wrapped with a `$desc` description.
 pub fn json_to_propdesc(v: &Value) -> Result<PropDesc> {
     if let Value::Object(o) = v
         && let Some(value) = o.get("$value")
@@ -62,7 +67,7 @@ pub fn json_to_propdesc(v: &Value) -> Result<PropDesc> {
 
 pub fn json_to_properties(v: &Value) -> Result<Properties> {
     let Value::Object(o) = v else {
-        bail!("`properties` must be a JSON object");
+        return Err(invalid("`properties` must be a JSON object"));
     };
     let mut props = Properties::new();
     for (k, val) in o {
@@ -73,27 +78,27 @@ pub fn json_to_properties(v: &Value) -> Result<Properties> {
 
 fn json_to_f32_vec(v: &Value) -> Result<Vec<f32>> {
     let Value::Array(a) = v else {
-        bail!("`$vector` must be an array of numbers");
+        return Err(invalid("`$vector` must be an array of numbers"));
     };
     a.iter()
         .map(|x| {
             x.as_f64()
                 .map(|f| f as f32)
-                .ok_or_else(|| anyhow::anyhow!("`$vector` element is not a number"))
+                .ok_or_else(|| invalid("`$vector` element is not a number"))
         })
         .collect()
 }
 
 fn json_to_u8_vec(v: &Value) -> Result<Vec<u8>> {
     let Value::Array(a) = v else {
-        bail!("`$bytes` must be an array of byte values");
+        return Err(invalid("`$bytes` must be an array of byte values"));
     };
     a.iter()
         .map(|x| {
             x.as_u64()
                 .filter(|n| *n <= 255)
                 .map(|n| n as u8)
-                .ok_or_else(|| anyhow::anyhow!("`$bytes` element is not a 0..=255 integer"))
+                .ok_or_else(|| invalid("`$bytes` element is not a 0..=255 integer"))
         })
         .collect()
 }
@@ -134,7 +139,7 @@ pub fn properties_to_json(props: &Properties) -> Value {
     )
 }
 
-/// A full node record as an export/`get` JSON object.
+/// A full node record as a JSON object (`get`, export, MCP `get_node`).
 pub fn node_to_json(node: &NodeRecord) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("id".into(), json!(node.id.0));
@@ -159,8 +164,7 @@ mod tests {
             PropValue::Float(1.5),
             PropValue::Str("hi".into()),
         ] {
-            let j = value_to_json(&v);
-            assert_eq!(json_to_value(&j).unwrap(), v);
+            assert_eq!(json_to_value(&value_to_json(&v)).unwrap(), v);
         }
     }
 
@@ -178,7 +182,6 @@ mod tests {
         let j = propdesc_to_json(&p);
         assert_eq!(j, json!({"$desc": "the year", "$value": 2026}));
         assert_eq!(json_to_propdesc(&j).unwrap(), p);
-        // undescribed collapses to the bare value
         let bare = PropDesc::new(PropValue::Int(1));
         assert_eq!(propdesc_to_json(&bare), json!(1));
         assert_eq!(json_to_propdesc(&json!(1)).unwrap(), bare);
@@ -196,15 +199,15 @@ mod tests {
             "name": "Alice",
             "meta": { "score": {"$desc": "0..1", "$value": 0.9} }
         });
-        let v = json_to_value(&j).unwrap();
-        // round-trips back to equivalent JSON
-        assert_eq!(value_to_json(&v), j);
+        assert_eq!(value_to_json(&json_to_value(&j).unwrap()), j);
     }
 
     #[test]
     fn properties_object_required() {
         assert!(json_to_properties(&json!([1, 2, 3])).is_err());
-        let props = json_to_properties(&json!({"a": 1})).unwrap();
-        assert_eq!(props["a"].value, PropValue::Int(1));
+        assert_eq!(
+            json_to_properties(&json!({"a": 1})).unwrap()["a"].value,
+            PropValue::Int(1)
+        );
     }
 }

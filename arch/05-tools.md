@@ -1,6 +1,14 @@
 # CLI Tools Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: draft · `drsg` built (M4), `digest` deferred · 2026-07-28
+
+**M4 landed** the `drsg` binary (clap): init, plane list/create/drop/show,
+import/export (JSONL in the `json` dialect below), get (id or
+`@external-key`), query (a serialized `LogicalPlan` as JSON), catalog, index
+ensure, stats, check. Handlers are testable functions over the core API
+writing to a `Write`. The JSON dialect lives in `dr-strange-core`'s
+feature-gated `json` module (shared with MCP). **`digest` is intentionally
+absent** pending its own design session (§3, arch/07).
 
 Scope: the `drsg` binary (`dr-strange-cli` crate) — the human-facing command-line
 wrapper over `dr-strange-core`. First consumer of the public API; its job is equal
