@@ -215,6 +215,15 @@ pub fn lookup_edge_type(txn: &dyn ReadTransaction, name: &str) -> Result<Option<
         .transpose()
 }
 
+/// Read-only label id lookup (mirror of [`lookup_edge_type`]); `None` if the
+/// label name was never interned — used by `scan_label`, which then yields no
+/// nodes rather than erroring.
+pub fn lookup_label(txn: &dyn ReadTransaction, name: &str) -> Result<Option<u32>> {
+    txn.get(TableId::Meta, &keys::dict_label_key(name))?
+        .map(|v| decode_u32(&v, "dictionary"))
+        .transpose()
+}
+
 pub fn resolve_label(txn: &dyn ReadTransaction, id: u32) -> Result<String> {
     let bytes = txn
         .get(TableId::Meta, &keys::dict_label_rev_key(id))?
@@ -670,6 +679,40 @@ pub fn remove_edge_prop(
     props.remove(key);
     let record = codec::encode_edge_record(src, dst, ty_id, &props);
     txn.put(TableId::Edges, &edge_key, &record)
+}
+
+/// All node ids in a plane, in ascending id order (a `Nodes`-table prefix
+/// scan). The query engine's `ScanAll` source (arch/03 §2).
+///
+/// Returns an owned `Vec`: v0 materializes the source id list, then the
+/// executor pipeline (expand/filter/limit) stays lazy over it. Streaming the
+/// source is a later optimization (arch/03 §2 "start scalar").
+pub fn scan_all(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<Vec<NodeId>> {
+    let prefix = keys::plane_key(plane).to_vec();
+    let end = prefix_successor(&prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::Nodes, &prefix, end.as_deref())? {
+        let (key, _) = item?;
+        let (_, node) = keys::parse_node_key(&key)?;
+        out.push(node);
+    }
+    Ok(out)
+}
+
+/// All node ids carrying `label` in a plane, ascending (a `label_idx` prefix
+/// scan). The `ScanLabel` source. Unknown label ⇒ empty, not an error.
+pub fn scan_label(txn: &dyn ReadTransaction, plane: PlaneId, label: &str) -> Result<Vec<NodeId>> {
+    let Some(label_id) = lookup_label(txn, label)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = keys::label_idx_prefix(plane, label_id).to_vec();
+    let end = prefix_successor(&prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::LabelIdx, &prefix, end.as_deref())? {
+        let (key, _) = item?;
+        out.push(keys::label_idx_node(&key)?);
+    }
+    Ok(out)
 }
 
 /// 1-hop expansion via prefix scan on the adjacency tables (arch/01 §3).
@@ -1156,6 +1199,73 @@ mod tests {
         let n = create_node(&mut txn, PlaneId::STARTUP, &["L"], &Properties::new()).unwrap();
         assert!(get_node(&txn, p2, n).unwrap().is_none());
         assert!(get_node(&txn, PlaneId::STARTUP, n).unwrap().is_some());
+    }
+
+    // ---- scan sources --------------------------------------------------
+
+    #[test]
+    fn scan_all_returns_plane_nodes_in_id_order() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &["A"], &Properties::new()).unwrap();
+        let b = create_node(&mut txn, PlaneId::STARTUP, &["B"], &Properties::new()).unwrap();
+        let _x = create_node(&mut txn, p2, &["A"], &Properties::new()).unwrap();
+
+        assert_eq!(scan_all(&txn, PlaneId::STARTUP).unwrap(), vec![a, b]);
+        // other plane's nodes don't leak in
+        assert_eq!(scan_all(&txn, p2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scan_label_filters_by_label_and_plane() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
+        let a1 = create_node(&mut txn, PlaneId::STARTUP, &["Paper"], &Properties::new()).unwrap();
+        let _p = create_node(&mut txn, PlaneId::STARTUP, &["Person"], &Properties::new()).unwrap();
+        let a2 = create_node(&mut txn, PlaneId::STARTUP, &["Paper"], &Properties::new()).unwrap();
+        create_node(&mut txn, p2, &["Paper"], &Properties::new()).unwrap();
+
+        assert_eq!(
+            scan_label(&txn, PlaneId::STARTUP, "Paper").unwrap(),
+            vec![a1, a2]
+        );
+        // a label the plane doesn't use here
+        assert!(
+            scan_label(&txn, PlaneId::STARTUP, "Org")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_label_unknown_label_is_empty_not_error() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        assert!(
+            scan_label(&txn, PlaneId::STARTUP, "NeverInterned")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(lookup_label(&txn, "NeverInterned").unwrap(), None);
+    }
+
+    #[test]
+    fn scan_label_reflects_deletes() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let a = create_node(&mut txn, PlaneId::STARTUP, &["Paper"], &Properties::new()).unwrap();
+        let b = create_node(&mut txn, PlaneId::STARTUP, &["Paper"], &Properties::new()).unwrap();
+        delete_node(&mut txn, PlaneId::STARTUP, a).unwrap();
+        assert_eq!(
+            scan_label(&txn, PlaneId::STARTUP, "Paper").unwrap(),
+            vec![b]
+        );
     }
 
     // ---- external keys -----------------------------------------------

@@ -1,21 +1,27 @@
-//! Public API layer (arch/04): `Database`, `PlaneHandle`, `WriteTxn`.
-//! The only surface wrappers may use. M1 scope: M0's vertical slice plus
-//! deletes, external keys, property mutation, and batched id allocation.
+//! Public API layer (arch/04): `Database`, `PlaneHandle`, `WriteTxn`, and the
+//! read [`QueryBuilder`]. The only surface wrappers may use. Covers writes
+//! (create/delete/mutate, external keys, batched ids) and the M2 query
+//! engine (scan/seek → expand/filter/sort/limit → nodes/ids/count/select).
 //!
-//! Engine dispatch: graph logic lives in `storage::graph` and is written
-//! against `&dyn` transactions; this layer only chooses the backend (a
-//! small enum — the one place that knows concrete engine types) and owns
-//! transaction lifecycles. TODO(M2): query builder mirroring plan operators.
+//! Engine dispatch: graph logic lives in `storage::graph` and query execution
+//! in `compute::exec`, both written against `&dyn` seams (transactions,
+//! `GraphReader`); this layer only chooses the backend (a small enum — the
+//! one place that knows concrete engine types) and owns transaction and
+//! reader lifecycles.
 
 use std::path::Path;
 
+use crate::cache::{GraphReader, UncachedReader};
+use crate::compute::exec;
+use crate::compute::expr::{self, Expr};
+use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::types::{
-    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, Properties,
+    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };
 
 enum Engine {
@@ -162,6 +168,25 @@ impl<'db> PlaneHandle<'db> {
             .with_read(|txn| graph::neighbors(txn, self.id, id, dir, ty))
     }
 
+    /// Starts a query in this plane (arch/03, arch/04 §3). Defaults to
+    /// scanning every node; call a source method (`scan_label`, `seek_ids`,
+    /// …) to narrow it, then chain steps and a terminal:
+    ///
+    /// ```ignore
+    /// let papers = plane.query()
+    ///     .scan_label("Paper")
+    ///     .expand_out("CITES")
+    ///     .filter(p("year").ge(2020))
+    ///     .limit(10)
+    ///     .nodes()?;
+    /// ```
+    pub fn query(&self) -> QueryBuilder<'db> {
+        QueryBuilder {
+            plane: *self,
+            plan: LogicalPlan::new(Source::ScanAll),
+        }
+    }
+
     /// Starts a write transaction scoped to this plane. Blocks while another
     /// write transaction is open (single writer, arch/01 §6).
     pub fn write(&self) -> Result<WriteTxn<'db>> {
@@ -303,5 +328,202 @@ impl WriteTxn<'_> {
             TxnInner::Memory(t) => (*t).commit(),
             TxnInner::Redb(t) => (*t).commit(),
         }
+    }
+}
+
+/// A fluent builder for a read query (arch/04 §3). Constructs a
+/// [`LogicalPlan`] one operator at a time — the builder mirrors plan
+/// operators one-to-one, adding no semantics of its own (arch/03 §2) — then
+/// a terminal runs it through the executor over a read snapshot.
+///
+/// Source methods (`scan_label`, `seek_ids`, …) set where rows come from and
+/// are normally called first; step methods append to the pipeline; terminals
+/// (`nodes`, `ids`, `count`, `select`) execute.
+#[derive(Clone)]
+pub struct QueryBuilder<'db> {
+    plane: PlaneHandle<'db>,
+    plan: LogicalPlan,
+}
+
+impl std::fmt::Debug for QueryBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBuilder")
+            .field("plane", &self.plane.id())
+            .field("plan", &self.plan)
+            .finish()
+    }
+}
+
+impl<'db> QueryBuilder<'db> {
+    // ---- sources (set where rows originate) ------------------------------
+
+    /// Every node in the plane (the default).
+    pub fn scan_all(mut self) -> Self {
+        self.plan.source = Source::ScanAll;
+        self
+    }
+
+    /// Every node carrying `label`.
+    pub fn scan_label(mut self, label: impl Into<String>) -> Self {
+        self.plan.source = Source::ScanLabel(label.into());
+        self
+    }
+
+    /// Specific node ids (ids not present in the plane are dropped).
+    pub fn seek_ids(mut self, ids: impl IntoIterator<Item = NodeId>) -> Self {
+        self.plan.source = Source::SeekIds(ids.into_iter().collect());
+        self
+    }
+
+    /// Nodes resolved from external keys (unresolved keys are dropped).
+    pub fn seek_keys<S: Into<String>>(mut self, keys: impl IntoIterator<Item = S>) -> Self {
+        self.plan.source = Source::SeekKeys(keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    // ---- steps -----------------------------------------------------------
+
+    /// 1-hop expansion in `dir`; `edge_type = None` means any type.
+    pub fn expand(mut self, dir: Dir, edge_type: Option<&str>) -> Self {
+        self.plan.push(Step::Expand {
+            dir,
+            edge_type: edge_type.map(str::to_string),
+        });
+        self
+    }
+
+    pub fn expand_out(self, edge_type: &str) -> Self {
+        self.expand(Dir::Out, Some(edge_type))
+    }
+
+    pub fn expand_in(self, edge_type: &str) -> Self {
+        self.expand(Dir::In, Some(edge_type))
+    }
+
+    pub fn expand_both(self, edge_type: &str) -> Self {
+        self.expand(Dir::Both, Some(edge_type))
+    }
+
+    /// Variable-length expansion over `min..=max` hops (walk semantics).
+    pub fn expand_var(mut self, dir: Dir, edge_type: Option<&str>, min: u32, max: u32) -> Self {
+        self.plan.push(Step::ExpandVar {
+            dir,
+            edge_type: edge_type.map(str::to_string),
+            min,
+            max,
+        });
+        self
+    }
+
+    /// Keep rows whose current node satisfies `predicate`.
+    pub fn filter(mut self, predicate: Expr) -> Self {
+        self.plan.push(Step::Filter(predicate));
+        self
+    }
+
+    /// Deduplicate by current node id.
+    pub fn distinct(mut self) -> Self {
+        self.plan.push(Step::Distinct);
+        self
+    }
+
+    pub fn skip(mut self, n: u64) -> Self {
+        self.plan.push(Step::Skip(n));
+        self
+    }
+
+    pub fn limit(mut self, n: u64) -> Self {
+        self.plan.push(Step::Limit(n));
+        self
+    }
+
+    /// Sort by explicit keys (evaluated on the current node).
+    pub fn sort_by(mut self, keys: Vec<SortKey>) -> Self {
+        self.plan.push(Step::Sort(keys));
+        self
+    }
+
+    pub fn sort_asc(self, expr: Expr) -> Self {
+        self.sort_by(vec![SortKey {
+            expr,
+            descending: false,
+        }])
+    }
+
+    pub fn sort_desc(self, expr: Expr) -> Self {
+        self.sort_by(vec![SortKey {
+            expr,
+            descending: true,
+        }])
+    }
+
+    // ---- inspection ------------------------------------------------------
+
+    /// The plan built so far (serializable — arch/00 §2).
+    pub fn plan(&self) -> &LogicalPlan {
+        &self.plan
+    }
+
+    // ---- terminals (execute) ---------------------------------------------
+
+    fn with_reader<T>(&self, f: impl FnOnce(&UncachedReader) -> Result<T>) -> Result<T> {
+        self.plane.db.engine.with_read(|txn| {
+            let reader = UncachedReader::new(txn, self.plane.id());
+            f(&reader)
+        })
+    }
+
+    /// Current-node ids of the matching rows, in pipeline order.
+    pub fn ids(&self) -> Result<Vec<NodeId>> {
+        self.with_reader(|reader| {
+            exec::execute(&self.plan, reader)?
+                .map(|r| r.map(|row| row.head))
+                .collect()
+        })
+    }
+
+    /// The full current-node records of the matching rows.
+    pub fn nodes(&self) -> Result<Vec<NodeRecord>> {
+        self.with_reader(|reader| {
+            let mut out = Vec::new();
+            for r in exec::execute(&self.plan, reader)? {
+                let row = r?;
+                if let Some(node) = reader.node(row.head)? {
+                    out.push((*node).clone());
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Number of matching rows.
+    pub fn count(&self) -> Result<usize> {
+        self.with_reader(|reader| {
+            let mut n = 0usize;
+            for r in exec::execute(&self.plan, reader)? {
+                r?;
+                n += 1;
+            }
+            Ok(n)
+        })
+    }
+
+    /// Evaluate `exprs` against each matching row's current node — one output
+    /// tuple per row (arch/03's projection, terminal form for v0).
+    pub fn select(&self, exprs: &[Expr]) -> Result<Vec<Vec<PropValue>>> {
+        self.with_reader(|reader| {
+            let mut out = Vec::new();
+            for r in exec::execute(&self.plan, reader)? {
+                let row = r?;
+                let node = reader.node(row.head)?;
+                out.push(
+                    exprs
+                        .iter()
+                        .map(|e| expr::eval(e, node.as_deref()))
+                        .collect(),
+                );
+            }
+            Ok(out)
+        })
     }
 }

@@ -108,9 +108,13 @@ Each milestone ends with a working vertical slice, not a finished layer.
   edge, plane), external keys (`create_node_with_key` / lookup), property
   mutation (`set_prop`/`remove_prop` on nodes and edges), batched node/edge
   ID allocation; property-based tests against an in-memory model.
-- **M2 — query engine v0**: logical plan + iterator executor; builder API;
-  filters, projections, multi-hop expansion, limits. Cache layer lands here
-  (pass-through `NoCache` in M0–M1), sized by traversal benchmarks.
+- **M2 — query engine v0** ✅: serializable logical plan
+  (scan/seek → expand/expand-var/filter/sort/distinct/skip/limit) + total
+  `Expr` evaluator + pull-based executor over the `GraphReader` seam; builder
+  API with `nodes`/`ids`/`count`/`select` terminals. Row model is the linear
+  pipeline (current node + trail). The cache *seam* landed (`UncachedReader`);
+  the moka `CachedReader` is deferred to when traversal benchmarks can size it
+  (arch/02).
 - **M3 — AI-native**: vector property type, HNSW index + `VectorTopK`, hybrid
   query slice ("similar then expand"); soft-schema catalog + introspection.
 - **M4 — first wrappers**: `drsg` CLI (import/query/stats; `digest` once its

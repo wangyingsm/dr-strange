@@ -96,6 +96,27 @@ pub fn label_idx_key(plane: PlaneId, label: u32, node: NodeId) -> [u8; 16] {
     k
 }
 
+/// Prefix for "all nodes with `label` in `plane`" — a `label_idx` scan range.
+pub fn label_idx_prefix(plane: PlaneId, label: u32) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k[..4].copy_from_slice(&plane.0.to_be_bytes());
+    k[4..].copy_from_slice(&label.to_be_bytes());
+    k
+}
+
+/// Extracts the trailing node id from a `label_idx` key.
+pub fn label_idx_node(key: &[u8]) -> Result<NodeId> {
+    if key.len() != 16 {
+        return Err(Error::Corrupt(format!(
+            "label_idx key has length {}, expected 16",
+            key.len()
+        )));
+    }
+    Ok(NodeId(u64::from_be_bytes(
+        key[8..].try_into().expect("checked length"),
+    )))
+}
+
 // ---- adjacency ------------------------------------------------------------
 //
 // adj_fwd: plane · src · type · dst · edge      (value: empty)

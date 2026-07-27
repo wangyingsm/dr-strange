@@ -2,16 +2,23 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Globally unique across all planes; monotonically allocated, never reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `serde(transparent)` so it serializes as a bare integer in plans/wire
+/// payloads (arch/00 §2), not `{"0": n}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct NodeId(pub u64);
 
 /// Globally unique across all planes; monotonically allocated, never reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EdgeId(pub u64);
 
 /// Plane 0 is the default plane, named "startup" (arch/09 §2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PlaneId(pub u32);
 
 impl PlaneId {
@@ -67,11 +74,49 @@ pub enum PropValue {
 }
 
 /// Direction of an adjacency scan / expansion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
     Out,
     In,
     Both,
+}
+
+// Ergonomic literal conversions: let query builders write `p("year").ge(2020)`
+// and `lit("Alice")` without spelling out `PropValue::…` at every call site.
+impl From<bool> for PropValue {
+    fn from(v: bool) -> Self {
+        PropValue::Bool(v)
+    }
+}
+impl From<i64> for PropValue {
+    fn from(v: i64) -> Self {
+        PropValue::Int(v)
+    }
+}
+impl From<i32> for PropValue {
+    fn from(v: i32) -> Self {
+        PropValue::Int(v as i64)
+    }
+}
+impl From<f64> for PropValue {
+    fn from(v: f64) -> Self {
+        PropValue::Float(v)
+    }
+}
+impl From<&str> for PropValue {
+    fn from(v: &str) -> Self {
+        PropValue::Str(v.to_string())
+    }
+}
+impl From<String> for PropValue {
+    fn from(v: String) -> Self {
+        PropValue::Str(v)
+    }
+}
+impl From<Vec<f32>> for PropValue {
+    fn from(v: Vec<f32>) -> Self {
+        PropValue::Vector(v)
+    }
 }
 
 /// A fully decoded node, as returned by reads (arch/04 §3).

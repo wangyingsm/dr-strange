@@ -1,6 +1,15 @@
 # Cache Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: draft · seam implemented, caching deferred (M2) · 2026-07-27
+
+**M2 landed the seam, not the cache.** The `GraphReader` trait (§2) and the
+pass-through `UncachedReader` are built; the executor reads only through them.
+The actual moka-backed `CachedReader` with commit-seq version stamping (§3–§4)
+is deliberately **not** built yet — arch gates moka-vs-hand-rolled on traversal
+benchmarks (§7 open-Q 1), and there is nothing to size against until the
+engine has a realistic workload. The seam means adding it later touches no
+executor code. Cacheable reads already return `Arc`s so the trait signature
+won't change when the cache arrives.
 
 Scope: an in-memory, read-through cache sitting between the storage layer and
 the computation layer. The executor never talks to storage directly; it talks

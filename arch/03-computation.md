@@ -1,11 +1,15 @@
 # Computation Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: draft · core query engine implemented (M2) · 2026-07-27
 
-Scope: turning requests into results — the logical plan algebra, the executor,
-**native hybrid graph+vector search**, and the soft-schema catalog. Reads
-exclusively through the cache layer's `GraphReader` trait (see
-[02-cache.md](02-cache.md)); never touches raw KV keys.
+**M2 landed**: the non-hybrid core is built — `Source`
+(ScanAll/ScanLabel/SeekIds/SeekKeys) + `Step`
+(Expand/ExpandVar/Filter/Skip/Limit/Distinct/Sort), a serializable
+`LogicalPlan`, a total `Expr` evaluator, and a pull-based executor over
+`GraphReader` (`compute::{plan, expr, exec}`). The **row model is the linear
+pipeline** described in §2 (a current node + its trail), not yet the
+named-multi-variable form. Hybrid operators (§4) and the catalog (§5) remain
+M3. `Project` is a v0 API terminal (`select`), not yet a plan `Step`.
 
 Design commitment up front: **hybrid search is an executor capability, not
 API-level aggregation.** A query mixing traversal and similarity is ONE plan
@@ -188,12 +192,17 @@ plan/executor decisions don't preclude it.
 
 ## 8. Open questions
 
-1. **`Expr` surface** — is the set above enough for M2? String operators
-   (`contains`, prefix) and list membership likely needed early.
-2. **`ExpandVar`/`ExpandBeam` path semantics** — trail vs walk vs simple-path
-   uniqueness default? (Cypher defaults to trail; simple-path is what users
-   usually mean.) Should the beam revisit a node reached via a
-   better-scoring path, or dedup?
+1. **`Expr` surface** — the M2 set (property access, literals, `HasLabel`,
+   `IsNull`, comparisons with numeric coercion, boolean logic, arithmetic;
+   total evaluation — incomparable/missing ⇒ predicate false) shipped and is
+   enough for filter/sort. Still deferred: string operators (`contains`,
+   prefix), list membership, and edge-property access (needs the richer
+   binding model).
+2. **`ExpandVar`/`ExpandBeam` path semantics** — **v0 chose walk semantics**
+   for `ExpandVar`: bounded by depth `min..=max`, nodes/edges may repeat, one
+   row per distinct walk; callers add `Distinct` for uniqueness. Trail /
+   simple-path modes and the `ExpandBeam` revisit-vs-dedup question are
+   revisited when the richer binding model + `ExpandBeam` land (M3).
 3. **Score channel: one or many?** — a single `f32` keeps operators simple
    but forces `Score` to fold multi-signal fusion eagerly; named score
    columns are the alternative. Decide at M3 with real GraphRAG queries.
