@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compute::expr::Expr;
+use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
 
 /// Where a plan's rows originate.
@@ -28,6 +29,16 @@ pub enum Source {
     SeekIds(Vec<NodeId>),
     /// Nodes resolved from external keys (unresolved keys are dropped).
     SeekKeys(Vec<String>),
+    /// Global similarity search: the `k` nodes (optionally restricted to
+    /// `label`) whose `property` vector is closest to `query` under `metric`.
+    /// Seed rows carry their similarity in the score channel (arch/03 §4.1).
+    VectorTopK {
+        label: Option<String>,
+        property: String,
+        query: Vec<f32>,
+        metric: Metric,
+        k: u64,
+    },
 }
 
 /// One pipeline stage, applied to the stream of rows.
@@ -55,6 +66,29 @@ pub enum Step {
     Distinct,
     /// Reorder rows by one or more keys (a pipeline barrier — materializes).
     Sort(Vec<SortKey>),
+    /// Graph-constrained vector search (arch/03 §4.3): rank the current
+    /// frontier by similarity of `property` to `query` and keep the top `k`,
+    /// setting each kept row's score. The "no client-side join" headline.
+    /// A barrier — needs the whole frontier.
+    FrontierTopK {
+        property: String,
+        query: Vec<f32>,
+        metric: Metric,
+        k: u64,
+    },
+    /// Similarity-guided beam traversal (arch/03 §4.4): at each of `depth`
+    /// steps, expand the frontier, score neighbors' `property` against
+    /// `query`, keep the best `width`. Emits the kept beam at every level;
+    /// each row's score is its similarity. Walk semantics (may revisit).
+    ExpandBeam {
+        dir: Dir,
+        edge_type: Option<String>,
+        property: String,
+        query: Vec<f32>,
+        metric: Metric,
+        width: u32,
+        depth: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,8 +124,15 @@ mod tests {
 
     #[test]
     fn plan_serde_roundtrip() {
+        use crate::storage::vector::Metric;
         let plan = LogicalPlan {
-            source: Source::ScanLabel("Paper".into()),
+            source: Source::VectorTopK {
+                label: Some("Paper".into()),
+                property: "embedding".into(),
+                query: vec![0.1, 0.2, 0.3],
+                metric: Metric::Cosine,
+                k: 25,
+            },
             steps: vec![
                 Step::Expand {
                     dir: Dir::Out,
@@ -102,6 +143,21 @@ mod tests {
                     edge_type: None,
                     min: 1,
                     max: 2,
+                },
+                Step::FrontierTopK {
+                    property: "embedding".into(),
+                    query: vec![0.4, 0.5, 0.6],
+                    metric: Metric::Dot,
+                    k: 10,
+                },
+                Step::ExpandBeam {
+                    dir: Dir::Out,
+                    edge_type: Some("CITES".into()),
+                    property: "embedding".into(),
+                    query: vec![0.7, 0.8, 0.9],
+                    metric: Metric::L2,
+                    width: 4,
+                    depth: 3,
                 },
                 Step::Filter(p("year").ge(2020).and(has_label("Paper"))),
                 Step::Distinct,

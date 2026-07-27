@@ -16,8 +16,12 @@ pub mod storage;
 pub mod types;
 
 pub use api::{Database, PlaneHandle, QueryBuilder, WriteTxn};
-pub use compute::{Expr, LogicalPlan, Row, SortKey, Source, Step, has_label, lit, p};
+pub use compute::{
+    Expr, LogicalPlan, Row, SortKey, Source, Step, distance, has_label, hops, lit, p, score,
+    similarity,
+};
 pub use error::{Error, Result};
+pub use storage::vector::Metric;
 pub use types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };

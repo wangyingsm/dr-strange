@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::vector::Metric;
 use crate::types::{NodeRecord, PropValue};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,6 +26,27 @@ pub enum Expr {
     Literal(PropValue),
     /// True iff the current node carries `label`.
     HasLabel(String),
+    /// The row's similarity score channel as a `Float` (`Null` if the row
+    /// carries no score — arch/03 §4.5 `score()`).
+    Score,
+    /// Hops taken to reach the current node (trail length) as an `Int`
+    /// (arch/03 §4.5 `hops()`), for structural fusion terms like `1/hops`.
+    Hops,
+    /// Distance from the current node's vector `property` to `query` under
+    /// `metric`, as a `Float` (`Null` if the property is absent or not a
+    /// vector). arch/03 §4.5 `distance()`.
+    Distance {
+        property: String,
+        query: Vec<f32>,
+        metric: Metric,
+    },
+    /// Similarity (higher = closer) — the negation-monotone twin of
+    /// `Distance`. arch/03 §4.5 `similarity()`.
+    Similarity {
+        property: String,
+        query: Vec<f32>,
+        metric: Metric,
+    },
     /// True iff the inner expression evaluates to `Null`.
     IsNull(Box<Expr>),
     Not(Box<Expr>),
@@ -174,35 +196,116 @@ pub fn has_label(label: impl Into<String>) -> Expr {
     Expr::HasLabel(label.into())
 }
 
+/// The row's similarity score channel (arch/03 §4.5).
+pub fn score() -> Expr {
+    Expr::Score
+}
+
+/// Hops taken to reach the current node (arch/03 §4.5).
+pub fn hops() -> Expr {
+    Expr::Hops
+}
+
+/// Distance from the current node's `property` vector to `query` (arch/03
+/// §4.5) — smaller is closer.
+pub fn distance(property: impl Into<String>, query: impl Into<Vec<f32>>, metric: Metric) -> Expr {
+    Expr::Distance {
+        property: property.into(),
+        query: query.into(),
+        metric,
+    }
+}
+
+/// Similarity from the current node's `property` vector to `query` (arch/03
+/// §4.5) — larger is closer.
+pub fn similarity(property: impl Into<String>, query: impl Into<Vec<f32>>, metric: Metric) -> Expr {
+    Expr::Similarity {
+        property: property.into(),
+        query: query.into(),
+        metric,
+    }
+}
+
 // ---- evaluation ----------------------------------------------------------
 
-/// Evaluates `expr` against `node` (the current row's node, `None` if the row
-/// points at a missing node). Total: returns a value, never an error.
-pub fn eval(expr: &Expr, node: Option<&NodeRecord>) -> PropValue {
+/// What an `Expr` is evaluated against: the current node (or `None` if the
+/// row points at a missing node), the row's score channel, and its hop
+/// count. The linear-pipeline row's world (arch/03 §2).
+#[derive(Clone, Copy)]
+pub struct EvalCtx<'a> {
+    pub node: Option<&'a NodeRecord>,
+    pub score: Option<f32>,
+    pub hops: usize,
+}
+
+impl<'a> EvalCtx<'a> {
+    /// Context for a bare node with no score/hops (filters over a plain scan,
+    /// projection helpers, tests).
+    pub fn node(node: Option<&'a NodeRecord>) -> Self {
+        Self {
+            node,
+            score: None,
+            hops: 0,
+        }
+    }
+
+    fn vector_prop(&self, property: &str) -> Option<&[f32]> {
+        match self.node?.properties.get(property).map(|p| &p.value) {
+            Some(PropValue::Vector(v)) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluates `expr` against `ctx`. Total: returns a value, never an error.
+pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
     match expr {
-        Expr::Property(key) => node
+        Expr::Property(key) => ctx
+            .node
             .and_then(|n| n.properties.get(key))
             .map(|p| p.value.clone())
             .unwrap_or(PropValue::Null),
         Expr::Literal(v) => v.clone(),
-        Expr::HasLabel(label) => {
-            PropValue::Bool(node.is_some_and(|n| n.labels.iter().any(|l| l == label)))
-        }
-        Expr::IsNull(e) => PropValue::Bool(matches!(eval(e, node), PropValue::Null)),
-        Expr::Not(e) => PropValue::Bool(!is_true(&eval(e, node))),
+        Expr::HasLabel(label) => PropValue::Bool(
+            ctx.node
+                .is_some_and(|n| n.labels.iter().any(|l| l == label)),
+        ),
+        Expr::Score => ctx
+            .score
+            .map(|s| PropValue::Float(s as f64))
+            .unwrap_or(PropValue::Null),
+        Expr::Hops => PropValue::Int(ctx.hops as i64),
+        Expr::Distance {
+            property,
+            query,
+            metric,
+        } => ctx
+            .vector_prop(property)
+            .map(|v| PropValue::Float(metric.distance(query, v) as f64))
+            .unwrap_or(PropValue::Null),
+        Expr::Similarity {
+            property,
+            query,
+            metric,
+        } => ctx
+            .vector_prop(property)
+            .map(|v| PropValue::Float(metric.similarity(query, v) as f64))
+            .unwrap_or(PropValue::Null),
+        Expr::IsNull(e) => PropValue::Bool(matches!(eval(e, ctx), PropValue::Null)),
+        Expr::Not(e) => PropValue::Bool(!is_true(&eval(e, ctx))),
         Expr::Compare { op, lhs, rhs } => {
-            PropValue::Bool(compare(*op, &eval(lhs, node), &eval(rhs, node)))
+            PropValue::Bool(compare(*op, &eval(lhs, ctx), &eval(rhs, ctx)))
         }
         Expr::Logic { op, lhs, rhs } => {
-            let a = is_true(&eval(lhs, node));
+            let a = is_true(&eval(lhs, ctx));
             // Short-circuit — also avoids evaluating the rhs needlessly.
             let v = match op {
-                LogicOp::And => a && is_true(&eval(rhs, node)),
-                LogicOp::Or => a || is_true(&eval(rhs, node)),
+                LogicOp::And => a && is_true(&eval(rhs, ctx)),
+                LogicOp::Or => a || is_true(&eval(rhs, ctx)),
             };
             PropValue::Bool(v)
         }
-        Expr::Arith { op, lhs, rhs } => arith(*op, &eval(lhs, node), &eval(rhs, node)),
+        Expr::Arith { op, lhs, rhs } => arith(*op, &eval(lhs, ctx), &eval(rhs, ctx)),
     }
 }
 
@@ -303,16 +406,20 @@ mod tests {
         }
     }
 
+    fn ev(expr: &Expr, node: Option<&NodeRecord>) -> PropValue {
+        eval(expr, &EvalCtx::node(node))
+    }
+
     fn b(expr: &Expr, n: &NodeRecord) -> bool {
-        is_true(&eval(expr, Some(n)))
+        is_true(&ev(expr, Some(n)))
     }
 
     #[test]
     fn property_and_missing_property() {
         let n = node(&[], &[("year", PropValue::Int(2020))]);
-        assert_eq!(eval(&p("year"), Some(&n)), PropValue::Int(2020));
-        assert_eq!(eval(&p("absent"), Some(&n)), PropValue::Null);
-        assert_eq!(eval(&p("year"), None), PropValue::Null);
+        assert_eq!(ev(&p("year"), Some(&n)), PropValue::Int(2020));
+        assert_eq!(ev(&p("absent"), Some(&n)), PropValue::Null);
+        assert_eq!(ev(&p("year"), None), PropValue::Null);
     }
 
     #[test]
@@ -360,22 +467,19 @@ mod tests {
         let n = node(&["Person", "Author"], &[]);
         assert!(b(&has_label("Person"), &n));
         assert!(!b(&has_label("Paper"), &n));
-        assert!(!is_true(&eval(&has_label("Person"), None)));
+        assert!(!is_true(&ev(&has_label("Person"), None)));
     }
 
     #[test]
     fn arithmetic() {
         let n = node(&[], &[("x", PropValue::Int(10))]);
-        assert_eq!(eval(&p("x").add(5), Some(&n)), PropValue::Int(15));
-        assert_eq!(eval(&p("x").mul(3), Some(&n)), PropValue::Int(30));
-        assert_eq!(eval(&p("x").div(0), Some(&n)), PropValue::Null);
+        assert_eq!(ev(&p("x").add(5), Some(&n)), PropValue::Int(15));
+        assert_eq!(ev(&p("x").mul(3), Some(&n)), PropValue::Int(30));
+        assert_eq!(ev(&p("x").div(0), Some(&n)), PropValue::Null);
         // float contaminates to float
-        assert_eq!(
-            eval(&p("x").add(lit(0.5)), Some(&n)),
-            PropValue::Float(10.5)
-        );
+        assert_eq!(ev(&p("x").add(lit(0.5)), Some(&n)), PropValue::Float(10.5));
         // arithmetic on non-numeric → Null
-        assert_eq!(eval(&lit("s").add(1), Some(&n)), PropValue::Null);
+        assert_eq!(ev(&lit("s").add(1), Some(&n)), PropValue::Null);
         // and a computed comparison
         assert!(b(&p("x").add(5).ge(15), &n));
     }
@@ -397,5 +501,57 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn score_and_hops_read_the_row_channel() {
+        let n = node(&[], &[]);
+        let ctx = EvalCtx {
+            node: Some(&n),
+            score: Some(0.75),
+            hops: 2,
+        };
+        assert_eq!(eval(&score(), &ctx), PropValue::Float(0.75));
+        assert_eq!(eval(&hops(), &ctx), PropValue::Int(2));
+        // score is Null when the row carries none
+        let none = EvalCtx {
+            node: Some(&n),
+            score: None,
+            hops: 0,
+        };
+        assert_eq!(eval(&score(), &none), PropValue::Null);
+    }
+
+    #[test]
+    fn distance_and_similarity_over_a_vector_property() {
+        let n = node(&[], &[("emb", PropValue::Vector(vec![1.0, 0.0]))]);
+        let ctx = EvalCtx::node(Some(&n));
+        // identical direction → cosine distance ~0, similarity ~1
+        let d = eval(&distance("emb", vec![1.0, 0.0], Metric::Cosine), &ctx);
+        let s = eval(&similarity("emb", vec![1.0, 0.0], Metric::Cosine), &ctx);
+        assert!(matches!(d, PropValue::Float(x) if x.abs() < 1e-6));
+        assert!(matches!(s, PropValue::Float(x) if (x - 1.0).abs() < 1e-6));
+        // missing / non-vector property → Null
+        assert_eq!(
+            eval(&distance("absent", vec![1.0], Metric::L2), &ctx),
+            PropValue::Null
+        );
+    }
+
+    #[test]
+    fn linear_fusion_of_score_and_hops() {
+        // 0.7*score + 0.3/hops, a canonical GraphRAG rank (arch/03 §4.5)
+        let n = node(&[], &[]);
+        let ctx = EvalCtx {
+            node: Some(&n),
+            score: Some(1.0),
+            hops: 2,
+        };
+        let fused = score().mul(lit(0.7)).add(lit(0.3).div(hops()));
+        // 0.7*1.0 + 0.3/2 = 0.85
+        match eval(&fused, &ctx) {
+            PropValue::Float(v) => assert!((v - 0.85).abs() < 1e-6, "got {v}"),
+            other => panic!("expected float, got {other:?}"),
+        }
     }
 }

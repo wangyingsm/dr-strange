@@ -17,15 +17,20 @@ use crate::cache::GraphReader;
 use crate::compute::expr::{self, Expr};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::Result;
-use crate::types::{Dir, EdgeId, NodeId, PropValue};
+use crate::storage::vector::{Metric, top_k};
+use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
 
-/// One row of the executor's stream: the current node and the path to it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One row of the executor's stream: the current node, the path to it, and an
+/// optional similarity **score channel** (arch/03 §2, §4.5) set by the hybrid
+/// operators and readable in expressions via `score()`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub head: NodeId,
     /// `(edge traversed, node reached)` for each hop, in order. Empty at a
-    /// source. Carries path information for future path-returning queries.
+    /// source. Carries path information for future path-returning queries;
+    /// its length is `hops()`.
     pub trail: Vec<(EdgeId, NodeId)>,
+    pub score: Option<f32>,
 }
 
 impl Row {
@@ -33,13 +38,43 @@ impl Row {
         Row {
             head,
             trail: Vec::new(),
+            score: None,
         }
     }
 
+    /// A source row that already carries a score (vector-search seeds).
+    fn scored(head: NodeId, score: f32) -> Self {
+        Row {
+            head,
+            trail: Vec::new(),
+            score: Some(score),
+        }
+    }
+
+    /// Extend the path by one hop; the score channel is inherited so a seed's
+    /// similarity survives expansion (arch/03 §4.1).
     fn step(&self, edge: EdgeId, node: NodeId) -> Self {
         let mut trail = self.trail.clone();
         trail.push((edge, node));
-        Row { head: node, trail }
+        Row {
+            head: node,
+            trail,
+            score: self.score,
+        }
+    }
+
+    /// The same row with its score channel replaced (rerank operators).
+    fn with_score(mut self, score: f32) -> Self {
+        self.score = Some(score);
+        self
+    }
+
+    fn ctx<'a>(&self, node: Option<&'a NodeRecord>) -> expr::EvalCtx<'a> {
+        expr::EvalCtx {
+            node,
+            score: self.score,
+            hops: self.trail.len(),
+        }
     }
 }
 
@@ -79,8 +114,59 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
             }
             out
         }
+        Source::VectorTopK {
+            label,
+            property,
+            query,
+            metric,
+            k,
+        } => {
+            // Exact (record-backed) global similarity search: score every
+            // candidate with the vector property, keep top-k, seed the score
+            // channel. The declared HNSW index accelerates this later.
+            let candidates = match label {
+                Some(l) => reader.scan_label(l)?,
+                None => reader.scan_all()?,
+            };
+            return vector_top_k_rows(reader, &candidates, property, query, *metric, *k as usize);
+        }
     };
     Ok(ids.into_iter().map(Row::start).collect())
+}
+
+/// Score `candidates` by similarity of their `property` vector to `query`,
+/// returning the top-`k` as scored rows (descending similarity). Shared by
+/// the `VectorTopK` source and the `FrontierTopK` step.
+fn vector_top_k_rows(
+    reader: &dyn GraphReader,
+    candidates: &[NodeId],
+    property: &str,
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+) -> Result<Vec<Row>> {
+    let mut items: Vec<(u64, f32)> = Vec::new();
+    for &id in candidates {
+        if let Some(v) = node_vector(reader, id, property)? {
+            let d = metric.distance(query, &v);
+            // Non-finite distance = dimension mismatch (arch/01 §5); skip it,
+            // the same way the evaluator drops incomparable values.
+            if d.is_finite() {
+                items.push((id.0, d));
+            }
+        }
+    }
+    // top_k picks smallest distances; convert distance→similarity for the
+    // score channel so higher = closer (arch/03 §4.5).
+    Ok(top_k(items.into_iter(), k)
+        .into_iter()
+        .map(|hit| {
+            Row::scored(
+                NodeId(hit.id),
+                metric.similarity_from_distance(hit.distance),
+            )
+        })
+        .collect())
 }
 
 fn apply_step<'r>(
@@ -121,7 +207,106 @@ fn apply_step<'r>(
         }
         // Barrier: drain, sort, re-emit.
         Step::Sort(keys) => Box::new(sort_rows(iter, keys, reader)?.into_iter().map(Ok)),
+        // Barrier: rank the whole frontier by similarity, keep top-k.
+        Step::FrontierTopK {
+            property,
+            query,
+            metric,
+            k,
+        } => {
+            let frontier = drain(iter)?;
+            let ids: Vec<NodeId> = frontier.iter().map(|r| r.head).collect();
+            let ranked = vector_top_k_rows(reader, &ids, property, query, *metric, *k as usize)?;
+            // vector_top_k_rows makes fresh scored rows (no trail); re-attach
+            // each winner's original trail so path info survives the rerank.
+            let mut by_head: std::collections::HashMap<NodeId, Row> =
+                frontier.into_iter().map(|r| (r.head, r)).collect();
+            let out: Vec<Result<Row>> = ranked
+                .into_iter()
+                .map(|scored| {
+                    let score = scored.score.expect("ranked rows are scored");
+                    let base = by_head.remove(&scored.head).unwrap_or(scored);
+                    Ok(base.with_score(score))
+                })
+                .collect();
+            Box::new(out.into_iter())
+        }
+        Step::ExpandBeam {
+            dir,
+            edge_type,
+            property,
+            query,
+            metric,
+            width,
+            depth,
+        } => {
+            let frontier = drain(iter)?;
+            let out = expand_beam(
+                reader,
+                frontier,
+                *dir,
+                edge_type,
+                property,
+                query,
+                *metric,
+                *width as usize,
+                *depth,
+            )?;
+            Box::new(out.into_iter().map(Ok))
+        }
     })
+}
+
+/// Drains a row stream, propagating the first error (used by barrier steps).
+fn drain(iter: RowIter<'_>) -> Result<Vec<Row>> {
+    iter.collect()
+}
+
+/// Similarity-guided beam search (arch/03 §4.4). At each of `depth` steps,
+/// expand every frontier row, score each neighbor's `property` against
+/// `query`, keep the globally-best `width` as the next frontier, and emit
+/// them. Neighbors lacking the vector property score `-inf` (sink out unless
+/// the beam is wider than the candidate set). Walk semantics: a node may be
+/// revisited across steps; callers add `Distinct`.
+#[allow(clippy::too_many_arguments)]
+fn expand_beam(
+    reader: &dyn GraphReader,
+    start: Vec<Row>,
+    dir: Dir,
+    edge_type: &Option<String>,
+    property: &str,
+    query: &[f32],
+    metric: Metric,
+    width: usize,
+    depth: u32,
+) -> Result<Vec<Row>> {
+    let mut emitted: Vec<Row> = Vec::new();
+    let mut frontier = start;
+    for _ in 0..depth {
+        // Score every neighbor of the current frontier.
+        let mut candidates: Vec<(f32, Row)> = Vec::new();
+        for row in &frontier {
+            for n in reader
+                .neighbors(row.head, dir, edge_type.as_deref())?
+                .iter()
+            {
+                let sim = match node_vector(reader, n.node, property)? {
+                    Some(v) => metric.similarity(query, &v),
+                    None => f32::NEG_INFINITY,
+                };
+                candidates.push((sim, row.step(n.edge, n.node).with_score(sim)));
+            }
+        }
+        if candidates.is_empty() {
+            break;
+        }
+        // Keep the best `width` by similarity (descending).
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+        candidates.truncate(width);
+        frontier = candidates.into_iter().map(|(_, r)| r).collect();
+        emitted.extend(frontier.iter().cloned());
+    }
+    Ok(emitted)
 }
 
 fn expand_one(
@@ -184,7 +369,8 @@ fn filter_one(reader: &dyn GraphReader, rr: Result<Row>, pred: &Expr) -> Option<
         Ok(row) => match reader.node(row.head) {
             Err(e) => Some(Err(e)),
             Ok(node) => {
-                if expr::is_true(&expr::eval(pred, node.as_deref())) {
+                let ctx = row.ctx(node.as_deref());
+                if expr::is_true(&expr::eval(pred, &ctx)) {
                     Some(Ok(row))
                 } else {
                     None
@@ -201,14 +387,24 @@ fn sort_rows(iter: RowIter<'_>, keys: &[SortKey], reader: &dyn GraphReader) -> R
     for rr in iter {
         let row = rr?;
         let node = reader.node(row.head)?;
-        let vals = keys
-            .iter()
-            .map(|k| expr::eval(&k.expr, node.as_deref()))
-            .collect();
+        let ctx = row.ctx(node.as_deref());
+        let vals = keys.iter().map(|k| expr::eval(&k.expr, &ctx)).collect();
         decorated.push((vals, row));
     }
     decorated.sort_by(|a, b| cmp_keys(&a.0, &b.0, keys));
     Ok(decorated.into_iter().map(|(_, row)| row).collect())
+}
+
+/// Reads the current node's `property` as a vector, or `None` if absent /
+/// not a vector — the exact (record-backed) path for hybrid operators.
+fn node_vector(reader: &dyn GraphReader, head: NodeId, property: &str) -> Result<Option<Vec<f32>>> {
+    let Some(node) = reader.node(head)? else {
+        return Ok(None);
+    };
+    Ok(match node.properties.get(property).map(|p| &p.value) {
+        Some(PropValue::Vector(v)) => Some(v.clone()),
+        _ => None,
+    })
 }
 
 fn cmp_keys(a: &[PropValue], b: &[PropValue], keys: &[SortKey]) -> std::cmp::Ordering {

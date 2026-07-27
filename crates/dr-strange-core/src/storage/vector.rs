@@ -56,6 +56,16 @@ impl Metric {
             Metric::L2 => -l2(a, b),
         }
     }
+
+    /// Recover `similarity` from a `distance` this metric produced, without
+    /// the vectors — the two are exact affine twins per metric. Lets a
+    /// heap-ranked top-k (by distance) report true similarity scores.
+    pub fn similarity_from_distance(self, distance: f32) -> f32 {
+        match self {
+            Metric::Cosine => 1.0 - distance, // distance = 1 - cos
+            Metric::Dot | Metric::L2 => -distance,
+        }
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

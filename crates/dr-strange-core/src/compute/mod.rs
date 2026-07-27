@@ -17,5 +17,5 @@ pub mod expr;
 pub mod plan;
 
 pub use exec::Row;
-pub use expr::{Expr, has_label, lit, p};
+pub use expr::{Expr, distance, has_label, hops, lit, p, score, similarity};
 pub use plan::{LogicalPlan, SortKey, Source, Step};

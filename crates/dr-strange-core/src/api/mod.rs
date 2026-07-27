@@ -13,13 +13,14 @@ use std::path::Path;
 
 use crate::cache::{GraphReader, UncachedReader};
 use crate::compute::exec;
-use crate::compute::expr::{self, Expr};
+use crate::compute::expr::{self, Expr, score};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
+use crate::storage::vector::Metric;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };
@@ -381,6 +382,27 @@ impl<'db> QueryBuilder<'db> {
         self
     }
 
+    /// Global similarity search: the `k` nodes closest to `query` by their
+    /// `property` vector, seeded with a similarity score (arch/03 §4.1).
+    /// `label = None` searches the whole plane.
+    pub fn vector_top_k(
+        mut self,
+        label: Option<&str>,
+        property: &str,
+        query: impl Into<Vec<f32>>,
+        metric: Metric,
+        k: u64,
+    ) -> Self {
+        self.plan.source = Source::VectorTopK {
+            label: label.map(str::to_string),
+            property: property.to_string(),
+            query: query.into(),
+            metric,
+            k,
+        };
+        self
+    }
+
     // ---- steps -----------------------------------------------------------
 
     /// 1-hop expansion in `dir`; `edge_type = None` means any type.
@@ -421,6 +443,50 @@ impl<'db> QueryBuilder<'db> {
         self
     }
 
+    /// Graph-constrained vector search (arch/03 §4.3): rerank the current
+    /// frontier by similarity of `property` to `query`, keeping the top `k`
+    /// with scores — one plan, no client-side join.
+    pub fn frontier_top_k(
+        mut self,
+        property: &str,
+        query: impl Into<Vec<f32>>,
+        metric: Metric,
+        k: u64,
+    ) -> Self {
+        self.plan.push(Step::FrontierTopK {
+            property: property.to_string(),
+            query: query.into(),
+            metric,
+            k,
+        });
+        self
+    }
+
+    /// Similarity-guided beam traversal (arch/03 §4.4): walk toward `query`'s
+    /// meaning, keeping the best `width` per step for `depth` steps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expand_beam(
+        mut self,
+        dir: Dir,
+        edge_type: Option<&str>,
+        property: &str,
+        query: impl Into<Vec<f32>>,
+        metric: Metric,
+        width: u32,
+        depth: u32,
+    ) -> Self {
+        self.plan.push(Step::ExpandBeam {
+            dir,
+            edge_type: edge_type.map(str::to_string),
+            property: property.to_string(),
+            query: query.into(),
+            metric,
+            width,
+            depth,
+        });
+        self
+    }
+
     /// Deduplicate by current node id.
     pub fn distinct(mut self) -> Self {
         self.plan.push(Step::Distinct);
@@ -455,6 +521,12 @@ impl<'db> QueryBuilder<'db> {
             expr,
             descending: true,
         }])
+    }
+
+    /// Sort most-similar-first by the row score channel — the usual final
+    /// step after a vector search.
+    pub fn sort_by_score(self) -> Self {
+        self.sort_desc(score())
     }
 
     // ---- inspection ------------------------------------------------------
@@ -496,6 +568,21 @@ impl<'db> QueryBuilder<'db> {
         })
     }
 
+    /// Like [`nodes`](Self::nodes) but pairs each with its similarity score
+    /// (`None` for rows that never passed through a vector operator).
+    pub fn scored_nodes(&self) -> Result<Vec<(NodeRecord, Option<f32>)>> {
+        self.with_reader(|reader| {
+            let mut out = Vec::new();
+            for r in exec::execute(&self.plan, reader)? {
+                let row = r?;
+                if let Some(node) = reader.node(row.head)? {
+                    out.push(((*node).clone(), row.score));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Number of matching rows.
     pub fn count(&self) -> Result<usize> {
         self.with_reader(|reader| {
@@ -516,12 +603,12 @@ impl<'db> QueryBuilder<'db> {
             for r in exec::execute(&self.plan, reader)? {
                 let row = r?;
                 let node = reader.node(row.head)?;
-                out.push(
-                    exprs
-                        .iter()
-                        .map(|e| expr::eval(e, node.as_deref()))
-                        .collect(),
-                );
+                let ctx = expr::EvalCtx {
+                    node: node.as_deref(),
+                    score: row.score,
+                    hops: row.trail.len(),
+                };
+                out.push(exprs.iter().map(|e| expr::eval(e, &ctx)).collect());
             }
             Ok(out)
         })
