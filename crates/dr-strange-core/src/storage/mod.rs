@@ -10,6 +10,7 @@
 pub mod codec;
 pub mod engine;
 pub mod graph;
+pub mod hnsw;
 pub mod keys;
 pub mod memory;
 pub mod redb_backend;
