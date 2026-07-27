@@ -1,15 +1,26 @@
 # Computation Layer
 
-**Status**: draft · core query engine implemented (M2) · 2026-07-27
+**Status**: draft · query engine + native hybrid search + catalog built
+(M2–M3) · 2026-07-28
 
-**M2 landed**: the non-hybrid core is built — `Source`
+**M2 landed** the non-hybrid core: `Source`
 (ScanAll/ScanLabel/SeekIds/SeekKeys) + `Step`
 (Expand/ExpandVar/Filter/Skip/Limit/Distinct/Sort), a serializable
 `LogicalPlan`, a total `Expr` evaluator, and a pull-based executor over
 `GraphReader` (`compute::{plan, expr, exec}`). The **row model is the linear
-pipeline** described in §2 (a current node + its trail), not yet the
-named-multi-variable form. Hybrid operators (§4) and the catalog (§5) remain
-M3. `Project` is a v0 API terminal (`select`), not yet a plan `Step`.
+pipeline** of §2 (a current node + trail + an optional `f32` score channel),
+not the named-multi-variable form. `Project` is a v0 API terminal
+(`select`), not a plan `Step`.
+
+**M3 landed** the AI-native surface: the hybrid operators of §4 —
+`Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed
+natively (one plan, one snapshot; never API aggregation), with the score
+channel and `score()`/`hops()`/`distance()`/`similarity()` fusion in `Expr`.
+Vector search is exact by default and index-accelerated when a `(plane,
+label, property)` index is declared (`crate::index`, arch/01 §5). The
+soft-schema **catalog** of §5 is built (`compute::catalog`, `plane.catalog()`
+/ `db.catalog()`), computed by full scan; incremental maintenance is the
+remaining optimization.
 
 Design commitment up front: **hybrid search is an executor capability, not
 API-level aggregation.** A query mixing traversal and similarity is ONE plan

@@ -153,3 +153,108 @@ impl VectorRegistry {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::engine::{StorageEngine, WriteTransaction};
+    use crate::storage::memory::MemoryEngine;
+    use crate::types::{PropDesc, PropValue, Properties};
+
+    fn emb(v: Vec<f32>) -> Properties {
+        [("emb".to_string(), PropDesc::new(PropValue::Vector(v)))]
+            .into_iter()
+            .collect()
+    }
+
+    /// Builds a startup-plane graph with three "Doc" nodes and a declared
+    /// L2 index over them, returning the engine + node ids.
+    fn setup() -> (MemoryEngine, VectorRegistry, [NodeId; 3]) {
+        let eng = MemoryEngine::new();
+        let ids;
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            let a =
+                graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &emb(vec![0.0])).unwrap();
+            let b =
+                graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &emb(vec![5.0])).unwrap();
+            let c =
+                graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &emb(vec![9.0])).unwrap();
+            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2)
+                .unwrap();
+            ids = [a, b, c];
+            txn.commit().unwrap();
+        }
+        let mut reg = VectorRegistry::new();
+        {
+            let txn = eng.begin_read().unwrap();
+            reg.rebuild_from(&txn).unwrap();
+        }
+        (eng, reg, ids)
+    }
+
+    #[test]
+    fn rebuild_declared_and_search() {
+        let (_eng, reg, [a, _b, _c]) = setup();
+        assert_eq!(
+            reg.declared(PlaneId::STARTUP),
+            vec![("Doc".to_string(), "emb".to_string(), Metric::L2)]
+        );
+        let hits = reg
+            .search(PlaneId::STARTUP, "Doc", "emb", &[0.0], Metric::L2, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits[0].id, a.0);
+    }
+
+    #[test]
+    fn search_returns_none_for_missing_or_wrong_metric() {
+        let (_eng, reg, _) = setup();
+        // no such index
+        assert!(
+            reg.search(PlaneId::STARTUP, "Ghost", "emb", &[0.0], Metric::L2, 1)
+                .is_none()
+        );
+        // declared for L2, queried as Cosine
+        assert!(
+            reg.search(PlaneId::STARTUP, "Doc", "emb", &[0.0], Metric::Cosine, 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn upsert_remove_one_and_remove_node() {
+        let (_eng, mut reg, [a, b, _c]) = setup();
+        let near0 = |r: &VectorRegistry| {
+            r.search(PlaneId::STARTUP, "Doc", "emb", &[0.0], Metric::L2, 1)
+                .unwrap()
+                .unwrap()[0]
+                .id
+        };
+        assert_eq!(near0(&reg), a.0);
+
+        // move b to the origin via upsert; it becomes nearest
+        reg.upsert(PlaneId::STARTUP, "Doc", "emb", b, &[0.0])
+            .unwrap();
+        // both a and b at 0 now; remove a → b is the unique nearest
+        reg.remove_one(PlaneId::STARTUP, "Doc", "emb", a).unwrap();
+        assert_eq!(near0(&reg), b.0);
+
+        // remove_one on an index that doesn't exist is a harmless no-op
+        reg.remove_one(PlaneId::STARTUP, "Ghost", "emb", b).unwrap();
+        // upsert into a non-existent index is also a no-op
+        reg.upsert(PlaneId::STARTUP, "Ghost", "emb", b, &[0.0])
+            .unwrap();
+
+        // remove_node strips b from every index
+        reg.remove_node(b).unwrap();
+        assert!(
+            reg.search(PlaneId::STARTUP, "Doc", "emb", &[0.0], Metric::L2, 5)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .all(|h| h.id != b.0)
+        );
+    }
+}

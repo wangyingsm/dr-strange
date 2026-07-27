@@ -767,6 +767,39 @@ pub fn scan_all(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<Vec<NodeId>
     Ok(out)
 }
 
+/// All edge ids in a plane, ascending (an `Edges`-table prefix scan). Used by
+/// the catalog to walk edges; edges have the same `plane · id` key layout as
+/// nodes.
+pub fn scan_edges(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<Vec<EdgeId>> {
+    let prefix = keys::plane_key(plane).to_vec();
+    let end = prefix_successor(&prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::Edges, &prefix, end.as_deref())? {
+        let (key, _) = item?;
+        let (_, id) = keys::parse_node_key(&key)?; // same 12-byte plane·id layout
+        out.push(EdgeId(id.0));
+    }
+    Ok(out)
+}
+
+/// All planes as `(id, name)`, ascending by id (a `plane_names` scan). Used
+/// for the cross-plane catalog roll-up.
+pub fn list_planes(txn: &dyn ReadTransaction) -> Result<Vec<(PlaneId, String)>> {
+    let mut out = Vec::new();
+    for item in txn.range(TableId::PlaneNames, b"", None)? {
+        let (key, value) = item?;
+        let name = String::from_utf8(key).map_err(|_| Error::Corrupt("bad plane name".into()))?;
+        let id = value
+            .as_slice()
+            .try_into()
+            .map(|b| PlaneId(u32::from_be_bytes(b)))
+            .map_err(|_| Error::Corrupt("bad plane id".into()))?;
+        out.push((id, name));
+    }
+    out.sort_by_key(|(p, _)| p.0);
+    Ok(out)
+}
+
 /// All node ids carrying `label` in a plane, ascending (a `label_idx` prefix
 /// scan). The `ScanLabel` source. Unknown label ⇒ empty, not an error.
 pub fn scan_label(txn: &dyn ReadTransaction, plane: PlaneId, label: &str) -> Result<Vec<NodeId>> {

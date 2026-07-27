@@ -209,7 +209,14 @@ Inherited from redb in v1:
    unmaintained (RUSTSEC-2025-0141); postcard has a versioned wire-format
    spec independent of the crate, which durable on-disk data needs. Revisit
    only if decode-heavy traversal benchmarks (M2) show it's a bottleneck.
-2. **HNSW library vs hand-rolled** — recall + build/query speed benchmark (M3).
+2. ~~**HNSW library vs hand-rolled.**~~ **Resolved (M3): hand-rolled,
+   pure-Rust.** `usearch` is C++ (contradicts the no-C++-build-chain ethos
+   that chose redb over RocksDB); hand-rolling keeps the on-disk format ours
+   (the bincode lesson). An exact `BruteForceIndex` is the small-plane impl
+   *and* the recall oracle the HNSW is tested against (recall@10 ≥ 0.85).
+   The registry declares indexes durably in `meta` and rebuilds the HNSW
+   from the KV on open — so the KV stays the single source of truth and the
+   HNSW *graph* sidecar (open-time speedup only) is deferred, not required.
 3. **Overflow storage for large blobs** — needed in v1 or defer?
 4. **Adjacency value payload** — should `adj_fwd` duplicate a few hot edge
    properties (e.g. weight) to avoid an `edges` lookup during weighted

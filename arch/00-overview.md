@@ -115,8 +115,14 @@ Each milestone ends with a working vertical slice, not a finished layer.
   pipeline (current node + trail). The cache *seam* landed (`UncachedReader`);
   the moka `CachedReader` is deferred to when traversal benchmarks can size it
   (arch/02).
-- **M3 — AI-native**: vector property type, HNSW index + `VectorTopK`, hybrid
-  query slice ("similar then expand"); soft-schema catalog + introspection.
+- **M3 — AI-native** ✅: `Metric` + exact brute-force + hand-rolled pure-Rust
+  HNSW behind `VectorIndex`; native hybrid operators `VectorTopK` /
+  `FrontierTopK` / `ExpandBeam` with a row score channel and
+  `score`/`hops`/`distance`/`similarity` fusion; a declared-index registry
+  (`ensure_vector_index`, rebuilt from the KV on open, write-coherent);
+  soft-schema catalog + introspection (`plane.catalog()` / `db.catalog()`).
+  Deferred: HNSW graph sidecar (open-time speedup), incremental catalog
+  maintenance.
 - **M4 — first wrappers**: `drsg` CLI (import/query/stats; `digest` once its
   design session lands) and MCP server.
 - **M5 — hardening**: crash-recovery tests, benchmarks (vs Kùzu/Neo4j on

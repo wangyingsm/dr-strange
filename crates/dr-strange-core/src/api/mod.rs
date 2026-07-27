@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::RwLock;
 
 use crate::cache::{GraphReader, UncachedReader};
+use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
@@ -141,6 +142,17 @@ impl Database {
     pub fn drop_plane(&self, id: PlaneId) -> Result<()> {
         self.engine.with_write(|txn| graph::drop_plane(txn, id))
     }
+
+    /// The soft-schema catalog rolled up across every plane (arch/03 §5).
+    pub fn catalog(&self) -> Result<CatalogSnapshot> {
+        self.engine.with_read(|txn| {
+            let mut rollup = CatalogSnapshot::default();
+            for (plane, _name) in graph::list_planes(txn)? {
+                rollup.merge(&catalog::compute(txn, plane)?);
+            }
+            Ok(rollup)
+        })
+    }
 }
 
 /// Scope handle for one plane — all data access goes through one of these
@@ -191,6 +203,15 @@ impl<'db> PlaneHandle<'db> {
         self.db
             .engine
             .with_read(|txn| graph::neighbors(txn, self.id, id, dir, ty))
+    }
+
+    /// This plane's soft-schema catalog (arch/03 §5) — the descriptive shape
+    /// (labels, property types/descriptions, edge-type connectivity, counts)
+    /// the MCP layer serves as "schema". Computed by scanning the plane.
+    pub fn catalog(&self) -> Result<CatalogSnapshot> {
+        self.db
+            .engine
+            .with_read(|txn| catalog::compute(txn, self.id))
     }
 
     /// Starts a query in this plane (arch/03, arch/04 §3). Defaults to

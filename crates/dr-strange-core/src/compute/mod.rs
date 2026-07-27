@@ -12,10 +12,12 @@
 //! Design commitment: hybrid search is an executor capability — one plan,
 //! one snapshot — never API-level aggregation (arch/03 §4).
 
+pub mod catalog;
 pub mod exec;
 pub mod expr;
 pub mod plan;
 
+pub use catalog::{CatalogSnapshot, EdgeTypeStats, LabelStats, PropStats, ValueType};
 pub use exec::Row;
 pub use expr::{Expr, distance, has_label, hops, lit, p, score, similarity};
 pub use plan::{LogicalPlan, SortKey, Source, Step};
