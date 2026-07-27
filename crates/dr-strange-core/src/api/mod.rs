@@ -143,6 +143,11 @@ impl Database {
         self.engine.with_write(|txn| graph::drop_plane(txn, id))
     }
 
+    /// Every plane as `(id, name)`, ascending by id (arch/04 §1).
+    pub fn planes(&self) -> Result<Vec<(PlaneId, String)>> {
+        self.engine.with_read(|txn| graph::list_planes(txn))
+    }
+
     /// The soft-schema catalog rolled up across every plane (arch/03 §5).
     pub fn catalog(&self) -> Result<CatalogSnapshot> {
         self.engine.with_read(|txn| {
@@ -231,6 +236,13 @@ impl<'db> PlaneHandle<'db> {
             plane: *self,
             plan: LogicalPlan::new(Source::ScanAll),
         }
+    }
+
+    /// A query from an already-built (e.g. deserialized) [`LogicalPlan`] —
+    /// the entry point for running a plan received over the wire or from the
+    /// CLI's `query` command. Terminals work as usual.
+    pub fn query_from_plan(&self, plan: LogicalPlan) -> QueryBuilder<'db> {
+        QueryBuilder { plane: *self, plan }
     }
 
     /// Declares (and builds) a vector index on `(label, property)` with

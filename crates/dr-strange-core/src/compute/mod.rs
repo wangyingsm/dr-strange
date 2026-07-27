@@ -17,7 +17,7 @@ pub mod exec;
 pub mod expr;
 pub mod plan;
 
-pub use catalog::{CatalogSnapshot, EdgeTypeStats, LabelStats, PropStats, ValueType};
+pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};
 pub use exec::Row;
 pub use expr::{Expr, distance, has_label, hops, lit, p, score, similarity};
 pub use plan::{LogicalPlan, SortKey, Source, Step};

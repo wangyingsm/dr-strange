@@ -18,8 +18,8 @@ pub mod types;
 
 pub use api::{Database, PlaneHandle, QueryBuilder, WriteTxn};
 pub use compute::{
-    CatalogSnapshot, EdgeTypeStats, Expr, LabelStats, LogicalPlan, PropStats, Row, SortKey, Source,
-    Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
+    CatalogSnapshot, Connection, EdgeTypeStats, Expr, LabelStats, LogicalPlan, PropStats, Row,
+    SortKey, Source, Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
 pub use storage::vector::Metric;

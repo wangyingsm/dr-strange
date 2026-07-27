@@ -73,10 +73,7 @@ fn catalog_describes_labels_properties_types_and_descriptions() {
     // edge-type connectivity: AUTHORED links Person -> Paper, twice
     let authored = &cat.edge_types["AUTHORED"];
     assert_eq!(authored.count, 2);
-    assert_eq!(
-        authored.connections[&("Person".to_string(), "Paper".to_string())],
-        2
-    );
+    assert_eq!(authored.connection("Person", "Paper"), 2);
 }
 
 #[test]

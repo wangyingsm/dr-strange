@@ -68,14 +68,55 @@ pub struct LabelStats {
     pub properties: BTreeMap<String, PropStats>,
 }
 
+/// One `src_label → dst_label` link observed for an edge type, with its
+/// frequency.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Connection {
+    pub src_label: String,
+    pub dst_label: String,
+    pub count: u64,
+}
+
 /// Observed shape of one edge type.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EdgeTypeStats {
     pub count: u64,
     /// Which `(src_label, dst_label)` pairs this edge type actually links,
-    /// and how often — the connectivity map (arch/03 §5). A multi-label
-    /// endpoint contributes every combination.
-    pub connections: BTreeMap<(String, String), u64>,
+    /// and how often — the connectivity list (arch/03 §5). A multi-label
+    /// endpoint contributes every combination. A `Vec` (not a tuple-keyed
+    /// map) so it serializes cleanly to JSON, which MCP serves.
+    pub connections: Vec<Connection>,
+}
+
+impl EdgeTypeStats {
+    /// Increments the `src → dst` connection count by `by`, inserting it if
+    /// new. Keeps `connections` sorted for deterministic output.
+    fn add_connection(&mut self, src: &str, dst: &str, by: u64) {
+        match self
+            .connections
+            .iter_mut()
+            .find(|c| c.src_label == src && c.dst_label == dst)
+        {
+            Some(c) => c.count += by,
+            None => {
+                self.connections.push(Connection {
+                    src_label: src.to_string(),
+                    dst_label: dst.to_string(),
+                    count: by,
+                });
+                self.connections.sort();
+            }
+        }
+    }
+
+    /// The observed count of `src → dst` links (0 if never seen).
+    pub fn connection(&self, src: &str, dst: &str) -> u64 {
+        self.connections
+            .iter()
+            .find(|c| c.src_label == src && c.dst_label == dst)
+            .map(|c| c.count)
+            .unwrap_or(0)
+    }
 }
 
 /// A plane's (or the whole database's, rolled up) descriptive schema.
@@ -105,7 +146,9 @@ impl CatalogSnapshot {
         for (ty, stats) in &other.edge_types {
             let dst = self.edge_types.entry(ty.clone()).or_default();
             dst.count += stats.count;
-            merge_counts(&mut dst.connections, &stats.connections);
+            for c in &stats.connections {
+                dst.add_connection(&c.src_label, &c.dst_label, c.count);
+            }
         }
     }
 }
@@ -144,8 +187,6 @@ pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnaps
             continue;
         };
         cat.edge_count += 1;
-        let ets = cat.edge_types.entry(edge.ty.clone()).or_default();
-        ets.count += 1;
         // Record every (src_label, dst_label) combination this edge links.
         let src_labels = graph::get_node(txn, plane, edge.src)?
             .map(|n| n.labels)
@@ -153,9 +194,11 @@ pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnaps
         let dst_labels = graph::get_node(txn, plane, edge.dst)?
             .map(|n| n.labels)
             .unwrap_or_default();
+        let ets = cat.edge_types.entry(edge.ty.clone()).or_default();
+        ets.count += 1;
         for sl in &src_labels {
             for dl in &dst_labels {
-                *ets.connections.entry((sl.clone(), dl.clone())).or_default() += 1;
+                ets.add_connection(sl, dl, 1);
             }
         }
     }
@@ -197,7 +240,7 @@ mod tests {
             *ps.descriptions.entry("d".into()).or_default() += 1;
             let ets = c.edge_types.entry(ty.into()).or_default();
             ets.count = 1;
-            *ets.connections.entry((sl.into(), dl.into())).or_default() += 1;
+            ets.add_connection(sl, dl, 1);
             c
         };
 
@@ -210,10 +253,7 @@ mod tests {
         assert_eq!(a.labels["L"].properties["p"].types[&ValueType::Int], 2);
         assert_eq!(a.labels["L"].properties["p"].descriptions["d"], 2);
         assert_eq!(a.edge_types["T"].count, 2);
-        assert_eq!(
-            a.edge_types["T"].connections[&("A".to_string(), "B".to_string())],
-            2
-        );
+        assert_eq!(a.edge_types["T"].connection("A", "B"), 2);
 
         // distinct keys accumulate independently
         a.merge(&one("U", "C", "D"));
