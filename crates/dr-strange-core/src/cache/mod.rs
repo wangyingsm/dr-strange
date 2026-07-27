@@ -17,8 +17,10 @@
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::index::VectorRegistry;
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
+use crate::storage::vector::{Hit, Metric, top_k};
 use crate::types::{Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId};
 
 /// Monotonic commit sequence number — the version-stamping and invalidation
@@ -45,6 +47,52 @@ pub trait GraphReader {
     fn scan_label(&self, label: &str) -> Result<Vec<NodeId>>;
     /// Resolve a caller-supplied external key to a node id (`SeekKeys`).
     fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>>;
+
+    /// Global similarity search for `VectorTopK`: the `k` nodes (optionally
+    /// restricted to `label`) closest to `query` by their `property` vector,
+    /// as `(id, distance)`. Uses a declared HNSW index when one matches;
+    /// otherwise exact brute force. The default is the brute-force path.
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        metric: Metric,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
+        brute_force_search(self, label, property, query, metric, k)
+    }
+}
+
+/// Exact similarity search by scanning candidate records — the fallback when
+/// no index is declared, and the oracle the index must match. Skips nodes
+/// without the vector property and dimension mismatches (non-finite
+/// distance), matching the evaluator's total semantics (arch/01 §5).
+fn brute_force_search<R: GraphReader + ?Sized>(
+    reader: &R,
+    label: Option<&str>,
+    property: &str,
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+) -> Result<Vec<Hit>> {
+    let candidates = match label {
+        Some(l) => reader.scan_label(l)?,
+        None => reader.scan_all()?,
+    };
+    let mut items: Vec<(u64, f32)> = Vec::new();
+    for id in candidates {
+        if let Some(node) = reader.node(id)?
+            && let Some(crate::types::PropValue::Vector(v)) =
+                node.properties.get(property).map(|p| &p.value)
+        {
+            let d = metric.distance(query, v);
+            if d.is_finite() {
+                items.push((id.0, d));
+            }
+        }
+    }
+    Ok(top_k(items.into_iter(), k))
 }
 
 /// Pass-through `GraphReader` over a storage read transaction (arch/02 §2).
@@ -54,11 +102,31 @@ pub trait GraphReader {
 pub struct UncachedReader<'a> {
     txn: &'a dyn ReadTransaction,
     plane: PlaneId,
+    /// Declared vector indexes (a read-locked view for the query's lifetime).
+    /// `None` ⇒ every vector search takes the exact brute-force path.
+    registry: Option<&'a VectorRegistry>,
 }
 
 impl<'a> UncachedReader<'a> {
     pub fn new(txn: &'a dyn ReadTransaction, plane: PlaneId) -> Self {
-        Self { txn, plane }
+        Self {
+            txn,
+            plane,
+            registry: None,
+        }
+    }
+
+    /// With access to declared indexes, so `vector_search` can use them.
+    pub fn with_registry(
+        txn: &'a dyn ReadTransaction,
+        plane: PlaneId,
+        registry: &'a VectorRegistry,
+    ) -> Self {
+        Self {
+            txn,
+            plane,
+            registry: Some(registry),
+        }
     }
 }
 
@@ -89,6 +157,26 @@ impl GraphReader for UncachedReader<'_> {
 
     fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>> {
         graph::node_id_by_external_key(self.txn, self.plane, key)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        metric: Metric,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
+        // Use the declared index when it covers this exact (label, property,
+        // metric); otherwise fall back to exact brute force. A `None` label
+        // means "whole plane", which per-label indexes can't answer, so that
+        // also brute-forces.
+        if let (Some(reg), Some(l)) = (self.registry, label)
+            && let Some(result) = reg.search(self.plane, l, property, query, metric, k)
+        {
+            return result;
+        }
+        brute_force_search(self, label, property, query, metric, k)
     }
 }
 

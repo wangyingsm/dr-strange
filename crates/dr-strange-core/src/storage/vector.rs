@@ -66,6 +66,24 @@ impl Metric {
             Metric::Dot | Metric::L2 => -distance,
         }
     }
+
+    /// One-byte tag for storing a metric in the KV (index declarations).
+    pub fn tag(self) -> u8 {
+        match self {
+            Metric::Cosine => 0,
+            Metric::Dot => 1,
+            Metric::L2 => 2,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Metric> {
+        match tag {
+            0 => Some(Metric::Cosine),
+            1 => Some(Metric::Dot),
+            2 => Some(Metric::L2),
+            _ => None,
+        }
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

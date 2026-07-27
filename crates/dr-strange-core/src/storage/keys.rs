@@ -20,6 +20,44 @@ pub const META_NEXT_PLANE_ID: &[u8] = b"next_plane_id";
 pub const META_NEXT_LABEL_ID: &[u8] = b"next_label_id";
 pub const META_NEXT_EDGE_TYPE_ID: &[u8] = b"next_edge_type_id";
 
+/// Vector-index declarations live in `meta`, keyed
+/// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag.
+/// The `\0` separates the two variable-length names unambiguously (labels
+/// and property keys can't contain a NUL in practice).
+pub const VINDEX_PREFIX: &[u8] = b"vidx:";
+
+pub fn vindex_decl_key(plane: PlaneId, label: &str, property: &str) -> Vec<u8> {
+    let mut k = VINDEX_PREFIX.to_vec();
+    k.extend_from_slice(&plane.0.to_be_bytes());
+    k.extend_from_slice(label.as_bytes());
+    k.push(0);
+    k.extend_from_slice(property.as_bytes());
+    k
+}
+
+/// Parses a `vidx:` declaration key back into `(plane, label, property)`.
+pub fn parse_vindex_decl_key(key: &[u8]) -> Result<(PlaneId, String, String)> {
+    let rest = key
+        .strip_prefix(VINDEX_PREFIX)
+        .ok_or_else(|| Error::Corrupt("vindex key missing prefix".into()))?;
+    if rest.len() < 4 {
+        return Err(Error::Corrupt("vindex key too short".into()));
+    }
+    let plane = PlaneId(u32::from_be_bytes(
+        rest[..4].try_into().expect("checked length"),
+    ));
+    let tail = &rest[4..];
+    let sep = tail
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| Error::Corrupt("vindex key missing separator".into()))?;
+    let label = String::from_utf8(tail[..sep].to_vec())
+        .map_err(|_| Error::Corrupt("bad vindex label".into()))?;
+    let property = String::from_utf8(tail[sep + 1..].to_vec())
+        .map_err(|_| Error::Corrupt("bad vindex property".into()))?;
+    Ok((plane, label, property))
+}
+
 /// Dictionary entries live in `meta` too: forward `name → u32` and reverse
 /// `u32 → name`, per kind (label / edge type).
 pub fn dict_label_key(name: &str) -> Vec<u8> {

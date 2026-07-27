@@ -121,22 +121,29 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
             metric,
             k,
         } => {
-            // Exact (record-backed) global similarity search: score every
-            // candidate with the vector property, keep top-k, seed the score
-            // channel. The declared HNSW index accelerates this later.
-            let candidates = match label {
-                Some(l) => reader.scan_label(l)?,
-                None => reader.scan_all()?,
-            };
-            return vector_top_k_rows(reader, &candidates, property, query, *metric, *k as usize);
+            // Global similarity search — index-accelerated when a matching
+            // index is declared, exact brute force otherwise. The reader
+            // decides (arch/01 §5); either way the result is `(id, distance)`.
+            let hits =
+                reader.vector_search(label.as_deref(), property, query, *metric, *k as usize)?;
+            return Ok(hits
+                .into_iter()
+                .map(|hit| {
+                    Row::scored(
+                        NodeId(hit.id),
+                        metric.similarity_from_distance(hit.distance),
+                    )
+                })
+                .collect());
         }
     };
     Ok(ids.into_iter().map(Row::start).collect())
 }
 
-/// Score `candidates` by similarity of their `property` vector to `query`,
-/// returning the top-`k` as scored rows (descending similarity). Shared by
-/// the `VectorTopK` source and the `FrontierTopK` step.
+/// Score `candidates` (a graph frontier) by similarity of their `property`
+/// vector to `query`, returning the top-`k` as scored rows. Used by
+/// `FrontierTopK` — always exact over the (usually small) frontier, matching
+/// arch/03 §4.3's "small frontier ⇒ brute force" guidance.
 fn vector_top_k_rows(
     reader: &dyn GraphReader,
     candidates: &[NodeId],

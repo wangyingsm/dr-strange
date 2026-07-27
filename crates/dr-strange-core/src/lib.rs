@@ -12,6 +12,7 @@ pub mod api;
 pub mod cache;
 pub mod compute;
 pub mod error;
+pub mod index;
 pub mod storage;
 pub mod types;
 

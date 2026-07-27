@@ -11,6 +11,7 @@
 
 use crate::error::{Error, Result};
 use crate::storage::engine::{ReadTransaction, TableId, WriteTransaction, prefix_successor};
+use crate::storage::vector::Metric;
 use crate::storage::{codec, keys};
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, Properties,
@@ -335,6 +336,73 @@ pub fn drop_plane(txn: &mut dyn WriteTransaction, id: PlaneId) -> Result<()> {
     txn.delete(TableId::Planes, &keys::plane_key(id))?;
     txn.delete(TableId::PlaneNames, &keys::plane_name_key(&name))?;
     Ok(())
+}
+
+// ---- vector index declarations (arch/01 §5) -------------------------------
+// Only the *declaration* (which (plane,label,property) is indexed, and its
+// metric) is durable, in `meta`. The index structure itself is rebuilt from
+// the KV — the KV is the source of truth (see `crate::index`).
+
+/// Records that `(plane, label, property)` is vector-indexed with `metric`.
+/// Returns whether this was a new declaration. Errors if it already exists
+/// with a different metric.
+pub fn declare_vector_index(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    label: &str,
+    property: &str,
+    metric: Metric,
+) -> Result<bool> {
+    let key = keys::vindex_decl_key(plane, label, property);
+    if let Some(existing) = txn.get(TableId::Meta, &key)? {
+        let current = existing
+            .first()
+            .and_then(|&t| Metric::from_tag(t))
+            .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
+        if current != metric {
+            return Err(Error::InvalidArgument(format!(
+                "vector index on {label}.{property} already exists with a different metric"
+            )));
+        }
+        return Ok(false);
+    }
+    txn.put(TableId::Meta, &key, &[metric.tag()])?;
+    Ok(true)
+}
+
+/// All declared vector indexes, `(plane, label, property, metric)`.
+pub fn list_vector_indexes(
+    txn: &dyn ReadTransaction,
+) -> Result<Vec<(PlaneId, String, String, Metric)>> {
+    let prefix = keys::VINDEX_PREFIX;
+    let end = prefix_successor(prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::Meta, prefix, end.as_deref())? {
+        let (key, value) = item?;
+        let (plane, label, property) = keys::parse_vindex_decl_key(&key)?;
+        let metric = value
+            .first()
+            .and_then(|&t| Metric::from_tag(t))
+            .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
+        out.push((plane, label, property, metric));
+    }
+    Ok(out)
+}
+
+/// Reads a node's `property` as a vector, or `None` if absent / not a vector.
+pub fn node_vector(
+    txn: &dyn ReadTransaction,
+    plane: PlaneId,
+    id: NodeId,
+    property: &str,
+) -> Result<Option<Vec<f32>>> {
+    let Some(node) = get_node(txn, plane, id)? else {
+        return Ok(None);
+    };
+    Ok(match node.properties.get(property).map(|p| &p.value) {
+        Some(crate::types::PropValue::Vector(v)) => Some(v.clone()),
+        _ => None,
+    })
 }
 
 // ---- nodes ----------------------------------------------------------------

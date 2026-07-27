@@ -10,12 +10,14 @@
 //! reader lifecycles.
 
 use std::path::Path;
+use std::sync::RwLock;
 
 use crate::cache::{GraphReader, UncachedReader};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
+use crate::index::VectorRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
@@ -63,6 +65,10 @@ impl Engine {
 /// on stable snapshots; writes serialize on the backend's single writer.
 pub struct Database {
     engine: Engine,
+    /// In-memory vector indexes (arch/01 §5). Rebuilt from the KV on open;
+    /// read-locked during queries, write-locked at commit to apply the
+    /// coherence events a write transaction buffered.
+    indexes: RwLock<VectorRegistry>,
 }
 
 impl std::fmt::Debug for Database {
@@ -90,7 +96,25 @@ impl Database {
 
     fn init(engine: Engine) -> Result<Self> {
         engine.with_write(|txn| graph::init(txn))?;
-        Ok(Self { engine })
+        // Rebuild declared vector indexes from the KV (arch/01 §5).
+        let mut registry = VectorRegistry::new();
+        engine.with_read(|txn| registry.rebuild_from(txn))?;
+        Ok(Self {
+            engine,
+            indexes: RwLock::new(registry),
+        })
+    }
+
+    fn indexes(&self) -> std::sync::RwLockReadGuard<'_, VectorRegistry> {
+        self.indexes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn indexes_mut(&self) -> std::sync::RwLockWriteGuard<'_, VectorRegistry> {
+        self.indexes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Looks up an existing plane by name. The `"startup"` plane always exists.
@@ -188,6 +212,23 @@ impl<'db> PlaneHandle<'db> {
         }
     }
 
+    /// Declares (and builds) a vector index on `(label, property)` with
+    /// `metric` (arch/01 §5). Idempotent; errors if an index already exists
+    /// on the same pair with a different metric. Existing matching nodes are
+    /// indexed immediately, and later writes keep it coherent.
+    pub fn ensure_vector_index(&self, label: &str, property: &str, metric: Metric) -> Result<()> {
+        let plane = self.id;
+        self.db.engine.with_write(|txn| {
+            graph::declare_vector_index(txn, plane, label, property, metric).map(|_| ())
+        })?;
+        // Build the in-memory index from committed data.
+        self.db.engine.with_read(|txn| {
+            self.db
+                .indexes_mut()
+                .build_entry(txn, plane, label, property, metric)
+        })
+    }
+
     /// Starts a write transaction scoped to this plane. Blocks while another
     /// write transaction is open (single writer, arch/01 §6).
     pub fn write(&self) -> Result<WriteTxn<'db>> {
@@ -195,10 +236,16 @@ impl<'db> PlaneHandle<'db> {
             Engine::Memory(e) => TxnInner::Memory(Box::new(e.begin_write()?)),
             Engine::Redb(e) => TxnInner::Redb(Box::new(e.begin_write()?)),
         };
+        // Snapshot this plane's declared indexes so mutations can mirror into
+        // them at commit without re-locking per operation.
+        let decls = self.db.indexes().declared(self.id);
         Ok(WriteTxn {
+            db: self.db,
             plane: self.id,
             inner,
             ids: IdAllocator::new(),
+            decls,
+            events: Vec::new(),
         })
     }
 }
@@ -210,14 +257,37 @@ enum TxnInner<'db> {
     Redb(Box<RedbWriteTxn>),
 }
 
+/// A vector-index coherence event, buffered during a write and applied to the
+/// registry at commit (never on abort — mirroring the KV's own semantics).
+enum IndexEvent {
+    Upsert {
+        label: String,
+        property: String,
+        node: NodeId,
+        vector: Vec<f32>,
+    },
+    Remove {
+        label: String,
+        property: String,
+        node: NodeId,
+    },
+    RemoveNode(NodeId),
+}
+
 /// A plane-scoped write transaction. Dropped without [`commit`](Self::commit)
 /// ⇒ all changes discarded.
 pub struct WriteTxn<'db> {
+    db: &'db Database,
     plane: PlaneId,
     inner: TxnInner<'db>,
     /// Batched node/edge id allocator (arch/01 §2 TODO) — see
     /// `graph::IdAllocator` for the abort/commit-safety argument.
     ids: IdAllocator,
+    /// This plane's declared indexes, snapshotted at `write()` (see
+    /// `record_node_events`).
+    decls: Vec<(String, String, Metric)>,
+    /// Buffered coherence events, applied to the registry at commit.
+    events: Vec<IndexEvent>,
 }
 
 impl WriteTxn<'_> {
@@ -243,11 +313,37 @@ impl WriteTxn<'_> {
         (txn, ids)
     }
 
+    /// Buffers index events for a node given its labels and property map: an
+    /// `Upsert` where a declared index's property is present as a vector, a
+    /// `Remove` where it is absent or non-vector. No-op unless some index is
+    /// declared for one of the node's labels.
+    fn record_node_events(&mut self, node: NodeId, labels: &[&str], props: &Properties) {
+        for (label, property, _metric) in &self.decls {
+            if !labels.iter().any(|l| l == label) {
+                continue;
+            }
+            match props.get(property).map(|p| &p.value) {
+                Some(PropValue::Vector(v)) => self.events.push(IndexEvent::Upsert {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                    vector: v.clone(),
+                }),
+                _ => self.events.push(IndexEvent::Remove {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                }),
+            }
+        }
+    }
+
     pub fn create_node(&mut self, labels: &[&str], props: Properties) -> Result<NodeId> {
         let plane = self.plane;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, None, labels, &props)?;
+        self.record_node_events(id, labels, &props);
         Ok(id)
     }
 
@@ -264,6 +360,7 @@ impl WriteTxn<'_> {
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
+        self.record_node_events(id, labels, &props);
         Ok(id)
     }
 
@@ -287,7 +384,9 @@ impl WriteTxn<'_> {
     /// (arch/01 §2). Idempotent: deleting an absent node is `Ok(())`.
     pub fn delete_node(&mut self, id: NodeId) -> Result<()> {
         let plane = self.plane;
-        graph::delete_node(self.txn(), plane, id)
+        graph::delete_node(self.txn(), plane, id)?;
+        self.events.push(IndexEvent::RemoveNode(id));
+        Ok(())
     }
 
     /// Deletes an edge and both of its adjacency entries. Idempotent.
@@ -300,14 +399,56 @@ impl WriteTxn<'_> {
     /// Errors with `NotFound` if the node does not exist.
     pub fn set_prop(&mut self, id: NodeId, key: &str, prop: PropDesc) -> Result<()> {
         let plane = self.plane;
-        graph::set_node_prop(self.txn(), plane, id, key, prop)
+        let value = prop.value.clone();
+        graph::set_node_prop(self.txn(), plane, id, key, prop)?;
+        self.record_prop_event(id, key, Some(value))
     }
 
     /// Removes one property from an existing node; removing an absent key
     /// is not an error (soft schema — arch/01 §4).
     pub fn remove_prop(&mut self, id: NodeId, key: &str) -> Result<()> {
         let plane = self.plane;
-        graph::remove_node_prop(self.txn(), plane, id, key)
+        graph::remove_node_prop(self.txn(), plane, id, key)?;
+        self.record_prop_event(id, key, None)
+    }
+
+    /// Buffers index events for a single-property change on `node`: an
+    /// `Upsert` if the new value is a vector on an indexed `(label, key)`, a
+    /// `Remove` otherwise. Cheap no-op unless some declared index names `key`.
+    fn record_prop_event(
+        &mut self,
+        node: NodeId,
+        key: &str,
+        new_value: Option<PropValue>,
+    ) -> Result<()> {
+        if !self.decls.iter().any(|(_, prop, _)| prop == key) {
+            return Ok(());
+        }
+        let plane = self.plane;
+        let labels = match graph::get_node(self.txn(), plane, node)? {
+            Some(n) => n.labels,
+            None => return Ok(()), // node gone; nothing to mirror
+        };
+        let mut new_events = Vec::new();
+        for (label, property, _metric) in &self.decls {
+            if property == key && labels.iter().any(|l| l == label) {
+                new_events.push(match &new_value {
+                    Some(PropValue::Vector(v)) => IndexEvent::Upsert {
+                        label: label.clone(),
+                        property: property.clone(),
+                        node,
+                        vector: v.clone(),
+                    },
+                    _ => IndexEvent::Remove {
+                        label: label.clone(),
+                        property: property.clone(),
+                        node,
+                    },
+                });
+            }
+        }
+        self.events.extend(new_events);
+        Ok(())
     }
 
     /// Sets (inserts or overwrites) one property on an existing edge.
@@ -325,10 +466,48 @@ impl WriteTxn<'_> {
     }
 
     pub fn commit(self) -> Result<()> {
-        match self.inner {
-            TxnInner::Memory(t) => (*t).commit(),
-            TxnInner::Redb(t) => (*t).commit(),
+        let WriteTxn {
+            db,
+            plane,
+            inner,
+            events,
+            ..
+        } = self;
+        // Commit the KV first; only then mirror into the in-memory indexes.
+        // If applying events somehow failed, the KV is still the source of
+        // truth and rebuild-from-KV on next open restores coherence.
+        match inner {
+            TxnInner::Memory(t) => (*t).commit()?,
+            TxnInner::Redb(t) => (*t).commit()?,
         }
+        if !events.is_empty() {
+            let mut registry = db.indexes_mut();
+            for event in events {
+                apply_index_event(&mut registry, plane, event)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn apply_index_event(
+    registry: &mut VectorRegistry,
+    plane: PlaneId,
+    event: IndexEvent,
+) -> Result<()> {
+    match event {
+        IndexEvent::Upsert {
+            label,
+            property,
+            node,
+            vector,
+        } => registry.upsert(plane, &label, &property, node, &vector),
+        IndexEvent::Remove {
+            label,
+            property,
+            node,
+        } => registry.remove_one(plane, &label, &property, node),
+        IndexEvent::RemoveNode(node) => registry.remove_node(node),
     }
 }
 
@@ -539,8 +718,11 @@ impl<'db> QueryBuilder<'db> {
     // ---- terminals (execute) ---------------------------------------------
 
     fn with_reader<T>(&self, f: impl FnOnce(&UncachedReader) -> Result<T>) -> Result<T> {
+        // Hold a read lock on the index registry for the query's lifetime so
+        // `VectorTopK` can consult declared indexes (arch/01 §5).
+        let registry = self.plane.db.indexes();
         self.plane.db.engine.with_read(|txn| {
-            let reader = UncachedReader::new(txn, self.plane.id());
+            let reader = UncachedReader::with_registry(txn, self.plane.id(), &registry);
             f(&reader)
         })
     }
