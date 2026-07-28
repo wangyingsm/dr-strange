@@ -5,8 +5,8 @@
 //!
 //! The core is synchronous; each tool runs its database work on a blocking
 //! task so a long scan never stalls the async runtime. The `digest` tool
-//! (LLM ingestion) is intentionally absent pending its own design session
-//! (arch/06, arch/07).
+//! (LLM ingestion, arch/07) reads provider API keys from the server's
+//! environment, never from params.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +48,37 @@ struct GetNode {
     id: Option<u64>,
     /// External key (mutually exclusive with `id`).
     key: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Digest {
+    /// The document text to digest into a graph.
+    text: String,
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Write the result. Default `false` — a dry-run that returns the proposed
+    /// nodes/edges for inspection (arch/07 §2: proposals, not mutations).
+    #[serde(default)]
+    apply: bool,
+    /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or a base
+    /// URL. API keys are read from the server's environment, never params.
+    #[serde(default)]
+    chat: Option<String>,
+    /// Embedding provider preset or base URL (defaults to the chat provider).
+    #[serde(default)]
+    embed: Option<String>,
+    /// Chat model override.
+    #[serde(default)]
+    model: Option<String>,
+    /// Embedding model override.
+    #[serde(default)]
+    embed_model: Option<String>,
+    /// Provenance: what the document is (recorded on every node/edge).
+    #[serde(default)]
+    source: Option<String>,
+    /// Skip embedding generation.
+    #[serde(default)]
+    no_embed: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -322,6 +353,90 @@ fn drop_plane_logic(db: &Database, req: DropPlane) -> AnyResult<Value> {
     Ok(jval!({ "dropped": req.name }))
 }
 
+fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let chat_provider = req.chat.as_deref().unwrap_or("openai");
+    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let embed = !req.no_embed;
+
+    // Provider keys come from the server's environment (never tool params).
+    let chat =
+        dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)?;
+    let chat_model = chat.model().to_string();
+    let embedder = dr_strange_llm::build_provider(
+        embed_provider,
+        req.embed_model.as_deref(),
+        None,
+        None,
+        embed,
+    )?;
+
+    let p = db.plane(&req.plane)?;
+    let catalog = p.catalog()?;
+    let run_id = format!(
+        "mcp-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let opts = dr_strange_llm::DigestOptions {
+        source: req.source.unwrap_or_else(|| "mcp-digest".into()),
+        model: chat_model,
+        run_id,
+        chunk_chars: 4000,
+        embed,
+    };
+
+    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)?;
+    let r = &result.report;
+    let mut out = jval!({
+        "applied": req.apply,
+        "report": {
+            "chunks": r.chunks,
+            "entities": r.entities,
+            "relations": r.relations,
+            "dropped_relations": r.dropped_relations,
+            "chat_requests": r.chat_requests,
+            "input_tokens": r.input_tokens,
+            "output_tokens": r.output_tokens,
+            "embed_tokens": r.embed_tokens,
+        },
+    });
+
+    if req.apply {
+        let mut txn = p.write()?;
+        let stats = result.apply(&mut txn)?;
+        txn.commit()?;
+        out["nodes_written"] = jval!(stats.nodes);
+        out["edges_written"] = jval!(stats.edges);
+    } else {
+        // Dry-run: return the proposed graph (capped) so the agent can inspect
+        // before a second call with apply=true.
+        let nodes: Vec<Value> = result
+            .nodes
+            .iter()
+            .take(50)
+            .map(|n| {
+                jval!({
+                    "key": n.key,
+                    "label": n.label,
+                    "properties": json::properties_to_json(&n.props),
+                })
+            })
+            .collect();
+        let edges: Vec<Value> = result
+            .edges
+            .iter()
+            .take(100)
+            .map(|e| jval!({ "src": e.src, "type": e.ty, "dst": e.dst }))
+            .collect();
+        out["proposal"] = jval!({ "nodes": nodes, "edges": edges });
+    }
+    Ok(out)
+}
+
 // ---- tools (rmcp wrappers) ------------------------------------------------
 
 #[tool_router(router = tool_router)]
@@ -411,6 +526,21 @@ impl DrStrange {
             )));
         }
         self.blocking(move |db| drop_plane_logic(db, req)).await
+    }
+
+    #[tool(
+        description = "Digest a document into the plane's graph via an LLM: extract typed \
+        entities + relations (grounded on the plane's soft-schema catalog), embed them, and — \
+        only when apply=true — write them with provenance. Dry-run (the default) returns the \
+        proposed nodes/edges for review; call again with apply=true to commit. Provider API keys \
+        come from the server's environment (e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / \
+        DASHSCOPE_API_KEY), never from params."
+    )]
+    async fn digest(
+        &self,
+        Parameters(req): Parameters<Digest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking(move |db| digest_logic(db, req)).await
     }
 }
 

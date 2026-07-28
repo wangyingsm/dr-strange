@@ -606,6 +606,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dr-strange-core",
+ "dr-strange-llm",
  "rmcp",
  "schemars",
  "serde",

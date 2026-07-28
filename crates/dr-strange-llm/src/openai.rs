@@ -8,10 +8,45 @@
 //! from different providers (e.g. DeepSeek chat + Qwen embeddings): build two
 //! instances and pass each to the role it serves.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+use crate::preset::preset;
 use crate::provider::{Chat, ChatReply, EmbedReply, Embedder};
+
+/// Build an [`OpenAiProvider`] from a provider name (a [`preset`] or a raw base
+/// URL) plus optional overrides, reading the API key from the environment. The
+/// one place CLI and MCP resolve provider config the same way. `embed` selects
+/// the embedding vs chat default model and, when true, requires a model.
+pub fn build_provider(
+    provider: &str,
+    model: Option<&str>,
+    url: Option<&str>,
+    key_env: Option<&str>,
+    embed: bool,
+) -> Result<OpenAiProvider> {
+    let p = preset(provider);
+    let base = url
+        .map(str::to_string)
+        .or_else(|| p.map(|p| p.base_url.to_string()))
+        .ok_or_else(|| anyhow!("unknown provider '{provider}'; give a base URL instead"))?;
+    let key_env = key_env.or_else(|| p.map(|p| p.key_env)).unwrap_or("");
+    let key = if key_env.is_empty() {
+        String::new()
+    } else {
+        std::env::var(key_env).unwrap_or_default()
+    };
+    let model = model
+        .or_else(|| p.map(|p| if embed { p.embed_model } else { p.chat_model }))
+        .unwrap_or("");
+    if embed && model.is_empty() {
+        bail!(
+            "provider '{provider}' has no embedding model — use qwen/openai/ollama, set an embed model, or disable embedding"
+        );
+    }
+    let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
+    Ok(OpenAiProvider::new(base, key, model).with_embed_batch(batch))
+}
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -40,6 +75,11 @@ impl OpenAiProvider {
     pub fn with_embed_batch(mut self, n: usize) -> Self {
         self.embed_batch = n.max(1);
         self
+    }
+
+    /// The model this instance uses (for provenance).
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {

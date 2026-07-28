@@ -182,38 +182,6 @@ pub struct DigestArgs<'a> {
     pub embed_key_env: Option<&'a str>,
 }
 
-/// Resolves a provider's base URL / key / model / embed-batch from a preset
-/// name (or raw base URL) plus optional overrides.
-#[cfg(feature = "digest")]
-fn resolve_provider(
-    name: &str,
-    url: Option<&str>,
-    model: Option<&str>,
-    key_env: Option<&str>,
-    embed: bool,
-) -> Result<(String, String, String, usize)> {
-    let p = dr_strange_llm::preset(name);
-    let base = url
-        .map(str::to_string)
-        .or_else(|| p.map(|p| p.base_url.to_string()))
-        .ok_or_else(|| {
-            anyhow!("unknown provider '{name}'; pass a base URL via --chat-url/--embed-url")
-        })?;
-    let key_env = key_env.or_else(|| p.map(|p| p.key_env)).unwrap_or("");
-    let key = if key_env.is_empty() {
-        String::new()
-    } else {
-        std::env::var(key_env).unwrap_or_default()
-    };
-    let default_model = p.map(|p| if embed { p.embed_model } else { p.chat_model });
-    let model = model
-        .or(default_model)
-        .map(str::to_string)
-        .unwrap_or_default();
-    let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
-    Ok((base, key, model, batch))
-}
-
 /// Digests a document into the plane: an LLM extracts entities/relations
 /// (grounded on the plane's catalog), they're embedded and stamped with
 /// provenance, and — only with `apply` — written through the bulk path.
@@ -230,30 +198,21 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| args.file.display().to_string());
 
-    let (cb, ck, chat_model, _) = resolve_provider(
+    let chat = dr_strange_llm::build_provider(
         args.chat_provider,
-        args.chat_url,
         args.model,
+        args.chat_url,
         args.chat_key_env,
         false,
     )?;
-    let chat = dr_strange_llm::OpenAiProvider::new(cb, ck, &chat_model);
-
-    let (eb, ek, embed_model, ebatch) = resolve_provider(
+    let chat_model = chat.model().to_string();
+    let embedder = dr_strange_llm::build_provider(
         args.embed_provider,
-        args.embed_url,
         args.embed_model,
+        args.embed_url,
         args.embed_key_env,
-        true,
+        args.embed,
     )?;
-    if args.embed && embed_model.is_empty() {
-        bail!(
-            "embed provider '{}' has no embedding model — use --embed qwen|openai|ollama, --embed-model, or --no-embed",
-            args.embed_provider
-        );
-    }
-    let embedder =
-        dr_strange_llm::OpenAiProvider::new(eb, ek, embed_model).with_embed_batch(ebatch);
 
     let p = plane(db, args.plane)?;
     let catalog = p.catalog()?;
