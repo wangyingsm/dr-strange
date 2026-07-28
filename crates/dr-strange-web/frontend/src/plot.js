@@ -30,6 +30,10 @@ export class Plot {
       renderEdgeLabels: true,
       labelDensity: 0.5,
       labelRenderedSizeThreshold: 5,
+      // Edge picking reads a downsized framebuffer, so a thin edge has no
+      // clickable pixels and the hit falls through to the stage. Give edges a
+      // floor thickness so they can actually be selected/hovered.
+      minEdgeThickness: 3.5,
     })
     this.sigma.on('clickNode', ({ node }) =>
       handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record')),
@@ -80,7 +84,7 @@ export class Plot {
       if (this.graph.hasNode(String(e.src)) && this.graph.hasNode(String(e.dst))) {
         this.graph.addEdgeWithKey(key, String(e.src), String(e.dst), {
           label: e.type,
-          size: 1.5,
+          size: 4,
           record: e,
         })
       }
