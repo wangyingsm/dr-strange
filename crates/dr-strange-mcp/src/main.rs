@@ -79,10 +79,6 @@ struct Digest {
     /// Skip embedding generation.
     #[serde(default)]
     no_embed: bool,
-    /// Ground extraction on the plane's existing labels/edge-types as a soft
-    /// hint (default true). Set false for purely document-driven labels.
-    #[serde(default)]
-    ground: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -377,7 +373,6 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
     )?;
 
     let p = db.plane(&req.plane)?;
-    let catalog = p.catalog()?;
     let run_id = format!(
         "mcp-{}",
         SystemTime::now()
@@ -391,10 +386,9 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         run_id,
         chunk_chars: 4000,
         embed,
-        ground: req.ground.unwrap_or(true),
     };
 
-    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)?;
+    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, &opts)?;
     let r = &result.report;
     let mut out = jval!({
         "applied": req.apply,
@@ -535,7 +529,7 @@ impl DrStrange {
 
     #[tool(
         description = "Digest a document into the plane's graph via an LLM: extract typed \
-        entities + relations (grounded on the plane's soft-schema catalog), embed them, and — \
+        entities + relations (labels chosen purely from the document), embed them, and — \
         only when apply=true — write them with provenance. Dry-run (the default) returns the \
         proposed nodes/edges for review; call again with apply=true to commit. Provider API keys \
         come from the server's environment (e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / \

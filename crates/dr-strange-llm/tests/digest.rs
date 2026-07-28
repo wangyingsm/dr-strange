@@ -22,21 +22,13 @@ fn opts(embed: bool) -> DigestOptions {
         run_id: "run-42".into(),
         chunk_chars: 4000,
         embed,
-        ground: true,
     }
 }
 
 #[test]
 fn digests_entities_relations_provenance_and_embeddings() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest(
-        "Alice is an engineer at Acme.",
-        &mock,
-        &mock,
-        None,
-        &opts(true),
-    )
-    .unwrap();
+    let result = digest("Alice is an engineer at Acme.", &mock, &mock, &opts(true)).unwrap();
 
     // Two entities; the WORKS_AT relation kept, the dangling KNOWS dropped.
     assert_eq!(result.report.entities, 2);
@@ -66,7 +58,7 @@ fn digests_entities_relations_provenance_and_embeddings() {
 #[test]
 fn apply_writes_the_graph() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest("Alice at Acme.", &mock, &mock, None, &opts(false)).unwrap();
+    let result = digest("Alice at Acme.", &mock, &mock, &opts(false)).unwrap();
 
     let db = Database::in_memory().unwrap();
     {
@@ -89,7 +81,7 @@ fn apply_writes_the_graph() {
 #[test]
 fn no_embed_leaves_no_vectors() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest("Alice at Acme.", &mock, &mock, None, &opts(false)).unwrap();
+    let result = digest("Alice at Acme.", &mock, &mock, &opts(false)).unwrap();
     assert!(
         result
             .nodes

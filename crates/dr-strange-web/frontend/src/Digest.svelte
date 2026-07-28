@@ -8,7 +8,6 @@
   let chat = $state('openai')
   let embed = $state('openai')
   let noEmbed = $state(false)
-  let ground = $state(false)
   let proposal = $state(null) // { report, nodes, edges }
   let status = $state('')
   let error = $state(null)
@@ -46,12 +45,10 @@
     proposal = null
     try {
       proposal = await rpc('digest.run', {
-        plane,
         text,
         chat,
         embed,
         no_embed: noEmbed,
-        ground,
       })
       const r = proposal.report
       status = `proposal: ${r.entities} entities, ${r.relations} relations`
@@ -98,9 +95,6 @@
     </select>
   </label>
   <label class="check"><input type="checkbox" bind:checked={noEmbed} /> no embeddings</label>
-  <label class="check" title="Reuse the plane's existing labels/edge-types where they fit; off = labels chosen purely from the document">
-    <input type="checkbox" bind:checked={ground} /> reuse existing schema
-  </label>
   <label class="file-btn">
     Upload file
     <input type="file" accept=".md,.markdown,.txt,.pdf,.docx" onchange={onFile} />

@@ -5,19 +5,18 @@
 //! arch/07 §2) and then [`DigestResult::apply`]s through the bulk API.
 //!
 //! Pipeline: chunk the document → for each chunk, ask the [`Chat`] model to
-//! extract typed entities + relations as strict JSON (grounded on the plane's
-//! catalog when there is one) → merge entities across chunks by key → embed
-//! each entity's text → attach provenance (source, model, run id) as
-//! self-describing [`PropDesc`]. Extraction is schema-constrained; the soft
-//! schema still absorbs whatever labels/types the model returns.
+//! extract typed entities + relations as strict JSON (labels chosen purely from
+//! the document — no preset schema, no catalog grounding) → merge entities
+//! across chunks by key → embed each entity's text → attach provenance (source,
+//! model, run id) as self-describing [`PropDesc`]. Extraction is
+//! schema-constrained; the soft schema still absorbs whatever labels/types the
+//! model returns.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use dr_strange_core::json;
-use dr_strange_core::{
-    BulkEdge, BulkNode, BulkStats, CatalogSnapshot, PropDesc, PropValue, Properties, WriteTxn,
-};
+use dr_strange_core::{BulkEdge, BulkNode, BulkStats, PropDesc, PropValue, Properties, WriteTxn};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -100,10 +99,6 @@ pub struct DigestOptions {
     pub chunk_chars: usize,
     /// Whether to embed entities into `embedding` vectors.
     pub embed: bool,
-    /// Show the model the plane's existing labels/edge-types as a *soft*
-    /// consistency hint (reuse only when they genuinely fit). Off ⇒ purely
-    /// document-driven labels, ignoring the plane's current schema.
-    pub ground: bool,
 }
 
 impl DigestResult {
@@ -142,11 +137,10 @@ pub fn digest(
     document: &str,
     chat: &dyn Chat,
     embedder: &dyn Embedder,
-    catalog: Option<&CatalogSnapshot>,
     opts: &DigestOptions,
 ) -> Result<DigestResult> {
     let chunks = chunk(document, opts.chunk_chars);
-    let system = system_prompt(catalog, opts.ground);
+    let system = system_prompt();
 
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
     let mut edges: Vec<DigestEdge> = Vec::new();
@@ -337,8 +331,11 @@ fn chunk(doc: &str, size: usize) -> Vec<String> {
     chunks
 }
 
-fn system_prompt(catalog: Option<&CatalogSnapshot>, ground: bool) -> String {
-    let mut p = String::from(
+fn system_prompt() -> String {
+    // No preset labels: the document alone dictates the schema. The plane's
+    // existing catalog is deliberately never shown to the model — labels can
+    // always be edited after the fact (arch/07 §2).
+    String::from(
         "You extract a knowledge graph from the user's text. Let the DOCUMENT decide the schema: \
          give each entity the most specific, accurate label for what it actually is here \
          (e.g. Protein, City, Statute, Album, Algorithm — not a generic default), and each \
@@ -351,29 +348,7 @@ fn system_prompt(catalog: Option<&CatalogSnapshot>, ground: bool) -> String {
          \"description\":\"one concise sentence\"}]}\n\
          Use the SAME key for an entity every time it appears so mentions collapse to one node. \
          Relations must reference entity keys you also emit.",
-    );
-    if let Some(cat) = catalog
-        && ground
-        && (!cat.labels.is_empty() || !cat.edge_types.is_empty())
-    {
-        if !cat.labels.is_empty() {
-            let labels: Vec<&str> = cat.labels.keys().map(String::as_str).collect();
-            p.push_str(&format!(
-                "\nFor consistency the plane already uses these labels: {}. Reuse one ONLY when it \
-                 genuinely fits; otherwise create a new, more accurate label — never force an \
-                 entity into an ill-fitting one.",
-                labels.join(", ")
-            ));
-        }
-        if !cat.edge_types.is_empty() {
-            let types: Vec<&str> = cat.edge_types.keys().map(String::as_str).collect();
-            p.push_str(&format!(
-                "\nExisting relation types: {}. Same rule — reuse only on a genuine fit, else a new type.",
-                types.join(", ")
-            ));
-        }
-    }
-    p
+    )
 }
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
@@ -400,39 +375,16 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dr_strange_core::LabelStats;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn grounding_is_soft_and_toggleable() {
-        let mut labels = BTreeMap::new();
-        labels.insert(
-            "Person".to_string(),
-            LabelStats {
-                count: 1,
-                properties: BTreeMap::new(),
-            },
-        );
-        let cat = CatalogSnapshot {
-            node_count: 1,
-            edge_count: 0,
-            labels,
-            edge_types: BTreeMap::new(),
-        };
-
-        // Every prompt tells the model to pick document-specific labels.
-        let base = "most specific, accurate label";
-
-        // Grounded: mentions the existing label, but only as a soft "reuse if
-        // it fits" hint — not a "prefer these" directive.
-        let grounded = system_prompt(Some(&cat), true);
-        assert!(grounded.contains(base));
-        assert!(grounded.contains("Person"));
-        assert!(grounded.contains("ONLY when it"));
-
-        // Ungrounded: never leaks the plane's schema.
-        let free = system_prompt(Some(&cat), false);
-        assert!(free.contains(base));
-        assert!(!free.contains("Person"));
+    fn prompt_is_document_driven_with_no_preset_labels() {
+        let p = system_prompt();
+        // Tells the model to pick the most specific label from the document…
+        assert!(p.contains("most specific, accurate label"));
+        assert!(p.contains("Let the DOCUMENT decide the schema"));
+        assert!(p.contains("Do not fall back on a fixed set"));
+        // …and never leaks a plane's existing schema as a preset to reuse.
+        assert!(!p.contains("already uses these labels"));
+        assert!(!p.contains("Existing relation types"));
     }
 }

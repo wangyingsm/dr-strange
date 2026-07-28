@@ -360,7 +360,6 @@ fn llm_err(e: anyhow::Error) -> RpcError {
 
 #[derive(Deserialize)]
 pub struct DigestRun {
-    plane: String,
     /// The document text to digest.
     text: String,
     #[serde(default)]
@@ -375,15 +374,12 @@ pub struct DigestRun {
     source: Option<String>,
     #[serde(default)]
     no_embed: bool,
-    /// Ground on the plane's existing schema as a soft hint (default true).
-    #[serde(default)]
-    ground: Option<bool>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
 /// keys come from the server's environment, never params. Blocking work runs
 /// on the /rpc handler's blocking task.
-pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+pub fn digest_run(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestRun = params(p)?;
     let chat_provider = req.chat.as_deref().unwrap_or("openai");
     let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
@@ -402,18 +398,14 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     )
     .map_err(llm_err)?;
 
-    let plane = app(ctx.db.plane(&req.plane))?;
-    let catalog = app(plane.catalog())?;
     let opts = dr_strange_llm::DigestOptions {
         source: req.source.unwrap_or_else(|| "web-digest".into()),
         model: chat_model,
         run_id: format!("web-{}", now_secs()),
         chunk_chars: 4000,
         embed,
-        ground: req.ground.unwrap_or(true),
     };
-    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)
-        .map_err(llm_err)?;
+    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, &opts).map_err(llm_err)?;
 
     let r = &result.report;
     Ok(jval!({

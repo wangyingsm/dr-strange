@@ -171,8 +171,6 @@ pub struct DigestArgs<'a> {
     pub apply: bool,
     pub chunk_chars: usize,
     pub embed: bool,
-    /// Ground extraction on the plane's existing labels/edge-types (soft hint).
-    pub ground: bool,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -185,7 +183,7 @@ pub struct DigestArgs<'a> {
 }
 
 /// Digests a document into the plane: an LLM extracts entities/relations
-/// (grounded on the plane's catalog), they're embedded and stamped with
+/// (labels chosen purely from the document), they're embedded and stamped with
 /// provenance, and — only with `apply` — written through the bulk path.
 /// Dry-run by default (arch/07 §2: proposals, not mutations).
 #[cfg(feature = "digest")]
@@ -217,7 +215,6 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
     )?;
 
     let p = plane(db, args.plane)?;
-    let catalog = p.catalog()?;
     let run_id = format!(
         "{}-{}",
         source,
@@ -232,10 +229,9 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         run_id,
         chunk_chars: args.chunk_chars,
         embed: args.embed,
-        ground: args.ground,
     };
 
-    let result = dr_strange_llm::digest(&doc, &chat, &embedder, Some(&catalog), &opts)?;
+    let result = dr_strange_llm::digest(&doc, &chat, &embedder, &opts)?;
     let r = &result.report;
     writeln!(
         out,
