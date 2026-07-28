@@ -11,6 +11,7 @@ use dr_strange_core::{
     BulkEdge, BulkNode, Database, Dir, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord,
     Properties, json,
 };
+use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
 
@@ -307,6 +308,15 @@ pub struct Find {
     q: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// Rank nodes by embedding similarity instead of substring matching.
+    #[serde(default)]
+    semantic: bool,
+    /// Embedding provider for semantic mode (preset or base URL); server env
+    /// supplies the key. Must match the model the plane was embedded with.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
 }
 
 /// `plane.find` — text search over the plane. Nodes match on external key,
@@ -317,15 +327,38 @@ pub struct Find {
 /// each; `truncated` says whether either cap cut the results short.
 pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Find = params(p)?;
-    let needle = req.q.trim().to_lowercase();
     let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
-    if needle.is_empty() {
+    if req.q.trim().is_empty() {
         return Ok(
-            jval!({ "nodes": [], "edges": [], "scanned": 0, "total": 0, "truncated": false }),
+            jval!({ "nodes": [], "edges": [], "mode": "text", "scanned": 0, "total": 0, "truncated": false }),
         );
     }
 
     let plane = app(ctx.db.plane(&req.plane))?;
+
+    // Semantic mode: embed the query and rank nodes by vector similarity. Any
+    // failure — no key, provider error, or a plane with no embeddings — falls
+    // back to the text scan below, surfacing why via `note`.
+    let mut note: Option<String> = None;
+    if req.semantic {
+        match semantic_find(&plane, &req, limit) {
+            Ok(hits) if !hits.is_empty() => {
+                let n = hits.len();
+                return Ok(jval!({
+                    "nodes": hits,
+                    "edges": [],
+                    "mode": "semantic",
+                    "scanned": n,
+                    "total": n,
+                    "truncated": false,
+                }));
+            }
+            Ok(_) => note = Some("no embedded nodes in this plane — showing text matches".into()),
+            Err(e) => note = Some(format!("semantic unavailable ({e}) — showing text matches")),
+        }
+    }
+
+    let needle = req.q.trim().to_lowercase();
     let all = app(plane.query().scan_all().nodes())?;
     let total = all.len();
 
@@ -386,10 +419,61 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     Ok(jval!({
         "nodes": node_hits,
         "edges": edge_hits,
+        "mode": "text",
+        "note": note,
         "scanned": examined,
         "total": total,
         "truncated": nodes_truncated || edges_truncated,
     }))
+}
+
+/// Semantic search: embed the query with the requested provider (key from the
+/// server env) and return the plane's most vector-similar nodes, each carrying
+/// a `score` and a `match` hint. Errors (no key, provider down, no embed model)
+/// and an empty result (a plane with no embeddings, or embeddings of a
+/// different dimension) let the caller fall back to text.
+fn semantic_find(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    req: &Find,
+    limit: usize,
+) -> anyhow::Result<Vec<Value>> {
+    let provider = req.provider.as_deref().unwrap_or("openai");
+    let embedder =
+        dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)?;
+    let reply = embedder.embed(std::slice::from_ref(&req.q))?;
+    let query = reply
+        .vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+
+    let hits = plane
+        .query()
+        .vector_top_k(None, "embedding", query, Metric::Cosine, limit as u64)
+        .scored_nodes()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(hits
+        .iter()
+        .map(|(n, score)| {
+            let mut obj = json::node_to_json(n);
+            if let Value::Object(map) = &mut obj {
+                match score {
+                    Some(s) => {
+                        map.insert("score".into(), jval!(s));
+                        map.insert(
+                            "match".into(),
+                            Value::String(format!("semantic · {:.0}%", s * 100.0)),
+                        );
+                    }
+                    None => {
+                        map.insert("match".into(), Value::String("semantic".into()));
+                    }
+                }
+            }
+            obj
+        })
+        .collect())
 }
 
 /// Returns a short "matched in …" hint if `needle` (already lowercased) occurs

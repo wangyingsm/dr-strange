@@ -359,6 +359,26 @@ mod tests {
     }
 
     #[test]
+    fn semantic_find_falls_back_to_text_when_unavailable() {
+        let db = seeded(); // "alice", no embeddings
+        // deepseek has no embedding model, so semantic can't run (no network
+        // hit) — the request must fall back to the text scan with a note.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"ali","semantic":true,"provider":"deepseek"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["mode"], "text");
+        assert!(
+            resp["result"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("semantic unavailable")
+        );
+        assert_eq!(resp["result"]["nodes"][0]["external_key"], "alice");
+    }
+
+    #[test]
     fn plane_find_matches_edges_by_type() {
         let (db, alice, bob) = seeded_graph(); // alice -KNOWS-> bob
 

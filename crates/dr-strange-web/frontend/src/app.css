@@ -197,10 +197,37 @@ nav button.active {
 .search {
   position: relative;
 }
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
 .search input {
   font-size: 0.9rem;
-  width: 30rem;
-  max-width: 55vw;
+  width: 26rem;
+  max-width: 46vw;
+}
+.search .sem {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.search-row select {
+  font: inherit;
+  font-size: 0.8rem;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.45rem;
+}
+.search .results .note {
+  margin: 0.3rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--accent);
 }
 .search .results {
   position: absolute;

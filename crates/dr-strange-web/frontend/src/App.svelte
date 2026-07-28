@@ -5,11 +5,16 @@
   import Explore from './Explore.svelte'
   import Digest from './Digest.svelte'
 
+  // Providers with an embedding endpoint (deepseek is chat-only, so excluded).
+  const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
+
   let view = $state('dashboard')
   let planes = $state([]) // [{ id, name, ... }]
   let plane = $state('startup') // app-wide current plane (browse + search)
   let q = $state('') // search box
-  let results = $state(null) // { nodes, scanned, total, truncated } | { error }
+  let semantic = $state(false) // text substring vs embedding-similarity search
+  let embedProvider = $state('openai')
+  let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
 
   let nonce = 0
@@ -24,10 +29,11 @@
     }
   })
 
-  // Debounced text search over the current plane.
+  // Debounced search over the current plane; re-runs when the query, plane, or
+  // search mode/provider change.
   $effect(() => {
     const query = q.trim()
-    const pl = plane
+    const params = { plane, q: query, semantic, provider: embedProvider }
     clearTimeout(timer)
     if (!query) {
       results = null
@@ -35,7 +41,7 @@
     }
     timer = setTimeout(async () => {
       try {
-        results = await rpc('plane.find', { plane: pl, q: query })
+        results = await rpc('plane.find', params)
       } catch (e) {
         results = { error: e.message }
       }
@@ -72,19 +78,31 @@
     </label>
 
     <div class="search">
-      <input
-        type="search"
-        placeholder="Search this plane…"
-        bind:value={q}
-        onkeydown={(e) => e.key === 'Escape' && (q = '')}
-      />
+      <div class="search-row">
+        <input
+          type="search"
+          placeholder={semantic ? 'Search by meaning…' : 'Search this plane…'}
+          bind:value={q}
+          onkeydown={(e) => e.key === 'Escape' && (q = '')}
+        />
+        <label class="sem" title="Rank nodes by embedding similarity instead of substring matching">
+          <input type="checkbox" bind:checked={semantic} /> semantic
+        </label>
+        {#if semantic}
+          <select bind:value={embedProvider} title="Embedding provider (must match how the plane was embedded)">
+            {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+          </select>
+        {/if}
+      </div>
       {#if results}
         <div class="results">
           {#if results.error}
             <p class="empty">{results.error}</p>
           {:else if !results.nodes.length && !results.edges?.length}
+            {#if results.note}<p class="note">{results.note}</p>{/if}
             <p class="empty">no matches</p>
           {:else}
+            {#if results.note}<p class="note">{results.note}</p>{/if}
             {#if results.nodes.length}
               <p class="group">Nodes</p>
               <ul>
