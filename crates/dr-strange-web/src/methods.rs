@@ -375,6 +375,9 @@ pub struct DigestRun {
     source: Option<String>,
     #[serde(default)]
     no_embed: bool,
+    /// Ground on the plane's existing schema as a soft hint (default true).
+    #[serde(default)]
+    ground: Option<bool>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
@@ -407,6 +410,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         run_id: format!("web-{}", now_secs()),
         chunk_chars: 4000,
         embed,
+        ground: req.ground.unwrap_or(true),
     };
     let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)
         .map_err(llm_err)?;

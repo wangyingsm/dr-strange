@@ -22,6 +22,7 @@ fn opts(embed: bool) -> DigestOptions {
         run_id: "run-42".into(),
         chunk_chars: 4000,
         embed,
+        ground: true,
     }
 }
 

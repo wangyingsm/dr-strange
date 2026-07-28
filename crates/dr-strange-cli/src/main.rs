@@ -113,6 +113,10 @@ enum Command {
         /// Skip embedding generation.
         #[arg(long)]
         no_embed: bool,
+        /// Don't ground extraction on the plane's existing labels/edge-types
+        /// (pick labels purely from the document).
+        #[arg(long)]
+        no_ground: bool,
     },
 }
 
@@ -239,6 +243,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             embed_key_env,
             chunk_chars,
             no_embed,
+            no_ground,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -247,6 +252,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 apply,
                 chunk_chars,
                 embed: !no_embed,
+                ground: !no_ground,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),

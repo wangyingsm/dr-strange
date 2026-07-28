@@ -79,6 +79,10 @@ struct Digest {
     /// Skip embedding generation.
     #[serde(default)]
     no_embed: bool,
+    /// Ground extraction on the plane's existing labels/edge-types as a soft
+    /// hint (default true). Set false for purely document-driven labels.
+    #[serde(default)]
+    ground: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -387,6 +391,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         run_id,
         chunk_chars: 4000,
         embed,
+        ground: req.ground.unwrap_or(true),
     };
 
     let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)?;

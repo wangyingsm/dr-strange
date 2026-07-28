@@ -171,6 +171,8 @@ pub struct DigestArgs<'a> {
     pub apply: bool,
     pub chunk_chars: usize,
     pub embed: bool,
+    /// Ground extraction on the plane's existing labels/edge-types (soft hint).
+    pub ground: bool,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -230,6 +232,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         run_id,
         chunk_chars: args.chunk_chars,
         embed: args.embed,
+        ground: args.ground,
     };
 
     let result = dr_strange_llm::digest(&doc, &chat, &embedder, Some(&catalog), &opts)?;

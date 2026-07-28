@@ -100,6 +100,10 @@ pub struct DigestOptions {
     pub chunk_chars: usize,
     /// Whether to embed entities into `embedding` vectors.
     pub embed: bool,
+    /// Show the model the plane's existing labels/edge-types as a *soft*
+    /// consistency hint (reuse only when they genuinely fit). Off ⇒ purely
+    /// document-driven labels, ignoring the plane's current schema.
+    pub ground: bool,
 }
 
 impl DigestResult {
@@ -142,7 +146,7 @@ pub fn digest(
     opts: &DigestOptions,
 ) -> Result<DigestResult> {
     let chunks = chunk(document, opts.chunk_chars);
-    let system = system_prompt(catalog);
+    let system = system_prompt(catalog, opts.ground);
 
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
     let mut edges: Vec<DigestEdge> = Vec::new();
@@ -333,11 +337,15 @@ fn chunk(doc: &str, size: usize) -> Vec<String> {
     chunks
 }
 
-fn system_prompt(catalog: Option<&CatalogSnapshot>) -> String {
+fn system_prompt(catalog: Option<&CatalogSnapshot>, ground: bool) -> String {
     let mut p = String::from(
-        "You extract a knowledge graph from the user's text. Reply with ONLY strict JSON, no prose, \
-         no markdown fences, in exactly this shape:\n\
-         {\"entities\":[{\"key\":\"stable canonical name\",\"label\":\"EntityType\",\
+        "You extract a knowledge graph from the user's text. Let the DOCUMENT decide the schema: \
+         give each entity the most specific, accurate label for what it actually is here \
+         (e.g. Protein, City, Statute, Album, Algorithm — not a generic default), and each \
+         relation a precise UPPER_SNAKE type drawn from the text. Do not fall back on a fixed set \
+         of labels.\n\
+         Reply with ONLY strict JSON, no prose, no markdown fences, in exactly this shape:\n\
+         {\"entities\":[{\"key\":\"stable canonical name\",\"label\":\"SpecificType\",\
          \"properties\":{\"...\":\"...\"},\"description\":\"one concise sentence\"}],\
          \"relations\":[{\"src\":\"entity key\",\"dst\":\"entity key\",\"type\":\"REL_TYPE\",\
          \"description\":\"one concise sentence\"}]}\n\
@@ -345,19 +353,22 @@ fn system_prompt(catalog: Option<&CatalogSnapshot>) -> String {
          Relations must reference entity keys you also emit.",
     );
     if let Some(cat) = catalog
+        && ground
         && (!cat.labels.is_empty() || !cat.edge_types.is_empty())
     {
         if !cat.labels.is_empty() {
             let labels: Vec<&str> = cat.labels.keys().map(String::as_str).collect();
             p.push_str(&format!(
-                "\nPrefer these existing labels where they fit: {}.",
+                "\nFor consistency the plane already uses these labels: {}. Reuse one ONLY when it \
+                 genuinely fits; otherwise create a new, more accurate label — never force an \
+                 entity into an ill-fitting one.",
                 labels.join(", ")
             ));
         }
         if !cat.edge_types.is_empty() {
             let types: Vec<&str> = cat.edge_types.keys().map(String::as_str).collect();
             p.push_str(&format!(
-                "\nPrefer these existing relation types where they fit: {}.",
+                "\nExisting relation types: {}. Same rule — reuse only on a genuine fit, else a new type.",
                 types.join(", ")
             ));
         }
@@ -384,4 +395,44 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
             &body[..body.len().min(160)]
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dr_strange_core::LabelStats;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn grounding_is_soft_and_toggleable() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "Person".to_string(),
+            LabelStats {
+                count: 1,
+                properties: BTreeMap::new(),
+            },
+        );
+        let cat = CatalogSnapshot {
+            node_count: 1,
+            edge_count: 0,
+            labels,
+            edge_types: BTreeMap::new(),
+        };
+
+        // Every prompt tells the model to pick document-specific labels.
+        let base = "most specific, accurate label";
+
+        // Grounded: mentions the existing label, but only as a soft "reuse if
+        // it fits" hint — not a "prefer these" directive.
+        let grounded = system_prompt(Some(&cat), true);
+        assert!(grounded.contains(base));
+        assert!(grounded.contains("Person"));
+        assert!(grounded.contains("ONLY when it"));
+
+        // Ungrounded: never leaks the plane's schema.
+        let free = system_prompt(Some(&cat), false);
+        assert!(free.contains(base));
+        assert!(!free.contains("Person"));
+    }
 }
