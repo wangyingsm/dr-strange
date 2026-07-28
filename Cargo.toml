@@ -6,6 +6,7 @@ members = [
     "crates/dr-strange-mcp",
     "crates/dr-strange-web",
     "crates/dr-strange-llm",
+    "benchmarks/drsg-bench",
 ]
 
 [workspace.package]

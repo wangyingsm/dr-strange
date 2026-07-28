@@ -1,0 +1,16 @@
+[package]
+name = "drsg-bench"
+description = "Cross-engine benchmark harness for dr-strange (dev-only; not part of the shipped product)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "drsg-bench"
+path = "src/main.rs"
+
+[dependencies]
+dr-strange-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
