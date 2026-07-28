@@ -28,14 +28,18 @@ const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
 //    inverts from the solid nodes around it and is unmistakable;
 //  - a plain hover draws the label box (sigma's default paints it hardcoded
 //    white, invisible under light text in dark mode).
-// `label`/`bg`/`canvasBg` are getters read every draw, so theme flips track.
-function drawNodeHover(label, bg, canvasBg) {
+// `label`/`bg`/`canvasBg` are getters read every draw, so theme flips track;
+// `graph` gives access to the node's stored (untouched) category colour.
+function drawNodeHover(label, bg, canvasBg, graph) {
   return (context, data, settings) => {
     const { labelSize: size, labelFont: font, labelWeight: weight } = settings
     context.font = `${weight} ${size}px ${font}`
 
     if (data.highlighted) {
       const r = data.size
+      // The reducer made the WebGL disc transparent; its category colour still
+      // lives on the graph node, which we read for the ring stroke.
+      const ringColor = graph.getNodeAttribute(data.key, 'color') || HOVER_COLOR
       context.shadowBlur = 0 // clear any shadow left by a hover box this frame
       context.beginPath()
       context.arc(data.x, data.y, r, 0, Math.PI * 2)
@@ -43,7 +47,7 @@ function drawNodeHover(label, bg, canvasBg) {
       context.fillStyle = canvasBg() // hollow the interior to the background
       context.fill()
       context.lineWidth = Math.max(2.5, r * 0.4)
-      context.strokeStyle = data.color // ring = the node's category colour
+      context.strokeStyle = ringColor
       context.stroke()
       if (data.label) {
         context.fillStyle = label()
@@ -113,7 +117,7 @@ export class Plot {
       renderEdgeLabels: true,
       labelColor: { color: nodeLabel() },
       edgeLabelColor: { color: edgeLabel() },
-      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg, canvasBg),
+      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg, canvasBg, this.graph),
       labelDensity: 0.5,
       labelRenderedSizeThreshold: 5,
       // Edge picking reads a downsized framebuffer, so a thin edge has no
@@ -127,11 +131,20 @@ export class Plot {
         edge === this.hoveredEdge || edge === this.selectedEdge
           ? { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
           : data,
-      // The selected node renders focused: `highlighted` routes it through the
-      // (themed) hover box, plus a size bump — its category color is kept.
+      // The selected node renders as a hollow ring. Sigma draws a highlighted
+      // node's solid WebGL disc *over* anything the hover drawer paints, so we
+      // make that disc transparent here and let drawNodeHover paint the ring
+      // (its colour read from the graph's stored category colour).
       nodeReducer: (node, data) =>
         node === this.selectedNode
-          ? { ...data, highlighted: true, forceLabel: true, size: (data.size ?? 5) * 1.35, zIndex: 1 }
+          ? {
+              ...data,
+              highlighted: true,
+              forceLabel: true,
+              size: (data.size ?? 5) * 1.35,
+              color: 'rgba(0,0,0,0)',
+              zIndex: 1,
+            }
           : data,
     })
 
