@@ -66,7 +66,17 @@
 </script>
 
 <header>
-  <h1>dr-strange</h1>
+  <h1 class="brand">
+    <svg class="logo" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="32" cy="32" r="30" />
+      <circle class="ticks" cx="32" cy="32" r="25.5" stroke-width="3" stroke-dasharray="1.2 3" />
+      <rect x="16" y="16" width="32" height="32" />
+      <rect x="16" y="16" width="32" height="32" transform="rotate(45 32 32)" />
+      <circle cx="32" cy="32" r="11" />
+      <circle cx="32" cy="32" r="3.5" fill="currentColor" stroke="none" />
+    </svg>
+    <span>Dr <b>STRANGE</b></span>
+  </h1>
 
   <div class="tools">
     <label class="plane-pick">
@@ -159,5 +169,5 @@
 {:else if view === 'explore'}
   <Explore {plane} {focus} />
 {:else}
-  <Digest />
+  <Digest {plane} />
 {/if}

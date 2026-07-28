@@ -51,6 +51,36 @@ h1 {
   flex: 1 1 0; /* left flank — equal to nav so .tools centers between them */
   min-width: max-content;
 }
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.brand .logo {
+  width: 1.7rem;
+  height: 1.7rem;
+  color: #d9a441; /* Dr. Strange gold magic circle */
+  flex: none;
+}
+.brand .logo .ticks {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: spin 24s linear infinite; /* slow-turning rune ring */
+}
+.brand b {
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand .logo .ticks {
+    animation: none;
+  }
+}
 
 h2 {
   font-size: 0.85rem;

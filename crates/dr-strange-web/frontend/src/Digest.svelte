@@ -3,7 +3,8 @@
 
   const PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
 
-  let plane = $state('startup')
+  // The target plane comes from the app-wide picker in the header.
+  let { plane } = $props()
   let text = $state('')
   let chat = $state('openai')
   let embed = $state('openai')
@@ -127,7 +128,6 @@
 </script>
 
 <div class="controls">
-  <label>Plane <input class="txt" bind:value={plane} /></label>
   <label>
     Chat
     <select bind:value={chat}>
