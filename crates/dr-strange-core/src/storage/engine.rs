@@ -82,6 +82,18 @@ pub trait WriteTransaction: ReadTransaction {
     fn put(&mut self, table: TableId, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&mut self, table: TableId, key: &[u8]) -> Result<()>;
 
+    /// Inserts many `(key, value)` pairs into one table. The bulk-load fast
+    /// path (arch/01 §2) calls this so a backend can amortize per-op overhead
+    /// across the whole batch — redb opens the table once instead of per key.
+    /// Callers that want the sorted-insert win (redb B-tree) pre-sort `items`.
+    /// The default just loops [`put`](Self::put); override where it pays.
+    fn put_batch(&mut self, table: TableId, items: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        for (k, v) in items {
+            self.put(table, k, v)?;
+        }
+        Ok(())
+    }
+
     /// Prefix range-delete; plane drop relies on this being cheap (arch/01 §3).
     fn delete_prefix(&mut self, table: TableId, prefix: &[u8]) -> Result<()>;
 

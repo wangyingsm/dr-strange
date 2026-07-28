@@ -98,7 +98,11 @@ pub(super) fn next_id(txn: &mut dyn WriteTransaction, counter: &[u8]) -> Result<
 /// Reserves `count` contiguous ids from `counter` in one meta write, and
 /// returns the batch's starting id — `[start, start + count)` all now
 /// belong to the caller. The building block under [`IdAllocator`].
-fn reserve_id_batch(txn: &mut dyn WriteTransaction, counter: &[u8], count: u64) -> Result<u64> {
+pub(super) fn reserve_id_batch(
+    txn: &mut dyn WriteTransaction,
+    counter: &[u8],
+    count: u64,
+) -> Result<u64> {
     let start =
         get_u64(txn, counter)?.ok_or_else(|| Error::Corrupt("missing id counter".into()))?;
     put_u64(txn, counter, start + count)?;

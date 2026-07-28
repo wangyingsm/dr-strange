@@ -6,13 +6,12 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 | Operation | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
-| Bulk-load nodes (↑ better) | 87 K/s | 265 K/s | 410 K/s | 32 K/s |
-| Bulk-load edges (+ adjacency/index) (↑ better) | 78 K/s | 1.3 M/s | 526 K/s | 26 K/s |
-| Point lookup by key — median (↓ better) | 3.2 µs | 397.6 µs | 5.5 µs | 978.6 µs |
-| 1-hop expansion — median (↓ better) | 7.6 µs | 2.37 ms | 13.7 µs | 799.5 µs |
-| 2-hop reachable set — median (↓ better) | 34.9 µs | 9.84 ms | 94.7 µs | 1.56 ms |
+| Graph load — nodes + edges (↑ better) | 166 K/s | 797 K/s | 502 K/s | 27 K/s |
+| Point lookup by key — median (↓ better) | 3.8 µs | 397.6 µs | 5.5 µs | 978.6 µs |
+| 1-hop expansion — median (↓ better) | 7.2 µs | 2.37 ms | 13.7 µs | 799.5 µs |
+| 2-hop reachable set — median (↓ better) | 34.3 µs | 9.84 ms | 94.7 µs | 1.56 ms |
 | Vector index build (↑ better) | 1 K/s | 3 K/s | — | 3 K/s |
-| Vector top-k query — median (↓ better) | 365.6 µs | 10.39 ms | — | 3.57 ms |
+| Vector top-k query — median (↓ better) | 380.4 µs | 10.39 ms | — | 3.57 ms |
 
 ## Reading this
 
@@ -24,7 +23,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 - **Dataset** is generated once by `drsg-bench gen` (deterministic SplitMix64 seed) to plain CSV/txt; all engines read those exact files and the same query files — no engine regenerates data.
 - **Identity**: the string key `n{i}` is the primary key in every engine, so point lookups and edge loads use each engine's PK index (Kùzu only indexes the PK, so a non-PK lookup would be an unfair scan).
-- **load_edges** includes building the structure that makes expansion fast (drsg adjacency tables / SQLite `src` index / Kùzu rel storage / Neo4j relationships), so it is edge-insert + index, not insert alone.
+- **Graph load** is nodes + edges through each engine's bulk path (drsg `bulk_load` / Kùzu `COPY` / SQLite `executemany` / Neo4j `UNWIND`) and includes building the adjacency/indexes that make expansion fast — insert + index, not insert alone. It's one combined throughput number (total rows / total load time).
 - **expand/traverse** resolve the start node by key first (as any client must), then expand; `traverse_2hop` is the distinct set reachable in 1–2 hops.
 - Each engine runs **alone** (no CPU contention). drsg is a `--release` build.
 
@@ -38,7 +37,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 ## Takeaways for dr-strange
 
 - **Strong — low-latency point & graph queries.** The embedded KV design gives microsecond point lookups and single-digit-µs 1-hop expansion, on par with SQLite and orders of magnitude below the query-engine round-trips of Kùzu/Neo4j. That's the embedded, agent-in-the-loop sweet spot dr-strange is built for.
-- **Weak — bulk edge load.** Kùzu's columnar `COPY` loads edges far faster; drsg writes each edge's two adjacency entries through redb one at a time. A bulk-load fast path (batched writes, deferred index maintenance) is the clearest throughput win.
+- **Improved — bulk load.** A `bulk_load` fast path (contiguous id reservation, in-memory interning, and sorted batched writes with each table opened once) roughly doubled load throughput over the old per-record loop, moving drsg past Neo4j. It still trails Kùzu's columnar `COPY` and SQLite: drsg writes three sorted B-tree entries per edge (record + two adjacency) where a columnar store appends — closing that further is an on-disk-layout change, not just faster inserts.
 - **Improved — vector-index build.** The original hand-rolled HNSW built ~10× slower than Kùzu/Neo4j. After caching per-vector norms (so every metric is one dot), an AVX2+FMA dot kernel, and removing per-search allocation, build is ~4× faster and now within ~2× of the mature engines. The remaining gap is single-threaded construction; parallel build (deferred, arch/01 §5) would close it.
 - **Strong — vector query.** drsg's top-k latency is now well below both Kùzu and Neo4j — the same cached-norm + SIMD path that sped up build also sharpened search.
 

@@ -14,12 +14,15 @@
 //! values (counters, dictionary entries, id pointers) — is big-endian.
 //! Record bodies are the codec's business (postcard varint).
 
+mod bulk;
 mod edge;
 mod meta;
 mod node;
 
 #[cfg(test)]
 mod tests;
+
+pub use bulk::{BulkEdge, BulkNode, BulkStats, bulk_load};
 
 pub(crate) use meta::IdAllocator;
 pub use meta::{

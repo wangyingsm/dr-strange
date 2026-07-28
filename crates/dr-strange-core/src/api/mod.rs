@@ -20,7 +20,7 @@ use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
-use crate::storage::graph::{self, IdAllocator};
+use crate::storage::graph::{self, BulkEdge, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::storage::vector::Metric;
@@ -444,6 +444,50 @@ impl WriteTxn<'_> {
         let id = ids.next_edge_id(txn)?;
         graph::insert_edge(txn, plane, id, src, dst, ty, &props)?;
         Ok(id)
+    }
+
+    /// Bulk-loads `nodes` then `edges` into this plane in one pass — the fast
+    /// path for initial ingest (arch/01 §2). Much faster than looping
+    /// `create_node`/`create_edge`: one contiguous id reservation per kind,
+    /// in-memory interning, and sorted batched writes with each table opened
+    /// once.
+    ///
+    /// Edge endpoints are named by external key and must resolve within this
+    /// batch or already exist in the plane. External keys are assumed fresh:
+    /// in-batch duplicates are rejected, but uniqueness is not checked against
+    /// the pre-existing KV — use `create_node_with_key` when you need that.
+    pub fn bulk_load(
+        &mut self,
+        nodes: Vec<BulkNode<'_>>,
+        edges: Vec<BulkEdge<'_>>,
+    ) -> Result<BulkStats> {
+        let plane = self.plane;
+        let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges)?;
+
+        // Mirror bulk-loaded vectors into any declared in-memory index. Almost
+        // always a no-op: bulk load precedes index declaration (which rebuilds
+        // from the KV), so `decls` is empty here.
+        if !self.decls.is_empty() {
+            let mut new_events = Vec::new();
+            for (i, node) in nodes.iter().enumerate() {
+                let node_id = NodeId(stats.node_start + i as u64);
+                for (label, property, _metric) in &self.decls {
+                    if node.labels.contains(&label.as_str())
+                        && let Some(PropValue::Vector(v)) =
+                            node.props.get(property).map(|p| &p.value)
+                    {
+                        new_events.push(IndexEvent::Upsert {
+                            label: label.clone(),
+                            property: property.clone(),
+                            node: node_id,
+                            vector: v.clone(),
+                        });
+                    }
+                }
+            }
+            self.events.extend(new_events);
+        }
+        Ok(stats)
     }
 
     /// Deletes a node, cascading to every incident edge in both directions

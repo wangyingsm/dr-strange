@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dr_strange_core::{Database, Dir, Metric, NodeId, PropDesc, PropValue, Properties};
+use dr_strange_core::{BulkEdge, BulkNode, Database, Dir, Metric, PropDesc, PropValue, Properties};
 use serde::Serialize;
 
 // A few labels / edge types so the catalog and colouring have variety; kept
@@ -260,59 +260,78 @@ fn run(data: &Path, db_path: &Path, out: &Path, k: u64) -> Result<()> {
     }
     let db = Database::open(db_path)?;
 
-    // ---- load nodes + edges (single write txn, drsg's fastest bulk path) --
+    // ---- load nodes + edges via the bulk fast path (one write txn) --------
+    // Every comparator loads through a bulk path (Kùzu COPY / SQLite
+    // executemany / Neo4j UNWIND), so drsg's `bulk_load` is the apples-to-
+    // apples loader. Timed as one "load" (nodes+edges), parsing included to
+    // match how SQLite's timed executemany parses its rows lazily.
     let node_lines = read_lines(&data.join("nodes.csv"))?;
     let edge_lines = read_lines(&data.join("edges.csv"))?;
     let n_nodes = (node_lines.len() - 1) as u64; // minus header
     let n_edges = (edge_lines.len() - 1) as u64;
 
-    // csv id (0..N, dense) → drsg NodeId
-    let mut id_map: Vec<NodeId> = Vec::with_capacity(n_nodes as usize);
-
     let t = Instant::now();
     {
-        let plane = db.plane("startup")?;
-        let mut txn = plane.write()?;
+        // Owned buffers keep the &str borrows in BulkNode/BulkEdge alive for
+        // the bulk_load call.
+        let mut nkeys: Vec<String> = Vec::with_capacity(n_nodes as usize);
+        let mut nlabels: Vec<String> = Vec::with_capacity(n_nodes as usize);
+        let mut nprops: Vec<Properties> = Vec::with_capacity(n_nodes as usize);
         for line in node_lines.iter().skip(1) {
             let mut f = line.splitn(5, ',');
             let _id = f.next().unwrap();
-            let key = f.next().unwrap();
-            let label = f.next().unwrap();
+            nkeys.push(f.next().unwrap().to_string());
+            nlabels.push(f.next().unwrap().to_string());
             let name = f.next().unwrap();
             let value: i64 = f.next().unwrap().parse().unwrap();
             let mut props: Properties = BTreeMap::new();
             props.insert("name".into(), prop(PropValue::Str(name.into())));
             props.insert("value".into(), prop(PropValue::Int(value)));
-            let nid = txn.create_node_with_key(key, &[label], props)?;
-            id_map.push(nid);
+            nprops.push(props);
         }
-        let load_nodes_ms = t.elapsed().as_secs_f64() * 1000.0;
-        results.push(throughput_result(
-            &engine,
-            "load_nodes",
-            n_nodes,
-            load_nodes_ms,
-        ));
+        let label_slots: Vec<[&str; 1]> = nlabels.iter().map(|l| [l.as_str()]).collect();
 
-        let te = Instant::now();
+        let mut esrc: Vec<String> = Vec::with_capacity(n_edges as usize);
+        let mut edst: Vec<String> = Vec::with_capacity(n_edges as usize);
+        let mut etype: Vec<String> = Vec::with_capacity(n_edges as usize);
         for line in edge_lines.iter().skip(1) {
             let mut f = line.splitn(3, ',');
-            // keys are "n{id}" with dense id, so strip the prefix to index the
-            // map directly (no per-edge key lookup during bulk load).
-            let src: usize = f.next().unwrap()[1..].parse().unwrap();
-            let dst: usize = f.next().unwrap()[1..].parse().unwrap();
-            let ty = f.next().unwrap();
-            txn.create_edge(id_map[src], id_map[dst], ty, Properties::new())?;
+            esrc.push(f.next().unwrap().to_string());
+            edst.push(f.next().unwrap().to_string());
+            etype.push(f.next().unwrap().to_string());
         }
+
+        let bnodes: Vec<BulkNode> = nkeys
+            .iter()
+            .zip(&label_slots)
+            .zip(nprops)
+            .map(|((k, ls), props)| BulkNode {
+                external_key: Some(k),
+                labels: ls,
+                props,
+            })
+            .collect();
+        let bedges: Vec<BulkEdge> = (0..n_edges as usize)
+            .map(|i| BulkEdge {
+                src_key: &esrc[i],
+                dst_key: &edst[i],
+                ty: &etype[i],
+                props: Properties::new(),
+            })
+            .collect();
+
+        let plane = db.plane("startup")?;
+        let mut txn = plane.write()?;
+        txn.bulk_load(bnodes, bedges)?;
         txn.commit()?;
-        let load_edges_ms = te.elapsed().as_secs_f64() * 1000.0;
-        results.push(throughput_result(
-            &engine,
-            "load_edges",
-            n_edges,
-            load_edges_ms,
-        ));
     }
+    let load_ms = t.elapsed().as_secs_f64() * 1000.0;
+    results.push(throughput_result(
+        &engine,
+        "load",
+        n_nodes + n_edges,
+        load_ms,
+    ));
 
     // ---- point lookup by external key -------------------------------------
     let lookup_keys = read_lines(&data.join("queries/lookup_keys.txt"))?;

@@ -18,8 +18,7 @@ OUT = ROOT / "BENCHMARKS.md"
 
 # op key → (kind, unit, human label, better-direction)
 OPS = [
-    ("load_nodes", "throughput", "nodes/s", "Bulk-load nodes", "higher"),
-    ("load_edges", "throughput", "edges/s", "Bulk-load edges (+ adjacency/index)", "higher"),
+    ("load", "throughput", "rows/s", "Graph load — nodes + edges", "higher"),
     ("lookup", "latency", "µs", "Point lookup by key — median", "lower"),
     ("expand_1hop", "latency", "µs", "1-hop expansion — median", "lower"),
     ("traverse_2hop", "latency", "µs", "2-hop reachable set — median", "lower"),
@@ -57,7 +56,19 @@ def load_results():
         if not f.exists():
             continue
         rows = json.loads(f.read_text())
-        data[eng_key] = {r["op"]: r for r in rows}
+        by_op = {r["op"]: r for r in rows}
+        # Engines that time nodes and edges separately (SQLite/Kùzu/Neo4j) get
+        # a combined "load" synthesized so the comparison is one fair row: total
+        # rows over total load time. drsg reports "load" directly (bulk_load).
+        if "load" not in by_op and "load_nodes" in by_op and "load_edges" in by_op:
+            ln, le = by_op["load_nodes"], by_op["load_edges"]
+            n = ln["n"] + le["n"]
+            ms = ln["total_ms"] + le["total_ms"]
+            by_op["load"] = {
+                "op": "load", "n": n, "total_ms": ms,
+                "throughput_per_s": n / (ms / 1000) if ms > 0 else 0.0,
+            }
+        data[eng_key] = by_op
     return data
 
 
@@ -120,9 +131,11 @@ def main():
         "- **Identity**: the string key `n{i}` is the primary key in every "
         "engine, so point lookups and edge loads use each engine's PK index "
         "(Kùzu only indexes the PK, so a non-PK lookup would be an unfair scan).\n"
-        "- **load_edges** includes building the structure that makes expansion "
-        "fast (drsg adjacency tables / SQLite `src` index / Kùzu rel storage / "
-        "Neo4j relationships), so it is edge-insert + index, not insert alone.\n"
+        "- **Graph load** is nodes + edges through each engine's bulk path "
+        "(drsg `bulk_load` / Kùzu `COPY` / SQLite `executemany` / Neo4j "
+        "`UNWIND`) and includes building the adjacency/indexes that make "
+        "expansion fast — insert + index, not insert alone. It's one combined "
+        "throughput number (total rows / total load time).\n"
         "- **expand/traverse** resolve the start node by key first (as any "
         "client must), then expand; `traverse_2hop` is the distinct set "
         "reachable in 1–2 hops.\n"
@@ -154,10 +167,14 @@ def main():
         "expansion, on par with SQLite and orders of magnitude below the "
         "query-engine round-trips of Kùzu/Neo4j. That's the embedded, "
         "agent-in-the-loop sweet spot dr-strange is built for.\n"
-        "- **Weak — bulk edge load.** Kùzu's columnar `COPY` loads edges far "
-        "faster; drsg writes each edge's two adjacency entries through redb one "
-        "at a time. A bulk-load fast path (batched writes, deferred index "
-        "maintenance) is the clearest throughput win.\n"
+        "- **Improved — bulk load.** A `bulk_load` fast path (contiguous id "
+        "reservation, in-memory interning, and sorted batched writes with each "
+        "table opened once) roughly doubled load throughput over the old "
+        "per-record loop, moving drsg past Neo4j. It still trails Kùzu's "
+        "columnar `COPY` and SQLite: drsg writes three sorted B-tree entries "
+        "per edge (record + two adjacency) where a columnar store appends — "
+        "closing that further is an on-disk-layout change, not just faster "
+        "inserts.\n"
         "- **Improved — vector-index build.** The original hand-rolled HNSW "
         "built ~10× slower than Kùzu/Neo4j. After caching per-vector norms (so "
         "every metric is one dot), an AVX2+FMA dot kernel, and removing "
