@@ -22,14 +22,36 @@ function colorFor(label, legend) {
 
 const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
 
-// A theme-aware replacement for sigma's default node-hover drawer, whose label
-// box is hardcoded white (invisible light text on it in dark mode). Same box
-// geometry as the default; only the fill + label color are themed. `label` and
-// `bg` are getters read on every hover, so it tracks live theme changes.
-function drawNodeHover(label, bg) {
+// A theme-aware replacement for sigma's default node-hover drawer. Two jobs:
+//  - the SELECTED node (sigma routes `highlighted` nodes here) draws as a
+//    hollow ring in its own colour — interior filled with the canvas bg — so it
+//    inverts from the solid nodes around it and is unmistakable;
+//  - a plain hover draws the label box (sigma's default paints it hardcoded
+//    white, invisible under light text in dark mode).
+// `label`/`bg`/`canvasBg` are getters read every draw, so theme flips track.
+function drawNodeHover(label, bg, canvasBg) {
   return (context, data, settings) => {
     const { labelSize: size, labelFont: font, labelWeight: weight } = settings
     context.font = `${weight} ${size}px ${font}`
+
+    if (data.highlighted) {
+      const r = data.size
+      context.shadowBlur = 0 // clear any shadow left by a hover box this frame
+      context.beginPath()
+      context.arc(data.x, data.y, r, 0, Math.PI * 2)
+      context.closePath()
+      context.fillStyle = canvasBg() // hollow the interior to the background
+      context.fill()
+      context.lineWidth = Math.max(2.5, r * 0.4)
+      context.strokeStyle = data.color // ring = the node's category colour
+      context.stroke()
+      if (data.label) {
+        context.fillStyle = label()
+        context.fillText(data.label, data.x + r + 3, data.y + size / 3)
+      }
+      return
+    }
+
     context.fillStyle = bg()
     context.shadowOffsetX = 0
     context.shadowOffsetY = 0
@@ -81,6 +103,9 @@ export class Plot {
     // Hover-label box: sigma's default paints it hardcoded white, hiding our
     // light dark-mode label text. Match the panel background per theme instead.
     const hoverBg = () => (media.matches ? '#26262e' : '#ffffff')
+    // The plot area's background (--panel), used to hollow the selected-node
+    // ring so its interior blends with the canvas.
+    const canvasBg = () => (media.matches ? '#1f1f27' : '#ffffff')
 
     this.sigma = new Sigma(this.graph, container, {
       defaultEdgeType: 'arrow',
@@ -88,7 +113,7 @@ export class Plot {
       renderEdgeLabels: true,
       labelColor: { color: nodeLabel() },
       edgeLabelColor: { color: edgeLabel() },
-      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg),
+      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg, canvasBg),
       labelDensity: 0.5,
       labelRenderedSizeThreshold: 5,
       // Edge picking reads a downsized framebuffer, so a thin edge has no
