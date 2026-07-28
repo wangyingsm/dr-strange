@@ -18,6 +18,9 @@
 //! trait signature never changes. Scans return owned `Vec`s — arch/02 §1 lists
 //! query/scan results as deliberately *not* cached.
 
+mod store;
+pub(crate) use store::GraphCache;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -226,6 +229,11 @@ pub struct CachedReader<'a> {
     txn: &'a dyn ReadTransaction,
     plane: PlaneId,
     registry: Option<&'a VectorRegistry>,
+    /// Optional shared cross-query L2 (arch/02 §3). `None` ⇒ pure per-query
+    /// (L1 only) — used by tests and the differential oracle.
+    l2: Option<(&'a GraphCache, u64)>,
+    // Per-query L1: fast intra-query hits and negative caching. Bound to this
+    // reader's snapshot, dropped at query end.
     nodes: RefCell<HashMap<NodeId, Option<Arc<NodeRecord>>>>,
     edges: RefCell<HashMap<EdgeId, Option<Arc<EdgeRecord>>>>,
     adjacency: RefCell<HashMap<AdjKey, Arc<[Neighbor]>>>,
@@ -233,7 +241,7 @@ pub struct CachedReader<'a> {
 
 impl<'a> CachedReader<'a> {
     pub fn new(txn: &'a dyn ReadTransaction, plane: PlaneId) -> Self {
-        Self::build(txn, plane, None)
+        Self::build(txn, plane, None, None)
     }
 
     pub fn with_registry(
@@ -241,18 +249,32 @@ impl<'a> CachedReader<'a> {
         plane: PlaneId,
         registry: &'a VectorRegistry,
     ) -> Self {
-        Self::build(txn, plane, Some(registry))
+        Self::build(txn, plane, Some(registry), None)
+    }
+
+    /// The full reader used by the query path: per-query L1 plus the shared,
+    /// cross-query, seq-stamped L2 (`cache` at snapshot `seq`).
+    pub(crate) fn with_cache(
+        txn: &'a dyn ReadTransaction,
+        plane: PlaneId,
+        registry: &'a VectorRegistry,
+        cache: &'a GraphCache,
+        seq: u64,
+    ) -> Self {
+        Self::build(txn, plane, Some(registry), Some((cache, seq)))
     }
 
     fn build(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
         registry: Option<&'a VectorRegistry>,
+        l2: Option<(&'a GraphCache, u64)>,
     ) -> Self {
         Self {
             txn,
             plane,
             registry,
+            l2,
             nodes: RefCell::new(HashMap::new()),
             edges: RefCell::new(HashMap::new()),
             adjacency: RefCell::new(HashMap::new()),
@@ -266,44 +288,58 @@ impl GraphReader for CachedReader<'_> {
     }
 
     fn node(&self, id: NodeId) -> Result<Option<Arc<NodeRecord>>> {
-        use std::collections::hash_map::Entry;
-        // One borrow + one hash probe (vs get-then-insert). Holding the
-        // borrow_mut across the storage read is safe: the read touches
-        // `self.txn`, never re-enters this cache (single-threaded execution).
-        match self.nodes.borrow_mut().entry(id) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
-            Entry::Vacant(e) => {
-                let v = graph::get_node(self.txn, self.plane, id)?.map(Arc::new);
-                Ok(e.insert(v).clone())
-            }
+        if let Some(v) = self.nodes.borrow().get(&id) {
+            return Ok(v.clone()); // L1 (per-query), including a cached miss
         }
+        if let Some((cache, seq)) = self.l2
+            && let Some(node) = cache.node(id.0, seq)
+        {
+            self.nodes.borrow_mut().insert(id, Some(node.clone()));
+            return Ok(Some(node)); // L2 (cross-query, seq-valid)
+        }
+        let v = graph::get_node(self.txn, self.plane, id)?.map(Arc::new);
+        if let (Some((cache, seq)), Some(node)) = (self.l2, &v) {
+            cache.put_node(id.0, seq, node.clone()); // only existing records
+        }
+        self.nodes.borrow_mut().insert(id, v.clone());
+        Ok(v)
     }
 
     fn edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
-        use std::collections::hash_map::Entry;
-        match self.edges.borrow_mut().entry(id) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
-            Entry::Vacant(e) => {
-                let v = graph::get_edge(self.txn, self.plane, id)?.map(Arc::new);
-                Ok(e.insert(v).clone())
-            }
+        if let Some(v) = self.edges.borrow().get(&id) {
+            return Ok(v.clone());
         }
+        if let Some((cache, seq)) = self.l2
+            && let Some(edge) = cache.edge(id.0, seq)
+        {
+            self.edges.borrow_mut().insert(id, Some(edge.clone()));
+            return Ok(Some(edge));
+        }
+        let v = graph::get_edge(self.txn, self.plane, id)?.map(Arc::new);
+        if let (Some((cache, seq)), Some(edge)) = (self.l2, &v) {
+            cache.put_edge(id.0, seq, edge.clone());
+        }
+        self.edges.borrow_mut().insert(id, v.clone());
+        Ok(v)
     }
 
     fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Arc<[Neighbor]>> {
-        use std::collections::hash_map::Entry;
-        match self
-            .adjacency
-            .borrow_mut()
-            .entry((id, dir, ty.map(str::to_string)))
-        {
-            Entry::Occupied(e) => Ok(e.get().clone()),
-            Entry::Vacant(e) => {
-                let v: Arc<[Neighbor]> =
-                    graph::neighbors(self.txn, self.plane, id, dir, ty)?.into();
-                Ok(e.insert(v).clone())
-            }
+        let key = (id, dir, ty.map(str::to_string));
+        if let Some(v) = self.adjacency.borrow().get(&key) {
+            return Ok(v.clone());
         }
+        if let Some((cache, seq)) = self.l2
+            && let Some(a) = cache.adj(id.0, dir, ty, seq)
+        {
+            self.adjacency.borrow_mut().insert(key, a.clone());
+            return Ok(a);
+        }
+        let a: Arc<[Neighbor]> = graph::neighbors(self.txn, self.plane, id, dir, ty)?.into();
+        if let Some((cache, seq)) = self.l2 {
+            cache.put_adj(id.0, dir, ty, seq, a.clone());
+        }
+        self.adjacency.borrow_mut().insert(key, a.clone());
+        Ok(a)
     }
 
     fn scan_all(&self) -> Result<Vec<NodeId>> {
@@ -497,6 +533,31 @@ mod tests {
         let plan = traversal_plan(seed);
         assert_eq!(heads(&uncached, &plan), heads(&cached, &plan));
         assert_eq!(heads(&uncached, &plan), heads(&cached, &plan));
+    }
+
+    #[test]
+    fn l2_shares_decoded_arcs_at_same_seq() {
+        use crate::index::VectorRegistry;
+        let (eng, seed) = dense_graph(50, 3);
+        let txn = eng.begin_read().unwrap();
+        let cache = GraphCache::new(1 << 20);
+        let reg = VectorRegistry::new();
+
+        // Two independent readers at the same seq: the second's node comes
+        // from L2, so it's the *same* decoded Arc — proof of a cross-query hit.
+        let r1 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7);
+        let n1 = r1.node(seed).unwrap().unwrap();
+        let r2 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7);
+        let n2 = r2.node(seed).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&n1, &n2), "same seq ⇒ L2 hit ⇒ shared Arc");
+        assert!(cache.weighted_size() > 0);
+
+        // A reader at a newer seq must NOT get the stale entry: seq mismatch is
+        // a miss, so it re-decodes a fresh Arc (snapshot isolation).
+        let r3 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 8);
+        let n3 = r3.node(seed).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&n1, &n3), "newer seq ⇒ miss ⇒ fresh decode");
+        assert_eq!(*n1, *n3, "same underlying record, just re-decoded");
     }
 
     /// A chunky property map so postcard decode on read is non-trivial — the

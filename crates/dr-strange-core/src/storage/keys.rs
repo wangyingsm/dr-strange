@@ -19,6 +19,9 @@ pub const META_NEXT_EDGE_ID: &[u8] = b"next_edge_id";
 pub const META_NEXT_PLANE_ID: &[u8] = b"next_plane_id";
 pub const META_NEXT_LABEL_ID: &[u8] = b"next_label_id";
 pub const META_NEXT_EDGE_TYPE_ID: &[u8] = b"next_edge_type_id";
+/// Monotonic commit sequence (arch/02 §3): bumped inside every write txn, so a
+/// reader reads it from its own snapshot — the cache's version stamp.
+pub const META_COMMIT_SEQ: &[u8] = b"commit_seq";
 
 /// Vector-index declarations live in `meta`, keyed
 /// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag.

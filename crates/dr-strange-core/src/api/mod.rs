@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::RwLock;
 
-use crate::cache::{CachedReader, GraphReader};
+use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
@@ -43,18 +43,23 @@ impl Engine {
         }
     }
 
-    /// Runs `f` in a write transaction and commits iff it succeeded.
+    /// Runs `f` in a write transaction and commits iff it succeeded. Every
+    /// committed write bumps the commit sequence (arch/02 §3) so the cache's
+    /// version stamp advances — coarse invalidation: any write logically
+    /// flushes the cache for subsequent snapshots.
     fn with_write<T>(&self, f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>) -> Result<T> {
         match self {
             Engine::Memory(e) => {
                 let mut txn = e.begin_write()?;
                 let out = f(&mut txn)?;
+                graph::bump_commit_seq(&mut txn)?;
                 txn.commit()?;
                 Ok(out)
             }
             Engine::Redb(e) => {
                 let mut txn = e.begin_write()?;
                 let out = f(&mut txn)?;
+                graph::bump_commit_seq(&mut txn)?;
                 txn.commit()?;
                 Ok(out)
             }
@@ -64,12 +69,19 @@ impl Engine {
 
 /// An embedded dr-strange database. Cheap to share behind `&`; all reads run
 /// on stable snapshots; writes serialize on the backend's single writer.
+/// Cross-query decoded-object cache budget (arch/02 §4). Modest by default —
+/// embedded-library ethos; a host can size it up when it wants to.
+const CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct Database {
     engine: Engine,
     /// In-memory vector indexes (arch/01 §5). Rebuilt from the KV on open;
     /// read-locked during queries, write-locked at commit to apply the
     /// coherence events a write transaction buffered.
     indexes: RwLock<VectorRegistry>,
+    /// Cross-query, seq-stamped decoded-record cache (arch/02 §3). Memory-only;
+    /// rebuilt cold on open, so it never holds durable state.
+    cache: GraphCache,
 }
 
 impl std::fmt::Debug for Database {
@@ -103,7 +115,14 @@ impl Database {
         Ok(Self {
             engine,
             indexes: RwLock::new(registry),
+            cache: GraphCache::new(CACHE_BYTES),
         })
+    }
+
+    /// The current commit sequence (arch/02 §3) — the web UI's change token.
+    /// Reads it from a fresh snapshot.
+    pub fn commit_seq(&self) -> Result<u64> {
+        self.engine.with_read(|txn| graph::read_commit_seq(txn))
     }
 
     fn indexes(&self) -> std::sync::RwLockReadGuard<'_, VectorRegistry> {
@@ -575,7 +594,10 @@ impl WriteTxn<'_> {
         graph::remove_edge_prop(self.txn(), plane, id, key)
     }
 
-    pub fn commit(self) -> Result<()> {
+    pub fn commit(mut self) -> Result<()> {
+        // Bump the commit sequence inside the txn (arch/02 §3) so it commits
+        // atomically with the data — advances the cache's version stamp.
+        graph::bump_commit_seq(self.txn())?;
         let WriteTxn {
             db,
             plane,
@@ -833,8 +855,12 @@ impl<'db> QueryBuilder<'db> {
         // memoizes decoded records/adjacency for this one query (arch/02): a
         // revisit-heavy traversal decodes each hot node once, not per visit.
         let registry = self.plane.db.indexes();
+        let cache = &self.plane.db.cache;
         self.plane.db.engine.with_read(|txn| {
-            let reader = CachedReader::with_registry(txn, self.plane.id(), &registry);
+            // The snapshot's commit seq, read from the same txn — so it's
+            // consistent with what this reader sees, the L2 version stamp.
+            let seq = graph::read_commit_seq(txn)?;
+            let reader = CachedReader::with_cache(txn, self.plane.id(), &registry, cache, seq);
             f(&reader)
         })
     }

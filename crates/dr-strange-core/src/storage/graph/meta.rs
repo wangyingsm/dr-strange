@@ -42,6 +42,7 @@ pub fn init(txn: &mut dyn WriteTransaction) -> Result<()> {
             put_u64(txn, keys::META_NEXT_PLANE_ID, 1)?;
             put_u64(txn, keys::META_NEXT_LABEL_ID, 1)?;
             put_u64(txn, keys::META_NEXT_EDGE_TYPE_ID, 1)?;
+            put_u64(txn, keys::META_COMMIT_SEQ, 0)?;
             write_plane(
                 txn,
                 PlaneId::STARTUP,
@@ -84,6 +85,23 @@ pub(super) fn get_u64(txn: &dyn ReadTransaction, key: &[u8]) -> Result<Option<u6
 
 pub(super) fn put_u64(txn: &mut dyn WriteTransaction, key: &[u8], v: u64) -> Result<()> {
     txn.put(TableId::Meta, key, &v.to_be_bytes())
+}
+
+/// The current commit sequence, read from `txn`'s snapshot (arch/02 §3). Absent
+/// ⇒ 0 (a pre-commit-seq database). Because it lives in the KV, a reader's seq
+/// is always consistent with the storage snapshot it sees — the cache's
+/// version stamp with no separate coordination.
+pub fn read_commit_seq(txn: &dyn ReadTransaction) -> Result<u64> {
+    Ok(get_u64(txn, keys::META_COMMIT_SEQ)?.unwrap_or(0))
+}
+
+/// Advances the commit sequence by one, within the caller's write txn (so it
+/// commits atomically with the data). Returns the new value. Called once per
+/// committed write, so any change bumps the stamp the cache versions against.
+pub fn bump_commit_seq(txn: &mut dyn WriteTransaction) -> Result<u64> {
+    let next = read_commit_seq(txn)? + 1;
+    put_u64(txn, keys::META_COMMIT_SEQ, next)?;
+    Ok(next)
 }
 
 /// Allocates the next id from a meta counter, one meta write per call. Used
