@@ -73,6 +73,35 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7700")]
         addr: SocketAddr,
     },
+    /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
+    #[cfg(feature = "digest")]
+    Digest {
+        /// Document to digest (text / markdown).
+        file: PathBuf,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Write the result (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+        /// OpenAI-compatible base URL (OpenAI, gateways, ollama, llama.cpp).
+        #[arg(long, default_value = "https://api.openai.com/v1")]
+        base_url: String,
+        /// Chat model used for extraction.
+        #[arg(long, default_value = "gpt-4o-mini")]
+        model: String,
+        /// Embedding model.
+        #[arg(long, default_value = "text-embedding-3-small")]
+        embed_model: String,
+        /// Environment variable holding the API key.
+        #[arg(long, default_value = "OPENAI_API_KEY")]
+        api_key_env: String,
+        /// Target chunk size in characters.
+        #[arg(long, default_value_t = 4000)]
+        chunk_chars: usize,
+        /// Skip embedding generation.
+        #[arg(long)]
+        no_embed: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +211,33 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             // Hands off to the web crate, which owns its own async runtime and
             // blocks until Ctrl-C; `out` is unused (the server logs itself).
             dr_strange_web::serve(db, Some(cli.db.clone()), addr)
+        }
+        #[cfg(feature = "digest")]
+        Command::Digest {
+            file,
+            plane,
+            apply,
+            base_url,
+            model,
+            embed_model,
+            api_key_env,
+            chunk_chars,
+            no_embed,
+        } => {
+            let db = commands::open(&cli.db)?;
+            commands::digest(
+                &db,
+                &plane,
+                &file,
+                apply,
+                &base_url,
+                &model,
+                &embed_model,
+                &api_key_env,
+                chunk_chars,
+                !no_embed,
+                out,
+            )
         }
     }
 }

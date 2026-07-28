@@ -159,6 +159,96 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+// ---- digest (LLM ingest, arch/07) ----------------------------------------
+
+/// Digests a document into the plane: an LLM extracts entities/relations
+/// (grounded on the plane's catalog), they're embedded and stamped with
+/// provenance, and — only with `apply` — written through the bulk path.
+/// Dry-run by default (arch/07 §2: proposals, not mutations).
+#[cfg(feature = "digest")]
+#[allow(clippy::too_many_arguments)]
+pub fn digest(
+    db: &Database,
+    plane_name: &str,
+    file: &Path,
+    apply: bool,
+    base_url: &str,
+    model: &str,
+    embed_model: &str,
+    api_key_env: &str,
+    chunk_chars: usize,
+    embed: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let doc =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let source = file
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.display().to_string());
+    let api_key = std::env::var(api_key_env).unwrap_or_default();
+
+    let provider = dr_strange_llm::OpenAiProvider::new(base_url, api_key, model, embed_model);
+    let p = plane(db, plane_name)?;
+    let catalog = p.catalog()?;
+    let run_id = format!(
+        "{}-{}",
+        source,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let opts = dr_strange_llm::DigestOptions {
+        source,
+        model: model.to_string(),
+        run_id,
+        chunk_chars,
+        embed,
+    };
+
+    let result = dr_strange_llm::digest(&doc, &provider, &provider, Some(&catalog), &opts)?;
+    let r = &result.report;
+    writeln!(
+        out,
+        "digest: {} chunks → {} entities, {} relations ({} dangling dropped)",
+        r.chunks, r.entities, r.relations, r.dropped_relations
+    )?;
+    writeln!(
+        out,
+        "  {} chat request(s); tokens {} in / {} out / {} embed",
+        r.chat_requests, r.input_tokens, r.output_tokens, r.embed_tokens
+    )?;
+
+    if apply {
+        let mut txn = p.write()?;
+        let stats = result.apply(&mut txn)?;
+        txn.commit()?;
+        writeln!(
+            out,
+            "applied: wrote {} nodes, {} edges",
+            stats.nodes, stats.edges
+        )?;
+        if embed {
+            writeln!(
+                out,
+                "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"
+            )?;
+        }
+    } else {
+        for n in result.nodes.iter().take(12) {
+            writeln!(out, "  [{}] {} ({} props)", n.label, n.key, n.props.len())?;
+        }
+        if result.nodes.len() > 12 {
+            writeln!(out, "  … and {} more", result.nodes.len() - 12)?;
+        }
+        writeln!(out, "dry run — re-run with --apply to write")?;
+    }
+    Ok(())
+}
+
 // ---- import / export -----------------------------------------------------
 
 /// An edge endpoint reference in the JSONL: `{prefix}_key` (external key) or
