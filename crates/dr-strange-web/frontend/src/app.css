@@ -48,7 +48,7 @@ h1 {
   margin: 0;
   font-size: 1.5rem;
   letter-spacing: -0.02em;
-  flex: 1 1 0; /* left flank — equal to nav so .tools centers between them */
+  flex: 0 0 auto;
 }
 
 h2 {
@@ -149,7 +149,7 @@ h2 {
 nav {
   display: flex;
   gap: 0.25rem;
-  flex: 1 1 0; /* right flank — mirrors h1 so the centered tools stay centered */
+  flex-basis: 100%; /* wrap onto its own line under the search/controls */
   justify-content: flex-end;
 }
 nav button {
@@ -167,11 +167,26 @@ nav button.active {
   border-color: var(--border);
 }
 
-/* ---- header tools: plane picker + search ---- */
-.tools {
+/* ---- header: centered search + right-aligned controls ---- */
+.search {
+  position: relative;
+  flex: 1 1 16rem; /* grow to fill the middle of the top row */
+}
+.search input {
+  font: inherit;
+  font-size: 0.9rem;
+  width: 100%;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+}
+.right-controls {
   display: flex;
   align-items: center;
   gap: 0.6rem;
+  margin-left: auto; /* pin plane picker + semantic toggle to the right */
 }
 .plane-pick {
   display: flex;
@@ -182,47 +197,22 @@ nav button.active {
   letter-spacing: 0.06em;
   color: var(--muted);
 }
-.plane-pick select,
-.search input {
+.right-controls select {
   font: inherit;
+  font-size: 0.82rem;
   background: var(--panel);
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 0.35rem 0.6rem;
+  padding: 0.3rem 0.45rem;
 }
-.plane-pick select {
-  font-size: 0.85rem;
-}
-.search {
-  position: relative;
-}
-.search-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-.search input {
-  font-size: 0.9rem;
-  width: 26rem;
-  max-width: 46vw;
-}
-.search .sem {
+.right-controls .sem {
   display: flex;
   align-items: center;
   gap: 0.3rem;
   font-size: 0.78rem;
   color: var(--muted);
   white-space: nowrap;
-}
-.search-row select {
-  font: inherit;
-  font-size: 0.8rem;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.3rem 0.45rem;
 }
 .search .results .note {
   margin: 0.3rem 0.5rem;

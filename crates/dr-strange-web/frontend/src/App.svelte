@@ -68,34 +68,15 @@
 <header>
   <h1>dr-strange</h1>
 
-  <div class="tools">
-    <label class="plane-pick">
-      Plane
-      <select bind:value={plane}>
-        {#each planes as p (p.id)}<option value={p.name}>{p.name}</option>{/each}
-        {#if !planes.length}<option value={plane}>{plane}</option>{/if}
-      </select>
-    </label>
-
-    <div class="search">
-      <div class="search-row">
-        <input
-          type="search"
-          placeholder={semantic ? 'Search by meaning…' : 'Search this plane…'}
-          bind:value={q}
-          onkeydown={(e) => e.key === 'Escape' && (q = '')}
-        />
-        <label class="sem" title="Rank nodes by embedding similarity instead of substring matching">
-          <input type="checkbox" bind:checked={semantic} /> semantic
-        </label>
-        {#if semantic}
-          <select bind:value={embedProvider} title="Embedding provider (must match how the plane was embedded)">
-            {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
-          </select>
-        {/if}
-      </div>
-      {#if results}
-        <div class="results">
+  <div class="search">
+    <input
+      type="search"
+      placeholder={semantic ? 'Search by meaning…' : 'Search this plane…'}
+      bind:value={q}
+      onkeydown={(e) => e.key === 'Escape' && (q = '')}
+    />
+    {#if results}
+      <div class="results">
           {#if results.error}
             <p class="empty">{results.error}</p>
           {:else if !results.nodes.length && !results.edges?.length}
@@ -137,7 +118,24 @@
           {/if}
         </div>
       {/if}
-    </div>
+  </div>
+
+  <div class="right-controls">
+    <label class="plane-pick">
+      Plane
+      <select bind:value={plane}>
+        {#each planes as p (p.id)}<option value={p.name}>{p.name}</option>{/each}
+        {#if !planes.length}<option value={plane}>{plane}</option>{/if}
+      </select>
+    </label>
+    <label class="sem" title="Rank nodes by embedding similarity instead of substring matching">
+      <input type="checkbox" bind:checked={semantic} /> semantic
+    </label>
+    {#if semantic}
+      <select bind:value={embedProvider} title="Embedding provider (must match how the plane was embedded)">
+        {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+      </select>
+    {/if}
   </div>
 
   <nav>
