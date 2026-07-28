@@ -355,6 +355,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(miss["result"]["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(miss["result"]["edges"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn plane_find_matches_edges_by_type() {
+        let (db, alice, bob) = seeded_graph(); // alice -KNOWS-> bob
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"know"},"id":1}"#,
+        )
+        .unwrap();
+        // No node has "know" in it; the KNOWS edge does.
+        assert_eq!(resp["result"]["nodes"].as_array().unwrap().len(), 0);
+        let edges = resp["result"]["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["type"], "KNOWS");
+        assert_eq!(edges[0]["match"], "type");
+        assert_eq!(edges[0]["src"], alice);
+        assert_eq!(edges[0]["dst"], bob);
     }
 
     #[test]

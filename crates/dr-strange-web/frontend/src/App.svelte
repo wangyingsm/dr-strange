@@ -43,7 +43,16 @@
   })
 
   function openNode(n) {
-    focus = { id: n.id, nonce: ++nonce }
+    focus = { kind: 'node', id: n.id, nonce: ++nonce }
+    goExplore()
+  }
+
+  function openEdge(e) {
+    focus = { kind: 'edge', edge: e, nonce: ++nonce }
+    goExplore()
+  }
+
+  function goExplore() {
     view = 'explore'
     results = null
     q = ''
@@ -73,24 +82,39 @@
         <div class="results">
           {#if results.error}
             <p class="empty">{results.error}</p>
-          {:else if !results.nodes.length}
+          {:else if !results.nodes.length && !results.edges?.length}
             <p class="empty">no matches</p>
           {:else}
-            <ul>
-              {#each results.nodes as n (n.id)}
-                <li>
-                  <button onclick={() => openNode(n)}>
-                    <span class="k">{n.external_key ?? `#${n.id}`}</span>
-                    <span class="l">{n.labels?.join(', ')}</span>
-                    <span class="m">{n.match}</span>
-                  </button>
-                </li>
-              {/each}
-            </ul>
+            {#if results.nodes.length}
+              <p class="group">Nodes</p>
+              <ul>
+                {#each results.nodes as n (n.id)}
+                  <li>
+                    <button onclick={() => openNode(n)}>
+                      <span class="k">{n.external_key ?? `#${n.id}`}</span>
+                      <span class="l">{n.labels?.join(', ')}</span>
+                      <span class="m">{n.match}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+            {#if results.edges?.length}
+              <p class="group">Edges</p>
+              <ul>
+                {#each results.edges as e (e.id)}
+                  <li>
+                    <button onclick={() => openEdge(e)}>
+                      <span class="k">{e.type}</span>
+                      <span class="l">#{e.src} → #{e.dst}</span>
+                      <span class="m">{e.match}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
             {#if results.truncated}
-              <p class="empty">
-                first {results.nodes.length} shown · more exist (scanned {results.scanned}/{results.total})
-              </p>
+              <p class="empty">more matches exist (scanned {results.scanned}/{results.total} nodes)</p>
             {/if}
           {/if}
         </div>

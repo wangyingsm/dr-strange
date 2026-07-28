@@ -216,6 +216,13 @@ nav button.active {
   overflow: auto;
   padding: 0.25rem;
 }
+.search .results .group {
+  margin: 0.35rem 0.5rem 0.15rem;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
 .search .results ul {
   list-style: none;
   margin: 0;

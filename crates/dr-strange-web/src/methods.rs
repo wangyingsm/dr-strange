@@ -309,49 +309,86 @@ pub struct Find {
     limit: Option<usize>,
 }
 
-/// `plane.find` — text search over the plane: a case-insensitive substring
-/// match against each node's external key, labels, and string property values.
-/// There is no text index (arch/03), so this is a linear scan, capped at
-/// [`FIND_SCAN_CAP`] nodes and [`limit`] results. Each hit carries a `match`
-/// hint (which field matched) so the UI can show *why* it surfaced.
+/// `plane.find` — text search over the plane. Nodes match on external key,
+/// labels, and string property values; edges match on type and string property
+/// values. Both hit `match` hints (which field matched) so the UI can show
+/// *why* something surfaced. There is no text index (arch/03), so this is a
+/// linear scan capped at [`FIND_SCAN_CAP`] nodes / edges and [`limit`] results
+/// each; `truncated` says whether either cap cut the results short.
 pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Find = params(p)?;
     let needle = req.q.trim().to_lowercase();
     let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
     if needle.is_empty() {
-        return Ok(jval!({ "nodes": [], "scanned": 0, "total": 0, "truncated": false }));
+        return Ok(
+            jval!({ "nodes": [], "edges": [], "scanned": 0, "total": 0, "truncated": false }),
+        );
     }
 
     let plane = app(ctx.db.plane(&req.plane))?;
     let all = app(plane.query().scan_all().nodes())?;
     let total = all.len();
 
-    let mut hits = Vec::new();
+    // ---- nodes ----
+    let mut node_hits = Vec::new();
     let mut examined = 0usize;
-    for n in all {
+    for n in &all {
         if examined >= FIND_SCAN_CAP {
             break;
         }
         examined += 1;
-        if let Some(hint) = match_node(&n, &needle) {
-            let mut obj = json::node_to_json(&n);
+        if let Some(hint) = match_node(n, &needle) {
+            let mut obj = json::node_to_json(n);
             if let Value::Object(map) = &mut obj {
                 map.insert("match".into(), Value::String(hint));
             }
-            hits.push(obj);
-            if hits.len() >= limit {
+            node_hits.push(obj);
+            if node_hits.len() >= limit {
                 break;
+            }
+        }
+    }
+    let nodes_truncated = examined < total;
+
+    // ---- edges ----
+    // The core has no edge scan, so walk each node's outgoing hops (as
+    // `graph.seed` does), dedup by edge id, and match the edge record.
+    let mut edge_hits = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut edges_examined = 0usize;
+    let mut edges_truncated = false;
+    'walk: for n in &all {
+        for hop in app(plane.neighbors(n.id, Dir::Out, None))? {
+            if !seen.insert(hop.edge.0) {
+                continue;
+            }
+            if edges_examined >= FIND_SCAN_CAP {
+                edges_truncated = true;
+                break 'walk;
+            }
+            edges_examined += 1;
+            if let Some(edge) = app(plane.edge(hop.edge))?
+                && let Some(hint) = match_edge(&edge, &needle)
+            {
+                let mut obj = edge_to_json(&edge);
+                if let Value::Object(map) = &mut obj {
+                    map.insert("match".into(), Value::String(hint));
+                }
+                edge_hits.push(obj);
+                if edge_hits.len() >= limit {
+                    edges_truncated = true;
+                    break 'walk;
+                }
             }
         }
     }
 
     Ok(jval!({
-        "nodes": hits,
+        "nodes": node_hits,
+        "edges": edge_hits,
         "scanned": examined,
         "total": total,
-        // We stopped before scanning the whole plane (result cap or scan cap),
-        // so there may be more matches than shown.
-        "truncated": examined < total,
+        "truncated": nodes_truncated || edges_truncated,
     }))
 }
 
@@ -369,6 +406,22 @@ fn match_node(n: &NodeRecord, needle: &str) -> Option<String> {
         return Some(format!("label: {l}"));
     }
     for (k, pd) in &n.properties {
+        if let dr_strange_core::PropValue::Str(s) = &pd.value
+            && s.to_lowercase().contains(needle)
+        {
+            return Some(format!("{k}: {}", snippet(s)));
+        }
+    }
+    None
+}
+
+/// Like [`match_node`] but for an edge: matches its type, then string property
+/// values. `None` if `needle` (already lowercased) occurs in neither.
+fn match_edge(e: &EdgeRecord, needle: &str) -> Option<String> {
+    if e.ty.to_lowercase().contains(needle) {
+        return Some("type".into());
+    }
+    for (k, pd) in &e.properties {
         if let dr_strange_core::PropValue::Str(s) = &pd.value
             && s.to_lowercase().contains(needle)
         {

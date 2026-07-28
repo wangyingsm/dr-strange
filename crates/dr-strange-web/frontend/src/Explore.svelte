@@ -117,6 +117,33 @@
     }
   }
 
+  // Center an edge (from header search): show both endpoints + their
+  // neighborhoods and select the edge itself.
+  async function focusEdge(edge) {
+    error = null
+    try {
+      const [src, dst] = await Promise.all([
+        rpc('node.get', { plane, id: edge.src }),
+        rpc('node.get', { plane, id: edge.dst }),
+      ])
+      plot.clear()
+      plot.addSubgraph({ nodes: [src, dst].filter(Boolean), edges: [edge] })
+      for (const id of [edge.src, edge.dst]) {
+        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both' }), id)
+      }
+      legend = plot.legendEntries()
+      selected = { kind: 'edge', data: edge }
+      status = `focused ${edge.type}: ${src?.external_key ?? `#${edge.src}`} → ${dst?.external_key ?? `#${edge.dst}`}`
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  async function applyFocus() {
+    if (focus.kind === 'edge') await focusEdge(focus.edge)
+    else await focusNode(focus.id)
+  }
+
   // Re-seed when the current plane changes (order-independent: whoever runs
   // first — onMount or the effect below — seeds once, the other no-ops).
   async function reseed() {
@@ -131,7 +158,7 @@
   async function maybeFocus() {
     if (!started || !focus || focus.nonce === appliedFocus) return
     appliedFocus = focus.nonce
-    await focusNode(focus.id)
+    await applyFocus()
   }
 
   onMount(async () => {
@@ -149,11 +176,11 @@
     })
     started = true
     if (focus) {
-      // Arrived here from a search hit — go straight to that node's
+      // Arrived here from a search hit — go straight to that node/edge's
       // neighborhood instead of seeding (then discarding) the whole plane.
       seededPlane = plane
       appliedFocus = focus.nonce
-      await focusNode(focus.id)
+      await applyFocus()
     } else {
       await reseed()
     }
