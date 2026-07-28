@@ -131,6 +131,7 @@
       for (const id of [edge.src, edge.dst]) {
         plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both' }), id)
       }
+      plot.selectEdge(edge.id) // keep the found edge lit
       legend = plot.legendEntries()
       selected = { kind: 'edge', data: edge }
       status = `focused ${edge.type}: ${src?.external_key ?? `#${edge.src}`} → ${dst?.external_key ?? `#${edge.dst}`}`

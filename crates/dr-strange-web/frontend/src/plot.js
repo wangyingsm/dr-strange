@@ -70,6 +70,7 @@ export class Plot {
     this.legend = new Map()
     this.container = container
     this.hoveredEdge = null
+    this.selectedEdge = null // persists (unlike hover) while an edge is selected
 
     // Labels are canvas-drawn, so CSS variables don't reach them — read the
     // OS theme directly and keep them legible on both backgrounds.
@@ -93,21 +94,30 @@ export class Plot {
       // clickable pixels and the hit falls through to the stage. Give edges a
       // floor thickness so they can actually be selected/hovered.
       minEdgeThickness: 3.5,
-      // Highlight the edge under the cursor so its clickable region is
-      // obvious — thicker, amber, with its type label forced visible.
+      // Highlight the hovered OR selected edge — thicker, amber, with its type
+      // label forced visible. Hover makes the clickable region obvious; the
+      // selected edge stays lit so a click/search focus is visible.
       edgeReducer: (edge, data) =>
-        edge === this.hoveredEdge
+        edge === this.hoveredEdge || edge === this.selectedEdge
           ? { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
           : data,
     })
 
-    this.sigma.on('clickNode', ({ node }) =>
-      handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record')),
-    )
-    this.sigma.on('clickEdge', ({ edge }) =>
-      handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record')),
-    )
-    this.sigma.on('clickStage', () => handlers.onClearSelection?.())
+    this.sigma.on('clickNode', ({ node }) => {
+      this.selectedEdge = null // a node click supersedes any edge selection
+      this.sigma.refresh()
+      handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record'))
+    })
+    this.sigma.on('clickEdge', ({ edge }) => {
+      this.selectedEdge = edge
+      this.sigma.refresh()
+      handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record'))
+    })
+    this.sigma.on('clickStage', () => {
+      this.selectedEdge = null
+      this.sigma.refresh()
+      handlers.onClearSelection?.()
+    })
 
     // Recolour labels if the OS theme flips while the plot is open.
     media.addEventListener('change', () => {
@@ -137,6 +147,13 @@ export class Plot {
   clear() {
     this.graph.clear()
     this.legend.clear()
+    this.selectedEdge = null
+  }
+
+  /** Highlight an edge by its record id (search focus uses this). */
+  selectEdge(id) {
+    this.selectedEdge = 'e' + id
+    this.sigma.refresh()
   }
 
   /**

@@ -199,8 +199,8 @@ nav button.active {
 }
 .search input {
   font-size: 0.9rem;
-  width: 16rem;
-  max-width: 42vw;
+  width: 30rem;
+  max-width: 55vw;
 }
 .search .results {
   position: absolute;
