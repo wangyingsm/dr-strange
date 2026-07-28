@@ -3,6 +3,14 @@
 //! `word/document.xml` and stripping its tags. The extracted text is what the
 //! digest pipeline sees — imperfect docx/pdf extraction is fine, the LLM
 //! tolerates it.
+//!
+//! Logging note: `pdf-extract` emits per-glyph font/unicode diagnostics through
+//! the `log` crate — some at `warn!` (e.g. "unknown glyph name"), the noisiest
+//! at `debug!`. We install no logger, so they're dropped today. If a
+//! tracing/log subscriber is ever added, filter the `pdf_extract` target down
+//! to `error`/off, or a broken-font PDF will flood the logs (and a synchronous
+//! subscriber would slow extraction). 0.7 used raw `println!`, which saturated
+//! stdout and made large PDFs appear to hang; the 0.12 bump ended that.
 
 use std::io::{Cursor, Read};
 

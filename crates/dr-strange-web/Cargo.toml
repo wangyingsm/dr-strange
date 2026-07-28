@@ -15,8 +15,14 @@ serde_json = "1"
 anyhow = "1"
 rust-embed = "8"
 mime_guess = "2"
-# Server-side document text extraction for the digest page.
-pdf-extract = "0.7"
+# Server-side document text extraction for the digest page. 0.7 emitted its
+# per-glyph font/unicode warnings with raw `println!`, flooding stdout on PDFs
+# with broken unicode maps — extraction slowed to a crawl (a perceived hang).
+# 0.12 routes them through the `log` crate instead (some at `warn!`), so there
+# are no raw writes regardless of logging. NOTE: if we later add tracing, filter
+# the `pdf_extract` target to `error`/off (e.g. EnvFilter "info,pdf_extract=error")
+# or those per-glyph warns will flood the logs again. See extract.rs.
+pdf-extract = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
