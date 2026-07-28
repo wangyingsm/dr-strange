@@ -139,3 +139,160 @@ h2 {
 .empty {
   color: var(--muted);
 }
+
+/* ---- nav ---- */
+nav {
+  margin-left: auto;
+  display: flex;
+  gap: 0.25rem;
+}
+nav button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  padding: 0.35rem 0.8rem;
+  border-radius: 8px;
+  font: inherit;
+  cursor: pointer;
+}
+nav button.active {
+  color: var(--fg);
+  background: var(--panel);
+  border-color: var(--border);
+}
+
+.row {
+  margin-bottom: 1rem;
+}
+
+/* ---- explore controls ---- */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.controls select,
+.controls button {
+  font: 14px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+.controls .status {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- plot canvas ---- */
+.canvas-wrap {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.canvas {
+  width: 100%;
+  height: min(72vh, 760px);
+}
+
+.legend {
+  position: absolute;
+  left: 0.75rem;
+  bottom: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  max-height: 40%;
+  overflow: auto;
+}
+.legend .swatch {
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.legend .swatch::before {
+  content: '';
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--c);
+  flex: none;
+}
+
+.inspector {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  width: min(300px, 42%);
+  max-height: calc(100% - 1.5rem);
+  overflow: auto;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+}
+.inspector h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1rem;
+}
+.inspector .key {
+  margin: 0 0 0.2rem;
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.inspector .sub {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.inspector dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
+.inspector dt {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.inspector dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.inspector .badge {
+  margin-left: 0.2rem;
+  cursor: help;
+  opacity: 0.7;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-top: 0.6rem;
+}

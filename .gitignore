@@ -1,1 +1,5 @@
 /target
+
+# Local database files created by drsg / just serve.
+*.drsg
+*.drsg.jsonl

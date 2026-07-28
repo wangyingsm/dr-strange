@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use dr_strange_core::{Database, Dir, LogicalPlan, Metric, NodeId, NodeRecord, json};
+use dr_strange_core::{Database, Dir, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord, json};
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
 
@@ -51,6 +51,19 @@ fn parse_dir(s: Option<&str>) -> Dir {
 /// Node records with an optional similarity/traversal score folded in as a
 /// `score` field — mirrors the MCP `scored_rows` shape so plots (chunk 2) can
 /// size/colour by score without a second call.
+/// An edge record as a JSON object — the counterpart to `json::node_to_json`
+/// (which the core provides), kept here since the core's dialect has no edge
+/// form yet. The plot merges these into its graph model alongside nodes.
+fn edge_to_json(e: &EdgeRecord) -> Value {
+    jval!({
+        "id": e.id.0,
+        "src": e.src.0,
+        "dst": e.dst.0,
+        "type": e.ty,
+        "properties": json::properties_to_json(&e.properties),
+    })
+}
+
 fn scored_rows(rows: &[(NodeRecord, Option<f32>)]) -> Value {
     Value::Array(
         rows.iter()
@@ -213,4 +226,117 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         .query_from_plan(plan)
         .scored_nodes())?;
     Ok(scored_rows(&rows))
+}
+
+// ---- graph-plot subgraph methods (chunk 2, arch/08 §2.2) ------------------
+
+/// The default node cap for a seeded view — the plot never asks the core for
+/// an unbounded dump (arch/08 §2.2, "cursors throughout").
+const SEED_LIMIT: u64 = 200;
+/// The default fan-out cap for one click-to-expand (hub-safe expansion).
+const EXPAND_LIMIT: u64 = 100;
+
+#[derive(Deserialize)]
+pub struct Seed {
+    plane: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `graph.seed` — an initial canvas: up to `limit` nodes (optionally of one
+/// label) plus the edges induced among exactly that node set. `total` is the
+/// full unfiltered node count so the UI can say how much was left off.
+pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Seed = params(p)?;
+    let limit = req.limit.unwrap_or(SEED_LIMIT);
+    let plane = app(ctx.db.plane(&req.plane))?;
+
+    let all_ids = match &req.label {
+        Some(label) => app(plane.query().scan_label(label.clone()).ids())?,
+        None => app(plane.query().scan_all().ids())?,
+    };
+    let total = all_ids.len();
+    let ids: Vec<NodeId> = all_ids.into_iter().take(limit as usize).collect();
+    let set: std::collections::BTreeSet<u64> = ids.iter().map(|n| n.0).collect();
+
+    let mut nodes = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if let Some(node) = app(plane.node(*id))? {
+            nodes.push(json::node_to_json(&node));
+        }
+    }
+
+    // Induced edges: walk each in-set node's outgoing hops and keep those
+    // whose destination is also in the set (each undirected edge is captured
+    // exactly once, from its source). Dedup by edge id defensively.
+    let mut seen_edges = std::collections::BTreeSet::new();
+    let mut edges = Vec::new();
+    for id in &ids {
+        for hop in app(plane.neighbors(*id, Dir::Out, None))? {
+            if set.contains(&hop.node.0)
+                && seen_edges.insert(hop.edge.0)
+                && let Some(edge) = app(plane.edge(hop.edge))?
+            {
+                edges.push(edge_to_json(&edge));
+            }
+        }
+    }
+
+    Ok(jval!({
+        "nodes": nodes,
+        "edges": edges,
+        "total": total,
+        "truncated": total > ids.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct Expand {
+    plane: String,
+    id: u64,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default, rename = "type")]
+    edge_type: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `graph.expand` — hub-safe neighbourhood expansion around one node: the
+/// neighbour node records plus the connecting edge records, capped at `limit`
+/// hops. `total` is the full incident count so the UI can offer "N more…".
+pub fn graph_expand(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Expand = params(p)?;
+    let limit = req.limit.unwrap_or(EXPAND_LIMIT) as usize;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let dir = parse_dir(req.direction.as_deref());
+
+    let hops = app(plane.neighbors(NodeId(req.id), dir, req.edge_type.as_deref()))?;
+    let total = hops.len();
+
+    let mut seen_nodes = std::collections::BTreeSet::new();
+    let mut seen_edges = std::collections::BTreeSet::new();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for hop in hops.into_iter().take(limit) {
+        if seen_nodes.insert(hop.node.0)
+            && let Some(node) = app(plane.node(hop.node))?
+        {
+            nodes.push(json::node_to_json(&node));
+        }
+        if seen_edges.insert(hop.edge.0)
+            && let Some(edge) = app(plane.edge(hop.edge))?
+        {
+            edges.push(edge_to_json(&edge));
+        }
+    }
+
+    Ok(jval!({
+        "nodes": nodes,
+        "edges": edges,
+        "total": total,
+        "truncated": total > limit,
+    }))
 }

@@ -158,6 +158,8 @@ fn dispatch_method(ctx: &Ctx<'_>, method: &str, params: Value) -> Result<Value, 
         "plane.neighbors" => methods::plane_neighbors(ctx, params),
         "plane.search" => methods::plane_search(ctx, params),
         "plane.query" => methods::plane_query(ctx, params),
+        "graph.seed" => methods::graph_seed(ctx, params),
+        "graph.expand" => methods::graph_expand(ctx, params),
         other => Err(RpcError::method_not_found(other)),
     }
 }
@@ -176,6 +178,24 @@ mod tests {
             .unwrap();
         txn.commit().unwrap();
         db
+    }
+
+    /// An in-memory DB with alice —KNOWS→ bob on the startup plane; returns
+    /// the two node ids so tests need not assume the id base.
+    fn seeded_graph() -> (Database, u64, u64) {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let alice = txn
+            .create_node_with_key("alice", &["Person"], Properties::new())
+            .unwrap();
+        let bob = txn
+            .create_node_with_key("bob", &["Person"], Properties::new())
+            .unwrap();
+        txn.create_edge(alice, bob, "KNOWS", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        (db, alice.0, bob.0)
     }
 
     fn call(db: &Database, body: &str) -> Option<Value> {
@@ -299,6 +319,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn graph_seed_returns_induced_subgraph() {
+        let (db, _, _) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 2);
+        // The alice→bob edge is induced (both endpoints in the set).
+        assert_eq!(r["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(r["edges"][0]["type"], "KNOWS");
+        assert_eq!(r["total"], 2);
+        assert_eq!(r["truncated"], false);
+    }
+
+    #[test]
+    fn graph_seed_respects_limit_and_reports_total() {
+        let (db, _, _) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup","limit":1},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(r["total"], 2);
+        assert_eq!(r["truncated"], true);
+    }
+
+    #[test]
+    fn graph_expand_returns_neighbor_and_edge() {
+        let (db, alice, bob) = seeded_graph();
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"graph.expand","params":{{"plane":"startup","id":{alice},"direction":"out"}},"id":1}}"#
+        );
+        let resp = call(&db, &body).unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(r["nodes"][0]["id"], bob);
+        assert_eq!(r["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(r["total"], 1);
     }
 
     #[test]
