@@ -22,6 +22,48 @@ function colorFor(label, legend) {
 
 const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
 
+// A theme-aware replacement for sigma's default node-hover drawer, whose label
+// box is hardcoded white (invisible light text on it in dark mode). Same box
+// geometry as the default; only the fill + label color are themed. `label` and
+// `bg` are getters read on every hover, so it tracks live theme changes.
+function drawNodeHover(label, bg) {
+  return (context, data, settings) => {
+    const { labelSize: size, labelFont: font, labelWeight: weight } = settings
+    context.font = `${weight} ${size}px ${font}`
+    context.fillStyle = bg()
+    context.shadowOffsetX = 0
+    context.shadowOffsetY = 0
+    context.shadowBlur = 8
+    context.shadowColor = '#000'
+    const PADDING = 2
+    if (typeof data.label === 'string') {
+      const boxWidth = Math.round(context.measureText(data.label).width + 5)
+      const boxHeight = Math.round(size + 2 * PADDING)
+      const radius = Math.max(data.size, size / 2) + PADDING
+      const angle = Math.asin(boxHeight / 2 / radius)
+      const dx = Math.sqrt(Math.abs(radius ** 2 - (boxHeight / 2) ** 2))
+      context.beginPath()
+      context.moveTo(data.x + dx, data.y + boxHeight / 2)
+      context.lineTo(data.x + radius + boxWidth, data.y + boxHeight / 2)
+      context.lineTo(data.x + radius + boxWidth, data.y - boxHeight / 2)
+      context.lineTo(data.x + dx, data.y - boxHeight / 2)
+      context.arc(data.x, data.y, radius, angle, -angle)
+      context.closePath()
+      context.fill()
+    } else {
+      context.beginPath()
+      context.arc(data.x, data.y, data.size + PADDING, 0, Math.PI * 2)
+      context.closePath()
+      context.fill()
+    }
+    context.shadowBlur = 0
+    if (data.label) {
+      context.fillStyle = label()
+      context.fillText(data.label, data.x + data.size + 3, data.y + size / 3)
+    }
+  }
+}
+
 export class Plot {
   constructor(container, handlers = {}) {
     this.graph = new Graph({ type: 'directed', multi: true })
@@ -34,6 +76,9 @@ export class Plot {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
     const nodeLabel = () => (media.matches ? '#e8e8ee' : '#1a1a1e')
     const edgeLabel = () => (media.matches ? '#9ca3af' : '#6b7280')
+    // Hover-label box: sigma's default paints it hardcoded white, hiding our
+    // light dark-mode label text. Match the panel background per theme instead.
+    const hoverBg = () => (media.matches ? '#26262e' : '#ffffff')
 
     this.sigma = new Sigma(this.graph, container, {
       defaultEdgeType: 'arrow',
@@ -41,6 +86,7 @@ export class Plot {
       renderEdgeLabels: true,
       labelColor: { color: nodeLabel() },
       edgeLabelColor: { color: edgeLabel() },
+      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg),
       labelDensity: 0.5,
       labelRenderedSizeThreshold: 5,
       // Edge picking reads a downsized framebuffer, so a thin edge has no

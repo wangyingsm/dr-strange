@@ -16,15 +16,22 @@
   let error = $state(null)
   let vectorView = $state(null) // { k, values } — floats popup, null = closed
 
-  // Flatten a properties object (values are raw or `{ $desc, $value }`), then
-  // sink underscore-prefixed provenance/internal props to the bottom — each
-  // group keeps its original order.
+  // Flatten a properties object (values are raw, `{ $desc, $value }`, or an
+  // embedding `{ $vector: [...] }`), then sink underscore-prefixed
+  // provenance/internal props to the bottom — each group keeps its order.
   function propEntries(props) {
-    const entries = Object.entries(props ?? {}).map(([k, v]) =>
-      v && typeof v === 'object' && '$value' in v
-        ? { k, v: v.$value, desc: v.$desc }
-        : { k, v, desc: null },
-    )
+    const entries = Object.entries(props ?? {}).map(([k, raw]) => {
+      let v = raw
+      let desc = null
+      if (v && typeof v === 'object' && '$value' in v) {
+        desc = v.$desc
+        v = v.$value
+      }
+      if (v && typeof v === 'object' && Array.isArray(v.$vector)) {
+        v = v.$vector // unwrap embeddings so they collapse to a button
+      }
+      return { k, v, desc }
+    })
     const inner = entries.filter((e) => e.k.startsWith('_'))
     const outer = entries.filter((e) => !e.k.startsWith('_'))
     return [...outer, ...inner]

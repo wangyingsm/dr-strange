@@ -26,8 +26,16 @@
         method: 'POST',
         body: buf,
       })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'extraction failed')
+      // The server may answer with a non-JSON error body (e.g. a 413 when the
+      // upload is too large), so read text and parse defensively.
+      const raw = await res.text()
+      let data = {}
+      try {
+        data = raw ? JSON.parse(raw) : {}
+      } catch {
+        // leave data empty; fall back to the raw body as the message
+      }
+      if (!res.ok) throw new Error(data.error || raw || `extraction failed (${res.status})`)
       text = data.text
       proposal = null
       status = `extracted ${data.chars} chars from ${file.name}`

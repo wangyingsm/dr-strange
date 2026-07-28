@@ -12,7 +12,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -26,6 +26,12 @@ use crate::rpc;
 /// How often a WebSocket connection pushes a fresh `db.stats` snapshot. The
 /// dashboard renders these live (arch/08 §2.1).
 const STATS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Upload ceiling for `/digest/extract` and `/rpc`. axum defaults to 2 MiB,
+/// which rejects real PDFs (and digest.write payloads carrying embeddings)
+/// with a plain-text "Failed to buffer the request body" before the handler
+/// ever runs. 64 MiB is generous for a document + its vectors.
+const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// Everything the request handlers share. `Arc`-wrapped and cheap to clone
 /// into each blocking task.
@@ -48,6 +54,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .fallback(static_handler)
         .with_state(state)
 }
