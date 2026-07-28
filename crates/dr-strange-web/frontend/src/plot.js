@@ -71,6 +71,7 @@ export class Plot {
     this.container = container
     this.hoveredEdge = null
     this.selectedEdge = null // persists (unlike hover) while an edge is selected
+    this.selectedNode = null // the selected node, shown focused in the graph
 
     // Labels are canvas-drawn, so CSS variables don't reach them — read the
     // OS theme directly and keep them legible on both backgrounds.
@@ -101,20 +102,29 @@ export class Plot {
         edge === this.hoveredEdge || edge === this.selectedEdge
           ? { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
           : data,
+      // The selected node renders focused: `highlighted` routes it through the
+      // (themed) hover box, plus a size bump — its category color is kept.
+      nodeReducer: (node, data) =>
+        node === this.selectedNode
+          ? { ...data, highlighted: true, forceLabel: true, size: (data.size ?? 5) * 1.35, zIndex: 1 }
+          : data,
     })
 
     this.sigma.on('clickNode', ({ node }) => {
+      this.selectedNode = node
       this.selectedEdge = null // a node click supersedes any edge selection
       this.sigma.refresh()
       handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record'))
     })
     this.sigma.on('clickEdge', ({ edge }) => {
       this.selectedEdge = edge
+      this.selectedNode = null
       this.sigma.refresh()
       handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record'))
     })
     this.sigma.on('clickStage', () => {
       this.selectedEdge = null
+      this.selectedNode = null
       this.sigma.refresh()
       handlers.onClearSelection?.()
     })
@@ -148,11 +158,20 @@ export class Plot {
     this.graph.clear()
     this.legend.clear()
     this.selectedEdge = null
+    this.selectedNode = null
   }
 
   /** Highlight an edge by its record id (search focus uses this). */
   selectEdge(id) {
     this.selectedEdge = 'e' + id
+    this.selectedNode = null
+    this.sigma.refresh()
+  }
+
+  /** Highlight a node by its id (click-expand and search focus use this). */
+  selectNode(id) {
+    this.selectedNode = String(id)
+    this.selectedEdge = null
     this.sigma.refresh()
   }
 

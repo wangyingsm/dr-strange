@@ -109,6 +109,7 @@
       plot.addSubgraph({ nodes: [node], edges: [] })
       const sg = await rpc('graph.expand', { plane, id, direction: 'both' })
       plot.addSubgraph(sg, id)
+      plot.selectNode(id) // keep the focused node lit
       legend = plot.legendEntries()
       selected = { kind: 'node', data: node }
       status = `focused ${node.external_key ?? `#${id}`} · +${sg.nodes.length} neighbors`
