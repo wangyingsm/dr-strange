@@ -83,18 +83,30 @@ enum Command {
         /// Write the result (default is a dry-run preview).
         #[arg(long)]
         apply: bool,
-        /// OpenAI-compatible base URL (OpenAI, gateways, ollama, llama.cpp).
-        #[arg(long, default_value = "https://api.openai.com/v1")]
-        base_url: String,
-        /// Chat model used for extraction.
-        #[arg(long, default_value = "gpt-4o-mini")]
-        model: String,
-        /// Embedding model.
-        #[arg(long, default_value = "text-embedding-3-small")]
-        embed_model: String,
-        /// Environment variable holding the API key.
-        #[arg(long, default_value = "OPENAI_API_KEY")]
-        api_key_env: String,
+        /// Chat provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        chat: String,
+        /// Embedding provider: preset or a base URL (e.g. `qwen` for DeepSeek chat).
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        /// Chat model override (default: the chat provider's).
+        #[arg(long)]
+        model: Option<String>,
+        /// Embedding model override (default: the embed provider's).
+        #[arg(long)]
+        embed_model: Option<String>,
+        /// Chat base-URL override.
+        #[arg(long)]
+        chat_url: Option<String>,
+        /// Embedding base-URL override.
+        #[arg(long)]
+        embed_url: Option<String>,
+        /// Env var for the chat API key (default: the provider's).
+        #[arg(long)]
+        chat_key_env: Option<String>,
+        /// Env var for the embedding API key (default: the provider's).
+        #[arg(long)]
+        embed_key_env: Option<String>,
         /// Target chunk size in characters.
         #[arg(long, default_value_t = 4000)]
         chunk_chars: usize,
@@ -217,27 +229,34 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             file,
             plane,
             apply,
-            base_url,
+            chat,
+            embed,
             model,
             embed_model,
-            api_key_env,
+            chat_url,
+            embed_url,
+            chat_key_env,
+            embed_key_env,
             chunk_chars,
             no_embed,
         } => {
             let db = commands::open(&cli.db)?;
-            commands::digest(
-                &db,
-                &plane,
-                &file,
+            let args = commands::DigestArgs {
+                file: &file,
+                plane: &plane,
                 apply,
-                &base_url,
-                &model,
-                &embed_model,
-                &api_key_env,
                 chunk_chars,
-                !no_embed,
-                out,
-            )
+                embed: !no_embed,
+                chat_provider: &chat,
+                embed_provider: &embed,
+                model: model.as_deref(),
+                embed_model: embed_model.as_deref(),
+                chat_url: chat_url.as_deref(),
+                embed_url: embed_url.as_deref(),
+                chat_key_env: chat_key_env.as_deref(),
+                embed_key_env: embed_key_env.as_deref(),
+            };
+            commands::digest(&db, &args, out)
         }
     }
 }

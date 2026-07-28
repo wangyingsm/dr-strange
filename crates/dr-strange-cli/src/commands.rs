@@ -161,37 +161,101 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
 
 // ---- digest (LLM ingest, arch/07) ----------------------------------------
 
+/// Flags for [`digest`]. Chat and embeddings are configured separately so a
+/// document can be extracted by one provider and embedded by another (e.g.
+/// `--chat deepseek --embed qwen`, since DeepSeek has no embeddings endpoint).
+#[cfg(feature = "digest")]
+pub struct DigestArgs<'a> {
+    pub file: &'a Path,
+    pub plane: &'a str,
+    pub apply: bool,
+    pub chunk_chars: usize,
+    pub embed: bool,
+    /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
+    pub chat_provider: &'a str,
+    pub embed_provider: &'a str,
+    pub model: Option<&'a str>,
+    pub embed_model: Option<&'a str>,
+    pub chat_url: Option<&'a str>,
+    pub embed_url: Option<&'a str>,
+    pub chat_key_env: Option<&'a str>,
+    pub embed_key_env: Option<&'a str>,
+}
+
+/// Resolves a provider's base URL / key / model / embed-batch from a preset
+/// name (or raw base URL) plus optional overrides.
+#[cfg(feature = "digest")]
+fn resolve_provider(
+    name: &str,
+    url: Option<&str>,
+    model: Option<&str>,
+    key_env: Option<&str>,
+    embed: bool,
+) -> Result<(String, String, String, usize)> {
+    let p = dr_strange_llm::preset(name);
+    let base = url
+        .map(str::to_string)
+        .or_else(|| p.map(|p| p.base_url.to_string()))
+        .ok_or_else(|| {
+            anyhow!("unknown provider '{name}'; pass a base URL via --chat-url/--embed-url")
+        })?;
+    let key_env = key_env.or_else(|| p.map(|p| p.key_env)).unwrap_or("");
+    let key = if key_env.is_empty() {
+        String::new()
+    } else {
+        std::env::var(key_env).unwrap_or_default()
+    };
+    let default_model = p.map(|p| if embed { p.embed_model } else { p.chat_model });
+    let model = model
+        .or(default_model)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
+    Ok((base, key, model, batch))
+}
+
 /// Digests a document into the plane: an LLM extracts entities/relations
 /// (grounded on the plane's catalog), they're embedded and stamped with
 /// provenance, and — only with `apply` — written through the bulk path.
 /// Dry-run by default (arch/07 §2: proposals, not mutations).
 #[cfg(feature = "digest")]
-#[allow(clippy::too_many_arguments)]
-pub fn digest(
-    db: &Database,
-    plane_name: &str,
-    file: &Path,
-    apply: bool,
-    base_url: &str,
-    model: &str,
-    embed_model: &str,
-    api_key_env: &str,
-    chunk_chars: usize,
-    embed: bool,
-    out: &mut dyn Write,
-) -> Result<()> {
+pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let doc =
-        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let source = file
+    let doc = std::fs::read_to_string(args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    let source = args
+        .file
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file.display().to_string());
-    let api_key = std::env::var(api_key_env).unwrap_or_default();
+        .unwrap_or_else(|| args.file.display().to_string());
 
-    let provider = dr_strange_llm::OpenAiProvider::new(base_url, api_key, model, embed_model);
-    let p = plane(db, plane_name)?;
+    let (cb, ck, chat_model, _) = resolve_provider(
+        args.chat_provider,
+        args.chat_url,
+        args.model,
+        args.chat_key_env,
+        false,
+    )?;
+    let chat = dr_strange_llm::OpenAiProvider::new(cb, ck, &chat_model);
+
+    let (eb, ek, embed_model, ebatch) = resolve_provider(
+        args.embed_provider,
+        args.embed_url,
+        args.embed_model,
+        args.embed_key_env,
+        true,
+    )?;
+    if args.embed && embed_model.is_empty() {
+        bail!(
+            "embed provider '{}' has no embedding model — use --embed qwen|openai|ollama, --embed-model, or --no-embed",
+            args.embed_provider
+        );
+    }
+    let embedder =
+        dr_strange_llm::OpenAiProvider::new(eb, ek, embed_model).with_embed_batch(ebatch);
+
+    let p = plane(db, args.plane)?;
     let catalog = p.catalog()?;
     let run_id = format!(
         "{}-{}",
@@ -203,13 +267,13 @@ pub fn digest(
     );
     let opts = dr_strange_llm::DigestOptions {
         source,
-        model: model.to_string(),
+        model: chat_model,
         run_id,
-        chunk_chars,
-        embed,
+        chunk_chars: args.chunk_chars,
+        embed: args.embed,
     };
 
-    let result = dr_strange_llm::digest(&doc, &provider, &provider, Some(&catalog), &opts)?;
+    let result = dr_strange_llm::digest(&doc, &chat, &embedder, Some(&catalog), &opts)?;
     let r = &result.report;
     writeln!(
         out,
@@ -222,7 +286,7 @@ pub fn digest(
         r.chat_requests, r.input_tokens, r.output_tokens, r.embed_tokens
     )?;
 
-    if apply {
+    if args.apply {
         let mut txn = p.write()?;
         let stats = result.apply(&mut txn)?;
         txn.commit()?;
@@ -231,7 +295,7 @@ pub fn digest(
             "applied: wrote {} nodes, {} edges",
             stats.nodes, stats.edges
         )?;
-        if embed {
+        if args.embed {
             writeln!(
                 out,
                 "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"

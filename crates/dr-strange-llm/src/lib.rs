@@ -13,8 +13,10 @@
 
 mod digest;
 mod openai;
+mod preset;
 mod provider;
 
 pub use digest::{DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult, digest};
 pub use openai::OpenAiProvider;
+pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider};
