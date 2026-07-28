@@ -275,7 +275,8 @@ pub fn create_plane(
     Ok(id)
 }
 
-fn read_plane_name(txn: &dyn ReadTransaction, id: PlaneId) -> Result<Option<String>> {
+/// Reads a plane's `(name, properties)`; `None` if the plane doesn't exist.
+pub fn read_plane(txn: &dyn ReadTransaction, id: PlaneId) -> Result<Option<(String, Properties)>> {
     let Some(buf) = txn.get(TableId::Planes, &keys::plane_key(id))? else {
         return Ok(None);
     };
@@ -285,12 +286,51 @@ fn read_plane_name(txn: &dyn ReadTransaction, id: PlaneId) -> Result<Option<Stri
         .try_into()
         .expect("checked length");
     let name_len = u32::from_be_bytes(len_bytes) as usize;
+    let name_end = 4 + name_len;
     let name_bytes = buf
-        .get(4..4 + name_len)
+        .get(4..name_end)
         .ok_or_else(|| Error::Corrupt("truncated plane record".into()))?;
     let name = String::from_utf8(name_bytes.to_vec())
         .map_err(|_| Error::Corrupt("bad plane name".into()))?;
-    Ok(Some(name))
+    let props_bytes = buf
+        .get(name_end..)
+        .ok_or_else(|| Error::Corrupt("truncated plane record".into()))?;
+    let properties = codec::decode_props(props_bytes)?;
+    Ok(Some((name, properties)))
+}
+
+/// Replaces a plane's property map (arch/09 §3), keeping its name. Errors
+/// `NotFound` if the plane doesn't exist.
+pub fn set_plane_properties(
+    txn: &mut dyn WriteTransaction,
+    id: PlaneId,
+    props: &Properties,
+) -> Result<()> {
+    let (name, _) =
+        read_plane(txn, id)?.ok_or_else(|| Error::NotFound(format!("plane {}", id.0)))?;
+    write_plane(txn, id, &name, props)
+}
+
+/// Renames a plane (arch/09 §3), keeping its id and properties. Errors
+/// `PlaneExists` if the new name is taken, `NotFound` if the plane is
+/// absent, and `InvalidArgument` for the startup plane (whose name is an
+/// invariant). No-op if `new_name` equals the current name.
+pub fn rename_plane(txn: &mut dyn WriteTransaction, id: PlaneId, new_name: &str) -> Result<()> {
+    if id == PlaneId::STARTUP {
+        return Err(Error::InvalidArgument(
+            "the startup plane cannot be renamed".into(),
+        ));
+    }
+    let (old_name, props) =
+        read_plane(txn, id)?.ok_or_else(|| Error::NotFound(format!("plane {}", id.0)))?;
+    if old_name == new_name {
+        return Ok(());
+    }
+    if plane_id_by_name(txn, new_name)?.is_some() {
+        return Err(Error::PlaneExists(new_name.to_string()));
+    }
+    txn.delete(TableId::PlaneNames, &keys::plane_name_key(&old_name))?;
+    write_plane(txn, id, new_name, &props)
 }
 
 /// Deletes a plane and everything on it: every plane-scoped table is
@@ -302,7 +342,7 @@ pub fn drop_plane(txn: &mut dyn WriteTransaction, id: PlaneId) -> Result<()> {
             "the startup plane always exists and cannot be dropped".into(),
         ));
     }
-    let Some(name) = read_plane_name(txn, id)? else {
+    let Some((name, _)) = read_plane(txn, id)? else {
         return Ok(());
     };
 
@@ -1703,6 +1743,65 @@ mod tests {
             plane_id_by_name(&txn, DEFAULT_PLANE_NAME).unwrap(),
             Some(PlaneId::STARTUP)
         );
+    }
+
+    #[test]
+    fn plane_properties_and_rename() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+
+        let mut props = Properties::new();
+        props.insert(
+            "source".into(),
+            PropDesc::described("where this came from", PropValue::Str("arxiv".into())),
+        );
+        let p = create_plane(&mut txn, "paper-1", &props).unwrap();
+
+        // read back name + props
+        let (name, read_props) = read_plane(&txn, p).unwrap().unwrap();
+        assert_eq!(name, "paper-1");
+        assert_eq!(read_props, props);
+
+        // replace properties
+        let mut props2 = Properties::new();
+        props2.insert(
+            "status".into(),
+            PropDesc::new(PropValue::Str("merged".into())),
+        );
+        set_plane_properties(&mut txn, p, &props2).unwrap();
+        let (_, after) = read_plane(&txn, p).unwrap().unwrap();
+        assert_eq!(after, props2);
+
+        // rename: name lookup moves, id + props stay
+        rename_plane(&mut txn, p, "paper-1-final").unwrap();
+        assert_eq!(plane_id_by_name(&txn, "paper-1").unwrap(), None);
+        assert_eq!(plane_id_by_name(&txn, "paper-1-final").unwrap(), Some(p));
+        let (renamed, still) = read_plane(&txn, p).unwrap().unwrap();
+        assert_eq!(renamed, "paper-1-final");
+        assert_eq!(still, props2);
+
+        // rename to same name is a no-op
+        rename_plane(&mut txn, p, "paper-1-final").unwrap();
+
+        // errors: taken name, absent plane, startup, and props on absent plane
+        create_plane(&mut txn, "taken", &Properties::new()).unwrap();
+        assert!(matches!(
+            rename_plane(&mut txn, p, "taken"),
+            Err(Error::PlaneExists(_))
+        ));
+        assert!(matches!(
+            rename_plane(&mut txn, PlaneId(999), "x"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            rename_plane(&mut txn, PlaneId::STARTUP, "x"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            set_plane_properties(&mut txn, PlaneId(999), &Properties::new()),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

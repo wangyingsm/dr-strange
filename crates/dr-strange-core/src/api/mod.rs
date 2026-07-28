@@ -179,6 +179,39 @@ impl<'db> PlaneHandle<'db> {
         self.id
     }
 
+    /// This plane's name.
+    pub fn name(&self) -> Result<String> {
+        self.read_plane().map(|(name, _)| name)
+    }
+
+    /// This plane's own property map (arch/09 §2) — provenance, description,
+    /// etc. (Not the graph data; that's `node`/`query`.)
+    pub fn properties(&self) -> Result<Properties> {
+        self.read_plane().map(|(_, props)| props)
+    }
+
+    fn read_plane(&self) -> Result<(String, Properties)> {
+        self.db
+            .engine
+            .with_read(|txn| graph::read_plane(txn, self.id))?
+            .ok_or_else(|| Error::NotFound(format!("plane {}", self.id.0)))
+    }
+
+    /// Replaces this plane's property map (arch/09 §3).
+    pub fn set_properties(&self, props: Properties) -> Result<()> {
+        self.db
+            .engine
+            .with_write(|txn| graph::set_plane_properties(txn, self.id, &props))
+    }
+
+    /// Renames this plane (arch/09 §3); the handle's id is unchanged, so it
+    /// stays valid. Errors if the name is taken or this is the startup plane.
+    pub fn rename(&self, new_name: &str) -> Result<()> {
+        self.db
+            .engine
+            .with_write(|txn| graph::rename_plane(txn, self.id, new_name))
+    }
+
     /// Fetches one node with decoded labels and properties; `None` if the id
     /// does not exist in this plane.
     pub fn node(&self, id: NodeId) -> Result<Option<NodeRecord>> {

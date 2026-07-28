@@ -217,6 +217,53 @@ fn new_plane_supports_full_slice_and_carries_props() {
 }
 
 #[test]
+fn plane_name_properties_and_rename_via_api() {
+    let db = Database::in_memory().unwrap();
+    let plane = db
+        .create_plane(
+            "run-1",
+            [(
+                "model".to_string(),
+                PropDesc::new(PropValue::Str("gpt".into())),
+            )]
+            .into(),
+        )
+        .unwrap();
+
+    assert_eq!(plane.name().unwrap(), "run-1");
+    assert_eq!(
+        plane.properties().unwrap().get("model").map(|p| &p.value),
+        Some(&PropValue::Str("gpt".into()))
+    );
+
+    // replace properties
+    plane
+        .set_properties(
+            [(
+                "status".to_string(),
+                PropDesc::new(PropValue::Str("done".into())),
+            )]
+            .into(),
+        )
+        .unwrap();
+    let props = plane.properties().unwrap();
+    assert!(props.contains_key("status") && !props.contains_key("model"));
+
+    // rename: handle id stays valid, new name resolves
+    plane.rename("run-1-final").unwrap();
+    assert_eq!(plane.name().unwrap(), "run-1-final");
+    assert_eq!(db.plane("run-1-final").unwrap().id(), plane.id());
+    assert!(matches!(db.plane("run-1").unwrap_err(), Error::NotFound(_)));
+
+    // startup can't be renamed
+    let startup = db.plane("startup").unwrap();
+    assert!(matches!(
+        startup.rename("nope").unwrap_err(),
+        Error::InvalidArgument(_)
+    ));
+}
+
+#[test]
 fn handles_have_useful_debug_output() {
     let db = Database::in_memory().unwrap();
     assert!(format!("{db:?}").contains("memory"));

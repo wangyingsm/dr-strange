@@ -50,12 +50,17 @@ pub fn plane_drop(db: &Database, name: &str, out: &mut dyn Write) -> Result<()> 
 }
 
 pub fn plane_show(db: &Database, name: &str, out: &mut dyn Write) -> Result<()> {
-    let cat = plane(db, name)?.catalog()?;
+    let p = plane(db, name)?;
+    let props = p.properties()?;
+    let cat = p.catalog()?;
     writeln!(
         out,
         "plane '{name}': {} nodes, {} edges",
         cat.node_count, cat.edge_count
     )?;
+    if !props.is_empty() {
+        writeln!(out, "  properties: {}", jsonio::properties_to_json(&props))?;
+    }
     for (label, stats) in &cat.labels {
         writeln!(out, "  label {label}: {} nodes", stats.count)?;
     }
