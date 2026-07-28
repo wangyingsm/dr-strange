@@ -293,6 +293,74 @@ nav button.active {
   cursor: help;
   opacity: 0.7;
 }
+.vec-btn {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 6px;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+}
+.vec-btn:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* ---- vector floats popup ---- */
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 45%, transparent);
+  z-index: 10;
+}
+.modal {
+  width: min(560px, 90%);
+  max-height: 80%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px color-mix(in srgb, #000 40%, transparent);
+  overflow: hidden;
+}
+.modal header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+.modal .close {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+.modal .close:hover {
+  color: var(--fg);
+}
+.modal .floats {
+  margin: 0;
+  padding: 0.8rem 0.9rem;
+  overflow: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
 
 .hint {
   color: var(--muted);

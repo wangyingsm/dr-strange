@@ -14,14 +14,33 @@
   let legend = $state([])
   let status = $state('')
   let error = $state(null)
+  let vectorView = $state(null) // { k, values } — floats popup, null = closed
 
-  // Flatten a properties object (values are raw or `{ $desc, $value }`).
+  // Flatten a properties object (values are raw or `{ $desc, $value }`), then
+  // sink underscore-prefixed provenance/internal props to the bottom — each
+  // group keeps its original order.
   function propEntries(props) {
-    return Object.entries(props ?? {}).map(([k, v]) =>
+    const entries = Object.entries(props ?? {}).map(([k, v]) =>
       v && typeof v === 'object' && '$value' in v
         ? { k, v: v.$value, desc: v.$desc }
         : { k, v, desc: null },
     )
+    const inner = entries.filter((e) => e.k.startsWith('_'))
+    const outer = entries.filter((e) => !e.k.startsWith('_'))
+    return [...outer, ...inner]
+  }
+
+  // A numeric array = an embedding vector; render a button, not 128+ floats.
+  const isVector = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')
+
+  // Pretty grid: fixed-width columns of 6 values, index-addressable via rows.
+  function formatVector(v) {
+    const cols = 6
+    const rows = []
+    for (let i = 0; i < v.length; i += cols) {
+      rows.push(v.slice(i, i + cols).map((x) => x.toFixed(5).padStart(10)).join(' '))
+    }
+    return rows.join('\n')
   }
 
   async function loadPlanes() {
@@ -144,10 +163,30 @@
       <dl>
         {#each propEntries(selected.data.properties) as pe (pe.k)}
           <dt title={pe.desc ?? ''}>{pe.k}{#if pe.desc}<span class="badge" title={pe.desc}>ℹ</span>{/if}</dt>
-          <dd>{typeof pe.v === 'string' ? pe.v : JSON.stringify(pe.v)}</dd>
+          <dd>
+            {#if isVector(pe.v)}
+              <button class="vec-btn" onclick={() => (vectorView = { k: pe.k, values: pe.v })}>
+                show vector ({pe.v.length} dims)
+              </button>
+            {:else}
+              {typeof pe.v === 'string' ? pe.v : JSON.stringify(pe.v)}
+            {/if}
+          </dd>
         {/each}
       </dl>
     </aside>
+  {/if}
+
+  {#if vectorView}
+    <div class="modal-backdrop">
+      <div class="modal">
+        <header>
+          <span>{vectorView.k} · {vectorView.values.length} dims</span>
+          <button class="close" onclick={() => (vectorView = null)}>×</button>
+        </header>
+        <pre class="floats">{formatVector(vectorView.values)}</pre>
+      </div>
+    </div>
   {/if}
 </div>
 
