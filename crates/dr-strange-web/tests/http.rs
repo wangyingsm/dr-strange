@@ -99,6 +99,8 @@ async fn serves_dashboard_and_rpc() {
     // /digest/extract accepts an upload well past axum's 2 MiB default limit —
     // real PDFs are larger, and the old default 413'd them (with a non-JSON
     // body) before the handler ran. 5 MiB of plain text extracts as UTF-8.
+    // The response is newline-delimited JSON (progress lines then the result);
+    // a .txt has no progress, so the final line carries {chars,text}.
     let big = "a".repeat(5 * 1024 * 1024);
     let extract = client
         .post(format!("{base}/digest/extract?name=big.txt"))
@@ -107,6 +109,8 @@ async fn serves_dashboard_and_rpc() {
         .await
         .unwrap();
     assert!(extract.status().is_success(), "large upload was rejected");
-    let body: Value = extract.json().await.unwrap();
+    let ndjson = extract.text().await.unwrap();
+    let last = ndjson.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    let body: Value = serde_json::from_str(last).unwrap();
     assert_eq!(body["chars"], big.len());
 }

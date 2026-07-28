@@ -13,12 +13,14 @@
   let status = $state('')
   let error = $state(null)
   let busy = $state(false)
+  let pct = $state(null) // extraction progress 0..100, null = no/indeterminate
 
   async function onFile(e) {
     const file = e.target.files?.[0]
     if (!file) return
     error = null
     busy = true
+    pct = null
     status = `extracting ${file.name}…`
     try {
       const buf = await file.arrayBuffer()
@@ -26,23 +28,55 @@
         method: 'POST',
         body: buf,
       })
-      // The server may answer with a non-JSON error body (e.g. a 413 when the
-      // upload is too large), so read text and parse defensively.
-      const raw = await res.text()
-      let data = {}
-      try {
-        data = raw ? JSON.parse(raw) : {}
-      } catch {
-        // leave data empty; fall back to the raw body as the message
+      // A non-2xx here is a pre-stream failure (e.g. a 413 when the upload is
+      // too large) with a non-streamed body — read it defensively.
+      if (!res.ok) {
+        const raw = await res.text()
+        let msg = raw
+        try {
+          msg = JSON.parse(raw).error || raw
+        } catch {
+          /* keep raw */
+        }
+        throw new Error(msg || `extraction failed (${res.status})`)
       }
-      if (!res.ok) throw new Error(data.error || raw || `extraction failed (${res.status})`)
-      text = data.text
+
+      // Success is a stream of newline-delimited JSON: progress lines then a
+      // final {chars,text} (or {error}). Parse it line by line to drive the bar.
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let done = null
+      for (;;) {
+        const { value, done: streamDone } = await reader.read()
+        if (streamDone) break
+        buffer += decoder.decode(value, { stream: true })
+        let nl
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl).trim()
+          buffer = buffer.slice(nl + 1)
+          if (!line) continue
+          const msg = JSON.parse(line)
+          if (msg.progress) {
+            const { page, total } = msg.progress
+            pct = total ? Math.round((page / total) * 100) : null
+            status = `extracting ${file.name}… page ${page}/${total}`
+          } else if (msg.error) {
+            throw new Error(msg.error)
+          } else if (msg.text !== undefined) {
+            done = msg
+          }
+        }
+      }
+      if (!done) throw new Error('extraction ended without a result')
+      text = done.text
       proposal = null
-      status = `extracted ${data.chars} chars from ${file.name}`
+      status = `extracted ${done.chars} chars from ${file.name}`
     } catch (err) {
       error = err.message
     } finally {
       busy = false
+      pct = null
       e.target.value = '' // allow re-selecting the same file
     }
   }
@@ -118,6 +152,11 @@
 
 {#if error}<p class="error">{error}</p>{/if}
 {#if status}<p class="status">{status}</p>{/if}
+{#if busy && pct !== null}
+  <div class="progress" role="progressbar" aria-valuenow={pct} aria-valuemin="0" aria-valuemax="100">
+    <div class="bar" style="width:{pct}%"></div>
+  </div>
+{/if}
 
 <textarea
   class="doc"

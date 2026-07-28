@@ -398,6 +398,20 @@ nav button.active {
   display: none;
 }
 
+.progress {
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  overflow: hidden;
+  margin: 0 0 0.75rem;
+}
+.progress .bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transition: width 0.2s ease;
+}
+
 textarea.doc {
   width: 100%;
   box-sizing: border-box;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
@@ -18,6 +18,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::Database;
 use serde_json::json;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::assets::static_handler;
 use crate::methods::{self, Ctx};
@@ -67,22 +69,44 @@ struct ExtractQuery {
 }
 
 /// `POST /digest/extract?name=doc.pdf` — the raw file bytes in the body,
-/// extracted text out (arch/07 digest page). No DB access; runs the
-/// (potentially slow) PDF/docx parsing on a blocking task.
+/// extracted text out (arch/07 digest page). No DB access; the (potentially
+/// slow) PDF/docx parsing runs on a blocking task.
+///
+/// The response is a stream of newline-delimited JSON objects so the digest
+/// page can show a progress bar during a long PDF extraction:
+///   `{"progress":{"page":3,"total":42}}`  — zero or more, as pages are parsed
+///   `{"chars":12345,"text":"…"}`          — the final result, or
+///   `{"error":"…"}`                       — a terminal failure
 async fn extract_http(Query(q): Query<ExtractQuery>, body: Bytes) -> Response {
-    let out =
-        tokio::task::spawn_blocking(move || crate::extract::extract_text(&q.name, &body)).await;
-    match out {
-        Ok(Ok(text)) => {
-            Json(json!({ "chars": text.chars().count(), "text": text })).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "extract task panicked").into_response(),
-    }
+    // Bounded channel: `blocking_send` applies backpressure if the client reads
+    // slowly, rather than buffering the whole document's progress in memory.
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+
+    tokio::task::spawn_blocking(move || {
+        let send = |v: serde_json::Value| {
+            let mut line = serde_json::to_vec(&v).unwrap_or_default();
+            line.push(b'\n');
+            // Err ⇒ the client hung up; nothing left to do but stop trying.
+            tx.blocking_send(Ok(Bytes::from(line))).is_ok()
+        };
+        // Scope the progress closure so its borrow of `send` ends before the
+        // final message is sent.
+        let result = {
+            let mut on_page = |page, total| {
+                send(json!({ "progress": { "page": page, "total": total } }));
+            };
+            crate::extract::extract_text_with_progress(&q.name, &body, &mut on_page)
+        };
+        match result {
+            Ok(text) => send(json!({ "chars": text.chars().count(), "text": text })),
+            Err(e) => send(json!({ "error": e.to_string() })),
+        };
+    });
+
+    Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
 }
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
