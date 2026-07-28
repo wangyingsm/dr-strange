@@ -197,10 +197,23 @@ Inherited from redb in v1:
 
 - Property-based tests: random operation sequences applied both to the real
   engine and to a naive in-memory model graph; states must match.
-- Crash-recovery: kill-during-commit harness over redb's guarantees, plus
-  vector-sidecar staleness recovery.
-- The in-memory `StorageEngine` backend keeps the full upper-layer test suite
-  fast.
+- **Crash-recovery (M5, deterministic — `tests/durability.rs`,
+  `tests/reopen.rs`):** a fault-injecting `StorageEngine` wrapper fails the
+  Nth mutating op or the commit, proving graph ops propagate a backend error
+  rather than half-applying, and that a failed commit is atomic (prior
+  committed state exactly intact). Plus reopen tests: closing and reopening
+  the redb file restores every layer — records, external keys, adjacency, the
+  HNSW index (rebuilt from the KV), the catalog, plane properties — matched
+  by a proptest of random batches with a reopen between each. An OS-level
+  SIGKILL test was considered and deferred (CI-flaky) in favour of the
+  deterministic approach.
+- **Benchmarks (M5 — `benches/graph.rs`, criterion):** insert / point-lookup /
+  1-&-2-hop expand (memory vs redb) and vector search (brute force vs HNSW) —
+  the numbers that gate the deferred moka cache and HNSW sidecar. External-DB
+  comparison (Kùzu/Neo4j) is a separate later effort.
+- The in-memory `StorageEngine` keeps the upper-layer suite fast. Its
+  committed snapshot is `Arc`-shared (M5), so a read is an O(1) pointer clone
+  and a write is copy-on-write — no longer a full deep copy per read.
 
 ## 8. Open questions
 

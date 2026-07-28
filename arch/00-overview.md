@@ -127,9 +127,15 @@ Each milestone ends with a working vertical slice, not a finished layer.
   query/catalog/index/stats/check) and `drsg-mcp` MCP server (rmcp SDK, stdio,
   10 tools over the core API). Shared JSON dialect in the core's feature-gated
   `json` module. `digest` deferred to its own design session (arch/07).
-- **M5 — hardening**: crash-recovery tests, benchmarks (vs Kùzu/Neo4j on
-  LDBC-ish workloads), API polish. Then decide v2: query language, custom
-  storage engine, network server.
+- **M5 — hardening** ✅: deterministic crash-recovery tests (fault-injecting
+  engine — error propagation + commit atomicity; redb reopen restores every
+  layer incl. the rebuilt HNSW index, with a reopen proptest); criterion
+  micro-benchmarks (insert/lookup/expand, brute-force vs HNSW); API polish
+  (plane rename + properties get/set). The benchmarks surfaced and fixed a
+  memory-snapshot deep-copy (now `Arc` copy-on-write). Deferred: external-DB
+  comparison (Kùzu/Neo4j), and — informed by the benchmarks — building the
+  moka `CachedReader` and the HNSW sidecar. Then decide v2: query language,
+  custom storage engine, network server.
 - **M6 — web UI v1**: `drsg serve` (JSON-RPC 2.0 backend) with dashboard and
   visual graph plots ([08-web-ui.md](08-web-ui.md)).
 

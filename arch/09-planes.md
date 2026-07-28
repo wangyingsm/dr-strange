@@ -55,7 +55,7 @@ MCP layer surfaces so an LLM can choose where to read and write.
 |---|---|---|
 | `create_plane(name, props)` | new empty canvas | O(1) |
 | `drop_plane(id)` | delete the canvas and everything on it | prefix range-delete per table + drop of its vector index files |
-| `rename / set properties` | metadata update | O(1) |
+| `rename / set properties` ✅ (M5) | metadata update — `PlaneHandle::rename` / `set_properties` / `properties` (startup can't be renamed) | O(1) |
 | `copy(selection, from, to)` | copy a subgraph into another plane: **new node/edge IDs**, `external_key`s carried along (they are the cross-plane identity thread) | O(selection) |
 | `move(selection, from, to)` | copy + delete; edges fully inside the selection move, edges crossing the selection boundary are dropped (reported to the caller) | O(selection) |
 | `merge(from…, to)` | v2, sits on `copy` + entity resolution (LLM layer proposes matches by external key / embedding similarity; core executes the copy plan) | — |
