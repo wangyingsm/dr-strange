@@ -40,7 +40,7 @@ const LINK_K: usize = 8;
 pub struct ExistingEntity {
     pub key: String,
     pub label: String,
-    pub summary: String,
+    pub description: String,
 }
 
 /// Supplies the existing entities most similar to a chunk's embedding, so the
@@ -79,14 +79,14 @@ impl CandidateSource for PlaneCandidates<'_> {
             .filter_map(|(n, _)| {
                 let key = n.external_key?; // only keyed nodes are linkable
                 let label = n.labels.into_iter().next().unwrap_or_default();
-                let summary = match n.properties.get("summary").map(|p| &p.value) {
+                let description = match n.properties.get("description").map(|p| &p.value) {
                     Some(PropValue::Str(s)) => s.clone(),
                     _ => String::new(),
                 };
                 Some(ExistingEntity {
                     key,
                     label,
-                    summary,
+                    description,
                 })
             })
             .collect())
@@ -268,7 +268,7 @@ pub fn digest(
             merge_props(&mut node.props, &e.properties);
             if let Some(d) = e.description {
                 node.props
-                    .entry("summary".into())
+                    .entry("description".into())
                     .or_insert_with(|| desc_prop(d));
             }
         }
@@ -280,7 +280,7 @@ pub fn digest(
                 let mut props = Properties::new();
                 merge_props(&mut props, &r.properties);
                 if let Some(d) = r.description {
-                    props.insert("summary".into(), desc_prop(d));
+                    props.insert("description".into(), desc_prop(d));
                 }
                 edges.push(DigestEdge {
                     src: r.src,
@@ -358,7 +358,7 @@ fn prop(value: PropValue) -> PropDesc {
 
 fn desc_prop(text: String) -> PropDesc {
     PropDesc {
-        description: Some("LLM-extracted summary".into()),
+        description: Some("LLM-extracted description".into()),
         value: PropValue::Str(text),
     }
 }
@@ -398,14 +398,22 @@ fn add_provenance(props: &mut Properties, opts: &DigestOptions) {
     stamp(props, "_run", "digest run id", &opts.run_id);
 }
 
+/// The text embedded for an entity: its key + label, then every string
+/// property (`key: value` per line, in the map's stable order). Provenance and
+/// the embedding itself aren't attached yet at this point in the pipeline, so
+/// only extracted content feeds the vector. Property order is deterministic
+/// (`Properties` is a `BTreeMap`), keeping the run-scoped dedup reproducible.
 fn embed_text(n: &DigestNode) -> String {
-    let summary = match n.props.get("summary").map(|p| &p.value) {
-        Some(PropValue::Str(s)) => s.as_str(),
-        _ => "",
-    };
-    format!("{} ({}): {}", n.key, n.label, summary)
-        .trim()
-        .to_string()
+    let mut s = format!("{} ({})", n.key, n.label);
+    for (k, pd) in &n.props {
+        if let PropValue::Str(v) = &pd.value {
+            let v = v.trim();
+            if !v.is_empty() {
+                s.push_str(&format!("\n{k}: {v}"));
+            }
+        }
+    }
+    s
 }
 
 fn dedup(texts: &[String]) -> (Vec<String>, Vec<usize>) {
@@ -464,7 +472,7 @@ fn system_prompt(link: bool) -> String {
     if link {
         p.push_str(
             "\nSome messages start with an \"EXISTING ENTITIES\" block listing nodes already in \
-             the graph as `key (Label): summary`. That block is CONTEXT, not text to extract from. \
+             the graph as `key (Label): description`. That block is CONTEXT, not text to extract from. \
              If the document refers to one of those entities, reuse its EXACT key so your output \
              attaches to that existing node — do not invent a variant key and do not restate its \
              properties. You may emit relations that reference those keys (to link new entities to \
@@ -486,8 +494,13 @@ fn existing_block(cands: &[ExistingEntity]) -> Option<String> {
          re-extract these):\n",
     );
     for e in cands {
-        let summary: String = e.summary.chars().take(160).collect();
-        s.push_str(&format!("- {} ({}): {}\n", e.key, e.label, summary.trim()));
+        let description: String = e.description.chars().take(160).collect();
+        s.push_str(&format!(
+            "- {} ({}): {}\n",
+            e.key,
+            e.label,
+            description.trim()
+        ));
     }
     Some(s)
 }
@@ -545,7 +558,7 @@ mod tests {
         let block = existing_block(&[ExistingEntity {
             key: "alice".into(),
             label: "Person".into(),
-            summary: "an engineer at Acme".into(),
+            description: "an engineer at Acme".into(),
         }])
         .unwrap();
         assert!(block.contains("EXISTING ENTITIES"));

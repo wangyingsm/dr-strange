@@ -44,11 +44,11 @@ fn digests_entities_relations_provenance_and_embeddings() {
     assert_eq!(result.report.dropped_relations, 1);
     assert_eq!(result.report.chat_requests, 1);
 
-    // Nodes carry label, extracted props, a summary, provenance, and a vector.
+    // Nodes carry label, extracted props, a description, provenance, and a vector.
     let alice = result.nodes.iter().find(|n| n.key == "alice").unwrap();
     assert_eq!(alice.label, "Person");
     assert!(matches!(&alice.props["role"].value, PropValue::Str(s) if s == "engineer"));
-    assert!(alice.props.contains_key("summary"));
+    assert!(alice.props.contains_key("description"));
     assert!(matches!(&alice.props["embedding"].value, PropValue::Vector(v) if v.len() == 8));
     for key in ["_source", "_model", "_run"] {
         assert!(alice.props.contains_key(key), "missing provenance {key}");
@@ -105,7 +105,7 @@ impl CandidateSource for AcmeExists {
         Ok(vec![ExistingEntity {
             key: "acme".into(),
             label: "Company".into(),
-            summary: "a robotics company".into(),
+            description: "a robotics company".into(),
         }])
     }
 }
