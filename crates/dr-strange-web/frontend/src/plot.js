@@ -20,10 +20,15 @@ function colorFor(label, legend) {
   return legend.get(key)
 }
 
+const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
+
 export class Plot {
   constructor(container, handlers = {}) {
     this.graph = new Graph({ type: 'directed', multi: true })
     this.legend = new Map()
+    this.container = container
+    this.hoveredEdge = null
+
     this.sigma = new Sigma(this.graph, container, {
       defaultEdgeType: 'arrow',
       enableEdgeEvents: true,
@@ -34,7 +39,14 @@ export class Plot {
       // clickable pixels and the hit falls through to the stage. Give edges a
       // floor thickness so they can actually be selected/hovered.
       minEdgeThickness: 3.5,
+      // Highlight the edge under the cursor so its clickable region is
+      // obvious — thicker, amber, with its type label forced visible.
+      edgeReducer: (edge, data) =>
+        edge === this.hoveredEdge
+          ? { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
+          : data,
     })
+
     this.sigma.on('clickNode', ({ node }) =>
       handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record')),
     )
@@ -42,6 +54,24 @@ export class Plot {
       handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record')),
     )
     this.sigma.on('clickStage', () => handlers.onClearSelection?.())
+
+    // Pointer cursor + edge highlight on hover.
+    this.sigma.on('enterNode', () => this._cursor('pointer'))
+    this.sigma.on('leaveNode', () => this._cursor(''))
+    this.sigma.on('enterEdge', ({ edge }) => {
+      this.hoveredEdge = edge
+      this._cursor('pointer')
+      this.sigma.refresh()
+    })
+    this.sigma.on('leaveEdge', () => {
+      this.hoveredEdge = null
+      this._cursor('')
+      this.sigma.refresh()
+    })
+  }
+
+  _cursor(value) {
+    this.container.style.cursor = value
   }
 
   clear() {
