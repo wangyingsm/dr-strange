@@ -15,6 +15,7 @@
   let error = $state(null)
   let busy = $state(false)
   let pct = $state(null) // extraction progress 0..100, null = no/indeterminate
+  let thinking = $state(false) // waiting on the (slow, indeterminate) LLM call
 
   async function onFile(e) {
     const file = e.target.files?.[0]
@@ -85,7 +86,8 @@
   async function preview() {
     error = null
     busy = true
-    status = 'running digest (calling the LLM)…'
+    thinking = true
+    status = 'summoning the LLM…'
     proposal = null
     try {
       proposal = await rpc('digest.run', {
@@ -103,6 +105,7 @@
       error = err.message
     } finally {
       busy = false
+      thinking = false
     }
   }
 
@@ -205,3 +208,31 @@
   (OPENAI_API_KEY / DEEPSEEK_API_KEY / DASHSCOPE_API_KEY). Write commits the previewed proposal
   with no second LLM call.
 </p>
+
+{#if thinking}
+  <div class="thinking-overlay">
+    <div class="thinking-box">
+      <svg
+        class="portal"
+        viewBox="0 0 64 64"
+        fill="none"
+        stroke="#d9a441"
+        stroke-width="2"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <g class="cw">
+          <circle cx="32" cy="32" r="30" />
+          <circle cx="32" cy="32" r="25.5" stroke-width="3" stroke-dasharray="1.2 3" />
+        </g>
+        <g class="ccw">
+          <rect x="16" y="16" width="32" height="32" />
+          <rect x="16" y="16" width="32" height="32" transform="rotate(45 32 32)" />
+          <circle cx="32" cy="32" r="11" />
+        </g>
+        <circle class="core" cx="32" cy="32" r="3.5" fill="#d9a441" stroke="none" />
+      </svg>
+      <p>{status}</p>
+    </div>
+  </div>
+{/if}

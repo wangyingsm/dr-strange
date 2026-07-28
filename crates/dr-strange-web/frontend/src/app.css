@@ -76,6 +76,67 @@ h1 {
     transform: rotate(360deg);
   }
 }
+@keyframes portal-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(0.6);
+  }
+}
+
+/* ---- "calling the LLM" overlay: a spinning magic circle ---- */
+.thinking-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+}
+.thinking-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+.thinking-box p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.portal {
+  width: 5.5rem;
+  height: 5.5rem;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, #d9a441 55%, transparent));
+}
+.portal .cw,
+.portal .ccw,
+.portal .core {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.portal .cw {
+  animation: spin 3s linear infinite;
+}
+.portal .ccw {
+  animation: spin 4.5s linear infinite reverse;
+}
+.portal .core {
+  animation: portal-pulse 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .portal .cw,
+  .portal .ccw,
+  .portal .core {
+    animation-duration: 0s;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .brand .logo .ticks {
     animation: none;
