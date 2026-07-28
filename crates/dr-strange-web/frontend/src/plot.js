@@ -29,10 +29,18 @@ export class Plot {
     this.container = container
     this.hoveredEdge = null
 
+    // Labels are canvas-drawn, so CSS variables don't reach them — read the
+    // OS theme directly and keep them legible on both backgrounds.
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const nodeLabel = () => (media.matches ? '#e8e8ee' : '#1a1a1e')
+    const edgeLabel = () => (media.matches ? '#9ca3af' : '#6b7280')
+
     this.sigma = new Sigma(this.graph, container, {
       defaultEdgeType: 'arrow',
       enableEdgeEvents: true,
       renderEdgeLabels: true,
+      labelColor: { color: nodeLabel() },
+      edgeLabelColor: { color: edgeLabel() },
       labelDensity: 0.5,
       labelRenderedSizeThreshold: 5,
       // Edge picking reads a downsized framebuffer, so a thin edge has no
@@ -54,6 +62,12 @@ export class Plot {
       handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record')),
     )
     this.sigma.on('clickStage', () => handlers.onClearSelection?.())
+
+    // Recolour labels if the OS theme flips while the plot is open.
+    media.addEventListener('change', () => {
+      this.sigma.setSetting('labelColor', { color: nodeLabel() })
+      this.sigma.setSetting('edgeLabelColor', { color: edgeLabel() })
+    })
 
     // Pointer cursor + edge highlight on hover.
     this.sigma.on('enterNode', () => this._cursor('pointer'))

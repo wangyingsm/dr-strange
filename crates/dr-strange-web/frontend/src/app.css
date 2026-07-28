@@ -1,23 +1,26 @@
 :root {
-  --bg: #fbfbfd;
+  /* Warm, low-contrast neutrals — softer than pure black/white. */
+  --bg: #f6f6f4;
   --panel: #ffffff;
-  --fg: #1a1a1e;
+  --fg: #23232a;
   --muted: #6b7280;
-  --border: #e5e7eb;
+  --border: #e6e4e0;
   --accent: #6d28d9;
-  --ok: #16a34a;
+  --ok: #15803d;
   color-scheme: light dark;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0e0e12;
-    --panel: #17171d;
-    --fg: #e6e6ea;
-    --muted: #9ca3af;
-    --border: #26262e;
-    --accent: #a78bfa;
-    --ok: #4ade80;
+    /* Slightly warm, not pure black; brighter muted for readable secondary
+       text, and a softer accent that doesn't glare. */
+    --bg: #16161c;
+    --panel: #1f1f27;
+    --fg: #ececf1;
+    --muted: #a6adbb;
+    --border: #30303c;
+    --accent: #b79cf6;
+    --ok: #5ed67f;
   }
 }
 
