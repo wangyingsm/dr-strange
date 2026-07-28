@@ -1,19 +1,25 @@
 //! Cache layer (arch/02): the read seam between storage and computation.
 //!
 //! The executor never touches storage directly — it reads through
-//! [`GraphReader`]. Two implementations are planned:
-//! - [`UncachedReader`] (this milestone, M2): a thin pass-through over a
-//!   storage read transaction, scoped to one plane.
-//! - `CachedReader` (later): moka W-TinyLFU over decoded records + adjacency
-//!   segments, with commit-sequence version stamping (arch/02 §3). Gated on
-//!   traversal benchmarks (arch/02 open-Q 1); the trait is shaped now so it
-//!   lands without touching executor code.
+//! [`GraphReader`]. Two implementations:
+//! - [`UncachedReader`]: a thin pass-through over a storage read transaction —
+//!   the always-correct baseline and the oracle for differential tests.
+//! - [`CachedReader`] (the query path's default): **per-query** memoization of
+//!   decoded `node`/`edge`/`neighbors` results, bound to one snapshot, dropped
+//!   at query end. A revisit-heavy traversal decodes each hot record once, not
+//!   per visit (measured up to ~3.8× on hot property-rich traversals; a slight
+//!   loss on broad low-revisit scans — the benchmark-gated call of arch/02 §5).
 //!
-//! Cacheable reads (`node`/`edge`/`neighbors`) already return `Arc`s, so the
-//! future cache serves shared clones and the trait signature never changes.
-//! Scans return owned `Vec`s — arch/02 §1 lists query/scan results as
-//! deliberately *not* cached.
+//! Deferred: the **persistent, cross-query** moka W-TinyLFU cache with
+//! commit-sequence version stamping (arch/02 §3–4), which needs a commit-seq
+//! subsystem built first. [`CommitSeq`] is its token, defined here already.
+//!
+//! Cacheable reads return `Arc`s, so a cache serves shared clones and the
+//! trait signature never changes. Scans return owned `Vec`s — arch/02 §1 lists
+//! query/scan results as deliberately *not* cached.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -95,6 +101,29 @@ fn brute_force_search<R: GraphReader + ?Sized>(
     Ok(top_k(items.into_iter(), k))
 }
 
+/// Shared `vector_search` body: use a declared index when it covers this exact
+/// `(label, property, metric)`; otherwise exact brute force. A `None` label
+/// means "whole plane", which per-label indexes can't answer, so that also
+/// brute-forces. Both readers delegate here so their behaviour is identical.
+#[allow(clippy::too_many_arguments)] // mirrors the GraphReader::vector_search arity it shares
+fn indexed_or_brute<R: GraphReader + ?Sized>(
+    reader: &R,
+    registry: Option<&VectorRegistry>,
+    plane: PlaneId,
+    label: Option<&str>,
+    property: &str,
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+) -> Result<Vec<Hit>> {
+    if let (Some(reg), Some(l)) = (registry, label)
+        && let Some(result) = reg.search(plane, l, property, query, metric, k)
+    {
+        return result;
+    }
+    brute_force_search(reader, label, property, query, metric, k)
+}
+
 /// Pass-through `GraphReader` over a storage read transaction (arch/02 §2).
 /// Every read hits storage and decodes fresh — the point of comparison the
 /// future cache must beat, and the always-correct baseline for differential
@@ -167,22 +196,154 @@ impl GraphReader for UncachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        // Use the declared index when it covers this exact (label, property,
-        // metric); otherwise fall back to exact brute force. A `None` label
-        // means "whole plane", which per-label indexes can't answer, so that
-        // also brute-forces.
-        if let (Some(reg), Some(l)) = (self.registry, label)
-            && let Some(result) = reg.search(self.plane, l, property, query, metric, k)
-        {
-            return result;
+        indexed_or_brute(
+            self,
+            self.registry,
+            self.plane,
+            label,
+            property,
+            query,
+            metric,
+            k,
+        )
+    }
+}
+
+/// Per-query memoizing [`GraphReader`] (arch/02): decoded `node`/`edge`/
+/// `neighbors` results are cached for the life of one query, so a multi-hop
+/// traversal that revisits a node decodes it once, not once per visit. Bound
+/// to a single storage snapshot (one read txn), so it needs no MVCC
+/// invalidation — the whole reader, and its caches, are dropped at query end.
+///
+/// Scans (`scan_all`/`scan_label`) and key lookups pass through uncached
+/// (arch/02 §1: query/scan results are deliberately not cached). Interior
+/// mutability (`RefCell`) is safe: query execution is single-threaded.
+/// Adjacency cache key: a node's neighbours in a direction, optionally
+/// filtered to one edge type.
+type AdjKey = (NodeId, Dir, Option<String>);
+
+pub struct CachedReader<'a> {
+    txn: &'a dyn ReadTransaction,
+    plane: PlaneId,
+    registry: Option<&'a VectorRegistry>,
+    nodes: RefCell<HashMap<NodeId, Option<Arc<NodeRecord>>>>,
+    edges: RefCell<HashMap<EdgeId, Option<Arc<EdgeRecord>>>>,
+    adjacency: RefCell<HashMap<AdjKey, Arc<[Neighbor]>>>,
+}
+
+impl<'a> CachedReader<'a> {
+    pub fn new(txn: &'a dyn ReadTransaction, plane: PlaneId) -> Self {
+        Self::build(txn, plane, None)
+    }
+
+    pub fn with_registry(
+        txn: &'a dyn ReadTransaction,
+        plane: PlaneId,
+        registry: &'a VectorRegistry,
+    ) -> Self {
+        Self::build(txn, plane, Some(registry))
+    }
+
+    fn build(
+        txn: &'a dyn ReadTransaction,
+        plane: PlaneId,
+        registry: Option<&'a VectorRegistry>,
+    ) -> Self {
+        Self {
+            txn,
+            plane,
+            registry,
+            nodes: RefCell::new(HashMap::new()),
+            edges: RefCell::new(HashMap::new()),
+            adjacency: RefCell::new(HashMap::new()),
         }
-        brute_force_search(self, label, property, query, metric, k)
+    }
+}
+
+impl GraphReader for CachedReader<'_> {
+    fn plane(&self) -> PlaneId {
+        self.plane
+    }
+
+    fn node(&self, id: NodeId) -> Result<Option<Arc<NodeRecord>>> {
+        use std::collections::hash_map::Entry;
+        // One borrow + one hash probe (vs get-then-insert). Holding the
+        // borrow_mut across the storage read is safe: the read touches
+        // `self.txn`, never re-enters this cache (single-threaded execution).
+        match self.nodes.borrow_mut().entry(id) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let v = graph::get_node(self.txn, self.plane, id)?.map(Arc::new);
+                Ok(e.insert(v).clone())
+            }
+        }
+    }
+
+    fn edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
+        use std::collections::hash_map::Entry;
+        match self.edges.borrow_mut().entry(id) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let v = graph::get_edge(self.txn, self.plane, id)?.map(Arc::new);
+                Ok(e.insert(v).clone())
+            }
+        }
+    }
+
+    fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Arc<[Neighbor]>> {
+        use std::collections::hash_map::Entry;
+        match self
+            .adjacency
+            .borrow_mut()
+            .entry((id, dir, ty.map(str::to_string)))
+        {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let v: Arc<[Neighbor]> =
+                    graph::neighbors(self.txn, self.plane, id, dir, ty)?.into();
+                Ok(e.insert(v).clone())
+            }
+        }
+    }
+
+    fn scan_all(&self) -> Result<Vec<NodeId>> {
+        graph::scan_all(self.txn, self.plane)
+    }
+
+    fn scan_label(&self, label: &str) -> Result<Vec<NodeId>> {
+        graph::scan_label(self.txn, self.plane, label)
+    }
+
+    fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>> {
+        graph::node_id_by_external_key(self.txn, self.plane, key)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        metric: Metric,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
+        indexed_or_brute(
+            self,
+            self.registry,
+            self.plane,
+            label,
+            property,
+            query,
+            metric,
+            k,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute::exec;
+    use crate::compute::plan::{LogicalPlan, Source, Step};
     use crate::storage::engine::{StorageEngine, WriteTransaction};
     use crate::storage::memory::MemoryEngine;
     use crate::types::Properties;
@@ -244,5 +405,192 @@ mod tests {
     fn commit_seq_orders() {
         assert!(CommitSeq(1) < CommitSeq(2));
         assert_eq!(CommitSeq(3), CommitSeq(3));
+    }
+
+    // ---- CachedReader ----------------------------------------------------
+
+    /// A deterministic dense random graph in a fresh memory engine; returns it
+    /// with a seed whose 3-hop neighbourhood revisits most of the graph.
+    fn dense_graph(n: u64, fanout: u64) -> (MemoryEngine, NodeId) {
+        let eng = MemoryEngine::new();
+        let ids: Vec<NodeId>;
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            ids = (0..n)
+                .map(|_| {
+                    graph::create_node(&mut txn, PlaneId::STARTUP, &["N"], &Properties::new())
+                        .unwrap()
+                })
+                .collect();
+            let mut r: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = || {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                r
+            };
+            for &src in &ids {
+                for _ in 0..fanout {
+                    let dst = ids[(next() % n) as usize];
+                    graph::create_edge(
+                        &mut txn,
+                        PlaneId::STARTUP,
+                        src,
+                        dst,
+                        "E",
+                        &Properties::new(),
+                    )
+                    .unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        (eng, ids[0])
+    }
+
+    fn traversal_plan(seed: NodeId) -> LogicalPlan {
+        LogicalPlan {
+            source: Source::SeekIds(vec![seed]),
+            steps: vec![
+                Step::ExpandVar {
+                    dir: Dir::Out,
+                    edge_type: None,
+                    min: 1,
+                    max: 3,
+                },
+                Step::Distinct,
+            ],
+        }
+    }
+
+    fn heads(reader: &dyn GraphReader, plan: &LogicalPlan) -> Vec<u64> {
+        let mut v: Vec<u64> = exec::execute(plan, reader)
+            .unwrap()
+            .map(|r| r.unwrap().head.0)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn cached_matches_uncached() {
+        let (eng, seed) = dense_graph(300, 6);
+        let txn = eng.begin_read().unwrap();
+        let uncached = UncachedReader::new(&txn, PlaneId::STARTUP);
+        let cached = CachedReader::new(&txn, PlaneId::STARTUP);
+
+        // Direct reader methods agree (arch/02 §6 differential).
+        for id in uncached.scan_all().unwrap() {
+            assert_eq!(uncached.node(id).unwrap(), cached.node(id).unwrap());
+            for dir in [Dir::Out, Dir::In, Dir::Both] {
+                assert_eq!(
+                    uncached.neighbors(id, dir, None).unwrap(),
+                    cached.neighbors(id, dir, None).unwrap()
+                );
+            }
+        }
+        assert_eq!(uncached.scan_all().unwrap(), cached.scan_all().unwrap());
+
+        // A revisit-heavy executor traversal yields identical rows, and
+        // re-running through the warmed cache stays correct.
+        let plan = traversal_plan(seed);
+        assert_eq!(heads(&uncached, &plan), heads(&cached, &plan));
+        assert_eq!(heads(&uncached, &plan), heads(&cached, &plan));
+    }
+
+    /// A chunky property map so postcard decode on read is non-trivial — the
+    /// per-visit cost arch/02 says a cache should save.
+    fn fat_props() -> Properties {
+        use crate::types::{PropDesc, PropValue};
+        let mut p = Properties::new();
+        for i in 0..12 {
+            p.insert(
+                format!("field_{i}"),
+                PropDesc {
+                    description: Some(format!("description of field {i}")),
+                    value: PropValue::Str(format!("value-{i}-lorem-ipsum-dolor-sit-amet")),
+                },
+            );
+        }
+        p
+    }
+
+    fn build_dense(txn: &mut dyn WriteTransaction, n: u64, fanout: u64) -> NodeId {
+        graph::init(txn).unwrap();
+        let ids: Vec<NodeId> = (0..n)
+            .map(|_| graph::create_node(txn, PlaneId::STARTUP, &["N"], &fat_props()).unwrap())
+            .collect();
+        let mut r: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for &src in &ids {
+            for _ in 0..fanout {
+                let dst = ids[(next() % n) as usize];
+                graph::create_edge(txn, PlaneId::STARTUP, src, dst, "E", &Properties::new())
+                    .unwrap();
+            }
+        }
+        ids[0]
+    }
+
+    /// Sizing measurement (arch/02 §5); not run by default. Run with
+    /// `cargo test -p dr-strange-core --lib cache -- --ignored --nocapture`.
+    /// Reports both a pure-expansion plan (adjacency reads) and an
+    /// expand+filter plan (revisited node-record decodes) on the redb backend,
+    /// where reads are B-tree + postcard decode — the case a cache can save.
+    #[test]
+    #[ignore]
+    fn bench_cached_vs_uncached() {
+        use crate::compute::expr::has_label;
+        use crate::storage::redb_backend::RedbEngine;
+        use std::time::Instant;
+
+        // Two regimes: a small/hot subgraph (deep walks revisit the same nodes
+        // heavily — the cache's best case) and a broad one (low revisit — where
+        // per-miss overhead can cost more than it saves).
+        for (regime, nodes, fanout) in [("hot(150)", 150u64, 10u64), ("broad(3000)", 3000, 10)] {
+            let dir = tempfile::tempdir().unwrap();
+            let eng = RedbEngine::open(dir.path().join("bench.redb")).unwrap();
+            let seed = {
+                let mut txn = eng.begin_write().unwrap();
+                let s = build_dense(&mut txn, nodes, fanout);
+                txn.commit().unwrap();
+                s
+            };
+            let txn = eng.begin_read().unwrap();
+
+            let expand = traversal_plan(seed); // ExpandVar(1,3) + Distinct
+            let mut filter = traversal_plan(seed);
+            filter.steps.insert(1, Step::Filter(has_label("N"))); // reads node records
+
+            for (name, plan) in [("expand", &expand), ("expand+filter", &filter)] {
+                let iters = 100;
+                let uncached = UncachedReader::new(&txn, PlaneId::STARTUP);
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let _ = exec::execute(plan, &uncached).unwrap().count();
+                }
+                let un = t.elapsed().as_secs_f64();
+
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let cached = CachedReader::new(&txn, PlaneId::STARTUP);
+                    let _ = exec::execute(plan, &cached).unwrap().count();
+                }
+                let ca = t.elapsed().as_secs_f64();
+
+                println!(
+                    "{regime:<11} {name:<14} x{iters}: uncached {:>7.1} ms, cached {:>7.1} ms → {:.2}x",
+                    un * 1000.0,
+                    ca * 1000.0,
+                    un / ca
+                );
+            }
+        }
     }
 }

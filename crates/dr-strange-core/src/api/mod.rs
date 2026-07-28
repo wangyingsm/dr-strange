@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::RwLock;
 
-use crate::cache::{GraphReader, UncachedReader};
+use crate::cache::{CachedReader, GraphReader};
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
@@ -827,12 +827,14 @@ impl<'db> QueryBuilder<'db> {
 
     // ---- terminals (execute) ---------------------------------------------
 
-    fn with_reader<T>(&self, f: impl FnOnce(&UncachedReader) -> Result<T>) -> Result<T> {
+    fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
         // Hold a read lock on the index registry for the query's lifetime so
-        // `VectorTopK` can consult declared indexes (arch/01 §5).
+        // `VectorTopK` can consult declared indexes (arch/01 §5). The reader
+        // memoizes decoded records/adjacency for this one query (arch/02): a
+        // revisit-heavy traversal decodes each hot node once, not per visit.
         let registry = self.plane.db.indexes();
         self.plane.db.engine.with_read(|txn| {
-            let reader = UncachedReader::with_registry(txn, self.plane.id(), &registry);
+            let reader = CachedReader::with_registry(txn, self.plane.id(), &registry);
             f(&reader)
         })
     }
