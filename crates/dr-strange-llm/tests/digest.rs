@@ -1,8 +1,9 @@
 //! Digest pipeline against the deterministic mock provider (arch/07) — the
 //! whole chunk→extract→embed→assemble→apply path, offline.
 
+use anyhow::Result;
 use dr_strange_core::{Database, Dir, PropValue};
-use dr_strange_llm::{DigestOptions, MockProvider, digest};
+use dr_strange_llm::{CandidateSource, DigestOptions, ExistingEntity, MockProvider, digest};
 
 const REPLY: &str = r#"{
   "entities": [
@@ -28,7 +29,14 @@ fn opts(embed: bool) -> DigestOptions {
 #[test]
 fn digests_entities_relations_provenance_and_embeddings() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest("Alice is an engineer at Acme.", &mock, &mock, &opts(true)).unwrap();
+    let result = digest(
+        "Alice is an engineer at Acme.",
+        &mock,
+        &mock,
+        None,
+        &opts(true),
+    )
+    .unwrap();
 
     // Two entities; the WORKS_AT relation kept, the dangling KNOWS dropped.
     assert_eq!(result.report.entities, 2);
@@ -58,7 +66,7 @@ fn digests_entities_relations_provenance_and_embeddings() {
 #[test]
 fn apply_writes_the_graph() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest("Alice at Acme.", &mock, &mock, &opts(false)).unwrap();
+    let result = digest("Alice at Acme.", &mock, &mock, None, &opts(false)).unwrap();
 
     let db = Database::in_memory().unwrap();
     {
@@ -81,11 +89,53 @@ fn apply_writes_the_graph() {
 #[test]
 fn no_embed_leaves_no_vectors() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
-    let result = digest("Alice at Acme.", &mock, &mock, &opts(false)).unwrap();
+    let result = digest("Alice at Acme.", &mock, &mock, None, &opts(false)).unwrap();
     assert!(
         result
             .nodes
             .iter()
             .all(|n| !n.props.contains_key("embedding"))
+    );
+}
+
+/// A candidate source that always surfaces `acme` as an existing entity.
+struct AcmeExists;
+impl CandidateSource for AcmeExists {
+    fn similar(&self, _query: &[f32], _k: usize) -> Result<Vec<ExistingEntity>> {
+        Ok(vec![ExistingEntity {
+            key: "acme".into(),
+            label: "Company".into(),
+            summary: "a robotics company".into(),
+        }])
+    }
+}
+
+#[test]
+fn linking_dedups_existing_entity_but_keeps_its_edge() {
+    // The model still emits both entities + the WORKS_AT edge (REPLY), but the
+    // candidate source says `acme` already exists — so acme is linked, not
+    // re-created, while the edge to it survives for the bulk loader to resolve.
+    let mock = MockProvider::new(vec![REPLY.to_string()], 8);
+    let result = digest(
+        "Alice is an engineer at Acme.",
+        &mock,
+        &mock,
+        Some(&AcmeExists),
+        &opts(false),
+    )
+    .unwrap();
+
+    // acme dropped from new nodes (it exists); alice remains new.
+    let keys: Vec<&str> = result.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(keys, ["alice"]);
+    assert_eq!(result.report.entities, 1);
+    assert_eq!(result.report.linked, 1);
+
+    // The alice→acme edge is kept even though acme isn't a fresh node.
+    assert_eq!(result.report.relations, 1);
+    let e = &result.edges[0];
+    assert_eq!(
+        (e.src.as_str(), e.ty.as_str(), e.dst.as_str()),
+        ("alice", "WORKS_AT", "acme")
     );
 }

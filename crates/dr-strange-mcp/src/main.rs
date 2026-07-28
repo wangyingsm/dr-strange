@@ -79,6 +79,10 @@ struct Digest {
     /// Skip embedding generation.
     #[serde(default)]
     no_embed: bool,
+    /// Link extracted entities to existing plane nodes via vector retrieval
+    /// (default true). Off ⇒ every entity is proposed as new.
+    #[serde(default)]
+    link: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -359,6 +363,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
     let chat_provider = req.chat.as_deref().unwrap_or("openai");
     let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
     let embed = !req.no_embed;
+    let link = req.link.unwrap_or(true);
 
     // Provider keys come from the server's environment (never tool params).
     let chat =
@@ -388,7 +393,9 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         embed,
     };
 
-    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, &opts)?;
+    let cands = dr_strange_llm::PlaneCandidates::new(&p);
+    let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, candidates, &opts)?;
     let r = &result.report;
     let mut out = jval!({
         "applied": req.apply,
@@ -396,6 +403,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
             "chunks": r.chunks,
             "entities": r.entities,
             "relations": r.relations,
+            "linked": r.linked,
             "dropped_relations": r.dropped_relations,
             "chat_requests": r.chat_requests,
             "input_tokens": r.input_tokens,
@@ -529,7 +537,9 @@ impl DrStrange {
 
     #[tool(
         description = "Digest a document into the plane's graph via an LLM: extract typed \
-        entities + relations (labels chosen purely from the document), embed them, and — \
+        entities + relations (labels chosen purely from the document), link them to existing \
+        plane nodes via vector retrieval (set link=false to propose everything as new), embed \
+        them, and — \
         only when apply=true — write them with provenance. Dry-run (the default) returns the \
         proposed nodes/edges for review; call again with apply=true to commit. Provider API keys \
         come from the server's environment (e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / \

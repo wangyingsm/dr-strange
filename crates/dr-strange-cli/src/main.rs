@@ -113,6 +113,10 @@ enum Command {
         /// Skip embedding generation.
         #[arg(long)]
         no_embed: bool,
+        /// Don't link extracted entities to existing plane nodes (propose every
+        /// entity as new; skips the per-chunk vector retrieval).
+        #[arg(long)]
+        no_link: bool,
     },
 }
 
@@ -239,6 +243,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             embed_key_env,
             chunk_chars,
             no_embed,
+            no_link,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -247,6 +252,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 apply,
                 chunk_chars,
                 embed: !no_embed,
+                link: !no_link,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),

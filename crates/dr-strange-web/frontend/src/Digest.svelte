@@ -8,6 +8,7 @@
   let chat = $state('openai')
   let embed = $state('openai')
   let noEmbed = $state(false)
+  let link = $state(true)
   let proposal = $state(null) // { report, nodes, edges }
   let status = $state('')
   let error = $state(null)
@@ -45,13 +46,16 @@
     proposal = null
     try {
       proposal = await rpc('digest.run', {
+        plane,
         text,
         chat,
         embed,
         no_embed: noEmbed,
+        link,
       })
       const r = proposal.report
-      status = `proposal: ${r.entities} entities, ${r.relations} relations`
+      const linked = r.linked ? `, ${r.linked} linked to existing` : ''
+      status = `proposal: ${r.entities} entities, ${r.relations} relations${linked}`
     } catch (err) {
       error = err.message
     } finally {
@@ -95,6 +99,9 @@
     </select>
   </label>
   <label class="check"><input type="checkbox" bind:checked={noEmbed} /> no embeddings</label>
+  <label class="check" title="Retrieve similar entities already in the plane and let the LLM reuse their keys / add edges to them, instead of creating duplicates">
+    <input type="checkbox" bind:checked={link} /> link to existing nodes
+  </label>
   <label class="file-btn">
     Upload file
     <input type="file" accept=".md,.markdown,.txt,.pdf,.docx" onchange={onFile} />
@@ -119,7 +126,8 @@
 {#if proposal}
   <section class="proposal">
     <div class="report">
-      {proposal.report.chunks} chunks · {proposal.report.entities} entities ·
+      {proposal.report.chunks} chunks · {proposal.report.entities} new entities{#if proposal.report.linked}
+        ({proposal.report.linked} linked to existing){/if} ·
       {proposal.report.relations} relations ({proposal.report.dropped_relations} dropped) · tokens
       {proposal.report.input_tokens}/{proposal.report.output_tokens} chat,
       {proposal.report.embed_tokens} embed

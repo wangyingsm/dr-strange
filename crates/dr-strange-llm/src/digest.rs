@@ -11,16 +11,87 @@
 //! model, run id) as self-describing [`PropDesc`]. Extraction is
 //! schema-constrained; the soft schema still absorbs whatever labels/types the
 //! model returns.
+//!
+//! Optional entity linking (arch/07 §1 v1.5): given a [`CandidateSource`], each
+//! chunk is embedded and its most-similar existing graph entities are offered
+//! to the model as reuse candidates. Entities whose key the model reuses are
+//! linked (not re-created) and relations to them are kept — the bulk loader
+//! resolves those keys against the plane.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use dr_strange_core::json;
-use dr_strange_core::{BulkEdge, BulkNode, BulkStats, PropDesc, PropValue, Properties, WriteTxn};
+use dr_strange_core::{
+    BulkEdge, BulkNode, BulkStats, Metric, PropDesc, PropValue, Properties, WriteTxn,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::provider::{Chat, Embedder};
+
+/// How many existing entities to retrieve per chunk as reuse candidates.
+const LINK_K: usize = 8;
+
+// ---- entity linking (arch/07 §1 v1.5) ------------------------------------
+
+/// An entity already present in the target graph, surfaced to the model so it
+/// can reuse its identity (its `key`) instead of minting a duplicate.
+pub struct ExistingEntity {
+    pub key: String,
+    pub label: String,
+    pub summary: String,
+}
+
+/// Supplies the existing entities most similar to a chunk's embedding, so the
+/// digest can offer them as reuse candidates. Implemented by the caller over
+/// the target plane's vector search — [`digest`] stays decoupled from storage.
+pub trait CandidateSource {
+    /// Existing entities similar to `query`, most-similar first (may be empty).
+    /// Best-effort: an empty result simply means "propose everything as new".
+    fn similar(&self, query: &[f32], k: usize) -> Result<Vec<ExistingEntity>>;
+}
+
+/// The default [`CandidateSource`]: cosine top-k over a plane's `embedding`
+/// property — where [`digest`] stores entity vectors — so a re-digest links
+/// against what previous digests wrote. Nodes without an embedding (or with a
+/// mismatched dimension) are simply invisible to the search.
+pub struct PlaneCandidates<'a> {
+    plane: &'a dr_strange_core::PlaneHandle<'a>,
+}
+
+impl<'a> PlaneCandidates<'a> {
+    pub fn new(plane: &'a dr_strange_core::PlaneHandle<'a>) -> Self {
+        Self { plane }
+    }
+}
+
+impl CandidateSource for PlaneCandidates<'_> {
+    fn similar(&self, query: &[f32], k: usize) -> Result<Vec<ExistingEntity>> {
+        let hits = self
+            .plane
+            .query()
+            .vector_top_k(None, "embedding", query.to_vec(), Metric::Cosine, k as u64)
+            .scored_nodes()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|(n, _)| {
+                let key = n.external_key?; // only keyed nodes are linkable
+                let label = n.labels.into_iter().next().unwrap_or_default();
+                let summary = match n.properties.get("summary").map(|p| &p.value) {
+                    Some(PropValue::Str(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                Some(ExistingEntity {
+                    key,
+                    label,
+                    summary,
+                })
+            })
+            .collect())
+    }
+}
 
 // ---- what the model returns ----------------------------------------------
 
@@ -75,6 +146,9 @@ pub struct DigestReport {
     pub chunks: usize,
     pub entities: usize,
     pub relations: usize,
+    /// Extracted entities that matched an existing graph node (by reused key)
+    /// and were linked to rather than re-created.
+    pub linked: usize,
     pub dropped_relations: usize,
     pub chat_requests: usize,
     pub input_tokens: u64,
@@ -137,21 +211,46 @@ pub fn digest(
     document: &str,
     chat: &dyn Chat,
     embedder: &dyn Embedder,
+    candidates: Option<&dyn CandidateSource>,
     opts: &DigestOptions,
 ) -> Result<DigestResult> {
     let chunks = chunk(document, opts.chunk_chars);
-    let system = system_prompt();
+    let system = system_prompt(candidates.is_some());
 
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
     let mut edges: Vec<DigestEdge> = Vec::new();
     let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
+    // Existing graph entities surfaced across all chunks (key → entity). Used
+    // to (a) skip re-creating them as nodes and (b) treat them as valid
+    // relation endpoints so new→existing edges survive.
+    let mut existing: HashMap<String, ExistingEntity> = HashMap::new();
     let mut report = DigestReport {
         chunks: chunks.len(),
         ..Default::default()
     };
 
     for chunk in &chunks {
-        let reply = chat.complete(&system, chunk)?;
+        // Entity linking: retrieve existing entities similar to this chunk and
+        // prepend them as reuse context (arch/07 §1 v1.5).
+        let user = match candidates {
+            Some(src) => {
+                let emb = embedder.embed(std::slice::from_ref(chunk))?;
+                report.embed_tokens += emb.tokens;
+                let cands = match emb.vectors.first() {
+                    Some(qv) => src.similar(qv, LINK_K)?,
+                    None => Vec::new(),
+                };
+                let block = existing_block(&cands);
+                for e in cands {
+                    existing.entry(e.key.clone()).or_insert(e);
+                }
+                block.map(|b| format!("{b}\n---\n{chunk}"))
+            }
+            None => None,
+        };
+        let user = user.as_deref().unwrap_or(chunk);
+
+        let reply = chat.complete(&system, user)?;
         report.chat_requests += 1;
         report.input_tokens += reply.input_tokens;
         report.output_tokens += reply.output_tokens;
@@ -193,18 +292,31 @@ pub fn digest(
         }
     }
 
-    let mut nodes: Vec<DigestNode> = entities.into_values().collect();
+    // Entities the model reused an existing key for are linked, not re-created:
+    // drop them from the new-node set (bulk load would otherwise write a second
+    // node under a key the plane already holds and corrupt the key index).
+    report.linked = entities
+        .keys()
+        .filter(|k| existing.contains_key(*k))
+        .count();
+    let mut nodes: Vec<DigestNode> = entities
+        .into_values()
+        .filter(|n| !existing.contains_key(&n.key))
+        .collect();
     for n in &mut nodes {
         if n.label.is_empty() {
             n.label = "Entity".into();
         }
     }
 
-    // Drop relations whose endpoints weren't extracted as entities (model
-    // hallucination) — otherwise the bulk load would reject the batch.
-    let keys: HashSet<&str> = nodes.iter().map(|n| n.key.as_str()).collect();
+    // Drop relations whose endpoints are neither a freshly-extracted entity nor
+    // an existing graph node (model hallucination) — otherwise the bulk load
+    // would reject the batch. Edges to existing nodes are kept: the bulk
+    // loader resolves those keys against the plane.
+    let mut valid: HashSet<&str> = nodes.iter().map(|n| n.key.as_str()).collect();
+    valid.extend(existing.keys().map(String::as_str));
     let before = edges.len();
-    edges.retain(|e| keys.contains(e.src.as_str()) && keys.contains(e.dst.as_str()));
+    edges.retain(|e| valid.contains(e.src.as_str()) && valid.contains(e.dst.as_str()));
     report.dropped_relations = before - edges.len();
 
     if opts.embed && !nodes.is_empty() {
@@ -331,11 +443,11 @@ fn chunk(doc: &str, size: usize) -> Vec<String> {
     chunks
 }
 
-fn system_prompt() -> String {
+fn system_prompt(link: bool) -> String {
     // No preset labels: the document alone dictates the schema. The plane's
     // existing catalog is deliberately never shown to the model — labels can
     // always be edited after the fact (arch/07 §2).
-    String::from(
+    let mut p = String::from(
         "You extract a knowledge graph from the user's text. Let the DOCUMENT decide the schema: \
          give each entity the most specific, accurate label for what it actually is here \
          (e.g. Protein, City, Statute, Album, Algorithm — not a generic default), and each \
@@ -348,7 +460,36 @@ fn system_prompt() -> String {
          \"description\":\"one concise sentence\"}]}\n\
          Use the SAME key for an entity every time it appears so mentions collapse to one node. \
          Relations must reference entity keys you also emit.",
-    )
+    );
+    if link {
+        p.push_str(
+            "\nSome messages start with an \"EXISTING ENTITIES\" block listing nodes already in \
+             the graph as `key (Label): summary`. That block is CONTEXT, not text to extract from. \
+             If the document refers to one of those entities, reuse its EXACT key so your output \
+             attaches to that existing node — do not invent a variant key and do not restate its \
+             properties. You may emit relations that reference those keys (to link new entities to \
+             existing ones, or two existing ones together). Still label genuinely new entities from \
+             the document.",
+        );
+    }
+    p
+}
+
+/// The reuse-candidate context block prepended to a chunk, or `None` when there
+/// are no candidates (so the chunk is sent unchanged).
+fn existing_block(cands: &[ExistingEntity]) -> Option<String> {
+    if cands.is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "EXISTING ENTITIES (already in the graph — reuse a key if the text refers to it; do NOT \
+         re-extract these):\n",
+    );
+    for e in cands {
+        let summary: String = e.summary.chars().take(160).collect();
+        s.push_str(&format!("- {} ({}): {}\n", e.key, e.label, summary.trim()));
+    }
+    Some(s)
 }
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
@@ -378,7 +519,7 @@ mod tests {
 
     #[test]
     fn prompt_is_document_driven_with_no_preset_labels() {
-        let p = system_prompt();
+        let p = system_prompt(false);
         // Tells the model to pick the most specific label from the document…
         assert!(p.contains("most specific, accurate label"));
         assert!(p.contains("Let the DOCUMENT decide the schema"));
@@ -386,5 +527,28 @@ mod tests {
         // …and never leaks a plane's existing schema as a preset to reuse.
         assert!(!p.contains("already uses these labels"));
         assert!(!p.contains("Existing relation types"));
+        // No linking ⇒ no reuse-candidate instructions.
+        assert!(!p.contains("EXISTING ENTITIES"));
+    }
+
+    #[test]
+    fn linking_adds_reuse_instructions_and_context_block() {
+        // The linked prompt keeps the document-driven base and adds the
+        // reuse-by-exact-key convention.
+        let p = system_prompt(true);
+        assert!(p.contains("most specific, accurate label"));
+        assert!(p.contains("EXISTING ENTITIES"));
+        assert!(p.contains("reuse its EXACT key"));
+
+        // A candidate list renders as a labelled context block; empty ⇒ none.
+        assert!(existing_block(&[]).is_none());
+        let block = existing_block(&[ExistingEntity {
+            key: "alice".into(),
+            label: "Person".into(),
+            summary: "an engineer at Acme".into(),
+        }])
+        .unwrap();
+        assert!(block.contains("EXISTING ENTITIES"));
+        assert!(block.contains("alice (Person): an engineer at Acme"));
     }
 }

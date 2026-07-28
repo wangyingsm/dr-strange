@@ -360,6 +360,9 @@ fn llm_err(e: anyhow::Error) -> RpcError {
 
 #[derive(Deserialize)]
 pub struct DigestRun {
+    /// Target plane — only read here, to retrieve existing entities as reuse
+    /// candidates for linking (the write happens in `digest.write`).
+    plane: String,
     /// The document text to digest.
     text: String,
     #[serde(default)]
@@ -374,16 +377,21 @@ pub struct DigestRun {
     source: Option<String>,
     #[serde(default)]
     no_embed: bool,
+    /// Link extracted entities to existing graph nodes via vector retrieval
+    /// (default true). Off ⇒ every entity is proposed as new.
+    #[serde(default)]
+    link: Option<bool>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
 /// keys come from the server's environment, never params. Blocking work runs
 /// on the /rpc handler's blocking task.
-pub fn digest_run(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestRun = params(p)?;
     let chat_provider = req.chat.as_deref().unwrap_or("openai");
     let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
     let embed = !req.no_embed;
+    let link = req.link.unwrap_or(true);
 
     let chat =
         dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
@@ -405,7 +413,11 @@ pub fn digest_run(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         chunk_chars: 4000,
         embed,
     };
-    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, &opts).map_err(llm_err)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let cands = dr_strange_llm::PlaneCandidates::new(&plane);
+    let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+    let result =
+        dr_strange_llm::digest(&req.text, &chat, &embedder, candidates, &opts).map_err(llm_err)?;
 
     let r = &result.report;
     Ok(jval!({
@@ -413,6 +425,7 @@ pub fn digest_run(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             "chunks": r.chunks,
             "entities": r.entities,
             "relations": r.relations,
+            "linked": r.linked,
             "dropped_relations": r.dropped_relations,
             "chat_requests": r.chat_requests,
             "input_tokens": r.input_tokens,

@@ -171,6 +171,8 @@ pub struct DigestArgs<'a> {
     pub apply: bool,
     pub chunk_chars: usize,
     pub embed: bool,
+    /// Link extracted entities to existing plane nodes via vector retrieval.
+    pub link: bool,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -231,12 +233,16 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         embed: args.embed,
     };
 
-    let result = dr_strange_llm::digest(&doc, &chat, &embedder, &opts)?;
+    let cands = dr_strange_llm::PlaneCandidates::new(&p);
+    let candidates = args
+        .link
+        .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+    let result = dr_strange_llm::digest(&doc, &chat, &embedder, candidates, &opts)?;
     let r = &result.report;
     writeln!(
         out,
-        "digest: {} chunks → {} entities, {} relations ({} dangling dropped)",
-        r.chunks, r.entities, r.relations, r.dropped_relations
+        "digest: {} chunks → {} new entities ({} linked to existing), {} relations ({} dangling dropped)",
+        r.chunks, r.entities, r.linked, r.relations, r.dropped_relations
     )?;
     writeln!(
         out,

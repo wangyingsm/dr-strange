@@ -16,7 +16,10 @@ mod openai;
 mod preset;
 mod provider;
 
-pub use digest::{DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult, digest};
+pub use digest::{
+    CandidateSource, DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult,
+    ExistingEntity, PlaneCandidates, digest,
+};
 pub use openai::{OpenAiProvider, build_provider};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider};
