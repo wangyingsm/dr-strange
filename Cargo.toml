@@ -4,6 +4,7 @@ members = [
     "crates/dr-strange-core",
     "crates/dr-strange-cli",
     "crates/dr-strange-mcp",
+    "crates/dr-strange-web",
     "crates/dr-strange-llm",
 ]
 

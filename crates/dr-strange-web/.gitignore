@@ -1,0 +1,6 @@
+# Frontend build inputs/outputs are not committed; the SPA is (re)built with
+# `just web-build` and embedded at compile time. build.rs backfills a
+# placeholder dist/ so `cargo build` works without the JS toolchain.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

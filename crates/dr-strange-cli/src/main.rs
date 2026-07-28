@@ -6,6 +6,7 @@
 mod commands;
 
 use std::io::{self, BufReader, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -66,6 +67,12 @@ enum Command {
     Stats,
     /// Integrity check: scan every plane, report readability.
     Check,
+    /// Serve the web dashboard + JSON-RPC 2.0 API (arch/08).
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:7700")]
+        addr: SocketAddr,
+    },
 }
 
 #[derive(Subcommand)]
@@ -169,6 +176,12 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         Command::Check => {
             let db = commands::open(&cli.db)?;
             commands::check(&db, out)
+        }
+        Command::Serve { addr } => {
+            let db = commands::open(&cli.db)?;
+            // Hands off to the web crate, which owns its own async runtime and
+            // blocks until Ctrl-C; `out` is unused (the server logs itself).
+            dr_strange_web::serve(db, Some(cli.db.clone()), addr)
         }
     }
 }

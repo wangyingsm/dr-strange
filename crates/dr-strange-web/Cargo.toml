@@ -1,0 +1,19 @@
+[package]
+name = "dr-strange-web"
+description = "drsg serve — JSON-RPC 2.0 web backend + dashboard for dr-strange (arch/08)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dr-strange-core = { workspace = true, features = ["json"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rust-embed = "8"
+mime_guess = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
