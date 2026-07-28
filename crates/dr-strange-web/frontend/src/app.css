@@ -48,6 +48,7 @@ h1 {
   margin: 0;
   font-size: 1.5rem;
   letter-spacing: -0.02em;
+  flex: 1 1 0; /* left flank — equal to nav so .tools centers between them */
 }
 
 h2 {
@@ -146,9 +147,10 @@ h2 {
 
 /* ---- nav ---- */
 nav {
-  margin-left: auto;
   display: flex;
   gap: 0.25rem;
+  flex: 1 1 0; /* right flank — mirrors h1 so the centered tools stay centered */
+  justify-content: flex-end;
 }
 nav button {
   background: transparent;

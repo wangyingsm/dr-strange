@@ -196,16 +196,96 @@ export class Plot {
       this.sigma.refresh()
       return
     }
+    // Low gravity so ForceAtlas2 doesn't pile every disconnected group onto
+    // the center (there's no attraction *between* components, only repulsion,
+    // so weak gravity lets them drift apart); outbound-attraction spreads hubs.
     forceAtlas2.assign(this.graph, {
       iterations: this.graph.order > 400 ? 60 : 150,
       settings: {
-        gravity: 1.2,
+        gravity: 0.4,
         scalingRatio: 18,
         adjustSizes: true,
+        outboundAttractionDistribution: true,
         barnesHutOptimize: this.graph.order > 400,
       },
     })
+    // Then hard-separate: pack each connected component's bounding box into a
+    // grid so unrelated groups never overlap, regardless of how FA2 settled.
+    this._packComponents()
     this.sigma.refresh()
+  }
+
+  /** Connected components (undirected) as arrays of node keys, via BFS. */
+  _components() {
+    const seen = new Set()
+    const comps = []
+    this.graph.forEachNode((start) => {
+      if (seen.has(start)) return
+      const comp = []
+      const stack = [start]
+      seen.add(start)
+      while (stack.length) {
+        const cur = stack.pop()
+        comp.push(cur)
+        this.graph.forEachNeighbor(cur, (nb) => {
+          if (!seen.has(nb)) {
+            seen.add(nb)
+            stack.push(nb)
+          }
+        })
+      }
+      comps.push(comp)
+    })
+    return comps
+  }
+
+  /**
+   * Rigidly translate each connected component so their bounding boxes tile a
+   * grid with a gap between them — preserving each component's internal FA2
+   * layout while guaranteeing unrelated groups don't overlap. No-op for a
+   * single component.
+   */
+  _packComponents(gap = 4) {
+    const comps = this._components()
+    if (comps.length <= 1) return
+
+    const boxes = comps.map((comp) => {
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity
+      for (const n of comp) {
+        const x = this.graph.getNodeAttribute(n, 'x')
+        const y = this.graph.getNodeAttribute(n, 'y')
+        if (x < minX) minX = x
+        if (y < minY) minY = y
+        if (x > maxX) maxX = x
+        if (y > maxY) maxY = y
+      }
+      return { comp, minX, minY, w: maxX - minX || 1, h: maxY - minY || 1 }
+    })
+
+    // Shelf-pack tallest-first, wrapping near a square overall aspect.
+    boxes.sort((a, b) => b.h - a.h)
+    const rowLimit = Math.sqrt(boxes.reduce((s, b) => s + (b.w + gap) * (b.h + gap), 0))
+    let cursorX = 0
+    let cursorY = 0
+    let rowH = 0
+    for (const b of boxes) {
+      if (cursorX > 0 && cursorX + b.w > rowLimit) {
+        cursorX = 0
+        cursorY += rowH + gap
+        rowH = 0
+      }
+      const dx = cursorX - b.minX
+      const dy = cursorY - b.minY
+      for (const n of b.comp) {
+        this.graph.setNodeAttribute(n, 'x', this.graph.getNodeAttribute(n, 'x') + dx)
+        this.graph.setNodeAttribute(n, 'y', this.graph.getNodeAttribute(n, 'y') + dy)
+      }
+      cursorX += b.w + gap
+      rowH = Math.max(rowH, b.h)
+    }
   }
 
   legendEntries() {
