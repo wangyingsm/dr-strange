@@ -2,11 +2,15 @@
 //! synchronous `fn(&Ctx, params) -> Result<Value, RpcError>` that wraps the
 //! core `Database` API and serializes through the core's `json` dialect — the
 //! same structures the CLI and MCP emit, so all three surfaces agree on the
-//! wire shape. Methods are read-only in chunk 1 (arch/08 §2 backend slice).
+//! wire shape. Most methods are reads; `digest.run`/`digest.write` power the
+//! digest page (arch/07), the latter writing through the bulk path.
 
 use std::path::Path;
 
-use dr_strange_core::{Database, Dir, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord, json};
+use dr_strange_core::{
+    BulkEdge, BulkNode, Database, Dir, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord,
+    Properties, json,
+};
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
 
@@ -339,4 +343,188 @@ pub fn graph_expand(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "total": total,
         "truncated": total > limit,
     }))
+}
+
+// ---- digest (LLM ingest, arch/07 via the web page) ------------------------
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn llm_err(e: anyhow::Error) -> RpcError {
+    RpcError::server(e.to_string())
+}
+
+#[derive(Deserialize)]
+pub struct DigestRun {
+    plane: String,
+    /// The document text to digest.
+    text: String,
+    #[serde(default)]
+    chat: Option<String>,
+    #[serde(default)]
+    embed: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    no_embed: bool,
+}
+
+/// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
+/// keys come from the server's environment, never params. Blocking work runs
+/// on the /rpc handler's blocking task.
+pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: DigestRun = params(p)?;
+    let chat_provider = req.chat.as_deref().unwrap_or("openai");
+    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let embed = !req.no_embed;
+
+    let chat =
+        dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
+            .map_err(llm_err)?;
+    let chat_model = chat.model().to_string();
+    let embedder = dr_strange_llm::build_provider(
+        embed_provider,
+        req.embed_model.as_deref(),
+        None,
+        None,
+        embed,
+    )
+    .map_err(llm_err)?;
+
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let catalog = app(plane.catalog())?;
+    let opts = dr_strange_llm::DigestOptions {
+        source: req.source.unwrap_or_else(|| "web-digest".into()),
+        model: chat_model,
+        run_id: format!("web-{}", now_secs()),
+        chunk_chars: 4000,
+        embed,
+    };
+    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, Some(&catalog), &opts)
+        .map_err(llm_err)?;
+
+    let r = &result.report;
+    Ok(jval!({
+        "report": {
+            "chunks": r.chunks,
+            "entities": r.entities,
+            "relations": r.relations,
+            "dropped_relations": r.dropped_relations,
+            "chat_requests": r.chat_requests,
+            "input_tokens": r.input_tokens,
+            "output_tokens": r.output_tokens,
+            "embed_tokens": r.embed_tokens,
+        },
+        "nodes": result.nodes.iter().map(|n| jval!({
+            "key": n.key,
+            "label": n.label,
+            "properties": json::properties_to_json(&n.props),
+        })).collect::<Vec<_>>(),
+        "edges": result.edges.iter().map(|e| jval!({
+            "src": e.src,
+            "type": e.ty,
+            "dst": e.dst,
+            "properties": json::properties_to_json(&e.props),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct DigestWrite {
+    plane: String,
+    nodes: Vec<WriteNode>,
+    #[serde(default)]
+    edges: Vec<WriteEdge>,
+}
+
+#[derive(Deserialize)]
+struct WriteNode {
+    key: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+#[derive(Deserialize)]
+struct WriteEdge {
+    src: String,
+    #[serde(rename = "type")]
+    ty: String,
+    dst: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+fn props_of(v: &Value) -> Result<Properties, RpcError> {
+    if v.is_null() {
+        Ok(Properties::new())
+    } else {
+        json::json_to_properties(v).map_err(|e| RpcError::invalid_params(e.to_string()))
+    }
+}
+
+/// `digest.write` — write a previously-computed proposal into the plane via the
+/// bulk path. No LLM call: it re-materializes the nodes/edges `digest.run`
+/// returned (embeddings included), so the review-then-write flow costs one LLM
+/// pass, not two.
+pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: DigestWrite = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+
+    let mut node_props = Vec::with_capacity(req.nodes.len());
+    for n in &req.nodes {
+        node_props.push(props_of(&n.properties)?);
+    }
+    let label_slots: Vec<[&str; 1]> = req
+        .nodes
+        .iter()
+        .map(|n| {
+            [if n.label.is_empty() {
+                "Entity"
+            } else {
+                n.label.as_str()
+            }]
+        })
+        .collect();
+    let bnodes: Vec<BulkNode> = req
+        .nodes
+        .iter()
+        .zip(&label_slots)
+        .zip(node_props)
+        .map(|((n, ls), props)| BulkNode {
+            external_key: Some(&n.key),
+            labels: ls,
+            props,
+        })
+        .collect();
+
+    let mut edge_props = Vec::with_capacity(req.edges.len());
+    for e in &req.edges {
+        edge_props.push(props_of(&e.properties)?);
+    }
+    let bedges: Vec<BulkEdge> = req
+        .edges
+        .iter()
+        .zip(edge_props)
+        .map(|(e, props)| BulkEdge {
+            src_key: &e.src,
+            dst_key: &e.dst,
+            ty: &e.ty,
+            props,
+        })
+        .collect();
+
+    let mut txn = app(plane.write())?;
+    let stats = app(txn.bulk_load(bnodes, bedges))?;
+    app(txn.commit())?;
+    Ok(jval!({ "nodes_written": stats.nodes, "edges_written": stats.edges }))
 }

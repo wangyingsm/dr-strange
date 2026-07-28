@@ -10,6 +10,7 @@
 //! a minimal dashboard; the WebGL graph-plot views (arch/08 §2.2) land next.
 
 mod assets;
+mod extract;
 mod methods;
 mod rpc;
 mod server;

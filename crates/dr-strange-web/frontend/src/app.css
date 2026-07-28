@@ -296,3 +296,125 @@ nav button.active {
   font-size: 0.85rem;
   margin-top: 0.6rem;
 }
+
+/* ---- digest page ---- */
+.controls .check {
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--fg);
+  gap: 0.3rem;
+}
+.controls .txt {
+  font: 14px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  width: 8rem;
+}
+.controls .file-btn {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--fg);
+}
+.controls .file-btn input {
+  display: none;
+}
+
+textarea.doc {
+  width: 100%;
+  box-sizing: border-box;
+  font: 13px/1.5 ui-monospace, monospace;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.85rem;
+  resize: vertical;
+  margin-bottom: 0.75rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+.actions button {
+  font: 14px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+}
+.actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.proposal {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 0.85rem 1rem;
+  margin-bottom: 0.75rem;
+}
+.proposal .report {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 0.6rem;
+}
+.proposal .cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+.proposal h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.proposal ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 40vh;
+  overflow: auto;
+  font-size: 0.88rem;
+}
+.proposal li {
+  padding: 0.15rem 0;
+  overflow-wrap: anywhere;
+}
+.proposal .lbl {
+  display: inline-block;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+  border-radius: 5px;
+  padding: 0 0.35rem;
+  font-size: 0.78rem;
+}
+.proposal .ty {
+  color: var(--accent);
+  font-size: 0.82rem;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 0.85rem;
+}

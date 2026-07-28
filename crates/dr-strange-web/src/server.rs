@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -47,8 +47,35 @@ fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
+        .route("/digest/extract", post(extract_http))
         .fallback(static_handler)
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct ExtractQuery {
+    /// Filename — the extension selects the extractor.
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST /digest/extract?name=doc.pdf` — the raw file bytes in the body,
+/// extracted text out (arch/07 digest page). No DB access; runs the
+/// (potentially slow) PDF/docx parsing on a blocking task.
+async fn extract_http(Query(q): Query<ExtractQuery>, body: Bytes) -> Response {
+    let out =
+        tokio::task::spawn_blocking(move || crate::extract::extract_text(&q.name, &body)).await;
+    match out {
+        Ok(Ok(text)) => {
+            Json(json!({ "chars": text.chars().count(), "text": text })).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "extract task panicked").into_response(),
+    }
 }
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the

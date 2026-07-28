@@ -1,6 +1,7 @@
 <script>
   import Dashboard from './Dashboard.svelte'
   import Explore from './Explore.svelte'
+  import Digest from './Digest.svelte'
 
   let view = $state('dashboard')
 </script>
@@ -14,13 +15,18 @@
     <button class:active={view === 'explore'} onclick={() => (view = 'explore')}>
       Explore
     </button>
+    <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
+      Digest
+    </button>
   </nav>
 </header>
 
-<!-- Keep both mounted-on-demand: Explore owns a sigma/WebGL instance that is
-     created on mount and killed on destroy, so switching views is clean. -->
+<!-- Explore owns a sigma/WebGL instance created on mount and killed on
+     destroy, so mounting views on demand keeps switching clean. -->
 {#if view === 'dashboard'}
   <Dashboard />
-{:else}
+{:else if view === 'explore'}
   <Explore />
+{:else}
+  <Digest />
 {/if}

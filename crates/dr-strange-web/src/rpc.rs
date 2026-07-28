@@ -160,6 +160,8 @@ fn dispatch_method(ctx: &Ctx<'_>, method: &str, params: Value) -> Result<Value, 
         "plane.query" => methods::plane_query(ctx, params),
         "graph.seed" => methods::graph_seed(ctx, params),
         "graph.expand" => methods::graph_expand(ctx, params),
+        "digest.run" => methods::digest_run(ctx, params),
+        "digest.write" => methods::digest_write(ctx, params),
         other => Err(RpcError::method_not_found(other)),
     }
 }
