@@ -13,13 +13,13 @@
 //! index never needs to reclaim tombstones itself.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, backend};
-use crate::storage::vector::{Hit, IdFilter, Metric, VectorIndex, top_k};
+use crate::storage::vector::{Hit, IdFilter, Metric, VectorIndex, dot, top_k};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HnswParams {
@@ -59,6 +59,10 @@ impl Default for HnswParams {
 struct Node {
     id: u64,
     vector: Vec<f32>,
+    /// L2 norm of `vector`, cached at insert. Lets every metric reduce to a
+    /// single dot product against a prepared query (arch/01 §5 build path):
+    /// cosine = `1 - dot/(qn·nn)`, L2 = `√(qn² + nn² - 2·dot)`.
+    norm: f32,
     deleted: bool,
     /// Adjacency per layer: `layers[l]` holds internal indices of neighbors
     /// at layer `l`. `layers.len() - 1` is this node's top layer.
@@ -76,10 +80,88 @@ pub struct HnswIndex {
     // Rebuilt on load, so skipped in the on-disk form.
     #[serde(skip)]
     id_to_idx: HashMap<u64, usize>,
+    // Reusable search buffers (see [`Scratch`]); never serialized. Owned by
+    // the index so a whole build reuses one allocation instead of allocating
+    // a visited-set + heaps per `search_layer` call.
+    #[serde(skip)]
+    scratch: Scratch,
+}
+
+/// Per-search scratch space, reused across the millions of `search_layer`
+/// calls a build makes. `visited` is a generation-stamp buffer: a node is
+/// "seen this search" iff `visited[i] == epoch`, so resetting is a single
+/// `epoch += 1` instead of clearing the set. The two heaps are cleared and
+/// refilled rather than reallocated.
+#[derive(Debug, Clone, Default)]
+struct Scratch {
+    visited: Vec<u32>,
+    epoch: u32,
+    cand: BinaryHeap<Reverse<(Dist, usize)>>,
+    w: BinaryHeap<(Dist, usize)>,
+}
+
+impl Scratch {
+    /// Ready the buffers for a search over `n` nodes: grow `visited`, bump the
+    /// generation (clearing on the rare `u32` wrap), and empty the heaps.
+    fn ready(&mut self, n: usize) {
+        if self.visited.len() < n {
+            self.visited.resize(n, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.visited.iter_mut().for_each(|v| *v = 0);
+            self.epoch = 1;
+        }
+        self.cand.clear();
+        self.w.clear();
+    }
+}
+
+/// Distance from a dot product and the two operands' L2 norms — the shared
+/// form all three metrics collapse to once norms are cached. Matches
+/// [`Metric::distance`] exactly so HNSW recall stays defined against the exact
+/// brute-force oracle.
+fn metric_dist(metric: Metric, d: f32, na: f32, nb: f32) -> f32 {
+    match metric {
+        Metric::Dot => -d,
+        Metric::Cosine => {
+            let denom = na * nb;
+            if denom == 0.0 {
+                1.0
+            } else {
+                1.0 - (d / denom).clamp(-1.0, 1.0)
+            }
+        }
+        Metric::L2 => (na * na + nb * nb - 2.0 * d).max(0.0).sqrt(),
+    }
+}
+
+/// A query vector plus its cached L2 norm — prepared once per search so each
+/// distance against it is a single dot product.
+#[derive(Clone, Copy)]
+struct Query<'a> {
+    vec: &'a [f32],
+    norm: f32,
+}
+
+/// Distance from a prepared query to node `idx` — one dot.
+fn dist_q(nodes: &[Node], metric: Metric, q: Query<'_>, idx: usize) -> f32 {
+    let n = &nodes[idx];
+    metric_dist(metric, dot(q.vec, &n.vector), q.norm, n.norm)
+}
+
+/// Distance between two stored nodes — one dot (used by pruning).
+fn dist_nn(nodes: &[Node], metric: Metric, a: usize, b: usize) -> f32 {
+    metric_dist(
+        metric,
+        dot(&nodes[a].vector, &nodes[b].vector),
+        nodes[a].norm,
+        nodes[b].norm,
+    )
 }
 
 /// `f32` wrapper with a total order (via `total_cmp`) for use in heaps.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Dist(f32);
 impl Eq for Dist {}
 impl Ord for Dist {
@@ -107,6 +189,7 @@ impl HnswIndex {
             top_layer: 0,
             rng: params.seed,
             id_to_idx: HashMap::new(),
+            scratch: Scratch::default(),
         }
     }
 
@@ -128,10 +211,6 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.id_to_idx.is_empty()
-    }
-
-    fn dist(&self, q: &[f32], idx: usize) -> f32 {
-        self.metric.distance(q, &self.nodes[idx].vector)
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -156,28 +235,37 @@ impl HnswIndex {
         }
     }
 
-    /// The ef nearest nodes to `q` reachable from `entry_points` at `layer`,
-    /// ascending by distance. Tombstoned nodes are traversed for connectivity
-    /// but never included in the returned set.
+    /// The ef nearest live nodes to a prepared query `(q, q_norm)` reachable
+    /// from `entry_points` at `layer`, ascending by distance. Tombstoned nodes
+    /// are traversed for connectivity but never returned. Uses (and leaves
+    /// dirty) the caller-provided `scratch` buffers — associated, not a method,
+    /// so `&nodes` and `&mut scratch` can be borrowed disjointly from `self`.
     fn search_layer(
-        &self,
-        q: &[f32],
+        nodes: &[Node],
+        metric: Metric,
+        q: Query<'_>,
         entry_points: &[usize],
         ef: usize,
         layer: usize,
+        scratch: &mut Scratch,
     ) -> Vec<(f32, usize)> {
-        let mut visited: HashSet<usize> = HashSet::new();
-        // Candidate frontier: min-heap (nearest first) via Reverse.
-        let mut cand: BinaryHeap<Reverse<(Dist, usize)>> = BinaryHeap::new();
-        // Results: max-heap (farthest on top) capped at ef, live nodes only.
-        let mut w: BinaryHeap<(Dist, usize)> = BinaryHeap::new();
+        scratch.ready(nodes.len());
+        let Scratch {
+            visited,
+            epoch,
+            cand,
+            w,
+        } = scratch;
+        let epoch = *epoch;
 
         for &e in entry_points {
-            let d = self.dist(q, e);
-            visited.insert(e);
-            cand.push(Reverse((Dist(d), e)));
-            if !self.nodes[e].deleted {
-                push_bounded(&mut w, ef, d, e);
+            if visited[e] != epoch {
+                visited[e] = epoch;
+                let d = dist_q(nodes, metric, q, e);
+                cand.push(Reverse((Dist(d), e)));
+                if !nodes[e].deleted {
+                    push_bounded(w, ef, d, e);
+                }
             }
         }
 
@@ -188,44 +276,41 @@ impl HnswIndex {
             {
                 break; // nearest candidate worse than our worst keeper
             }
-            for &e in &self.nodes[c].layers[layer] {
-                if visited.insert(e) {
-                    let d = self.dist(q, e);
+            for &e in &nodes[c].layers[layer] {
+                if visited[e] != epoch {
+                    visited[e] = epoch;
+                    let d = dist_q(nodes, metric, q, e);
                     let farthest = w.peek().map(|(Dist(fd), _)| *fd).unwrap_or(f32::INFINITY);
                     if d < farthest || w.len() < ef {
                         cand.push(Reverse((Dist(d), e)));
-                        if !self.nodes[e].deleted {
-                            push_bounded(&mut w, ef, d, e);
+                        if !nodes[e].deleted {
+                            push_bounded(w, ef, d, e);
                         }
                     }
                 }
             }
         }
 
-        let mut out: Vec<(f32, usize)> = w.into_iter().map(|(Dist(d), i)| (d, i)).collect();
+        let mut out: Vec<(f32, usize)> = w.iter().map(|&(Dist(d), i)| (d, i)).collect();
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
         out
     }
 
-    fn connect(&mut self, a: usize, b: usize, layer: usize) {
-        self.nodes[a].layers[layer].push(b);
-        self.nodes[b].layers[layer].push(a);
+    /// Keep only the `max_conn` nearest neighbors of `node` at `layer`. Scores
+    /// each neighbor once (no vector clone, no re-sort recomputation).
+    fn prune(&mut self, node: usize, layer: usize) {
         let max = self.max_conn(layer);
-        self.prune(a, layer, max);
-        self.prune(b, layer, max);
-    }
-
-    /// Keep only the `max` nearest neighbors of `node` at `layer` (simple
-    /// closest-M selection).
-    fn prune(&mut self, node: usize, layer: usize, max: usize) {
         if self.nodes[node].layers[layer].len() <= max {
             return;
         }
-        let v = self.nodes[node].vector.clone();
-        let mut ns = std::mem::take(&mut self.nodes[node].layers[layer]);
-        ns.sort_by(|&x, &y| self.dist(&v, x).total_cmp(&self.dist(&v, y)));
-        ns.truncate(max);
-        self.nodes[node].layers[layer] = ns;
+        let ns = std::mem::take(&mut self.nodes[node].layers[layer]);
+        let mut scored: Vec<(f32, usize)> = ns
+            .iter()
+            .map(|&x| (dist_nn(&self.nodes, self.metric, node, x), x))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.truncate(max);
+        self.nodes[node].layers[layer] = scored.into_iter().map(|(_, x)| x).collect();
     }
 }
 
@@ -248,9 +333,11 @@ impl VectorIndex for HnswIndex {
 
         let level = self.random_level();
         let idx = self.nodes.len();
+        let q_norm = dot(vector, vector).sqrt(); // prepared-query norm, cached
         self.nodes.push(Node {
             id,
             vector: vector.to_vec(),
+            norm: q_norm,
             deleted: false,
             layers: vec![Vec::new(); level + 1],
         });
@@ -262,26 +349,47 @@ impl VectorIndex for HnswIndex {
             return Ok(());
         };
 
+        let metric = self.metric;
+        let ef_construction = self.params.ef_construction;
+        let q = Query {
+            vec: vector,
+            norm: q_norm,
+        };
+
         // Descend from the top down to level+1 with a width-1 greedy search.
         let mut ep = entry;
         let mut lc = self.top_layer;
         while lc > level {
-            let w = self.search_layer(vector, &[ep], 1, lc);
+            let w = Self::search_layer(&self.nodes, metric, q, &[ep], 1, lc, &mut self.scratch);
             if let Some(&(_, nearest)) = w.first() {
                 ep = nearest;
             }
             lc -= 1;
         }
 
-        // Insert at every layer from min(level, top) down to 0.
+        // Insert at every layer from min(level, top) down to 0. Add all of
+        // idx's chosen edges, prune each neighbor once, then prune idx once
+        // (vs. re-pruning idx after every single edge).
         let start = level.min(self.top_layer);
         let mut entry_points = vec![ep];
         for lc in (0..=start).rev() {
-            let w = self.search_layer(vector, &entry_points, self.params.ef_construction, lc);
+            let w = Self::search_layer(
+                &self.nodes,
+                metric,
+                q,
+                &entry_points,
+                ef_construction,
+                lc,
+                &mut self.scratch,
+            );
             let max = self.max_conn(lc);
-            for &(_, neighbor) in w.iter().take(max) {
-                self.connect(idx, neighbor, lc);
+            let chosen: Vec<usize> = w.iter().take(max).map(|&(_, i)| i).collect();
+            for &nb in &chosen {
+                self.nodes[idx].layers[lc].push(nb);
+                self.nodes[nb].layers[lc].push(idx);
+                self.prune(nb, lc);
             }
+            self.prune(idx, lc);
             entry_points = if w.is_empty() {
                 vec![ep]
             } else {
@@ -317,10 +425,16 @@ impl VectorIndex for HnswIndex {
             return Ok(Vec::new());
         };
 
+        let q = Query {
+            vec: query,
+            norm: dot(query, query).sqrt(),
+        };
+        let mut scratch = Scratch::default();
+
         let mut ep = entry;
         let mut lc = self.top_layer;
         while lc > 0 {
-            let w = self.search_layer(query, &[ep], 1, lc);
+            let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], 1, lc, &mut scratch);
             if let Some(&(_, nearest)) = w.first() {
                 ep = nearest;
             }
@@ -334,7 +448,7 @@ impl VectorIndex for HnswIndex {
         } else {
             self.params.ef_search.max(k)
         };
-        let w = self.search_layer(query, &[ep], ef, 0);
+        let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
 
         let hits = top_k(
             w.into_iter()

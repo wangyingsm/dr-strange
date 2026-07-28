@@ -6,13 +6,13 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 | Operation | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
-| Bulk-load nodes (↑ better) | 111 K/s | 278 K/s | 485 K/s | 32 K/s |
-| Bulk-load edges (+ adjacency/index) (↑ better) | 87 K/s | 1.4 M/s | 609 K/s | 26 K/s |
-| Point lookup by key — median (↓ better) | 3.3 µs | 365.7 µs | 4.5 µs | 978.6 µs |
-| 1-hop expansion — median (↓ better) | 6.3 µs | 2.26 ms | 11.4 µs | 799.5 µs |
-| 2-hop reachable set — median (↓ better) | 32.5 µs | 9.19 ms | 79.2 µs | 1.56 ms |
-| Vector index build (↑ better) | 318/s | 3 K/s | — | 3 K/s |
-| Vector top-k query — median (↓ better) | 1.18 ms | 9.99 ms | — | 3.57 ms |
+| Bulk-load nodes (↑ better) | 87 K/s | 265 K/s | 410 K/s | 32 K/s |
+| Bulk-load edges (+ adjacency/index) (↑ better) | 78 K/s | 1.3 M/s | 526 K/s | 26 K/s |
+| Point lookup by key — median (↓ better) | 3.2 µs | 397.6 µs | 5.5 µs | 978.6 µs |
+| 1-hop expansion — median (↓ better) | 7.6 µs | 2.37 ms | 13.7 µs | 799.5 µs |
+| 2-hop reachable set — median (↓ better) | 34.9 µs | 9.84 ms | 94.7 µs | 1.56 ms |
+| Vector index build (↑ better) | 1 K/s | 3 K/s | — | 3 K/s |
+| Vector top-k query — median (↓ better) | 365.6 µs | 10.39 ms | — | 3.57 ms |
 
 ## Reading this
 
@@ -39,6 +39,6 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 - **Strong — low-latency point & graph queries.** The embedded KV design gives microsecond point lookups and single-digit-µs 1-hop expansion, on par with SQLite and orders of magnitude below the query-engine round-trips of Kùzu/Neo4j. That's the embedded, agent-in-the-loop sweet spot dr-strange is built for.
 - **Weak — bulk edge load.** Kùzu's columnar `COPY` loads edges far faster; drsg writes each edge's two adjacency entries through redb one at a time. A bulk-load fast path (batched writes, deferred index maintenance) is the clearest throughput win.
-- **Weak — vector-index build.** drsg's hand-rolled HNSW builds an order of magnitude slower than Kùzu's and Neo4j's. The deferred HNSW sidecar + parallel/build-time optimizations (arch/01 §5) are where to invest for the AI-native story.
-- **Competitive — vector query.** Once built, drsg's top-k latency is lower than both Kùzu and Neo4j here: the query path is healthy, it's index *construction* that lags.
+- **Improved — vector-index build.** The original hand-rolled HNSW built ~10× slower than Kùzu/Neo4j. After caching per-vector norms (so every metric is one dot), an AVX2+FMA dot kernel, and removing per-search allocation, build is ~4× faster and now within ~2× of the mature engines. The remaining gap is single-threaded construction; parallel build (deferred, arch/01 §5) would close it.
+- **Strong — vector query.** drsg's top-k latency is now well below both Kùzu and Neo4j — the same cached-norm + SIMD path that sped up build also sharpened search.
 

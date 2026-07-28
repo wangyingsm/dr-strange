@@ -86,8 +86,52 @@ impl Metric {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+/// Dot product — the one hot numeric kernel. Every metric reduces to it (see
+/// `l2`/`cosine` below and [`super::hnsw`]'s cached-norm distances), so this is
+/// where SIMD pays off across build, search, and brute force alike. Dispatches
+/// to an AVX2+FMA path when the CPU supports it, else a scalar fallback.
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: gated on runtime detection of avx2+fma just above.
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    dot_scalar(a, b)
+}
+
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = a.len();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let va = _mm256_loadu_ps(pa.add(i));
+            let vb = _mm256_loadu_ps(pb.add(i));
+            acc = _mm256_fmadd_ps(va, vb, acc);
+            i += 8;
+        }
+        // Horizontal sum of the 8 lanes.
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let mut sum: f32 = lanes.iter().sum();
+        // Scalar tail for the remaining < 8 elements.
+        while i < n {
+            sum += *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+        sum
+    }
 }
 
 fn l2(a: &[f32], b: &[f32]) -> f32 {

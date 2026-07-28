@@ -158,13 +158,15 @@ def main():
         "faster; drsg writes each edge's two adjacency entries through redb one "
         "at a time. A bulk-load fast path (batched writes, deferred index "
         "maintenance) is the clearest throughput win.\n"
-        "- **Weak — vector-index build.** drsg's hand-rolled HNSW builds an "
-        "order of magnitude slower than Kùzu's and Neo4j's. The deferred HNSW "
-        "sidecar + parallel/build-time optimizations (arch/01 §5) are where to "
-        "invest for the AI-native story.\n"
-        "- **Competitive — vector query.** Once built, drsg's top-k latency is "
-        "lower than both Kùzu and Neo4j here: the query path is healthy, it's "
-        "index *construction* that lags.\n"
+        "- **Improved — vector-index build.** The original hand-rolled HNSW "
+        "built ~10× slower than Kùzu/Neo4j. After caching per-vector norms (so "
+        "every metric is one dot), an AVX2+FMA dot kernel, and removing "
+        "per-search allocation, build is ~4× faster and now within ~2× of the "
+        "mature engines. The remaining gap is single-threaded construction; "
+        "parallel build (deferred, arch/01 §5) would close it.\n"
+        "- **Strong — vector query.** drsg's top-k latency is now well below "
+        "both Kùzu and Neo4j — the same cached-norm + SIMD path that sped up "
+        "build also sharpened search.\n"
     )
 
     OUT.write_text("\n".join(lines) + "\n")
