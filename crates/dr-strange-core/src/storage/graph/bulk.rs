@@ -44,6 +44,16 @@ pub struct BulkEdge<'a> {
     pub props: Properties,
 }
 
+/// One edge to bulk-load, endpoints already resolved to node ids. Used by the
+/// CLI import, which resolves each endpoint itself (by key or by a numeric-id
+/// remap) and validates before calling — see [`bulk_load_edges`].
+pub struct BulkEdgeById<'a> {
+    pub src: NodeId,
+    pub dst: NodeId,
+    pub ty: &'a str,
+    pub props: Properties,
+}
+
 /// Outcome of a bulk load. `node_start` is the first assigned node id, so
 /// callers (e.g. the API layer's index-event mirroring) can recover each
 /// node's id as `node_start + i`.
@@ -178,6 +188,57 @@ pub fn bulk_load(
         edges: edges.len() as u64,
         node_start,
     })
+}
+
+/// Bulk-writes edges whose endpoints are already resolved node ids — the same
+/// sorted, batched, table-opened-once writes as [`bulk_load`]'s edge phase, but
+/// **trusted**: the caller guarantees both endpoints exist (no per-edge
+/// validation here). The CLI import validates against its in-memory node set
+/// before calling, so no dangling adjacency is written.
+pub fn bulk_load_edges(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    edges: &[BulkEdgeById],
+) -> Result<u64> {
+    let edge_start = reserve_id_batch(txn, keys::META_NEXT_EDGE_ID, edges.len() as u64)?;
+
+    let mut type_ids: HashMap<&str, u32> = HashMap::new();
+    let mut edges_b: Batch = Vec::with_capacity(edges.len());
+    let mut adj_fwd_b: Batch = Vec::with_capacity(edges.len());
+    let mut adj_rev_b: Batch = Vec::with_capacity(edges.len());
+
+    for (i, e) in edges.iter().enumerate() {
+        let id = EdgeId(edge_start + i as u64);
+        let ty_id = match type_ids.get(e.ty) {
+            Some(&x) => x,
+            None => {
+                let x = intern_edge_type(txn, e.ty)?;
+                type_ids.insert(e.ty, x);
+                x
+            }
+        };
+        edges_b.push((
+            keys::edge_key(plane, id).to_vec(),
+            codec::encode_edge_record(e.src, e.dst, ty_id, &e.props),
+        ));
+        adj_fwd_b.push((
+            keys::adj_key(plane, e.src, ty_id, e.dst, id).to_vec(),
+            Vec::new(),
+        ));
+        adj_rev_b.push((
+            keys::adj_key(plane, e.dst, ty_id, e.src, id).to_vec(),
+            Vec::new(),
+        ));
+    }
+
+    for b in [&mut adj_fwd_b, &mut adj_rev_b] {
+        b.sort_unstable_by(|a, c| a.0.cmp(&c.0));
+    }
+    txn.put_batch(TableId::Edges, &edges_b)?;
+    txn.put_batch(TableId::AdjFwd, &adj_fwd_b)?;
+    txn.put_batch(TableId::AdjRev, &adj_rev_b)?;
+
+    Ok(edges.len() as u64)
 }
 
 /// Resolves an endpoint key: the current batch first (in memory), then the

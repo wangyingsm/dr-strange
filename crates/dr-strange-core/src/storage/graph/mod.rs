@@ -22,7 +22,7 @@ mod node;
 #[cfg(test)]
 mod tests;
 
-pub use bulk::{BulkEdge, BulkNode, BulkStats, bulk_load};
+pub use bulk::{BulkEdge, BulkEdgeById, BulkNode, BulkStats, bulk_load, bulk_load_edges};
 
 pub(crate) use meta::IdAllocator;
 pub use meta::{

@@ -24,7 +24,7 @@ pub use compute::{
     SortKey, Source, Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
-pub use storage::graph::{BulkEdge, BulkNode, BulkStats};
+pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
 pub use storage::vector::Metric;
 pub use types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,

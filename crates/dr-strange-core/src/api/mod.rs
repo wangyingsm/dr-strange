@@ -20,7 +20,7 @@ use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
-use crate::storage::graph::{self, BulkEdge, BulkNode, BulkStats, IdAllocator};
+use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::storage::vector::Metric;
@@ -507,6 +507,16 @@ impl WriteTxn<'_> {
             self.events.extend(new_events);
         }
         Ok(stats)
+    }
+
+    /// Bulk-writes edges whose endpoints are already resolved node ids
+    /// (arch/01 §2) — the id-based companion to [`bulk_load`](Self::bulk_load),
+    /// used by `drsg import` which resolves and validates endpoints itself.
+    /// **Trusted**: the caller must guarantee both endpoints exist; a bad id
+    /// writes dangling adjacency.
+    pub fn bulk_load_edges(&mut self, edges: Vec<BulkEdgeById<'_>>) -> Result<u64> {
+        let plane = self.plane;
+        graph::bulk_load_edges(self.txn(), plane, &edges)
     }
 
     /// Deletes a node, cascading to every incident edge in both directions

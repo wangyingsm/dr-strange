@@ -6,7 +6,9 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use dr_strange_core::{Database, Dir, LogicalPlan, Metric, NodeId, PlaneHandle, Properties};
+use dr_strange_core::{
+    BulkEdgeById, BulkNode, Database, Dir, LogicalPlan, Metric, NodeId, PlaneHandle, Properties,
+};
 use serde_json::{Value, json};
 
 use dr_strange_core::json as jsonio;
@@ -159,9 +161,22 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
 
 // ---- import / export -----------------------------------------------------
 
-/// Imports JSONL: each line is a node `{"labels":[…], "external_key"?, "properties"?}`
-/// or an edge `{"src_key"|"src", "dst_key"|"dst", "type", "properties"?}`. An
-/// edge line is one carrying `type`. Returns `(nodes, edges)` created.
+/// An edge endpoint reference in the JSONL: `{prefix}_key` (external key) or
+/// `{prefix}` (numeric node id, as `export` emits).
+enum Ref {
+    Key(String),
+    Id(u64),
+}
+
+/// Imports JSONL: each line is a node `{"id"?, "labels":[…], "external_key"?,
+/// "properties"?}` or an edge `{"src_key"|"src", "dst_key"|"dst", "type",
+/// "properties"?}` (an edge line is one carrying `type`).
+///
+/// Uses the bulk-load fast path: the whole file is buffered, nodes are loaded
+/// in one batch, then edge endpoints are resolved — by external key, or by
+/// remapping the exported numeric `id` to the node's freshly-assigned one —
+/// and edges are bulk-written. Endpoints must resolve within this batch or
+/// already exist in the plane; keys are assumed fresh (as bulk load requires).
 pub fn import(
     db: &Database,
     plane_name: &str,
@@ -169,86 +184,153 @@ pub fn import(
     out: &mut dyn Write,
 ) -> Result<()> {
     let p = plane(db, plane_name)?;
-    let mut txn = p.write()?;
-    let (mut nodes, mut edges) = (0u64, 0u64);
-    // External keys created earlier in this same transaction: a fresh read
-    // (node_by_key) can't see them until commit, so track them here and
-    // resolve edges from this map first.
-    let mut created: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
+
+    // Buffer the whole file (bulk load needs the batch up front).
+    let mut old_ids: Vec<Option<u64>> = Vec::new();
+    let mut keys: Vec<Option<String>> = Vec::new();
+    let mut labels: Vec<Vec<String>> = Vec::new();
+    let mut node_props: Vec<Properties> = Vec::new();
+    let mut edges: Vec<(Ref, Ref, String, Properties)> = Vec::new();
 
     for (lineno, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("line {}: invalid JSON", lineno + 1))?;
+        let ctx = || format!("line {}", lineno + 1);
+        let value: Value =
+            serde_json::from_str(&line).with_context(|| format!("{}: bad JSON", ctx()))?;
         let obj = value
             .as_object()
-            .ok_or_else(|| anyhow!("line {}: expected a JSON object", lineno + 1))?;
+            .ok_or_else(|| anyhow!("{}: expected a JSON object", ctx()))?;
 
         if obj.contains_key("type") {
-            let src = resolve_ref(&p, &created, obj, "src")?;
-            let dst = resolve_ref(&p, &created, obj, "dst")?;
+            let src = parse_ref(obj, "src").with_context(ctx)?;
+            let dst = parse_ref(obj, "dst").with_context(ctx)?;
             let ty = obj
                 .get("type")
                 .and_then(|t| t.as_str())
-                .context("edge missing `type`")?;
-            let props = obj
-                .get("properties")
-                .map(jsonio::json_to_properties)
-                .transpose()?
-                .unwrap_or_default();
-            txn.create_edge(src, dst, ty, props)?;
-            edges += 1;
+                .with_context(|| format!("{}: edge missing `type`", ctx()))?
+                .to_string();
+            edges.push((src, dst, ty, edge_props(obj)?));
         } else {
-            let labels = obj
-                .get("labels")
-                .and_then(|l| l.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            let props = obj
-                .get("properties")
-                .map(jsonio::json_to_properties)
-                .transpose()?
-                .unwrap_or_default();
-            match obj.get("external_key").and_then(|k| k.as_str()) {
-                Some(key) => {
-                    let id = txn.create_node_with_key(key, &labels, props)?;
-                    created.insert(key.to_string(), id);
-                }
-                None => {
-                    txn.create_node(&labels, props)?;
-                }
-            }
-            nodes += 1;
+            old_ids.push(obj.get("id").and_then(Value::as_u64));
+            keys.push(
+                obj.get("external_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_string),
+            );
+            labels.push(
+                obj.get("labels")
+                    .and_then(|l| l.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            node_props.push(edge_props(obj)?);
         }
     }
+
+    let mut txn = p.write()?;
+
+    // Node phase (fast path): one batch, contiguous ids.
+    let label_refs: Vec<Vec<&str>> = labels
+        .iter()
+        .map(|ls| ls.iter().map(String::as_str).collect())
+        .collect();
+    let bnodes: Vec<BulkNode> = keys
+        .iter()
+        .zip(&label_refs)
+        .zip(node_props)
+        .map(|((k, lr), props)| BulkNode {
+            external_key: k.as_deref(),
+            labels: lr,
+            props,
+        })
+        .collect();
+    let n_nodes = bnodes.len() as u64;
+    let stats = txn.bulk_load(bnodes, Vec::new())?;
+
+    // Maps from this batch's identifiers to the freshly-assigned node ids.
+    let mut old_to_new = std::collections::HashMap::new();
+    let mut key_to_new = std::collections::HashMap::new();
+    for i in 0..n_nodes as usize {
+        let id = NodeId(stats.node_start + i as u64);
+        if let Some(o) = old_ids[i] {
+            old_to_new.insert(o, id);
+        }
+        if let Some(k) = &keys[i] {
+            key_to_new.insert(k.clone(), id);
+        }
+    }
+
+    // Resolve + validate every endpoint, then bulk-write the edges by id.
+    let mut bedges: Vec<BulkEdgeById> = Vec::with_capacity(edges.len());
+    for (src, dst, ty, props) in &edges {
+        bedges.push(BulkEdgeById {
+            src: resolve(src, &key_to_new, &old_to_new, &p)?,
+            dst: resolve(dst, &key_to_new, &old_to_new, &p)?,
+            ty,
+            props: props.clone(),
+        });
+    }
+    let n_edges = txn.bulk_load_edges(bedges)?;
+
     txn.commit()?;
-    writeln!(out, "imported {nodes} nodes, {edges} edges")?;
+    writeln!(out, "imported {n_nodes} nodes, {n_edges} edges")?;
     Ok(())
 }
 
-/// Resolves an edge endpoint from either `{prefix}_key` (external key —
-/// checked against same-transaction creations first, then committed nodes)
-/// or `{prefix}` (numeric id).
-fn resolve_ref(
-    p: &PlaneHandle,
-    created: &std::collections::HashMap<String, NodeId>,
-    obj: &serde_json::Map<String, Value>,
-    prefix: &str,
-) -> Result<NodeId> {
+fn edge_props(obj: &serde_json::Map<String, Value>) -> Result<Properties> {
+    Ok(obj
+        .get("properties")
+        .map(jsonio::json_to_properties)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn parse_ref(obj: &serde_json::Map<String, Value>, prefix: &str) -> Result<Ref> {
     if let Some(key) = obj.get(&format!("{prefix}_key")).and_then(|v| v.as_str()) {
-        if let Some(id) = created.get(key) {
-            return Ok(*id);
-        }
-        p.node_by_key(key)?
-            .map(|n| n.id)
-            .ok_or_else(|| anyhow!("edge references unknown {prefix}_key '{key}'"))
+        Ok(Ref::Key(key.to_string()))
     } else if let Some(id) = obj.get(prefix).and_then(|v| v.as_u64()) {
-        Ok(NodeId(id))
+        Ok(Ref::Id(id))
     } else {
         bail!("edge missing `{prefix}_key` or `{prefix}`")
+    }
+}
+
+/// Resolves a reference to a node id, validating existence: a batch key/id
+/// maps to the freshly-assigned id; otherwise it must already exist in the
+/// plane (a committed key, or a live node id).
+fn resolve(
+    r: &Ref,
+    key_to_new: &std::collections::HashMap<String, NodeId>,
+    old_to_new: &std::collections::HashMap<u64, NodeId>,
+    p: &PlaneHandle,
+) -> Result<NodeId> {
+    match r {
+        Ref::Key(k) => {
+            if let Some(&id) = key_to_new.get(k) {
+                return Ok(id);
+            }
+            p.node_by_key(k)?
+                .map(|n| n.id)
+                .ok_or_else(|| anyhow!("edge references unknown key '{k}'"))
+        }
+        Ref::Id(o) => {
+            if let Some(&id) = old_to_new.get(o) {
+                return Ok(id);
+            }
+            let id = NodeId(*o);
+            if p.node(id)?.is_some() {
+                Ok(id)
+            } else {
+                bail!("edge references unknown node id {o}")
+            }
+        }
     }
 }
 
@@ -325,6 +407,29 @@ mod tests {
         assert!(cap(|o| get(&db, "startup", "1", o)).contains("\"id\":1"));
         assert!(cap(|o| stats(&db, o)).contains("1 planes, 2 nodes, 1 edges"));
         assert!(cap(|o| check(&db, o)).contains("ok: 2 nodes"));
+    }
+
+    #[test]
+    fn import_remaps_exported_numeric_edge_ids() {
+        // The file's node ids (5, 6) don't match the fresh db's assignments;
+        // the numeric edge (src:5 → dst:6) must still connect a → b.
+        let jsonl = concat!(
+            r#"{"id":5,"external_key":"a","labels":["N"]}"#,
+            "\n",
+            r#"{"id":6,"external_key":"b","labels":["N"]}"#,
+            "\n",
+            r#"{"src":5,"dst":6,"type":"E"}"#,
+            "\n",
+        );
+        let db = Database::in_memory().unwrap();
+        cap(|o| import(&db, "startup", jsonl.as_bytes(), o));
+        let p = db.plane("startup").unwrap();
+        let a = p.node_by_key("a").unwrap().unwrap();
+        let b = p.node_by_key("b").unwrap().unwrap();
+        assert_ne!(a.id.0, 5, "ids are reassigned, not copied from the file");
+        let ns = p.neighbors(a.id, Dir::Out, None).unwrap();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].node, b.id, "numeric edge remapped to the right node");
     }
 
     #[test]
