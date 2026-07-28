@@ -22,12 +22,37 @@ pub fn extract_text_with_progress(
     progress: &mut dyn FnMut(u32, u32),
 ) -> Result<String> {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "md" | "markdown" | "txt" | "text" | "" => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        "pdf" => extract_pdf(bytes, progress),
-        "docx" => extract_docx(bytes),
+    let raw = match ext.as_str() {
+        "md" | "markdown" | "txt" | "text" | "" => String::from_utf8_lossy(bytes).into_owned(),
+        "pdf" => extract_pdf(bytes, progress)?,
+        "docx" => extract_docx(bytes)?,
         other => bail!("unsupported file type '.{other}' — use md, txt, pdf, or docx"),
+    };
+    Ok(normalize_whitespace(&raw))
+}
+
+/// Tidy the whitespace extraction leaves behind (PDF/docx are especially
+/// noisy): collapse runs of spaces/tabs within a line to one, trim each line's
+/// ends, and squeeze runs of blank lines down to a single one — keeping the
+/// blank-line paragraph breaks the digest chunker splits on (arch/07). Leading
+/// and trailing blank lines are dropped entirely.
+fn normalize_whitespace(s: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev_blank = true; // start "blank" so leading blank lines are dropped
+    for raw in s.lines() {
+        // `split_whitespace` collapses internal runs and trims both ends.
+        let line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let blank = line.is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        lines.push(line);
+        prev_blank = blank;
     }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Extracts a PDF page by page (via [`output_doc`]) so we can report progress —
@@ -144,5 +169,24 @@ mod tests {
     #[test]
     fn unknown_extension_errors() {
         assert!(extract_text("a.xyz", b"x").is_err());
+    }
+
+    #[test]
+    fn normalizes_messy_whitespace() {
+        let messy = "  \n\nAlice   met  Bob.  \n\n\n\ttrailing tab here \t\n  \n";
+        // Multiple spaces → one, tabs collapsed, trailing/leading trimmed,
+        // runs of blank lines squeezed to a single paragraph break, and
+        // leading/trailing blank lines dropped.
+        assert_eq!(
+            normalize_whitespace(messy),
+            "Alice met Bob.\n\ntrailing tab here"
+        );
+        // A single paragraph break survives (the chunker splits on it).
+        assert_eq!(normalize_whitespace("a\n\nb"), "a\n\nb");
+        // Extraction runs through the normalizer.
+        assert_eq!(
+            extract_text("a.txt", b"foo   bar  \n\n\n baz ").unwrap(),
+            "foo bar\n\nbaz"
+        );
     }
 }
