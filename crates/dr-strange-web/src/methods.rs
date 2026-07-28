@@ -239,6 +239,11 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 const SEED_LIMIT: u64 = 200;
 /// The default fan-out cap for one click-to-expand (hub-safe expansion).
 const EXPAND_LIMIT: u64 = 100;
+/// Text search stops after examining this many nodes — there is no text index,
+/// so `plane.find` is a linear scan; the cap keeps a huge plane responsive.
+const FIND_SCAN_CAP: usize = 20_000;
+/// Default number of matches `plane.find` returns.
+const FIND_LIMIT: usize = 50;
 
 #[derive(Deserialize)]
 pub struct Seed {
@@ -294,6 +299,93 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "total": total,
         "truncated": total > ids.len(),
     }))
+}
+
+#[derive(Deserialize)]
+pub struct Find {
+    plane: String,
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `plane.find` — text search over the plane: a case-insensitive substring
+/// match against each node's external key, labels, and string property values.
+/// There is no text index (arch/03), so this is a linear scan, capped at
+/// [`FIND_SCAN_CAP`] nodes and [`limit`] results. Each hit carries a `match`
+/// hint (which field matched) so the UI can show *why* it surfaced.
+pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Find = params(p)?;
+    let needle = req.q.trim().to_lowercase();
+    let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
+    if needle.is_empty() {
+        return Ok(jval!({ "nodes": [], "scanned": 0, "total": 0, "truncated": false }));
+    }
+
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let all = app(plane.query().scan_all().nodes())?;
+    let total = all.len();
+
+    let mut hits = Vec::new();
+    let mut examined = 0usize;
+    for n in all {
+        if examined >= FIND_SCAN_CAP {
+            break;
+        }
+        examined += 1;
+        if let Some(hint) = match_node(&n, &needle) {
+            let mut obj = json::node_to_json(&n);
+            if let Value::Object(map) = &mut obj {
+                map.insert("match".into(), Value::String(hint));
+            }
+            hits.push(obj);
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    Ok(jval!({
+        "nodes": hits,
+        "scanned": examined,
+        "total": total,
+        // We stopped before scanning the whole plane (result cap or scan cap),
+        // so there may be more matches than shown.
+        "truncated": examined < total,
+    }))
+}
+
+/// Returns a short "matched in …" hint if `needle` (already lowercased) occurs
+/// in the node's key, a label, or a string property value; `None` otherwise.
+/// Key is checked first, then labels, then properties — most-specific first.
+fn match_node(n: &NodeRecord, needle: &str) -> Option<String> {
+    if n.external_key
+        .as_deref()
+        .is_some_and(|k| k.to_lowercase().contains(needle))
+    {
+        return Some("key".into());
+    }
+    if let Some(l) = n.labels.iter().find(|l| l.to_lowercase().contains(needle)) {
+        return Some(format!("label: {l}"));
+    }
+    for (k, pd) in &n.properties {
+        if let dr_strange_core::PropValue::Str(s) = &pd.value
+            && s.to_lowercase().contains(needle)
+        {
+            return Some(format!("{k}: {}", snippet(s)));
+        }
+    }
+    None
+}
+
+/// Trim a matched property value for display (single line, bounded length).
+fn snippet(s: &str) -> String {
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 80 {
+        format!("{}…", one_line.chars().take(80).collect::<String>())
+    } else {
+        one_line
+    }
 }
 
 #[derive(Deserialize)]

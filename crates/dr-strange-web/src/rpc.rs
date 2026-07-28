@@ -158,6 +158,7 @@ fn dispatch_method(ctx: &Ctx<'_>, method: &str, params: Value) -> Result<Value, 
         "plane.neighbors" => methods::plane_neighbors(ctx, params),
         "plane.search" => methods::plane_search(ctx, params),
         "plane.query" => methods::plane_query(ctx, params),
+        "plane.find" => methods::plane_find(ctx, params),
         "graph.seed" => methods::graph_seed(ctx, params),
         "graph.expand" => methods::graph_expand(ctx, params),
         "digest.run" => methods::digest_run(ctx, params),
@@ -321,6 +322,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn plane_find_matches_key_and_label_case_insensitively() {
+        let db = seeded(); // one node: key "alice", label "Person"
+
+        // Substring of the key, wrong case — still a hit, flagged as a key match.
+        let hit = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"ALI"},"id":1}"#,
+        )
+        .unwrap();
+        let nodes = hit["result"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["external_key"], "alice");
+        assert_eq!(nodes[0]["match"], "key");
+        assert_eq!(hit["result"]["truncated"], false);
+
+        // Label substring, different case.
+        let by_label = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"pers"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(by_label["result"]["nodes"][0]["match"], "label: Person");
+
+        // No match.
+        let miss = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"zzz"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(miss["result"]["nodes"].as_array().unwrap().len(), 0);
     }
 
     #[test]

@@ -3,11 +3,16 @@
   import { rpc } from './rpc.js'
   import { Plot } from './plot.js'
 
+  // `plane` is the app-wide current plane (App owns it); `focus` is a
+  // { id, nonce } signal from the header search — center that node.
+  let { plane, focus } = $props()
+
   let container // canvas div (bind:this)
   let plot = null
+  let started = false // plot created + first seed done
+  let seededPlane = null // last plane we seeded (avoids re-seeding on no-op)
+  let appliedFocus = -1 // last focus nonce we centered (idempotent)
 
-  let planes = $state([])
-  let plane = $state('startup')
   let labels = $state([]) // catalog label names for the filter
   let labelFilter = $state('') // '' = all labels
   let selected = $state(null) // { kind: 'node'|'edge', data }
@@ -50,11 +55,6 @@
     return rows.join('\n')
   }
 
-  async function loadPlanes() {
-    planes = await rpc('plane.list')
-    if (!planes.some((p) => p.name === plane)) plane = planes[0]?.name ?? 'startup'
-  }
-
   async function loadCatalog() {
     try {
       const cat = await rpc('plane.catalog', { plane })
@@ -95,10 +95,43 @@
     }
   }
 
-  async function changePlane() {
+  // Center a specific node (from header search): show it plus its 1-hop
+  // neighborhood and select it.
+  async function focusNode(id) {
+    error = null
+    try {
+      const node = await rpc('node.get', { plane, id })
+      if (!node) {
+        status = `node ${id} not found`
+        return
+      }
+      plot.clear()
+      plot.addSubgraph({ nodes: [node], edges: [] })
+      const sg = await rpc('graph.expand', { plane, id, direction: 'both' })
+      plot.addSubgraph(sg, id)
+      legend = plot.legendEntries()
+      selected = { kind: 'node', data: node }
+      status = `focused ${node.external_key ?? `#${id}`} · +${sg.nodes.length} neighbors`
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  // Re-seed when the current plane changes (order-independent: whoever runs
+  // first — onMount or the effect below — seeds once, the other no-ops).
+  async function reseed() {
+    if (!started || plane === seededPlane) return
+    seededPlane = plane
     labelFilter = ''
     await loadCatalog()
     await seed()
+  }
+
+  // Apply a pending focus signal once (idempotent by nonce).
+  async function maybeFocus() {
+    if (!started || !focus || focus.nonce === appliedFocus) return
+    appliedFocus = focus.nonce
+    await focusNode(focus.id)
   }
 
   onMount(async () => {
@@ -114,23 +147,32 @@
         selected = null
       },
     })
-    await loadPlanes()
-    await loadCatalog()
-    await seed()
+    started = true
+    if (focus) {
+      // Arrived here from a search hit — go straight to that node's
+      // neighborhood instead of seeding (then discarding) the whole plane.
+      seededPlane = plane
+      appliedFocus = focus.nonce
+      await focusNode(focus.id)
+    } else {
+      await reseed()
+    }
+  })
+
+  // React to plane switches and search focuses after mount.
+  $effect(() => {
+    plane // track
+    reseed()
+  })
+  $effect(() => {
+    focus // track
+    maybeFocus()
   })
 
   onDestroy(() => plot?.destroy())
 </script>
 
 <div class="controls">
-  <label>
-    Plane
-    <select bind:value={plane} onchange={changePlane}>
-      {#each planes as p (p.id)}
-        <option value={p.name}>{p.name}</option>
-      {/each}
-    </select>
-  </label>
   <label>
     Label
     <select bind:value={labelFilter} onchange={seed}>
