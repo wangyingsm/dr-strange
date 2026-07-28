@@ -17,10 +17,15 @@ serde_json = { version = "1.0.151", optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1.11.0"
 redb = "4.1.0"
 serde_json = "1.0.151"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "graph"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

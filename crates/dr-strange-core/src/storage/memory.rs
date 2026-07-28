@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::error::Result;
 use crate::storage::engine::{KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction};
@@ -56,7 +56,11 @@ impl Tables {
 
 #[derive(Debug)]
 pub struct MemoryEngine {
-    data: Mutex<Tables>,
+    /// Committed data behind an `Arc` so a read snapshot is an O(1) pointer
+    /// clone, not an O(data) deep copy. A write deep-copies once (into its
+    /// staged buffer) and publishes a fresh `Arc` at commit; readers keep the
+    /// `Arc` they opened with — copy-on-write MVCC.
+    data: Mutex<Arc<Tables>>,
     /// Held for the lifetime of a write transaction — single-writer.
     writer: Mutex<()>,
 }
@@ -64,14 +68,14 @@ pub struct MemoryEngine {
 impl MemoryEngine {
     pub fn new() -> Self {
         Self {
-            data: Mutex::new(Tables::new()),
+            data: Mutex::new(Arc::new(Tables::new())),
             writer: Mutex::new(()),
         }
     }
 
     /// Poisoning only means a panic elsewhere while a lock was held; data is
     /// only ever replaced atomically at commit, so it is always consistent.
-    fn data(&self) -> MutexGuard<'_, Tables> {
+    fn data(&self) -> MutexGuard<'_, Arc<Tables>> {
         self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -94,13 +98,14 @@ impl StorageEngine for MemoryEngine {
 
     fn begin_read(&self) -> Result<MemoryReadTxn> {
         Ok(MemoryReadTxn {
-            snapshot: self.data().clone(),
+            snapshot: Arc::clone(&self.data()),
         })
     }
 
     fn begin_write(&self) -> Result<MemoryWriteTxn<'_>> {
         let guard = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        let staged = self.data().clone();
+        // Deep-copy the committed tables into a mutable staging buffer.
+        let staged = (**self.data()).clone();
         Ok(MemoryWriteTxn {
             engine: self,
             staged,
@@ -110,7 +115,7 @@ impl StorageEngine for MemoryEngine {
 }
 
 pub struct MemoryReadTxn {
-    snapshot: Tables,
+    snapshot: Arc<Tables>,
 }
 
 impl ReadTransaction for MemoryReadTxn {
@@ -181,7 +186,9 @@ impl WriteTransaction for MemoryWriteTxn<'_> {
     }
 
     fn commit(self) -> Result<()> {
-        *self.engine.data() = self.staged;
+        // Publish the staged tables as the new committed snapshot; readers
+        // holding the previous Arc are unaffected.
+        *self.engine.data() = Arc::new(self.staged);
         Ok(())
     }
 }
