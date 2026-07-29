@@ -233,6 +233,123 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+/* "+" tile that opens the new-plane popup */
+.new-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.2rem;
+  min-height: 92px;
+  font: inherit;
+  color: var(--muted);
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+.new-card span[aria-hidden] {
+  font-size: 1.6rem;
+  line-height: 1;
+}
+.new-card .new-card-label {
+  font-size: 0.85rem;
+}
+.new-card:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- new-plane popup ---- */
+.dlg-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 45%, transparent);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+}
+.dlg {
+  width: min(360px, 90%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px color-mix(in srgb, #000 40%, transparent);
+  overflow: hidden;
+}
+.dlg header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+.dlg .close {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+.dlg .close:hover {
+  color: var(--fg);
+}
+.dlg-body {
+  padding: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.dlg-body input {
+  font: inherit;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem;
+}
+.dlg-body input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.dlg-error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #e0555f;
+}
+.dlg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.dlg-actions button {
+  font: inherit;
+  font-size: 0.85rem;
+  border-radius: 8px;
+  padding: 0.4rem 0.85rem;
+  cursor: pointer;
+}
+.dlg-actions .ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.dlg-actions .primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+.dlg-actions .primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .empty {
   color: var(--muted);
 }
@@ -309,60 +426,6 @@ nav button.active {
   font-size: 0.78rem;
   color: var(--muted);
   white-space: nowrap;
-}
-.plane-pick .add-plane {
-  font: inherit;
-  font-size: 1rem;
-  line-height: 1;
-  width: 1.5rem;
-  height: 1.5rem;
-  display: grid;
-  place-items: center;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  cursor: pointer;
-}
-.plane-pick .add-plane:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.new-plane {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  white-space: nowrap;
-}
-.new-plane input {
-  font: inherit;
-  font-size: 0.82rem;
-  width: 9rem;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.3rem 0.45rem;
-}
-.new-plane button {
-  font: inherit;
-  font-size: 0.78rem;
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  padding: 0.3rem 0.55rem;
-  cursor: pointer;
-}
-.new-plane button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.new-plane .plane-error {
-  font-size: 0.75rem;
-  color: #e0555f;
-  text-transform: none;
-  letter-spacing: 0;
 }
 .search .results .note {
   margin: 0.3rem 0.5rem;
