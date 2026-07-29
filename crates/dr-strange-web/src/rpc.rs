@@ -158,6 +158,38 @@ fn handle_single(ctx: &Ctx<'_>, auth: &Auth<'_>, msg: Value) -> Option<Value> {
     })
 }
 
+/// Every dispatched method name — the server's declared RPC surface. Kept in
+/// lockstep with [`dispatch_method`] (right below) and cross-checked against the
+/// OpenRPC schema by the drift test, so the schema, this list, and dispatch can
+/// never silently disagree. Test-only: its sole purpose is that cross-check.
+#[cfg(test)]
+const METHODS: &[&str] = &[
+    "rpc.discover",
+    "db.stats",
+    "db.catalog",
+    "plane.list",
+    "plane.catalog",
+    "node.get",
+    "plane.neighbors",
+    "plane.search",
+    "plane.query",
+    "plane.find",
+    "graph.seed",
+    "graph.expand",
+    "digest.run",
+    "digest.write",
+    "node.create",
+    "node.update",
+    "node.delete",
+    "edge.create",
+    "edge.update",
+    "edge.delete",
+    "plane.create",
+    "plane.rename",
+    "plane.set_props",
+    "plane.delete",
+];
+
 /// Dispatch one method. Every arm declares the [`Access`] it requires via the
 /// `guarded!` macro, so a method cannot be added without classifying it — an
 /// ungated write can't ship by omission. The gate runs before the handler, so
@@ -179,6 +211,7 @@ fn dispatch_method(
     }
 
     match method {
+        "rpc.discover" => guarded!(Access::Read, methods::rpc_discover(ctx)),
         "db.stats" => guarded!(Access::Read, methods::db_stats(ctx)),
         "db.catalog" => guarded!(Access::Read, methods::db_catalog(ctx)),
         "plane.list" => guarded!(Access::Read, methods::plane_list(ctx)),
@@ -259,6 +292,11 @@ mod tests {
     /// Extract the error code from a (single) response.
     fn err_code(resp: &Value) -> i64 {
         resp["error"]["code"].as_i64().unwrap()
+    }
+
+    /// The error code if the response is an error, else `None` (a success).
+    fn err_code_opt(resp: &Value) -> Option<i64> {
+        resp.get("error").and_then(|e| e["code"].as_i64())
     }
 
     #[test]
@@ -821,6 +859,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(err_code(&resp), -32001);
+    }
+
+    // ---- OpenRPC schema / surface drift -----------------------------------
+
+    #[test]
+    fn dispatch_knows_every_declared_method() {
+        let db = seeded();
+        for m in METHODS {
+            let body = format!(r#"{{"jsonrpc":"2.0","method":"{m}","params":{{}},"id":1}}"#);
+            let resp = call(&db, &body).unwrap();
+            // The method exists ⇒ never "method not found". It may still error
+            // on the empty params (-32602 / -32000), which is fine here.
+            assert_ne!(
+                err_code_opt(&resp),
+                Some(-32601),
+                "METHODS lists `{m}` but dispatch doesn't handle it"
+            );
+        }
+        // Sanity: an undeclared name really is not-found.
+        let bogus = call(&db, r#"{"jsonrpc":"2.0","method":"no.such.method","id":1}"#).unwrap();
+        assert_eq!(err_code(&bogus), -32601);
+    }
+
+    #[test]
+    fn openrpc_schema_matches_the_declared_surface() {
+        let doc: Value = serde_json::from_str(include_str!("../openrpc.json"))
+            .expect("openrpc.json must be valid JSON");
+        let in_schema: std::collections::BTreeSet<String> = doc["methods"]
+            .as_array()
+            .expect("openrpc `methods` array")
+            .iter()
+            .map(|m| m["name"].as_str().expect("method name").to_string())
+            .collect();
+        let declared: std::collections::BTreeSet<String> =
+            METHODS.iter().map(|s| s.to_string()).collect();
+        // Both directions: a schema method with no dispatch arm, or a dispatched
+        // method missing from the schema, fails here — the SDK contract can't
+        // drift from the server.
+        assert_eq!(
+            in_schema, declared,
+            "OpenRPC doc and the dispatch surface disagree"
+        );
+    }
+
+    #[test]
+    fn rpc_discover_returns_the_document() {
+        let db = seeded();
+        let resp = call(&db, r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#).unwrap();
+        assert_eq!(resp["result"]["openrpc"], "1.2.6");
+        assert!(resp["result"]["methods"].as_array().unwrap().len() >= 20);
     }
 
     #[test]

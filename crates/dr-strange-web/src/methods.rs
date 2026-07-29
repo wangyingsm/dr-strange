@@ -83,6 +83,18 @@ fn scored_rows(rows: &[(NodeRecord, Option<f32>)]) -> Value {
     )
 }
 
+// ---- service description --------------------------------------------------
+
+/// The OpenRPC service description, embedded at build time. It is the source of
+/// truth for the language SDKs and the RPC reference; the drift test in `rpc`
+/// keeps it in lockstep with the dispatch table.
+const OPENRPC: &str = include_str!("../openrpc.json");
+
+/// `rpc.discover` — return the OpenRPC document (the standard discovery method).
+pub fn rpc_discover(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
+    serde_json::from_str(OPENRPC).map_err(|e| RpcError::server(format!("bad openrpc doc: {e}")))
+}
+
 // ---- methods --------------------------------------------------------------
 
 /// `db.stats` — the dashboard's health panel: plane/node/edge counts plus the
