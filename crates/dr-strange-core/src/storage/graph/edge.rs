@@ -136,6 +136,45 @@ pub fn remove_edge_prop(
     txn.put(TableId::Edges, &edge_key, &record)
 }
 
+/// Changes an existing edge's type (arch/01 §4). The type is part of the
+/// adjacency key, so this moves both adjacency entries and rewrites the record.
+/// Errors with `NotFound` if the edge does not exist.
+pub fn set_edge_type(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    id: EdgeId,
+    ty: &str,
+) -> Result<()> {
+    let edge_key = keys::edge_key(plane, id);
+    let Some(buf) = txn.get(TableId::Edges, &edge_key)? else {
+        return Err(Error::NotFound(format!("edge {}", id.0)));
+    };
+    let (src, dst, old_ty_id, props) = codec::decode_edge_record(&buf)?;
+    let new_ty_id = intern_edge_type(txn, ty)?;
+    if new_ty_id != old_ty_id {
+        txn.delete(
+            TableId::AdjFwd,
+            &keys::adj_key(plane, src, old_ty_id, dst, id),
+        )?;
+        txn.delete(
+            TableId::AdjRev,
+            &keys::adj_key(plane, dst, old_ty_id, src, id),
+        )?;
+        txn.put(
+            TableId::AdjFwd,
+            &keys::adj_key(plane, src, new_ty_id, dst, id),
+            b"",
+        )?;
+        txn.put(
+            TableId::AdjRev,
+            &keys::adj_key(plane, dst, new_ty_id, src, id),
+            b"",
+        )?;
+    }
+    let record = codec::encode_edge_record(src, dst, new_ty_id, &props);
+    txn.put(TableId::Edges, &edge_key, &record)
+}
+
 /// All edge ids in a plane, ascending (an `Edges`-table prefix scan). Used by
 /// the catalog to walk edges; edges have the same `plane · id` key layout as
 /// nodes.

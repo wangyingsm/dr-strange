@@ -551,6 +551,58 @@ impl WriteTxn<'_> {
         self.record_prop_event(id, key, None)
     }
 
+    /// Replaces a node's entire label set. Errors `NotFound` if the node is
+    /// absent. Adjusts vector-index membership for any declared index whose
+    /// label the node gained or lost.
+    pub fn set_labels(&mut self, id: NodeId, labels: &[&str]) -> Result<()> {
+        let plane = self.plane;
+        // Snapshot the old labels + the node's props before the write so index
+        // membership can be diffed (a node's spot in a `(label, property)` index
+        // depends on whether it still carries that label).
+        let node = graph::get_node(self.txn(), plane, id)?
+            .ok_or_else(|| Error::NotFound(format!("node {}", id.0)))?;
+        graph::set_node_labels(self.txn(), plane, id, labels)?;
+        if !self.decls.is_empty() {
+            self.record_labels_event(id, &node.labels, labels, &node.properties);
+        }
+        Ok(())
+    }
+
+    /// Buffers index events for a label-set change: for each declared index the
+    /// node newly matches (label gained + carries the vector) an `Upsert`, and
+    /// for each it no longer matches (label lost) a `Remove`.
+    fn record_labels_event(
+        &mut self,
+        node: NodeId,
+        old: &[String],
+        new: &[&str],
+        props: &Properties,
+    ) {
+        let mut events = Vec::new();
+        for (label, property, _metric) in &self.decls {
+            let had = old.iter().any(|l| l == label);
+            let has = new.iter().any(|l| l == label);
+            if had == has {
+                continue;
+            }
+            match props.get(property).map(|p| &p.value) {
+                Some(PropValue::Vector(v)) if has => events.push(IndexEvent::Upsert {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                    vector: v.clone(),
+                }),
+                Some(PropValue::Vector(_)) => events.push(IndexEvent::Remove {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                }),
+                _ => {} // no vector on this property ⇒ nothing indexed either way
+            }
+        }
+        self.events.extend(events);
+    }
+
     /// Buffers index events for a single-property change on `node`: an
     /// `Upsert` if the new value is a vector on an indexed `(label, key)`, a
     /// `Remove` otherwise. Cheap no-op unless some declared index names `key`.
@@ -595,6 +647,14 @@ impl WriteTxn<'_> {
     pub fn set_edge_prop(&mut self, id: EdgeId, key: &str, prop: PropDesc) -> Result<()> {
         let plane = self.plane;
         graph::set_edge_prop(self.txn(), plane, id, key, prop)
+    }
+
+    /// Changes an existing edge's type. Errors `NotFound` if the edge is
+    /// absent. (Edge indexes key on node labels, so a retype needs no index
+    /// bookkeeping.)
+    pub fn set_edge_type(&mut self, id: EdgeId, ty: &str) -> Result<()> {
+        let plane = self.plane;
+        graph::set_edge_type(self.txn(), plane, id, ty)
     }
 
     /// Removes one property from an existing edge; removing an absent key

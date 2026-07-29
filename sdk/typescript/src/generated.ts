@@ -146,8 +146,8 @@ export class Drsg extends Client {
     return this._call("node.create", params) as Promise<NodeRecord>;
   }
 
-  /** Patch a node's properties: `set` inserts/overwrites, `unset` removes. (access: write) */
-  nodeUpdate(params: { plane: string; id?: number; key?: string; set?: Properties; unset?: Array<string> }): Promise<NodeRecord> {
+  /** Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set. (access: write) */
+  nodeUpdate(params: { plane: string; id?: number; key?: string; set?: Properties; unset?: Array<string>; labels?: Array<string> }): Promise<NodeRecord> {
     return this._call("node.update", params) as Promise<NodeRecord>;
   }
 
@@ -161,8 +161,8 @@ export class Drsg extends Client {
     return this._call("edge.create", params) as Promise<EdgeRecord>;
   }
 
-  /** Patch an edge's properties (`set`/`unset`). (access: write) */
-  edgeUpdate(params: { plane: string; edge: number; set?: Properties; unset?: Array<string> }): Promise<EdgeRecord> {
+  /** Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type. (access: write) */
+  edgeUpdate(params: { plane: string; edge: number; set?: Properties; unset?: Array<string>; type?: string }): Promise<EdgeRecord> {
     return this._call("edge.update", params) as Promise<EdgeRecord>;
   }
 

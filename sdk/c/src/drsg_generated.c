@@ -200,7 +200,7 @@ struct json_object *drsg_node_create(drsg_client *c, const char *plane, const dr
     return rc == 0 ? result : NULL;
 }
 
-/* Patch a node's properties: `set` inserts/overwrites, `unset` removes. (access: write) */
+/* Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set. (access: write) */
 struct json_object *drsg_node_update(drsg_client *c, const char *plane, const drsg_node_update_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
@@ -209,6 +209,7 @@ struct json_object *drsg_node_update(drsg_client *c, const char *plane, const dr
         if (opts->key) json_object_object_add(p, "key", json_object_new_string(opts->key));
         if (opts->set) json_object_object_add(p, "set", json_object_get(opts->set));
         if (opts->unset) json_object_object_add(p, "unset", json_object_get(opts->unset));
+        if (opts->labels) json_object_object_add(p, "labels", json_object_get(opts->labels));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "node.update", p, &result, err);
@@ -246,7 +247,7 @@ struct json_object *drsg_edge_create(drsg_client *c, const char *plane, struct j
     return rc == 0 ? result : NULL;
 }
 
-/* Patch an edge's properties (`set`/`unset`). (access: write) */
+/* Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type. (access: write) */
 struct json_object *drsg_edge_update(drsg_client *c, const char *plane, int64_t edge, const drsg_edge_update_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
@@ -254,6 +255,7 @@ struct json_object *drsg_edge_update(drsg_client *c, const char *plane, int64_t 
     if (opts) {
         if (opts->set) json_object_object_add(p, "set", json_object_get(opts->set));
         if (opts->unset) json_object_object_add(p, "unset", json_object_get(opts->unset));
+        if (opts->type) json_object_object_add(p, "type", json_object_new_string(opts->type));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "edge.update", p, &result, err);

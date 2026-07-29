@@ -327,26 +327,31 @@ public class Drsg extends Client {
             Long id,
             String key,
             Map<String, Object> set,
-            List<String> unset) {
+            List<String> unset,
+            List<String> labels) {
 
         public static NodeUpdateParams of(String plane) {
-            return new NodeUpdateParams(plane, null, null, null, null);
+            return new NodeUpdateParams(plane, null, null, null, null, null);
         }
 
         public NodeUpdateParams withId(Long id) {
-            return new NodeUpdateParams(plane, id, key, set, unset);
+            return new NodeUpdateParams(plane, id, key, set, unset, labels);
         }
 
         public NodeUpdateParams withKey(String key) {
-            return new NodeUpdateParams(plane, id, key, set, unset);
+            return new NodeUpdateParams(plane, id, key, set, unset, labels);
         }
 
         public NodeUpdateParams withSet(Map<String, Object> set) {
-            return new NodeUpdateParams(plane, id, key, set, unset);
+            return new NodeUpdateParams(plane, id, key, set, unset, labels);
         }
 
         public NodeUpdateParams withUnset(List<String> unset) {
-            return new NodeUpdateParams(plane, id, key, set, unset);
+            return new NodeUpdateParams(plane, id, key, set, unset, labels);
+        }
+
+        public NodeUpdateParams withLabels(List<String> labels) {
+            return new NodeUpdateParams(plane, id, key, set, unset, labels);
         }
     }
 
@@ -388,18 +393,23 @@ public class Drsg extends Client {
             String plane,
             long edge,
             Map<String, Object> set,
-            List<String> unset) {
+            List<String> unset,
+            String type) {
 
         public static EdgeUpdateParams of(String plane, long edge) {
-            return new EdgeUpdateParams(plane, edge, null, null);
+            return new EdgeUpdateParams(plane, edge, null, null, null);
         }
 
         public EdgeUpdateParams withSet(Map<String, Object> set) {
-            return new EdgeUpdateParams(plane, edge, set, unset);
+            return new EdgeUpdateParams(plane, edge, set, unset, type);
         }
 
         public EdgeUpdateParams withUnset(List<String> unset) {
-            return new EdgeUpdateParams(plane, edge, set, unset);
+            return new EdgeUpdateParams(plane, edge, set, unset, type);
+        }
+
+        public EdgeUpdateParams withType(String type) {
+            return new EdgeUpdateParams(plane, edge, set, unset, type);
         }
     }
 
@@ -526,7 +536,7 @@ public class Drsg extends Client {
         return call("node.create", params, new TypeReference<NodeRecord>() {});
     }
 
-    /** Patch a node's properties: `set` inserts/overwrites, `unset` removes. (access: write) */
+    /** Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set. (access: write) */
     public NodeRecord nodeUpdate(NodeUpdateParams params) throws DrsgException {
         return call("node.update", params, new TypeReference<NodeRecord>() {});
     }
@@ -541,7 +551,7 @@ public class Drsg extends Client {
         return call("edge.create", params, new TypeReference<EdgeRecord>() {});
     }
 
-    /** Patch an edge's properties (`set`/`unset`). (access: write) */
+    /** Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type. (access: write) */
     public EdgeRecord edgeUpdate(EdgeUpdateParams params) throws DrsgException {
         return call("edge.update", params, new TypeReference<EdgeRecord>() {});
     }

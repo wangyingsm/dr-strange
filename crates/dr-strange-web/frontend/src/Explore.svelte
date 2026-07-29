@@ -31,6 +31,8 @@
   let newKey = $state('')
   let newValue = $state('')
   let saveError = $state(null)
+  let draftLabels = $state('') // node: comma-separated labels being edited
+  let draftType = $state('') // edge: type being edited
 
   // Inspector delete (type-to-confirm popup).
   let confirmingDelete = $state(false)
@@ -146,6 +148,8 @@
     }))
     newKey = ''
     newValue = ''
+    draftLabels = selected.kind === 'node' ? (selected.data.labels ?? []).join(', ') : ''
+    draftType = selected.kind === 'edge' ? (selected.data.type ?? '') : ''
     editing = true
   }
 
@@ -173,10 +177,18 @@
       .filter((k) => !kept.has(k))
 
     try {
-      const updated =
-        selected.kind === 'node'
-          ? await rpc('node.update', { plane, id: selected.data.id, set, unset })
-          : await rpc('edge.update', { plane, edge: selected.data.id, set, unset })
+      let updated
+      if (selected.kind === 'node') {
+        const labels = draftLabels
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        updated = await rpc('node.update', { plane, id: selected.data.id, set, unset, labels })
+      } else {
+        const params = { plane, edge: selected.data.id, set, unset }
+        if (draftType.trim()) params.type = draftType.trim()
+        updated = await rpc('edge.update', params)
+      }
       selected = { kind: selected.kind, data: updated }
       editing = false
       status = `updated ${selected.kind} ${updated.id}`
@@ -510,6 +522,15 @@
           <button class="danger" onclick={askDelete}>Delete</button>
         </div>
       {:else}
+        <div class="edit-field">
+          {#if selected.kind === 'node'}
+            <span>Labels</span>
+            <input bind:value={draftLabels} placeholder="comma-separated" />
+          {:else}
+            <span>Type</span>
+            <input bind:value={draftType} placeholder="edge type" />
+          {/if}
+        </div>
         <div class="edit-props">
           {#each draft as row, i (i)}
             <div class="edit-row">

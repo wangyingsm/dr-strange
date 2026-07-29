@@ -108,9 +108,10 @@ typedef struct {
     const char *key;
     struct json_object *set;
     struct json_object *unset;
+    struct json_object *labels;
 } drsg_node_update_opts;
 
-/* Patch a node's properties: `set` inserts/overwrites, `unset` removes. (access: write) */
+/* Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set. (access: write) */
 struct json_object *drsg_node_update(drsg_client *c, const char *plane, const drsg_node_update_opts *opts, drsg_error *err);
 
 typedef struct {
@@ -131,9 +132,10 @@ struct json_object *drsg_edge_create(drsg_client *c, const char *plane, struct j
 typedef struct {
     struct json_object *set;
     struct json_object *unset;
+    const char *type;
 } drsg_edge_update_opts;
 
-/* Patch an edge's properties (`set`/`unset`). (access: write) */
+/* Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type. (access: write) */
 struct json_object *drsg_edge_update(drsg_client *c, const char *plane, int64_t edge, const drsg_edge_update_opts *opts, drsg_error *err);
 
 /* Delete one edge. (access: write) */

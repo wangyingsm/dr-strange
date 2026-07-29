@@ -35,10 +35,12 @@ pub use meta::{
 pub(crate) use node::insert_node;
 pub use node::{
     create_node, create_node_with_key, delete_node, get_node, get_node_by_external_key,
-    node_id_by_external_key, node_vector, remove_node_prop, scan_all, scan_label, set_node_prop,
+    node_id_by_external_key, node_vector, remove_node_prop, scan_all, scan_label, set_node_labels,
+    set_node_prop,
 };
 
 pub(crate) use edge::insert_edge;
 pub use edge::{
     create_edge, delete_edge, get_edge, neighbors, remove_edge_prop, scan_edges, set_edge_prop,
+    set_edge_type,
 };

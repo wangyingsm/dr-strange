@@ -176,14 +176,15 @@
     },
     {
       "name": "node.update",
-      "summary": "Patch a node's properties: `set` inserts/overwrites, `unset` removes.",
+      "summary": "Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set.",
       "x-access": "write",
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "id", "required": false, "schema": { "type": "integer" } },
         { "name": "key", "required": false, "schema": { "type": "string" } },
         { "name": "set", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } },
-        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } }
+        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } },
+        { "name": "labels", "required": false, "schema": { "type": "array", "items": { "type": "string" } } }
       ],
       "result": { "name": "node", "schema": { "$ref": "#/components/schemas/NodeRecord" } }
     },
@@ -213,13 +214,14 @@
     },
     {
       "name": "edge.update",
-      "summary": "Patch an edge's properties (`set`/`unset`).",
+      "summary": "Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type.",
       "x-access": "write",
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "edge", "required": true, "schema": { "type": "integer" } },
         { "name": "set", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } },
-        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } }
+        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } },
+        { "name": "type", "required": false, "schema": { "type": "string" } }
       ],
       "result": { "name": "edge", "schema": { "$ref": "#/components/schemas/EdgeRecord" } }
     },

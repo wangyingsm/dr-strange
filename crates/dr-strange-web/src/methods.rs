@@ -869,11 +869,13 @@ pub struct UpdateNode {
     /// Property keys to remove.
     #[serde(default)]
     unset: Vec<String>,
+    /// When present, replaces the node's entire label set.
+    #[serde(default)]
+    labels: Option<Vec<String>>,
 }
 
-/// `node.update` — patch a node's properties: `set` inserts/overwrites, `unset`
-/// removes. Labels are immutable here (the core has no label-patch op). Returns
-/// the updated record.
+/// `node.update` — patch a node's properties (`set`/`unset`) and, when `labels`
+/// is present, replace its label set. Returns the updated record.
 pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: UpdateNode = params(p)?;
     let plane = app(ctx.db.plane(&req.plane))?;
@@ -886,6 +888,10 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
     for k in &req.unset {
         app(txn.remove_prop(id, k))?;
+    }
+    if let Some(labels) = &req.labels {
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        app(txn.set_labels(id, &refs))?;
     }
     app(txn.commit())?;
 
@@ -962,10 +968,13 @@ pub struct UpdateEdge {
     set: Value,
     #[serde(default)]
     unset: Vec<String>,
+    /// When present, changes the edge's type.
+    #[serde(rename = "type", default)]
+    ty: Option<String>,
 }
 
-/// `edge.update` — patch an edge's properties (`set`/`unset`). Returns the
-/// updated edge record.
+/// `edge.update` — patch an edge's properties (`set`/`unset`) and, when `type`
+/// is present, change its type. Returns the updated edge record.
 pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: UpdateEdge = params(p)?;
     let plane = app(ctx.db.plane(&req.plane))?;
@@ -978,6 +987,9 @@ pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
     for k in &req.unset {
         app(txn.remove_edge_prop(id, k))?;
+    }
+    if let Some(ty) = &req.ty {
+        app(txn.set_edge_type(id, ty))?;
     }
     app(txn.commit())?;
 

@@ -1283,3 +1283,58 @@ fn insert_node_rejects_duplicate_external_key_even_with_preallocated_id() {
         Err(Error::Conflict(_))
     ));
 }
+
+#[test]
+fn set_node_labels_replaces_labels_and_reindexes() {
+    with_db(|txn| {
+        let id = create_node(
+            txn,
+            PlaneId::STARTUP,
+            &["Person", "Author"],
+            &Properties::new(),
+        )?;
+        // Present under both labels initially.
+        assert_eq!(scan_label(txn, PlaneId::STARTUP, "Person")?, vec![id]);
+        assert_eq!(scan_label(txn, PlaneId::STARTUP, "Author")?, vec![id]);
+
+        set_node_labels(txn, PlaneId::STARTUP, id, &["Person", "Speaker"])?;
+        let n = get_node(txn, PlaneId::STARTUP, id)?.unwrap();
+        assert_eq!(n.labels, vec!["Person".to_string(), "Speaker".to_string()]);
+
+        // Kept label still indexed; dropped one gone; new one present.
+        assert_eq!(scan_label(txn, PlaneId::STARTUP, "Person")?, vec![id]);
+        assert!(scan_label(txn, PlaneId::STARTUP, "Author")?.is_empty());
+        assert_eq!(scan_label(txn, PlaneId::STARTUP, "Speaker")?, vec![id]);
+
+        // Absent node ⇒ NotFound.
+        assert!(matches!(
+            set_node_labels(txn, PlaneId::STARTUP, NodeId(9999), &["X"]),
+            Err(Error::NotFound(_))
+        ));
+        Ok(())
+    });
+}
+
+#[test]
+fn set_edge_type_retypes_and_moves_adjacency() {
+    with_db(|txn| {
+        let a = create_node(txn, PlaneId::STARTUP, &[], &Properties::new())?;
+        let b = create_node(txn, PlaneId::STARTUP, &[], &Properties::new())?;
+        let e = create_edge(txn, PlaneId::STARTUP, a, b, "KNOWS", &Properties::new())?;
+
+        set_edge_type(txn, PlaneId::STARTUP, e, "FOLLOWS")?;
+        assert_eq!(get_edge(txn, PlaneId::STARTUP, e)?.unwrap().ty, "FOLLOWS");
+
+        // Adjacency now answers under the new type, not the old.
+        let by_new = neighbors(txn, PlaneId::STARTUP, a, Dir::Out, Some("FOLLOWS"))?;
+        assert_eq!(by_new.len(), 1);
+        assert_eq!(by_new[0].node, b);
+        assert!(neighbors(txn, PlaneId::STARTUP, a, Dir::Out, Some("KNOWS"))?.is_empty());
+
+        assert!(matches!(
+            set_edge_type(txn, PlaneId::STARTUP, EdgeId(9999), "X"),
+            Err(Error::NotFound(_))
+        ));
+        Ok(())
+    });
+}

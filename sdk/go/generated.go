@@ -161,11 +161,12 @@ type NodeCreateParams struct {
 }
 
 type NodeUpdateParams struct {
-	Plane string     `json:"plane"`
-	ID    *int64     `json:"id,omitempty"`
-	Key   *string    `json:"key,omitempty"`
-	Set   Properties `json:"set,omitempty"`
-	Unset []string   `json:"unset,omitempty"`
+	Plane  string     `json:"plane"`
+	ID     *int64     `json:"id,omitempty"`
+	Key    *string    `json:"key,omitempty"`
+	Set    Properties `json:"set,omitempty"`
+	Unset  []string   `json:"unset,omitempty"`
+	Labels []string   `json:"labels,omitempty"`
 }
 
 type NodeDeleteParams struct {
@@ -187,6 +188,7 @@ type EdgeUpdateParams struct {
 	Edge  int64      `json:"edge"`
 	Set   Properties `json:"set,omitempty"`
 	Unset []string   `json:"unset,omitempty"`
+	Type  *string    `json:"type,omitempty"`
 }
 
 type EdgeDeleteParams struct {
@@ -318,7 +320,7 @@ func (c *Client) NodeCreate(ctx context.Context, p NodeCreateParams) (*NodeRecor
 	return out, err
 }
 
-// NodeUpdate Patch a node's properties: `set` inserts/overwrites, `unset` removes. (access: write)
+// NodeUpdate Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set. (access: write)
 func (c *Client) NodeUpdate(ctx context.Context, p NodeUpdateParams) (*NodeRecord, error) {
 	var out *NodeRecord
 	err := c.call(ctx, "node.update", p, &out)
@@ -339,7 +341,7 @@ func (c *Client) EdgeCreate(ctx context.Context, p EdgeCreateParams) (*EdgeRecor
 	return out, err
 }
 
-// EdgeUpdate Patch an edge's properties (`set`/`unset`). (access: write)
+// EdgeUpdate Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type. (access: write)
 func (c *Client) EdgeUpdate(ctx context.Context, p EdgeUpdateParams) (*EdgeRecord, error) {
 	var out *EdgeRecord
 	err := c.call(ctx, "edge.update", p, &out)

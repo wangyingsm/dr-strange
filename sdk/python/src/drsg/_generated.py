@@ -190,8 +190,8 @@ class Drsg(_Client):
             _p["properties"] = properties
         return self._call("node.create", _p)
 
-    def node_update(self, plane, id=None, key=None, set=None, unset=None) -> Any:
-        """Patch a node's properties: `set` inserts/overwrites, `unset` removes.
+    def node_update(self, plane, id=None, key=None, set=None, unset=None, labels=None) -> Any:
+        """Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set.
 
         Access: write."""
         _p: dict = {}
@@ -204,6 +204,8 @@ class Drsg(_Client):
             _p["set"] = set
         if unset is not None:
             _p["unset"] = unset
+        if labels is not None:
+            _p["labels"] = labels
         return self._call("node.update", _p)
 
     def node_delete(self, plane, id=None, key=None) -> Any:
@@ -231,8 +233,8 @@ class Drsg(_Client):
             _p["properties"] = properties
         return self._call("edge.create", _p)
 
-    def edge_update(self, plane, edge, set=None, unset=None) -> Any:
-        """Patch an edge's properties (`set`/`unset`).
+    def edge_update(self, plane, edge, set=None, unset=None, type=None) -> Any:
+        """Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type.
 
         Access: write."""
         _p: dict = {}
@@ -242,6 +244,8 @@ class Drsg(_Client):
             _p["set"] = set
         if unset is not None:
             _p["unset"] = unset
+        if type is not None:
+            _p["type"] = type
         return self._call("edge.update", _p)
 
     def edge_delete(self, plane, edge) -> Any:

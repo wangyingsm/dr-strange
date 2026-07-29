@@ -207,6 +207,35 @@ pub fn remove_node_prop(
     txn.put(TableId::Nodes, &node_key, &record)
 }
 
+/// Replaces a node's entire label set (arch/01 §4: labels are soft schema and
+/// may be re-declared). Rewrites the label index to match. Errors with
+/// `NotFound` if the node does not exist.
+pub fn set_node_labels(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    id: NodeId,
+    labels: &[&str],
+) -> Result<()> {
+    let node_key = keys::node_key(plane, id);
+    let Some(buf) = txn.get(TableId::Nodes, &node_key)? else {
+        return Err(Error::NotFound(format!("node {}", id.0)));
+    };
+    let (external_key, old_label_ids, props) = codec::decode_node_record(&buf)?;
+    // Intern the new labels first, so a failure leaves the index untouched.
+    let mut new_label_ids = Vec::with_capacity(labels.len());
+    for l in labels {
+        new_label_ids.push(intern_label(txn, l)?);
+    }
+    for lid in &old_label_ids {
+        txn.delete(TableId::LabelIdx, &keys::label_idx_key(plane, *lid, id))?;
+    }
+    for &lid in &new_label_ids {
+        txn.put(TableId::LabelIdx, &keys::label_idx_key(plane, lid, id), b"")?;
+    }
+    let record = codec::encode_node_record(external_key.as_deref(), &new_label_ids, &props);
+    txn.put(TableId::Nodes, &node_key, &record)
+}
+
 /// Deletes a node and everything that references it: its label-index
 /// entries, its external-key entry, its `node_plane` entry, and — cascading
 /// — every incident edge in both directions (with their own adjacency
