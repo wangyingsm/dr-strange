@@ -21,6 +21,10 @@ function colorFor(label, legend) {
 }
 
 const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
+// Connect-drag endpoints: the node the drag started on (source) and the one
+// under the cursor (target) get loud, distinct solid colours while dragging.
+const CONNECT_SRC = '#16a34a' // green
+const CONNECT_DST = '#2563eb' // blue
 
 // A theme-aware replacement for sigma's default node-hover drawer. Two jobs:
 //  - the SELECTED node (sigma routes `highlighted` nodes here) draws as a
@@ -135,8 +139,18 @@ export class Plot {
       // node's solid WebGL disc *over* anything the hover drawer paints, so we
       // make that disc transparent here and let drawNodeHover paint the ring
       // (its colour read from the graph's stored category colour).
-      nodeReducer: (node, data) =>
-        node === this.selectedNode
+      nodeReducer: (node, data) => {
+        // Mid-connect: paint the source green and the hovered target blue, both
+        // enlarged with forced labels, so it's unmistakable what's being joined.
+        if (this.connectFrom) {
+          if (node === this.connectFrom) {
+            return { ...data, color: CONNECT_SRC, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
+          }
+          if (node === this.hoveredNode) {
+            return { ...data, color: CONNECT_DST, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
+          }
+        }
+        return node === this.selectedNode
           ? {
               ...data,
               highlighted: true,
@@ -145,7 +159,8 @@ export class Plot {
               color: 'rgba(0,0,0,0)',
               zIndex: 1,
             }
-          : data,
+          : data
+      },
     })
 
     this.sigma.on('clickNode', ({ node }) => {
@@ -178,10 +193,12 @@ export class Plot {
     this.sigma.on('enterNode', ({ node }) => {
       this.hoveredNode = node
       this._cursor(this.connectFrom ? 'crosshair' : 'pointer')
+      if (this.connectFrom) this.sigma.refresh() // repaint the target highlight
     })
     this.sigma.on('leaveNode', () => {
       this.hoveredNode = null
       this._cursor(this.connectFrom ? 'crosshair' : '')
+      if (this.connectFrom) this.sigma.refresh()
     })
     this.sigma.on('enterEdge', ({ edge }) => {
       this.hoveredEdge = edge
@@ -228,6 +245,7 @@ export class Plot {
     this.sigma.on('downNode', ({ node }) => {
       this.connectFrom = node
       this._cursor('crosshair')
+      this.sigma.refresh() // light up the source
     })
 
     // Block sigma's built-in left-drag camera pan (we pan with the right button).
@@ -260,8 +278,31 @@ export class Plot {
       this.leftDown = false
       this.rightPan = null
       this._cursor(this.hoveredNode ? 'pointer' : '')
+      this.sigma.refresh() // clear the source/target highlights
     }
     window.addEventListener('mouseup', this._onUp)
+  }
+
+  /** Whether a node id is currently on the canvas. */
+  hasNode(id) {
+    return this.graph.hasNode(String(id))
+  }
+
+  /**
+   * Add a single edge between two nodes already on the canvas and refresh —
+   * NO relayout, so connecting two visible nodes leaves the graph put.
+   */
+  addEdgeInPlace(e) {
+    const key = 'e' + e.id
+    if (this.graph.hasEdge(key)) return
+    if (this.graph.hasNode(String(e.src)) && this.graph.hasNode(String(e.dst))) {
+      this.graph.addEdgeWithKey(key, String(e.src), String(e.dst), {
+        label: e.type,
+        size: 4,
+        record: e,
+      })
+      this.sigma.refresh()
+    }
   }
 
   _cursor(value) {

@@ -293,7 +293,16 @@
         type: eType.trim(),
       })
       resetCreate()
-      await focusEdge(edge) // center + select the new edge
+      // If both endpoints are already on the canvas (the common case for a
+      // drag-connect), just drop the edge in — no relayout, graph stays put.
+      if (plot.hasNode(edge.src) && plot.hasNode(edge.dst)) {
+        plot.addEdgeInPlace(edge)
+        plot.selectEdge(edge.id)
+        selected = { kind: 'edge', data: edge }
+        status = `created edge ${edge.id}`
+      } else {
+        await focusEdge(edge) // an endpoint isn't shown — center on the new edge
+      }
     } catch (e) {
       createError = e.message
     }
