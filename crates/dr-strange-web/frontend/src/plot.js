@@ -6,6 +6,18 @@
 import Graph from 'graphology'
 import Sigma from 'sigma'
 import forceAtlas2 from 'graphology-layout-forceatlas2'
+import { EdgeCurvedArrowProgram, indexParallelEdgesIndex } from '@sigma/edge-curve'
+
+const DEFAULT_CURVATURE = 0.25 // gentle arc for a solitary edge
+
+// Curvature for the nth of a set of parallel edges (sigma's own formula), so a
+// bundle fans out symmetrically instead of overlapping.
+function curveFor(index, maxIndex) {
+  if (index < 0) return -curveFor(-index, maxIndex)
+  const amplitude = 3.5
+  const maxCurvature = (amplitude * (1 - Math.exp(-maxIndex / amplitude))) / maxIndex
+  return (maxCurvature * index) / maxIndex
+}
 
 // Categorical palette; labels are assigned colors in first-seen order so the
 // legend stays stable within a session.
@@ -116,7 +128,10 @@ export class Plot {
     const canvasBg = () => (media.matches ? '#1f1f27' : '#ffffff')
 
     this.sigma = new Sigma(this.graph, container, {
-      defaultEdgeType: 'arrow',
+      // Curved edges (arrowheads kept): prettier than straight lines, and a
+      // curve per direction keeps A→B and B→A from sitting on top of each other.
+      defaultEdgeType: 'curved',
+      edgeProgramClasses: { curved: EdgeCurvedArrowProgram },
       enableEdgeEvents: true,
       renderEdgeLabels: true,
       labelColor: { color: nodeLabel() },
@@ -301,6 +316,7 @@ export class Plot {
         size: 4,
         record: e,
       })
+      this._curveEdges() // re-fan in case this created a parallel bundle
       this.sigma.refresh()
     }
   }
@@ -371,8 +387,29 @@ export class Plot {
       }
     }
 
+    this._curveEdges()
     this._sizeByDegree()
     this._layout()
+  }
+
+  /**
+   * Assign each edge a curvature: a gentle default for a lone edge, and a
+   * fanned-out value for members of a parallel bundle so they don't overlap.
+   */
+  _curveEdges() {
+    indexParallelEdgesIndex(this.graph, {
+      edgeIndexAttribute: 'parallelIndex',
+      edgeMinIndexAttribute: 'parallelMinIndex',
+      edgeMaxIndexAttribute: 'parallelMaxIndex',
+    })
+    this.graph.forEachEdge((edge, attrs) => {
+      const { parallelIndex, parallelMaxIndex } = attrs
+      const curvature =
+        typeof parallelIndex === 'number' && parallelMaxIndex
+          ? curveFor(parallelIndex, parallelMaxIndex)
+          : DEFAULT_CURVATURE
+      this.graph.setEdgeAttribute(edge, 'curvature', curvature)
+    })
   }
 
   _sizeByDegree() {
