@@ -600,6 +600,13 @@ nav button.active {
 /* pushes "+ New plane" to the right end of the controls line */
 .controls .new-plane-btn {
   margin-left: auto;
+  color: #16a34a;
+  border-color: color-mix(in srgb, #16a34a 40%, transparent);
+}
+.controls .new-plane-btn:hover {
+  color: #fff;
+  background: #16a34a;
+  border-color: #16a34a;
 }
 
 /* ---- create node/edge panel (mutation UI) ---- */
