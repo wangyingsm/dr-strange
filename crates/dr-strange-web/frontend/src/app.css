@@ -263,7 +263,8 @@ h2 {
   cursor: default;
 }
 
-/* "+" tile that opens the new-plane popup */
+/* "+" tile that opens the new-plane popup — additive/green, like Explore's
+   "+ New plane" button */
 .new-card {
   display: flex;
   flex-direction: column;
@@ -272,9 +273,9 @@ h2 {
   gap: 0.2rem;
   min-height: 92px;
   font: inherit;
-  color: var(--muted);
+  color: #16a34a;
   background: transparent;
-  border: 1px dashed var(--border);
+  border: 1px dashed color-mix(in srgb, #16a34a 45%, transparent);
   border-radius: 12px;
   cursor: pointer;
 }
@@ -286,8 +287,9 @@ h2 {
   font-size: 0.85rem;
 }
 .new-card:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  color: #fff;
+  background: #16a34a;
+  border-color: #16a34a;
 }
 
 /* ---- new-plane popup ---- */
