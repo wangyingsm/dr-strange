@@ -599,14 +599,19 @@ nav button.active {
   border-color: var(--accent);
   color: var(--accent);
 }
-/* the "New Node / New Edge / New Plane" cluster sits at the right end */
+/* the "New Node / New Edge / New Plane" cluster sits at the right end, all
+   sharing the additive-green style */
 .controls .new-node-btn {
   margin-left: auto;
 }
+.controls .new-node-btn,
+.controls .new-edge-btn,
 .controls .new-plane-btn {
   color: #16a34a;
   border-color: color-mix(in srgb, #16a34a 40%, transparent);
 }
+.controls .new-node-btn:hover,
+.controls .new-edge-btn:hover,
 .controls .new-plane-btn:hover {
   color: #fff;
   background: #16a34a;
