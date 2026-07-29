@@ -1,0 +1,4 @@
+*.o
+libdrsg.a
+drsg-codegen
+test/e2e
