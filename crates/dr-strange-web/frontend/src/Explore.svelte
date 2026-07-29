@@ -32,6 +32,11 @@
   let newValue = $state('')
   let saveError = $state(null)
 
+  // Inspector delete (type-to-confirm popup).
+  let confirmingDelete = $state(false)
+  let deleteInput = $state('')
+  let deleteError = $state(null)
+
   // Create-node / create-edge state.
   let creating = $state(null) // null | 'node' | 'edge'
   let createError = $state(null)
@@ -180,23 +185,39 @@
     }
   }
 
-  async function deleteSelected() {
-    if (!selected) return
+  // The token the user must type to confirm a delete: a node's external key
+  // (or its id when keyless), an edge's id.
+  function deleteToken() {
+    if (!selected) return ''
+    return selected.kind === 'node'
+      ? (selected.data.external_key ?? String(selected.data.id))
+      : String(selected.data.id)
+  }
+
+  function askDelete() {
+    deleteInput = ''
+    deleteError = null
+    confirmingDelete = true
+  }
+  function cancelDelete() {
+    confirmingDelete = false
+  }
+
+  async function confirmDelete() {
+    if (!selected || deleteInput.trim() !== deleteToken()) return // type-to-confirm
     const kind = selected.kind
-    const name =
-      kind === 'node'
-        ? (selected.data.external_key ?? `#${selected.data.id}`)
-        : `${selected.data.type} #${selected.data.id}`
-    if (!confirm(`Delete ${kind} ${name}? This cannot be undone.`)) return
+    const token = deleteToken()
+    deleteError = null
     try {
       if (kind === 'node') await rpc('node.delete', { plane, id: selected.data.id })
       else await rpc('edge.delete', { plane, edge: selected.data.id })
+      confirmingDelete = false
       selected = null
       editing = false
       await seed() // reload the canvas without the deleted element
-      status = `deleted ${kind} ${name}`
+      status = `deleted ${kind} ${token}`
     } catch (e) {
-      error = e.message
+      deleteError = e.message
     }
   }
 
@@ -220,7 +241,9 @@
   }
 
   function onKeydown(e) {
-    if (e.key === 'Escape' && creating) resetCreate()
+    if (e.key !== 'Escape') return
+    if (creating) resetCreate()
+    else if (confirmingDelete) cancelDelete()
   }
 
   async function createNode() {
@@ -476,7 +499,7 @@
         </dl>
         <div class="inspector-actions">
           <button onclick={startEdit}>Edit</button>
-          <button class="danger" onclick={deleteSelected}>Delete</button>
+          <button class="danger" onclick={askDelete}>Delete</button>
         </div>
       {:else}
         <div class="edit-props">
@@ -514,5 +537,36 @@
     </div>
   {/if}
 </div>
+
+{#if confirmingDelete && selected}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Delete {selected.kind}">
+      <header>
+        Delete {selected.kind}
+        <button class="close" onclick={cancelDelete} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <p class="dlg-warn">
+          This permanently deletes {selected.kind} <b>{deleteToken()}</b>{#if selected.kind === 'node'} and its incident edges{/if}. This cannot be undone.
+        </p>
+        <label class="dlg-confirm">
+          Type <code>{deleteToken()}</code> to confirm
+          <input
+            bind:value={deleteInput}
+            use:autofocus
+            onkeydown={(e) => e.key === 'Enter' && confirmDelete()}
+          />
+        </label>
+        {#if deleteError}<p class="dlg-error">{deleteError}</p>{/if}
+        <div class="dlg-actions">
+          <button class="ghost" onclick={cancelDelete}>Cancel</button>
+          <button class="danger" onclick={confirmDelete} disabled={deleteInput.trim() !== deleteToken()}>
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <p class="hint">Click a node to expand its neighbourhood and inspect it. Click empty space to deselect.</p>
