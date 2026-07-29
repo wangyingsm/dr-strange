@@ -30,7 +30,12 @@
   async function exportPlane(name) {
     error = null
     try {
-      const res = await fetch(`/export?plane=${encodeURIComponent(name)}`, { headers: authHeaders() })
+      // POST (not GET): a same-origin GET omits the Origin header the server's
+      // local-UI check needs, so a tokenless server would 401 its own UI.
+      const res = await fetch(`/export?plane=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: authHeaders(),
+      })
       if (!res.ok) throw new Error(`export failed (${res.status})`)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)

@@ -107,7 +107,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
-        .route("/export", get(export_http))
+        // POST (not GET): browsers omit the Origin header on same-origin GETs,
+        // so the local-UI Origin check can't see it and a tokenless server
+        // would 401 its own UI. POST always carries Origin.
+        .route("/export", post(export_http))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .fallback(static_handler)
         .with_state(state)
@@ -197,7 +200,7 @@ fn safe_filename(name: &str) -> String {
     if s.is_empty() { "plane".to_string() } else { s }
 }
 
-/// `GET /export?plane=startup` — the plane serialized as JSONL, returned as a
+/// `POST /export?plane=startup` — the plane serialized as JSONL, returned as a
 /// file download (`drsg import` reads the same format). Read-gated like the
 /// rest of the surface; the DB scan runs on a blocking task.
 async fn export_http(
