@@ -173,9 +173,16 @@ export class Plot {
       this.sigma.setSetting('edgeLabelColor', { color: edgeLabel() })
     })
 
-    // Pointer cursor + edge highlight on hover.
-    this.sigma.on('enterNode', () => this._cursor('pointer'))
-    this.sigma.on('leaveNode', () => this._cursor(''))
+    // Pointer cursor + edge highlight on hover. `hoveredNode` is the connect
+    // target when a left-drag from another node is released.
+    this.sigma.on('enterNode', ({ node }) => {
+      this.hoveredNode = node
+      this._cursor(this.connectFrom ? 'crosshair' : 'pointer')
+    })
+    this.sigma.on('leaveNode', () => {
+      this.hoveredNode = null
+      this._cursor(this.connectFrom ? 'crosshair' : '')
+    })
     this.sigma.on('enterEdge', ({ edge }) => {
       this.hoveredEdge = edge
       this._cursor('pointer')
@@ -186,6 +193,75 @@ export class Plot {
       this._cursor('')
       this.sigma.refresh()
     })
+
+    this._setupMouse(handlers)
+  }
+
+  // Custom mouse model (arch/08): the RIGHT button drags to pan the canvas
+  // (sigma only pans on left); the LEFT button never pans — instead a left-drag
+  // starting on a node and released on another opens an edge between them.
+  _setupMouse(handlers) {
+    this.rightPan = null // { lastX, lastY } while right-dragging
+    this.leftDown = false
+    this.hoveredNode = null
+    this.connectFrom = null // node a left-drag started on
+
+    const rel = (e) => {
+      const r = this.container.getBoundingClientRect()
+      return { x: e.clientX - r.left, y: e.clientY - r.top }
+    }
+
+    // Right-drag pans; suppress its context menu.
+    this.container.addEventListener('contextmenu', (e) => e.preventDefault())
+    this._onDown = (e) => {
+      if (e.button === 2) {
+        const p = rel(e)
+        this.rightPan = { lastX: p.x, lastY: p.y }
+        e.preventDefault()
+      } else if (e.button === 0) {
+        this.leftDown = true
+      }
+    }
+    this.container.addEventListener('mousedown', this._onDown)
+
+    // A left-drag starting on a node begins a "connect" gesture.
+    this.sigma.on('downNode', ({ node }) => {
+      this.connectFrom = node
+      this._cursor('crosshair')
+    })
+
+    // Block sigma's built-in left-drag camera pan (we pan with the right button).
+    this.sigma.getMouseCaptor().on('mousemovebody', (e) => {
+      if (this.leftDown) e.preventSigmaDefault()
+    })
+
+    // Right-drag pan, replicating sigma's own viewport→graph delta math.
+    this._onMove = (e) => {
+      if (!this.rightPan) return
+      const p = rel(e)
+      const camera = this.sigma.getCamera()
+      const last = this.sigma.viewportToFramedGraph({ x: this.rightPan.lastX, y: this.rightPan.lastY })
+      const cur = this.sigma.viewportToFramedGraph({ x: p.x, y: p.y })
+      const s = camera.getState()
+      camera.setState({ x: s.x + (last.x - cur.x), y: s.y + (last.y - cur.y) })
+      this.rightPan.lastX = p.x
+      this.rightPan.lastY = p.y
+    }
+    window.addEventListener('mousemove', this._onMove)
+
+    this._onUp = () => {
+      // Finish a connect gesture: left-drag from one node, released on another.
+      if (!this.rightPan && this.connectFrom && this.hoveredNode && this.hoveredNode !== this.connectFrom) {
+        const src = this.graph.getNodeAttribute(this.connectFrom, 'record')
+        const dst = this.graph.getNodeAttribute(this.hoveredNode, 'record')
+        handlers.onConnect?.(src, dst)
+      }
+      this.connectFrom = null
+      this.leftDown = false
+      this.rightPan = null
+      this._cursor(this.hoveredNode ? 'pointer' : '')
+    }
+    window.addEventListener('mouseup', this._onUp)
   }
 
   _cursor(value) {
@@ -367,6 +443,8 @@ export class Plot {
   }
 
   destroy() {
+    window.removeEventListener('mousemove', this._onMove)
+    window.removeEventListener('mouseup', this._onUp)
     this.sigma.kill()
   }
 }

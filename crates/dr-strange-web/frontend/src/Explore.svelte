@@ -373,6 +373,14 @@
       onClearSelection: () => {
         selected = null
       },
+      // Left-drag from one node to another: open the New Edge popup with the
+      // endpoints prefilled (the user just supplies the edge type).
+      onConnect: (src, dst) => {
+        resetCreate()
+        eSrc = src.external_key ?? String(src.id)
+        eDst = dst.external_key ?? String(dst.id)
+        creating = 'edge'
+      },
     })
     started = true
     if (focus) {
@@ -569,4 +577,4 @@
   </div>
 {/if}
 
-<p class="hint">Click a node to expand its neighbourhood and inspect it. Click empty space to deselect.</p>
+<p class="hint">Click a node to expand and inspect it; click empty space to deselect. Drag from one node onto another to connect them. Hold the right mouse button to pan.</p>
