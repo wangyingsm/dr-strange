@@ -2,10 +2,14 @@
   import { onMount, onDestroy } from 'svelte'
   import { rpc } from './rpc.js'
   import { Plot } from './plot.js'
+  import CreatePlane from './CreatePlane.svelte'
 
   // `plane` is the app-wide current plane (App owns it); `focus` is a
   // { id, nonce } signal from the header search — center that node.
-  let { plane, focus } = $props()
+  // `onPlaneCreated` bubbles a new plane up to App (refresh picker + switch).
+  let { plane, focus, onPlaneCreated = () => {} } = $props()
+
+  let newPlaneOpen = $state(false) // new-plane popup open?
 
   let container // canvas div (bind:this)
   let plot = null
@@ -373,7 +377,10 @@
   <button onclick={() => (creating = creating === 'node' ? null : 'node')} class:active={creating === 'node'}>+ Node</button>
   <button onclick={() => (creating = creating === 'edge' ? null : 'edge')} class:active={creating === 'edge'}>+ Edge</button>
   <span class="status">{status}</span>
+  <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">+ New plane</button>
 </div>
+
+<CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if creating === 'node'}
   <div class="create-panel">

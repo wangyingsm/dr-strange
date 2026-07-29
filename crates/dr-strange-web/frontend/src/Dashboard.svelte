@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte'
   import { rpc, liveStats } from './rpc.js'
+  import CreatePlane from './CreatePlane.svelte'
 
   let { onPlaneCreated = () => {}, onPlaneDeleted = () => {} } = $props()
 
@@ -9,10 +10,7 @@
   let error = $state(null)
   let connected = $state(false)
 
-  // "New plane" popup.
-  let creating = $state(false)
-  let newName = $state('')
-  let createError = $state(null)
+  let creating = $state(false) // new-plane popup open?
 
   // "Delete plane" popup (type-to-confirm).
   let deleting = $state(null) // the plane being deleted, or null
@@ -23,27 +21,9 @@
     planes = await rpc('plane.list')
   }
 
-  function openCreate() {
-    newName = ''
-    createError = null
-    creating = true
-  }
-  function closeCreate() {
-    creating = false
-  }
-
-  async function submitCreate() {
-    const name = newName.trim()
-    if (!name) return
-    createError = null
-    try {
-      await rpc('plane.create', { name })
-      await loadPlanes()
-      onPlaneCreated(name) // refresh the header picker + switch to it
-      creating = false
-    } catch (e) {
-      createError = e.message
-    }
+  async function afterCreate(name) {
+    await loadPlanes() // refresh the cards
+    onPlaneCreated(name) // refresh the header picker + switch to it
   }
 
   function openDelete(p) {
@@ -75,9 +55,7 @@
   }
 
   function onKeydown(e) {
-    if (e.key !== 'Escape') return
-    if (creating) closeCreate()
-    else if (deleting) closeDelete()
+    if (e.key === 'Escape' && deleting) closeDelete()
   }
 
   // A property value is either a raw JSON value or, when it carries a
@@ -162,36 +140,13 @@
       </div>
     </article>
   {/each}
-  <button class="card new-card" onclick={openCreate} title="Create a new plane" aria-label="Create a new plane">
+  <button class="card new-card" onclick={() => (creating = true)} title="Create a new plane" aria-label="Create a new plane">
     <span aria-hidden="true">+</span>
     <span class="new-card-label">New plane</span>
   </button>
 </section>
 
-{#if creating}
-  <div class="dlg-backdrop">
-    <div class="dlg" role="dialog" aria-modal="true" aria-label="Create a new plane">
-      <header>
-        New plane
-        <button class="close" onclick={closeCreate} aria-label="Close">×</button>
-      </header>
-      <div class="dlg-body">
-        <input
-          type="text"
-          placeholder="plane name"
-          bind:value={newName}
-          use:autofocus
-          onkeydown={(e) => e.key === 'Enter' && submitCreate()}
-        />
-        {#if createError}<p class="dlg-error">{createError}</p>{/if}
-        <div class="dlg-actions">
-          <button class="ghost" onclick={closeCreate}>Cancel</button>
-          <button class="primary" onclick={submitCreate} disabled={!newName.trim()}>Create</button>
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
+<CreatePlane bind:open={creating} onCreated={afterCreate} />
 
 {#if deleting}
   <div class="dlg-backdrop">

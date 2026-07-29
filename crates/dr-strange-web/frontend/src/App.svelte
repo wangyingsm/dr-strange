@@ -185,7 +185,7 @@
 {#if view === 'dashboard'}
   <Dashboard {onPlaneCreated} {onPlaneDeleted} />
 {:else if view === 'explore'}
-  <Explore {plane} {focus} />
+  <Explore {plane} {focus} {onPlaneCreated} />
 {:else}
   <Digest {plane} />
 {/if}

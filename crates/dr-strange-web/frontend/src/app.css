@@ -597,6 +597,10 @@ nav button.active {
   border-color: var(--accent);
   color: var(--accent);
 }
+/* pushes "+ New plane" to the right end of the controls line */
+.controls .new-plane-btn {
+  margin-left: auto;
+}
 
 /* ---- create node/edge panel (mutation UI) ---- */
 .create-panel {
