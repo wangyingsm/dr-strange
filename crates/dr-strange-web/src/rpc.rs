@@ -9,6 +9,7 @@
 
 use serde_json::{Value, json};
 
+use crate::auth::{Access, Auth};
 use crate::methods::{self, Ctx};
 
 // ---- error model ----------------------------------------------------------
@@ -45,6 +46,16 @@ impl RpcError {
     pub fn server(msg: impl Into<String>) -> Self {
         Self::new(-32000, msg)
     }
+    /// A write/admin method was called without a valid credential. JSON-RPC has
+    /// no standard auth code; `-32001` sits in the app server-error band and is
+    /// distinct from `-32000` so clients (and the SDKs) can detect an auth
+    /// failure — the wire analogue of HTTP 401.
+    pub fn unauthorized() -> Self {
+        Self::new(
+            -32001,
+            "unauthorized: this method requires a valid write credential (set DRSG_TOKEN and send it as `Authorization: Bearer <token>`)",
+        )
+    }
 
     fn to_value(&self) -> Value {
         let mut obj = json!({ "code": self.code, "message": self.message });
@@ -68,7 +79,7 @@ fn ok_response(id: Value, result: Value) -> Value {
 /// Parses and dispatches one JSON-RPC message (single or batch). Returns the
 /// response `Value`, or `None` when nothing is owed to the caller — a batch of
 /// only notifications, or a single notification (a request with no `id`).
-pub fn handle(ctx: &Ctx<'_>, body: &[u8]) -> Option<Value> {
+pub fn handle(ctx: &Ctx<'_>, auth: &Auth<'_>, body: &[u8]) -> Option<Value> {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         // Parse errors carry a null id per spec §5.1.
@@ -90,7 +101,7 @@ pub fn handle(ctx: &Ctx<'_>, body: &[u8]) -> Option<Value> {
             }
             let responses: Vec<Value> = items
                 .into_iter()
-                .filter_map(|item| handle_single(ctx, item))
+                .filter_map(|item| handle_single(ctx, auth, item))
                 .collect();
             // An all-notification batch produces no response at all.
             if responses.is_empty() {
@@ -99,7 +110,7 @@ pub fn handle(ctx: &Ctx<'_>, body: &[u8]) -> Option<Value> {
                 Some(Value::Array(responses))
             }
         }
-        obj @ Value::Object(_) => handle_single(ctx, obj),
+        obj @ Value::Object(_) => handle_single(ctx, auth, obj),
         _ => Some(error_response(
             Value::Null,
             &RpcError::invalid_request("request must be an object or array"),
@@ -109,7 +120,7 @@ pub fn handle(ctx: &Ctx<'_>, body: &[u8]) -> Option<Value> {
 
 /// One request object → its response, or `None` for a notification (no `id`).
 /// A notification never yields a response even when it errors (spec §4.1).
-fn handle_single(ctx: &Ctx<'_>, msg: Value) -> Option<Value> {
+fn handle_single(ctx: &Ctx<'_>, auth: &Auth<'_>, msg: Value) -> Option<Value> {
     let Value::Object(map) = msg else {
         return Some(error_response(
             Value::Null,
@@ -133,7 +144,7 @@ fn handle_single(ctx: &Ctx<'_>, msg: Value) -> Option<Value> {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_request("missing `method`"))?;
         let params = map.get("params").cloned().unwrap_or(Value::Null);
-        dispatch_method(ctx, method, params)
+        dispatch_method(ctx, auth, method, params)
     };
 
     let result = dispatch();
@@ -146,23 +157,42 @@ fn handle_single(ctx: &Ctx<'_>, msg: Value) -> Option<Value> {
     })
 }
 
-/// Read-only method table for chunk 1 — each maps 1:1 to the core API and
-/// returns the same JSON dialect the CLI/MCP already speak.
-fn dispatch_method(ctx: &Ctx<'_>, method: &str, params: Value) -> Result<Value, RpcError> {
+/// Dispatch one method. Every arm declares the [`Access`] it requires via the
+/// `guarded!` macro, so a method cannot be added without classifying it — an
+/// ungated write can't ship by omission. The gate runs before the handler, so
+/// an unauthorized caller never reaches the core.
+fn dispatch_method(
+    ctx: &Ctx<'_>,
+    auth: &Auth<'_>,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcError> {
+    /// `guarded!(<access>, <handler-call>)` — enforce the access level, then run.
+    macro_rules! guarded {
+        ($access:expr, $call:expr) => {{
+            if !auth.allows($access) {
+                return Err(RpcError::unauthorized());
+            }
+            $call
+        }};
+    }
+
     match method {
-        "db.stats" => methods::db_stats(ctx),
-        "db.catalog" => methods::db_catalog(ctx),
-        "plane.list" => methods::plane_list(ctx),
-        "plane.catalog" => methods::plane_catalog(ctx, params),
-        "node.get" => methods::node_get(ctx, params),
-        "plane.neighbors" => methods::plane_neighbors(ctx, params),
-        "plane.search" => methods::plane_search(ctx, params),
-        "plane.query" => methods::plane_query(ctx, params),
-        "plane.find" => methods::plane_find(ctx, params),
-        "graph.seed" => methods::graph_seed(ctx, params),
-        "graph.expand" => methods::graph_expand(ctx, params),
-        "digest.run" => methods::digest_run(ctx, params),
-        "digest.write" => methods::digest_write(ctx, params),
+        "db.stats" => guarded!(Access::Read, methods::db_stats(ctx)),
+        "db.catalog" => guarded!(Access::Read, methods::db_catalog(ctx)),
+        "plane.list" => guarded!(Access::Read, methods::plane_list(ctx)),
+        "plane.catalog" => guarded!(Access::Read, methods::plane_catalog(ctx, params)),
+        "node.get" => guarded!(Access::Read, methods::node_get(ctx, params)),
+        "plane.neighbors" => guarded!(Access::Read, methods::plane_neighbors(ctx, params)),
+        "plane.search" => guarded!(Access::Read, methods::plane_search(ctx, params)),
+        "plane.query" => guarded!(Access::Read, methods::plane_query(ctx, params)),
+        "plane.find" => guarded!(Access::Read, methods::plane_find(ctx, params)),
+        "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
+        "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),
+        // `digest.run` writes nothing, but it spends the server's provider
+        // credentials (the LLM + embedding calls), so it's a privileged op.
+        "digest.run" => guarded!(Access::Write, methods::digest_run(ctx, params)),
+        "digest.write" => guarded!(Access::Write, methods::digest_write(ctx, params)),
         other => Err(RpcError::method_not_found(other)),
     }
 }
@@ -203,7 +233,14 @@ mod tests {
 
     fn call(db: &Database, body: &str) -> Option<Value> {
         let ctx = Ctx { db, db_path: None };
-        handle(&ctx, body.as_bytes())
+        handle(&ctx, &Auth::allow_all(), body.as_bytes())
+    }
+
+    /// Dispatch `body` under an explicit authorizer + credentials (for the auth
+    /// gate tests).
+    fn call_as(db: &Database, auth: &Auth<'_>, body: &str) -> Option<Value> {
+        let ctx = Ctx { db, db_path: None };
+        handle(&ctx, auth, body.as_bytes())
     }
 
     /// Extract the error code from a (single) response.
@@ -440,6 +477,82 @@ mod tests {
         assert_eq!(r["nodes"][0]["id"], bob);
         assert_eq!(r["edges"].as_array().unwrap().len(), 1);
         assert_eq!(r["total"], 1);
+    }
+
+    // ---- auth gate --------------------------------------------------------
+
+    use crate::auth::{Credentials, SharedToken};
+
+    /// An empty-payload `digest.write` — writes zero nodes/edges, so it reaches
+    /// the handler iff the auth gate lets it through.
+    const EMPTY_WRITE: &str = r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[],"edges":[]},"id":1}"#;
+
+    fn native(bearer: Option<&str>) -> Credentials {
+        Credentials {
+            bearer: bearer.map(String::from),
+            local_ui: false,
+        }
+    }
+    fn browser(bearer: Option<&str>) -> Credentials {
+        Credentials {
+            bearer: bearer.map(String::from),
+            local_ui: true,
+        }
+    }
+
+    #[test]
+    fn write_denied_for_native_client_without_token() {
+        let db = seeded();
+        let token = SharedToken::new(Some("s3cret".into()));
+        let auth = Auth::new(&token, native(None));
+        let resp = call_as(&db, &auth, EMPTY_WRITE).unwrap();
+        assert_eq!(err_code(&resp), -32001);
+    }
+
+    #[test]
+    fn write_allowed_with_correct_token() {
+        let db = seeded();
+        let token = SharedToken::new(Some("s3cret".into()));
+        let auth = Auth::new(&token, native(Some("s3cret")));
+        let resp = call_as(&db, &auth, EMPTY_WRITE).unwrap();
+        // Reaches the handler: a real (empty) write result, not an auth error.
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        assert_eq!(resp["result"]["nodes_written"], 0);
+    }
+
+    #[test]
+    fn reads_stay_open_when_a_token_is_configured() {
+        let db = seeded();
+        let token = SharedToken::new(Some("s3cret".into()));
+        let auth = Auth::new(&token, native(None)); // no credential at all
+        let resp = call_as(
+            &db,
+            &auth,
+            r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["nodes"], 1);
+    }
+
+    #[test]
+    fn native_write_denied_when_no_token_configured() {
+        // With no DRSG_TOKEN set, a programmatic client still can't write —
+        // only the same-origin browser UI can (see below).
+        let db = seeded();
+        let open = SharedToken::new(None);
+        let auth = Auth::new(&open, native(None));
+        let resp = call_as(&db, &auth, EMPTY_WRITE).unwrap();
+        assert_eq!(err_code(&resp), -32001);
+    }
+
+    #[test]
+    fn local_ui_write_allowed_when_no_token_configured() {
+        let db = seeded();
+        let open = SharedToken::new(None);
+        let auth = Auth::new(&open, browser(None));
+        let resp = call_as(&db, &auth, EMPTY_WRITE).unwrap();
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        assert_eq!(resp["result"]["nodes_written"], 0);
     }
 
     #[test]

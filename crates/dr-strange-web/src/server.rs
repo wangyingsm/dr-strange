@@ -13,7 +13,7 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::Database;
@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::assets::static_handler;
+use crate::auth::{AllowedOrigins, Auth, Authorizer, Credentials, SharedToken};
 use crate::methods::{self, Ctx};
 use crate::rpc;
 
@@ -40,6 +41,10 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 pub struct AppState {
     pub db: Arc<Database>,
     pub db_path: Option<PathBuf>,
+    /// Write-authorization backend (v1: a single shared `DRSG_TOKEN`).
+    pub authorizer: Arc<dyn Authorizer>,
+    /// Browser-`Origin` allow-list — the CSRF guard.
+    pub origins: AllowedOrigins,
 }
 
 impl AppState {
@@ -49,6 +54,48 @@ impl AppState {
             db_path: self.db_path.as_deref(),
         }
     }
+}
+
+/// Pull the bearer token from an `Authorization: Bearer …` header, if present.
+fn bearer_of(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?
+        .trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Resolve the caller's [`Credentials`], enforcing the **Origin guard**: a
+/// request carrying a *disallowed* `Origin` (a cross-site browser) is refused
+/// with 403 before it can act. A request with no `Origin` (a native client /
+/// SDK) passes through here, to be gated by the token at dispatch instead.
+///
+/// `ws_token` carries the WebSocket's `?token=` query value — browsers can't
+/// set an `Authorization` header on a WS handshake, so the token rides the URL
+/// there.
+fn resolve_credentials(
+    state: &AppState,
+    headers: &HeaderMap,
+    ws_token: Option<String>,
+) -> Result<Credentials, Box<Response>> {
+    let local_ui = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some(origin) if state.origins.allows(origin) => true,
+        Some(_) => {
+            return Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    "cross-origin request refused (Origin not allowed)",
+                )
+                    .into_response(),
+            ));
+        }
+        None => false,
+    };
+    Ok(Credentials {
+        bearer: bearer_of(headers).or(ws_token),
+        local_ui,
+    })
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -77,7 +124,17 @@ struct ExtractQuery {
 ///   `{"progress":{"page":3,"total":42}}`  — zero or more, as pages are parsed
 ///   `{"chars":12345,"text":"…"}`          — the final result, or
 ///   `{"error":"…"}`                       — a terminal failure
-async fn extract_http(Query(q): Query<ExtractQuery>, body: Bytes) -> Response {
+async fn extract_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ExtractQuery>,
+    body: Bytes,
+) -> Response {
+    // Extraction touches no DB state, but a cross-site page shouldn't be able to
+    // make the user's browser burn CPU here — apply the same Origin guard.
+    if let Err(resp) = resolve_credentials(&state, &headers, None) {
+        return *resp;
+    }
     // Bounded channel: `blocking_send` applies backpressure if the client reads
     // slowly, rather than buffering the whole document's progress in memory.
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
@@ -112,9 +169,21 @@ async fn extract_http(Query(q): Query<ExtractQuery>, body: Bytes) -> Response {
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
 pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> anyhow::Result<()> {
+    let authorizer = SharedToken::from_env();
+    if authorizer.is_configured() {
+        println!(
+            "drsg serve: write auth ENABLED — mutations require DRSG_TOKEN (Authorization: Bearer <token>)"
+        );
+    } else {
+        println!(
+            "drsg serve: WARNING — no DRSG_TOKEN set; mutations are allowed only from the local browser UI. Set DRSG_TOKEN to require a token for programmatic writes."
+        );
+    }
     let state = Arc::new(AppState {
         db: Arc::new(db),
         db_path,
+        authorizer: Arc::new(authorizer),
+        origins: AllowedOrigins::from_env(),
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
@@ -131,8 +200,16 @@ async fn shutdown_signal() {
 
 // ---- HTTP JSON-RPC --------------------------------------------------------
 
-async fn rpc_http(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let out = tokio::task::spawn_blocking(move || rpc::handle(&state.ctx(), &body)).await;
+async fn rpc_http(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        let auth = Auth::new(state.authorizer.as_ref(), creds);
+        rpc::handle(&state.ctx(), &auth, &body)
+    })
+    .await;
     match out {
         // A notification (or all-notification batch) owes no response body.
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
@@ -151,15 +228,32 @@ async fn rpc_http(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 
 // ---- WebSocket ------------------------------------------------------------
 
-async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| ws_task(socket, state))
+/// The WebSocket carries its bearer token in the query string (`/ws?token=…`)
+/// because the browser WebSocket API can't set request headers.
+#[derive(serde::Deserialize)]
+struct WsQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, q.token) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    ws.on_upgrade(move |socket| ws_task(socket, state, creds))
 }
 
 /// One WebSocket connection: answers JSON-RPC requests framed as text, and
 /// every [`STATS_INTERVAL`] pushes a `db.stats` notification for the live
 /// dashboard. The first interval tick fires immediately, so a client sees
 /// stats the moment it connects.
-async fn ws_task(mut socket: WebSocket, state: Arc<AppState>) {
+async fn ws_task(mut socket: WebSocket, state: Arc<AppState>, creds: Credentials) {
     let mut ticker = tokio::time::interval(STATS_INTERVAL);
     loop {
         tokio::select! {
@@ -175,10 +269,14 @@ async fn ws_task(mut socket: WebSocket, state: Arc<AppState>) {
                     Some(Ok(Message::Text(text))) => {
                         let body = text.as_bytes().to_vec();
                         let st = state.clone();
-                        let resp = tokio::task::spawn_blocking(move || rpc::handle(&st.ctx(), &body))
-                            .await
-                            .ok()
-                            .flatten();
+                        let creds = creds.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            let auth = Auth::new(st.authorizer.as_ref(), creds);
+                            rpc::handle(&st.ctx(), &auth, &body)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
                         if let Some(value) = resp
                             && socket.send(Message::Text(value.to_string().into())).await.is_err()
                         {
