@@ -19,10 +19,12 @@
 /// so a new method cannot ship ungated by omission.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Access {
-    /// Pure reads — always allowed (still subject to the server's Origin guard).
+    /// Pure reads. Still authenticated — the *whole* surface requires a
+    /// credential (or the same-origin-UI fallback); the level matters only to a
+    /// future scoped-key backend that could mint read-only keys.
     Read,
     /// Mutations, or operations that spend the server's provider credentials
-    /// (e.g. `digest.run`'s LLM call) — require a write credential.
+    /// (e.g. `digest.run`'s LLM call).
     Write,
     /// Administrative operations (plane create / rename / delete; future key
     /// management). Same gate as `Write` under the single-token model; kept
@@ -84,22 +86,21 @@ impl SharedToken {
 }
 
 impl Authorizer for SharedToken {
-    fn allows(&self, access: Access, creds: &Credentials) -> bool {
-        match access {
-            Access::Read => true,
-            Access::Write | Access::Admin => {
-                // A valid token authorizes any client — an SDK, curl, or the
-                // browser once the token is injected into the page.
-                if self.token_ok(&creds.bearer) {
-                    return true;
-                }
-                // Zero-config desktop: with NO token set, our own same-origin
-                // UI may still write (the Origin guard is its CSRF shield). A
-                // native client without the token is denied — programmatic
-                // writes must present a token.
-                self.token.is_none() && creds.local_ui
-            }
+    fn allows(&self, _access: Access, creds: &Credentials) -> bool {
+        // Single shared token: authentication is uniform across read / write /
+        // admin — the entire surface is protected. (A future scoped-key backend
+        // would branch on `access`; that's why the trait still carries it.)
+        //
+        // A valid token authorizes any client — an SDK, curl, or the browser
+        // once the token is injected into the page.
+        if self.token_ok(&creds.bearer) {
+            return true;
         }
+        // Zero-config desktop: with NO token set, our own same-origin browser
+        // UI is trusted (the Origin guard is its CSRF shield). Any client
+        // without the token — even for a read — is denied, so programmatic
+        // (SDK / curl) access requires an explicit DRSG_TOKEN.
+        self.token.is_none() && creds.local_ui
     }
 }
 
@@ -222,30 +223,27 @@ mod tests {
     }
 
     #[test]
-    fn reads_are_always_allowed() {
+    fn every_access_level_needs_a_credential_when_a_token_is_set() {
+        // The whole surface is protected: with a token configured, no request —
+        // read, write, or admin — gets through without it.
         let guarded = SharedToken::new(Some("s3cret".into()));
-        assert!(guarded.allows(Access::Read, &native(None)));
-        assert!(guarded.allows(Access::Read, &native(Some("wrong"))));
+        for access in [Access::Read, Access::Write, Access::Admin] {
+            assert!(!guarded.allows(access, &native(None)));
+            assert!(!guarded.allows(access, &native(Some("nope"))));
+            assert!(guarded.allows(access, &native(Some("s3cret"))));
+        }
     }
 
     #[test]
-    fn token_gates_writes_for_native_clients() {
-        let guarded = SharedToken::new(Some("s3cret".into()));
-        // No / wrong token → denied; exact token → allowed.
-        assert!(!guarded.allows(Access::Write, &native(None)));
-        assert!(!guarded.allows(Access::Write, &native(Some("nope"))));
-        assert!(guarded.allows(Access::Write, &native(Some("s3cret"))));
-        // Admin is gated the same way under the single-token model.
-        assert!(guarded.allows(Access::Admin, &native(Some("s3cret"))));
-        assert!(!guarded.allows(Access::Admin, &native(None)));
-    }
-
-    #[test]
-    fn no_token_allows_local_ui_but_not_native_writes() {
+    fn no_token_allows_local_ui_but_not_native_clients() {
         let open = SharedToken::new(None);
-        // Same-origin browser UI may write with no token (CSRF-shielded).
+        // Same-origin browser UI works with no token (CSRF-shielded) — including
+        // reads, so the local dashboard needs zero configuration.
+        assert!(open.allows(Access::Read, &browser(None)));
         assert!(open.allows(Access::Write, &browser(None)));
-        // A programmatic client with no token is denied — must set DRSG_TOKEN.
+        // A programmatic client with no token is denied even a read — it must
+        // set DRSG_TOKEN to reach the API at all.
+        assert!(!open.allows(Access::Read, &native(None)));
         assert!(!open.allows(Access::Write, &native(None)));
     }
 
@@ -255,7 +253,9 @@ mod tests {
         // injects it into the page) — the origin bypass only applies when no
         // token is configured.
         let guarded = SharedToken::new(Some("s3cret".into()));
+        assert!(!guarded.allows(Access::Read, &browser(None)));
         assert!(!guarded.allows(Access::Write, &browser(None)));
+        assert!(guarded.allows(Access::Read, &browser(Some("s3cret"))));
         assert!(guarded.allows(Access::Write, &browser(Some("s3cret"))));
     }
 

@@ -46,14 +46,15 @@ impl RpcError {
     pub fn server(msg: impl Into<String>) -> Self {
         Self::new(-32000, msg)
     }
-    /// A write/admin method was called without a valid credential. JSON-RPC has
-    /// no standard auth code; `-32001` sits in the app server-error band and is
-    /// distinct from `-32000` so clients (and the SDKs) can detect an auth
-    /// failure — the wire analogue of HTTP 401.
+    /// A method was called without a valid credential. The whole surface is
+    /// authenticated, so this covers reads too. JSON-RPC has no standard auth
+    /// code; `-32001` sits in the app server-error band and is distinct from
+    /// `-32000` so clients (and the SDKs) can detect an auth failure — the wire
+    /// analogue of HTTP 401.
     pub fn unauthorized() -> Self {
         Self::new(
             -32001,
-            "unauthorized: this method requires a valid write credential (set DRSG_TOKEN and send it as `Authorization: Bearer <token>`)",
+            "unauthorized: set DRSG_TOKEN and send it as `Authorization: Bearer <token>` (WebSocket: `?token=<token>`)",
         )
     }
 
@@ -521,17 +522,18 @@ mod tests {
     }
 
     #[test]
-    fn reads_stay_open_when_a_token_is_configured() {
+    fn reads_are_gated_when_a_token_is_configured() {
         let db = seeded();
         let token = SharedToken::new(Some("s3cret".into()));
-        let auth = Auth::new(&token, native(None)); // no credential at all
-        let resp = call_as(
-            &db,
-            &auth,
-            r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#,
-        )
-        .unwrap();
-        assert_eq!(resp["result"]["nodes"], 1);
+        const STATS: &str = r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#;
+
+        // No credential → even a read is refused.
+        let denied = call_as(&db, &Auth::new(&token, native(None)), STATS).unwrap();
+        assert_eq!(err_code(&denied), -32001);
+
+        // With the token → the read goes through.
+        let ok = call_as(&db, &Auth::new(&token, native(Some("s3cret"))), STATS).unwrap();
+        assert_eq!(ok["result"]["nodes"], 1);
     }
 
     #[test]

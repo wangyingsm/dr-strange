@@ -35,9 +35,12 @@ fn spawn_server() -> SocketAddr {
     addr
 }
 
+/// A read/write RPC as the browser UI makes it: same-origin, so the no-token
+/// local-UI fallback authorizes it (the whole surface is authenticated now).
 async fn rpc(client: &reqwest::Client, base: &str, method: &str, params: Value) -> Value {
     client
         .post(format!("{base}/rpc"))
+        .header("origin", base)
         .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 }))
         .send()
         .await
@@ -105,6 +108,7 @@ async fn serves_dashboard_and_rpc() {
     let big = "a".repeat(5 * 1024 * 1024);
     let extract = client
         .post(format!("{base}/digest/extract?name=big.txt"))
+        .header("origin", &base) // authenticated like the browser UI
         .body(big.clone())
         .send()
         .await
@@ -116,70 +120,75 @@ async fn serves_dashboard_and_rpc() {
     assert_eq!(body["chars"], big.len());
 }
 
-/// The write-auth gate, exercised over the real HTTP wiring (the header →
+/// The auth gate, exercised over the real HTTP wiring (the header →
 /// [`Credentials`] extraction + Origin guard live in the server layer, not in
-/// the pure dispatcher). This server has no `DRSG_TOKEN`, so the only path to a
-/// write is the same-origin browser UI.
+/// the pure dispatcher). This server has no `DRSG_TOKEN`, so the *entire*
+/// surface — reads included — is reachable only from the same-origin browser
+/// UI; a native client (no Origin) is refused everywhere.
 #[tokio::test]
-async fn write_auth_gate_over_http() {
+async fn auth_gate_over_http() {
     let addr = spawn_server();
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
     wait_ready(&client, &base).await;
 
-    // An empty write: reaches the handler iff the auth gate allows it.
+    let post = |body: Value, origin: Option<&'static str>| {
+        let mut req = client.post(format!("{base}/rpc")).json(&body);
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        req.send()
+    };
     let write = json!({
-        "jsonrpc": "2.0",
-        "method": "digest.write",
-        "params": { "plane": "startup", "nodes": [], "edges": [] },
-        "id": 1,
+        "jsonrpc": "2.0", "method": "digest.write",
+        "params": { "plane": "startup", "nodes": [], "edges": [] }, "id": 1,
     });
+    let read = json!({ "jsonrpc": "2.0", "method": "db.stats", "id": 2 });
 
-    // 1. Native client (no Origin), no token configured → write denied (-32001).
-    let denied: Value = client
-        .post(format!("{base}/rpc"))
-        .json(&write)
-        .send()
+    // 1. Native client (no Origin), no token → EVERY method denied (-32001),
+    //    reads too. Programmatic access requires DRSG_TOKEN.
+    let denied_write: Value = post(write.clone(), None)
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(denied["error"]["code"], -32001, "native write should be denied");
-
-    // 2. Same-origin browser (loopback Origin) → the local-UI write is allowed.
-    let allowed: Value = client
-        .post(format!("{base}/rpc"))
-        .header("origin", format!("http://{addr}"))
-        .json(&write)
-        .send()
+    assert_eq!(denied_write["error"]["code"], -32001, "native write denied");
+    let denied_read: Value = post(read.clone(), None)
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert!(allowed.get("error").is_none(), "unexpected error: {allowed}");
-    assert_eq!(allowed["result"]["nodes_written"], 0);
+    assert_eq!(
+        denied_read["error"]["code"], -32001,
+        "native read denied too"
+    );
 
-    // 3. Cross-origin browser → refused at the Origin guard (403), never
-    //    dispatched. This is the CSRF/DNS-rebinding defense.
-    let forbidden = client
-        .post(format!("{base}/rpc"))
-        .header("origin", "https://evil.example.com")
-        .json(&write)
-        .send()
+    // 2. Same-origin browser (loopback Origin) → the local-UI fallback allows it.
+    let ok_read: Value = post(read.clone(), Some("http://127.0.0.1"))
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
-
-    // A read is likewise refused cross-origin — a malicious page can't even
-    // snoop the graph.
-    let read_cross = client
-        .post(format!("{base}/rpc"))
-        .header("origin", "https://evil.example.com")
-        .json(&json!({"jsonrpc":"2.0","method":"db.stats","id":2}))
-        .send()
+    assert_eq!(ok_read["result"]["nodes"], 1);
+    let ok_write: Value = post(write.clone(), Some("http://127.0.0.1"))
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(read_cross.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        ok_write.get("error").is_none(),
+        "unexpected error: {ok_write}"
+    );
+    assert_eq!(ok_write["result"]["nodes_written"], 0);
+
+    // 3. Cross-origin browser → refused at the Origin guard (403), for reads
+    //    and writes alike — a malicious page can neither mutate nor snoop.
+    let forbidden_write = post(write, Some("https://evil.example.com")).await.unwrap();
+    assert_eq!(forbidden_write.status(), reqwest::StatusCode::FORBIDDEN);
+    let forbidden_read = post(read, Some("https://evil.example.com")).await.unwrap();
+    assert_eq!(forbidden_read.status(), reqwest::StatusCode::FORBIDDEN);
 }

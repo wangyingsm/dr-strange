@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::assets::static_handler;
-use crate::auth::{AllowedOrigins, Auth, Authorizer, Credentials, SharedToken};
+use crate::auth::{Access, AllowedOrigins, Auth, Authorizer, Credentials, SharedToken};
 use crate::methods::{self, Ctx};
 use crate::rpc;
 
@@ -130,10 +130,14 @@ async fn extract_http(
     Query(q): Query<ExtractQuery>,
     body: Bytes,
 ) -> Response {
-    // Extraction touches no DB state, but a cross-site page shouldn't be able to
-    // make the user's browser burn CPU here — apply the same Origin guard.
-    if let Err(resp) = resolve_credentials(&state, &headers, None) {
-        return *resp;
+    // Extraction touches no DB state, but the whole surface is authenticated:
+    // apply the Origin guard, then require a credential (read level).
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     // Bounded channel: `blocking_send` applies backpressure if the client reads
     // slowly, rather than buffering the whole document's progress in memory.
@@ -172,11 +176,11 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> an
     let authorizer = SharedToken::from_env();
     if authorizer.is_configured() {
         println!(
-            "drsg serve: write auth ENABLED — mutations require DRSG_TOKEN (Authorization: Bearer <token>)"
+            "drsg serve: auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
         );
     } else {
         println!(
-            "drsg serve: WARNING — no DRSG_TOKEN set; mutations are allowed only from the local browser UI. Set DRSG_TOKEN to require a token for programmatic writes."
+            "drsg serve: WARNING — no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
         );
     }
     let state = Arc::new(AppState {
@@ -246,6 +250,11 @@ async fn ws_upgrade(
         Ok(c) => c,
         Err(resp) => return *resp,
     };
+    // The socket's stats push is a read, and reads are authenticated too — an
+    // unauthorized client gets no socket at all.
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     ws.on_upgrade(move |socket| ws_task(socket, state, creds))
 }
 
