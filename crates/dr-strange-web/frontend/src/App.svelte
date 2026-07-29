@@ -31,6 +31,13 @@
     plane = name
   }
 
+  // Dashboard also deletes planes; refresh the picker, and leave the deleted
+  // plane if it was the current one (startup always survives).
+  function onPlaneDeleted(name) {
+    loadPlanes()
+    if (plane === name) plane = 'startup'
+  }
+
   onMount(async () => {
     try {
       await loadPlanes()
@@ -176,7 +183,7 @@
 <!-- Explore owns a sigma/WebGL instance created on mount and killed on
      destroy, so mounting views on demand keeps switching clean. -->
 {#if view === 'dashboard'}
-  <Dashboard {onPlaneCreated} />
+  <Dashboard {onPlaneCreated} {onPlaneDeleted} />
 {:else if view === 'explore'}
   <Explore {plane} {focus} />
 {:else}

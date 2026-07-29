@@ -232,6 +232,31 @@ h2 {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.card-foot .del {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.card-foot .del:hover:enabled {
+  color: #e0555f;
+  border-color: color-mix(in srgb, #e0555f 45%, transparent);
+  background: color-mix(in srgb, #e0555f 12%, transparent);
+}
+.card-foot .del:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
 
 /* "+" tile that opens the new-plane popup */
 .new-card {
@@ -323,6 +348,23 @@ h2 {
   font-size: 0.8rem;
   color: #e0555f;
 }
+.dlg-warn {
+  margin: 0;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  color: var(--fg);
+}
+.dlg-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.dlg-confirm code {
+  font-family: ui-monospace, monospace;
+  color: var(--fg);
+}
 .dlg-actions {
   display: flex;
   justify-content: flex-end;
@@ -345,7 +387,12 @@ h2 {
   color: #fff;
   border: none;
 }
-.dlg-actions .primary:disabled {
+.dlg-actions .danger {
+  background: #e0555f;
+  color: #fff;
+  border: none;
+}
+.dlg-actions button:disabled {
   opacity: 0.5;
   cursor: default;
 }
