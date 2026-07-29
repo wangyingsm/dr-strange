@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Database, Dir, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord,
-    Properties, json,
+    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord,
+    PlaneHandle, Properties, json,
 };
 use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
 use serde::Deserialize;
@@ -765,4 +765,233 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let stats = app(txn.bulk_load(bnodes, bedges))?;
     app(txn.commit())?;
     Ok(jval!({ "nodes_written": stats.nodes, "edges_written": stats.edges }))
+}
+
+// ---- granular mutations (arch/09 §3) --------------------------------------
+//
+// Each method is one write transaction, committed atomically — a single-op
+// unit of change. (Cross-op atomicity is the batch-`mutate` shape we did not
+// take.) Every one is gated `Access::Write` at dispatch, so an unauthorized
+// caller never reaches the core.
+
+/// A node reference in a request body: either a numeric `id` or an external
+/// `key`. Used for edge endpoints, which take one field each.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NodeRef {
+    Id(u64),
+    Key(String),
+}
+
+impl NodeRef {
+    /// Resolve to a concrete [`NodeId`] in `plane`. A key that names no node is
+    /// an error; a numeric id is trusted (the core validates it on use).
+    fn resolve(&self, plane: &PlaneHandle<'_>) -> Result<NodeId, RpcError> {
+        match self {
+            NodeRef::Id(id) => Ok(NodeId(*id)),
+            NodeRef::Key(key) => app(plane.node_by_key(key))?
+                .map(|n| n.id)
+                .ok_or_else(|| RpcError::server(format!("no node with key '{key}'"))),
+        }
+    }
+}
+
+/// Resolve an `id`-or-`key` node selector (the `node.*` request shape) to a
+/// `NodeId`, without asserting existence for the numeric path.
+fn resolve_node(
+    plane: &PlaneHandle<'_>,
+    id: Option<u64>,
+    key: Option<&str>,
+) -> Result<NodeId, RpcError> {
+    match (id, key) {
+        (Some(id), _) => Ok(NodeId(id)),
+        (None, Some(k)) => app(plane.node_by_key(k))?
+            .map(|n| n.id)
+            .ok_or_else(|| RpcError::server(format!("no node with key '{k}'"))),
+        (None, None) => Err(RpcError::invalid_params("provide `id` or `key`")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateNode {
+    plane: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    properties: Value,
+}
+
+/// `node.create` — add a node with optional stable external key + labels.
+/// Returns the created node record. Errors (as a conflict) if the key is
+/// already bound in this plane.
+pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: CreateNode = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let props = props_of(&req.properties)?;
+    let labels: Vec<&str> = req.labels.iter().map(String::as_str).collect();
+
+    let mut txn = app(plane.write())?;
+    let id = match &req.key {
+        Some(k) => app(txn.create_node_with_key(k, &labels, props))?,
+        None => app(txn.create_node(&labels, props))?,
+    };
+    app(txn.commit())?;
+
+    Ok(app(plane.node(id))?
+        .map(|n| json::node_to_json(&n))
+        .unwrap_or(Value::Null))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateNode {
+    plane: String,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    key: Option<String>,
+    /// Properties to insert or overwrite (core JSON dialect).
+    #[serde(default)]
+    set: Value,
+    /// Property keys to remove.
+    #[serde(default)]
+    unset: Vec<String>,
+}
+
+/// `node.update` — patch a node's properties: `set` inserts/overwrites, `unset`
+/// removes. Labels are immutable here (the core has no label-patch op). Returns
+/// the updated record.
+pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: UpdateNode = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let id = resolve_node(&plane, req.id, req.key.as_deref())?;
+    let set = props_of(&req.set)?;
+
+    let mut txn = app(plane.write())?;
+    for (k, pd) in set {
+        app(txn.set_prop(id, &k, pd))?;
+    }
+    for k in &req.unset {
+        app(txn.remove_prop(id, k))?;
+    }
+    app(txn.commit())?;
+
+    Ok(app(plane.node(id))?
+        .map(|n| json::node_to_json(&n))
+        .unwrap_or(Value::Null))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteNode {
+    plane: String,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// `node.delete` — remove a node and cascade to its incident edges. Reports
+/// whether a node was actually present (`deleted`), so a redundant delete is a
+/// clean no-op rather than an error.
+pub fn node_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: DeleteNode = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let existing = match (req.id, &req.key) {
+        (Some(id), _) => app(plane.node(NodeId(id)))?,
+        (None, Some(k)) => app(plane.node_by_key(k))?,
+        (None, None) => return Err(RpcError::invalid_params("provide `id` or `key`")),
+    };
+    let Some(node) = existing else {
+        return Ok(jval!({ "deleted": false }));
+    };
+
+    let mut txn = app(plane.write())?;
+    app(txn.delete_node(node.id))?;
+    app(txn.commit())?;
+    Ok(jval!({ "deleted": true, "id": node.id.0 }))
+}
+
+#[derive(Deserialize)]
+pub struct CreateEdge {
+    plane: String,
+    src: NodeRef,
+    dst: NodeRef,
+    #[serde(rename = "type")]
+    ty: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+/// `edge.create` — add a directed edge between two existing nodes (each named
+/// by id or key). Both endpoints must exist in the plane. Returns the created
+/// edge record.
+pub fn edge_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: CreateEdge = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let src = req.src.resolve(&plane)?;
+    let dst = req.dst.resolve(&plane)?;
+    let props = props_of(&req.properties)?;
+
+    let mut txn = app(plane.write())?;
+    let id = app(txn.create_edge(src, dst, &req.ty, props))?;
+    app(txn.commit())?;
+
+    Ok(app(plane.edge(id))?
+        .map(|e| edge_to_json(&e))
+        .unwrap_or(Value::Null))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateEdge {
+    plane: String,
+    edge: u64,
+    #[serde(default)]
+    set: Value,
+    #[serde(default)]
+    unset: Vec<String>,
+}
+
+/// `edge.update` — patch an edge's properties (`set`/`unset`). Returns the
+/// updated edge record.
+pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: UpdateEdge = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let id = EdgeId(req.edge);
+    let set = props_of(&req.set)?;
+
+    let mut txn = app(plane.write())?;
+    for (k, pd) in set {
+        app(txn.set_edge_prop(id, &k, pd))?;
+    }
+    for k in &req.unset {
+        app(txn.remove_edge_prop(id, k))?;
+    }
+    app(txn.commit())?;
+
+    Ok(app(plane.edge(id))?
+        .map(|e| edge_to_json(&e))
+        .unwrap_or(Value::Null))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteEdge {
+    plane: String,
+    edge: u64,
+}
+
+/// `edge.delete` — remove one edge. Reports whether it was present, so a
+/// redundant delete is a clean no-op.
+pub fn edge_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: DeleteEdge = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let id = EdgeId(req.edge);
+    if app(plane.edge(id))?.is_none() {
+        return Ok(jval!({ "deleted": false }));
+    }
+
+    let mut txn = app(plane.write())?;
+    app(txn.delete_edge(id))?;
+    app(txn.commit())?;
+    Ok(jval!({ "deleted": true, "id": id.0 }))
 }

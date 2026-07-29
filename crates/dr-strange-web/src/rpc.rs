@@ -194,6 +194,13 @@ fn dispatch_method(
         // credentials (the LLM + embedding calls), so it's a privileged op.
         "digest.run" => guarded!(Access::Write, methods::digest_run(ctx, params)),
         "digest.write" => guarded!(Access::Write, methods::digest_write(ctx, params)),
+        // Granular mutations (arch/09 §3).
+        "node.create" => guarded!(Access::Write, methods::node_create(ctx, params)),
+        "node.update" => guarded!(Access::Write, methods::node_update(ctx, params)),
+        "node.delete" => guarded!(Access::Write, methods::node_delete(ctx, params)),
+        "edge.create" => guarded!(Access::Write, methods::edge_create(ctx, params)),
+        "edge.update" => guarded!(Access::Write, methods::edge_update(ctx, params)),
+        "edge.delete" => guarded!(Access::Write, methods::edge_delete(ctx, params)),
         other => Err(RpcError::method_not_found(other)),
     }
 }
@@ -555,6 +562,142 @@ mod tests {
         let resp = call_as(&db, &auth, EMPTY_WRITE).unwrap();
         assert!(resp.get("error").is_none(), "unexpected error: {resp}");
         assert_eq!(resp["result"]["nodes_written"], 0);
+    }
+
+    // ---- granular mutations -----------------------------------------------
+
+    #[test]
+    fn node_create_then_get_roundtrips() {
+        let db = seeded();
+        let created = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"carol","labels":["Person"],"properties":{"age":30}},"id":1}"#,
+        )
+        .unwrap();
+        assert!(
+            created.get("error").is_none(),
+            "unexpected error: {created}"
+        );
+        assert_eq!(created["result"]["external_key"], "carol");
+        assert_eq!(created["result"]["labels"][0], "Person");
+
+        // The node is now readable, properties intact.
+        let got = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.get","params":{"plane":"startup","key":"carol"},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(got["result"]["properties"]["age"], 30);
+    }
+
+    #[test]
+    fn node_create_duplicate_key_conflicts() {
+        let db = seeded(); // already has "alice"
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"alice","labels":["Person"]},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32000); // core Conflict → app error
+    }
+
+    #[test]
+    fn node_update_sets_and_unsets_properties() {
+        let db = seeded();
+        // Set two props on alice.
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.update","params":{"plane":"startup","key":"alice","set":{"age":41,"city":"NYC"}},"id":1}"#,
+        )
+        .unwrap();
+        let after_set = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.get","params":{"plane":"startup","key":"alice"},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(after_set["result"]["properties"]["age"], 41);
+        assert_eq!(after_set["result"]["properties"]["city"], "NYC");
+
+        // Remove one.
+        let updated = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.update","params":{"plane":"startup","key":"alice","unset":["city"]},"id":3}"#,
+        )
+        .unwrap();
+        assert!(updated["result"]["properties"].get("city").is_none());
+        assert_eq!(updated["result"]["properties"]["age"], 41);
+    }
+
+    #[test]
+    fn node_delete_cascades_edges_and_reports_presence() {
+        let (db, alice, _bob) = seeded_graph(); // alice -KNOWS-> bob
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"node.delete","params":{{"plane":"startup","id":{alice}}},"id":1}}"#
+        );
+        let del = call(&db, &body).unwrap();
+        assert_eq!(del["result"]["deleted"], true);
+
+        // The node is gone and its edge cascaded away.
+        let stats = call(&db, r#"{"jsonrpc":"2.0","method":"db.stats","id":2}"#).unwrap();
+        assert_eq!(stats["result"]["nodes"], 1);
+        assert_eq!(stats["result"]["edges"], 0);
+
+        // A second delete of the same (now-absent) node is a clean no-op.
+        let again = call(&db, &body).unwrap();
+        assert_eq!(again["result"]["deleted"], false);
+    }
+
+    #[test]
+    fn edge_create_and_delete() {
+        let db = seeded(); // "alice"
+        // Add a second node, then connect them by key.
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"bob","labels":["Person"]},"id":1}"#,
+        )
+        .unwrap();
+        let edge = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"edge.create","params":{"plane":"startup","src":"alice","dst":"bob","type":"KNOWS"},"id":2}"#,
+        )
+        .unwrap();
+        assert!(edge.get("error").is_none(), "unexpected error: {edge}");
+        assert_eq!(edge["result"]["type"], "KNOWS");
+        let edge_id = edge["result"]["id"].as_u64().unwrap();
+
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"edge.delete","params":{{"plane":"startup","edge":{edge_id}}},"id":3}}"#
+        );
+        assert_eq!(call(&db, &body).unwrap()["result"]["deleted"], true);
+        // Idempotent: gone now.
+        assert_eq!(call(&db, &body).unwrap()["result"]["deleted"], false);
+    }
+
+    #[test]
+    fn edge_create_rejects_unknown_endpoint() {
+        let db = seeded(); // only "alice"
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"edge.create","params":{"plane":"startup","src":"alice","dst":"nobody","type":"KNOWS"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32000);
+    }
+
+    #[test]
+    fn mutations_are_gated_by_auth() {
+        // A new write method is denied to a native client when a token is set —
+        // the guarded! classification covers the whole family, not just digest.
+        let db = seeded();
+        let token = SharedToken::new(Some("s3cret".into()));
+        let auth = Auth::new(&token, native(None));
+        let resp = call_as(
+            &db,
+            &auth,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"x"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32001);
     }
 
     #[test]
