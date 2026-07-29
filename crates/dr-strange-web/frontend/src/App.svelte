@@ -183,7 +183,7 @@
 <!-- Explore owns a sigma/WebGL instance created on mount and killed on
      destroy, so mounting views on demand keeps switching clean. -->
 {#if view === 'dashboard'}
-  <Dashboard {onPlaneCreated} {onPlaneDeleted} />
+  <Dashboard {plane} {onPlaneCreated} {onPlaneDeleted} onSelectPlane={(name) => (plane = name)} />
 {:else if view === 'explore'}
   <Explore {plane} {focus} {onPlaneCreated} />
 {:else}
