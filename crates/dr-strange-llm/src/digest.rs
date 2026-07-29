@@ -437,18 +437,60 @@ fn chunk(doc: &str, size: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     for para in doc.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
-        if !cur.is_empty() && cur.len() + para.len() + 2 > size {
-            chunks.push(std::mem::take(&mut cur));
+        // A paragraph longer than `size` must itself be split — otherwise a doc
+        // with few blank lines becomes one giant chunk whose extraction JSON
+        // overruns the model's output limit and comes back truncated.
+        for piece in split_paragraph(para, size) {
+            if !cur.is_empty() && cur.len() + piece.len() + 2 > size {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push_str("\n\n");
+            }
+            cur.push_str(&piece);
         }
-        if !cur.is_empty() {
-            cur.push_str("\n\n");
-        }
-        cur.push_str(para);
     }
     if !cur.is_empty() {
         chunks.push(cur);
     }
     chunks
+}
+
+/// Break a paragraph into pieces of at most `size` chars, cutting at whitespace
+/// where possible (char-safe: never splits a UTF-8 codepoint). Returns the
+/// paragraph unchanged when it already fits.
+fn split_paragraph(para: &str, size: usize) -> Vec<String> {
+    if para.chars().count() <= size {
+        return vec![para.to_string()];
+    }
+    let mut pieces = Vec::new();
+    let mut cur = String::new();
+    for word in para.split_whitespace() {
+        // A single word longer than `size` gets hard-split by chars.
+        if word.chars().count() > size {
+            if !cur.is_empty() {
+                pieces.push(std::mem::take(&mut cur));
+            }
+            for ch in word.chars() {
+                if cur.chars().count() >= size {
+                    pieces.push(std::mem::take(&mut cur));
+                }
+                cur.push(ch);
+            }
+            continue;
+        }
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > size {
+            pieces.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+    pieces
 }
 
 fn system_prompt(link: bool) -> String {
@@ -563,5 +605,32 @@ mod tests {
         .unwrap();
         assert!(block.contains("EXISTING ENTITIES"));
         assert!(block.contains("alice (Person): an engineer at Acme"));
+    }
+
+    #[test]
+    fn chunk_bounds_even_a_single_giant_paragraph() {
+        // One paragraph, no blank lines, far bigger than `size` — must still be
+        // split so no chunk overruns the model's output limit.
+        let para = "word ".repeat(500); // ~2500 chars, no "\n\n"
+        let chunks = chunk(&para, 400);
+        assert!(chunks.len() > 1, "oversized paragraph was not split");
+        assert!(
+            chunks.iter().all(|c| c.chars().count() <= 400),
+            "a chunk exceeded the size bound"
+        );
+        // Reassembled words are preserved (whitespace-normalised).
+        let joined: Vec<&str> = chunks.iter().flat_map(|c| c.split_whitespace()).collect();
+        assert_eq!(joined.len(), 500);
+        assert!(joined.iter().all(|w| *w == "word"));
+    }
+
+    #[test]
+    fn split_paragraph_hard_splits_a_giant_word() {
+        // A single token longer than `size` is cut by chars, never mid-codepoint.
+        let word = "é".repeat(300); // multi-byte chars
+        let pieces = split_paragraph(&word, 100);
+        assert!(pieces.len() >= 3);
+        assert!(pieces.iter().all(|p| p.chars().count() <= 100));
+        assert_eq!(pieces.concat().chars().count(), 300);
     }
 }

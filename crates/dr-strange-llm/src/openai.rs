@@ -14,6 +14,12 @@ use serde_json::{Value, json};
 use crate::preset::preset;
 use crate::provider::{Chat, ChatReply, EmbedReply, Embedder};
 
+/// Output-token ceiling for extraction replies. Generous headroom so a chunk's
+/// JSON is not cut off mid-object (which yields unparseable output). Chunks are
+/// size-bounded upstream, so this is rarely the binding limit; it also fits the
+/// preset models' output caps (deepseek-chat / qwen-plus are 8K).
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+
 /// Build an [`OpenAiProvider`] from a provider name (a [`preset`] or a raw base
 /// URL) plus optional overrides, reading the API key from the environment. The
 /// one place CLI and MCP resolve provider config the same way. `embed` selects
@@ -133,13 +139,23 @@ impl Chat for OpenAiProvider {
             json!({
                 "model": self.model,
                 "temperature": 0,
+                "max_tokens": MAX_OUTPUT_TOKENS,
                 "messages": [
                     { "role": "system", "content": system },
                     { "role": "user", "content": user },
                 ],
             }),
         )?;
-        let text = v["choices"][0]["message"]["content"]
+        let choice = &v["choices"][0];
+        // A truncated reply (hit the output cap) is unparseable JSON — surface
+        // the real cause instead of a confusing "not valid extraction JSON".
+        if choice["finish_reason"] == "length" {
+            bail!(
+                "the model's reply hit the {MAX_OUTPUT_TOKENS}-token output limit and was cut off \
+                 — the text is too dense to extract in one pass; try a smaller chunk size"
+            );
+        }
+        let text = choice["message"]["content"]
             .as_str()
             .context("provider reply had no message content")?
             .to_string();
