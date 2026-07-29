@@ -20,9 +20,34 @@
   let nonce = 0
   let timer
 
+  // "Add plane" affordance — the digest page lost its plane text-box when the
+  // picker went app-wide, so this is the only way to create one from the UI.
+  let addingPlane = $state(false)
+  let newPlaneName = $state('')
+  let planeError = $state(null)
+
+  async function loadPlanes() {
+    planes = await rpc('plane.list')
+  }
+
+  async function addPlane() {
+    const name = newPlaneName.trim()
+    if (!name) return
+    planeError = null
+    try {
+      await rpc('plane.create', { name })
+      await loadPlanes()
+      plane = name // switch to the new plane
+      newPlaneName = ''
+      addingPlane = false
+    } catch (e) {
+      planeError = e.message
+    }
+  }
+
   onMount(async () => {
     try {
-      planes = await rpc('plane.list')
+      await loadPlanes()
       if (!planes.some((p) => p.name === plane)) plane = planes[0]?.name ?? 'startup'
     } catch {
       // Dashboard still works; the header just shows the default plane.
@@ -85,7 +110,31 @@
         {#each planes as p (p.id)}<option value={p.name}>{p.name}</option>{/each}
         {#if !planes.length}<option value={plane}>{plane}</option>{/if}
       </select>
+      <button
+        class="add-plane"
+        title="Create a new plane"
+        aria-label="Create a new plane"
+        onclick={() => {
+          addingPlane = !addingPlane
+          planeError = null
+        }}>+</button>
     </label>
+
+    {#if addingPlane}
+      <span class="new-plane">
+        <input
+          type="text"
+          placeholder="new plane name"
+          bind:value={newPlaneName}
+          onkeydown={(e) => {
+            if (e.key === 'Enter') addPlane()
+            else if (e.key === 'Escape') addingPlane = false
+          }}
+        />
+        <button onclick={addPlane} disabled={!newPlaneName.trim()}>create</button>
+        {#if planeError}<span class="plane-error">{planeError}</span>{/if}
+      </span>
+    {/if}
 
     <div class="search">
       <input
