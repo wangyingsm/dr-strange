@@ -28,6 +28,15 @@
   let newValue = $state('')
   let saveError = $state(null)
 
+  // Create-node / create-edge state.
+  let creating = $state(null) // null | 'node' | 'edge'
+  let createError = $state(null)
+  let nKey = $state('')
+  let nLabels = $state('')
+  let eSrc = $state('')
+  let eDst = $state('')
+  let eType = $state('')
+
   // Flatten a properties object (values are raw, `{ $desc, $value }`, or an
   // embedding `{ $vector: [...] }`), then sink underscore-prefixed
   // provenance/internal props to the bottom — each group keeps its order.
@@ -187,6 +196,57 @@
     }
   }
 
+  function resetCreate() {
+    creating = null
+    createError = null
+    nKey = ''
+    nLabels = ''
+    eSrc = ''
+    eDst = ''
+    eType = ''
+  }
+
+  async function createNode() {
+    createError = null
+    const labels = nLabels
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const params = { plane, labels }
+    if (nKey.trim()) params.key = nKey.trim()
+    try {
+      const node = await rpc('node.create', params)
+      resetCreate()
+      await focusNode(node.id) // center + select the new node (then Edit for props)
+    } catch (e) {
+      createError = e.message
+    }
+  }
+
+  // A numeric string is a node id; anything else is an external key (matches
+  // the backend's NodeRef).
+  const nodeRef = (s) => (/^\d+$/.test(s.trim()) ? Number(s.trim()) : s.trim())
+
+  async function createEdge() {
+    createError = null
+    if (!eType.trim()) {
+      createError = 'edge type is required'
+      return
+    }
+    try {
+      const edge = await rpc('edge.create', {
+        plane,
+        src: nodeRef(eSrc),
+        dst: nodeRef(eDst),
+        type: eType.trim(),
+      })
+      resetCreate()
+      await focusEdge(edge) // center + select the new edge
+    } catch (e) {
+      createError = e.message
+    }
+  }
+
   // Leaving a selection (or switching to a new one) drops any in-progress edit.
   $effect(() => {
     selected // track
@@ -310,8 +370,29 @@
     </select>
   </label>
   <button onclick={seed}>Reload</button>
+  <button onclick={() => (creating = creating === 'node' ? null : 'node')} class:active={creating === 'node'}>+ Node</button>
+  <button onclick={() => (creating = creating === 'edge' ? null : 'edge')} class:active={creating === 'edge'}>+ Edge</button>
   <span class="status">{status}</span>
 </div>
+
+{#if creating === 'node'}
+  <div class="create-panel">
+    <input placeholder="key (optional)" bind:value={nKey} />
+    <input placeholder="labels (comma-separated)" bind:value={nLabels} />
+    <button class="primary" onclick={createNode}>Create node</button>
+    <button onclick={resetCreate}>Cancel</button>
+    {#if createError}<span class="error">{createError}</span>{/if}
+  </div>
+{:else if creating === 'edge'}
+  <div class="create-panel">
+    <input placeholder="src (key or id)" bind:value={eSrc} />
+    <input placeholder="dst (key or id)" bind:value={eDst} />
+    <input placeholder="type" bind:value={eType} />
+    <button class="primary" onclick={createEdge}>Create edge</button>
+    <button onclick={resetCreate}>Cancel</button>
+    {#if createError}<span class="error">{createError}</span>{/if}
+  </div>
+{/if}
 
 {#if error}<p class="error">{error}</p>{/if}
 

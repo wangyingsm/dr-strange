@@ -474,6 +474,49 @@ nav button.active {
   font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
 }
+.controls button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- create node/edge panel (mutation UI) ---- */
+.create-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.create-panel input {
+  font: 14px system-ui;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.55rem;
+}
+.create-panel button {
+  font: 14px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+.create-panel button.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+.create-panel .error {
+  margin: 0;
+  font-size: 0.8rem;
+}
 
 /* ---- plot canvas ---- */
 .canvas-wrap {
