@@ -187,5 +187,5 @@
 {:else if view === 'explore'}
   <Explore {plane} {focus} {onPlaneCreated} />
 {:else}
-  <Digest {plane} />
+  <Digest {plane} {onPlaneCreated} />
 {/if}

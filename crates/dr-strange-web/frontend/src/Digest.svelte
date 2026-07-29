@@ -1,10 +1,13 @@
 <script>
   import { rpc, authHeaders } from './rpc.js'
+  import CreatePlane from './CreatePlane.svelte'
 
   const PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
 
   // The target plane comes from the app-wide picker in the header.
-  let { plane } = $props()
+  // `onPlaneCreated` bubbles a new plane up to App (refresh picker + switch).
+  let { plane, onPlaneCreated = () => {} } = $props()
+  let newPlaneOpen = $state(false) // new-plane popup open?
   let text = $state('')
   let chat = $state('openai')
   let embed = $state('openai')
@@ -152,7 +155,10 @@
     Upload file
     <input type="file" accept=".md,.markdown,.txt,.pdf,.docx" onchange={onFile} />
   </label>
+  <button class="new-plane-btn ml-auto" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
 </div>
+
+<CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if error}<p class="error">{error}</p>{/if}
 {#if status}<p class="status">{status}</p>{/if}

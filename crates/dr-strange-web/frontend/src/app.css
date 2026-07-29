@@ -653,7 +653,8 @@ nav button.active {
 }
 /* the "New Node / New Edge / New Plane" cluster sits at the right end, all
    sharing the additive-green style */
-.controls .new-node-btn {
+.controls .new-node-btn,
+.controls .ml-auto {
   margin-left: auto;
 }
 .controls .new-node-btn,
