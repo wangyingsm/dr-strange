@@ -1,5 +1,5 @@
 <script>
-  import { rpc } from './rpc.js'
+  import { rpc, authHeaders } from './rpc.js'
 
   const PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
 
@@ -28,6 +28,7 @@
       const buf = await file.arrayBuffer()
       const res = await fetch(`/digest/extract?name=${encodeURIComponent(file.name)}`, {
         method: 'POST',
+        headers: authHeaders(),
         body: buf,
       })
       // A non-2xx here is a pre-stream failure (e.g. a 413 when the upload is

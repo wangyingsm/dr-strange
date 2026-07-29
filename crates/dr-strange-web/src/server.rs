@@ -45,6 +45,10 @@ pub struct AppState {
     pub authorizer: Arc<dyn Authorizer>,
     /// Browser-`Origin` allow-list — the CSRF guard.
     pub origins: AllowedOrigins,
+    /// The shared token, echoed into the served SPA so the local UI can
+    /// authenticate (see [`crate::assets`]). `None` when unset. Same value the
+    /// `authorizer` checks against, so the injected token always works.
+    pub bootstrap_token: Option<String>,
 }
 
 impl AppState {
@@ -173,7 +177,10 @@ async fn extract_http(
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
 pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> anyhow::Result<()> {
-    let authorizer = SharedToken::from_env();
+    // Read the secret once so the checker (`authorizer`) and the SPA's injected
+    // copy (`bootstrap_token`) can never disagree.
+    let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
+    let authorizer = SharedToken::new(token.clone());
     if authorizer.is_configured() {
         println!(
             "drsg serve: auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
@@ -188,6 +195,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> an
         db_path,
         authorizer: Arc::new(authorizer),
         origins: AllowedOrigins::from_env(),
+        bootstrap_token: token,
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;

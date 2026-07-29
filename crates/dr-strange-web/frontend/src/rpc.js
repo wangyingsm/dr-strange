@@ -2,11 +2,21 @@
 
 let nextId = 1
 
+// The shared auth token, injected into the page by the server when DRSG_TOKEN
+// is set (see crate::assets). Absent in the zero-config local case, where the
+// same-origin Origin guard authorizes the UI on its own.
+const TOKEN = (typeof window !== 'undefined' && window.__DRSG_TOKEN__) || null
+
+/** Merge the bearer token into a headers object when the server issued one. */
+export function authHeaders(extra = {}) {
+  return TOKEN ? { ...extra, authorization: `Bearer ${TOKEN}` } : extra
+}
+
 /** Call one JSON-RPC method over HTTP POST /rpc. Throws on an RPC error. */
 export async function rpc(method, params = undefined) {
   const res = await fetch('/rpc', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ jsonrpc: '2.0', method, params, id: nextId++ }),
   })
   const msg = await res.json()
@@ -21,7 +31,10 @@ export async function rpc(method, params = undefined) {
  */
 export function liveStats(onStats, onState) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  const ws = new WebSocket(`${proto}://${location.host}/ws`)
+  // The browser WebSocket API can't set request headers, so the token rides
+  // the query string (the server reads `?token=` there).
+  const q = TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''
+  const ws = new WebSocket(`${proto}://${location.host}/ws${q}`)
   ws.onopen = () => onState?.(true)
   ws.onclose = () => onState?.(false)
   ws.onmessage = (e) => {

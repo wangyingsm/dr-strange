@@ -64,11 +64,6 @@ impl SharedToken {
         }
     }
 
-    /// Read the shared secret from `DRSG_TOKEN` (unset or empty = none).
-    pub fn from_env() -> Self {
-        Self::new(std::env::var("DRSG_TOKEN").ok())
-    }
-
     /// Whether a token is configured — drives the startup banner and the
     /// zero-config local-UI write fallback.
     pub fn is_configured(&self) -> bool {
