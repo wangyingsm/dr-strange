@@ -40,11 +40,15 @@ check-drift: drsg-codegen
 test/e2e: test/e2e.c libdrsg.a
 	$(CC) $(ALL_CFLAGS) $< -o $@ libdrsg.a $(ALL_LIBS)
 
+# Build the quickstart example (run against a drsg serve on :7700).
+example: examples/quickstart.c libdrsg.a
+	$(CC) $(ALL_CFLAGS) $< -o $@ libdrsg.a $(ALL_LIBS)
+
 # Drift check + end-to-end suite against a real drsg serve.
 test: check-drift test/e2e
 	./test/run.sh
 
 clean:
-	rm -f $(OBJ) libdrsg.a drsg-codegen test/e2e
+	rm -f $(OBJ) libdrsg.a drsg-codegen test/e2e example
 
 .PHONY: generate check-drift test clean

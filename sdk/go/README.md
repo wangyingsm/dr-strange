@@ -38,6 +38,8 @@ Each method is the RPC method PascalCased (`node.create` → `NodeCreate`,
 (`ptr("alice")`) so unset is distinguishable from zero; a node reference
 (`Src`/`Dst`) is an `int64` id or a `string` key.
 
+A runnable version is [`examples/quickstart.go`](examples/quickstart.go) — `go run ./examples`.
+
 ### Auth
 
 The whole surface is authenticated. Set a token via `WithToken` or the

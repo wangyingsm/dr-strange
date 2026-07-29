@@ -2,3 +2,4 @@
 libdrsg.a
 drsg-codegen
 test/e2e
+example

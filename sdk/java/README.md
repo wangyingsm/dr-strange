@@ -40,6 +40,8 @@ returning the typed result. Build params with `Params.of(required…)` plus a
 `withX(…)` per optional field; a node reference (`src`/`dst`) is a `Long` id or
 a `String` key. Types are nested in the `Drsg` class (`Drsg.NodeRecord`).
 
+A runnable version is [`examples/Quickstart.java`](examples/Quickstart.java) (compile with the built classes + Jackson on the classpath).
+
 ### Auth
 
 The whole surface is authenticated. Pass a token to the constructor or set

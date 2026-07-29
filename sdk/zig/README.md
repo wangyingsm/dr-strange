@@ -45,6 +45,8 @@ required params are positional, optionals go in a `c.drsg_<method>_opts` struct
 (a null field is omitted), and each returns an owned `*json_object`. The `Client`
 wrapper adds RAII (`init`/`deinit`), a generic `call`, and Zig error unions.
 
+A runnable version is [`examples/quickstart.zig`](examples/quickstart.zig) — `zig build example`.
+
 ### Auth
 
 Pass a token to `Client.init` or set `DRSG_TOKEN`; it rides each request as

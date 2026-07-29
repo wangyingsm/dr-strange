@@ -31,6 +31,8 @@ Every method name is the RPC method with `.` → `_` (`node.create` →
 `node_create`); parameters are the schema's, keyword-friendly, with optionals
 defaulting to `None` and omitted from the call when unset.
 
+A runnable version is [`examples/quickstart.py`](examples/quickstart.py) — `python examples/quickstart.py`.
+
 ### Auth
 
 The whole surface is authenticated. Pass `token=` or set `DRSG_TOKEN`; it rides

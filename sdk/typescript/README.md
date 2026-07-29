@@ -32,6 +32,8 @@ Every method name is the RPC method camelCased (`node.create` → `nodeCreate`,
 `plane.set_props` → `planeSetProps`); it takes a single params object keyed by
 the schema's wire field names, and returns the method's typed result.
 
+A runnable version is [`examples/quickstart.ts`](examples/quickstart.ts) — `bun examples/quickstart.ts`.
+
 ### Auth
 
 The whole surface is authenticated. Pass `token` or set `DRSG_TOKEN`; it rides

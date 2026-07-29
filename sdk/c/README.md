@@ -49,6 +49,8 @@ A node reference (`src`/`dst`) is a `json_object` — pass
 a `json_object` the caller must `json_object_put`, or `NULL` on error (with
 `err` filled).
 
+A runnable version is [`examples/quickstart.c`](examples/quickstart.c) — `make example && ./example`.
+
 ### Auth
 
 The whole surface is authenticated. Pass a token or set `DRSG_TOKEN`; it rides
