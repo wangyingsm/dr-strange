@@ -150,7 +150,15 @@
           onclick={() => openDelete(p)}
           disabled={p.name === 'startup'}
           title={p.name === 'startup' ? 'The startup plane cannot be deleted' : 'Delete this plane'}
-        >Delete</button>
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2.75 4.25h10.5" />
+            <path d="M6.25 4.25V2.75h3.5v1.5" />
+            <path d="M4.35 4.25l.55 8.4a1 1 0 0 0 1 .9h4.2a1 1 0 0 0 1-.9l.55-8.4" />
+            <path d="M6.75 6.75v4M9.25 6.75v4" />
+          </svg>
+          Delete
+        </button>
       </div>
     </article>
   {/each}
