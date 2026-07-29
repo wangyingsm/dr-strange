@@ -21,6 +21,13 @@
   let error = $state(null)
   let vectorView = $state(null) // { k, values } — floats popup, null = closed
 
+  // Inspector mutation state (mutation UI): edit properties + delete.
+  let editing = $state(false)
+  let draft = $state([]) // editable [{ key, value }] rows of scalar props
+  let newKey = $state('')
+  let newValue = $state('')
+  let saveError = $state(null)
+
   // Flatten a properties object (values are raw, `{ $desc, $value }`, or an
   // embedding `{ $vector: [...] }`), then sink underscore-prefixed
   // provenance/internal props to the bottom — each group keeps its order.
@@ -94,6 +101,97 @@
       error = e.message
     }
   }
+
+  // ---- inspector mutations ------------------------------------------------
+
+  // Only plain scalar, non-provenance props are editable — vectors (embeddings)
+  // and underscore-prefixed provenance stay read-only.
+  function editableEntries(props) {
+    return propEntries(props).filter((e) => !e.k.startsWith('_') && !isVector(e.v))
+  }
+
+  // Parse an input the way the backend will: valid JSON (42, true, "x") keeps
+  // its type; anything else is a plain string.
+  function parseValue(s) {
+    try {
+      return JSON.parse(s)
+    } catch {
+      return s
+    }
+  }
+
+  function startEdit() {
+    saveError = null
+    draft = editableEntries(selected.data.properties).map((e) => ({
+      key: e.k,
+      value: typeof e.v === 'string' ? e.v : JSON.stringify(e.v),
+    }))
+    newKey = ''
+    newValue = ''
+    editing = true
+  }
+
+  function cancelEdit() {
+    editing = false
+    draft = []
+    saveError = null
+  }
+
+  function removeDraftRow(i) {
+    draft = draft.filter((_, j) => j !== i)
+  }
+
+  async function saveEdit() {
+    saveError = null
+    const rows = [...draft]
+    if (newKey.trim()) rows.push({ key: newKey.trim(), value: newValue })
+
+    // `set` = every kept row; `unset` = editable keys that were removed.
+    const set = {}
+    for (const r of rows) if (r.key.trim()) set[r.key.trim()] = parseValue(r.value)
+    const kept = new Set(rows.map((r) => r.key.trim()))
+    const unset = editableEntries(selected.data.properties)
+      .map((e) => e.k)
+      .filter((k) => !kept.has(k))
+
+    try {
+      const updated =
+        selected.kind === 'node'
+          ? await rpc('node.update', { plane, id: selected.data.id, set, unset })
+          : await rpc('edge.update', { plane, edge: selected.data.id, set, unset })
+      selected = { kind: selected.kind, data: updated }
+      editing = false
+      status = `updated ${selected.kind} ${updated.id}`
+    } catch (e) {
+      saveError = e.message
+    }
+  }
+
+  async function deleteSelected() {
+    if (!selected) return
+    const kind = selected.kind
+    const name =
+      kind === 'node'
+        ? (selected.data.external_key ?? `#${selected.data.id}`)
+        : `${selected.data.type} #${selected.data.id}`
+    if (!confirm(`Delete ${kind} ${name}? This cannot be undone.`)) return
+    try {
+      if (kind === 'node') await rpc('node.delete', { plane, id: selected.data.id })
+      else await rpc('edge.delete', { plane, edge: selected.data.id })
+      selected = null
+      editing = false
+      await seed() // reload the canvas without the deleted element
+      status = `deleted ${kind} ${name}`
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  // Leaving a selection (or switching to a new one) drops any in-progress edit.
+  $effect(() => {
+    selected // track
+    editing = false
+  })
 
   // Center a specific node (from header search): show it plus its 1-hop
   // neighborhood and select it.
@@ -238,20 +336,46 @@
         <h3>Edge {selected.data.id}</h3>
         <p class="sub">{selected.data.type} · {selected.data.src} → {selected.data.dst}</p>
       {/if}
-      <dl>
-        {#each propEntries(selected.data.properties) as pe (pe.k)}
-          <dt title={pe.desc ?? ''}>{pe.k}{#if pe.desc}<span class="badge" title={pe.desc}>ℹ</span>{/if}</dt>
-          <dd>
-            {#if isVector(pe.v)}
-              <button class="vec-btn" onclick={() => (vectorView = { k: pe.k, values: pe.v })}>
-                show vector ({pe.v.length} dims)
-              </button>
-            {:else}
-              {typeof pe.v === 'string' ? pe.v : JSON.stringify(pe.v)}
-            {/if}
-          </dd>
-        {/each}
-      </dl>
+      {#if !editing}
+        <dl>
+          {#each propEntries(selected.data.properties) as pe (pe.k)}
+            <dt title={pe.desc ?? ''}>{pe.k}{#if pe.desc}<span class="badge" title={pe.desc}>ℹ</span>{/if}</dt>
+            <dd>
+              {#if isVector(pe.v)}
+                <button class="vec-btn" onclick={() => (vectorView = { k: pe.k, values: pe.v })}>
+                  show vector ({pe.v.length} dims)
+                </button>
+              {:else}
+                {typeof pe.v === 'string' ? pe.v : JSON.stringify(pe.v)}
+              {/if}
+            </dd>
+          {/each}
+        </dl>
+        <div class="inspector-actions">
+          <button onclick={startEdit}>Edit</button>
+          <button class="danger" onclick={deleteSelected}>Delete</button>
+        </div>
+      {:else}
+        <div class="edit-props">
+          {#each draft as row, i (i)}
+            <div class="edit-row">
+              <input class="pk" value={row.key} readonly />
+              <input class="pv" bind:value={row.value} />
+              <button class="rm" title="remove property" onclick={() => removeDraftRow(i)}>×</button>
+            </div>
+          {/each}
+          <div class="edit-row new">
+            <input class="pk" placeholder="new key" bind:value={newKey} />
+            <input class="pv" placeholder="value" bind:value={newValue} />
+          </div>
+        </div>
+        {#if saveError}<p class="error">{saveError}</p>{/if}
+        <p class="edit-note">Values parse as JSON (<code>42</code>, <code>true</code>, <code>"text"</code>); vectors &amp; _provenance are read-only.</p>
+        <div class="inspector-actions">
+          <button class="primary" onclick={saveEdit}>Save</button>
+          <button onclick={cancelEdit}>Cancel</button>
+        </div>
+      {/if}
     </aside>
   {/if}
 

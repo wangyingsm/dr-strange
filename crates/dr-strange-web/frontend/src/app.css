@@ -579,6 +579,88 @@ nav button.active {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
+/* ---- inspector edit/delete (mutation UI) ---- */
+.inspector-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
+.inspector-actions button {
+  font: inherit;
+  font-size: 0.8rem;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+.inspector-actions button:hover {
+  border-color: var(--accent);
+}
+.inspector-actions button.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+.inspector-actions button.danger {
+  color: #e0555f;
+  border-color: color-mix(in srgb, #e0555f 45%, transparent);
+}
+.inspector-actions button.danger:hover {
+  background: color-mix(in srgb, #e0555f 14%, transparent);
+  border-color: #e0555f;
+}
+.edit-props {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0.2rem 0;
+}
+.edit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+  gap: 0.3rem;
+  align-items: center;
+}
+.edit-row.new {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+}
+.edit-row input {
+  font: inherit;
+  font-size: 0.8rem;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.22rem 0.4rem;
+}
+.edit-row input[readonly] {
+  color: var(--muted);
+  background: transparent;
+}
+.edit-row .rm {
+  font: inherit;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+.edit-row .rm:hover {
+  color: #e0555f;
+}
+.edit-note {
+  margin: 0.4rem 0 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.edit-note code {
+  font-family: ui-monospace, monospace;
+}
+
 /* ---- vector floats popup ---- */
 .modal-backdrop {
   position: absolute;
