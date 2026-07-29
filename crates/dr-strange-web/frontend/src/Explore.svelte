@@ -210,6 +210,19 @@
     eType = ''
   }
 
+  function openCreate(kind) {
+    resetCreate()
+    creating = kind
+  }
+
+  function autofocus(el) {
+    el.focus()
+  }
+
+  function onKeydown(e) {
+    if (e.key === 'Escape' && creating) resetCreate()
+  }
+
   async function createNode() {
     createError = null
     const labels = nLabels
@@ -363,6 +376,8 @@
   onDestroy(() => plot?.destroy())
 </script>
 
+<svelte:window onkeydown={onKeydown} />
+
 <div class="controls">
   <label>
     Label
@@ -374,30 +389,50 @@
     </select>
   </label>
   <button onclick={seed}>Reload</button>
-  <button onclick={() => (creating = creating === 'node' ? null : 'node')} class:active={creating === 'node'}>+ Node</button>
-  <button onclick={() => (creating = creating === 'edge' ? null : 'edge')} class:active={creating === 'edge'}>+ Edge</button>
   <span class="status">{status}</span>
-  <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">+ New plane</button>
+  <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
+  <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
+  <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
 </div>
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if creating === 'node'}
-  <div class="create-panel">
-    <input placeholder="key (optional)" bind:value={nKey} />
-    <input placeholder="labels (comma-separated)" bind:value={nLabels} />
-    <button class="primary" onclick={createNode}>Create node</button>
-    <button onclick={resetCreate}>Cancel</button>
-    {#if createError}<span class="error">{createError}</span>{/if}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Create a node">
+      <header>
+        New node
+        <button class="close" onclick={resetCreate} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <input placeholder="key (optional)" bind:value={nKey} use:autofocus onkeydown={(e) => e.key === 'Enter' && createNode()} />
+        <input placeholder="labels (comma-separated)" bind:value={nLabels} onkeydown={(e) => e.key === 'Enter' && createNode()} />
+        {#if createError}<p class="dlg-error">{createError}</p>{/if}
+        <div class="dlg-actions">
+          <button class="ghost" onclick={resetCreate}>Cancel</button>
+          <button class="primary" onclick={createNode}>Create node</button>
+        </div>
+      </div>
+    </div>
   </div>
 {:else if creating === 'edge'}
-  <div class="create-panel">
-    <input placeholder="src (key or id)" bind:value={eSrc} />
-    <input placeholder="dst (key or id)" bind:value={eDst} />
-    <input placeholder="type" bind:value={eType} />
-    <button class="primary" onclick={createEdge}>Create edge</button>
-    <button onclick={resetCreate}>Cancel</button>
-    {#if createError}<span class="error">{createError}</span>{/if}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Create an edge">
+      <header>
+        New edge
+        <button class="close" onclick={resetCreate} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <input placeholder="src (key or id)" bind:value={eSrc} use:autofocus onkeydown={(e) => e.key === 'Enter' && createEdge()} />
+        <input placeholder="dst (key or id)" bind:value={eDst} onkeydown={(e) => e.key === 'Enter' && createEdge()} />
+        <input placeholder="type" bind:value={eType} onkeydown={(e) => e.key === 'Enter' && createEdge()} />
+        {#if createError}<p class="dlg-error">{createError}</p>{/if}
+        <div class="dlg-actions">
+          <button class="ghost" onclick={resetCreate}>Cancel</button>
+          <button class="primary" onclick={createEdge}>Create edge</button>
+        </div>
+      </div>
+    </div>
   </div>
 {/if}
 
