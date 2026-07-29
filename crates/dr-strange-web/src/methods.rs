@@ -995,3 +995,77 @@ pub fn edge_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     app(txn.commit())?;
     Ok(jval!({ "deleted": true, "id": id.0 }))
 }
+
+// ---- plane administration (arch/09 §3) ------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreatePlane {
+    name: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+/// `plane.create` — make a new, empty plane. Errors if the name is taken.
+pub fn plane_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: CreatePlane = params(p)?;
+    let props = props_of(&req.properties)?;
+    let handle = app(ctx.db.create_plane(&req.name, props))?;
+    Ok(jval!({ "id": handle.id().0, "name": req.name }))
+}
+
+#[derive(Deserialize)]
+pub struct RenamePlane {
+    plane: String,
+    to: String,
+}
+
+/// `plane.rename` — rename an existing plane. Errors if the new name is taken
+/// or the target is the always-present `startup` plane.
+pub fn plane_rename(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: RenamePlane = params(p)?;
+    let handle = app(ctx.db.plane(&req.plane))?;
+    app(handle.rename(&req.to))?;
+    Ok(jval!({ "id": handle.id().0, "name": req.to }))
+}
+
+#[derive(Deserialize)]
+pub struct SetPlaneProps {
+    plane: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+/// `plane.set_props` — replace a plane's own property map (provenance,
+/// description, …). Returns the plane's new properties.
+pub fn plane_set_props(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: SetPlaneProps = params(p)?;
+    let props = props_of(&req.properties)?;
+    let handle = app(ctx.db.plane(&req.plane))?;
+    app(handle.set_properties(props))?;
+    let now = app(handle.properties())?;
+    Ok(jval!({
+        "id": handle.id().0,
+        "name": req.plane,
+        "properties": json::properties_to_json(&now),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct DeletePlane {
+    plane: String,
+}
+
+/// `plane.delete` — drop a plane and everything on it. Reports whether one was
+/// present (an absent name is a clean no-op); the `startup` plane cannot be
+/// dropped (the core rejects it).
+pub fn plane_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: DeletePlane = params(p)?;
+    let found = app(ctx.db.planes())?
+        .into_iter()
+        .find(|(_, name)| name == &req.plane);
+    let Some((id, _)) = found else {
+        return Ok(jval!({ "deleted": false }));
+    };
+    app(ctx.db.drop_plane(id))?;
+    Ok(jval!({ "deleted": true, "id": id.0 }))
+}

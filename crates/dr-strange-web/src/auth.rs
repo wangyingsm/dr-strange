@@ -26,11 +26,9 @@ pub enum Access {
     /// Mutations, or operations that spend the server's provider credentials
     /// (e.g. `digest.run`'s LLM call).
     Write,
-    /// Administrative operations (plane create / rename / delete; future key
-    /// management). Same gate as `Write` under the single-token model; kept
-    /// distinct so scoped keys can separate the two later. Not yet emitted by
-    /// any dispatch arm — the plane-admin methods land with the mutation work.
-    #[allow(dead_code)]
+    /// Administrative operations (plane create / rename / delete / set-props;
+    /// future key management). Same gate as `Write` under the single-token
+    /// model; kept distinct so scoped keys can separate the two later.
     Admin,
 }
 

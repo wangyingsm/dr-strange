@@ -201,6 +201,11 @@ fn dispatch_method(
         "edge.create" => guarded!(Access::Write, methods::edge_create(ctx, params)),
         "edge.update" => guarded!(Access::Write, methods::edge_update(ctx, params)),
         "edge.delete" => guarded!(Access::Write, methods::edge_delete(ctx, params)),
+        // Plane administration (arch/09 §3) — the strictest tier.
+        "plane.create" => guarded!(Access::Admin, methods::plane_create(ctx, params)),
+        "plane.rename" => guarded!(Access::Admin, methods::plane_rename(ctx, params)),
+        "plane.set_props" => guarded!(Access::Admin, methods::plane_set_props(ctx, params)),
+        "plane.delete" => guarded!(Access::Admin, methods::plane_delete(ctx, params)),
         other => Err(RpcError::method_not_found(other)),
     }
 }
@@ -695,6 +700,124 @@ mod tests {
             &db,
             &auth,
             r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"x"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32001);
+    }
+
+    // ---- plane administration ---------------------------------------------
+
+    #[test]
+    fn plane_create_then_listed() {
+        let db = seeded();
+        let created = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.create","params":{"name":"notes"},"id":1}"#,
+        )
+        .unwrap();
+        assert!(
+            created.get("error").is_none(),
+            "unexpected error: {created}"
+        );
+        assert_eq!(created["result"]["name"], "notes");
+
+        let planes = call(&db, r#"{"jsonrpc":"2.0","method":"plane.list","id":2}"#).unwrap();
+        assert!(
+            planes["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "notes")
+        );
+    }
+
+    #[test]
+    fn plane_create_duplicate_conflicts() {
+        let db = seeded();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.create","params":{"name":"startup"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32000);
+    }
+
+    #[test]
+    fn plane_rename_moves_the_name() {
+        let db = seeded();
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.create","params":{"name":"tmp"},"id":1}"#,
+        )
+        .unwrap();
+        let renamed = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.rename","params":{"plane":"tmp","to":"final"},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(renamed["result"]["name"], "final");
+
+        let names: Vec<String> = call(&db, r#"{"jsonrpc":"2.0","method":"plane.list","id":3}"#)
+            .unwrap()["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"final".to_string()));
+        assert!(!names.contains(&"tmp".to_string()));
+    }
+
+    #[test]
+    fn startup_plane_cannot_be_renamed_or_deleted() {
+        let db = seeded();
+        let rename = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.rename","params":{"plane":"startup","to":"x"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&rename), -32000);
+
+        let delete = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.delete","params":{"plane":"startup"},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&delete), -32000);
+    }
+
+    #[test]
+    fn plane_delete_reports_presence() {
+        let db = seeded();
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.create","params":{"name":"junk"},"id":1}"#,
+        )
+        .unwrap();
+        let del = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.delete","params":{"plane":"junk"},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(del["result"]["deleted"], true);
+        // Gone now → clean no-op.
+        let again = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.delete","params":{"plane":"junk"},"id":3}"#,
+        )
+        .unwrap();
+        assert_eq!(again["result"]["deleted"], false);
+    }
+
+    #[test]
+    fn plane_admin_is_gated_by_auth() {
+        let db = seeded();
+        let token = SharedToken::new(Some("s3cret".into()));
+        let auth = Auth::new(&token, native(None));
+        let resp = call_as(
+            &db,
+            &auth,
+            r#"{"jsonrpc":"2.0","method":"plane.create","params":{"name":"x"},"id":1}"#,
         )
         .unwrap();
         assert_eq!(err_code(&resp), -32001);
