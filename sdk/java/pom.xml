@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.wangyingsm</groupId>
+  <artifactId>drsg</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>drsg</name>
+  <description>Java client for dr-strange (drsg serve JSON-RPC)</description>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <jackson.version>2.17.2</jackson.version>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+      <!-- The codegen tool lives in the source tree but is not part of the API. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <configuration>
+          <excludes>
+            <exclude>io/github/wangyingsm/drsg/codegen/**</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+      <!-- `mvn -q compile exec:java` regenerates Drsg.java from the schema. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <configuration>
+          <mainClass>io.github.wangyingsm.drsg.codegen.Codegen</mainClass>
+          <arguments>
+            <argument>${project.basedir}/../../crates/dr-strange-web/openrpc.json</argument>
+            <argument>${project.basedir}/src/main/java/io/github/wangyingsm/drsg/Drsg.java</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
