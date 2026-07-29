@@ -238,6 +238,28 @@ h2 {
   justify-content: space-between;
   gap: 0.5rem;
 }
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.card-foot .export {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.card-foot .export:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 .card-foot .del {
   display: inline-flex;
   align-items: center;

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { rpc, liveStats } from './rpc.js'
+  import { rpc, liveStats, authHeaders } from './rpc.js'
   import CreatePlane from './CreatePlane.svelte'
 
   let { onPlaneCreated = () => {}, onPlaneDeleted = () => {} } = $props()
@@ -24,6 +24,26 @@
   async function afterCreate(name) {
     await loadPlanes() // refresh the cards
     onPlaneCreated(name) // refresh the header picker + switch to it
+  }
+
+  // Download a plane as JSONL (the server builds it; drsg import reads it back).
+  async function exportPlane(name) {
+    error = null
+    try {
+      const res = await fetch(`/export?plane=${encodeURIComponent(name)}`, { headers: authHeaders() })
+      if (!res.ok) throw new Error(`export failed (${res.status})`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${name}.jsonl`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      error = e.message
+    }
   }
 
   function openDelete(p) {
@@ -123,6 +143,15 @@
           <span>{p.nodes} nodes</span>
           <span>{p.edges} edges</span>
         </div>
+        <div class="card-actions">
+        <button class="export" onclick={() => exportPlane(p.name)} title="Export this plane as JSONL">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 2.5v7" />
+            <path d="M5 6.5 8 9.5l3-3" />
+            <path d="M2.75 11.5v1.25a.75.75 0 0 0 .75.75h9a.75.75 0 0 0 .75-.75V11.5" />
+          </svg>
+          Export
+        </button>
         <button
           class="del"
           onclick={() => openDelete(p)}
@@ -137,6 +166,7 @@
           </svg>
           Delete
         </button>
+        </div>
       </div>
     </article>
   {/each}

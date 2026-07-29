@@ -107,6 +107,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
+        .route("/export", get(export_http))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .fallback(static_handler)
         .with_state(state)
@@ -172,6 +173,66 @@ async fn extract_http(
         .header("content-type", "application/x-ndjson")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap()
+}
+
+#[derive(serde::Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    plane: String,
+}
+
+/// Keep only filename-safe characters — also stops CRLF/quote injection into
+/// the `Content-Disposition` header.
+fn safe_filename(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() { "plane".to_string() } else { s }
+}
+
+/// `GET /export?plane=startup` — the plane serialized as JSONL, returned as a
+/// file download (`drsg import` reads the same format). Read-gated like the
+/// rest of the surface; the DB scan runs on a blocking task.
+async fn export_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ExportQuery>,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    let plane = q.plane;
+    let built = tokio::task::spawn_blocking({
+        let state = state.clone();
+        let plane = plane.clone();
+        move || methods::export_plane(&state.ctx(), &plane)
+    })
+    .await;
+
+    match built {
+        Ok(Ok(jsonl)) => Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .header(
+                "content-disposition",
+                format!("attachment; filename=\"{}.jsonl\"", safe_filename(&plane)),
+            )
+            .body(Body::from(jsonl))
+            .unwrap(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response(),
+    }
 }
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the

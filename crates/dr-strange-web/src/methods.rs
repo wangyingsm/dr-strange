@@ -900,6 +900,29 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         .unwrap_or(Value::Null))
 }
 
+/// Serialize a plane to JSONL — node lines, then id-based edge lines — the
+/// exact format `drsg import` reads back. Backs the Dashboard's per-plane
+/// Export download. Not an RPC method (it returns a file, not JSON-RPC data);
+/// the `/export` HTTP endpoint calls it directly.
+pub fn export_plane(ctx: &Ctx<'_>, plane_name: &str) -> Result<String, RpcError> {
+    let plane = app(ctx.db.plane(plane_name))?;
+    let mut out = String::new();
+    for node in app(plane.query().scan_all().nodes())? {
+        out.push_str(&json::node_to_json(&node).to_string());
+        out.push('\n');
+    }
+    // Edges: walk each node's out-adjacency and emit each edge once.
+    for node in app(plane.query().scan_all().nodes())? {
+        for hop in app(plane.neighbors(node.id, Dir::Out, None))? {
+            if let Some(edge) = app(plane.edge(hop.edge))? {
+                out.push_str(&edge_to_json(&edge).to_string());
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 pub struct DeleteNode {
     plane: String,
