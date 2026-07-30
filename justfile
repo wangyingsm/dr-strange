@@ -16,6 +16,12 @@ web-dev:
 serve db="graph.drsg":
     cargo run -p dr-strange-cli -- --db {{db}} serve
 
+# Same, but on the hand-rolled native LSM backend (redb not compiled in). The
+# db path is a directory here (WAL + SSTs live inside it), so a native db and a
+# redb db shouldn't share the same path.
+serve-native db="graph.drsg":
+    cargo run -p dr-strange-cli --no-default-features --features native-backend,digest -- --db {{db}} serve
+
 # ---- benchmarks (see BENCHMARKS.md) --------------------------------------
 # Cross-engine comparison vs Kùzu / SQLite / Neo4j. The dataset is generated
 # once; every engine reads the same files. Results land in benchmarks/results/
