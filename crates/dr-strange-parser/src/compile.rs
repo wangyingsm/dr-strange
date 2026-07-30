@@ -34,18 +34,24 @@ fn resolve(arg: &VecArg, embedder: Option<&dyn Embedder>) -> Result<Vec<f32>, St
     }
 }
 
+/// One hop along the query's path: a relationship (`Expand`/`ExpandVar`) or a
+/// similarity beam (`ExpandBeam`). Each advances the current node.
+enum Hop<'a> {
+    Rel(&'a RelPat),
+    Beam(&'a BeamClause),
+}
+
 pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan, String> {
-    // Derive the source and the node path from either MATCH or SEARCH. Both
-    // consume their first node's label into the source (ScanLabel / VectorTopK),
-    // so it never becomes a HasLabel filter.
-    let empty_rest: Vec<(RelPat, NodePat)> = Vec::new();
-    let (source, first_node, rest): (Source, &NodePat, &[(RelPat, NodePat)]) = match &q.source {
+    // Derive the source + first node from MATCH or SEARCH. Both consume their
+    // first node's label into the source (ScanLabel / VectorTopK), so it never
+    // becomes a HasLabel filter.
+    let (source, first_node): (Source, &NodePat) = match &q.source {
         QuerySource::Match(p) => {
             let src = match &p.first.label {
                 Some(l) => Source::ScanLabel(l.clone()),
                 None => Source::ScanAll,
             };
-            (src, &p.first, p.rest.as_slice())
+            (src, &p.first)
         }
         QuerySource::Search(s) => {
             let src = Source::VectorTopK {
@@ -55,13 +61,21 @@ pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan,
                 metric: s.metric,
                 k: s.k,
             };
-            (src, &s.node, empty_rest.as_slice())
+            (src, &s.node)
         }
     };
 
-    // Nodes in path order; node i becomes the current row after i expands.
+    // The hops after the source, in path order: the MATCH pattern's
+    // relationships (if any), then any BEAM clauses.
+    let mut hops: Vec<(Hop, &NodePat)> = Vec::new();
+    if let QuerySource::Match(p) = &q.source {
+        hops.extend(p.rest.iter().map(|(r, n)| (Hop::Rel(r), n)));
+    }
+    hops.extend(q.beams.iter().map(|b| (Hop::Beam(b), &b.node)));
+
+    // Nodes in path order; node i becomes the current row after i hops.
     let mut nodes: Vec<&NodePat> = vec![first_node];
-    nodes.extend(rest.iter().map(|(_, n)| n));
+    nodes.extend(hops.iter().map(|(_, n)| *n));
     let last = nodes.len() - 1;
 
     // Variable → slot index. Reusing a variable would mean a graph constraint
@@ -106,30 +120,40 @@ pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan,
     steps.extend(slot_filters[0].drain(..).map(Step::Filter));
 
     for idx in 1..nodes.len() {
-        let (rel, _) = &rest[idx - 1];
-        match rel.var_len {
-            None => steps.push(Step::Expand {
-                dir: rel.dir,
-                edge_type: rel.ty.clone(),
-            }),
-            Some(VarLen { min, max }) => {
-                let max = max.ok_or_else(|| {
-                    "unbounded variable-length relationships aren't supported; \
-                     give an upper bound, e.g. *1..3"
-                        .to_string()
-                })?;
-                if min > max {
-                    return Err(format!(
-                        "variable-length range is empty: min ({min}) exceeds max ({max})"
-                    ));
-                }
-                steps.push(Step::ExpandVar {
+        match &hops[idx - 1].0 {
+            Hop::Rel(rel) => match rel.var_len {
+                None => steps.push(Step::Expand {
                     dir: rel.dir,
                     edge_type: rel.ty.clone(),
-                    min,
-                    max,
-                });
-            }
+                }),
+                Some(VarLen { min, max }) => {
+                    let max = max.ok_or_else(|| {
+                        "unbounded variable-length relationships aren't supported; \
+                         give an upper bound, e.g. *1..3"
+                            .to_string()
+                    })?;
+                    if min > max {
+                        return Err(format!(
+                            "variable-length range is empty: min ({min}) exceeds max ({max})"
+                        ));
+                    }
+                    steps.push(Step::ExpandVar {
+                        dir: rel.dir,
+                        edge_type: rel.ty.clone(),
+                        min,
+                        max,
+                    });
+                }
+            },
+            Hop::Beam(b) => steps.push(Step::ExpandBeam {
+                dir: b.dir,
+                edge_type: b.edge_type.clone(),
+                property: b.property.clone(),
+                query: resolve(&b.query, embedder)?,
+                metric: b.metric,
+                width: b.width,
+                depth: b.depth,
+            }),
         }
         // A non-source node's label becomes a HasLabel filter on the frontier.
         if let Some(l) = &nodes[idx].label {

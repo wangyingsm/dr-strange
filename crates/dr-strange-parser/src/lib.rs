@@ -18,6 +18,9 @@
 //! - **`SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]`** — an
 //!   indexed vector seed (`Source::VectorTopK`). `"text"` is embedded server-side
 //!   via [`parse_with_embedder`]; `[..]` is a literal escape hatch.
+//! - **`BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR "text"|[..]
+//!   [METRIC m] WIDTH w DEPTH d`** — similarity-guided beam traversal
+//!   (`Step::ExpandBeam`) from the current frontier; chains after MATCH/SEARCH.
 //! - `WHERE` over `=,<>,!=,<,<=,>,>=`, `AND`/`OR`/`NOT`, `+ - * /`, `IS [NOT] NULL`,
 //!   property access `a.key`, the label predicate `a:Label`, and the scoring
 //!   terms `score()`, `hops()`, `similarity(a.prop, "text"|[..][, metric])`,
@@ -28,8 +31,7 @@
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning / ordering by a non-terminal variable, projections, aggregation;
 //! - unbounded variable-length (`*`, `*n..`);
-//! - similarity-guided beam traversal (`ExpandBeam`), writes (`CREATE`/`SET`/`DELETE`),
-//!   and named `$params`.
+//! - writes (`CREATE`/`SET`/`DELETE`) and named `$params`.
 
 mod ast;
 mod compile;

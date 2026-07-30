@@ -586,6 +586,98 @@ fn similarity_by_text_embeds_too() {
 }
 
 #[test]
+fn beam_after_match_compiles_to_expand_beam() {
+    assert_eq!(
+        plan(
+            "MATCH (a:Paper) \
+             BEAM (b:Paper) OUT :CITES ON embedding NEAR [1.0, 0.0] METRIC cosine WIDTH 4 DEPTH 3 \
+             RETURN b"
+        ),
+        LogicalPlan {
+            source: Source::ScanLabel("Paper".into()),
+            steps: vec![
+                Step::ExpandBeam {
+                    dir: Dir::Out,
+                    edge_type: Some("CITES".into()),
+                    property: "embedding".into(),
+                    query: vec![1.0, 0.0],
+                    metric: Metric::Cosine,
+                    width: 4,
+                    depth: 3,
+                },
+                // b's label → a HasLabel filter on the beam frontier.
+                Step::Filter(has_label("Paper")),
+            ],
+        }
+    );
+}
+
+#[test]
+fn beam_defaults_metric_and_supports_directions() {
+    // No METRIC → cosine; IN direction; no edge type; anonymous result.
+    assert_eq!(
+        plan("MATCH (a) BEAM (b) IN ON emb NEAR [1.0] WIDTH 2 DEPTH 1 RETURN b").steps,
+        vec![Step::ExpandBeam {
+            dir: Dir::In,
+            edge_type: None,
+            property: "emb".into(),
+            query: vec![1.0],
+            metric: Metric::Cosine,
+            width: 2,
+            depth: 1,
+        }]
+    );
+}
+
+#[test]
+fn beam_embeds_text_and_composes_after_search() {
+    // "cat" → MockEmbedder → [3, 'c'].
+    let pl = parse_with_embedder(
+        "SEARCH (a:Paper) ON embedding NEAR [1.0, 0.0] TOPK 5 \
+         BEAM (b) OUT :CITES ON embedding NEAR \"cat\" WIDTH 3 DEPTH 2 \
+         RETURN b ORDER BY score() DESC",
+        &MockEmbedder,
+    )
+    .unwrap();
+    assert_eq!(
+        pl.source,
+        Source::VectorTopK {
+            label: Some("Paper".into()),
+            property: "embedding".into(),
+            query: vec![1.0, 0.0],
+            metric: Metric::Cosine,
+            k: 5,
+        }
+    );
+    assert_eq!(
+        pl.steps,
+        vec![
+            Step::ExpandBeam {
+                dir: Dir::Out,
+                edge_type: Some("CITES".into()),
+                property: "embedding".into(),
+                query: vec![3.0, 'c' as u32 as f32],
+                metric: Metric::Cosine,
+                width: 3,
+                depth: 2,
+            },
+            Step::Sort(vec![SortKey {
+                expr: score(),
+                descending: true,
+            }]),
+        ]
+    );
+}
+
+#[test]
+fn beam_requires_width_and_depth() {
+    assert!(matches!(
+        err("MATCH (a) BEAM (b) OUT ON emb NEAR [1.0] WIDTH 2 RETURN b"),
+        ParseError::Syntax(_)
+    ));
+}
+
+#[test]
 fn rejects_unknown_function_and_metric() {
     assert!(matches!(
         err("MATCH (n) RETURN n ORDER BY foo(n.x)"),

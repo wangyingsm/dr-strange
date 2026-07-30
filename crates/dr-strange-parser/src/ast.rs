@@ -11,15 +11,33 @@ use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
 use dr_strange_core::types::Dir;
 
 /// A whole parsed query: a source (`MATCH` pattern or a `SEARCH` vector seed),
-/// then `[WHERE …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n]`.
+/// zero or more `BEAM` hops, then `[WHERE …] RETURN … [ORDER BY …] [SKIP n]
+/// [LIMIT n]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub source: QuerySource,
+    pub beams: Vec<BeamClause>,
     pub where_clause: Option<PExpr>,
     pub ret: Return,
     pub order_by: Vec<OrderKey>,
     pub skip: Option<u64>,
     pub limit: Option<u64>,
+}
+
+/// `BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR <query>
+/// [METRIC m] WIDTH w DEPTH d` — similarity-guided beam traversal from the
+/// current frontier (compiles to `Step::ExpandBeam`), binding `result` as the
+/// new current node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeamClause {
+    pub node: NodePat,
+    pub dir: Dir,
+    pub edge_type: Option<String>,
+    pub property: String,
+    pub query: VecArg,
+    pub metric: Metric,
+    pub width: u32,
+    pub depth: u32,
 }
 
 /// Where the query's rows originate: a graph pattern (`MATCH`) or an indexed

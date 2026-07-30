@@ -513,9 +513,14 @@ fn query_tail(i: &str) -> IResult<&str, Tail> {
     ))
 }
 
-fn assemble(source: QuerySource, (where_clause, ret, order_by, skip, limit): Tail) -> Query {
+fn assemble(
+    source: QuerySource,
+    beams: Vec<BeamClause>,
+    (where_clause, ret, order_by, skip, limit): Tail,
+) -> Query {
     Query {
         source,
+        beams,
         where_clause,
         ret,
         order_by,
@@ -527,8 +532,9 @@ fn assemble(source: QuerySource, (where_clause, ret, order_by, skip, limit): Tai
 fn match_query(i: &str) -> IResult<&str, Query> {
     let (i, _) = kw("match")(i)?;
     let (i, pattern) = pattern(i)?;
+    let (i, beams) = many0(beam_clause)(i)?;
     let (i, tail) = query_tail(i)?;
-    Ok((i, assemble(QuerySource::Match(pattern), tail)))
+    Ok((i, assemble(QuerySource::Match(pattern), beams, tail)))
 }
 
 /// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` — the
@@ -542,6 +548,7 @@ fn search_query(i: &str) -> IResult<&str, Query> {
     let (i, query) = vec_arg(i)?;
     let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
     let (i, k) = opt(preceded(kw("topk"), uint))(i)?;
+    let (i, beams) = many0(beam_clause)(i)?;
     let (i, tail) = query_tail(i)?;
     let clause = SearchClause {
         node,
@@ -550,7 +557,47 @@ fn search_query(i: &str) -> IResult<&str, Query> {
         metric: metric.unwrap_or(Metric::Cosine),
         k: k.unwrap_or(DEFAULT_TOPK),
     };
-    Ok((i, assemble(QuerySource::Search(clause), tail)))
+    Ok((i, assemble(QuerySource::Search(clause), beams, tail)))
+}
+
+/// A traversal direction keyword for `BEAM`.
+fn beam_dir(i: &str) -> IResult<&str, Dir> {
+    alt((
+        value(Dir::Out, kw("out")),
+        value(Dir::In, kw("in")),
+        value(Dir::Both, kw("both")),
+    ))(i)
+}
+
+/// `BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR <q> [METRIC m]
+/// WIDTH w DEPTH d`.
+fn beam_clause(i: &str) -> IResult<&str, BeamClause> {
+    let (i, _) = kw("beam")(i)?;
+    let (i, node) = node_pat(i)?;
+    let (i, dir) = beam_dir(i)?;
+    let (i, edge_type) = opt(preceded(preceded(multispace0, char(':')), ident))(i)?;
+    let (i, _) = kw("on")(i)?;
+    let (i, property) = ident(i)?;
+    let (i, _) = kw("near")(i)?;
+    let (i, query) = vec_arg(i)?;
+    let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
+    let (i, _) = kw("width")(i)?;
+    let (i, width) = map_res(preceded(multispace0, digit1), str::parse::<u32>)(i)?;
+    let (i, _) = kw("depth")(i)?;
+    let (i, depth) = map_res(preceded(multispace0, digit1), str::parse::<u32>)(i)?;
+    Ok((
+        i,
+        BeamClause {
+            node,
+            dir,
+            edge_type,
+            property,
+            query,
+            metric: metric.unwrap_or(Metric::Cosine),
+            width,
+            depth,
+        },
+    ))
 }
 
 /// Default `TOPK` when the `SEARCH` clause omits it.
