@@ -132,6 +132,10 @@ struct Cypher {
     /// A query in the openCypher-subset language, e.g.
     /// `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.
     query: String,
+    /// Embedding provider for a text `SEARCH … NEAR "…"` (preset or base URL);
+    /// the server environment supplies the key. Defaults to `openai`.
+    #[serde(default)]
+    embed: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -319,8 +323,34 @@ fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
     Ok(scored_rows(&rows))
 }
 
+/// Adapts an LLM provider to the parser's `Embedder` seam so a text
+/// `SEARCH … NEAR "…"` embeds server-side (key from the process environment,
+/// never tool params).
+struct LlmEmbedder(Box<dyn dr_strange_llm::Embedder>);
+impl dr_strange_parser::Embedder for LlmEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let reply = self
+            .0
+            .embed(&[text.to_string()])
+            .map_err(|e| e.to_string())?;
+        reply
+            .vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| "embedder returned no vector".to_string())
+    }
+}
+
 fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
-    let plan = dr_strange_parser::parse(&req.query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let provider = req.embed.as_deref().unwrap_or("openai");
+    let embedder = dr_strange_llm::build_provider(provider, None, None, None, true)
+        .ok()
+        .map(|p| LlmEmbedder(Box::new(p)));
+    let plan = match &embedder {
+        Some(e) => dr_strange_parser::parse_with_embedder(&req.query, e),
+        None => dr_strange_parser::parse(&req.query),
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let rows = db.plane(&req.plane)?.query_from_plan(plan).scored_nodes()?;
     Ok(scored_rows(&rows))
 }

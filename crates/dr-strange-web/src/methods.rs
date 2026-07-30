@@ -245,15 +245,52 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     Ok(scored_rows(&rows))
 }
 
+/// Adapts an LLM provider to the parser's `Embedder` seam, so a
+/// `SEARCH … NEAR "text"` embeds the text server-side (key from the server
+/// environment, never the client) before the top-k runs.
+struct LlmEmbedder(Box<dyn Embedder>);
+impl dr_strange_parser::Embedder for LlmEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let reply = self
+            .0
+            .embed(&[text.to_string()])
+            .map_err(|e| e.to_string())?;
+        reply
+            .vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| "embedder returned no vector".to_string())
+    }
+}
+
+/// Build an embedder from a provider preset/URL (`None` if it can't be
+/// configured — e.g. the provider has no embedding model; a text SEARCH then
+/// errors clearly, while MATCH / literal-vector queries still work).
+fn make_embedder(provider: &str) -> Option<LlmEmbedder> {
+    dr_strange_llm::build_provider(provider, None, None, None, true)
+        .ok()
+        .map(|p| LlmEmbedder(Box::new(p)))
+}
+
 /// Compile an openCypher-subset query (via dr-strange-parser) to a
 /// `LogicalPlan`, run it, and return the matching nodes plus the edges induced
 /// among exactly that result set — the same `{nodes, edges}` shape as
 /// `graph.seed`, so the plot can render a query result as a subgraph. Used by
 /// the web-only `POST /cypher` endpoint (kept off the JSON-RPC surface so it
-/// doesn't ripple into the OpenRPC schema / the SDKs).
-pub fn cypher_subgraph(ctx: &Ctx<'_>, plane_name: &str, query: &str) -> Result<Value, RpcError> {
-    let plan =
-        dr_strange_parser::parse(query).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+/// doesn't ripple into the OpenRPC schema / the SDKs). `embed_provider` names
+/// the embedding provider for a text `SEARCH … NEAR "…"`.
+pub fn cypher_subgraph(
+    ctx: &Ctx<'_>,
+    plane_name: &str,
+    query: &str,
+    embed_provider: &str,
+) -> Result<Value, RpcError> {
+    let embedder = make_embedder(embed_provider);
+    let plan = match &embedder {
+        Some(e) => dr_strange_parser::parse_with_embedder(query, e),
+        None => dr_strange_parser::parse(query),
+    }
+    .map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let plane = app(ctx.db.plane(plane_name))?;
     let rows = app(plane.query_from_plan(plan).scored_nodes())?;
 

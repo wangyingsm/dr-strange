@@ -255,6 +255,10 @@ async fn export_http(
 struct CypherQuery {
     #[serde(default)]
     plane: String,
+    /// Embedding provider for a text `SEARCH … NEAR "…"` (preset or base URL);
+    /// the server env supplies the key. Defaults to `openai`.
+    #[serde(default)]
+    embed: Option<String>,
 }
 
 /// `POST /cypher?plane=startup` — the query text in the body, compiled to a
@@ -279,11 +283,12 @@ async fn cypher_http(
         Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
     };
     let plane = q.plane;
+    let embed = q.embed.unwrap_or_else(|| "openai".to_string());
 
     let built = tokio::task::spawn_blocking({
         let state = state.clone();
         let plane = plane.clone();
-        move || methods::cypher_subgraph(&state.ctx(), &plane, &query)
+        move || methods::cypher_subgraph(&state.ctx(), &plane, &query, &embed)
     })
     .await;
 

@@ -4,6 +4,10 @@
   import { Plot } from './plot.js'
   import CreatePlane from './CreatePlane.svelte'
 
+  // Providers with an embedding endpoint (deepseek is chat-only, so excluded) —
+  // used to embed a text `SEARCH … NEAR "…"`.
+  const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
+
   // `plane` is the app-wide current plane (App owns it); `focus` is a
   // { id, nonce } signal from the header search — center that node.
   // `onPlaneCreated` bubbles a new plane up to App (refresh picker + switch).
@@ -20,6 +24,7 @@
   let labels = $state([]) // catalog label names for the filter
   let labelFilter = $state('') // '' = all labels
   let cypher = $state('') // query-language text; '' = use the label seed
+  let embedProvider = $state('openai') // provider for a text SEARCH … NEAR "…"
   let selected = $state(null) // { kind: 'node'|'edge', data }
   let legend = $state([])
   let status = $state('')
@@ -121,7 +126,8 @@
     }
     error = null
     try {
-      const res = await fetch(`/cypher?plane=${encodeURIComponent(plane)}`, {
+      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(embedProvider)}`
+      const res = await fetch(url, {
         method: 'POST',
         headers: authHeaders({ 'content-type': 'text/plain' }),
         body: cypher,
@@ -480,10 +486,16 @@
   <input
     type="text"
     class="cypher"
-    placeholder="MATCH (n:Label) WHERE n.prop > 1 RETURN n ORDER BY n.prop DESC LIMIT 50 — Enter to run, empty to reset"
+    placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
     bind:value={cypher}
     onkeydown={(e) => e.key === 'Enter' && runCypher()}
   />
+  <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
+    embed
+    <select bind:value={embedProvider}>
+      {#each EMBED_PROVIDERS as pv (pv)}<option value={pv}>{pv}</option>{/each}
+    </select>
+  </label>
   <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
 </div>
 

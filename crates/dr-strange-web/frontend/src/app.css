@@ -693,6 +693,26 @@ nav button.active {
   outline: none;
   border-color: var(--accent);
 }
+.query-bar .embed-pick {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.query-bar .embed-pick select {
+  font: 13px system-ui;
+  text-transform: none;
+  letter-spacing: normal;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.4rem;
+}
 .query-bar .run-btn {
   font: 14px system-ui;
   color: #fff;
