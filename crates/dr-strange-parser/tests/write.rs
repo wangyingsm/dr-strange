@@ -96,6 +96,88 @@ fn rejects_undirected_create_edge() {
     ));
 }
 
+// ---- MATCH … SET / REMOVE / DELETE ----------------------------------------
+
+#[test]
+fn set_prop_label_and_merge() {
+    let db = Database::in_memory().unwrap();
+    write(&db, r#"CREATE (a:Person {key:"alice", age:30})"#);
+    let s = write(
+        &db,
+        r#"MATCH (n:Person) WHERE n.age = 30 SET n.age = 31, n:VIP, n += {city:"NYC", zip:10001}"#,
+    );
+    assert_eq!(s.props_set, 3); // age + city + zip
+    assert_eq!(s.labels_set, 1); // VIP
+
+    let a = plane(&db).node_by_key("alice").unwrap().unwrap();
+    assert_eq!(a.properties["age"].value, PropValue::Int(31));
+    assert_eq!(a.properties["city"].value, PropValue::Str("NYC".into()));
+    assert!(a.labels.iter().any(|l| l == "VIP"));
+    assert!(a.labels.iter().any(|l| l == "Person")); // original label kept
+}
+
+#[test]
+fn remove_prop_and_label() {
+    let db = Database::in_memory().unwrap();
+    write(&db, r#"CREATE (a:Person {key:"a", tmp:1})"#);
+    write(&db, "MATCH (n:Person) SET n:Archived");
+    let s = write(&db, "MATCH (n:Person) REMOVE n.tmp, n:Archived");
+    assert_eq!(s.props_set, 1);
+    assert_eq!(s.labels_set, 1);
+
+    let a = plane(&db).node_by_key("a").unwrap().unwrap();
+    assert!(!a.properties.contains_key("tmp"));
+    assert!(!a.labels.iter().any(|l| l == "Archived"));
+    assert!(a.labels.iter().any(|l| l == "Person"));
+}
+
+#[test]
+fn delete_unconnected_node() {
+    let db = Database::in_memory().unwrap();
+    write(&db, r#"CREATE (a:N {key:"a", tag:"x"})"#);
+    let s = write(&db, r#"MATCH (n:N) WHERE n.tag = "x" DELETE n"#);
+    assert_eq!(s.nodes_deleted, 1);
+    assert!(plane(&db).node_by_key("a").unwrap().is_none());
+}
+
+#[test]
+fn plain_delete_refuses_connected_node_detach_cascades() {
+    let db = Database::in_memory().unwrap();
+    write(
+        &db,
+        r#"CREATE (a:N {key:"a", tag:"x"})-[:R]->(b:N {key:"b", tag:"y"})"#,
+    );
+
+    // Plain DELETE of the connected node errors (and doesn't commit).
+    let stmt = parse_statement(r#"MATCH (n:N) WHERE n.tag = "x" DELETE n"#).unwrap();
+    let e = match stmt {
+        Statement::Write(w) => w.apply(&plane(&db)).unwrap_err(),
+        Statement::Read(_) => panic!("expected write"),
+    };
+    assert!(e.contains("DETACH"), "{e}");
+    assert!(plane(&db).node_by_key("a").unwrap().is_some());
+
+    // DETACH DELETE cascades: node a and its edge go, b remains.
+    let s = write(&db, r#"MATCH (n:N) WHERE n.tag = "x" DETACH DELETE n"#);
+    assert_eq!(s.nodes_deleted, 1);
+    let p = plane(&db);
+    assert!(p.node_by_key("a").unwrap().is_none());
+    assert!(p.node_by_key("b").unwrap().is_some());
+}
+
+#[test]
+fn rejects_mutation_of_non_terminal_variable() {
+    // `a` is not the pattern's terminal variable (`n` is).
+    let e = parse_statement(r#"MATCH (a:N)-[:R]->(n:N) SET a.x = 1"#).unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)));
+}
+
+#[test]
+fn rejects_match_write_with_anonymous_terminal() {
+    let e = parse_statement(r#"MATCH (a:N)-[:R]->() SET x.p = 1"#).unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)));
+}
+
 #[test]
 fn read_parse_rejects_a_write() {
     // The read-only `parse` refuses a write with a clear message.

@@ -27,37 +27,34 @@
 //!   `distance(...)` (usable in `ORDER BY` too — a brute-force rank).
 //! - `RETURN [DISTINCT] <var|*>`, `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n`.
 //!
+//! # Writes (via [`parse_statement`], applied with [`WriteStatement::apply`])
+//! - `CREATE (n:L {k: v, …}), (a)-[:T {…}]->(b), …` — a string `key:` sets the
+//!   external key; edges are directed (`->`/`<-`).
+//! - `MATCH pattern [WHERE …] SET n.p = v, n:Label, n += {…}` /
+//!   `REMOVE n.p, n:Label` / `[DETACH] DELETE n` — find-then-mutate on the
+//!   pattern's terminal variable (plain `DELETE` refuses a connected node).
+//!
 //! # Not yet (each is a clear error, never a silent mis-compile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning / ordering by a non-terminal variable, projections, aggregation;
 //! - unbounded variable-length (`*`, `*n..`);
-//! - writes (`CREATE`/`SET`/`DELETE`) and named `$params`.
+//! - `MERGE` (upsert), `CREATE` after `MATCH`, and named `$params`.
 
 mod ast;
 mod compile;
 mod parse;
 mod write;
 
-use dr_strange_core::{LogicalPlan, PlaneHandle};
+use dr_strange_core::LogicalPlan;
 
-pub use write::WriteSummary;
+pub use write::{WriteStatement, WriteSummary};
 
 /// A parsed statement: a read (a runnable [`LogicalPlan`]) or a write (applied
 /// with [`WriteStatement::apply`]). Surfaces branch on this to run a query.
+#[derive(Debug)]
 pub enum Statement {
     Read(LogicalPlan),
     Write(WriteStatement),
-}
-
-/// A parsed write statement (`CREATE`, …). Apply it to a plane to run it.
-pub struct WriteStatement(ast::WriteAst);
-
-impl WriteStatement {
-    /// Execute the write against `plane` in one committed transaction, returning
-    /// what changed.
-    pub fn apply(&self, plane: &PlaneHandle<'_>) -> Result<WriteSummary, String> {
-        write::execute(plane, &self.0)
-    }
 }
 
 /// Resolves the text in a `SEARCH … NEAR "text"` (or `similarity(p, "text")`)
@@ -147,7 +144,7 @@ fn parse_statement_inner(
         ast::StmtAst::Read(query) => {
             Statement::Read(compile::compile(*query, embedder).map_err(ParseError::Compile)?)
         }
-        ast::StmtAst::Write(w) => Statement::Write(WriteStatement(w)),
+        ast::StmtAst::Write(w) => Statement::Write(write::compile(w).map_err(ParseError::Compile)?),
     })
 }
 

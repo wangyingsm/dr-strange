@@ -181,18 +181,59 @@ pub enum StmtAst {
     Write(WriteAst),
 }
 
-/// A write statement: zero or one read (`MATCH`) to bind variables, then one or
-/// more write operations. (This cut wires up `CREATE`; SET/REMOVE/DELETE/MERGE
-/// land in later chunks.)
+/// A write statement: either a standalone `CREATE`, or a `MATCH … [WHERE …]`
+/// that binds the terminal node variable, followed by mutation ops that operate
+/// on it (`SET`/`REMOVE`/`DELETE`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteAst {
+    pub match_clause: Option<MatchClause>,
     pub ops: Vec<WriteOp>,
+}
+
+/// The read half of a `MATCH … [WHERE …] SET/REMOVE/DELETE` — a pattern to find
+/// nodes to mutate. Compiled to a read `LogicalPlan` whose terminal node is the
+/// bound variable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchClause {
+    pub pattern: Pattern,
+    pub where_clause: Option<PExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteOp {
     /// `CREATE (n:L {..}), (a)-[:T {..}]->(b), …`
     Create(Vec<CreatePath>),
+    /// `SET n.p = v, n:Label, n += {..}`
+    Set(Vec<SetItem>),
+    /// `REMOVE n.p, n:Label`
+    Remove(Vec<RemoveItem>),
+    /// `[DETACH] DELETE n, m, …`
+    Delete { detach: bool, vars: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetItem {
+    /// `n.key = value`
+    Prop {
+        var: String,
+        key: String,
+        value: PropValue,
+    },
+    /// `n:Label` — add a label.
+    Label { var: String, label: String },
+    /// `n += { .. }` — merge properties.
+    Merge {
+        var: String,
+        props: Vec<(String, PropValue)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveItem {
+    /// `n.key` — remove a property.
+    Prop { var: String, key: String },
+    /// `n:Label` — remove a label.
+    Label { var: String, label: String },
 }
 
 /// One CREATE path: a node, then directed `[:TYPE {..}]` hops to more nodes.

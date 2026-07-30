@@ -7,7 +7,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
 use nom::combinator::{map, map_res, not, opt, recognize, value};
-use nom::multi::{many0, separated_list0, separated_list1};
+use nom::multi::{many0, many1, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
 
 use dr_strange_core::Metric;
@@ -720,7 +720,92 @@ fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
     Ok((
         i,
         WriteAst {
+            match_clause: None,
             ops: vec![WriteOp::Create(paths)],
+        },
+    ))
+}
+
+/// `MATCH pattern [WHERE …] (SET|REMOVE|DELETE)…` — find nodes, then mutate them.
+fn match_write_stmt(i: &str) -> IResult<&str, WriteAst> {
+    let (i, _) = kw("match")(i)?;
+    let (i, pattern) = pattern(i)?;
+    let (i, where_clause) = opt(preceded(kw("where"), expr))(i)?;
+    let (i, ops) = many1(mutate_op)(i)?;
+    Ok((
+        i,
+        WriteAst {
+            match_clause: Some(MatchClause {
+                pattern,
+                where_clause,
+            }),
+            ops,
+        },
+    ))
+}
+
+fn mutate_op(i: &str) -> IResult<&str, WriteOp> {
+    alt((set_op, remove_op, delete_op))(i)
+}
+
+fn set_op(i: &str) -> IResult<&str, WriteOp> {
+    let (i, _) = kw("set")(i)?;
+    let (i, items) = separated_list1(symbol(","), set_item)(i)?;
+    Ok((i, WriteOp::Set(items)))
+}
+
+fn set_item(i: &str) -> IResult<&str, SetItem> {
+    let (i, var) = ident(i)?;
+    // `n += { .. }`
+    if let Ok((rest, _)) = symbol("+=")(i) {
+        let (rest, props) = prop_map(rest)?;
+        return Ok((rest, SetItem::Merge { var, props }));
+    }
+    let (i, _) = multispace0(i)?;
+    let (i, sep) = one_of(".:")(i)?;
+    if sep == '.' {
+        // `n.key = value`
+        let (i, key) = ident(i)?;
+        let (i, _) = symbol("=")(i)?;
+        let (i, value) = prop_value(i)?;
+        Ok((i, SetItem::Prop { var, key, value }))
+    } else {
+        // `n:Label`
+        let (i, label) = ident(i)?;
+        Ok((i, SetItem::Label { var, label }))
+    }
+}
+
+fn remove_op(i: &str) -> IResult<&str, WriteOp> {
+    let (i, _) = kw("remove")(i)?;
+    let (i, items) = separated_list1(symbol(","), remove_item)(i)?;
+    Ok((i, WriteOp::Remove(items)))
+}
+
+fn remove_item(i: &str) -> IResult<&str, RemoveItem> {
+    let (i, var) = ident(i)?;
+    let (i, _) = multispace0(i)?;
+    let (i, sep) = one_of(".:")(i)?;
+    let (i, name) = ident(i)?;
+    Ok((
+        i,
+        if sep == '.' {
+            RemoveItem::Prop { var, key: name }
+        } else {
+            RemoveItem::Label { var, label: name }
+        },
+    ))
+}
+
+fn delete_op(i: &str) -> IResult<&str, WriteOp> {
+    let (i, detach) = opt(kw("detach"))(i)?;
+    let (i, _) = kw("delete")(i)?;
+    let (i, vars) = separated_list1(symbol(","), ident)(i)?;
+    Ok((
+        i,
+        WriteOp::Delete {
+            detach: detach.is_some(),
+            vars,
         },
     ))
 }
@@ -730,6 +815,7 @@ fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
 pub fn statement(i: &str) -> IResult<&str, StmtAst> {
     alt((
         map(create_stmt, StmtAst::Write),
+        map(match_write_stmt, StmtAst::Write),
         map(query, |q| StmtAst::Read(Box::new(q))),
     ))(i)
 }
