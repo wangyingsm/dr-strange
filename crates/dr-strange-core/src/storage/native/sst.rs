@@ -6,7 +6,8 @@
 //! ```text
 //!   [data block]*     entries, sorted by (table, key, seq DESC)
 //!   [index block]     one entry per data block: its first key + offset/len
-//!   [footer]          index_offset, index_len, entry_count, max_seq, magic, crc32
+//!   [bloom block]     Bloom filter over the run's (table, key) pairs
+//!   [footer]          index+bloom offsets/lens, entry_count, max_seq, magic, crc32
 //! ```
 //! An **entry** is `table:u8, key_len:u32, key, seq:u64, flag:u8 (0=del,1=put),
 //! val_len:u32, val`. Keys are compared structurally as `(table, key, seq DESC)`
@@ -26,9 +27,88 @@ use crate::error::{Error, Result};
 use crate::storage::native::{MemKey, Op};
 
 const MAGIC: u32 = 0x5353_5244; // "DRSS"
-const FOOTER_LEN: u64 = 8 + 8 + 8 + 8 + 4 + 4; // 40 bytes
+// Footer: index_offset, index_len, bloom_offset, bloom_len, count, max_seq (6×u64)
+// + magic, crc (2×u32).
+const FOOTER_LEN: u64 = 8 * 6 + 4 * 2; // 56 bytes
 /// Target uncompressed size of a data block before it's cut.
 const BLOCK_TARGET: usize = 16 * 1024;
+/// Bloom-filter bits per key (~1% false-positive at k=7).
+const BLOOM_BITS_PER_KEY: usize = 10;
+const BLOOM_HASHES: u32 = 7;
+
+/// A Bloom filter over a run's `(table, key)` pairs, so a point `get` for a key
+/// absent from a run skips scanning it. Double-hashing (`h1 + i·h2`) derives the
+/// `k` positions from one 64-bit FNV-1a hash.
+struct Bloom {
+    bits: Vec<u8>,
+    m_bits: u64,
+    k: u32,
+}
+
+impl Bloom {
+    fn new(n: usize) -> Self {
+        let m_bits = (((n.max(1) * BLOOM_BITS_PER_KEY) as u64) + 7) & !7; // round to a byte
+        Bloom {
+            bits: vec![0u8; (m_bits / 8) as usize],
+            m_bits,
+            k: BLOOM_HASHES,
+        }
+    }
+
+    fn hashes(table: u8, key: &[u8]) -> (u64, u64) {
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a over [table] ++ key
+        h ^= table as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        for &b in key {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h, h.rotate_left(32) | 1) // (h1, odd h2)
+    }
+
+    fn add(&mut self, table: u8, key: &[u8]) {
+        let (mut h1, h2) = Self::hashes(table, key);
+        for _ in 0..self.k {
+            let bit = h1 % self.m_bits;
+            self.bits[(bit / 8) as usize] |= 1 << (bit % 8);
+            h1 = h1.wrapping_add(h2);
+        }
+    }
+
+    fn maybe_contains(&self, table: u8, key: &[u8]) -> bool {
+        if self.m_bits == 0 {
+            return true;
+        }
+        let (mut h1, h2) = Self::hashes(table, key);
+        for _ in 0..self.k {
+            let bit = h1 % self.m_bits;
+            if self.bits[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
+                return false;
+            }
+            h1 = h1.wrapping_add(h2);
+        }
+        true
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12 + self.bits.len());
+        put_u64(&mut buf, self.m_bits);
+        put_u32(&mut buf, self.k);
+        buf.extend_from_slice(&self.bits);
+        buf
+    }
+
+    fn decode(buf: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(buf);
+        let m_bits = c.u64()?;
+        let k = c.u32()?;
+        let bits = c.bytes(buf.len() - c.pos)?.to_vec();
+        if bits.len() as u64 != m_bits / 8 {
+            return None;
+        }
+        Some(Bloom { bits, m_bits, k })
+    }
+}
 
 /// One decoded key position `(table, key, seq)`, compared as `(table, key,
 /// seq DESC)` to match the memtable order.
@@ -58,6 +138,7 @@ struct BlockRef {
 pub(super) struct Sst {
     file: Mutex<File>,
     index: Vec<BlockRef>,
+    bloom: Bloom,
     pub(super) max_seq: u64,
     /// This run's file, so compaction can delete it once merged away.
     pub(super) path: PathBuf,
@@ -113,6 +194,7 @@ pub(super) fn write(
     let mut block_first: Option<KeyPos> = None;
     let mut offset = 0u64;
     let mut count = 0u64;
+    let mut bloom = Bloom::new(entries.len());
 
     let flush_block = |block: &mut Vec<u8>,
                        first: &mut Option<KeyPos>,
@@ -140,6 +222,7 @@ pub(super) fn write(
             });
         }
         encode_entry(&mut block, *table, key, *seq, op);
+        bloom.add(*table, key);
         count += 1;
         if block.len() >= BLOCK_TARGET {
             flush_block(
@@ -169,10 +252,17 @@ pub(super) fn write(
     }
     file.write_all(&index_bytes)?;
 
+    // Bloom block (right after the index).
+    let bloom_offset = index_offset + index_bytes.len() as u64;
+    let bloom_bytes = bloom.encode();
+    file.write_all(&bloom_bytes)?;
+
     // Footer.
     let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
     put_u64(&mut footer, index_offset);
     put_u64(&mut footer, index_bytes.len() as u64);
+    put_u64(&mut footer, bloom_offset);
+    put_u64(&mut footer, bloom_bytes.len() as u64);
     put_u64(&mut footer, count);
     put_u64(&mut footer, max_seq);
     put_u32(&mut footer, MAGIC);
@@ -262,27 +352,24 @@ impl Sst {
         let mut footer = vec![0u8; FOOTER_LEN as usize];
         file.read_exact(&mut footer)?;
         let mut c = Cursor::new(&footer);
-        let index_offset = c
-            .u64()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
-        let index_len = c
-            .u64()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
-        let _count = c
-            .u64()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
-        let max_seq = c
-            .u64()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
-        let magic = c
-            .u32()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
-        let crc = c
-            .u32()
-            .ok_or_else(|| Error::Corrupt("bad SST footer".into()))?;
+        let bad = || Error::Corrupt("bad SST footer".into());
+        let index_offset = c.u64().ok_or_else(bad)?;
+        let index_len = c.u64().ok_or_else(bad)?;
+        let bloom_offset = c.u64().ok_or_else(bad)?;
+        let bloom_len = c.u64().ok_or_else(bad)?;
+        let _count = c.u64().ok_or_else(bad)?;
+        let max_seq = c.u64().ok_or_else(bad)?;
+        let magic = c.u32().ok_or_else(bad)?;
+        let crc = c.u32().ok_or_else(bad)?;
         if magic != MAGIC || super::crc32(&footer[..FOOTER_LEN as usize - 4]) != crc {
             return Err(Error::Corrupt("SST footer magic/crc mismatch".into()));
         }
+
+        // Bloom block.
+        file.seek(SeekFrom::Start(bloom_offset))?;
+        let mut bbuf = vec![0u8; bloom_len as usize];
+        file.read_exact(&mut bbuf)?;
+        let bloom = Bloom::decode(&bbuf).ok_or_else(|| Error::Corrupt("bad SST bloom".into()))?;
 
         // Index block.
         file.seek(SeekFrom::Start(index_offset))?;
@@ -321,6 +408,7 @@ impl Sst {
         Ok(Self {
             file: Mutex::new(file),
             index,
+            bloom,
             max_seq,
             path: path.to_path_buf(),
         })
@@ -364,6 +452,10 @@ impl Sst {
     /// Newest version of `(table, key)` visible at `snapshot` in this SST, as an
     /// `Op` (`None` if this SST holds no version at or below `snapshot`).
     pub(super) fn get(&self, table: u8, key: &[u8], snapshot: u64) -> Result<Option<Op>> {
+        // Skip the whole run if its Bloom filter rules the key out.
+        if !self.bloom.maybe_contains(table, key) {
+            return Ok(None);
+        }
         let Some(start) = self.start_block(table, key) else {
             return Ok(None);
         };
