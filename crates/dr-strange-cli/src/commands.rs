@@ -107,9 +107,58 @@ pub fn query(db: &Database, plane_name: &str, plan_json: &str, out: &mut dyn Wri
 
 /// Run a query written in the openCypher-subset language (arch/00 §5): compile
 /// it to a `LogicalPlan`, then execute it exactly like the JSON `query` path.
-pub fn cypher(db: &Database, plane_name: &str, query: &str, out: &mut dyn Write) -> Result<()> {
-    let plan = dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}"))?;
+/// `embed` names an embedding provider for a text `SEARCH … NEAR "…"`.
+pub fn cypher(
+    db: &Database,
+    plane_name: &str,
+    query: &str,
+    embed: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let plan = compile_cypher(query, embed)?;
     run_plan(db, plane_name, plan, out)
+}
+
+/// Compile a query, embedding a text `SEARCH … NEAR "…"` when an `embed`
+/// provider is given. Embedding lives behind the `digest` feature (which pulls
+/// in dr-strange-llm); MATCH / literal-vector queries compile without it.
+#[cfg(feature = "digest")]
+fn compile_cypher(query: &str, embed: Option<&str>) -> Result<LogicalPlan> {
+    // Adapt the LLM provider to the parser's embedder seam (key from the env).
+    struct LlmEmbedder(Box<dyn dr_strange_llm::Embedder>);
+    impl dr_strange_parser::Embedder for LlmEmbedder {
+        fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, String> {
+            let reply = self
+                .0
+                .embed(&[text.to_string()])
+                .map_err(|e| e.to_string())?;
+            reply
+                .vectors
+                .into_iter()
+                .next()
+                .ok_or_else(|| "embedder returned no vector".to_string())
+        }
+    }
+    match embed {
+        Some(provider) => {
+            let e = LlmEmbedder(Box::new(dr_strange_llm::build_provider(
+                provider, None, None, None, true,
+            )?));
+            dr_strange_parser::parse_with_embedder(query, &e).map_err(|e| anyhow!("{e}"))
+        }
+        None => dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}")),
+    }
+}
+
+#[cfg(not(feature = "digest"))]
+fn compile_cypher(query: &str, embed: Option<&str>) -> Result<LogicalPlan> {
+    if embed.is_some() {
+        bail!(
+            "text SEARCH embedding needs the `digest` build feature \
+             (this binary was built with --no-default-features)"
+        );
+    }
+    dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}"))
 }
 
 /// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
@@ -589,6 +638,7 @@ mod tests {
                 &db,
                 "startup",
                 "MATCH (n:Paper) WHERE n.year >= 2021 RETURN n",
+                None,
                 o,
             )
         });
@@ -600,6 +650,20 @@ mod tests {
                 &db,
                 "startup",
                 "MATCH (a:Paper)-[:CITES]->(b:Paper) RETURN b",
+                None,
+                o,
+            )
+        });
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"external_key\":\"p2\""));
+        // A vector-literal SEARCH runs the top-k with no embedder: the fixture's
+        // Papers carry an `emb` vector, so NEAR [1,0] (cosine) returns p2.
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                "SEARCH (n:Paper) ON emb NEAR [1.0, 0.0] TOPK 1 RETURN n",
+                None,
                 o,
             )
         });
@@ -607,8 +671,19 @@ mod tests {
         assert!(out.contains("\"external_key\":\"p2\""));
         // An unsupported query surfaces the parser's error, not a panic.
         let mut sink = Vec::new();
-        let err = cypher(&db, "startup", "MATCH (n)", &mut sink).unwrap_err();
+        let err = cypher(&db, "startup", "MATCH (n)", None, &mut sink).unwrap_err();
         assert!(err.to_string().contains("syntax error"), "{err}");
+        // A text SEARCH with no --embed is a clear error, not a panic.
+        let mut sink = Vec::new();
+        let err = cypher(
+            &db,
+            "startup",
+            "SEARCH (n:Paper) ON emb NEAR \"hi\" RETURN n",
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("embedding provider"), "{err}");
     }
 
     #[test]

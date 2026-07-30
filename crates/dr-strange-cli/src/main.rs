@@ -61,6 +61,11 @@ enum Command {
         query: String,
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Embedding provider (preset or base URL) for a text
+        /// `SEARCH … NEAR "…"`; the key comes from the environment. Omit for
+        /// MATCH / literal-vector queries. Requires the `digest` build feature.
+        #[arg(long)]
+        embed: Option<String>,
     },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
@@ -210,14 +215,18 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             };
             commands::query(&db, &plane, &plan, out)
         }
-        Command::Cypher { query, plane } => {
+        Command::Cypher {
+            query,
+            plane,
+            embed,
+        } => {
             let db = commands::open(&cli.db)?;
             let query = if query == "-" {
                 io::read_to_string(io::stdin())?
             } else {
                 query
             };
-            commands::cypher(&db, &plane, &query, out)
+            commands::cypher(&db, &plane, &query, embed.as_deref(), out)
         }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;
