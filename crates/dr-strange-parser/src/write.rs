@@ -140,15 +140,24 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
     })
 }
 
-/// A MERGE upserts by external key, so it needs a string `key:`; its ON
-/// CREATE/MATCH SET items may reference only the MERGE variable.
+/// A MERGE upserts by external key, so every node needs a string `key:`. ON
+/// CREATE/MATCH SET is only for a single-node MERGE and references its variable.
 fn validate_merge(m: &MergeClause) -> Result<(), String> {
-    if m.node.key.is_none() {
+    let nodes = std::iter::once(&m.path.first).chain(m.path.rest.iter().map(|(_, n)| n));
+    for n in nodes {
+        if n.key.is_none() {
+            return Err(
+                "MERGE needs a `key:` on every node to upsert on, e.g. MERGE (n:Label {key:\"…\"})"
+                    .to_string(),
+            );
+        }
+    }
+    if !m.path.rest.is_empty() && (!m.on_create.is_empty() || !m.on_match.is_empty()) {
         return Err(
-            "MERGE needs a `key:` to upsert on, e.g. MERGE (n:Label {key:\"…\"})".to_string(),
+            "ON CREATE / ON MATCH SET is only supported for a single-node MERGE".to_string(),
         );
     }
-    let var = m.node.var.as_deref();
+    let var = m.path.first.var.as_deref();
     for it in m.on_create.iter().chain(&m.on_match) {
         match var {
             Some(v) if set_item_var(it) == v => {}
@@ -229,30 +238,8 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 }
             },
             WriteOp::Merge(m) => {
-                let key = m.node.key.as_deref().expect("compile guaranteed a key");
-                // Upsert by external key: found → bind + ON MATCH SET; else
-                // create with the inline props + ON CREATE SET.
-                let (id, items) = match plane.node_by_key(key).map_err(|e| e.to_string())? {
-                    Some(found) => {
-                        let id = found.id;
-                        labels.entry(id.0).or_insert(found.labels);
-                        (id, &m.on_match)
-                    }
-                    None => {
-                        let label_refs: Vec<&str> = m.node.label.as_deref().into_iter().collect();
-                        let id = txn
-                            .create_node_with_key(key, &label_refs, props_of(&m.node.props))
-                            .map_err(|e| e.to_string())?;
-                        summary.nodes_created += 1;
-                        labels
-                            .entry(id.0)
-                            .or_insert_with(|| m.node.label.clone().into_iter().collect());
-                        (id, &m.on_create)
-                    }
-                };
-                for it in items {
-                    apply_set(&mut txn, id, it, &mut labels, &mut summary)?;
-                }
+                let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                merge_path(plane, &mut txn, m, &mut vars, &mut labels, &mut summary)?;
             }
             WriteOp::Set(items) => {
                 for id in &ids {
@@ -352,6 +339,104 @@ fn apply_remove(
             }
         }
     }
+    Ok(())
+}
+
+// ---- MERGE ----------------------------------------------------------------
+
+/// Execute a MERGE (single node or path): upsert each keyed node by external
+/// key, apply ON CREATE/MATCH SET to a single node, and ensure each edge.
+fn merge_path<'a>(
+    plane: &PlaneHandle<'_>,
+    txn: &mut WriteTxn<'_>,
+    m: &'a MergeClause,
+    vars: &mut HashMap<&'a str, NodeId>,
+    labels: &mut HashMap<u64, Vec<String>>,
+    summary: &mut WriteSummary,
+) -> Result<(), String> {
+    let (first_id, created) = upsert_merge_node(plane, txn, &m.path.first, vars, labels, summary)?;
+    // ON CREATE / ON MATCH SET apply to a single-node MERGE's node.
+    let items = if created { &m.on_create } else { &m.on_match };
+    for it in items {
+        apply_set(txn, first_id, it, labels, summary)?;
+    }
+    let mut prev = first_id;
+    for (rel, node) in &m.path.rest {
+        let (cur, _) = upsert_merge_node(plane, txn, node, vars, labels, summary)?;
+        ensure_edge(plane, txn, prev, cur, rel, summary)?;
+        prev = cur;
+    }
+    Ok(())
+}
+
+/// Find a node by external key (and bind it) or create it. A node reusing an
+/// already-bound variable (a matched anchor, or an earlier MERGE node) is
+/// reused. Returns `(id, created)`.
+fn upsert_merge_node<'a>(
+    plane: &PlaneHandle<'_>,
+    txn: &mut WriteTxn<'_>,
+    cn: &'a CreateNode,
+    vars: &mut HashMap<&'a str, NodeId>,
+    labels: &mut HashMap<u64, Vec<String>>,
+    summary: &mut WriteSummary,
+) -> Result<(NodeId, bool), String> {
+    if let Some(v) = &cn.var
+        && let Some(&id) = vars.get(v.as_str())
+    {
+        return Ok((id, false));
+    }
+    let key = cn
+        .key
+        .as_deref()
+        .ok_or("MERGE node needs a `key:` to upsert on")?;
+    let (id, created) = match plane.node_by_key(key).map_err(|e| e.to_string())? {
+        Some(found) => {
+            let id = found.id;
+            labels.entry(id.0).or_insert(found.labels);
+            (id, false)
+        }
+        None => {
+            let label_refs: Vec<&str> = cn.label.as_deref().into_iter().collect();
+            let id = txn
+                .create_node_with_key(key, &label_refs, props_of(&cn.props))
+                .map_err(|e| e.to_string())?;
+            summary.nodes_created += 1;
+            labels
+                .entry(id.0)
+                .or_insert_with(|| cn.label.clone().into_iter().collect());
+            (id, true)
+        }
+    };
+    if let Some(v) = &cn.var {
+        vars.insert(v.as_str(), id);
+    }
+    Ok((id, created))
+}
+
+/// Ensure a directed edge of `rel.ty` exists between `prev` and `cur` — MERGE is
+/// idempotent, so a matching edge is not duplicated.
+fn ensure_edge(
+    plane: &PlaneHandle<'_>,
+    txn: &mut WriteTxn<'_>,
+    prev: NodeId,
+    cur: NodeId,
+    rel: &CreateRel,
+    summary: &mut WriteSummary,
+) -> Result<(), String> {
+    // `->` is prev→cur; `<-` is cur→prev.
+    let (src, dst) = match rel.dir {
+        Dir::In => (cur, prev),
+        _ => (prev, cur),
+    };
+    let existing = plane
+        .neighbors(src, Dir::Out, Some(&rel.ty))
+        .map_err(|e| e.to_string())?;
+    if existing.iter().any(|n| n.node == dst) {
+        return Ok(());
+    }
+    txn.create_edge(src, dst, &rel.ty, props_of(&rel.props))
+        .map_err(|e| e.to_string())?;
+    summary.edges_created += 1;
     Ok(())
 }
 

@@ -213,11 +213,13 @@ pub enum WriteOp {
     Delete { detach: bool, vars: Vec<String> },
 }
 
-/// `MERGE (node) [ON CREATE SET …] [ON MATCH SET …]` — upsert a node by its
-/// external `key`. `node` reuses the CREATE node shape (var/label/key/props).
+/// `MERGE (a {key}) [ON CREATE SET …] [ON MATCH SET …]` — upsert one node by
+/// its external key — or `MERGE (a {key})-[:T]->(b {key})` — upsert each keyed
+/// node and ensure the edge (element-wise, idempotent). `path` reuses the CREATE
+/// path shape; `on_create`/`on_match` apply only to a single-node MERGE.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeClause {
-    pub node: CreateNode,
+    pub path: CreatePath,
     pub on_create: Vec<SetItem>,
     pub on_match: Vec<SetItem>,
 }

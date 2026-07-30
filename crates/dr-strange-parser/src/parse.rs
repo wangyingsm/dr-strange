@@ -733,10 +733,11 @@ fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
     ))
 }
 
-/// `MERGE (n:L {key:"k", ..}) [ON CREATE SET …] [ON MATCH SET …]` — upsert.
-fn merge_stmt(i: &str) -> IResult<&str, WriteAst> {
+/// `MERGE (n:L {key:"k", ..}) [ON CREATE SET …] [ON MATCH SET …]` — upsert one
+/// node, or a path `MERGE (a {key})-[:T]->(b {key})`.
+fn merge_clause(i: &str) -> IResult<&str, WriteOp> {
     let (i, _) = kw("merge")(i)?;
-    let (i, node) = create_node(i)?;
+    let (i, path) = create_path(i)?;
     let (i, clauses) = many0(merge_on)(i)?;
     let mut on_create = Vec::new();
     let mut on_match = Vec::new();
@@ -749,13 +750,21 @@ fn merge_stmt(i: &str) -> IResult<&str, WriteAst> {
     }
     Ok((
         i,
+        WriteOp::Merge(MergeClause {
+            path,
+            on_create,
+            on_match,
+        }),
+    ))
+}
+
+fn merge_stmt(i: &str) -> IResult<&str, WriteAst> {
+    let (i, op) = merge_clause(i)?;
+    Ok((
+        i,
         WriteAst {
             match_clause: None,
-            ops: vec![WriteOp::Merge(MergeClause {
-                node,
-                on_create,
-                on_match,
-            })],
+            ops: vec![op],
         },
     ))
 }

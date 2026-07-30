@@ -268,6 +268,53 @@ fn merge_on_set_must_reference_the_merge_variable() {
 }
 
 #[test]
+fn merge_path_upserts_nodes_and_edge_idempotently() {
+    let db = Database::in_memory().unwrap();
+    let q = r#"MERGE (a:Person {key:"alice"})-[:KNOWS]->(b:Person {key:"bob"})"#;
+    let s = write(&db, q);
+    assert_eq!(s.nodes_created, 2);
+    assert_eq!(s.edges_created, 1);
+    let p = plane(&db);
+    let a = p.node_by_key("alice").unwrap().unwrap();
+    let b = p.node_by_key("bob").unwrap().unwrap();
+    let out = p.neighbors(a.id, Dir::Out, Some("KNOWS")).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].node, b.id);
+
+    // Idempotent: nodes bound, the edge already connects them → nothing new.
+    let s2 = write(&db, q);
+    assert_eq!((s2.nodes_created, s2.edges_created), (0, 0));
+    assert_eq!(p.neighbors(a.id, Dir::Out, Some("KNOWS")).unwrap().len(), 1);
+}
+
+#[test]
+fn merge_path_binds_existing_node_creates_the_rest() {
+    let db = Database::in_memory().unwrap();
+    write(&db, r#"CREATE (a:Person {key:"alice", age:30})"#);
+    let s = write(
+        &db,
+        r#"MERGE (a:Person {key:"alice"})-[:KNOWS]->(b:Person {key:"bob"})"#,
+    );
+    assert_eq!(s.nodes_created, 1); // only bob is new
+    assert_eq!(s.edges_created, 1);
+    // alice was bound, not recreated — her age survives.
+    let a = plane(&db).node_by_key("alice").unwrap().unwrap();
+    assert_eq!(a.properties["age"].value, PropValue::Int(30));
+}
+
+#[test]
+fn path_merge_rejects_on_clauses_and_keyless_nodes() {
+    assert!(matches!(
+        parse_statement(r#"MERGE (a {key:"a"})-[:R]->(b {key:"b"}) ON CREATE SET a.x = 1"#),
+        Err(ParseError::Compile(_))
+    ));
+    assert!(matches!(
+        parse_statement(r#"MERGE (a {key:"a"})-[:R]->(b:Person)"#),
+        Err(ParseError::Compile(_))
+    ));
+}
+
+#[test]
 fn create_duplicate_key_errors_and_rolls_back() {
     let db = Database::in_memory().unwrap();
     // Two nodes claiming the same external key — the second create fails; the
