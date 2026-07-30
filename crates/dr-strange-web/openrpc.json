@@ -103,7 +103,8 @@
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "query", "required": true, "schema": { "type": "string", "description": "The query-language statement." } },
-        { "name": "embed", "required": false, "schema": { "type": "string", "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env." } }
+        { "name": "embed", "required": false, "schema": { "type": "string", "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env." } },
+        { "name": "params", "required": false, "schema": { "type": "object", "description": "Values for $name placeholders in the query (no string interpolation)." } }
       ],
       "result": { "name": "result", "schema": { "type": "object", "description": "Read: {nodes, edges, count}. Write: {write, nodes_created, edges_created, props_set, labels_set, nodes_deleted, edges_deleted}." } }
     },

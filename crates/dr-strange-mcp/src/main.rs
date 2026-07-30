@@ -136,6 +136,9 @@ struct Cypher {
     /// the server environment supplies the key. Defaults to `openai`.
     #[serde(default)]
     embed: Option<String>,
+    /// Values for `$name` placeholders in the query, e.g. `{"min": 18}`.
+    #[serde(default)]
+    params: serde_json::Map<String, Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -346,10 +349,18 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     let embedder = dr_strange_llm::build_provider(provider, None, None, None, true)
         .ok()
         .map(|p| LlmEmbedder(Box::new(p)));
-    let stmt = match &embedder {
-        Some(e) => dr_strange_parser::parse_statement_with_embedder(&req.query, e),
-        None => dr_strange_parser::parse_statement(&req.query),
+    // Resolve `$name` placeholders from the params object.
+    let mut params = dr_strange_parser::Params::new();
+    for (k, v) in &req.params {
+        params.insert(k.clone(), json::json_to_value(v)?);
     }
+    let stmt = dr_strange_parser::parse_statement_full(
+        &req.query,
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_parser::Embedder),
+        &params,
+    )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let plane = db.plane(&req.plane)?;
     match stmt {

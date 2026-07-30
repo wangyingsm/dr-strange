@@ -66,6 +66,10 @@ enum Command {
         /// MATCH / literal-vector queries. Requires the `digest` build feature.
         #[arg(long)]
         embed: Option<String>,
+        /// A `$name` parameter as `name=<json>` (repeatable), e.g.
+        /// `--param min=18 --param who='"Alice"'`.
+        #[arg(long = "param", value_name = "NAME=JSON")]
+        param: Vec<String>,
     },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
@@ -219,6 +223,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             query,
             plane,
             embed,
+            param,
         } => {
             let db = commands::open(&cli.db)?;
             let query = if query == "-" {
@@ -226,7 +231,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             } else {
                 query
             };
-            commands::cypher(&db, &plane, &query, embed.as_deref(), out)
+            commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
         }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;

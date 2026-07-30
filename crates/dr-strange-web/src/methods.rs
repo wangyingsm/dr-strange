@@ -279,6 +279,20 @@ pub struct CypherReq {
     /// Embedding provider for a text `SEARCH … NEAR "…"` (default `openai`).
     #[serde(default)]
     embed: Option<String>,
+    /// Values for `$name` placeholders in the query.
+    #[serde(default)]
+    params: serde_json::Map<String, Value>,
+}
+
+/// Convert a JSON params object to the parser's `Params` (name → PropValue).
+fn to_params(map: &serde_json::Map<String, Value>) -> Result<dr_strange_parser::Params, RpcError> {
+    map.iter()
+        .map(|(k, v)| {
+            json::json_to_value(v)
+                .map(|pv| (k.clone(), pv))
+                .map_err(|e| RpcError::invalid_params(format!("param `{k}`: {e}")))
+        })
+        .collect()
 }
 
 /// `plane.cypher` — run a statement in the query language (reads return
@@ -287,11 +301,13 @@ pub struct CypherReq {
 /// get the language too. Write-gated at dispatch (the language can mutate).
 pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: CypherReq = params(p)?;
+    let params = to_params(&req.params)?;
     cypher_subgraph(
         ctx,
         &req.plane,
         &req.query,
         req.embed.as_deref().unwrap_or("openai"),
+        &params,
     )
 }
 
@@ -306,12 +322,16 @@ pub fn cypher_subgraph(
     plane_name: &str,
     query: &str,
     embed_provider: &str,
+    params: &dr_strange_parser::Params,
 ) -> Result<Value, RpcError> {
     let embedder = make_embedder(embed_provider);
-    let stmt = match &embedder {
-        Some(e) => dr_strange_parser::parse_statement_with_embedder(query, e),
-        None => dr_strange_parser::parse_statement(query),
-    }
+    let stmt = dr_strange_parser::parse_statement_full(
+        query,
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_parser::Embedder),
+        params,
+    )
     .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let plane = app(ctx.db.plane(plane_name))?;

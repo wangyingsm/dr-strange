@@ -111,6 +111,7 @@ struct json_object *drsg_plane_cypher(drsg_client *c, const char *plane, const c
     json_object_object_add(p, "query", json_object_new_string(query));
     if (opts) {
         if (opts->embed) json_object_object_add(p, "embed", json_object_new_string(opts->embed));
+        if (opts->params) json_object_object_add(p, "params", json_object_get(opts->params));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.cypher", p, &result, err);

@@ -124,6 +124,14 @@ def test_cypher_read_and_write(base_url):
     assert res["count"] == 1
     assert res["nodes"][0]["external_key"] == "carol"
 
+    # $params: values passed out-of-band, no string interpolation.
+    res = db.plane_cypher(
+        plane="startup",
+        query="MATCH (n:Person) WHERE n.age >= $min RETURN n",
+        params={"min": 40},
+    )
+    assert res["count"] == 0  # carol is 30
+
 
 def test_bad_token_raises_auth_error(base_url):
     db = Drsg(base_url=base_url, token="wrong")

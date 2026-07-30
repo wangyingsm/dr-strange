@@ -108,9 +108,10 @@ type PlaneQueryParams struct {
 }
 
 type PlaneCypherParams struct {
-	Plane string  `json:"plane"`
-	Query string  `json:"query"`
-	Embed *string `json:"embed,omitempty"`
+	Plane  string         `json:"plane"`
+	Query  string         `json:"query"`
+	Embed  *string        `json:"embed,omitempty"`
+	Params map[string]any `json:"params,omitempty"`
 }
 
 type PlaneFindParams struct {

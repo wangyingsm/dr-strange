@@ -291,7 +291,8 @@ async fn cypher_http(
     let built = tokio::task::spawn_blocking({
         let state = state.clone();
         let plane = plane.clone();
-        move || methods::cypher_subgraph(&state.ctx(), &plane, &query, &embed)
+        // The SPA doesn't send params; plane.cypher does (methods::plane_cypher).
+        move || methods::cypher_subgraph(&state.ctx(), &plane, &query, &embed, &Default::default())
     })
     .await;
 

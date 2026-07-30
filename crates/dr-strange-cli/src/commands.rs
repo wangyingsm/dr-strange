@@ -114,9 +114,11 @@ pub fn cypher(
     plane_name: &str,
     query: &str,
     embed: Option<&str>,
+    param: &[String],
     out: &mut dyn Write,
 ) -> Result<()> {
-    match parse_stmt(query, embed)? {
+    let params = parse_params(param)?;
+    match parse_stmt(query, embed, &params)? {
         dr_strange_parser::Statement::Read(plan) => run_plan(db, plane_name, plan, out),
         dr_strange_parser::Statement::Write(w) => {
             let p = plane(db, plane_name)?;
@@ -149,11 +151,31 @@ fn write_summary_line(s: &dr_strange_parser::WriteSummary) -> String {
     }
 }
 
+/// Build the `$param` map from `name=<json>` CLI args.
+fn parse_params(param: &[String]) -> Result<dr_strange_parser::Params> {
+    let mut params = dr_strange_parser::Params::new();
+    for kv in param {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--param must be NAME=<json>, got `{kv}`"))?;
+        let json: Value = serde_json::from_str(v)
+            .with_context(|| format!("--param `{k}`: value must be JSON"))?;
+        let pv = jsonio::json_to_value(&json).map_err(|e| anyhow!("--param `{k}`: {e}"))?;
+        params.insert(k.to_string(), pv);
+    }
+    Ok(params)
+}
+
 /// Parse a statement, embedding a text `SEARCH … NEAR "…"` when an `embed`
-/// provider is given. Embedding lives behind the `digest` feature (which pulls
-/// in dr-strange-llm); everything else parses without it.
+/// provider is given, and resolving `$name` placeholders from `params`.
+/// Embedding lives behind the `digest` feature (which pulls in dr-strange-llm);
+/// everything else parses without it.
 #[cfg(feature = "digest")]
-fn parse_stmt(query: &str, embed: Option<&str>) -> Result<dr_strange_parser::Statement> {
+fn parse_stmt(
+    query: &str,
+    embed: Option<&str>,
+    params: &dr_strange_parser::Params,
+) -> Result<dr_strange_parser::Statement> {
     // Adapt the LLM provider to the parser's embedder seam (key from the env).
     struct LlmEmbedder(Box<dyn dr_strange_llm::Embedder>);
     impl dr_strange_parser::Embedder for LlmEmbedder {
@@ -169,26 +191,35 @@ fn parse_stmt(query: &str, embed: Option<&str>) -> Result<dr_strange_parser::Sta
                 .ok_or_else(|| "embedder returned no vector".to_string())
         }
     }
-    match embed {
-        Some(provider) => {
-            let e = LlmEmbedder(Box::new(dr_strange_llm::build_provider(
-                provider, None, None, None, true,
-            )?));
-            dr_strange_parser::parse_statement_with_embedder(query, &e).map_err(|e| anyhow!("{e}"))
-        }
-        None => dr_strange_parser::parse_statement(query).map_err(|e| anyhow!("{e}")),
-    }
+    let embedder = match embed {
+        Some(provider) => Some(LlmEmbedder(Box::new(dr_strange_llm::build_provider(
+            provider, None, None, None, true,
+        )?))),
+        None => None,
+    };
+    dr_strange_parser::parse_statement_full(
+        query,
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_parser::Embedder),
+        params,
+    )
+    .map_err(|e| anyhow!("{e}"))
 }
 
 #[cfg(not(feature = "digest"))]
-fn parse_stmt(query: &str, embed: Option<&str>) -> Result<dr_strange_parser::Statement> {
+fn parse_stmt(
+    query: &str,
+    embed: Option<&str>,
+    params: &dr_strange_parser::Params,
+) -> Result<dr_strange_parser::Statement> {
     if embed.is_some() {
         bail!(
             "text SEARCH embedding needs the `digest` build feature \
              (this binary was built with --no-default-features)"
         );
     }
-    dr_strange_parser::parse_statement(query).map_err(|e| anyhow!("{e}"))
+    dr_strange_parser::parse_statement_full(query, None, params).map_err(|e| anyhow!("{e}"))
 }
 
 /// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
@@ -669,6 +700,7 @@ mod tests {
                 "startup",
                 "MATCH (n:Paper) WHERE n.year >= 2021 RETURN n",
                 None,
+                &[],
                 o,
             )
         });
@@ -681,6 +713,7 @@ mod tests {
                 "startup",
                 "MATCH (a:Paper)-[:CITES]->(b:Paper) RETURN b",
                 None,
+                &[],
                 o,
             )
         });
@@ -694,6 +727,7 @@ mod tests {
                 "startup",
                 "SEARCH (n:Paper) ON emb NEAR [1.0, 0.0] TOPK 1 RETURN n",
                 None,
+                &[],
                 o,
             )
         });
@@ -701,7 +735,7 @@ mod tests {
         assert!(out.contains("\"external_key\":\"p2\""));
         // An unsupported query surfaces the parser's error, not a panic.
         let mut sink = Vec::new();
-        let err = cypher(&db, "startup", "MATCH (n)", None, &mut sink).unwrap_err();
+        let err = cypher(&db, "startup", "MATCH (n)", None, &[], &mut sink).unwrap_err();
         assert!(err.to_string().contains("syntax error"), "{err}");
         // A text SEARCH with no --embed is a clear error, not a panic.
         let mut sink = Vec::new();
@@ -710,6 +744,7 @@ mod tests {
             "startup",
             "SEARCH (n:Paper) ON emb NEAR \"hi\" RETURN n",
             None,
+            &[],
             &mut sink,
         )
         .unwrap_err();
@@ -725,6 +760,7 @@ mod tests {
                 "startup",
                 r#"CREATE (a:Person {key:"alice"})-[:KNOWS]->(b:Person {key:"bob"})"#,
                 None,
+                &[],
                 o,
             )
         });
@@ -733,6 +769,23 @@ mod tests {
         let p = db.plane("startup").unwrap();
         assert!(p.node_by_key("alice").unwrap().is_some());
         assert!(p.node_by_key("bob").unwrap().is_some());
+    }
+
+    #[test]
+    fn cypher_with_params() {
+        let db = loaded(); // Papers p1(2020), p2(2021)
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                "MATCH (n:Paper) WHERE n.year >= $min RETURN n",
+                None,
+                &["min=2021".to_string()],
+                o,
+            )
+        });
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"external_key\":\"p2\""));
     }
 
     #[test]

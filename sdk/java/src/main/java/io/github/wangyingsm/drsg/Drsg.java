@@ -168,14 +168,19 @@ public class Drsg extends Client {
     public record PlaneCypherParams(
             String plane,
             String query,
-            String embed) {
+            String embed,
+            Map<String, Object> params) {
 
         public static PlaneCypherParams of(String plane, String query) {
-            return new PlaneCypherParams(plane, query, null);
+            return new PlaneCypherParams(plane, query, null, null);
         }
 
         public PlaneCypherParams withEmbed(String embed) {
-            return new PlaneCypherParams(plane, query, embed);
+            return new PlaneCypherParams(plane, query, embed, params);
+        }
+
+        public PlaneCypherParams withParams(Map<String, Object> params) {
+            return new PlaneCypherParams(plane, query, embed, params);
         }
     }
 
