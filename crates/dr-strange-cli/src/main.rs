@@ -4,6 +4,7 @@
 //! session (arch/05 §3, arch/07).
 
 mod commands;
+mod config;
 
 use std::io::{self, BufReader, Write};
 use std::net::SocketAddr;
@@ -19,6 +20,12 @@ struct Cli {
     /// Path to the database file.
     #[arg(long, short, global = true, default_value = "graph.drsg")]
     db: PathBuf,
+
+    /// Path to a `config.toml` (server / logging / LLM keys). Defaults to
+    /// `$DRSG_CONFIG`, then `./drsg.toml` if present; environment variables
+    /// override file values.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -85,9 +92,10 @@ enum Command {
     Check,
     /// Serve the web dashboard + JSON-RPC 2.0 API (arch/08).
     Serve {
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:7700")]
-        addr: SocketAddr,
+        /// Address to listen on. Overrides `config.toml`'s `[server].addr`;
+        /// defaults to 127.0.0.1:7700 when neither is set.
+        #[arg(long)]
+        addr: Option<SocketAddr>,
     },
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
@@ -176,16 +184,21 @@ impl From<MetricArg> for Metric {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Load config and fold its env-backed values (token, log dir, LLM keys)
+    // into the environment BEFORE logging starts or the tokio runtime spawns
+    // threads — `apply_env` relies on the process being single-threaded here.
+    let cfg = config::load(cli.config.as_deref())?;
+    config::apply_env(&cfg);
     // Hold the guard for the whole run so the file writer flushes on exit.
     let _log = dr_strange_log::init("drsg");
     let out = io::stdout();
     let mut out = out.lock();
-    run(cli, &mut out)?;
+    run(cli, &cfg, &mut out)?;
     out.flush()?;
     Ok(())
 }
 
-fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
+fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
     match cli.command {
         Command::Init => commands::init(&cli.db, out),
         Command::Plane(cmd) => {
@@ -256,10 +269,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
         Command::Serve { addr } => {
             let db = commands::open(&cli.db)?;
-            let opts = dr_strange_web::ServeOptions {
-                addr,
-                ..Default::default()
-            };
+            let opts = config::serve_options(cfg, addr);
             // Hands off to the web crate, which owns its own async runtime and
             // blocks until a shutdown signal; `out` is unused (the server logs
             // itself).
