@@ -255,6 +255,61 @@ fn native_edge_cases_while_flushing() {
     conformance_edge_cases(&eng);
 }
 
+// Many flushes trigger compaction: the run count stays bounded (well below the
+// number of flushes), reads see the latest values, deletes are reclaimed — and
+// a reader pinned before the churn STILL sees its old value, so the merge did
+// not drop a version a live snapshot needs.
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_compacts_and_preserves_mvcc() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.drsg");
+    let eng = NativeEngine::open_with_threshold(&path, 1).unwrap();
+
+    let commit = |k: &[u8], v: &[u8]| {
+        let mut w = eng.begin_write().unwrap();
+        w.put(TableId::Nodes, k, v).unwrap();
+        w.commit().unwrap();
+    };
+
+    commit(b"k", b"v0");
+    // Pin a reader here — before "gone" exists and before the churn.
+    let pinned = eng.begin_read().unwrap();
+    commit(b"gone", b"x");
+
+    for i in 1..=8 {
+        commit(b"k", format!("v{i}").as_bytes());
+    }
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.delete(TableId::Nodes, b"gone").unwrap();
+        w.commit().unwrap();
+    }
+
+    // ~11 flushes, but compaction bounded the run count.
+    let ssts = std::fs::read_dir(&path)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("sst-"))
+        .count();
+    assert!(
+        (1..=5).contains(&ssts),
+        "compaction should bound runs; found {ssts}"
+    );
+
+    // Newest reader: latest value, deletion reclaimed.
+    let now = eng.begin_read().unwrap();
+    assert_eq!(now.get(TableId::Nodes, b"k").unwrap(), Some(b"v8".to_vec()));
+    assert_eq!(now.get(TableId::Nodes, b"gone").unwrap(), None);
+
+    // Pinned reader: still its original snapshot, kept alive through compaction.
+    assert_eq!(
+        pinned.get(TableId::Nodes, b"k").unwrap(),
+        Some(b"v0".to_vec())
+    );
+    assert_eq!(pinned.get(TableId::Nodes, b"gone").unwrap(), None); // didn't exist yet
+}
+
 // Force several flushes, confirm SST files appear, then reopen and read back —
 // data now comes from the SSTs (the WAL was rotated), including an update that
 // shadows an older run and a delete that tombstones across a flush.

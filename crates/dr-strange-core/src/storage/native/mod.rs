@@ -45,6 +45,12 @@ use crate::storage::engine::{
 /// bound memory and log growth; below it everything stays in the memtable.
 const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 
+/// Compact (merge all runs into one) once this many SSTs accumulate — bounds the
+/// number of runs a read must consult and lets shadowed versions/tombstones be
+/// reclaimed. A single-tier "merge everything" policy; leveled/size-tiered
+/// compaction (less write amplification) is a later refinement.
+const COMPACTION_TRIGGER: usize = 4;
+
 /// A memtable entry: a value, or a tombstone marking a deletion.
 #[derive(Debug, Clone, PartialEq)]
 enum Op {
@@ -94,6 +100,10 @@ pub struct NativeEngine {
     write_gate: Mutex<()>,
     dir: PathBuf,
     flush_threshold: usize,
+    /// Live read snapshots (snapshot → reader count), so compaction never
+    /// reclaims a version some open reader could still need. Registered under
+    /// the store read lock at `begin_read` (see the ordering note there).
+    readers: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl NativeEngine {
@@ -139,6 +149,7 @@ impl NativeEngine {
             write_gate: Mutex::new(()),
             dir,
             flush_threshold,
+            readers: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -167,6 +178,128 @@ impl NativeEngine {
         f.seek(SeekFrom::Start(0))?;
         Ok(())
     }
+
+    /// The oldest sequence any live reader can still observe — the floor below
+    /// which older versions are unreachable and may be reclaimed. With no
+    /// readers, that's the committed sequence (everything below the newest
+    /// version per key is dead).
+    fn min_snapshot(&self, committed_seq: u64) -> u64 {
+        let readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        readers
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(committed_seq)
+            .min(committed_seq)
+    }
+
+    /// If enough runs have accumulated, merge them all into one, dropping
+    /// versions no reader can reach. Called from `commit` (single writer) after
+    /// the store lock is released, so the heavy merge I/O doesn't block readers.
+    fn maybe_compact(&self) -> Result<()> {
+        // Snapshot the runs to merge under a brief read lock.
+        let (runs, committed_seq, next) = {
+            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+            if store.ssts.len() <= COMPACTION_TRIGGER {
+                return Ok(());
+            }
+            (store.ssts.clone(), store.committed_seq, store.next_sst)
+        };
+        let min_snap = self.min_snapshot(committed_seq);
+
+        // Merge every run into one map (a later run's version wins), then drop
+        // what no reader needs.
+        let mut merged: BTreeMap<MemKey, Op> = BTreeMap::new();
+        for run in &runs {
+            run.load_into(&mut merged)?;
+        }
+        let kept = gc_versions(merged, min_snap);
+        let max_seq = kept
+            .keys()
+            .map(|(_, _, Reverse(s))| *s)
+            .max()
+            .unwrap_or(committed_seq);
+
+        let path = self.dir.join(format!("sst-{next:06}"));
+        sst::write(&path, &kept, max_seq)?;
+        let merged_sst = Arc::new(sst::Sst::open(&path)?);
+
+        // Swap the merged runs out for the single new run. Single writer ⇒ the
+        // first `runs.len()` entries are exactly the ones we merged.
+        let old = {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            let tail = store.ssts.split_off(runs.len());
+            let mut fresh = Vec::with_capacity(1 + tail.len());
+            fresh.push(merged_sst);
+            fresh.extend(tail);
+            let old = std::mem::replace(&mut store.ssts, fresh);
+            store.next_sst = next + 1;
+            old
+        };
+
+        // Delete the merged runs' files. Their `Arc`s drop here (readers never
+        // retain a run across a call), closing the handles first.
+        let paths: Vec<PathBuf> = old.iter().map(|s| s.path.clone()).collect();
+        drop(old);
+        for p in paths {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(())
+    }
+}
+
+/// Reclaim dead versions from a merged run. Processing each key newest-first,
+/// keep versions down to and including the first at or below `min_snapshot`
+/// (the "floor" a reader at that snapshot would see); drop everything older. A
+/// key whose only survivor is a tombstone at/below the floor is dropped
+/// entirely — this is the bottom run, so nothing older can resurface.
+fn gc_versions(merged: BTreeMap<MemKey, Op>, min_snapshot: u64) -> BTreeMap<MemKey, Op> {
+    let mut out = BTreeMap::new();
+    let mut group: Vec<(u64, Op)> = Vec::new();
+    let mut cur: Option<(u8, Vec<u8>)> = None;
+
+    for ((table, key, Reverse(seq)), op) in merged {
+        let k = (table, key);
+        if cur.as_ref() != Some(&k) {
+            if let Some((t, key)) = cur.take() {
+                emit_group(t, &key, &group, min_snapshot, &mut out);
+            }
+            group.clear();
+            cur = Some(k);
+        }
+        group.push((seq, op)); // newest-first: merged iterates seq DESC per key
+    }
+    if let Some((t, key)) = cur {
+        emit_group(t, &key, &group, min_snapshot, &mut out);
+    }
+    out
+}
+
+/// Emit the surviving versions of one key (its `group`, newest-first).
+fn emit_group(
+    table: u8,
+    key: &[u8],
+    group: &[(u64, Op)],
+    min_snapshot: u64,
+    out: &mut BTreeMap<MemKey, Op>,
+) {
+    let mut keep = 0;
+    for (seq, _) in group {
+        keep += 1;
+        if *seq <= min_snapshot {
+            break; // floor reached; older versions are unreachable
+        }
+    }
+    let kept = &group[..keep];
+    // A lone tombstone at/below the floor leaves nothing to shadow → drop it.
+    if let [(seq, Op::Del)] = kept
+        && *seq <= min_snapshot
+    {
+        return;
+    }
+    for (seq, op) in kept {
+        out.insert((table, key.to_vec(), Reverse(*seq)), op.clone());
+    }
 }
 
 impl StorageEngine for NativeEngine {
@@ -174,11 +307,22 @@ impl StorageEngine for NativeEngine {
     type WriteTxn<'a> = NativeWriteTxn<'a>;
 
     fn begin_read(&self) -> Result<NativeReadTxn<'_>> {
-        let snapshot = self
-            .store
-            .read()
+        // Read the snapshot AND register it while holding the store read lock.
+        // A commit sets `committed_seq` under the store *write* lock, so any
+        // reader whose snapshot is below a commit's sequence necessarily
+        // registered before that commit — hence before the compaction that
+        // commit may run. Compaction can therefore trust the reader set to bound
+        // what it reclaims. (A reader that registers later sees the new
+        // `committed_seq` and only needs the newest versions, which survive.)
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        let snapshot = store.committed_seq;
+        *self
+            .readers
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .committed_seq;
+            .entry(snapshot)
+            .or_insert(0) += 1;
+        drop(store);
         Ok(NativeReadTxn {
             engine: self,
             snapshot,
@@ -283,6 +427,22 @@ fn committed_values(
 pub struct NativeReadTxn<'a> {
     engine: &'a NativeEngine,
     snapshot: u64,
+}
+
+impl Drop for NativeReadTxn<'_> {
+    fn drop(&mut self) {
+        let mut readers = self
+            .engine
+            .readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let std::collections::btree_map::Entry::Occupied(mut e) = readers.entry(self.snapshot) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+    }
 }
 
 impl ReadTransaction for NativeReadTxn<'_> {
@@ -407,13 +567,17 @@ impl WriteTransaction for NativeWriteTxn<'_> {
         }
 
         // Publish to the memtable, advance the sequence, then flush if large.
-        let mut store = self.engine.store.write().unwrap_or_else(|e| e.into_inner());
-        for ((t, k), op) in self.buf {
-            store.mem_bytes += 1 + k.len() + 8 + op_bytes(&op);
-            store.mem.insert((t, k, Reverse(seq)), op);
+        {
+            let mut store = self.engine.store.write().unwrap_or_else(|e| e.into_inner());
+            for ((t, k), op) in self.buf {
+                store.mem_bytes += 1 + k.len() + 8 + op_bytes(&op);
+                store.mem.insert((t, k, Reverse(seq)), op);
+            }
+            store.committed_seq = seq;
+            self.engine.maybe_flush(&mut store)?;
         }
-        store.committed_seq = seq;
-        self.engine.maybe_flush(&mut store)
+        // Compact outside the store lock (heavy merge I/O shouldn't block reads).
+        self.engine.maybe_compact()
     }
 }
 

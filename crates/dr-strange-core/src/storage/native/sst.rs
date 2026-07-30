@@ -16,6 +16,7 @@
 //! Reads go through `pread` (a `Mutex<File>` + seek/read, portable) a block at a
 //! time; a block cache lands in a later phase.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub(super) struct Sst {
     file: Mutex<File>,
     index: Vec<BlockRef>,
     pub(super) max_seq: u64,
+    /// This run's file, so compaction can delete it once merged away.
+    pub(super) path: PathBuf,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -319,7 +322,22 @@ impl Sst {
             file: Mutex::new(file),
             index,
             max_seq,
+            path: path.to_path_buf(),
         })
+    }
+
+    /// Read every entry of this run into `out` (compaction input). A later run's
+    /// version of a key overwrites an earlier one because `out` is keyed by
+    /// `(table, key, Reverse(seq))` and runs have disjoint sequence ranges.
+    pub(super) fn load_into(&self, out: &mut BTreeMap<MemKey, Op>) -> Result<()> {
+        for block in &self.index {
+            let buf = self.read_block(block)?;
+            let mut c = Cursor::new(&buf);
+            while let Some(e) = decode_entry(&mut c) {
+                out.insert((e.table, e.key, std::cmp::Reverse(e.seq)), e.op);
+            }
+        }
+        Ok(())
     }
 
     fn read_block(&self, block: &BlockRef) -> Result<Vec<u8>> {
