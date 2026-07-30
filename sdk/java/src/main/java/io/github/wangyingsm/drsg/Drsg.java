@@ -165,6 +165,20 @@ public class Drsg extends Client {
         }
     }
 
+    public record PlaneCypherParams(
+            String plane,
+            String query,
+            String embed) {
+
+        public static PlaneCypherParams of(String plane, String query) {
+            return new PlaneCypherParams(plane, query, null);
+        }
+
+        public PlaneCypherParams withEmbed(String embed) {
+            return new PlaneCypherParams(plane, query, embed);
+        }
+    }
+
     public record PlaneFindParams(
             String plane,
             String q,
@@ -504,6 +518,11 @@ public class Drsg extends Client {
     /** Run a serialized logical plan verbatim; returns scored rows. (access: read) */
     public List<NodeRecord> planeQuery(PlaneQueryParams params) throws DrsgException {
         return call("plane.query", params, new TypeReference<List<NodeRecord>>() {});
+    }
+
+    /** Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
+    public Map<String, Object> planeCypher(PlaneCypherParams params) throws DrsgException {
+        return call("plane.cypher", params, new TypeReference<Map<String, Object>>() {});
     }
 
     /** Text (or semantic) search over the plane's nodes and edges. (access: read) */

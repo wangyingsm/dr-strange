@@ -4,5 +4,6 @@
 *.drsg
 *.drsg.jsonl
 
-# Runtime logs from dr-strange-log (DRSG_LOG_DIR, default ./logs).
-/logs/
+# Runtime logs from dr-strange-log (DRSG_LOG_DIR, default ./logs) — the server
+# writes ./logs relative to its cwd, so ignore the dir anywhere.
+logs/

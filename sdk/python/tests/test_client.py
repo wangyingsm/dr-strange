@@ -106,6 +106,25 @@ def test_discover(base_url):
     assert any(m["name"] == "node.create" for m in doc["methods"])
 
 
+def test_cypher_read_and_write(base_url):
+    db = Drsg(base_url=base_url, token=TOKEN)
+    # A write: CREATE two nodes and an edge → change-counts.
+    out = db.plane_cypher(
+        plane="startup",
+        query='CREATE (a:Person {key:"carol", age:30})-[:KNOWS]->(b:Person {key:"dave"})',
+    )
+    assert out["write"] is True
+    assert out["nodes_created"] == 2
+    assert out["edges_created"] == 1
+    # A read: MATCH … RETURN returns the result subgraph.
+    res = db.plane_cypher(
+        plane="startup",
+        query="MATCH (n:Person) WHERE n.age >= 18 RETURN n",
+    )
+    assert res["count"] == 1
+    assert res["nodes"][0]["external_key"] == "carol"
+
+
 def test_bad_token_raises_auth_error(base_url):
     db = Drsg(base_url=base_url, token="wrong")
     with pytest.raises(DrsgAuthError) as exc:

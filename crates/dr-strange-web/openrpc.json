@@ -97,6 +97,17 @@
       "result": { "name": "rows", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } } }
     },
     {
+      "name": "plane.cypher",
+      "summary": "Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated.",
+      "x-access": "write",
+      "params": [
+        { "name": "plane", "required": true, "schema": { "type": "string" } },
+        { "name": "query", "required": true, "schema": { "type": "string", "description": "The query-language statement." } },
+        { "name": "embed", "required": false, "schema": { "type": "string", "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env." } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object", "description": "Read: {nodes, edges, count}. Write: {write, nodes_created, edges_created, props_set, labels_set, nodes_deleted, edges_deleted}." } }
+    },
+    {
       "name": "plane.find",
       "summary": "Text (or semantic) search over the plane's nodes and edges.",
       "x-access": "read",

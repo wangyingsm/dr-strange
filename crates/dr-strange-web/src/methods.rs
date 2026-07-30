@@ -272,13 +272,35 @@ fn make_embedder(provider: &str) -> Option<LlmEmbedder> {
         .map(|p| LlmEmbedder(Box::new(p)))
 }
 
+#[derive(Deserialize)]
+pub struct CypherReq {
+    plane: String,
+    query: String,
+    /// Embedding provider for a text `SEARCH … NEAR "…"` (default `openai`).
+    #[serde(default)]
+    embed: Option<String>,
+}
+
+/// `plane.cypher` — run a statement in the query language (reads return
+/// `{nodes, edges, count}`; writes return `{write: true, …counts}`). The
+/// first-class RPC counterpart of the web-only `POST /cypher`, so SDK clients
+/// get the language too. Write-gated at dispatch (the language can mutate).
+pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: CypherReq = params(p)?;
+    cypher_subgraph(
+        ctx,
+        &req.plane,
+        &req.query,
+        req.embed.as_deref().unwrap_or("openai"),
+    )
+}
+
 /// Compile an openCypher-subset query (via dr-strange-parser) to a
 /// `LogicalPlan`, run it, and return the matching nodes plus the edges induced
 /// among exactly that result set — the same `{nodes, edges}` shape as
-/// `graph.seed`, so the plot can render a query result as a subgraph. Used by
-/// the web-only `POST /cypher` endpoint (kept off the JSON-RPC surface so it
-/// doesn't ripple into the OpenRPC schema / the SDKs). `embed_provider` names
-/// the embedding provider for a text `SEARCH … NEAR "…"`.
+/// `graph.seed`, so the plot can render a query result as a subgraph. Shared by
+/// the web-only `POST /cypher` endpoint and the `plane.cypher` RPC method.
+/// `embed_provider` names the embedding provider for a text `SEARCH … NEAR "…"`.
 pub fn cypher_subgraph(
     ctx: &Ctx<'_>,
     plane_name: &str,

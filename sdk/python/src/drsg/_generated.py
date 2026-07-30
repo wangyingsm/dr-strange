@@ -98,6 +98,17 @@ class Drsg(_Client):
         _p["plan"] = plan
         return self._call("plane.query", _p)
 
+    def plane_cypher(self, plane, query, embed=None) -> Any:
+        """Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated.
+
+        Access: write."""
+        _p: dict = {}
+        _p["plane"] = plane
+        _p["query"] = query
+        if embed is not None:
+            _p["embed"] = embed
+        return self._call("plane.cypher", _p)
+
     def plane_find(self, plane, q, limit=None, semantic=None, provider=None, embed_model=None) -> Any:
         """Text (or semantic) search over the plane's nodes and edges.
 

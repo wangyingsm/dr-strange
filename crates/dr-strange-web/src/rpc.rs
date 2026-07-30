@@ -190,6 +190,7 @@ const METHODS: &[&str] = &[
     "plane.neighbors",
     "plane.search",
     "plane.query",
+    "plane.cypher",
     "plane.find",
     "graph.seed",
     "graph.expand",
@@ -237,6 +238,9 @@ fn dispatch_method(
         "plane.neighbors" => guarded!(Access::Read, methods::plane_neighbors(ctx, params)),
         "plane.search" => guarded!(Access::Read, methods::plane_search(ctx, params)),
         "plane.query" => guarded!(Access::Read, methods::plane_query(ctx, params)),
+        // The language can mutate (CREATE/SET/DELETE/MERGE), so it's write-gated
+        // even for a read query (the single-token model collapses the levels).
+        "plane.cypher" => guarded!(Access::Write, methods::plane_cypher(ctx, params)),
         "plane.find" => guarded!(Access::Read, methods::plane_find(ctx, params)),
         "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
         "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),

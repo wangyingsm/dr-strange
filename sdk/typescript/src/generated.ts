@@ -116,6 +116,11 @@ export class Drsg extends Client {
     return this._call("plane.query", params) as Promise<Array<NodeRecord>>;
   }
 
+  /** Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
+  planeCypher(params: { plane: string; query: string; embed?: string }): Promise<Record<string, unknown>> {
+    return this._call("plane.cypher", params) as Promise<Record<string, unknown>>;
+  }
+
   /** Text (or semantic) search over the plane's nodes and edges. (access: read) */
   planeFind(params: { plane: string; q: string; limit?: number; semantic?: boolean; provider?: string; embed_model?: string }): Promise<FindResult> {
     return this._call("plane.find", params) as Promise<FindResult>;

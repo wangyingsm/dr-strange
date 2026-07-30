@@ -104,6 +104,20 @@ struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct j
     return rc == 0 ? result : NULL;
 }
 
+/* Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
+struct json_object *drsg_plane_cypher(drsg_client *c, const char *plane, const char *query, const drsg_plane_cypher_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    json_object_object_add(p, "query", json_object_new_string(query));
+    if (opts) {
+        if (opts->embed) json_object_object_add(p, "embed", json_object_new_string(opts->embed));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.cypher", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
 /* Text (or semantic) search over the plane's nodes and edges. (access: read) */
 struct json_object *drsg_plane_find(drsg_client *c, const char *plane, const char *q, const drsg_plane_find_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();

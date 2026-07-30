@@ -48,6 +48,13 @@ struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const c
 struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct json_object *plan, drsg_error *err);
 
 typedef struct {
+    const char *embed;
+} drsg_plane_cypher_opts;
+
+/* Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
+struct json_object *drsg_plane_cypher(drsg_client *c, const char *plane, const char *query, const drsg_plane_cypher_opts *opts, drsg_error *err);
+
+typedef struct {
     const int64_t *limit;
     const int *semantic;
     const char *provider;

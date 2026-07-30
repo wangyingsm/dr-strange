@@ -107,6 +107,12 @@ type PlaneQueryParams struct {
 	Plan  map[string]any `json:"plan"`
 }
 
+type PlaneCypherParams struct {
+	Plane string  `json:"plane"`
+	Query string  `json:"query"`
+	Embed *string `json:"embed,omitempty"`
+}
+
 type PlaneFindParams struct {
 	Plane      string  `json:"plane"`
 	Q          string  `json:"q"`
@@ -275,6 +281,13 @@ func (c *Client) PlaneSearch(ctx context.Context, p PlaneSearchParams) ([]NodeRe
 func (c *Client) PlaneQuery(ctx context.Context, p PlaneQueryParams) ([]NodeRecord, error) {
 	var out []NodeRecord
 	err := c.call(ctx, "plane.query", p, &out)
+	return out, err
+}
+
+// PlaneCypher Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write)
+func (c *Client) PlaneCypher(ctx context.Context, p PlaneCypherParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "plane.cypher", p, &out)
 	return out, err
 }
 
