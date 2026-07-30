@@ -26,11 +26,6 @@ use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::native::{NativeEngine, NativeWriteTxn};
 #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
-
-#[cfg(not(any(feature = "redb-backend", feature = "native-backend")))]
-compile_error!(
-    "a storage backend is required: enable feature `redb-backend` (default) or `native-backend`"
-);
 use crate::storage::vector::Metric;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
@@ -123,6 +118,7 @@ impl std::fmt::Debug for Database {
 /// The HNSW sidecar path for a database file: the file name with `.hnsw`
 /// appended (e.g. `graph.drsg` → `graph.drsg.hnsw`), so it sits beside the DB
 /// and never collides with it.
+#[cfg(any(feature = "redb-backend", feature = "native-backend"))]
 fn sidecar_path(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_owned();
     name.push(".hnsw");
@@ -149,10 +145,13 @@ impl Drop for Database {
 }
 
 impl Database {
-    /// Opens (creating if needed) a database file backed by redb.
+    /// Opens (creating if needed) an on-disk database at `path`, using whichever
+    /// storage backend the crate features select (`native-backend` takes
+    /// precedence over `redb-backend`). Requires a backend feature; a
+    /// no-backend build has the in-memory engine only.
+    #[cfg(any(feature = "redb-backend", feature = "native-backend"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        // `native-backend` takes precedence when both are enabled.
         #[cfg(feature = "native-backend")]
         let engine = Engine::Native(NativeEngine::open(path)?);
         #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]

@@ -11,8 +11,13 @@ path = "src/main.rs"
 [features]
 # `drsg digest` (LLM ingest, arch/07). On by default; build with
 # --no-default-features to drop the HTTP/LLM dependency chain.
-default = ["digest"]
+default = ["digest", "redb-backend"]
 digest = ["dep:dr-strange-llm"]
+# Storage backend, forwarded to core + web. redb is the default; build with
+# `--no-default-features --features native-backend,digest` for the hand-rolled
+# LSM engine with no redb dependency compiled in.
+redb-backend = ["dr-strange-core/redb-backend", "dr-strange-web/redb-backend"]
+native-backend = ["dr-strange-core/native-backend", "dr-strange-web/native-backend"]
 
 [dependencies]
 anyhow = "1.0.104"

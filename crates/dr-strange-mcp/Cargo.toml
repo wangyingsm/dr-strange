@@ -8,6 +8,13 @@ edition.workspace = true
 name = "drsg-mcp"
 path = "src/main.rs"
 
+[features]
+default = ["redb-backend"]
+# Storage backend, forwarded to core. redb by default; `native-backend` selects
+# the hand-rolled LSM engine.
+redb-backend = ["dr-strange-core/redb-backend"]
+native-backend = ["dr-strange-core/native-backend"]
+
 [dependencies]
 dr-strange-core = { workspace = true, features = ["json"] }
 # Non-optional: the rmcp #[tool_router] macro doesn't compose with #[cfg] on

@@ -16,7 +16,9 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-dr-strange-core = { path = "crates/dr-strange-core" }
+# default-features off so each member picks the storage backend (redb/native);
+# members that just need core's types (e.g. the parser) get a backend-free core.
+dr-strange-core = { path = "crates/dr-strange-core", default-features = false }
 dr-strange-log = { path = "crates/dr-strange-log" }
 dr-strange-parser = { path = "crates/dr-strange-parser" }
 thiserror = "2"

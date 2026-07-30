@@ -4,6 +4,13 @@ description = "drsg serve — JSON-RPC 2.0 web backend + dashboard for dr-strang
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["redb-backend"]
+# Storage backend, forwarded to core. redb by default; `native-backend` selects
+# the hand-rolled LSM engine.
+redb-backend = ["dr-strange-core/redb-backend"]
+native-backend = ["dr-strange-core/native-backend"]
+
 [dependencies]
 dr-strange-core = { workspace = true, features = ["json"] }
 dr-strange-llm = { path = "../dr-strange-llm" }
