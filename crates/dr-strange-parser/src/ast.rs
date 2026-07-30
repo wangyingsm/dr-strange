@@ -169,3 +169,55 @@ pub enum PExpr {
         metric: Metric,
     },
 }
+
+// ---- write statements -----------------------------------------------------
+
+/// A parsed top-level statement: a read (compiles to a `LogicalPlan`) or a
+/// write (executed against a `WriteTxn`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtAst {
+    // Boxed: a read `Query` is far larger than a `WriteAst`.
+    Read(Box<Query>),
+    Write(WriteAst),
+}
+
+/// A write statement: zero or one read (`MATCH`) to bind variables, then one or
+/// more write operations. (This cut wires up `CREATE`; SET/REMOVE/DELETE/MERGE
+/// land in later chunks.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteAst {
+    pub ops: Vec<WriteOp>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteOp {
+    /// `CREATE (n:L {..}), (a)-[:T {..}]->(b), …`
+    Create(Vec<CreatePath>),
+}
+
+/// One CREATE path: a node, then directed `[:TYPE {..}]` hops to more nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePath {
+    pub first: CreateNode,
+    pub rest: Vec<(CreateRel, CreateNode)>,
+}
+
+/// A node in a CREATE: optional variable (to reference within the statement),
+/// optional label, optional external `key` (from an inline `key: "…"`), and the
+/// remaining inline properties.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateNode {
+    pub var: Option<String>,
+    pub label: Option<String>,
+    pub key: Option<String>,
+    pub props: Vec<(String, PropValue)>,
+}
+
+/// A relationship in a CREATE: a required type, a direction (`->`/`<-`; never
+/// undirected — dr-strange edges are directed), and inline properties.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRel {
+    pub dir: Dir,
+    pub ty: String,
+    pub props: Vec<(String, PropValue)>,
+}

@@ -603,8 +603,133 @@ fn beam_clause(i: &str) -> IResult<&str, BeamClause> {
 /// Default `TOPK` when the `SEARCH` clause omits it.
 const DEFAULT_TOPK: u64 = 10;
 
-/// Parse a whole query. The public [`crate::parse`] wraps this and enforces
-/// that all input was consumed.
+/// Parse a whole read query. The public [`crate::parse`] wraps this and
+/// enforces that all input was consumed.
 pub fn query(i: &str) -> IResult<&str, Query> {
     alt((match_query, search_query))(i)
+}
+
+// ---- write statements -----------------------------------------------------
+
+/// A literal property value inside `{ … }`: number (with optional `-`), string,
+/// bool, null, or a vector literal (e.g. an embedding).
+fn prop_value(i: &str) -> IResult<&str, PropValue> {
+    alt((
+        map(preceded(symbol("-"), number), negate_number),
+        number,
+        quoted('\''),
+        quoted('"'),
+        value(PropValue::Bool(true), kw("true")),
+        value(PropValue::Bool(false), kw("false")),
+        value(PropValue::Null, kw("null")),
+        map(vector_literal, PropValue::Vector),
+    ))(i)
+}
+
+fn negate_number(v: PropValue) -> PropValue {
+    match v {
+        PropValue::Int(n) => PropValue::Int(-n),
+        PropValue::Float(f) => PropValue::Float(-f),
+        other => other,
+    }
+}
+
+/// An inline property map `{ key: value, … }` (empty allowed).
+fn prop_map(i: &str) -> IResult<&str, Vec<(String, PropValue)>> {
+    let (i, _) = symbol("{")(i)?;
+    let (i, entries) = separated_list0(symbol(","), prop_entry)(i)?;
+    let (i, _) = symbol("}")(i)?;
+    Ok((i, entries))
+}
+
+fn prop_entry(i: &str) -> IResult<&str, (String, PropValue)> {
+    let (i, k) = ident(i)?;
+    let (i, _) = symbol(":")(i)?;
+    let (i, v) = prop_value(i)?;
+    Ok((i, (k, v)))
+}
+
+fn create_node(i: &str) -> IResult<&str, CreateNode> {
+    let (i, _) = symbol("(")(i)?;
+    let (i, var) = opt(ident)(i)?;
+    let (i, label) = opt(preceded(preceded(multispace0, char(':')), ident))(i)?;
+    let (i, raw) = opt(prop_map)(i)?;
+    let (i, _) = symbol(")")(i)?;
+
+    // A string-valued `key` sets the external key; everything else is a property.
+    let mut key = None;
+    let mut props = Vec::new();
+    for (k, v) in raw.unwrap_or_default() {
+        match (k.as_str(), &v) {
+            ("key", PropValue::Str(s)) => key = Some(s.clone()),
+            _ => props.push((k, v)),
+        }
+    }
+    Ok((
+        i,
+        CreateNode {
+            var,
+            label,
+            key,
+            props,
+        },
+    ))
+}
+
+fn create_rel(i: &str) -> IResult<&str, CreateRel> {
+    let (i, _) = multispace0(i)?;
+    let (i, left) = opt(char('<'))(i)?;
+    let (i, _) = char('-')(i)?;
+    let (i, _) = char('[')(i)?;
+    let (i, _) = preceded(multispace0, char(':'))(i)?; // a CREATE edge needs a type
+    let (i, ty) = ident(i)?;
+    let (i, props) = opt(prop_map)(i)?;
+    let (i, _) = symbol("]")(i)?;
+    let (i, _) = char('-')(i)?;
+    let (i, right) = opt(char('>'))(i)?;
+    let dir = match (left.is_some(), right.is_some()) {
+        (false, true) => Dir::Out,
+        (true, false) => Dir::In,
+        // Undirected / two-headed: dr-strange edges are directed.
+        _ => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+    };
+    Ok((
+        i,
+        CreateRel {
+            dir,
+            ty,
+            props: props.unwrap_or_default(),
+        },
+    ))
+}
+
+fn create_path(i: &str) -> IResult<&str, CreatePath> {
+    let (i, first) = create_node(i)?;
+    let (i, rest) = many0(pair(create_rel, create_node))(i)?;
+    Ok((i, CreatePath { first, rest }))
+}
+
+fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
+    let (i, _) = kw("create")(i)?;
+    let (i, paths) = separated_list1(symbol(","), create_path)(i)?;
+    Ok((
+        i,
+        WriteAst {
+            ops: vec![WriteOp::Create(paths)],
+        },
+    ))
+}
+
+/// Parse a whole statement — a read query or a write. The public
+/// [`crate::parse_statement`] wraps this and enforces all input is consumed.
+pub fn statement(i: &str) -> IResult<&str, StmtAst> {
+    alt((
+        map(create_stmt, StmtAst::Write),
+        map(query, |q| StmtAst::Read(Box::new(q))),
+    ))(i)
 }
