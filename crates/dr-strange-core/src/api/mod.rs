@@ -9,7 +9,7 @@
 //! one place that knows concrete engine types) and owns transaction and
 //! reader lifecycles.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
@@ -75,13 +75,18 @@ const CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct Database {
     engine: Engine,
-    /// In-memory vector indexes (arch/01 §5). Rebuilt from the KV on open;
-    /// read-locked during queries, write-locked at commit to apply the
-    /// coherence events a write transaction buffered.
+    /// In-memory vector indexes (arch/01 §5). On open, loaded from the `.hnsw`
+    /// sidecar when fresh, else rebuilt from the KV; read-locked during queries,
+    /// write-locked at commit to apply the coherence events a write transaction
+    /// buffered.
     indexes: RwLock<VectorRegistry>,
     /// Cross-query, seq-stamped decoded-record cache (arch/02 §3). Memory-only;
     /// rebuilt cold on open, so it never holds durable state.
     cache: GraphCache,
+    /// Where the HNSW sidecar lives (the `.hnsw` file beside the database), or
+    /// `None` for an in-memory database. Loaded on open when fresh; saved
+    /// best-effort on drop.
+    sidecar: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Database {
@@ -96,29 +101,82 @@ impl std::fmt::Debug for Database {
     }
 }
 
+/// The HNSW sidecar path for a database file: the file name with `.hnsw`
+/// appended (e.g. `graph.drsg` → `graph.drsg.hnsw`), so it sits beside the DB
+/// and never collides with it.
+fn sidecar_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(".hnsw");
+    PathBuf::from(name)
+}
+
+impl Drop for Database {
+    /// Persist the vector indexes to the sidecar so the next open can skip the
+    /// rebuild-from-KV. Best-effort: the registry is kept coherent with each
+    /// committed write, so stamping it with the current commit sequence is
+    /// valid; any failure just means the next open rebuilds (still correct).
+    fn drop(&mut self) {
+        let Some(path) = self.sidecar.clone() else {
+            return;
+        };
+        let result = self
+            .engine
+            .with_read(|txn| graph::read_commit_seq(txn))
+            .and_then(|seq| self.indexes().save_sidecar(&path, seq));
+        if let Err(e) = result {
+            tracing::warn!(error = %e, path = %path.display(), "failed to write HNSW sidecar");
+        }
+    }
+}
+
 impl Database {
     /// Opens (creating if needed) a database file backed by redb.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let db = Self::init(Engine::Redb(RedbEngine::open(path)?))?;
+        let db = Self::init(
+            Engine::Redb(RedbEngine::open(path)?),
+            Some(sidecar_path(path)),
+        )?;
         tracing::info!(path = %path.display(), "opened database");
         Ok(db)
     }
 
     /// A fresh, empty in-memory database (tests, scratch work).
     pub fn in_memory() -> Result<Self> {
-        Self::init(Engine::Memory(Box::default()))
+        Self::init(Engine::Memory(Box::default()), None)
     }
 
-    fn init(engine: Engine) -> Result<Self> {
+    fn init(engine: Engine, sidecar: Option<PathBuf>) -> Result<Self> {
+        // The commit sequence of the data as last persisted — read BEFORE
+        // `graph::init`, since that runs a write transaction and every write
+        // bumps the sequence (arch/02 §3). This is the value the sidecar was
+        // stamped with on the previous drop. A brand-new database has no meta
+        // yet (read errors) and no sidecar to match anyway → `None`.
+        let prior_seq = engine.with_read(|txn| graph::read_commit_seq(txn)).ok();
         engine.with_write(|txn| graph::init(txn))?;
-        // Rebuild declared vector indexes from the KV (arch/01 §5).
-        let mut registry = VectorRegistry::new();
-        engine.with_read(|txn| registry.rebuild_from(txn))?;
+        // Vector indexes (arch/01 §5): load the HNSW sidecar when it is fresh
+        // (its stamped commit sequence equals the data's), else rebuild from
+        // the KV — the KV is always the source of truth, the sidecar only a
+        // cache.
+        let registry = match sidecar.as_deref().zip(prior_seq).and_then(|(p, seq)| {
+            let reg = VectorRegistry::load_sidecar(p, seq);
+            if reg.is_some() {
+                tracing::info!(path = %p.display(), "loaded HNSW sidecar");
+            }
+            reg
+        }) {
+            Some(reg) => reg,
+            None => {
+                let mut reg = VectorRegistry::new();
+                engine.with_read(|txn| reg.rebuild_from(txn))?;
+                reg
+            }
+        };
         Ok(Self {
             engine,
             indexes: RwLock::new(registry),
             cache: GraphCache::new(CACHE_BYTES),
+            sidecar,
         })
     }
 

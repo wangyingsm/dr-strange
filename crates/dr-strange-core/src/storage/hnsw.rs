@@ -196,13 +196,19 @@ impl HnswIndex {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         let mut idx: HnswIndex = postcard::from_bytes(&bytes).map_err(backend)?;
-        // Rebuild the live-id index (not serialized).
-        for (i, node) in idx.nodes.iter().enumerate() {
+        idx.reindex();
+        Ok(idx)
+    }
+
+    /// Rebuild the live-id lookup (`id_to_idx`) from `nodes`. Needed after any
+    /// deserialization, since that map is `#[serde(skip)]`. Idempotent.
+    pub(crate) fn reindex(&mut self) {
+        self.id_to_idx.clear();
+        for (i, node) in self.nodes.iter().enumerate() {
             if !node.deleted {
-                idx.id_to_idx.insert(node.id, i);
+                self.id_to_idx.insert(node.id, i);
             }
         }
-        Ok(idx)
     }
 
     pub fn len(&self) -> usize {
