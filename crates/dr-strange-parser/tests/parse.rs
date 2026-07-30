@@ -2,8 +2,21 @@
 //! `Source`/`Step`/`Expr` helpers, so these tests double as a spec for how each
 //! Cypher construct maps onto the pipeline.
 
-use dr_strange_core::{Dir, LogicalPlan, PropValue, SortKey, Source, Step, has_label, lit, p};
-use dr_strange_parser::{ParseError, parse};
+use dr_strange_core::{
+    Dir, LogicalPlan, Metric, PropValue, SortKey, Source, Step, distance, has_label, hops, lit, p,
+    score, similarity,
+};
+use dr_strange_parser::{Embedder, ParseError, parse, parse_with_embedder};
+
+/// A deterministic stand-in for a real embedding provider: text → a tiny
+/// vector derived from it, so tests can assert exact plans.
+struct MockEmbedder;
+impl Embedder for MockEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let first = text.chars().next().map_or(0.0, |c| c as u32 as f32);
+        Ok(vec![text.len() as f32, first])
+    }
+}
 
 fn plan(q: &str) -> LogicalPlan {
     parse(q).unwrap_or_else(|e| panic!("parse failed for `{q}`: {e}"))
@@ -390,6 +403,197 @@ fn rejects_unknown_variable_in_return_and_order_by() {
     assert!(matches!(
         err("MATCH (n) RETURN n ORDER BY zzz.x"),
         ParseError::Compile(_)
+    ));
+}
+
+// ---- vector search --------------------------------------------------------
+
+#[test]
+fn search_compiles_to_vector_topk() {
+    assert_eq!(
+        plan("SEARCH (p:Paper) ON embedding NEAR [1.0, 0.0, -0.5] METRIC cosine TOPK 5 RETURN p"),
+        LogicalPlan {
+            source: Source::VectorTopK {
+                label: Some("Paper".into()),
+                property: "embedding".into(),
+                query: vec![1.0, 0.0, -0.5],
+                metric: Metric::Cosine,
+                k: 5,
+            },
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn search_defaults_metric_cosine_topk_10_and_no_label() {
+    assert_eq!(
+        plan("SEARCH (n) ON emb NEAR [1.0] RETURN n"),
+        LogicalPlan {
+            source: Source::VectorTopK {
+                label: None,
+                property: "emb".into(),
+                query: vec![1.0],
+                metric: Metric::Cosine,
+                k: 10,
+            },
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn search_with_where_and_order_by_score() {
+    let pl = plan(
+        "SEARCH (p:Paper) ON emb NEAR [1.0, 0.0] TOPK 20 \
+         WHERE p.year >= 2020 RETURN p ORDER BY score() DESC LIMIT 5",
+    );
+    assert_eq!(
+        pl.source,
+        Source::VectorTopK {
+            label: Some("Paper".into()),
+            property: "emb".into(),
+            query: vec![1.0, 0.0],
+            metric: Metric::Cosine,
+            k: 20,
+        }
+    );
+    assert_eq!(
+        pl.steps,
+        vec![
+            Step::Filter(p("year").ge(2020)),
+            Step::Sort(vec![SortKey {
+                expr: score(),
+                descending: true,
+            }]),
+            Step::Limit(5),
+        ]
+    );
+}
+
+#[test]
+fn search_metric_l2_and_dot() {
+    let m = |q: &str| match plan(q).source {
+        Source::VectorTopK { metric, .. } => metric,
+        _ => panic!("expected VectorTopK"),
+    };
+    assert_eq!(
+        m("SEARCH (n) ON e NEAR [1.0] METRIC l2 RETURN n"),
+        Metric::L2
+    );
+    assert_eq!(
+        m("SEARCH (n) ON e NEAR [1.0] METRIC dot RETURN n"),
+        Metric::Dot
+    );
+}
+
+#[test]
+fn similarity_in_order_by_brute_force_rank() {
+    assert_eq!(
+        plan(
+            "MATCH (n:Paper) RETURN n ORDER BY similarity(n.embedding, [1.0, 0.0], cosine) DESC LIMIT 10"
+        ),
+        LogicalPlan {
+            source: Source::ScanLabel("Paper".into()),
+            steps: vec![
+                Step::Sort(vec![SortKey {
+                    expr: similarity("embedding", vec![1.0, 0.0], Metric::Cosine),
+                    descending: true,
+                }]),
+                Step::Limit(10),
+            ],
+        }
+    );
+}
+
+#[test]
+fn distance_in_where_defaults_cosine() {
+    assert_eq!(
+        plan("MATCH (n) WHERE distance(n.emb, [1.0]) < 0.5 RETURN n").steps,
+        vec![Step::Filter(
+            distance("emb", vec![1.0], Metric::Cosine).lt(lit(0.5))
+        )]
+    );
+}
+
+#[test]
+fn score_hops_fusion_in_order_by() {
+    assert_eq!(
+        plan("MATCH (a)-[:R*1..2]->(n) RETURN n ORDER BY score() * 0.7 + hops() DESC").steps,
+        vec![
+            Step::ExpandVar {
+                dir: Dir::Out,
+                edge_type: Some("R".into()),
+                min: 1,
+                max: 2,
+            },
+            Step::Sort(vec![SortKey {
+                expr: score().mul(lit(0.7)).add(hops()),
+                descending: true,
+            }]),
+        ]
+    );
+}
+
+#[test]
+fn search_by_text_embeds_via_the_embedder() {
+    // "hi" → MockEmbedder → [len=2, first='h'=104].
+    let pl = parse_with_embedder(
+        "SEARCH (p:Paper) ON embedding NEAR \"hi\" TOPK 5 RETURN p",
+        &MockEmbedder,
+    )
+    .unwrap();
+    assert_eq!(
+        pl.source,
+        Source::VectorTopK {
+            label: Some("Paper".into()),
+            property: "embedding".into(),
+            query: vec![2.0, 'h' as u32 as f32],
+            metric: Metric::Cosine,
+            k: 5,
+        }
+    );
+}
+
+#[test]
+fn text_search_without_an_embedder_is_a_clear_error() {
+    let e = parse("SEARCH (n) ON e NEAR \"hello\" RETURN n").unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)));
+    assert!(
+        e.to_string().contains("embedding provider"),
+        "message should point at the missing provider: {e}"
+    );
+}
+
+#[test]
+fn similarity_by_text_embeds_too() {
+    // "cat" → [3, 'c'=99].
+    let pl = parse_with_embedder(
+        "MATCH (n:Paper) RETURN n ORDER BY similarity(n.embedding, \"cat\") DESC LIMIT 3",
+        &MockEmbedder,
+    )
+    .unwrap();
+    assert_eq!(
+        pl.steps,
+        vec![
+            Step::Sort(vec![SortKey {
+                expr: similarity("embedding", vec![3.0, 'c' as u32 as f32], Metric::Cosine),
+                descending: true,
+            }]),
+            Step::Limit(3),
+        ]
+    );
+}
+
+#[test]
+fn rejects_unknown_function_and_metric() {
+    assert!(matches!(
+        err("MATCH (n) RETURN n ORDER BY foo(n.x)"),
+        ParseError::Syntax(_)
+    ));
+    assert!(matches!(
+        err("SEARCH (n) ON e NEAR [1.0] METRIC banana RETURN n"),
+        ParseError::Syntax(_)
     ));
 }
 

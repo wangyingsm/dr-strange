@@ -14,12 +14,54 @@ use std::collections::{BTreeSet, HashMap};
 use dr_strange_core::compute::expr::ArithOp;
 use dr_strange_core::{Expr, LogicalPlan, PropValue, SortKey, Source, Step};
 
+use crate::Embedder;
 use crate::ast::*;
 
-pub fn compile(q: Query) -> Result<LogicalPlan, String> {
+/// Resolve a query-vector argument: a literal passes through; text is embedded
+/// via the supplied `embedder`, failing clearly when none is configured.
+fn resolve(arg: &VecArg, embedder: Option<&dyn Embedder>) -> Result<Vec<f32>, String> {
+    match arg {
+        VecArg::Vector(v) => Ok(v.clone()),
+        VecArg::Text(t) => {
+            let e = embedder.ok_or_else(|| {
+                "SEARCH by text needs an embedding provider (set the API key), \
+                 or pass a literal vector like NEAR [..]"
+                    .to_string()
+            })?;
+            e.embed(t)
+                .map_err(|e| format!("embedding the query text failed: {e}"))
+        }
+    }
+}
+
+pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan, String> {
+    // Derive the source and the node path from either MATCH or SEARCH. Both
+    // consume their first node's label into the source (ScanLabel / VectorTopK),
+    // so it never becomes a HasLabel filter.
+    let empty_rest: Vec<(RelPat, NodePat)> = Vec::new();
+    let (source, first_node, rest): (Source, &NodePat, &[(RelPat, NodePat)]) = match &q.source {
+        QuerySource::Match(p) => {
+            let src = match &p.first.label {
+                Some(l) => Source::ScanLabel(l.clone()),
+                None => Source::ScanAll,
+            };
+            (src, &p.first, p.rest.as_slice())
+        }
+        QuerySource::Search(s) => {
+            let src = Source::VectorTopK {
+                label: s.node.label.clone(),
+                property: s.property.clone(),
+                query: resolve(&s.query, embedder)?,
+                metric: s.metric,
+                k: s.k,
+            };
+            (src, &s.node, empty_rest.as_slice())
+        }
+    };
+
     // Nodes in path order; node i becomes the current row after i expands.
-    let mut nodes: Vec<&NodePat> = vec![&q.pattern.first];
-    nodes.extend(q.pattern.rest.iter().map(|(_, n)| n));
+    let mut nodes: Vec<&NodePat> = vec![first_node];
+    nodes.extend(rest.iter().map(|(_, n)| n));
     let last = nodes.len() - 1;
 
     // Variable → slot index. Reusing a variable would mean a graph constraint
@@ -56,21 +98,15 @@ pub fn compile(q: Query) -> Result<LogicalPlan, String> {
                     );
                 }
             };
-            slot_filters[slot].push(compile_expr(&conj));
+            slot_filters[slot].push(compile_expr(&conj, embedder)?);
         }
     }
-
-    // Source from the first node's label.
-    let source = match &nodes[0].label {
-        Some(l) => Source::ScanLabel(l.clone()),
-        None => Source::ScanAll,
-    };
 
     let mut steps: Vec<Step> = Vec::new();
     steps.extend(slot_filters[0].drain(..).map(Step::Filter));
 
     for idx in 1..nodes.len() {
-        let (rel, _) = &q.pattern.rest[idx - 1];
+        let (rel, _) = &rest[idx - 1];
         match rel.var_len {
             None => steps.push(Step::Expand {
                 dir: rel.dir,
@@ -134,7 +170,7 @@ pub fn compile(q: Query) -> Result<LogicalPlan, String> {
                 }
             }
             keys.push(SortKey {
-                expr: compile_expr(&ok.expr),
+                expr: compile_expr(&ok.expr, embedder)?,
                 descending: ok.descending,
             });
         }
@@ -173,10 +209,14 @@ fn split_and(e: PExpr) -> Vec<PExpr> {
 fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
     fn go(e: &PExpr, out: &mut BTreeSet<String>) {
         match e {
-            PExpr::Prop { var, .. } | PExpr::HasLabel { var, .. } => {
+            PExpr::Prop { var, .. }
+            | PExpr::HasLabel { var, .. }
+            | PExpr::Similarity { var, .. }
+            | PExpr::Distance { var, .. } => {
                 out.insert(var.clone());
             }
-            PExpr::Lit(_) => {}
+            // score()/hops() read the row channel, not a variable's node.
+            PExpr::Lit(_) | PExpr::Score | PExpr::Hops => {}
             PExpr::IsNull(x) | PExpr::Not(x) | PExpr::Neg(x) => go(x, out),
             PExpr::Compare { lhs, rhs, .. }
             | PExpr::Logic { lhs, rhs, .. }
@@ -192,16 +232,18 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
 }
 
 /// Drop the variable qualifiers (the slot is already fixed by pushdown) and map
-/// straight onto core's `Expr`.
-fn compile_expr(e: &PExpr) -> Expr {
-    match e {
+/// straight onto core's `Expr`. Fallible only because `similarity`/`distance`
+/// may embed a text argument via `embedder`.
+fn compile_expr(e: &PExpr, embedder: Option<&dyn Embedder>) -> Result<Expr, String> {
+    let sub = |x: &PExpr| compile_expr(x, embedder).map(Box::new);
+    Ok(match e {
         PExpr::Lit(v) => Expr::Literal(v.clone()),
         PExpr::Prop { key, .. } => Expr::Property(key.clone()),
         PExpr::HasLabel { label, .. } => Expr::HasLabel(label.clone()),
-        PExpr::IsNull(x) => Expr::IsNull(Box::new(compile_expr(x))),
-        PExpr::Not(x) => Expr::Not(Box::new(compile_expr(x))),
+        PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
+        PExpr::Not(x) => Expr::Not(sub(x)?),
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).
-        PExpr::Neg(x) => match compile_expr(x) {
+        PExpr::Neg(x) => match compile_expr(x, embedder)? {
             Expr::Literal(PropValue::Int(n)) => Expr::Literal(PropValue::Int(-n)),
             Expr::Literal(PropValue::Float(f)) => Expr::Literal(PropValue::Float(-f)),
             other => Expr::Arith {
@@ -212,18 +254,40 @@ fn compile_expr(e: &PExpr) -> Expr {
         },
         PExpr::Compare { op, lhs, rhs } => Expr::Compare {
             op: *op,
-            lhs: Box::new(compile_expr(lhs)),
-            rhs: Box::new(compile_expr(rhs)),
+            lhs: sub(lhs)?,
+            rhs: sub(rhs)?,
         },
         PExpr::Logic { op, lhs, rhs } => Expr::Logic {
             op: *op,
-            lhs: Box::new(compile_expr(lhs)),
-            rhs: Box::new(compile_expr(rhs)),
+            lhs: sub(lhs)?,
+            rhs: sub(rhs)?,
         },
         PExpr::Arith { op, lhs, rhs } => Expr::Arith {
             op: *op,
-            lhs: Box::new(compile_expr(lhs)),
-            rhs: Box::new(compile_expr(rhs)),
+            lhs: sub(lhs)?,
+            rhs: sub(rhs)?,
         },
-    }
+        PExpr::Score => Expr::Score,
+        PExpr::Hops => Expr::Hops,
+        PExpr::Similarity {
+            property,
+            query,
+            metric,
+            ..
+        } => Expr::Similarity {
+            property: property.clone(),
+            query: resolve(query, embedder)?,
+            metric: *metric,
+        },
+        PExpr::Distance {
+            property,
+            query,
+            metric,
+            ..
+        } => Expr::Distance {
+            property: property.clone(),
+            query: resolve(query, embedder)?,
+            metric: *metric,
+        },
+    })
 }

@@ -7,12 +7,13 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
 use nom::combinator::{map, map_res, not, opt, recognize, value};
-use nom::multi::{many0, separated_list1};
+use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
 
-use dr_strange_core::Dir;
+use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
+use dr_strange_core::types::Dir;
 
 use crate::ast::*;
 
@@ -230,7 +231,7 @@ fn unary(i: &str) -> IResult<&str, PExpr> {
 }
 
 fn primary(i: &str) -> IResult<&str, PExpr> {
-    alt((paren_expr, literal, var_ref))(i)
+    alt((paren_expr, literal, func_or_var))(i)
 }
 
 fn paren_expr(i: &str) -> IResult<&str, PExpr> {
@@ -240,19 +241,143 @@ fn paren_expr(i: &str) -> IResult<&str, PExpr> {
     Ok((i, e))
 }
 
-/// A variable reference: `v.key` (property) or `v:Label` (label predicate). A
-/// bare variable is not a valid expression term in this cut.
-fn var_ref(i: &str) -> IResult<&str, PExpr> {
-    let (i, var) = ident(i)?;
-    let (i, _) = multispace0(i)?;
-    let (i, sep) = one_of(".:")(i)?;
-    let (i, name) = ident(i)?;
+/// An identifier at expression head: either a function call `name(...)` (a
+/// scoring term), a property `v.key`, or a label predicate `v:Label`. A bare
+/// variable is not a valid term in this cut.
+fn func_or_var(i: &str) -> IResult<&str, PExpr> {
+    let (after_name, name) = ident(i)?;
+    let (after_ws, _) = multispace0(after_name)?;
+    if after_ws.starts_with('(') {
+        // Committed to a function call once we see `(` — a bad one is a hard
+        // error, not a fall-through to the property/label form.
+        return func_call(&name, after_ws);
+    }
+    let (i, sep) = one_of(".:")(after_ws)?;
+    let (i, member) = ident(i)?;
     let out = if sep == '.' {
-        PExpr::Prop { var, key: name }
+        PExpr::Prop {
+            var: name,
+            key: member,
+        }
     } else {
-        PExpr::HasLabel { var, label: name }
+        PExpr::HasLabel {
+            var: name,
+            label: member,
+        }
     };
     Ok((i, out))
+}
+
+/// The recognized scoring functions: `score()`, `hops()`,
+/// `similarity(v.prop, <vector>[, metric])`, `distance(v.prop, <vector>[, metric])`.
+fn func_call<'a>(name: &str, i: &'a str) -> IResult<&'a str, PExpr> {
+    let (i, _) = symbol("(")(i)?;
+    match name {
+        "score" => {
+            let (i, _) = symbol(")")(i)?;
+            Ok((i, PExpr::Score))
+        }
+        "hops" => {
+            let (i, _) = symbol(")")(i)?;
+            Ok((i, PExpr::Hops))
+        }
+        "similarity" | "distance" => {
+            let (i, (var, key)) = prop_ref(i)?;
+            let (i, _) = symbol(",")(i)?;
+            let (i, query) = vec_arg(i)?;
+            let (i, metric) = opt(preceded(symbol(","), metric_ident))(i)?;
+            let (i, _) = symbol(")")(i)?;
+            let metric = metric.unwrap_or(Metric::Cosine);
+            let out = if name == "similarity" {
+                PExpr::Similarity {
+                    var,
+                    property: key,
+                    query,
+                    metric,
+                }
+            } else {
+                PExpr::Distance {
+                    var,
+                    property: key,
+                    query,
+                    metric,
+                }
+            };
+            Ok((i, out))
+        }
+        // Unknown function → a syntax error at this position.
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Tag,
+        ))),
+    }
+}
+
+/// A property reference `v.key`.
+fn prop_ref(i: &str) -> IResult<&str, (String, String)> {
+    let (i, var) = ident(i)?;
+    let (i, _) = multispace0(i)?;
+    let (i, _) = char('.')(i)?;
+    let (i, key) = ident(i)?;
+    Ok((i, (var, key)))
+}
+
+/// A vector literal `[f, f, …]` (empty allowed). Ints and floats both coerce
+/// to f32; a leading `-` negates.
+fn vector_literal(i: &str) -> IResult<&str, Vec<f32>> {
+    let (i, _) = symbol("[")(i)?;
+    let (i, xs) = separated_list0(symbol(","), f32_num)(i)?;
+    let (i, _) = symbol("]")(i)?;
+    Ok((i, xs))
+}
+
+/// A query-vector argument: `"text"` (embedded server-side) or `[..]` (literal).
+fn vec_arg(i: &str) -> IResult<&str, VecArg> {
+    alt((
+        map(quoted_str('\''), VecArg::Text),
+        map(quoted_str('"'), VecArg::Text),
+        map(vector_literal, VecArg::Vector),
+    ))(i)
+}
+
+/// A quoted string's contents (no escapes in this cut).
+fn quoted_str<'a>(q: char) -> impl Fn(&'a str) -> IResult<&'a str, String> {
+    move |i: &'a str| {
+        let (i, _) = multispace0(i)?;
+        let (i, s) = delimited(char(q), take_while(|c| c != q), char(q))(i)?;
+        Ok((i, s.to_string()))
+    }
+}
+
+fn f32_num(i: &str) -> IResult<&str, f32> {
+    let (i, neg) = opt(symbol("-"))(i)?;
+    let (i, v) = number(i)?;
+    let mut f = match v {
+        PropValue::Float(x) => x as f32,
+        PropValue::Int(n) => n as f32,
+        _ => 0.0, // `number` only ever yields Int/Float
+    };
+    if neg.is_some() {
+        f = -f;
+    }
+    Ok((i, f))
+}
+
+/// A metric name: `cosine` (default), `dot`, or `l2` (case-insensitive).
+fn metric_ident(i: &str) -> IResult<&str, Metric> {
+    let (rest, name) = ident(i)?;
+    let m = match name.to_ascii_lowercase().as_str() {
+        "cosine" => Metric::Cosine,
+        "dot" => Metric::Dot,
+        "l2" => Metric::L2,
+        _ => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+    };
+    Ok((rest, m))
 }
 
 // ---- pattern grammar ------------------------------------------------------
@@ -352,11 +477,17 @@ fn order_key(i: &str) -> IResult<&str, OrderKey> {
     ))
 }
 
-/// Parse a whole query. The public [`crate::parse`] wraps this and enforces
-/// that all input was consumed.
-pub fn query(i: &str) -> IResult<&str, Query> {
-    let (i, _) = kw("match")(i)?;
-    let (i, pattern) = pattern(i)?;
+/// The clauses shared by every query, after its source: an optional WHERE, a
+/// RETURN, then optional ORDER BY / SKIP / LIMIT.
+type Tail = (
+    Option<PExpr>,
+    Return,
+    Vec<OrderKey>,
+    Option<u64>,
+    Option<u64>,
+);
+
+fn query_tail(i: &str) -> IResult<&str, Tail> {
     let (i, where_clause) = opt(preceded(kw("where"), expr))(i)?;
     let (i, _) = kw("return")(i)?;
     let (i, distinct) = opt(kw("distinct"))(i)?;
@@ -369,16 +500,64 @@ pub fn query(i: &str) -> IResult<&str, Query> {
     let (i, limit) = opt(preceded(kw("limit"), uint))(i)?;
     Ok((
         i,
-        Query {
-            pattern,
+        (
             where_clause,
-            ret: Return {
+            Return {
                 distinct: distinct.is_some(),
                 item,
             },
-            order_by: order_by.unwrap_or_default(),
+            order_by.unwrap_or_default(),
             skip,
             limit,
-        },
+        ),
     ))
+}
+
+fn assemble(source: QuerySource, (where_clause, ret, order_by, skip, limit): Tail) -> Query {
+    Query {
+        source,
+        where_clause,
+        ret,
+        order_by,
+        skip,
+        limit,
+    }
+}
+
+fn match_query(i: &str) -> IResult<&str, Query> {
+    let (i, _) = kw("match")(i)?;
+    let (i, pattern) = pattern(i)?;
+    let (i, tail) = query_tail(i)?;
+    Ok((i, assemble(QuerySource::Match(pattern), tail)))
+}
+
+/// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` — the
+/// indexed vector seed (`Source::VectorTopK`).
+fn search_query(i: &str) -> IResult<&str, Query> {
+    let (i, _) = kw("search")(i)?;
+    let (i, node) = node_pat(i)?;
+    let (i, _) = kw("on")(i)?;
+    let (i, property) = ident(i)?;
+    let (i, _) = kw("near")(i)?;
+    let (i, query) = vec_arg(i)?;
+    let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
+    let (i, k) = opt(preceded(kw("topk"), uint))(i)?;
+    let (i, tail) = query_tail(i)?;
+    let clause = SearchClause {
+        node,
+        property,
+        query,
+        metric: metric.unwrap_or(Metric::Cosine),
+        k: k.unwrap_or(DEFAULT_TOPK),
+    };
+    Ok((i, assemble(QuerySource::Search(clause), tail)))
+}
+
+/// Default `TOPK` when the `SEARCH` clause omits it.
+const DEFAULT_TOPK: u64 = 10;
+
+/// Parse a whole query. The public [`crate::parse`] wraps this and enforces
+/// that all input was consumed.
+pub fn query(i: &str) -> IResult<&str, Query> {
+    alt((match_query, search_query))(i)
 }

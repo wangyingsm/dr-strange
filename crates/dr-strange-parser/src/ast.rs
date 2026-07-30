@@ -5,19 +5,50 @@
 //! ([`crate::compile`]) is what decides *where* in the pipeline each predicate
 //! belongs and drops the qualifier when it lands on that variable's slot.
 
-use dr_strange_core::Dir;
+use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
+use dr_strange_core::types::Dir;
 
-/// A whole parsed query: `MATCH … [WHERE …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n]`.
+/// A whole parsed query: a source (`MATCH` pattern or a `SEARCH` vector seed),
+/// then `[WHERE …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
-    pub pattern: Pattern,
+    pub source: QuerySource,
     pub where_clause: Option<PExpr>,
     pub ret: Return,
     pub order_by: Vec<OrderKey>,
     pub skip: Option<u64>,
     pub limit: Option<u64>,
+}
+
+/// Where the query's rows originate: a graph pattern (`MATCH`) or an indexed
+/// vector search (`SEARCH`). Both bind their node variables the same way, so
+/// the rest of the query (WHERE/RETURN/ORDER BY/…) is shared.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuerySource {
+    Match(Pattern),
+    Search(SearchClause),
+}
+
+/// A query-vector argument: either a literal vector (programmatic) or text to
+/// embed server-side (the ergonomic default — no 1024-float client payload).
+#[derive(Debug, Clone, PartialEq)]
+pub enum VecArg {
+    Vector(Vec<f32>),
+    Text(String),
+}
+
+/// `SEARCH (v:Label) ON prop NEAR <query> [METRIC m] [TOPK k]` — the indexed
+/// similarity seed (compiles to `Source::VectorTopK`). One node, no traversal
+/// tail in this cut. `<query>` is `"text"` (embedded) or `[..]` (literal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchClause {
+    pub node: NodePat,
+    pub property: String,
+    pub query: VecArg,
+    pub metric: Metric,
+    pub k: u64,
 }
 
 /// A single linear path: one node, then zero or more `(relationship, node)`
@@ -99,5 +130,24 @@ pub enum PExpr {
         op: ArithOp,
         lhs: Box<PExpr>,
         rhs: Box<PExpr>,
+    },
+    // ---- scoring terms (vector search) ----
+    /// The row's similarity score channel — `score()`.
+    Score,
+    /// Hops taken to reach the current node — `hops()`.
+    Hops,
+    /// `similarity(v.prop, <query>, metric)` — higher is closer.
+    Similarity {
+        var: String,
+        property: String,
+        query: VecArg,
+        metric: Metric,
+    },
+    /// `distance(v.prop, <query>, metric)` — lower is closer.
+    Distance {
+        var: String,
+        property: String,
+        query: VecArg,
+        metric: Metric,
     },
 }
