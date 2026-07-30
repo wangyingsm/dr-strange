@@ -32,14 +32,34 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, backend};
 use crate::storage::engine::{
     KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction, prefix_successor,
 };
+
+/// Shared cache of decoded-on-read SST data blocks, keyed by `(sst id, block
+/// offset)` and byte-weighted, so repeated reads of a hot block skip the
+/// `pread`. Ids are unique per engine instance (a monotonic counter), and the
+/// cache is dropped with the engine, so a compacted-away run's entries age out.
+pub(super) type BlockCache = Cache<(u64, u64), Arc<Vec<u8>>>;
+
+/// Byte budget for the block cache.
+const BLOCK_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn new_block_cache() -> Arc<BlockCache> {
+    Arc::new(
+        Cache::builder()
+            .max_capacity(BLOCK_CACHE_BYTES)
+            .weigher(|_k, v: &Arc<Vec<u8>>| v.len().min(u32::MAX as usize) as u32)
+            .build(),
+    )
+}
 
 /// Flush the memtable to an SST once its live bytes exceed this. SST + WAL then
 /// bound memory and log growth; below it everything stays in the memtable.
@@ -104,6 +124,18 @@ pub struct NativeEngine {
     /// reclaims a version some open reader could still need. Registered under
     /// the store read lock at `begin_read` (see the ordering note there).
     readers: Mutex<BTreeMap<u64, usize>>,
+    /// Shared SST block cache + the monotonic id counter that keys it.
+    blocks: Arc<BlockCache>,
+    next_sst_id: AtomicU64,
+}
+
+impl NativeEngine {
+    /// Open an SST, giving it a fresh cache id + a handle to the shared block
+    /// cache.
+    fn open_sst(&self, path: &Path) -> Result<Arc<sst::Sst>> {
+        let id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(sst::Sst::open(path, id, self.blocks.clone())?))
+    }
 }
 
 impl NativeEngine {
@@ -124,9 +156,12 @@ impl NativeEngine {
             next_sst: sst::next_number(&dir),
             ..Store::default()
         };
+        let blocks = new_block_cache();
+        let mut next_id = 0u64;
         // SSTs first (oldest→newest), tracking the highest sequence they hold.
         for sst_path in sst::list(&dir) {
-            let s = sst::Sst::open(&sst_path)?;
+            let s = sst::Sst::open(&sst_path, next_id, blocks.clone())?;
+            next_id += 1;
             store.committed_seq = store.committed_seq.max(s.max_seq);
             store.ssts.push(Arc::new(s));
         }
@@ -150,6 +185,8 @@ impl NativeEngine {
             dir,
             flush_threshold,
             readers: Mutex::new(BTreeMap::new()),
+            blocks,
+            next_sst_id: AtomicU64::new(next_id),
         })
     }
 
@@ -164,7 +201,8 @@ impl NativeEngine {
         store.next_sst += 1;
         let path = self.dir.join(format!("sst-{n:06}"));
         sst::write(&path, &store.mem, store.committed_seq)?;
-        store.ssts.push(Arc::new(sst::Sst::open(&path)?));
+        let s = self.open_sst(&path)?;
+        store.ssts.push(s);
         store.mem.clear();
         store.mem_bytes = 0;
 
@@ -222,7 +260,7 @@ impl NativeEngine {
 
         let path = self.dir.join(format!("sst-{next:06}"));
         sst::write(&path, &kept, max_seq)?;
-        let merged_sst = Arc::new(sst::Sst::open(&path)?);
+        let merged_sst = self.open_sst(&path)?;
 
         // Swap the merged runs out for the single new run. Single writer ⇒ the
         // first `runs.len()` entries are exactly the ones we merged.

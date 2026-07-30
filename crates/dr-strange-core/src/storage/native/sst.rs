@@ -21,10 +21,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::storage::native::{MemKey, Op};
+use crate::storage::native::{BlockCache, MemKey, Op};
 
 const MAGIC: u32 = 0x5353_5244; // "DRSS"
 // Footer: index_offset, index_len, bloom_offset, bloom_len, count, max_seq (6×u64)
@@ -142,6 +142,9 @@ pub(super) struct Sst {
     pub(super) max_seq: u64,
     /// This run's file, so compaction can delete it once merged away.
     pub(super) path: PathBuf,
+    /// Unique id (keys this run's blocks in the shared cache) + the cache.
+    id: u64,
+    cache: Arc<BlockCache>,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -341,7 +344,7 @@ fn decode_entry(c: &mut Cursor<'_>) -> Option<Entry> {
 }
 
 impl Sst {
-    pub(super) fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path, id: u64, cache: Arc<BlockCache>) -> Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.seek(SeekFrom::End(0))?;
         if file_len < FOOTER_LEN {
@@ -411,6 +414,8 @@ impl Sst {
             bloom,
             max_seq,
             path: path.to_path_buf(),
+            id,
+            cache,
         })
     }
 
@@ -428,12 +433,21 @@ impl Sst {
         Ok(())
     }
 
-    fn read_block(&self, block: &BlockRef) -> Result<Vec<u8>> {
-        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        file.seek(SeekFrom::Start(block.offset))?;
-        let mut buf = vec![0u8; block.len as usize];
-        file.read_exact(&mut buf)?;
-        Ok(buf)
+    fn read_block(&self, block: &BlockRef) -> Result<Arc<Vec<u8>>> {
+        let key = (self.id, block.offset);
+        if let Some(cached) = self.cache.get(&key) {
+            return Ok(cached);
+        }
+        let buf = {
+            let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+            file.seek(SeekFrom::Start(block.offset))?;
+            let mut buf = vec![0u8; block.len as usize];
+            file.read_exact(&mut buf)?;
+            buf
+        };
+        let arc = Arc::new(buf);
+        self.cache.insert(key, arc.clone());
+        Ok(arc)
     }
 
     /// The index of the first block that may hold `(table, key)`'s versions:

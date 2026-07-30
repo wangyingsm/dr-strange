@@ -38,7 +38,7 @@ enum Engine {
     #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
     Redb(RedbEngine),
     #[cfg(feature = "native-backend")]
-    Native(NativeEngine),
+    Native(Box<NativeEngine>),
 }
 
 impl Engine {
@@ -153,7 +153,7 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         #[cfg(feature = "native-backend")]
-        let engine = Engine::Native(NativeEngine::open(path)?);
+        let engine = Engine::Native(Box::new(NativeEngine::open(path)?));
         #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
         let engine = Engine::Redb(RedbEngine::open(path)?);
         let db = Self::init(engine, Some(sidecar_path(path)))?;
