@@ -236,6 +236,20 @@ fn merge_on_set_must_reference_the_merge_variable() {
 }
 
 #[test]
+fn create_duplicate_key_errors_and_rolls_back() {
+    let db = Database::in_memory().unwrap();
+    // Two nodes claiming the same external key — the second create fails; the
+    // whole statement's txn is never committed.
+    let stmt = parse_statement(r#"CREATE (a {key:"x"}), (b {key:"x"})"#).unwrap();
+    let err = match stmt {
+        Statement::Write(w) => w.apply(&plane(&db)).unwrap_err(),
+        Statement::Read(_) => panic!("expected write"),
+    };
+    assert!(!err.is_empty(), "duplicate key should error");
+    assert!(plane(&db).node_by_key("x").unwrap().is_none()); // rolled back
+}
+
+#[test]
 fn read_parse_rejects_a_write() {
     // The read-only `parse` refuses a write with a clear message.
     let e = parse("CREATE (n:Person)").unwrap_err();
