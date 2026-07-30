@@ -142,6 +142,28 @@ async fn serves_dashboard_and_rpc() {
         .await
         .unwrap();
     assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A CREATE write mutates the plane and returns its change-counts.
+    let created = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body(r#"CREATE (w:Widget {key:"w1"})"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    let cv: Value = created.json().await.unwrap();
+    assert_eq!(cv["write"], true);
+    assert_eq!(cv["nodes_created"], 1);
+    // …and it's really there.
+    let got = rpc(
+        &client,
+        &base,
+        "node.get",
+        json!({ "plane": "startup", "key": "w1" }),
+    )
+    .await;
+    assert_eq!(got["result"]["external_key"], "w1");
 }
 
 /// The auth gate, exercised over the real HTTP wiring (the header →

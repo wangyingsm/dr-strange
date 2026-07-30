@@ -105,9 +105,10 @@ pub fn query(db: &Database, plane_name: &str, plan_json: &str, out: &mut dyn Wri
     run_plan(db, plane_name, plan, out)
 }
 
-/// Run a query written in the openCypher-subset language (arch/00 §5): compile
-/// it to a `LogicalPlan`, then execute it exactly like the JSON `query` path.
-/// `embed` names an embedding provider for a text `SEARCH … NEAR "…"`.
+/// Run a statement written in the query language (arch/00 §5): a read compiles
+/// to a `LogicalPlan` and runs like the JSON `query` path; a write (`CREATE`, …)
+/// is applied to the plane and its change-counts are reported. `embed` names an
+/// embedding provider for a text `SEARCH … NEAR "…"`.
 pub fn cypher(
     db: &Database,
     plane_name: &str,
@@ -115,15 +116,44 @@ pub fn cypher(
     embed: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let plan = compile_cypher(query, embed)?;
-    run_plan(db, plane_name, plan, out)
+    match parse_stmt(query, embed)? {
+        dr_strange_parser::Statement::Read(plan) => run_plan(db, plane_name, plan, out),
+        dr_strange_parser::Statement::Write(w) => {
+            let p = plane(db, plane_name)?;
+            let summary = w.apply(&p).map_err(|e| anyhow!("{e}"))?;
+            writeln!(out, "{}", write_summary_line(&summary))?;
+            Ok(())
+        }
+    }
 }
 
-/// Compile a query, embedding a text `SEARCH … NEAR "…"` when an `embed`
+/// A human-readable one-liner of a write's effect — the non-zero counts.
+fn write_summary_line(s: &dr_strange_parser::WriteSummary) -> String {
+    let mut parts = Vec::new();
+    for (n, label) in [
+        (s.nodes_created, "nodes created"),
+        (s.edges_created, "edges created"),
+        (s.props_set, "props set"),
+        (s.labels_set, "labels set"),
+        (s.nodes_deleted, "nodes deleted"),
+        (s.edges_deleted, "edges deleted"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{n} {label}"));
+        }
+    }
+    if parts.is_empty() {
+        "no changes".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Parse a statement, embedding a text `SEARCH … NEAR "…"` when an `embed`
 /// provider is given. Embedding lives behind the `digest` feature (which pulls
-/// in dr-strange-llm); MATCH / literal-vector queries compile without it.
+/// in dr-strange-llm); everything else parses without it.
 #[cfg(feature = "digest")]
-fn compile_cypher(query: &str, embed: Option<&str>) -> Result<LogicalPlan> {
+fn parse_stmt(query: &str, embed: Option<&str>) -> Result<dr_strange_parser::Statement> {
     // Adapt the LLM provider to the parser's embedder seam (key from the env).
     struct LlmEmbedder(Box<dyn dr_strange_llm::Embedder>);
     impl dr_strange_parser::Embedder for LlmEmbedder {
@@ -144,21 +174,21 @@ fn compile_cypher(query: &str, embed: Option<&str>) -> Result<LogicalPlan> {
             let e = LlmEmbedder(Box::new(dr_strange_llm::build_provider(
                 provider, None, None, None, true,
             )?));
-            dr_strange_parser::parse_with_embedder(query, &e).map_err(|e| anyhow!("{e}"))
+            dr_strange_parser::parse_statement_with_embedder(query, &e).map_err(|e| anyhow!("{e}"))
         }
-        None => dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}")),
+        None => dr_strange_parser::parse_statement(query).map_err(|e| anyhow!("{e}")),
     }
 }
 
 #[cfg(not(feature = "digest"))]
-fn compile_cypher(query: &str, embed: Option<&str>) -> Result<LogicalPlan> {
+fn parse_stmt(query: &str, embed: Option<&str>) -> Result<dr_strange_parser::Statement> {
     if embed.is_some() {
         bail!(
             "text SEARCH embedding needs the `digest` build feature \
              (this binary was built with --no-default-features)"
         );
     }
-    dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}"))
+    dr_strange_parser::parse_statement(query).map_err(|e| anyhow!("{e}"))
 }
 
 /// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
@@ -684,6 +714,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("embedding provider"), "{err}");
+    }
+
+    #[test]
+    fn cypher_create_writes_and_summarizes() {
+        let db = Database::in_memory().unwrap();
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                r#"CREATE (a:Person {key:"alice"})-[:KNOWS]->(b:Person {key:"bob"})"#,
+                None,
+                o,
+            )
+        });
+        assert!(out.contains("2 nodes created"), "{out}");
+        assert!(out.contains("1 edges created"), "{out}");
+        let p = db.plane("startup").unwrap();
+        assert!(p.node_by_key("alice").unwrap().is_some());
+        assert!(p.node_by_key("bob").unwrap().is_some());
     }
 
     #[test]

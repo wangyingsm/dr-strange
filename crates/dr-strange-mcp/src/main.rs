@@ -346,13 +346,28 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     let embedder = dr_strange_llm::build_provider(provider, None, None, None, true)
         .ok()
         .map(|p| LlmEmbedder(Box::new(p)));
-    let plan = match &embedder {
-        Some(e) => dr_strange_parser::parse_with_embedder(&req.query, e),
-        None => dr_strange_parser::parse(&req.query),
+    let stmt = match &embedder {
+        Some(e) => dr_strange_parser::parse_statement_with_embedder(&req.query, e),
+        None => dr_strange_parser::parse_statement(&req.query),
     }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let rows = db.plane(&req.plane)?.query_from_plan(plan).scored_nodes()?;
-    Ok(scored_rows(&rows))
+    let plane = db.plane(&req.plane)?;
+    match stmt {
+        dr_strange_parser::Statement::Read(plan) => {
+            Ok(scored_rows(&plane.query_from_plan(plan).scored_nodes()?))
+        }
+        dr_strange_parser::Statement::Write(w) => {
+            let s = w.apply(&plane).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(jval!({
+                "nodes_created": s.nodes_created,
+                "edges_created": s.edges_created,
+                "props_set": s.props_set,
+                "labels_set": s.labels_set,
+                "nodes_deleted": s.nodes_deleted,
+                "edges_deleted": s.edges_deleted,
+            }))
+        }
+    }
 }
 
 fn write_nodes_logic(db: &Database, req: WriteNodes) -> AnyResult<Value> {
@@ -549,13 +564,14 @@ impl DrStrange {
         self.blocking("query", move |db| query_logic(db, req)).await
     }
 
-    #[tool(description = "Run a query written in the openCypher-subset query \
-        language and return the matching node records. Supports MATCH of one \
-        linear path (labels, ->/<-/- directions, bounded variable-length \
-        *m..n), WHERE (comparisons, AND/OR/NOT, arithmetic, IS [NOT] NULL, \
-        a.prop, a:Label), and RETURN [DISTINCT] / ORDER BY / SKIP / LIMIT. \
-        Prefer this over the raw `query` plan for readability. Example: \
-        `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.")]
+    #[tool(description = "Run a statement in the openCypher-subset query \
+        language. Reads (MATCH one linear path with labels/->/<-/- and bounded \
+        *m..n, SEARCH vector top-k, BEAM similarity traversal, WHERE, RETURN \
+        [DISTINCT]/ORDER BY/SKIP/LIMIT) return the matching node records. \
+        Writes (CREATE) mutate the plane and return change-counts. Prefer this \
+        over the raw `query` plan for readability. Examples: \
+        `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`; \
+        `CREATE (a:Person {key:\"alice\", age:30})-[:KNOWS]->(b:Person {key:\"bob\"})`.")]
     async fn cypher(
         &self,
         Parameters(req): Parameters<Cypher>,
@@ -784,6 +800,24 @@ mod tests {
         assert_eq!(hop[0]["external_key"], jval!("d1"));
         // a malformed query surfaces the parser error, not a panic
         assert!(cypher_logic(&db, from_value(jval!({"query": "MATCH (n)"})).unwrap()).is_err());
+    }
+
+    #[test]
+    fn cypher_create_writes() {
+        let db = Database::in_memory().unwrap();
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({"query": r#"CREATE (a:Person {key:"x", age:40})"#})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["nodes_created"], jval!(1));
+        let n = db
+            .plane("startup")
+            .unwrap()
+            .node_by_key("x")
+            .unwrap()
+            .unwrap();
+        assert!(n.labels.iter().any(|l| l == "Person"));
     }
 
     #[test]

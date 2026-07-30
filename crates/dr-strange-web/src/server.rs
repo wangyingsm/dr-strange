@@ -261,10 +261,13 @@ struct CypherQuery {
     embed: Option<String>,
 }
 
-/// `POST /cypher?plane=startup` — the query text in the body, compiled to a
-/// plan and run; returns `{nodes, edges, count}` (the result set + induced
-/// edges) as JSON so the plot can render it. Read-gated; the scan runs on a
-/// blocking task. A parse/compile error comes back as 400 with the message.
+/// `POST /cypher?plane=startup` — the query text in the body, run against the
+/// plane. A read returns `{nodes, edges, count}` (the result set + induced
+/// edges) for the plot; a write (`CREATE`, …) mutates and returns its
+/// change-counts. **Write-gated**: the language can mutate, so this needs write
+/// authorization even for a read query (the single-token model collapses the
+/// levels anyway; the browser UI is write-capable). Runs on a blocking task; a
+/// parse/compile error comes back as 400 with the message.
 async fn cypher_http(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -275,7 +278,7 @@ async fn cypher_http(
         Ok(c) => c,
         Err(resp) => return *resp,
     };
-    if !state.authorizer.allows(Access::Read, &creds) {
+    if !state.authorizer.allows(Access::Write, &creds) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let query = match String::from_utf8(body.to_vec()) {

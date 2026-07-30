@@ -115,10 +115,11 @@
     }
   }
 
-  // Run a query-language string against the current plane and render its
-  // result (nodes + induced edges) as a fresh subgraph. Empty query → fall
-  // back to the plain label seed. Hits the web-only POST /cypher endpoint
-  // (not an RPC method), so it uses a raw fetch with the bearer token.
+  // Run a query-language statement against the current plane. A read renders
+  // its result (nodes + induced edges) as a fresh subgraph; a write (CREATE, …)
+  // mutates and reports counts, then reloads the canvas. Empty query → fall
+  // back to the plain label seed. Hits the web-only POST /cypher endpoint (not
+  // an RPC method), so it uses a raw fetch with the bearer token.
   async function runCypher() {
     if (!cypher.trim()) {
       await seed()
@@ -133,12 +134,29 @@
         body: cypher,
       })
       if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
-      const sg = await res.json()
+      const out = await res.json()
+      if (out.write) {
+        // A write mutated the plane — summarise the non-zero counts, then reseed
+        // so the canvas reflects the new graph.
+        const bits = [
+          [out.nodes_created, 'nodes created'],
+          [out.edges_created, 'edges created'],
+          [out.props_set, 'props set'],
+          [out.labels_set, 'labels set'],
+          [out.nodes_deleted, 'nodes deleted'],
+          [out.edges_deleted, 'edges deleted'],
+        ]
+          .filter(([n]) => n > 0)
+          .map(([n, label]) => `${n} ${label}`)
+        status = bits.length ? bits.join(' · ') : 'no changes'
+        await seed()
+        return
+      }
       plot.clear()
-      plot.addSubgraph(sg)
+      plot.addSubgraph(out)
       legend = plot.legendEntries()
       selected = null
-      status = `${sg.count} nodes · ${sg.edges.length} edges`
+      status = `${out.count} nodes · ${out.edges.length} edges`
     } catch (e) {
       error = e.message
     }

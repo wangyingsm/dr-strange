@@ -286,12 +286,32 @@ pub fn cypher_subgraph(
     embed_provider: &str,
 ) -> Result<Value, RpcError> {
     let embedder = make_embedder(embed_provider);
-    let plan = match &embedder {
-        Some(e) => dr_strange_parser::parse_with_embedder(query, e),
-        None => dr_strange_parser::parse(query),
+    let stmt = match &embedder {
+        Some(e) => dr_strange_parser::parse_statement_with_embedder(query, e),
+        None => dr_strange_parser::parse_statement(query),
     }
     .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
     let plane = app(ctx.db.plane(plane_name))?;
+
+    // A write statement mutates the plane and returns its change-counts; the UI
+    // shows a status rather than a subgraph.
+    let plan = match stmt {
+        dr_strange_parser::Statement::Read(plan) => plan,
+        dr_strange_parser::Statement::Write(w) => {
+            let s = w.apply(&plane).map_err(RpcError::server)?;
+            return Ok(jval!({
+                "write": true,
+                "nodes_created": s.nodes_created,
+                "edges_created": s.edges_created,
+                "props_set": s.props_set,
+                "labels_set": s.labels_set,
+                "nodes_deleted": s.nodes_deleted,
+                "edges_deleted": s.edges_deleted,
+            }));
+        }
+    };
+
     let rows = app(plane.query_from_plan(plan).scored_nodes())?;
 
     let set: std::collections::BTreeSet<u64> = rows.iter().map(|(n, _)| n.id.0).collect();
