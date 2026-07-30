@@ -235,3 +235,69 @@ fn native_persists_across_reopen() {
         Some(b"me".to_vec())
     );
 }
+
+// The whole conformance surface, but with a 1-byte flush threshold so *every*
+// commit is flushed to its own SST — exercising the merged memtable+SST read
+// path (MVCC across runs, tombstones-in-SSTs, range merge) end to end.
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_conformance_while_flushing() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = NativeEngine::open_with_threshold(dir.path().join("f.drsg"), 1).unwrap();
+    conformance(&eng);
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_edge_cases_while_flushing() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = NativeEngine::open_with_threshold(dir.path().join("fe.drsg"), 1).unwrap();
+    conformance_edge_cases(&eng);
+}
+
+// Force several flushes, confirm SST files appear, then reopen and read back —
+// data now comes from the SSTs (the WAL was rotated), including an update that
+// shadows an older run and a delete that tombstones across a flush.
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_reads_and_reopens_across_ssts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.drsg");
+    {
+        let eng = NativeEngine::open_with_threshold(&path, 1).unwrap();
+        for (k, v) in [(&b"a"[..], &b"1"[..]), (b"b", b"2"), (b"c", b"3")] {
+            let mut w = eng.begin_write().unwrap();
+            w.put(TableId::Nodes, k, v).unwrap();
+            w.commit().unwrap();
+        }
+        // Update `a` (shadows the older SST) and delete `b` (tombstone).
+        let mut w = eng.begin_write().unwrap();
+        w.put(TableId::Nodes, b"a", b"updated").unwrap();
+        w.delete(TableId::Nodes, b"b").unwrap();
+        w.commit().unwrap();
+
+        // Several sst-* files exist; the WAL is empty after the last flush.
+        let ssts = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("sst-"))
+            .count();
+        assert!(ssts >= 3, "expected multiple SSTs, found {ssts}");
+    }
+
+    // Reopen: everything is served from the SSTs.
+    let eng = NativeEngine::open_with_threshold(&path, 1).unwrap();
+    let r = eng.begin_read().unwrap();
+    assert_eq!(
+        r.get(TableId::Nodes, b"a").unwrap(),
+        Some(b"updated".to_vec())
+    );
+    assert_eq!(r.get(TableId::Nodes, b"b").unwrap(), None); // deleted
+    assert_eq!(r.get(TableId::Nodes, b"c").unwrap(), Some(b"3".to_vec()));
+    let keys: Vec<Vec<u8>> = r
+        .range(TableId::Nodes, b"", None)
+        .unwrap()
+        .map(|kv| kv.unwrap().0)
+        .collect();
+    assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
+}

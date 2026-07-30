@@ -1,29 +1,30 @@
 //! Native LSM storage engine (arch/01 v2) — the hand-rolled alternative to
 //! redb, selected by the `native-backend` feature.
 //!
-//! **Phase 1 (this module): the memtable + WAL foundation.** Every logical
-//! table shares one keyspace, keys prefixed with a one-byte table id. Writes
-//! land in an in-memory, versioned memtable (a `BTreeMap`) and are made durable
-//! by a write-ahead log; on open the WAL is replayed to reconstruct the
-//! memtable. SST flush and compaction (which bound memory and WAL size) land in
-//! later phases — until then the whole dataset lives in the memtable and the
-//! WAL grows unbounded, but the transactional/MVCC/durability semantics are the
-//! final ones.
+//! **Structure.** A write lands in the write-ahead log (durability) and a
+//! versioned in-memory *memtable*. When the memtable grows past a threshold it
+//! is flushed to an immutable, sorted **SST** file ([`sst`]) and the WAL is
+//! rotated. A read merges the live memtable over the SSTs, newest run first.
+//! On open, the SSTs are loaded and the (un-flushed) WAL tail is replayed.
 //!
-//! **MVCC by sequence number.** Each committed write transaction gets one
-//! monotonically increasing sequence number; every key version it writes is
-//! stamped with it. A read transaction pins the latest committed sequence at
-//! `begin_read` and only ever sees versions at or below it — so a reader opened
-//! before a commit keeps seeing the old value afterwards, with no locks held
-//! across its lifetime (versions are never mutated in place, only superseded).
+//! **MVCC by sequence number.** Each committed transaction gets one
+//! monotonically increasing sequence; every version it writes is stamped with
+//! it. A reader pins the latest committed sequence at `begin_read` and only
+//! sees versions at or below it — so a reader opened before a commit keeps the
+//! old value, holding no locks across its lifetime. (SSTs are immutable and, in
+//! this phase, never removed, so an old snapshot's data is always reachable;
+//! reclaiming SSTs no live reader needs is a later phase.)
 //!
 //! **Atomic, durable commit.** A whole transaction is one length-prefixed,
-//! CRC32-checked WAL batch record, `fsync`ed before the memtable is updated. A
-//! crash mid-append leaves a torn tail that fails its checksum and is discarded
-//! on replay — so a commit is all-or-nothing.
+//! CRC32-checked WAL batch record, `fsync`ed before the memtable is published.
+//! A flush writes its SST (temp file + fsync + rename) before truncating the
+//! WAL, so a crash never loses committed data — at worst the next open replays
+//! WAL records already captured in an SST, which is idempotent.
 //!
-//! The on-disk form is a **directory** (not a single file): the WAL lives at
-//! `<path>/wal`, and future SSTs alongside it.
+//! The on-disk form is a **directory**: the WAL at `<path>/wal`, SSTs at
+//! `<path>/sst-NNNNNN`.
+
+mod sst;
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -31,7 +32,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,10 @@ use crate::storage::engine::{
     KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction, prefix_successor,
 };
 
+/// Flush the memtable to an SST once its live bytes exceed this. SST + WAL then
+/// bound memory and log growth; below it everything stays in the memtable.
+const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+
 /// A memtable entry: a value, or a tombstone marking a deletion.
 #[derive(Debug, Clone, PartialEq)]
 enum Op {
@@ -47,18 +52,37 @@ enum Op {
     Del,
 }
 
-/// Memtable key: `(table, user_key, Reverse(seq))`. The `Reverse` orders a
-/// key's versions newest-first, so the first version with `seq <= snapshot`
-/// found in a forward scan is the visible one.
+fn op_value(op: Op) -> Option<Vec<u8>> {
+    match op {
+        Op::Put(v) => Some(v),
+        Op::Del => None,
+    }
+}
+
+fn op_bytes(op: &Op) -> usize {
+    match op {
+        Op::Put(v) => v.len(),
+        Op::Del => 0,
+    }
+}
+
+/// Memtable key: `(table, user_key, Reverse(seq))`. `Reverse` orders a key's
+/// versions newest-first, so the first version with `seq <= snapshot` in a
+/// forward scan is the visible one.
 type MemKey = (u8, Vec<u8>, Reverse<u64>);
 
-/// The versioned memtable plus the high-water sequence of committed data. Kept
-/// together under one lock so a reader sees `committed_seq` consistent with the
-/// versions backing it.
+/// The versioned memtable, the SSTs it has been flushed into, and the committed
+/// high-water sequence — kept under one lock so a reader sees them consistently.
 #[derive(Default)]
 struct Store {
     mem: BTreeMap<MemKey, Op>,
+    /// Approximate live byte size of `mem`, for the flush threshold.
+    mem_bytes: usize,
     committed_seq: u64,
+    /// Flushed runs, oldest first (a later run shadows an earlier one).
+    ssts: Vec<Arc<sst::Sst>>,
+    /// Next SST file number.
+    next_sst: u64,
 }
 
 /// The native LSM engine. `Send + Sync`: reads take a shared lock on `store`,
@@ -68,28 +92,43 @@ pub struct NativeEngine {
     store: RwLock<Store>,
     wal: Mutex<BufWriter<File>>,
     write_gate: Mutex<()>,
-    #[allow(dead_code)] // used once SST files land beside the WAL (later phase)
     dir: PathBuf,
+    flush_threshold: usize,
 }
 
 impl NativeEngine {
-    /// Open (creating if absent) the engine directory at `path` and replay its
-    /// WAL into a fresh memtable.
+    /// Open (creating if absent) the engine directory at `path`: load its SSTs,
+    /// then replay the WAL tail into the memtable.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_threshold(path, DEFAULT_FLUSH_THRESHOLD)
+    }
+
+    pub(crate) fn open_with_threshold(
+        path: impl AsRef<Path>,
+        flush_threshold: usize,
+    ) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let wal_path = dir.join("wal");
 
+        let mut store = Store {
+            next_sst: sst::next_number(&dir),
+            ..Store::default()
+        };
+        // SSTs first (oldest→newest), tracking the highest sequence they hold.
+        for sst_path in sst::list(&dir) {
+            let s = sst::Sst::open(&sst_path)?;
+            store.committed_seq = store.committed_seq.max(s.max_seq);
+            store.ssts.push(Arc::new(s));
+        }
+
+        // Then the WAL tail (records not yet folded into an SST).
+        let wal_path = dir.join("wal");
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&wal_path)?;
-
-        // Replay: rebuild the memtable and find where the last intact record
-        // ends, then truncate any torn tail so the next append is clean.
-        let mut store = Store::default();
         let valid_len = replay(&mut file, &mut store)?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
@@ -99,7 +138,34 @@ impl NativeEngine {
             wal: Mutex::new(BufWriter::new(file)),
             write_gate: Mutex::new(()),
             dir,
+            flush_threshold,
         })
+    }
+
+    /// Flush the memtable to a new SST and rotate the WAL, if the memtable is
+    /// over threshold. Called from `commit` while holding the store write lock
+    /// (so single-writer). The SST is made durable before the WAL is truncated.
+    fn maybe_flush(&self, store: &mut Store) -> Result<()> {
+        if store.mem_bytes < self.flush_threshold || store.mem.is_empty() {
+            return Ok(());
+        }
+        let n = store.next_sst;
+        store.next_sst += 1;
+        let path = self.dir.join(format!("sst-{n:06}"));
+        sst::write(&path, &store.mem, store.committed_seq)?;
+        store.ssts.push(Arc::new(sst::Sst::open(&path)?));
+        store.mem.clear();
+        store.mem_bytes = 0;
+
+        // The flushed records are now durable in the SST → drop them from the
+        // WAL. (Not fsynced: if the truncation is lost, the next open just
+        // replays records already captured by the SST, which is idempotent.)
+        let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
+        wal.flush()?;
+        let f = wal.get_mut();
+        f.set_len(0)?;
+        f.seek(SeekFrom::Start(0))?;
+        Ok(())
     }
 }
 
@@ -120,7 +186,6 @@ impl StorageEngine for NativeEngine {
     }
 
     fn begin_write(&self) -> Result<NativeWriteTxn<'_>> {
-        // Hold the gate for the whole transaction — one writer at a time.
         let gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = self
             .store
@@ -136,54 +201,83 @@ impl StorageEngine for NativeEngine {
     }
 }
 
-/// Newest version of `(table, key)` visible at `snapshot`, from the memtable.
-fn visible(mem: &BTreeMap<MemKey, Op>, table: u8, key: &[u8], snapshot: u64) -> Option<Vec<u8>> {
+// ---- merged reads over memtable + SSTs -------------------------------------
+
+/// Newest memtable version of `(table, key)` visible at `snapshot`.
+fn mem_op(mem: &BTreeMap<MemKey, Op>, table: u8, key: &[u8], snapshot: u64) -> Option<Op> {
     let lo = (table, key.to_vec(), Reverse(u64::MAX));
     let hi = (table, key.to_vec(), Reverse(0u64));
     for ((_, _, Reverse(seq)), op) in mem.range(lo..=hi) {
         if *seq <= snapshot {
-            return match op {
-                Op::Put(v) => Some(v.clone()),
-                Op::Del => None,
-            };
+            return Some(op.clone());
         }
     }
     None
 }
 
-/// Collect the visible-at-`snapshot` `(key, value)` pairs of `table` in
-/// `[start, end)`, in key order — deduping each user key to its newest visible
-/// version and dropping tombstones.
-fn visible_range(
+/// Newest-visible `Op` per memtable user key in `[start, end)`, written into
+/// `out` (shadowing whatever the SSTs contributed).
+fn mem_range_ops(
     mem: &BTreeMap<MemKey, Op>,
     table: u8,
     start: &[u8],
     end: Option<&[u8]>,
     snapshot: u64,
-) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    out: &mut BTreeMap<Vec<u8>, Op>,
+) {
     let lo = Bound::Included((table, start.to_vec(), Reverse(u64::MAX)));
     let hi = match end {
-        // Exclude every version of the end key.
         Some(e) => Bound::Excluded((table, e.to_vec(), Reverse(u64::MAX))),
-        // End of this table = start of the next table id.
         None => Bound::Excluded((table + 1, Vec::new(), Reverse(u64::MAX))),
     };
-
-    let mut out = BTreeMap::new();
-    let mut cur: Option<&[u8]> = None;
+    let mut cur: Option<Vec<u8>> = None;
     for ((_, user, Reverse(seq)), op) in mem.range((lo, hi)) {
-        if cur == Some(user.as_slice()) {
-            continue; // already resolved this user key to its newest visible
+        if cur.as_deref() == Some(user.as_slice()) {
+            continue;
         }
         if *seq > snapshot {
-            continue; // version too new for this snapshot; try older ones
+            continue;
         }
-        cur = Some(user.as_slice());
-        if let Op::Put(v) = op {
-            out.insert(user.clone(), v.clone());
+        cur = Some(user.clone());
+        out.insert(user.clone(), op.clone());
+    }
+}
+
+/// Value of `(table, key)` visible at `snapshot`, merging memtable over SSTs
+/// (newest run first). The first source with a version wins — a tombstone there
+/// means "deleted", shadowing older runs.
+fn committed_get(store: &Store, table: u8, key: &[u8], snapshot: u64) -> Result<Option<Vec<u8>>> {
+    if let Some(op) = mem_op(&store.mem, table, key, snapshot) {
+        return Ok(op_value(op));
+    }
+    for s in store.ssts.iter().rev() {
+        if let Some(op) = s.get(table, key, snapshot)? {
+            return Ok(op_value(op));
         }
     }
-    out
+    Ok(None)
+}
+
+/// Visible `(key, value)` pairs of `table` in `[start, end)` at `snapshot`,
+/// merged across all runs. Applying oldest→newest with the memtable last means
+/// a newer run's `Put`/`Del` overrides an older one; surviving tombstones are
+/// then dropped.
+fn committed_values(
+    store: &Store,
+    table: u8,
+    start: &[u8],
+    end: Option<&[u8]>,
+    snapshot: u64,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut ops: BTreeMap<Vec<u8>, Op> = BTreeMap::new();
+    for s in store.ssts.iter() {
+        s.range(table, start, end, snapshot, &mut ops)?;
+    }
+    mem_range_ops(&store.mem, table, start, end, snapshot, &mut ops);
+    Ok(ops
+        .into_iter()
+        .filter_map(|(k, op)| op_value(op).map(|v| (k, v)))
+        .collect())
 }
 
 pub struct NativeReadTxn<'a> {
@@ -194,7 +288,7 @@ pub struct NativeReadTxn<'a> {
 impl ReadTransaction for NativeReadTxn<'_> {
     fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
-        Ok(visible(&store.mem, table as u8, key, self.snapshot))
+        committed_get(&store, table as u8, key, self.snapshot)
     }
 
     fn range(
@@ -204,7 +298,7 @@ impl ReadTransaction for NativeReadTxn<'_> {
         end: Option<&[u8]>,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + '_>> {
         let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
-        let out = visible_range(&store.mem, table as u8, start, end, self.snapshot);
+        let out = committed_values(&store, table as u8, start, end, self.snapshot)?;
         Ok(Box::new(out.into_iter().map(Ok)))
     }
 }
@@ -212,24 +306,18 @@ impl ReadTransaction for NativeReadTxn<'_> {
 pub struct NativeWriteTxn<'a> {
     engine: &'a NativeEngine,
     _gate: MutexGuard<'a, ()>,
-    /// Committed high-water at `begin_write`; the gate keeps it fixed, so the
-    /// commit sequence is exactly `snapshot + 1`.
     snapshot: u64,
-    /// Staged mutations, last-write-wins per key (no seq yet — assigned at
-    /// commit). Read-your-own-writes reads these before the committed store.
+    /// Staged mutations, last-write-wins per key (seq assigned at commit).
     buf: BTreeMap<(u8, Vec<u8>), Op>,
 }
 
 impl ReadTransaction for NativeWriteTxn<'_> {
     fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(op) = self.buf.get(&(table as u8, key.to_vec())) {
-            return Ok(match op {
-                Op::Put(v) => Some(v.clone()),
-                Op::Del => None,
-            });
+            return Ok(op_value(op.clone()));
         }
         let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
-        Ok(visible(&store.mem, table as u8, key, self.snapshot))
+        committed_get(&store, table as u8, key, self.snapshot)
     }
 
     fn range(
@@ -238,10 +326,9 @@ impl ReadTransaction for NativeWriteTxn<'_> {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + '_>> {
-        // Committed view, then overlay the transaction's own staged writes.
         let mut out = {
             let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
-            visible_range(&store.mem, table as u8, start, end, self.snapshot)
+            committed_values(&store, table as u8, start, end, self.snapshot)?
         };
         let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
         for ((t, user), op) in &self.buf {
@@ -275,14 +362,12 @@ impl WriteTransaction for NativeWriteTxn<'_> {
 
     fn delete_prefix(&mut self, table: TableId, prefix: &[u8]) -> Result<()> {
         let t = table as u8;
-        // Drop staged writes under the prefix.
         self.buf
             .retain(|(bt, k), _| !(*bt == t && k.starts_with(prefix)));
-        // Tombstone every committed key under the prefix visible at snapshot.
         let end = prefix_successor(prefix);
         let victims: Vec<Vec<u8>> = {
             let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
-            visible_range(&store.mem, t, prefix, end.as_deref(), self.snapshot)
+            committed_values(&store, t, prefix, end.as_deref(), self.snapshot)?
                 .into_keys()
                 .collect()
         };
@@ -294,7 +379,7 @@ impl WriteTransaction for NativeWriteTxn<'_> {
 
     fn commit(self) -> Result<()> {
         if self.buf.is_empty() {
-            return Ok(()); // nothing to persist; sequence does not advance
+            return Ok(());
         }
         let seq = self.snapshot + 1;
         let batch = WalBatch {
@@ -313,7 +398,7 @@ impl WriteTransaction for NativeWriteTxn<'_> {
                 .collect(),
         };
 
-        // Durability first: append + fsync the WAL before the data is visible.
+        // Durability first: append + fsync the WAL before publishing.
         {
             let mut wal = self.engine.wal.lock().unwrap_or_else(|e| e.into_inner());
             append_batch(&mut *wal, &batch)?;
@@ -321,13 +406,14 @@ impl WriteTransaction for NativeWriteTxn<'_> {
             wal.get_ref().sync_all()?;
         }
 
-        // Then publish to the memtable and advance the high-water sequence.
+        // Publish to the memtable, advance the sequence, then flush if large.
         let mut store = self.engine.store.write().unwrap_or_else(|e| e.into_inner());
         for ((t, k), op) in self.buf {
+            store.mem_bytes += 1 + k.len() + 8 + op_bytes(&op);
             store.mem.insert((t, k, Reverse(seq)), op);
         }
         store.committed_seq = seq;
-        Ok(())
+        self.engine.maybe_flush(&mut store)
     }
 }
 
@@ -375,17 +461,18 @@ fn replay(file: &mut File, store: &mut Store) -> Result<u64> {
             break;
         };
         if body_end > bytes.len() {
-            break; // truncated body
+            break;
         }
         let body = &bytes[body_start..body_end];
         if crc32(body) != crc {
-            break; // torn / corrupt record
+            break;
         }
         let Ok(batch) = postcard::from_bytes::<WalBatch>(body) else {
             break;
         };
         for op in batch.ops {
             let entry = op.value.map_or(Op::Del, Op::Put);
+            store.mem_bytes += 1 + op.key.len() + 8 + op_bytes(&entry);
             store
                 .mem
                 .insert((op.table, op.key, Reverse(batch.seq)), entry);
@@ -397,8 +484,8 @@ fn replay(file: &mut File, store: &mut Store) -> Result<u64> {
     Ok(valid)
 }
 
-/// Bitwise CRC-32 (IEEE 802.3 polynomial) — no dependency, and the WAL isn't a
-/// throughput bottleneck at this phase.
+/// Bitwise CRC-32 (IEEE 802.3 polynomial) — no dependency; used by the WAL and
+/// SST footers. Not a throughput bottleneck at this phase.
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {
