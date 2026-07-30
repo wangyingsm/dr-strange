@@ -12,6 +12,7 @@
 //! and `Sort` address the current node.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::cache::GraphReader;
 use crate::compute::expr::{self, Expr};
@@ -20,16 +21,32 @@ use crate::error::Result;
 use crate::storage::vector::{Metric, top_k};
 use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
 
+/// One hop of a path — `(edge traversed, node reached)` plus a link to the
+/// previous hop. Rows that branch from a common prefix *share* that prefix by
+/// `Rc`, so extending a path is O(1) (an `Rc` bump) instead of cloning an
+/// O(hops) `Vec`. It's an immutable cons-list: the whole path is recovered by
+/// walking `prev` (see [`Row::path`]). Confined to one query's executor run,
+/// which is single-threaded, so `Rc` (not `Arc`) is the right cost.
+#[derive(Debug, PartialEq)]
+struct TrailNode {
+    edge: EdgeId,
+    node: NodeId,
+    prev: Option<Rc<TrailNode>>,
+}
+
 /// One row of the executor's stream: the current node, the path to it, and an
 /// optional similarity **score channel** (arch/03 §2, §4.5) set by the hybrid
 /// operators and readable in expressions via `score()`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub head: NodeId,
-    /// `(edge traversed, node reached)` for each hop, in order. Empty at a
-    /// source. Carries path information for future path-returning queries;
-    /// its length is `hops()`.
-    pub trail: Vec<(EdgeId, NodeId)>,
+    /// Path back to the source as a shared cons-list; `None` at a source.
+    /// Private: reach it through [`Row::hops`] / [`Row::path`] so the O(1)-step
+    /// representation can change without touching callers.
+    trail: Option<Rc<TrailNode>>,
+    /// Hop count from the source (== path length). Held as a counter so
+    /// [`Row::hops`] is O(1) and never walks the list.
+    hops: u32,
     pub score: Option<f32>,
 }
 
@@ -37,7 +54,8 @@ impl Row {
     fn start(head: NodeId) -> Self {
         Row {
             head,
-            trail: Vec::new(),
+            trail: None,
+            hops: 0,
             score: None,
         }
     }
@@ -46,19 +64,24 @@ impl Row {
     fn scored(head: NodeId, score: f32) -> Self {
         Row {
             head,
-            trail: Vec::new(),
+            trail: None,
+            hops: 0,
             score: Some(score),
         }
     }
 
     /// Extend the path by one hop; the score channel is inherited so a seed's
-    /// similarity survives expansion (arch/03 §4.1).
+    /// similarity survives expansion (arch/03 §4.1). O(1): the new cons-cell
+    /// points at the shared prefix rather than copying it.
     fn step(&self, edge: EdgeId, node: NodeId) -> Self {
-        let mut trail = self.trail.clone();
-        trail.push((edge, node));
         Row {
             head: node,
-            trail,
+            trail: Some(Rc::new(TrailNode {
+                edge,
+                node,
+                prev: self.trail.clone(),
+            })),
+            hops: self.hops + 1,
             score: self.score,
         }
     }
@@ -69,11 +92,30 @@ impl Row {
         self
     }
 
+    /// Hops from the source — the path length. O(1).
+    pub fn hops(&self) -> usize {
+        self.hops as usize
+    }
+
+    /// The full path from the source as `(edge, node)` pairs, in traversal
+    /// order. O(hops); allocates, so call it only when a query actually needs
+    /// the path (path-returning queries — not yet a surface).
+    pub fn path(&self) -> Vec<(EdgeId, NodeId)> {
+        let mut out = Vec::with_capacity(self.hops as usize);
+        let mut cur = self.trail.as_deref();
+        while let Some(node) = cur {
+            out.push((node.edge, node.node));
+            cur = node.prev.as_deref();
+        }
+        out.reverse();
+        out
+    }
+
     fn ctx<'a>(&self, node: Option<&'a NodeRecord>) -> expr::EvalCtx<'a> {
         expr::EvalCtx {
             node,
             score: self.score,
-            hops: self.trail.len(),
+            hops: self.hops as usize,
         }
     }
 }
@@ -321,18 +363,25 @@ fn expand_one(
     rr: Result<Row>,
     dir: Dir,
     ty: &Option<String>,
-) -> std::vec::IntoIter<Result<Row>> {
+) -> Box<dyn Iterator<Item = Result<Row>>> {
     let row = match rr {
         Ok(r) => r,
-        Err(e) => return vec![Err(e)].into_iter(),
+        Err(e) => return Box::new(std::iter::once(Err(e))),
     };
     match reader.neighbors(row.head, dir, ty.as_deref()) {
-        Err(e) => vec![Err(e)].into_iter(),
-        Ok(ns) => ns
-            .iter()
-            .map(|n| Ok(row.step(n.edge, n.node)))
-            .collect::<Vec<_>>()
-            .into_iter(),
+        Err(e) => Box::new(std::iter::once(Err(e))),
+        // Lazy: `step` is O(1) and the neighbour rows are produced on demand,
+        // so a following `Limit` can stop without materialising the whole
+        // (possibly high) fan-out of a single node. The iterator owns the
+        // shared neighbour slice (`Arc`) and the source `row` and indexes into
+        // them — nothing borrows a local, so it can outlive this call.
+        Ok(ns) => {
+            let len = ns.len();
+            Box::new((0..len).map(move |i| {
+                let n = &ns[i];
+                Ok(row.step(n.edge, n.node))
+            }))
+        }
     }
 }
 

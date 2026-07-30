@@ -1004,7 +1004,7 @@ impl<'db> QueryBuilder<'db> {
                 let ctx = expr::EvalCtx {
                     node: node.as_deref(),
                     score: row.score,
-                    hops: row.trail.len(),
+                    hops: row.hops(),
                 };
                 out.push(exprs.iter().map(|e| expr::eval(e, &ctx)).collect());
             }
