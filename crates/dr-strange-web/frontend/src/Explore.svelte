@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
-  import { rpc } from './rpc.js'
+  import { rpc, authHeaders } from './rpc.js'
   import { Plot } from './plot.js'
   import CreatePlane from './CreatePlane.svelte'
 
@@ -19,6 +19,7 @@
 
   let labels = $state([]) // catalog label names for the filter
   let labelFilter = $state('') // '' = all labels
+  let cypher = $state('') // query-language text; '' = use the label seed
   let selected = $state(null) // { kind: 'node'|'edge', data }
   let legend = $state([])
   let status = $state('')
@@ -104,6 +105,34 @@
       status = `${sg.nodes.length} nodes · ${sg.edges.length} edges${
         sg.truncated ? ` (of ${sg.total}, capped)` : ''
       }`
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  // Run a query-language string against the current plane and render its
+  // result (nodes + induced edges) as a fresh subgraph. Empty query → fall
+  // back to the plain label seed. Hits the web-only POST /cypher endpoint
+  // (not an RPC method), so it uses a raw fetch with the bearer token.
+  async function runCypher() {
+    if (!cypher.trim()) {
+      await seed()
+      return
+    }
+    error = null
+    try {
+      const res = await fetch(`/cypher?plane=${encodeURIComponent(plane)}`, {
+        method: 'POST',
+        headers: authHeaders({ 'content-type': 'text/plain' }),
+        body: cypher,
+      })
+      if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
+      const sg = await res.json()
+      plot.clear()
+      plot.addSubgraph(sg)
+      legend = plot.legendEntries()
+      selected = null
+      status = `${sg.count} nodes · ${sg.edges.length} edges`
     } catch (e) {
       error = e.message
     }
@@ -445,6 +474,17 @@
   <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
   <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
   <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
+</div>
+
+<div class="query-bar">
+  <input
+    type="text"
+    class="cypher"
+    placeholder="MATCH (n:Label) WHERE n.prop > 1 RETURN n ORDER BY n.prop DESC LIMIT 50 — Enter to run, empty to reset"
+    bind:value={cypher}
+    onkeydown={(e) => e.key === 'Enter' && runCypher()}
+  />
+  <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
 </div>
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />

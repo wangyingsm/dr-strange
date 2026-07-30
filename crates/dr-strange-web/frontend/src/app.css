@@ -673,6 +673,39 @@ nav button.active {
   border-color: #16a34a;
 }
 
+/* ---- query-language bar (Explore) ---- */
+.query-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.query-bar .cypher {
+  flex: 1;
+  min-width: 0;
+  font: 13px/1.4 ui-monospace, monospace;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.6rem;
+}
+.query-bar .cypher:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.query-bar .run-btn {
+  font: 14px system-ui;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.4rem 1rem;
+  cursor: pointer;
+}
+.query-bar .run-btn:hover {
+  filter: brightness(1.08);
+}
+
 /* ---- plot canvas ---- */
 .canvas-wrap {
   position: relative;
