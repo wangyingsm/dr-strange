@@ -150,6 +150,10 @@ impl Chat for OpenAiProvider {
         // A truncated reply (hit the output cap) is unparseable JSON — surface
         // the real cause instead of a confusing "not valid extraction JSON".
         if choice["finish_reason"] == "length" {
+            tracing::warn!(
+                max_output_tokens = MAX_OUTPUT_TOKENS,
+                "provider reply truncated at the output-token limit"
+            );
             bail!(
                 "the model's reply hit the {MAX_OUTPUT_TOKENS}-token output limit and was cut off \
                  — the text is too dense to extract in one pass; try a smaller chunk size"

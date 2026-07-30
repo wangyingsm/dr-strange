@@ -215,6 +215,15 @@ pub fn digest(
     opts: &DigestOptions,
 ) -> Result<DigestResult> {
     let chunks = chunk(document, opts.chunk_chars);
+    // A span so the per-chunk chat calls (and any provider warnings emitted in
+    // dr-strange-llm::openai) nest under one identifiable digest run.
+    let _span = tracing::info_span!(
+        "digest",
+        run_id = %opts.run_id,
+        chunks = chunks.len(),
+        embed = opts.embed,
+    )
+    .entered();
     let system = system_prompt(candidates.is_some());
 
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
@@ -254,6 +263,13 @@ pub fn digest(
         report.chat_requests += 1;
         report.input_tokens += reply.input_tokens;
         report.output_tokens += reply.output_tokens;
+        tracing::debug!(
+            chunk = report.chat_requests,
+            of = chunks.len(),
+            input_tokens = reply.input_tokens,
+            output_tokens = reply.output_tokens,
+            "digest chunk extracted",
+        );
 
         let extraction = parse_extraction(&reply.text)?;
         for e in extraction.entities {
@@ -340,6 +356,22 @@ pub fn digest(
 
     report.entities = nodes.len();
     report.relations = edges.len();
+    if report.dropped_relations > 0 {
+        tracing::warn!(
+            dropped = report.dropped_relations,
+            "digest dropped relations whose endpoints were neither extracted nor existing nodes",
+        );
+    }
+    tracing::info!(
+        entities = report.entities,
+        relations = report.relations,
+        linked = report.linked,
+        dropped = report.dropped_relations,
+        input_tokens = report.input_tokens,
+        output_tokens = report.output_tokens,
+        embed_tokens = report.embed_tokens,
+        "digest complete",
+    );
     Ok(DigestResult {
         nodes,
         edges,

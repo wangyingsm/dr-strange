@@ -225,16 +225,25 @@ async fn export_http(
     .await;
 
     match built {
-        Ok(Ok(jsonl)) => Response::builder()
-            .header("content-type", "application/x-ndjson")
-            .header(
-                "content-disposition",
-                format!("attachment; filename=\"{}.jsonl\"", safe_filename(&plane)),
-            )
-            .body(Body::from(jsonl))
-            .unwrap(),
-        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response(),
+        Ok(Ok(jsonl)) => {
+            tracing::info!(plane = %plane, bytes = jsonl.len(), "exported plane as JSONL");
+            Response::builder()
+                .header("content-type", "application/x-ndjson")
+                .header(
+                    "content-disposition",
+                    format!("attachment; filename=\"{}.jsonl\"", safe_filename(&plane)),
+                )
+                .body(Body::from(jsonl))
+                .unwrap()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(plane = %plane, error = %e.message, "export failed");
+            (StatusCode::BAD_REQUEST, e.message).into_response()
+        }
+        Err(_) => {
+            tracing::error!(plane = %plane, "export task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response()
+        }
     }
 }
 

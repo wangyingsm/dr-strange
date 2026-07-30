@@ -99,7 +99,10 @@ impl std::fmt::Debug for Database {
 impl Database {
     /// Opens (creating if needed) a database file backed by redb.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init(Engine::Redb(RedbEngine::open(path)?))
+        let path = path.as_ref();
+        let db = Self::init(Engine::Redb(RedbEngine::open(path)?))?;
+        tracing::info!(path = %path.display(), "opened database");
+        Ok(db)
     }
 
     /// A fresh, empty in-memory database (tests, scratch work).
@@ -152,6 +155,7 @@ impl Database {
         let id = self
             .engine
             .with_write(|txn| graph::create_plane(txn, name, &props))?;
+        tracing::info!(name, id = id.0, "created plane");
         Ok(PlaneHandle { db: self, id })
     }
 
@@ -159,7 +163,9 @@ impl Database {
     /// already-absent plane id. Errors with `InvalidArgument` for
     /// `PlaneId::STARTUP`, which always exists.
     pub fn drop_plane(&self, id: PlaneId) -> Result<()> {
-        self.engine.with_write(|txn| graph::drop_plane(txn, id))
+        self.engine.with_write(|txn| graph::drop_plane(txn, id))?;
+        tracing::info!(id = id.0, "dropped plane");
+        Ok(())
     }
 
     /// Every plane as `(id, name)`, ascending by id (arch/04 §1).
@@ -675,6 +681,7 @@ impl WriteTxn<'_> {
             events,
             ..
         } = self;
+        let index_events = events.len();
         // Commit the KV first; only then mirror into the in-memory indexes.
         // If applying events somehow failed, the KV is still the source of
         // truth and rebuild-from-KV on next open restores coherence.
@@ -688,6 +695,7 @@ impl WriteTxn<'_> {
                 apply_index_event(&mut registry, plane, event)?;
             }
         }
+        tracing::debug!(plane = plane.0, index_events, "write txn committed");
         Ok(())
     }
 }

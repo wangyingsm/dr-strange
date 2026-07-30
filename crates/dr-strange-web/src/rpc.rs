@@ -148,7 +148,24 @@ fn handle_single(ctx: &Ctx<'_>, auth: &Auth<'_>, msg: Value) -> Option<Value> {
         dispatch_method(ctx, auth, method, params)
     };
 
+    // Name for the log line (before dispatch consumes `map` borrows).
+    let method_name = map
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let started = std::time::Instant::now();
     let result = dispatch();
+    let elapsed_ms = started.elapsed().as_millis();
+    match &result {
+        Ok(_) => tracing::debug!(method = method_name, elapsed_ms, "rpc ok"),
+        Err(e) => tracing::warn!(
+            method = method_name,
+            elapsed_ms,
+            code = e.code,
+            error = %e.message,
+            "rpc error",
+        ),
+    }
     if is_notification {
         return None;
     }

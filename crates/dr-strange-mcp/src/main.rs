@@ -200,7 +200,7 @@ impl DrStrange {
     /// Runs sync database work off the async runtime. A core error becomes a
     /// *tool-level* error (the caller sees the message); only a task-join
     /// failure is a protocol error (arch/06: rmcp's two failure modes).
-    async fn blocking<F>(&self, f: F) -> Result<CallToolResult, McpError>
+    async fn blocking<F>(&self, tool: &'static str, f: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
     {
@@ -209,8 +209,14 @@ impl DrStrange {
             .await
             .map_err(|e| McpError::internal_error(format!("task join failed: {e}"), None))?;
         Ok(match joined {
-            Ok(value) => ok(value),
-            Err(e) => tool_error(e.to_string()),
+            Ok(value) => {
+                tracing::debug!(tool, "mcp tool ok");
+                ok(value)
+            }
+            Err(e) => {
+                tracing::warn!(tool, error = %e, "mcp tool failed");
+                tool_error(e.to_string())
+            }
         })
     }
 }
@@ -450,7 +456,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
 impl DrStrange {
     #[tool(description = "List all planes with their node/edge counts.")]
     async fn list_planes(&self) -> Result<CallToolResult, McpError> {
-        self.blocking(list_planes_logic).await
+        self.blocking("list_planes", list_planes_logic).await
     }
 
     #[tool(description = "The soft-schema catalog for a plane: labels, property \
@@ -459,7 +465,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<PlaneOnly>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| describe_plane_logic(db, req)).await
+        self.blocking("describe_plane", move |db| describe_plane_logic(db, req))
+            .await
     }
 
     #[tool(description = "Fetch one node by `id` or external `key`.")]
@@ -467,7 +474,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<GetNode>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| get_node_logic(db, req)).await
+        self.blocking("get_node", move |db| get_node_logic(db, req))
+            .await
     }
 
     #[tool(description = "Vector similarity search: the k nodes closest to \
@@ -476,7 +484,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Search>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| search_logic(db, req)).await
+        self.blocking("search", move |db| search_logic(db, req))
+            .await
     }
 
     #[tool(description = "Neighbourhood expansion from a node (1 hop by \
@@ -485,13 +494,14 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Traverse>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| traverse_logic(db, req)).await
+        self.blocking("traverse", move |db| traverse_logic(db, req))
+            .await
     }
 
     #[tool(description = "Run a serialized logical query plan and return the \
         matching node records (with scores where present).")]
     async fn query(&self, Parameters(req): Parameters<Query>) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| query_logic(db, req)).await
+        self.blocking("query", move |db| query_logic(db, req)).await
     }
 
     #[tool(description = "Create nodes (batched). Each: {external_key?, labels, \
@@ -500,7 +510,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<WriteNodes>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| write_nodes_logic(db, req)).await
+        self.blocking("write_nodes", move |db| write_nodes_logic(db, req))
+            .await
     }
 
     #[tool(description = "Create edges (batched) by endpoint external keys. \
@@ -509,7 +520,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<WriteEdges>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| write_edges_logic(db, req)).await
+        self.blocking("write_edges", move |db| write_edges_logic(db, req))
+            .await
     }
 
     #[tool(description = "Create a new empty plane.")]
@@ -517,7 +529,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<CreatePlane>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| create_plane_logic(db, req)).await
+        self.blocking("create_plane", move |db| create_plane_logic(db, req))
+            .await
     }
 
     #[tool(description = "Delete a plane and everything on it. Requires \
@@ -532,7 +545,8 @@ impl DrStrange {
                 req.name
             )));
         }
-        self.blocking(move |db| drop_plane_logic(db, req)).await
+        self.blocking("drop_plane", move |db| drop_plane_logic(db, req))
+            .await
     }
 
     #[tool(
@@ -549,7 +563,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Digest>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking(move |db| digest_logic(db, req)).await
+        self.blocking("digest", move |db| digest_logic(db, req))
+            .await
     }
 }
 

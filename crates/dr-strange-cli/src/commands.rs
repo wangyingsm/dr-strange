@@ -398,6 +398,12 @@ pub fn import(
     let n_edges = txn.bulk_load_edges(bedges)?;
 
     txn.commit()?;
+    tracing::info!(
+        plane = plane_name,
+        nodes = n_nodes,
+        edges = n_edges,
+        "imported JSONL into plane",
+    );
     writeln!(out, "imported {n_nodes} nodes, {n_edges} edges")?;
     Ok(())
 }
