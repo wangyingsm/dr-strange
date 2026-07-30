@@ -1,0 +1,38 @@
+# Example dr-strange configuration. Copy to `drsg.toml` (auto-loaded from the
+# working directory) or point at it with `drsg --config <path>` or $DRSG_CONFIG.
+#
+# Every section is optional; anything omitted falls back to its default. Values
+# here are folded into the process environment at startup, so an environment
+# variable that is already set ALWAYS wins over the file — handy for injecting
+# secrets at launch without editing this file.
+
+[server]
+# Listen address. A `--addr` on the command line overrides this.
+addr = "0.0.0.0:7700"
+# Shared API token (→ DRSG_TOKEN). When set, every request must carry it
+# (`Authorization: Bearer <token>`; WebSocket via `?token=<token>`). When unset,
+# the API is reachable only from the local browser UI.
+token = "change-me"
+# Maximum requests processed at once; excess requests queue. Default 1024.
+max_concurrent = 1024
+# Extra browser origins allowed past the CSRF guard (→ DRSG_ALLOWED_ORIGINS).
+allowed_origins = ["https://app.example.com"]
+
+# Uncomment to serve HTTPS directly (rustls). Both files are PEM; `cert` is the
+# certificate chain, `key` its private key. Omit the whole section for plain
+# HTTP (e.g. when a reverse proxy terminates TLS in front).
+# [server.tls]
+# cert = "/etc/drsg/cert.pem"
+# key  = "/etc/drsg/key.pem"
+
+[logging]
+# Directory for the daily-rolling log file (→ DRSG_LOG_DIR). Default `./logs`.
+dir = "logs"
+
+# LLM API keys, by environment-variable name → secret. These feed the provider
+# layer (used by `digest` and text-`SEARCH`), which looks keys up by env-var
+# name. Keys stay server-side and never travel from a client.
+[llm]
+# OPENAI_API_KEY = "sk-..."
+# DEEPSEEK_API_KEY = "..."
+# DASHSCOPE_API_KEY = "..."   # Qwen / DashScope

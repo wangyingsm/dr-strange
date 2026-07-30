@@ -9,6 +9,11 @@ dr-strange-core = { workspace = true, features = ["json"] }
 dr-strange-llm = { path = "../dr-strange-llm" }
 dr-strange-parser.workspace = true
 axum = { version = "0.8", features = ["ws"] }
+# Native TLS for `drsg serve` (arch/08). axum-server drives the accept loop with
+# a rustls acceptor; `no-provider` + an explicit `ring` provider keeps the build
+# off the aws-lc-rs C toolchain.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Production hardening middleware (arch/08): a global in-flight concurrency cap
 # (tower) plus panic→500 and static security headers (tower-http).
 tower = { version = "0.5", features = ["limit"] }

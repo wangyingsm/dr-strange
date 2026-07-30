@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -412,15 +413,65 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         bootstrap_token: token,
     });
     let app = router(state, opts.max_concurrent);
-    let listener = tokio::net::TcpListener::bind(opts.addr).await?;
-    let bound = listener.local_addr()?;
+    // Bind a std listener up front so we can report the actual port (handy when
+    // the caller asked for :0) before either serving path takes over. Both paths
+    // register it with tokio, which rejects a blocking fd — so make it
+    // non-blocking here, once.
+    let std_listener = std::net::TcpListener::bind(opts.addr)?;
+    std_listener.set_nonblocking(true)?;
+    let bound = std_listener.local_addr()?;
+    let scheme = if opts.tls.is_some() { "https" } else { "http" };
     tracing::info!(
         %bound,
         max_concurrent = opts.max_concurrent,
-        "drsg serve: dashboard + JSON-RPC listening on http://{bound}"
+        "drsg serve: dashboard + JSON-RPC listening on {scheme}://{bound}"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    match opts.tls {
+        Some(tls) => serve_tls(app, std_listener, tls).await,
+        None => {
+            let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Serve HTTPS on an already-bound listener, terminating TLS with rustls.
+/// Graceful shutdown is wired to the same signal as the plain-HTTP path.
+async fn serve_tls(
+    app: Router,
+    listener: std::net::TcpListener,
+    tls: crate::TlsOptions,
+) -> anyhow::Result<()> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    // Install a process-default rustls crypto provider (ring). Idempotent — the
+    // error just means one is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = RustlsConfig::from_pem_file(&tls.cert, &tls.key)
+        .await
+        .with_context(|| {
+            format!(
+                "loading TLS certificate {} / key {}",
+                tls.cert.display(),
+                tls.key.display()
+            )
+        })?;
+
+    // axum_server drains in-flight connections when the handle is triggered.
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal().await;
+            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        }
+    });
+    axum_server::from_tcp_rustls(listener, config)?
+        .handle(handle)
+        .serve(app.into_make_service())
         .await?;
     Ok(())
 }

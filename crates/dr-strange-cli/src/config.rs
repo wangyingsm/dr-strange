@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use dr_strange_web::ServeOptions;
+use dr_strange_web::{ServeOptions, TlsOptions};
 use serde::Deserialize;
 
 /// The parsed `config.toml`. Every section is optional.
@@ -48,6 +48,16 @@ pub struct ServerCfg {
     pub max_concurrent: Option<usize>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
+    /// TLS certificate/key; when present, `serve` speaks HTTPS.
+    pub tls: Option<TlsCfg>,
+}
+
+/// The `[server.tls]` section — a PEM certificate chain and its private key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsCfg {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 /// The `[logging]` section.
@@ -120,6 +130,12 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     if let Some(max_concurrent) = cfg.server.max_concurrent {
         opts.max_concurrent = max_concurrent;
     }
+    if let Some(tls) = &cfg.server.tls {
+        opts.tls = Some(TlsOptions {
+            cert: tls.cert.clone(),
+            key: tls.key.clone(),
+        });
+    }
     opts
 }
 
@@ -191,5 +207,19 @@ mod tests {
         assert_eq!(opts.addr.to_string(), "0.0.0.0:9000");
         // Unset → the library default.
         assert_eq!(opts.max_concurrent, dr_strange_web::DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn tls_section_flows_into_serve_options() {
+        let cfg =
+            parse("[server.tls]\ncert = \"/etc/drsg/cert.pem\"\nkey = \"/etc/drsg/key.pem\"\n");
+        let tls = serve_options(&cfg, None).tls.expect("tls set");
+        assert_eq!(tls.cert, Path::new("/etc/drsg/cert.pem"));
+        assert_eq!(tls.key, Path::new("/etc/drsg/key.pem"));
+    }
+
+    #[test]
+    fn no_tls_section_means_plain_http() {
+        assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
     }
 }
