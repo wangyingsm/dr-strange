@@ -15,6 +15,8 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -211,6 +213,99 @@ impl HnswIndex {
         }
     }
 
+    /// Build the graph from a batch of `(id, vector)` concurrently across
+    /// threads. The index MUST be empty. **Non-deterministic** — threads insert
+    /// in a racing order, so the resulting graph varies run to run — but recall
+    /// is preserved (approximate index; correctness is recall vs brute force).
+    /// Small batches or a single core fall back to the sequential, deterministic
+    /// [`insert`](Self::insert) path.
+    ///
+    /// Design: level assignment is precomputed sequentially (so it stays a pure
+    /// function of the seed), then the node arena is pre-sized and filled with
+    /// immutable data (vectors/norms — read lock-free during search) plus a
+    /// per-node `Mutex` guarding only that node's adjacency. A thread never
+    /// holds two node locks at once, so there is no lock-ordering deadlock.
+    pub fn build_parallel(&mut self, items: &[(u64, Vec<f32>)]) -> Result<()> {
+        debug_assert!(self.nodes.is_empty(), "build_parallel needs an empty index");
+        let n = items.len();
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(n);
+        // Below this, thread setup + locking overhead outweighs the win; stay on
+        // the deterministic sequential path (also keeps small-graph tests exact).
+        if n < PARALLEL_MIN || threads <= 1 {
+            for (id, v) in items {
+                self.insert(*id, v)?;
+            }
+            return Ok(());
+        }
+
+        // Levels first, sequentially — a pure function of the seed regardless of
+        // how the inserts are then parallelized.
+        let meta: Vec<BuildMeta> = items
+            .iter()
+            .map(|(id, v)| BuildMeta {
+                id: *id,
+                norm: dot(v, v).sqrt(),
+                level: self.random_level(),
+                vector: v.clone(),
+            })
+            .collect();
+        let adj: Vec<Mutex<Vec<Vec<usize>>>> = meta
+            .iter()
+            .map(|m| Mutex::new(vec![Vec::new(); m.level + 1]))
+            .collect();
+        // Node 0 seeds the graph (no links); the rest insert against it.
+        let entry = Mutex::new((0usize, meta[0].level));
+        let next = AtomicUsize::new(1);
+        let metric = self.metric;
+        let ef = self.params.ef_construction;
+        let params = self.params;
+
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let mut scratch = Scratch::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        insert_into_build(
+                            i,
+                            &meta,
+                            &adj,
+                            &entry,
+                            metric,
+                            ef,
+                            &params,
+                            &mut scratch,
+                        );
+                    }
+                });
+            }
+        });
+
+        // Freeze the arena into the serving representation.
+        self.nodes = meta
+            .into_iter()
+            .zip(adj)
+            .map(|(m, a)| Node {
+                id: m.id,
+                vector: m.vector,
+                norm: m.norm,
+                deleted: false,
+                layers: a.into_inner().unwrap_or_else(|e| e.into_inner()),
+            })
+            .collect();
+        let (e, top) = entry.into_inner().unwrap_or_else(|e| e.into_inner());
+        self.entry = Some(e);
+        self.top_layer = top;
+        self.reindex();
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.id_to_idx.len()
     }
@@ -326,6 +421,207 @@ fn push_bounded(w: &mut BinaryHeap<(Dist, usize)>, ef: usize, d: f32, e: usize) 
     w.push((Dist(d), e));
     if w.len() > ef {
         w.pop();
+    }
+}
+
+// ---- Parallel bulk build ---------------------------------------------------
+//
+// A from-scratch build over many vectors, inserting nodes concurrently. The
+// node arena is pre-sized; each node's immutable data (vector/norm/level) is
+// read lock-free, and only its adjacency is behind a per-node `Mutex`. See
+// [`HnswIndex::build_parallel`].
+
+/// Batches at or above this size use the parallel path; smaller ones stay on
+/// the sequential deterministic `insert` (setup/locking overhead isn't worth
+/// it, and it keeps small-graph tests exact).
+const PARALLEL_MIN: usize = 2048;
+
+/// A node's build-time payload — everything except adjacency (which lives in a
+/// separate per-node `Mutex`), so the fields here are read without locking.
+struct BuildMeta {
+    id: u64,
+    vector: Vec<f32>,
+    norm: f32,
+    level: usize,
+}
+
+/// Query→node distance during the parallel build (reads immutable `meta`).
+fn dist_bm_q(meta: &[BuildMeta], metric: Metric, q: Query<'_>, idx: usize) -> f32 {
+    let n = &meta[idx];
+    metric_dist(metric, dot(q.vec, &n.vector), q.norm, n.norm)
+}
+
+/// Node→node distance during the parallel build (reads immutable `meta`).
+fn dist_bm(meta: &[BuildMeta], metric: Metric, a: usize, b: usize) -> f32 {
+    metric_dist(
+        metric,
+        dot(&meta[a].vector, &meta[b].vector),
+        meta[a].norm,
+        meta[b].norm,
+    )
+}
+
+/// The build-time analogue of [`HnswIndex::search_layer`]: the ef nearest nodes
+/// to `q` reachable from `entry_points` at `layer`. Neighbor lists are read
+/// under each node's lock (cloned out, lock released immediately); vectors are
+/// read lock-free. No node is ever tombstoned during a build.
+#[allow(clippy::too_many_arguments)]
+fn search_build(
+    meta: &[BuildMeta],
+    adj: &[Mutex<Vec<Vec<usize>>>],
+    metric: Metric,
+    q: Query<'_>,
+    entry_points: &[usize],
+    ef: usize,
+    layer: usize,
+    scratch: &mut Scratch,
+) -> Vec<(f32, usize)> {
+    scratch.ready(meta.len());
+    let Scratch {
+        visited,
+        epoch,
+        cand,
+        w,
+    } = scratch;
+    let epoch = *epoch;
+
+    for &e in entry_points {
+        if visited[e] != epoch {
+            visited[e] = epoch;
+            let d = dist_bm_q(meta, metric, q, e);
+            cand.push(Reverse((Dist(d), e)));
+            push_bounded(w, ef, d, e);
+        }
+    }
+
+    while let Some(Reverse((Dist(cd), c))) = cand.pop() {
+        if w.len() >= ef
+            && let Some((Dist(fd), _)) = w.peek()
+            && cd > *fd
+        {
+            break;
+        }
+        // Snapshot c's neighbors at `layer` under its lock, then release it.
+        let neighbors: Vec<usize> = {
+            let guard = adj[c].lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(layer).cloned().unwrap_or_default()
+        };
+        for e in neighbors {
+            if visited[e] != epoch {
+                visited[e] = epoch;
+                let d = dist_bm_q(meta, metric, q, e);
+                let farthest = w.peek().map(|(Dist(fd), _)| *fd).unwrap_or(f32::INFINITY);
+                if d < farthest || w.len() < ef {
+                    cand.push(Reverse((Dist(d), e)));
+                    push_bounded(w, ef, d, e);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(f32, usize)> = w.iter().map(|&(Dist(d), i)| (d, i)).collect();
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
+}
+
+/// Keep only the `maxc` nearest neighbors of `node` at `layer`, in the locked
+/// adjacency `links`. Distances read immutable `meta`, so no other lock is
+/// taken while this node's lock is held.
+fn prune_build(
+    meta: &[BuildMeta],
+    metric: Metric,
+    node: usize,
+    layer: usize,
+    links: &mut [Vec<usize>],
+    maxc: usize,
+) {
+    if links[layer].len() <= maxc {
+        return;
+    }
+    let ns = std::mem::take(&mut links[layer]);
+    let mut scored: Vec<(f32, usize)> = ns
+        .iter()
+        .map(|&x| (dist_bm(meta, metric, node, x), x))
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    scored.truncate(maxc);
+    links[layer] = scored.into_iter().map(|(_, x)| x).collect();
+}
+
+/// Insert node `idx` into the shared build graph. Mirrors the sequential
+/// [`HnswIndex::insert`] linking, but reads/writes adjacency through per-node
+/// locks and the shared `entry`. Only one node lock is held at a time.
+#[allow(clippy::too_many_arguments)]
+fn insert_into_build(
+    idx: usize,
+    meta: &[BuildMeta],
+    adj: &[Mutex<Vec<Vec<usize>>>],
+    entry: &Mutex<(usize, usize)>,
+    metric: Metric,
+    ef: usize,
+    params: &HnswParams,
+    scratch: &mut Scratch,
+) {
+    let level = meta[idx].level;
+    let q = Query {
+        vec: &meta[idx].vector,
+        norm: meta[idx].norm,
+    };
+    let max_conn = |layer: usize| if layer == 0 { params.m0 } else { params.m };
+
+    // Snapshot the entry point / top layer for this insertion.
+    let (mut ep, top) = *entry.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Greedy width-1 descent from the top down to level+1.
+    let mut lc = top;
+    while lc > level {
+        let w = search_build(meta, adj, metric, q, &[ep], 1, lc, scratch);
+        if let Some(&(_, nearest)) = w.first() {
+            ep = nearest;
+        }
+        lc -= 1;
+    }
+
+    // Connect at every layer from min(level, top) down to 0.
+    let start = level.min(top);
+    let mut entry_points = vec![ep];
+    for lc in (0..=start).rev() {
+        let w = search_build(meta, adj, metric, q, &entry_points, ef, lc, scratch);
+        let maxc = max_conn(lc);
+        let chosen: Vec<usize> = w.iter().take(maxc).map(|&(_, i)| i).collect();
+
+        // idx → chosen
+        {
+            let mut mine = adj[idx].lock().unwrap_or_else(|e| e.into_inner());
+            for &nb in &chosen {
+                mine[lc].push(nb);
+            }
+        }
+        // chosen → idx, pruning each neighbor (its own lock only).
+        for &nb in &chosen {
+            let mut nl = adj[nb].lock().unwrap_or_else(|e| e.into_inner());
+            nl[lc].push(idx);
+            prune_build(meta, metric, nb, lc, &mut nl, maxc);
+        }
+        // prune idx itself
+        {
+            let mut mine = adj[idx].lock().unwrap_or_else(|e| e.into_inner());
+            prune_build(meta, metric, idx, lc, &mut mine, maxc);
+        }
+
+        entry_points = if w.is_empty() {
+            vec![ep]
+        } else {
+            w.iter().map(|&(_, i)| i).collect()
+        };
+    }
+
+    // If this node is taller than the current top, it becomes the entry point.
+    if level > top {
+        let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+        if level > e.1 {
+            *e = (idx, level);
+        }
     }
 }
 
@@ -537,6 +833,81 @@ mod tests {
         assert!(
             recall >= 0.85,
             "mean recall@{k} was {recall:.3}, expected >= 0.85"
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_parallel_vs_sequential_build() {
+        use std::time::Instant;
+        let dim = 64;
+        let count = 50_000u64;
+        let mut vg = Gen(0xDEAD_BEEF_CAFE_1234);
+        let items: Vec<(u64, Vec<f32>)> = (0..count).map(|id| (id, vg.vec(dim))).collect();
+
+        let mut seq = HnswIndex::new(Metric::Cosine);
+        let t = Instant::now();
+        for (id, v) in &items {
+            seq.insert(*id, v).unwrap();
+        }
+        let seq_t = t.elapsed();
+
+        let mut par = HnswIndex::new(Metric::Cosine);
+        let t = Instant::now();
+        par.build_parallel(&items).unwrap();
+        let par_t = t.elapsed();
+
+        let cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        println!(
+            "build {count}x{dim} on {cores} cores: sequential {seq_t:?} vs parallel {par_t:?} \
+             ({:.1}x faster)",
+            seq_t.as_secs_f64() / par_t.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn parallel_build_has_high_recall() {
+        // Enough points to cross PARALLEL_MIN and actually exercise threads.
+        let dim = 16;
+        let count = 3000u64;
+        let mut vg = Gen(0x1357_9BDF_2468_ACE0);
+        let items: Vec<(u64, Vec<f32>)> = (0..count).map(|id| (id, vg.vec(dim))).collect();
+
+        let mut hnsw = HnswIndex::new(Metric::Cosine);
+        hnsw.build_parallel(&items).unwrap();
+        assert_eq!(hnsw.len(), count as usize);
+
+        let mut exact = BruteForceIndex::new(Metric::Cosine);
+        for (id, v) in &items {
+            exact.insert(*id, v).unwrap();
+        }
+
+        let k = 10;
+        let queries = 40;
+        let mut total = 0.0;
+        for _ in 0..queries {
+            let q = vg.vec(dim);
+            let h: Vec<u64> = hnsw
+                .search(&q, k, None)
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect();
+            let e: Vec<u64> = exact
+                .search(&q, k, None)
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect();
+            assert_eq!(h.len(), k);
+            total += recall_at_k(&h, &e);
+        }
+        let recall = total / queries as f64;
+        assert!(
+            recall >= 0.85,
+            "parallel-build mean recall@{k} was {recall:.3}, expected >= 0.85"
         );
     }
 

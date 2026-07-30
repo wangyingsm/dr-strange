@@ -71,7 +71,9 @@ impl VectorRegistry {
     }
 
     /// Builds (or replaces) one index by scanning its label and inserting
-    /// every node's vector for `property`.
+    /// every node's vector for `property`. The vectors are collected first and
+    /// handed to [`HnswIndex::build_parallel`], which parallelizes large
+    /// builds across threads (small ones stay on the sequential path).
     pub fn build_entry(
         &mut self,
         txn: &dyn ReadTransaction,
@@ -80,12 +82,14 @@ impl VectorRegistry {
         property: &str,
         metric: Metric,
     ) -> Result<()> {
-        let mut index = HnswIndex::new(metric);
+        let mut items = Vec::new();
         for id in graph::scan_label(txn, plane, label)? {
             if let Some(v) = graph::node_vector(txn, plane, id, property)? {
-                index.insert(id.0, &v)?;
+                items.push((id.0, v));
             }
         }
+        let mut index = HnswIndex::new(metric);
+        index.build_parallel(&items)?;
         self.entries.insert(
             (plane, label.to_string(), property.to_string()),
             Entry { metric, index },
