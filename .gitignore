@@ -3,3 +3,6 @@
 # Local database files created by drsg / just serve.
 *.drsg
 *.drsg.jsonl
+
+# Runtime logs from dr-strange-log (DRSG_LOG_DIR, default ./logs).
+/logs/

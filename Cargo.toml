@@ -7,6 +7,7 @@ members = [
     "crates/dr-strange-web",
     "crates/dr-strange-llm",
     "crates/dr-strange-log",
+    "crates/dr-strange-parser",
     "benchmarks/drsg-bench",
 ]
 
