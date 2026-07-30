@@ -4,6 +4,7 @@
 //! database call runs on a blocking task; the async runtime is never stalled
 //! by a long scan.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -247,9 +248,49 @@ async fn export_http(
     }
 }
 
+/// The Eye-of-Agamotto seal (the same square + diamond + tick-ring emblem as
+/// the web UI's SVG logo), rendered in text for the startup banner.
+const LOGO: &str = r#"
+                   ooooooooo
+              ooo             ooo
+           oo                     oo
+         oo          /   \          oo
+       oo    ++----//-----\\----++    oo
+      oo     |   //         \\   |     oo
+     oo      | //             \\ |      oo
+    oo       //                 \\       oo
+    oo     //|        ***        |\\     oo
+    o        |       *****       |        o
+    oo     \\|        ***        |//     oo
+    oo       \\                 //       oo
+     oo      | \\             // |      oo
+      oo     |   \\         //   |     oo
+       oo    ++----\\-----//----++    oo
+         oo          \   /          oo
+           oo                     oo
+              ooo             ooo
+                   ooooooooo"#;
+
+/// Prints the emblem + tagline to stderr at startup. Purely decorative, so it
+/// bypasses `tracing` (whose timestamps/levels would mangle the art); ANSI
+/// colour is used only when stderr is a real terminal.
+fn startup_banner() {
+    let (gold, bold, reset) = if std::io::stderr().is_terminal() {
+        ("\x1b[38;5;178m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    eprintln!("{gold}{LOGO}{reset}");
+    eprintln!(
+        "    {gold}{bold}Dr STRANGE{reset}{gold}, an AI-native embedded graph database  v{}{reset}\n",
+        env!("CARGO_PKG_VERSION"),
+    );
+}
+
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
 pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> anyhow::Result<()> {
+    startup_banner();
     // Read the secret once so the checker (`authorizer`) and the SPA's injected
     // copy (`bootstrap_token`) can never disagree.
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
