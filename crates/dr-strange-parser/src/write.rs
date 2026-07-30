@@ -79,11 +79,17 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
     let has_label_ops = ast.ops.iter().any(is_label_op);
 
     let binding = match ast.match_clause {
-        // Standalone: only CREATE is allowed with no MATCH.
+        // Standalone: only CREATE / MERGE are allowed with no MATCH.
         None => {
             for op in &ast.ops {
-                if !matches!(op, WriteOp::Create(_)) {
-                    return Err("SET / REMOVE / DELETE require a MATCH to select nodes".to_string());
+                match op {
+                    WriteOp::Create(_) => {}
+                    WriteOp::Merge(m) => validate_merge(m)?,
+                    _ => {
+                        return Err(
+                            "SET / REMOVE / DELETE require a MATCH to select nodes".to_string()
+                        );
+                    }
                 }
             }
             None
@@ -97,6 +103,9 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
                 match op {
                     WriteOp::Create(_) => {
                         return Err("CREATE after MATCH isn't supported yet".to_string());
+                    }
+                    WriteOp::Merge(_) => {
+                        return Err("MERGE after MATCH isn't supported yet".to_string());
                     }
                     WriteOp::Set(items) => check_var(items.iter().map(set_item_var), &var)?,
                     WriteOp::Remove(items) => check_var(items.iter().map(remove_item_var), &var)?,
@@ -128,6 +137,28 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
         ops: ast.ops,
         has_label_ops,
     })
+}
+
+/// A MERGE upserts by external key, so it needs a string `key:`; its ON
+/// CREATE/MATCH SET items may reference only the MERGE variable.
+fn validate_merge(m: &MergeClause) -> Result<(), String> {
+    if m.node.key.is_none() {
+        return Err(
+            "MERGE needs a `key:` to upsert on, e.g. MERGE (n:Label {key:\"…\"})".to_string(),
+        );
+    }
+    let var = m.node.var.as_deref();
+    for it in m.on_create.iter().chain(&m.on_match) {
+        match var {
+            Some(v) if set_item_var(it) == v => {}
+            _ => {
+                return Err(
+                    "ON CREATE / ON MATCH SET must reference the MERGE variable".to_string()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_var<'a>(vars: impl Iterator<Item = &'a str>, bound: &str) -> Result<(), String> {
@@ -180,6 +211,32 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
             WriteOp::Create(paths) => {
                 for path in paths {
                     create_path(&mut txn, path, &mut vars, &mut summary)?;
+                }
+            }
+            WriteOp::Merge(m) => {
+                let key = m.node.key.as_deref().expect("compile guaranteed a key");
+                // Upsert by external key: found → bind + ON MATCH SET; else
+                // create with the inline props + ON CREATE SET.
+                let (id, items) = match plane.node_by_key(key).map_err(|e| e.to_string())? {
+                    Some(found) => {
+                        let id = found.id;
+                        labels.entry(id.0).or_insert(found.labels);
+                        (id, &m.on_match)
+                    }
+                    None => {
+                        let label_refs: Vec<&str> = m.node.label.as_deref().into_iter().collect();
+                        let id = txn
+                            .create_node_with_key(key, &label_refs, props_of(&m.node.props))
+                            .map_err(|e| e.to_string())?;
+                        summary.nodes_created += 1;
+                        labels
+                            .entry(id.0)
+                            .or_insert_with(|| m.node.label.clone().into_iter().collect());
+                        (id, &m.on_create)
+                    }
+                };
+                for it in items {
+                    apply_set(&mut txn, id, it, &mut labels, &mut summary)?;
                 }
             }
             WriteOp::Set(items) => {

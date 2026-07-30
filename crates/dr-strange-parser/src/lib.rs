@@ -30,6 +30,8 @@
 //! # Writes (via [`parse_statement`], applied with [`WriteStatement::apply`])
 //! - `CREATE (n:L {k: v, …}), (a)-[:T {…}]->(b), …` — a string `key:` sets the
 //!   external key; edges are directed (`->`/`<-`).
+//! - `MERGE (n:L {key: "…", …}) [ON CREATE SET …] [ON MATCH SET …]` — upsert a
+//!   node by its external key.
 //! - `MATCH pattern [WHERE …] SET n.p = v, n:Label, n += {…}` /
 //!   `REMOVE n.p, n:Label` / `[DETACH] DELETE n` — find-then-mutate on the
 //!   pattern's terminal variable (plain `DELETE` refuses a connected node).
@@ -38,7 +40,7 @@
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning / ordering by a non-terminal variable, projections, aggregation;
 //! - unbounded variable-length (`*`, `*n..`);
-//! - `MERGE` (upsert), `CREATE` after `MATCH`, and named `$params`.
+//! - `CREATE`/`MERGE` after `MATCH`, path `MERGE`, and named `$params`.
 
 mod ast;
 mod compile;

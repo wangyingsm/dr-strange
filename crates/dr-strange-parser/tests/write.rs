@@ -178,6 +178,63 @@ fn rejects_match_write_with_anonymous_terminal() {
     assert!(matches!(e, ParseError::Compile(_)));
 }
 
+// ---- MERGE (upsert) -------------------------------------------------------
+
+#[test]
+fn merge_creates_when_absent() {
+    let db = Database::in_memory().unwrap();
+    let s = write(
+        &db,
+        r#"MERGE (a:Person {key:"alice", age:30})
+             ON CREATE SET a.created = true
+             ON MATCH SET a.seen = true"#,
+    );
+    assert_eq!(s.nodes_created, 1);
+    let a = plane(&db).node_by_key("alice").unwrap().unwrap();
+    assert!(a.labels.iter().any(|l| l == "Person"));
+    assert_eq!(a.properties["age"].value, PropValue::Int(30)); // inline prop written
+    assert_eq!(a.properties["created"].value, PropValue::Bool(true)); // ON CREATE
+    assert!(!a.properties.contains_key("seen")); // ON MATCH skipped
+}
+
+#[test]
+fn merge_binds_when_present() {
+    let db = Database::in_memory().unwrap();
+    write(&db, r#"CREATE (a:Person {key:"bob", age:40})"#);
+    let s = write(
+        &db,
+        r#"MERGE (a:Person {key:"bob", age:99})
+             ON CREATE SET a.created = true
+             ON MATCH SET a.seen = true"#,
+    );
+    assert_eq!(s.nodes_created, 0); // already existed → bound, not created
+    let b = plane(&db).node_by_key("bob").unwrap().unwrap();
+    assert_eq!(b.properties["age"].value, PropValue::Int(40)); // inline age:99 NOT reapplied
+    assert!(b.properties.contains_key("seen")); // ON MATCH applied
+    assert!(!b.properties.contains_key("created")); // ON CREATE skipped
+}
+
+#[test]
+fn merge_is_idempotent() {
+    let db = Database::in_memory().unwrap();
+    assert_eq!(write(&db, r#"MERGE (a:Tag {key:"t"})"#).nodes_created, 1);
+    assert_eq!(write(&db, r#"MERGE (a:Tag {key:"t"})"#).nodes_created, 0);
+    assert_eq!(plane(&db).catalog().unwrap().node_count, 1);
+}
+
+#[test]
+fn merge_requires_a_key() {
+    let e = parse_statement(r#"MERGE (a:Person {name:"x"})"#).unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)));
+    assert!(e.to_string().contains("key"), "{e}");
+}
+
+#[test]
+fn merge_on_set_must_reference_the_merge_variable() {
+    let e = parse_statement(r#"MERGE (a:Person {key:"k"}) ON CREATE SET b.x = 1"#).unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)));
+}
+
 #[test]
 fn read_parse_rejects_a_write() {
     // The read-only `parse` refuses a write with a clear message.

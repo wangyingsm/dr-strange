@@ -203,12 +203,23 @@ pub struct MatchClause {
 pub enum WriteOp {
     /// `CREATE (n:L {..}), (a)-[:T {..}]->(b), …`
     Create(Vec<CreatePath>),
+    /// `MERGE (n:L {key:"k", ..}) [ON CREATE SET …] [ON MATCH SET …]`
+    Merge(MergeClause),
     /// `SET n.p = v, n:Label, n += {..}`
     Set(Vec<SetItem>),
     /// `REMOVE n.p, n:Label`
     Remove(Vec<RemoveItem>),
     /// `[DETACH] DELETE n, m, …`
     Delete { detach: bool, vars: Vec<String> },
+}
+
+/// `MERGE (node) [ON CREATE SET …] [ON MATCH SET …]` — upsert a node by its
+/// external `key`. `node` reuses the CREATE node shape (var/label/key/props).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClause {
+    pub node: CreateNode,
+    pub on_create: Vec<SetItem>,
+    pub on_match: Vec<SetItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

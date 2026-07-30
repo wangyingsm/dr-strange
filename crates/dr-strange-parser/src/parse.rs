@@ -726,6 +726,42 @@ fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
     ))
 }
 
+/// `MERGE (n:L {key:"k", ..}) [ON CREATE SET …] [ON MATCH SET …]` — upsert.
+fn merge_stmt(i: &str) -> IResult<&str, WriteAst> {
+    let (i, _) = kw("merge")(i)?;
+    let (i, node) = create_node(i)?;
+    let (i, clauses) = many0(merge_on)(i)?;
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
+    for (is_create, items) in clauses {
+        if is_create {
+            on_create.extend(items);
+        } else {
+            on_match.extend(items);
+        }
+    }
+    Ok((
+        i,
+        WriteAst {
+            match_clause: None,
+            ops: vec![WriteOp::Merge(MergeClause {
+                node,
+                on_create,
+                on_match,
+            })],
+        },
+    ))
+}
+
+/// `ON CREATE SET …` (true) or `ON MATCH SET …` (false).
+fn merge_on(i: &str) -> IResult<&str, (bool, Vec<SetItem>)> {
+    let (i, _) = kw("on")(i)?;
+    let (i, is_create) = alt((value(true, kw("create")), value(false, kw("match"))))(i)?;
+    let (i, _) = kw("set")(i)?;
+    let (i, items) = separated_list1(symbol(","), set_item)(i)?;
+    Ok((i, (is_create, items)))
+}
+
 /// `MATCH pattern [WHERE …] (SET|REMOVE|DELETE)…` — find nodes, then mutate them.
 fn match_write_stmt(i: &str) -> IResult<&str, WriteAst> {
     let (i, _) = kw("match")(i)?;
@@ -815,6 +851,7 @@ fn delete_op(i: &str) -> IResult<&str, WriteOp> {
 pub fn statement(i: &str) -> IResult<&str, StmtAst> {
     alt((
         map(create_stmt, StmtAst::Write),
+        map(merge_stmt, StmtAst::Write),
         map(match_write_stmt, StmtAst::Write),
         map(query, |q| StmtAst::Read(Box::new(q))),
     ))(i)
