@@ -105,9 +105,7 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
                     // reuse the matched variable anchor to it; other vars are
                     // new. No var restriction (unlike SET/REMOVE/DELETE).
                     WriteOp::Create(_) => {}
-                    WriteOp::Merge(_) => {
-                        return Err("MERGE after MATCH isn't supported yet".to_string());
-                    }
+                    WriteOp::Merge(m) => validate_merge_after_match(m, &var)?,
                     WriteOp::Set(items) => check_var(items.iter().map(set_item_var), &var)?,
                     WriteOp::Remove(items) => check_var(items.iter().map(remove_item_var), &var)?,
                     WriteOp::Delete { vars, .. } => {
@@ -171,6 +169,32 @@ fn validate_merge(m: &MergeClause) -> Result<(), String> {
     Ok(())
 }
 
+/// A MERGE after MATCH must extend the matched node with a relationship: the
+/// first node anchors to the matched variable, every later node needs a key,
+/// and ON CREATE/MATCH SET isn't supported here.
+fn validate_merge_after_match(m: &MergeClause, terminal: &str) -> Result<(), String> {
+    if m.path.first.var.as_deref() != Some(terminal) {
+        return Err(format!(
+            "MERGE after MATCH must start from the matched variable `{terminal}`, \
+             e.g. MATCH ({terminal}) MERGE ({terminal})-[:R]->(b {{key:\"…\"}})"
+        ));
+    }
+    if m.path.rest.is_empty() {
+        return Err(
+            "MERGE after MATCH must extend the matched node with a relationship".to_string(),
+        );
+    }
+    for (_, n) in &m.path.rest {
+        if n.key.is_none() {
+            return Err("MERGE needs a `key:` on every non-anchor node".to_string());
+        }
+    }
+    if !m.on_create.is_empty() || !m.on_match.is_empty() {
+        return Err("ON CREATE / ON MATCH SET isn't supported for a MERGE after MATCH".to_string());
+    }
+    Ok(())
+}
+
 fn check_var<'a>(vars: impl Iterator<Item = &'a str>, bound: &str) -> Result<(), String> {
     for v in vars {
         if v != bound {
@@ -214,6 +238,10 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
     }
 
     let mut txn = plane.write().map_err(|e| e.to_string())?;
+    // Statement-scoped: keyed nodes upserted by MERGE, so a shared target across
+    // matched rows resolves to one node (node_by_key can't see the uncommitted
+    // create). Persists across ops and per-row loops.
+    let mut merged: HashMap<&str, NodeId> = HashMap::new();
 
     for op in &stmt.ops {
         match op {
@@ -237,10 +265,37 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                     }
                 }
             },
-            WriteOp::Merge(m) => {
-                let mut vars: HashMap<&str, NodeId> = HashMap::new();
-                merge_path(plane, &mut txn, m, &mut vars, &mut labels, &mut summary)?;
-            }
+            WriteOp::Merge(m) => match &stmt.binding {
+                // Standalone MERGE: run once.
+                None => {
+                    let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                    merge_path(
+                        plane,
+                        &mut txn,
+                        m,
+                        &mut vars,
+                        &mut merged,
+                        &mut labels,
+                        &mut summary,
+                    )?;
+                }
+                // MERGE after MATCH: once per matched row, anchored to that node.
+                Some((bound, _)) => {
+                    for id in &ids {
+                        let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                        vars.insert(bound.as_str(), *id);
+                        merge_path(
+                            plane,
+                            &mut txn,
+                            m,
+                            &mut vars,
+                            &mut merged,
+                            &mut labels,
+                            &mut summary,
+                        )?;
+                    }
+                }
+            },
             WriteOp::Set(items) => {
                 for id in &ids {
                     for it in items {
@@ -351,10 +406,12 @@ fn merge_path<'a>(
     txn: &mut WriteTxn<'_>,
     m: &'a MergeClause,
     vars: &mut HashMap<&'a str, NodeId>,
+    merged: &mut HashMap<&'a str, NodeId>,
     labels: &mut HashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
 ) -> Result<(), String> {
-    let (first_id, created) = upsert_merge_node(plane, txn, &m.path.first, vars, labels, summary)?;
+    let (first_id, created) =
+        upsert_merge_node(plane, txn, &m.path.first, vars, merged, labels, summary)?;
     // ON CREATE / ON MATCH SET apply to a single-node MERGE's node.
     let items = if created { &m.on_create } else { &m.on_match };
     for it in items {
@@ -362,21 +419,25 @@ fn merge_path<'a>(
     }
     let mut prev = first_id;
     for (rel, node) in &m.path.rest {
-        let (cur, _) = upsert_merge_node(plane, txn, node, vars, labels, summary)?;
+        let (cur, _) = upsert_merge_node(plane, txn, node, vars, merged, labels, summary)?;
         ensure_edge(plane, txn, prev, cur, rel, summary)?;
         prev = cur;
     }
     Ok(())
 }
 
-/// Find a node by external key (and bind it) or create it. A node reusing an
-/// already-bound variable (a matched anchor, or an earlier MERGE node) is
-/// reused. Returns `(id, created)`.
+/// Find a node by external key (and bind it) or create it. Reuse order: an
+/// already-bound variable (a matched anchor / an earlier node in this path),
+/// then a node upserted earlier *in this statement* by the same key (`merged` —
+/// needed because `node_by_key` can't see the uncommitted create, e.g. a shared
+/// MERGE target across matched rows), then the committed store. Returns
+/// `(id, created)`.
 fn upsert_merge_node<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
     vars: &mut HashMap<&'a str, NodeId>,
+    merged: &mut HashMap<&'a str, NodeId>,
     labels: &mut HashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
 ) -> Result<(NodeId, bool), String> {
@@ -389,6 +450,14 @@ fn upsert_merge_node<'a>(
         .key
         .as_deref()
         .ok_or("MERGE node needs a `key:` to upsert on")?;
+
+    if let Some(&id) = merged.get(key) {
+        if let Some(v) = &cn.var {
+            vars.insert(v.as_str(), id);
+        }
+        return Ok((id, false));
+    }
+
     let (id, created) = match plane.node_by_key(key).map_err(|e| e.to_string())? {
         Some(found) => {
             let id = found.id;
@@ -407,6 +476,7 @@ fn upsert_merge_node<'a>(
             (id, true)
         }
     };
+    merged.insert(key, id);
     if let Some(v) = &cn.var {
         vars.insert(v.as_str(), id);
     }

@@ -797,7 +797,7 @@ fn match_write_stmt(i: &str) -> IResult<&str, WriteAst> {
 }
 
 fn mutate_op(i: &str) -> IResult<&str, WriteOp> {
-    alt((set_op, remove_op, delete_op, create_clause))(i)
+    alt((set_op, remove_op, delete_op, create_clause, merge_clause))(i)
 }
 
 fn set_op(i: &str) -> IResult<&str, WriteOp> {

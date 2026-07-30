@@ -303,6 +303,52 @@ fn merge_path_binds_existing_node_creates_the_rest() {
 }
 
 #[test]
+fn merge_after_match_shares_target_across_rows() {
+    let db = Database::in_memory().unwrap();
+    write(
+        &db,
+        r#"CREATE (a:Person {key:"alice"}), (b:Person {key:"bob"})"#,
+    );
+    // Put every person on the eng team: the Team is upserted once and reused
+    // across matched rows (exercises the statement-scoped merge cache).
+    let q = r#"MATCH (p:Person) MERGE (p)-[:MEMBER_OF]->(t:Team {key:"eng"})"#;
+    let s = write(&db, q);
+    assert_eq!(s.nodes_created, 1); // one Team, not one per person
+    assert_eq!(s.edges_created, 2); // alice→eng, bob→eng
+
+    let p = plane(&db);
+    let team = p.node_by_key("eng").unwrap().unwrap();
+    let alice = p.node_by_key("alice").unwrap().unwrap();
+    assert_eq!(
+        p.neighbors(alice.id, Dir::Out, Some("MEMBER_OF")).unwrap()[0].node,
+        team.id
+    );
+
+    // Idempotent: everything is bound / already connected.
+    let s2 = write(&db, q);
+    assert_eq!((s2.nodes_created, s2.edges_created), (0, 0));
+}
+
+#[test]
+fn merge_after_match_validation() {
+    // The first node must be the matched variable.
+    assert!(matches!(
+        parse_statement(r#"MATCH (p:Person) MERGE (x)-[:R]->(t {key:"t"})"#),
+        Err(ParseError::Compile(_))
+    ));
+    // Must extend the matched node with a relationship.
+    assert!(matches!(
+        parse_statement("MATCH (p:Person) MERGE (p)"),
+        Err(ParseError::Compile(_))
+    ));
+    // ON CREATE / ON MATCH SET isn't supported here.
+    assert!(matches!(
+        parse_statement(r#"MATCH (p:Person) MERGE (p)-[:R]->(t {key:"t"}) ON CREATE SET p.x = 1"#),
+        Err(ParseError::Compile(_))
+    ));
+}
+
+#[test]
 fn path_merge_rejects_on_clauses_and_keyless_nodes() {
     assert!(matches!(
         parse_statement(r#"MERGE (a {key:"a"})-[:R]->(b {key:"b"}) ON CREATE SET a.x = 1"#),
