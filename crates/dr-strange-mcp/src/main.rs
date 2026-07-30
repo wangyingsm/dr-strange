@@ -126,6 +126,15 @@ struct Query {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct Cypher {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// A query in the openCypher-subset language, e.g.
+    /// `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.
+    query: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct NodeInput {
     external_key: Option<String>,
     #[serde(default)]
@@ -306,6 +315,12 @@ fn traverse_logic(db: &Database, req: Traverse) -> AnyResult<Value> {
 
 fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
     let plan: LogicalPlan = serde_json::from_value(req.plan)?;
+    let rows = db.plane(&req.plane)?.query_from_plan(plan).scored_nodes()?;
+    Ok(scored_rows(&rows))
+}
+
+fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
+    let plan = dr_strange_parser::parse(&req.query).map_err(|e| anyhow::anyhow!("{e}"))?;
     let rows = db.plane(&req.plane)?.query_from_plan(plan).scored_nodes()?;
     Ok(scored_rows(&rows))
 }
@@ -502,6 +517,21 @@ impl DrStrange {
         matching node records (with scores where present).")]
     async fn query(&self, Parameters(req): Parameters<Query>) -> Result<CallToolResult, McpError> {
         self.blocking("query", move |db| query_logic(db, req)).await
+    }
+
+    #[tool(description = "Run a query written in the openCypher-subset query \
+        language and return the matching node records. Supports MATCH of one \
+        linear path (labels, ->/<-/- directions, bounded variable-length \
+        *m..n), WHERE (comparisons, AND/OR/NOT, arithmetic, IS [NOT] NULL, \
+        a.prop, a:Label), and RETURN [DISTINCT] / ORDER BY / SKIP / LIMIT. \
+        Prefer this over the raw `query` plan for readability. Example: \
+        `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.")]
+    async fn cypher(
+        &self,
+        Parameters(req): Parameters<Cypher>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("cypher", move |db| cypher_logic(db, req))
+            .await
     }
 
     #[tool(description = "Create nodes (batched). Each: {external_key?, labels, \
@@ -702,6 +732,28 @@ mod tests {
         .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["external_key"], jval!("d1"));
+    }
+
+    #[test]
+    fn cypher_compiles_and_runs() {
+        let db = fixture();
+        // all Docs
+        let all = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN n"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        // traversal d0 -CITES-> d1
+        let hop = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (a:Doc)-[:CITES]->(b:Doc) RETURN b"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hop.as_array().unwrap().len(), 1);
+        assert_eq!(hop[0]["external_key"], jval!("d1"));
+        // a malformed query surfaces the parser error, not a panic
+        assert!(cypher_logic(&db, from_value(jval!({"query": "MATCH (n)"})).unwrap()).is_err());
     }
 
     #[test]

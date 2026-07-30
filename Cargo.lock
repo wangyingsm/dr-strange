@@ -713,6 +713,7 @@ dependencies = [
  "dr-strange-core",
  "dr-strange-llm",
  "dr-strange-log",
+ "dr-strange-parser",
  "rmcp",
  "schemars",
  "serde",

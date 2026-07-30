@@ -15,6 +15,7 @@ dr-strange-core = { workspace = true, features = ["json"] }
 # agents, so the `digest` tool (arch/07) is always compiled in.
 dr-strange-llm = { path = "../dr-strange-llm" }
 dr-strange-log.workspace = true
+dr-strange-parser.workspace = true
 rmcp = { version = "2.2.0", features = ["transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 serde = { version = "1", features = ["derive"] }
