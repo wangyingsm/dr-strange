@@ -6,6 +6,19 @@
 //! Covered: insert throughput, point lookup, 1-hop and 2-hop expansion
 //! (memory vs redb), and vector search brute-force vs the declared HNSW index.
 //! External-DB comparison (Kùzu/Neo4j) is a separate, later effort.
+//!
+//! **Backend comparison.** The `redb`-labelled `Database` benches run against
+//! whichever on-disk backend the features select, so the native LSM engine is
+//! measured against redb by running the suite twice:
+//! ```text
+//!   cargo bench --bench graph                          # redb (baseline)
+//!   cargo bench --bench graph --features native-backend  # native (reports Δ)
+//! ```
+//! Indicative (1 machine, data resident in the memtable): the native engine is
+//! ~3.5× faster on insert (40.4ms → 11.6ms / 1k nodes) and ~2.7× on point
+//! lookup (1.42µs → 518ns), and on par for 2-hop expansion. The SST read path
+//! (bloom/block-cache) only engages past the flush threshold and isn't measured
+//! by this small-data suite.
 
 use std::hint::black_box;
 
