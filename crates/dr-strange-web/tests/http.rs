@@ -118,6 +118,30 @@ async fn serves_dashboard_and_rpc() {
     let last = ndjson.lines().rfind(|l| !l.trim().is_empty()).unwrap();
     let body: Value = serde_json::from_str(last).unwrap();
     assert_eq!(body["chars"], big.len());
+
+    // /cypher compiles an openCypher-subset query and runs it; same-origin auth
+    // like the browser UI. The seeded graph has one Person, "alice".
+    let cy = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body("MATCH (n:Person) RETURN n")
+        .send()
+        .await
+        .unwrap();
+    assert!(cy.status().is_success());
+    let cyv: Value = cy.json().await.unwrap();
+    assert_eq!(cyv["count"], 1);
+    assert_eq!(cyv["nodes"][0]["external_key"], "alice");
+
+    // A malformed query is a 400 with the parser's message, not a panic.
+    let bad = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body("MATCH (n)")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 /// The auth gate, exercised over the real HTTP wiring (the header →

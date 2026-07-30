@@ -112,6 +112,9 @@ fn router(state: Arc<AppState>) -> Router {
         // so the local-UI Origin check can't see it and a tokenless server
         // would 401 its own UI. POST always carries Origin.
         .route("/export", post(export_http))
+        // POST: the query text is the body; kept off /rpc (and thus the OpenRPC
+        // schema / SDKs) as a web-only surface, like /export.
+        .route("/cypher", post(cypher_http))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .fallback(static_handler)
         .with_state(state)
@@ -244,6 +247,58 @@ async fn export_http(
         Err(_) => {
             tracing::error!(plane = %plane, "export task panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CypherQuery {
+    #[serde(default)]
+    plane: String,
+}
+
+/// `POST /cypher?plane=startup` — the query text in the body, compiled to a
+/// plan and run; returns `{nodes, edges, count}` (the result set + induced
+/// edges) as JSON so the plot can render it. Read-gated; the scan runs on a
+/// blocking task. A parse/compile error comes back as 400 with the message.
+async fn cypher_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<CypherQuery>,
+    body: Bytes,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let query = match String::from_utf8(body.to_vec()) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
+    };
+    let plane = q.plane;
+
+    let built = tokio::task::spawn_blocking({
+        let state = state.clone();
+        let plane = plane.clone();
+        move || methods::cypher_subgraph(&state.ctx(), &plane, &query)
+    })
+    .await;
+
+    match built {
+        Ok(Ok(value)) => {
+            tracing::debug!(plane = %plane, "cypher query ok");
+            Json(value).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(plane = %plane, code = e.code, error = %e.message, "cypher query rejected");
+            (StatusCode::BAD_REQUEST, e.message).into_response()
+        }
+        Err(_) => {
+            tracing::error!(plane = %plane, "cypher task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "cypher task failed").into_response()
         }
     }
 }

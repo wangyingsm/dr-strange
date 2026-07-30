@@ -245,6 +245,48 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     Ok(scored_rows(&rows))
 }
 
+/// Compile an openCypher-subset query (via dr-strange-parser) to a
+/// `LogicalPlan`, run it, and return the matching nodes plus the edges induced
+/// among exactly that result set — the same `{nodes, edges}` shape as
+/// `graph.seed`, so the plot can render a query result as a subgraph. Used by
+/// the web-only `POST /cypher` endpoint (kept off the JSON-RPC surface so it
+/// doesn't ripple into the OpenRPC schema / the SDKs).
+pub fn cypher_subgraph(ctx: &Ctx<'_>, plane_name: &str, query: &str) -> Result<Value, RpcError> {
+    let plan =
+        dr_strange_parser::parse(query).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let plane = app(ctx.db.plane(plane_name))?;
+    let rows = app(plane.query_from_plan(plan).scored_nodes())?;
+
+    let set: std::collections::BTreeSet<u64> = rows.iter().map(|(n, _)| n.id.0).collect();
+    let nodes: Vec<Value> = rows
+        .iter()
+        .map(|(n, s)| {
+            let mut obj = json::node_to_json(n);
+            if let (Some(score), Value::Object(map)) = (s, &mut obj) {
+                map.insert("score".into(), jval!(score));
+            }
+            obj
+        })
+        .collect();
+
+    // Induced edges: one pass over each result node's outgoing hops, keeping
+    // those whose destination is also in the result set (deduped by edge id).
+    let mut seen_edges = std::collections::BTreeSet::new();
+    let mut edges = Vec::new();
+    for (n, _) in &rows {
+        for hop in app(plane.neighbors(n.id, Dir::Out, None))? {
+            if set.contains(&hop.node.0)
+                && seen_edges.insert(hop.edge.0)
+                && let Some(edge) = app(plane.edge(hop.edge))?
+            {
+                edges.push(edge_to_json(&edge));
+            }
+        }
+    }
+
+    Ok(jval!({ "nodes": nodes, "edges": edges, "count": set.len() }))
+}
+
 // ---- graph-plot subgraph methods (chunk 2, arch/08 §2.2) ------------------
 
 /// The default node cap for a seeded view — the plot never asks the core for

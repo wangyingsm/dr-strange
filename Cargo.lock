@@ -737,6 +737,7 @@ dependencies = [
  "axum",
  "dr-strange-core",
  "dr-strange-llm",
+ "dr-strange-parser",
  "mime_guess",
  "pdf-extract",
  "reqwest",
