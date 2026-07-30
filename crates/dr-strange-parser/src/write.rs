@@ -101,9 +101,10 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
                 .to_string();
             for op in &ast.ops {
                 match op {
-                    WriteOp::Create(_) => {
-                        return Err("CREATE after MATCH isn't supported yet".to_string());
-                    }
+                    // CREATE after MATCH runs once per matched row: nodes that
+                    // reuse the matched variable anchor to it; other vars are
+                    // new. No var restriction (unlike SET/REMOVE/DELETE).
+                    WriteOp::Create(_) => {}
                     WriteOp::Merge(_) => {
                         return Err("MERGE after MATCH isn't supported yet".to_string());
                     }
@@ -204,15 +205,29 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
     }
 
     let mut txn = plane.write().map_err(|e| e.to_string())?;
-    let mut vars: HashMap<&str, NodeId> = HashMap::new();
 
     for op in &stmt.ops {
         match op {
-            WriteOp::Create(paths) => {
-                for path in paths {
-                    create_path(&mut txn, path, &mut vars, &mut summary)?;
+            WriteOp::Create(paths) => match &stmt.binding {
+                // Standalone CREATE: build once; vars are scoped to it.
+                None => {
+                    let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                    for path in paths {
+                        create_path(&mut txn, path, &mut vars, &mut summary)?;
+                    }
                 }
-            }
+                // CREATE after MATCH: once per matched row, with the matched
+                // variable pre-bound so `(a)` anchors to that node.
+                Some((bound, _)) => {
+                    for id in &ids {
+                        let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                        vars.insert(bound.as_str(), *id);
+                        for path in paths {
+                            create_path(&mut txn, path, &mut vars, &mut summary)?;
+                        }
+                    }
+                }
+            },
             WriteOp::Merge(m) => {
                 let key = m.node.key.as_deref().expect("compile guaranteed a key");
                 // Upsert by external key: found → bind + ON MATCH SET; else

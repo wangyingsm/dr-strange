@@ -166,6 +166,38 @@ fn plain_delete_refuses_connected_node_detach_cascades() {
 }
 
 #[test]
+fn match_create_anchors_new_nodes_to_matched_rows() {
+    let db = Database::in_memory().unwrap();
+    write(
+        &db,
+        r#"CREATE (a:Person {key:"alice", active:true}),
+                 (b:Person {key:"bob", active:true}),
+                 (c:Person {key:"carol", active:false})"#,
+    );
+    // Give every active person a fresh gold Badge — runs once per matched row.
+    let s = write(
+        &db,
+        r#"MATCH (p:Person) WHERE p.active = true CREATE (p)-[:HAS]->(badge:Badge {name:"gold"})"#,
+    );
+    assert_eq!(s.nodes_created, 2); // 2 badges (the matched persons are anchored, not recreated)
+    assert_eq!(s.edges_created, 2);
+
+    let p = plane(&db);
+    let alice = p.node_by_key("alice").unwrap().unwrap();
+    assert_eq!(
+        p.neighbors(alice.id, Dir::Out, Some("HAS")).unwrap().len(),
+        1
+    );
+    let carol = p.node_by_key("carol").unwrap().unwrap(); // inactive → untouched
+    assert!(
+        p.neighbors(carol.id, Dir::Out, Some("HAS"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(p.catalog().unwrap().node_count, 5); // 3 persons + 2 badges
+}
+
+#[test]
 fn rejects_mutation_of_non_terminal_variable() {
     // `a` is not the pattern's terminal variable (`n` is).
     let e = parse_statement(r#"MATCH (a:N)-[:R]->(n:N) SET a.x = 1"#).unwrap_err();

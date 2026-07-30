@@ -714,14 +714,21 @@ fn create_path(i: &str) -> IResult<&str, CreatePath> {
     Ok((i, CreatePath { first, rest }))
 }
 
-fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
+/// `CREATE (n:L {..}), (a)-[:T {..}]->(b), …` — usable standalone or as a
+/// clause after `MATCH` (anchoring new nodes/edges to the matched node).
+fn create_clause(i: &str) -> IResult<&str, WriteOp> {
     let (i, _) = kw("create")(i)?;
     let (i, paths) = separated_list1(symbol(","), create_path)(i)?;
+    Ok((i, WriteOp::Create(paths)))
+}
+
+fn create_stmt(i: &str) -> IResult<&str, WriteAst> {
+    let (i, op) = create_clause(i)?;
     Ok((
         i,
         WriteAst {
             match_clause: None,
-            ops: vec![WriteOp::Create(paths)],
+            ops: vec![op],
         },
     ))
 }
@@ -781,7 +788,7 @@ fn match_write_stmt(i: &str) -> IResult<&str, WriteAst> {
 }
 
 fn mutate_op(i: &str) -> IResult<&str, WriteOp> {
-    alt((set_op, remove_op, delete_op))(i)
+    alt((set_op, remove_op, delete_op, create_clause))(i)
 }
 
 fn set_op(i: &str) -> IResult<&str, WriteOp> {

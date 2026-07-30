@@ -35,12 +35,14 @@
 //! - `MATCH pattern [WHERE …] SET n.p = v, n:Label, n += {…}` /
 //!   `REMOVE n.p, n:Label` / `[DETACH] DELETE n` — find-then-mutate on the
 //!   pattern's terminal variable (plain `DELETE` refuses a connected node).
+//! - `MATCH pattern [WHERE …] CREATE (n)-[:T]->(x {…})` — once per matched row,
+//!   with the terminal variable pre-bound so `(n)` anchors to the matched node.
 //!
 //! # Not yet (each is a clear error, never a silent mis-compile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning / ordering by a non-terminal variable, projections, aggregation;
 //! - unbounded variable-length (`*`, `*n..`);
-//! - `CREATE`/`MERGE` after `MATCH`, path `MERGE`, and named `$params`.
+//! - `MERGE` after `MATCH`, path `MERGE`, and named `$params`.
 
 mod ast;
 mod compile;
