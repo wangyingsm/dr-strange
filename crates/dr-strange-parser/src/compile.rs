@@ -41,7 +41,11 @@ enum Hop<'a> {
     Beam(&'a BeamClause),
 }
 
-pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan, String> {
+pub fn compile(
+    q: Query,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<LogicalPlan, String> {
     // Derive the source + first node from MATCH or SEARCH. Both consume their
     // first node's label into the source (ScanLabel / VectorTopK), so it never
     // becomes a HasLabel filter.
@@ -112,7 +116,7 @@ pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan,
                     );
                 }
             };
-            slot_filters[slot].push(compile_expr(&conj, embedder)?);
+            slot_filters[slot].push(compile_expr(&conj, embedder, params)?);
         }
     }
 
@@ -194,7 +198,7 @@ pub fn compile(q: Query, embedder: Option<&dyn Embedder>) -> Result<LogicalPlan,
                 }
             }
             keys.push(SortKey {
-                expr: compile_expr(&ok.expr, embedder)?,
+                expr: compile_expr(&ok.expr, embedder, params)?,
                 descending: ok.descending,
             });
         }
@@ -240,7 +244,7 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
                 out.insert(var.clone());
             }
             // score()/hops() read the row channel, not a variable's node.
-            PExpr::Lit(_) | PExpr::Score | PExpr::Hops => {}
+            PExpr::Lit(_) | PExpr::Param(_) | PExpr::Score | PExpr::Hops => {}
             PExpr::IsNull(x) | PExpr::Not(x) | PExpr::Neg(x) => go(x, out),
             PExpr::Compare { lhs, rhs, .. }
             | PExpr::Logic { lhs, rhs, .. }
@@ -258,16 +262,21 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
 /// Drop the variable qualifiers (the slot is already fixed by pushdown) and map
 /// straight onto core's `Expr`. Fallible only because `similarity`/`distance`
 /// may embed a text argument via `embedder`.
-fn compile_expr(e: &PExpr, embedder: Option<&dyn Embedder>) -> Result<Expr, String> {
-    let sub = |x: &PExpr| compile_expr(x, embedder).map(Box::new);
+fn compile_expr(
+    e: &PExpr,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<Expr, String> {
+    let sub = |x: &PExpr| compile_expr(x, embedder, params).map(Box::new);
     Ok(match e {
         PExpr::Lit(v) => Expr::Literal(v.clone()),
+        PExpr::Param(name) => Expr::Literal(crate::resolve_param(params, name)?),
         PExpr::Prop { key, .. } => Expr::Property(key.clone()),
         PExpr::HasLabel { label, .. } => Expr::HasLabel(label.clone()),
         PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
         PExpr::Not(x) => Expr::Not(sub(x)?),
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).
-        PExpr::Neg(x) => match compile_expr(x, embedder)? {
+        PExpr::Neg(x) => match compile_expr(x, embedder, params)? {
             Expr::Literal(PropValue::Int(n)) => Expr::Literal(PropValue::Int(-n)),
             Expr::Literal(PropValue::Float(f)) => Expr::Literal(PropValue::Float(-f)),
             other => Expr::Arith {

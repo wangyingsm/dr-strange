@@ -6,7 +6,10 @@ use dr_strange_core::{
     Dir, LogicalPlan, Metric, PropValue, SortKey, Source, Step, distance, has_label, hops, lit, p,
     score, similarity,
 };
-use dr_strange_parser::{Embedder, ParseError, parse, parse_with_embedder};
+use dr_strange_parser::{
+    Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
+    parse_with_embedder,
+};
 
 /// A deterministic stand-in for a real embedding provider: text → a tiny
 /// vector derived from it, so tests can assert exact plans.
@@ -686,6 +689,39 @@ fn rejects_unknown_function_and_metric() {
     assert!(matches!(
         err("SEARCH (n) ON e NEAR [1.0] METRIC banana RETURN n"),
         ParseError::Syntax(_)
+    ));
+}
+
+#[test]
+fn where_param_resolves_at_parse_time() {
+    let mut params = Params::new();
+    params.insert("min".into(), PropValue::Int(25));
+    params.insert("who".into(), PropValue::Str("Alice".into()));
+    let stmt = parse_statement_full(
+        "MATCH (n:Person) WHERE n.age > $min AND n.name = $who RETURN n",
+        None,
+        &params,
+    )
+    .unwrap();
+    let plan = match stmt {
+        Statement::Read(p) => p,
+        Statement::Write(_) => panic!("expected read"),
+    };
+    assert_eq!(
+        plan.steps,
+        vec![
+            Step::Filter(p("age").gt(25)),
+            Step::Filter(p("name").eq("Alice")),
+        ]
+    );
+}
+
+#[test]
+fn unbound_param_in_a_read_errors() {
+    // No params → `$missing` can't resolve.
+    assert!(matches!(
+        parse_statement("MATCH (n) WHERE n.x = $missing RETURN n"),
+        Err(ParseError::Compile(_))
     ));
 }
 

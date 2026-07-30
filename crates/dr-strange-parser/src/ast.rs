@@ -123,6 +123,9 @@ pub struct OrderKey {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PExpr {
     Lit(PropValue),
+    /// A `$name` parameter placeholder used as a value — resolved from the
+    /// caller's params at parse time.
+    Param(String),
     Prop {
         var: String,
         key: String,
@@ -224,20 +227,28 @@ pub struct MergeClause {
     pub on_match: Vec<SetItem>,
 }
 
+/// A property value: a literal, or a `$name` parameter placeholder resolved
+/// from the caller's params at parse time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    Lit(PropValue),
+    Param(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetItem {
     /// `n.key = value`
     Prop {
         var: String,
         key: String,
-        value: PropValue,
+        value: Val,
     },
     /// `n:Label` — add a label.
     Label { var: String, label: String },
     /// `n += { .. }` — merge properties.
     Merge {
         var: String,
-        props: Vec<(String, PropValue)>,
+        props: Vec<(String, Val)>,
     },
 }
 
@@ -264,7 +275,7 @@ pub struct CreateNode {
     pub var: Option<String>,
     pub label: Option<String>,
     pub key: Option<String>,
-    pub props: Vec<(String, PropValue)>,
+    pub props: Vec<(String, Val)>,
 }
 
 /// A relationship in a CREATE: a required type, a direction (`->`/`<-`; never
@@ -273,5 +284,5 @@ pub struct CreateNode {
 pub struct CreateRel {
     pub dir: Dir,
     pub ty: String,
-    pub props: Vec<(String, PropValue)>,
+    pub props: Vec<(String, Val)>,
 }

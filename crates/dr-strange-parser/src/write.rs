@@ -37,6 +37,8 @@ pub struct WriteStatement {
     ops: Vec<WriteOp>,
     /// Whether any op adds/removes a label (so we preload current label sets).
     has_label_ops: bool,
+    /// Values for `$name` placeholders, resolved when props are written.
+    params: crate::Params,
 }
 
 impl WriteStatement {
@@ -75,7 +77,7 @@ fn is_label_op(op: &WriteOp) -> bool {
 }
 
 /// Validate a parsed write and compile its `MATCH` (if any) into a read plan.
-pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
+pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, String> {
     let has_label_ops = ast.ops.iter().any(is_label_op);
 
     let binding = match ast.match_clause {
@@ -126,7 +128,7 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
                 skip: None,
                 limit: None,
             };
-            let plan = crate::compile::compile(query, None)?;
+            let plan = crate::compile::compile(query, None, &params)?;
             Some((var, plan))
         }
     };
@@ -135,6 +137,7 @@ pub fn compile(ast: WriteAst) -> Result<WriteStatement, String> {
         binding,
         ops: ast.ops,
         has_label_ops,
+        params,
     })
 }
 
@@ -207,10 +210,17 @@ fn check_var<'a>(vars: impl Iterator<Item = &'a str>, bound: &str) -> Result<(),
     Ok(())
 }
 
-fn props_of(entries: &[(String, PropValue)]) -> Properties {
+fn resolve_val(v: &Val, params: &crate::Params) -> Result<PropValue, String> {
+    match v {
+        Val::Lit(p) => Ok(p.clone()),
+        Val::Param(name) => crate::resolve_param(params, name),
+    }
+}
+
+fn props_of(entries: &[(String, Val)], params: &crate::Params) -> Result<Properties, String> {
     entries
         .iter()
-        .map(|(k, v)| (k.clone(), PropDesc::new(v.clone())))
+        .map(|(k, v)| Ok((k.clone(), PropDesc::new(resolve_val(v, params)?))))
         .collect()
 }
 
@@ -250,7 +260,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 None => {
                     let mut vars: HashMap<&str, NodeId> = HashMap::new();
                     for path in paths {
-                        create_path(&mut txn, path, &mut vars, &mut summary)?;
+                        create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
                     }
                 }
                 // CREATE after MATCH: once per matched row, with the matched
@@ -260,7 +270,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                         let mut vars: HashMap<&str, NodeId> = HashMap::new();
                         vars.insert(bound.as_str(), *id);
                         for path in paths {
-                            create_path(&mut txn, path, &mut vars, &mut summary)?;
+                            create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
                         }
                     }
                 }
@@ -277,6 +287,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                         &mut merged,
                         &mut labels,
                         &mut summary,
+                        &stmt.params,
                     )?;
                 }
                 // MERGE after MATCH: once per matched row, anchored to that node.
@@ -292,6 +303,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                             &mut merged,
                             &mut labels,
                             &mut summary,
+                            &stmt.params,
                         )?;
                     }
                 }
@@ -299,7 +311,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
             WriteOp::Set(items) => {
                 for id in &ids {
                     for it in items {
-                        apply_set(&mut txn, *id, it, &mut labels, &mut summary)?;
+                        apply_set(&mut txn, *id, it, &mut labels, &mut summary, &stmt.params)?;
                     }
                 }
             }
@@ -344,16 +356,17 @@ fn apply_set(
     it: &SetItem,
     labels: &mut HashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<(), String> {
     match it {
         SetItem::Prop { key, value, .. } => {
-            txn.set_prop(id, key, PropDesc::new(value.clone()))
+            txn.set_prop(id, key, PropDesc::new(resolve_val(value, params)?))
                 .map_err(|e| e.to_string())?;
             summary.props_set += 1;
         }
         SetItem::Merge { props, .. } => {
             for (k, v) in props {
-                txn.set_prop(id, k, PropDesc::new(v.clone()))
+                txn.set_prop(id, k, PropDesc::new(resolve_val(v, params)?))
                     .map_err(|e| e.to_string())?;
                 summary.props_set += 1;
             }
@@ -401,6 +414,7 @@ fn apply_remove(
 
 /// Execute a MERGE (single node or path): upsert each keyed node by external
 /// key, apply ON CREATE/MATCH SET to a single node, and ensure each edge.
+#[allow(clippy::too_many_arguments)]
 fn merge_path<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
@@ -409,18 +423,27 @@ fn merge_path<'a>(
     merged: &mut HashMap<&'a str, NodeId>,
     labels: &mut HashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<(), String> {
-    let (first_id, created) =
-        upsert_merge_node(plane, txn, &m.path.first, vars, merged, labels, summary)?;
+    let (first_id, created) = upsert_merge_node(
+        plane,
+        txn,
+        &m.path.first,
+        vars,
+        merged,
+        labels,
+        summary,
+        params,
+    )?;
     // ON CREATE / ON MATCH SET apply to a single-node MERGE's node.
     let items = if created { &m.on_create } else { &m.on_match };
     for it in items {
-        apply_set(txn, first_id, it, labels, summary)?;
+        apply_set(txn, first_id, it, labels, summary, params)?;
     }
     let mut prev = first_id;
     for (rel, node) in &m.path.rest {
-        let (cur, _) = upsert_merge_node(plane, txn, node, vars, merged, labels, summary)?;
-        ensure_edge(plane, txn, prev, cur, rel, summary)?;
+        let (cur, _) = upsert_merge_node(plane, txn, node, vars, merged, labels, summary, params)?;
+        ensure_edge(plane, txn, prev, cur, rel, summary, params)?;
         prev = cur;
     }
     Ok(())
@@ -432,6 +455,7 @@ fn merge_path<'a>(
 /// needed because `node_by_key` can't see the uncommitted create, e.g. a shared
 /// MERGE target across matched rows), then the committed store. Returns
 /// `(id, created)`.
+#[allow(clippy::too_many_arguments)]
 fn upsert_merge_node<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
@@ -440,6 +464,7 @@ fn upsert_merge_node<'a>(
     merged: &mut HashMap<&'a str, NodeId>,
     labels: &mut HashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<(NodeId, bool), String> {
     if let Some(v) = &cn.var
         && let Some(&id) = vars.get(v.as_str())
@@ -467,7 +492,7 @@ fn upsert_merge_node<'a>(
         None => {
             let label_refs: Vec<&str> = cn.label.as_deref().into_iter().collect();
             let id = txn
-                .create_node_with_key(key, &label_refs, props_of(&cn.props))
+                .create_node_with_key(key, &label_refs, props_of(&cn.props, params)?)
                 .map_err(|e| e.to_string())?;
             summary.nodes_created += 1;
             labels
@@ -492,6 +517,7 @@ fn ensure_edge(
     cur: NodeId,
     rel: &CreateRel,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<(), String> {
     // `->` is prev→cur; `<-` is cur→prev.
     let (src, dst) = match rel.dir {
@@ -504,7 +530,7 @@ fn ensure_edge(
     if existing.iter().any(|n| n.node == dst) {
         return Ok(());
     }
-    txn.create_edge(src, dst, &rel.ty, props_of(&rel.props))
+    txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
         .map_err(|e| e.to_string())?;
     summary.edges_created += 1;
     Ok(())
@@ -517,6 +543,7 @@ fn get_or_create<'a>(
     cn: &'a CreateNode,
     vars: &mut HashMap<&'a str, NodeId>,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<NodeId, String> {
     if let Some(v) = &cn.var
         && let Some(&id) = vars.get(v.as_str())
@@ -524,7 +551,7 @@ fn get_or_create<'a>(
         return Ok(id); // same variable → the same node
     }
     let labels: Vec<&str> = cn.label.as_deref().into_iter().collect();
-    let props = props_of(&cn.props);
+    let props = props_of(&cn.props, params)?;
     let id = match &cn.key {
         Some(k) => txn
             .create_node_with_key(k, &labels, props)
@@ -543,16 +570,17 @@ fn create_path<'a>(
     path: &'a CreatePath,
     vars: &mut HashMap<&'a str, NodeId>,
     summary: &mut WriteSummary,
+    params: &crate::Params,
 ) -> Result<(), String> {
-    let mut prev = get_or_create(txn, &path.first, vars, summary)?;
+    let mut prev = get_or_create(txn, &path.first, vars, summary, params)?;
     for (rel, node) in &path.rest {
-        let cur = get_or_create(txn, node, vars, summary)?;
+        let cur = get_or_create(txn, node, vars, summary, params)?;
         // `->` is prev→cur; `<-` is cur→prev (the parser rejects undirected).
         let (src, dst) = match rel.dir {
             Dir::In => (cur, prev),
             _ => (prev, cur),
         };
-        txn.create_edge(src, dst, &rel.ty, props_of(&rel.props))
+        txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
             .map_err(|e| e.to_string())?;
         summary.edges_created += 1;
         prev = cur;

@@ -231,7 +231,12 @@ fn unary(i: &str) -> IResult<&str, PExpr> {
 }
 
 fn primary(i: &str) -> IResult<&str, PExpr> {
-    alt((paren_expr, literal, func_or_var))(i)
+    alt((
+        paren_expr,
+        map(param_name, PExpr::Param),
+        literal,
+        func_or_var,
+    ))(i)
 }
 
 fn paren_expr(i: &str) -> IResult<&str, PExpr> {
@@ -611,9 +616,13 @@ pub fn query(i: &str) -> IResult<&str, Query> {
 
 // ---- write statements -----------------------------------------------------
 
-/// A literal property value inside `{ … }`: number (with optional `-`), string,
-/// bool, null, or a vector literal (e.g. an embedding).
-fn prop_value(i: &str) -> IResult<&str, PropValue> {
+/// A property value inside `{ … }`: a `$name` parameter, or a literal — number
+/// (with optional `-`), string, bool, null, or a vector literal.
+fn prop_value(i: &str) -> IResult<&str, Val> {
+    alt((map(param_name, Val::Param), map(prop_literal, Val::Lit)))(i)
+}
+
+fn prop_literal(i: &str) -> IResult<&str, PropValue> {
     alt((
         map(preceded(symbol("-"), number), negate_number),
         number,
@@ -626,6 +635,11 @@ fn prop_value(i: &str) -> IResult<&str, PropValue> {
     ))(i)
 }
 
+/// A `$name` parameter placeholder — returns the bare name.
+fn param_name(i: &str) -> IResult<&str, String> {
+    preceded(symbol("$"), ident)(i)
+}
+
 fn negate_number(v: PropValue) -> PropValue {
     match v {
         PropValue::Int(n) => PropValue::Int(-n),
@@ -635,14 +649,14 @@ fn negate_number(v: PropValue) -> PropValue {
 }
 
 /// An inline property map `{ key: value, … }` (empty allowed).
-fn prop_map(i: &str) -> IResult<&str, Vec<(String, PropValue)>> {
+fn prop_map(i: &str) -> IResult<&str, Vec<(String, Val)>> {
     let (i, _) = symbol("{")(i)?;
     let (i, entries) = separated_list0(symbol(","), prop_entry)(i)?;
     let (i, _) = symbol("}")(i)?;
     Ok((i, entries))
 }
 
-fn prop_entry(i: &str) -> IResult<&str, (String, PropValue)> {
+fn prop_entry(i: &str) -> IResult<&str, (String, Val)> {
     let (i, k) = ident(i)?;
     let (i, _) = symbol(":")(i)?;
     let (i, v) = prop_value(i)?;
@@ -656,12 +670,13 @@ fn create_node(i: &str) -> IResult<&str, CreateNode> {
     let (i, raw) = opt(prop_map)(i)?;
     let (i, _) = symbol(")")(i)?;
 
-    // A string-valued `key` sets the external key; everything else is a property.
+    // A literal string `key` sets the external key; everything else is a
+    // property. (A `$param` key stays a property — keys must be literals.)
     let mut key = None;
     let mut props = Vec::new();
     for (k, v) in raw.unwrap_or_default() {
         match (k.as_str(), &v) {
-            ("key", PropValue::Str(s)) => key = Some(s.clone()),
+            ("key", Val::Lit(PropValue::Str(s))) => key = Some(s.clone()),
             _ => props.push((k, v)),
         }
     }

@@ -2,7 +2,9 @@
 //! assert the graph changed as expected.
 
 use dr_strange_core::{Database, Dir, PlaneHandle, PropValue};
-use dr_strange_parser::{ParseError, Statement, WriteSummary, parse, parse_statement};
+use dr_strange_parser::{
+    Params, ParseError, Statement, WriteSummary, parse, parse_statement, parse_statement_full,
+};
 
 /// Parse a write and apply it to `startup`, returning the summary.
 fn write(db: &Database, q: &str) -> WriteSummary {
@@ -372,6 +374,55 @@ fn create_duplicate_key_errors_and_rolls_back() {
     };
     assert!(!err.is_empty(), "duplicate key should error");
     assert!(plane(&db).node_by_key("x").unwrap().is_none()); // rolled back
+}
+
+// ---- $params --------------------------------------------------------------
+
+/// Apply a write with params, returning the summary.
+fn write_p(db: &Database, q: &str, params: &Params) -> WriteSummary {
+    match parse_statement_full(q, None, params).unwrap() {
+        Statement::Write(w) => w.apply(&db.plane("startup").unwrap()).unwrap(),
+        Statement::Read(_) => panic!("expected write"),
+    }
+}
+
+#[test]
+fn create_and_set_with_params() {
+    let db = Database::in_memory().unwrap();
+    let mut params = Params::new();
+    params.insert("age".into(), PropValue::Int(42));
+    params.insert("name".into(), PropValue::Str("Zoe".into()));
+
+    let s = write_p(
+        &db,
+        r#"CREATE (n:Person {key:"zoe", age:$age, name:$name})"#,
+        &params,
+    );
+    assert_eq!(s.nodes_created, 1);
+    let n = plane(&db).node_by_key("zoe").unwrap().unwrap();
+    assert_eq!(n.properties["age"].value, PropValue::Int(42));
+    assert_eq!(n.properties["name"].value, PropValue::Str("Zoe".into()));
+
+    let mut p2 = Params::new();
+    p2.insert("age".into(), PropValue::Int(99));
+    write_p(&db, "MATCH (n:Person) SET n.age = $age", &p2);
+    assert_eq!(
+        plane(&db).node_by_key("zoe").unwrap().unwrap().properties["age"].value,
+        PropValue::Int(99)
+    );
+}
+
+#[test]
+fn unbound_param_in_a_write_errors_at_apply() {
+    let db = Database::in_memory().unwrap();
+    // Parses fine (params resolve when props are written); apply reports it.
+    let stmt = parse_statement(r#"CREATE (n {key:"k", x:$missing})"#).unwrap();
+    let e = match stmt {
+        Statement::Write(w) => w.apply(&plane(&db)).unwrap_err(),
+        Statement::Read(_) => panic!("expected write"),
+    };
+    assert!(e.contains("unbound parameter"), "{e}");
+    assert!(plane(&db).node_by_key("k").unwrap().is_none()); // nothing committed
 }
 
 #[test]

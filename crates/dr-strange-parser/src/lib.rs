@@ -40,20 +40,40 @@
 //!   `MERGE (n)-[:T]->(x {key})` — once per matched row, with the terminal
 //!   variable pre-bound so `(n)` anchors to the matched node.
 //!
+//! # Parameters
+//! `$name` placeholders in value positions (WHERE/ORDER literals, SET/CREATE/
+//! MERGE props) are resolved from a caller-supplied [`Params`] map via
+//! [`parse_statement_full`] — the SDK-safe way to pass values (no string
+//! interpolation).
+//!
 //! # Not yet (each is a clear error, never a silent mis-compile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning / ordering by a non-terminal variable, projections, aggregation;
-//! - unbounded variable-length (`*`, `*n..`);
-//! - named `$params`.
+//! - unbounded variable-length (`*`, `*n..`).
 
 mod ast;
 mod compile;
 mod parse;
 mod write;
 
-use dr_strange_core::LogicalPlan;
+use std::collections::HashMap;
+
+use dr_strange_core::{LogicalPlan, PropValue};
 
 pub use write::{WriteStatement, WriteSummary};
+
+/// Values for `$name` placeholders in a query, supplied by the caller and
+/// resolved at parse time (so no string interpolation — the SDK-safe way to
+/// pass values). Keyed by the bare name (no `$`).
+pub type Params = HashMap<String, PropValue>;
+
+/// Resolve a `$name` placeholder against the caller's params.
+pub(crate) fn resolve_param(params: &Params, name: &str) -> Result<PropValue, String> {
+    params
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("unbound parameter `${name}`"))
+}
 
 /// A parsed statement: a read (a runnable [`LogicalPlan`]) or a write (applied
 /// with [`WriteStatement::apply`]). Surfaces branch on this to run a query.
@@ -98,7 +118,7 @@ impl std::error::Error for ParseError {}
 /// is an error here — use [`parse_statement`]. A text `SEARCH … NEAR "…"` also
 /// errors (no embedder); use [`parse_with_embedder`] or a literal vector.
 pub fn parse(input: &str) -> Result<LogicalPlan, ParseError> {
-    read_only(parse_statement_inner(input, None)?)
+    read_only(parse_statement_inner(input, None, &Params::new())?)
 }
 
 /// Like [`parse`], but resolves text `NEAR "…"` terms into query vectors via
@@ -107,13 +127,17 @@ pub fn parse_with_embedder(
     input: &str,
     embedder: &dyn Embedder,
 ) -> Result<LogicalPlan, ParseError> {
-    read_only(parse_statement_inner(input, Some(embedder))?)
+    read_only(parse_statement_inner(
+        input,
+        Some(embedder),
+        &Params::new(),
+    )?)
 }
 
 /// Parse a statement — either a read query or a write (`CREATE`, …). This is the
 /// entry point a surface uses when it wants to run *either*.
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
-    parse_statement_inner(input, None)
+    parse_statement_inner(input, None, &Params::new())
 }
 
 /// Like [`parse_statement`], but resolves a text `SEARCH … NEAR "…"` via `embedder`.
@@ -121,7 +145,18 @@ pub fn parse_statement_with_embedder(
     input: &str,
     embedder: &dyn Embedder,
 ) -> Result<Statement, ParseError> {
-    parse_statement_inner(input, Some(embedder))
+    parse_statement_inner(input, Some(embedder), &Params::new())
+}
+
+/// The general entry point: parse a statement, resolving text `SEARCH` via an
+/// optional `embedder` and `$name` placeholders via `params`. The surfaces that
+/// accept parameters (CLI/MCP/plane.cypher) use this.
+pub fn parse_statement_full(
+    input: &str,
+    embedder: Option<&dyn Embedder>,
+    params: &Params,
+) -> Result<Statement, ParseError> {
+    parse_statement_inner(input, embedder, params)
 }
 
 fn read_only(stmt: Statement) -> Result<LogicalPlan, ParseError> {
@@ -136,6 +171,7 @@ fn read_only(stmt: Statement) -> Result<LogicalPlan, ParseError> {
 fn parse_statement_inner(
     input: &str,
     embedder: Option<&dyn Embedder>,
+    params: &Params,
 ) -> Result<Statement, ParseError> {
     let (rest, stmt) = parse::statement(input).map_err(|e| ParseError::Syntax(describe(e)))?;
     // Everything must be consumed — trailing tokens mean a mistyped clause.
@@ -147,10 +183,12 @@ fn parse_statement_inner(
         )));
     }
     Ok(match stmt {
-        ast::StmtAst::Read(query) => {
-            Statement::Read(compile::compile(*query, embedder).map_err(ParseError::Compile)?)
+        ast::StmtAst::Read(query) => Statement::Read(
+            compile::compile(*query, embedder, params).map_err(ParseError::Compile)?,
+        ),
+        ast::StmtAst::Write(w) => {
+            Statement::Write(write::compile(w, params.clone()).map_err(ParseError::Compile)?)
         }
-        ast::StmtAst::Write(w) => Statement::Write(write::compile(w).map_err(ParseError::Compile)?),
     })
 }
 
