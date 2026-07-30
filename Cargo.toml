@@ -6,6 +6,7 @@ members = [
     "crates/dr-strange-mcp",
     "crates/dr-strange-web",
     "crates/dr-strange-llm",
+    "crates/dr-strange-log",
     "benchmarks/drsg-bench",
 ]
 
@@ -15,4 +16,6 @@ edition = "2024"
 
 [workspace.dependencies]
 dr-strange-core = { path = "crates/dr-strange-core" }
+dr-strange-log = { path = "crates/dr-strange-log" }
 thiserror = "2"
+tracing = "0.1"

@@ -246,12 +246,12 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> an
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
     let authorizer = SharedToken::new(token.clone());
     if authorizer.is_configured() {
-        println!(
-            "drsg serve: auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
+        tracing::info!(
+            "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
         );
     } else {
-        println!(
-            "drsg serve: WARNING — no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
+        tracing::warn!(
+            "no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
         );
     }
     let state = Arc::new(AppState {
@@ -263,7 +263,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> an
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    println!("drsg serve: dashboard + JSON-RPC on http://{bound}");
+    tracing::info!(%bound, "drsg serve: dashboard + JSON-RPC listening on http://{bound}");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;

@@ -15,6 +15,7 @@ serde_json = "1"
 anyhow = "1"
 rust-embed = "8"
 mime_guess = "2"
+tracing.workspace = true
 # Server-side document text extraction for the digest page. 0.7 emitted its
 # per-glyph font/unicode warnings with raw `println!`, flooding stdout on PDFs
 # with broken unicode maps — extraction slowed to a crawl (a perceived hang).

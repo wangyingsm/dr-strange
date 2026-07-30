@@ -1,0 +1,12 @@
+[package]
+name = "dr-strange-log"
+description = "Tracing subscriber setup for dr-strange binaries — stderr + rolling file"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+# `env-filter` isn't in the default set; keep the defaults (fmt, ansi, and the
+# `tracing-log` bridge that captures `log`-crate records, e.g. pdf-extract's).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"

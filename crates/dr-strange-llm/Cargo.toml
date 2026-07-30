@@ -10,3 +10,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 ureq = { version = "2", features = ["json"] }
+tracing.workspace = true

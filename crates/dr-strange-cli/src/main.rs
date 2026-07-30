@@ -160,6 +160,8 @@ impl From<MetricArg> for Metric {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Hold the guard for the whole run so the file writer flushes on exit.
+    let _log = dr_strange_log::init("drsg");
     let out = io::stdout();
     let mut out = out.lock();
     run(cli, &mut out)?;

@@ -576,12 +576,17 @@ impl ServerHandler for DrStrange {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr + a rolling file — never stdout, which carries the
+    // stdio JSON-RPC protocol. Hold the guard so the writer flushes on exit.
+    let _log = dr_strange_log::init("drsg-mcp");
+
     // The database path: first CLI arg, else $DRSG_DB, else graph.drsg.
     let path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("DRSG_DB").ok())
         .unwrap_or_else(|| "graph.drsg".to_string());
-    let db = Arc::new(Database::open(PathBuf::from(path))?);
+    let db = Arc::new(Database::open(PathBuf::from(&path))?);
+    tracing::info!(db = %path, "drsg-mcp: database opened; serving MCP over stdio");
 
     let server = DrStrange {
         db,
