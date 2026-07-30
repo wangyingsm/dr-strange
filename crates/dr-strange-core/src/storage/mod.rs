@@ -13,8 +13,12 @@ pub mod graph;
 pub mod hnsw;
 pub mod keys;
 pub mod memory;
-pub mod redb_backend;
+#[cfg(feature = "native-backend")]
+pub mod native;
 pub mod vector;
+
+#[cfg(feature = "redb-backend")]
+pub mod redb_backend;
 
 #[cfg(test)]
 mod conformance_tests;

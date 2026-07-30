@@ -22,7 +22,15 @@ use crate::index::VectorRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
+#[cfg(feature = "native-backend")]
+use crate::storage::native::{NativeEngine, NativeWriteTxn};
+#[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
+
+#[cfg(not(any(feature = "redb-backend", feature = "native-backend")))]
+compile_error!(
+    "a storage backend is required: enable feature `redb-backend` (default) or `native-backend`"
+);
 use crate::storage::vector::Metric;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
@@ -32,14 +40,20 @@ enum Engine {
     // Boxed: the memory engine embeds its tables inline and dwarfs the redb
     // handle (clippy::large_enum_variant).
     Memory(Box<MemoryEngine>),
+    #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
     Redb(RedbEngine),
+    #[cfg(feature = "native-backend")]
+    Native(NativeEngine),
 }
 
 impl Engine {
     fn with_read<T>(&self, f: impl FnOnce(&dyn ReadTransaction) -> Result<T>) -> Result<T> {
         match self {
             Engine::Memory(e) => f(&e.begin_read()?),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             Engine::Redb(e) => f(&e.begin_read()?),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => f(&e.begin_read()?),
         }
     }
 
@@ -48,21 +62,23 @@ impl Engine {
     /// version stamp advances — coarse invalidation: any write logically
     /// flushes the cache for subsequent snapshots.
     fn with_write<T>(&self, f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>) -> Result<T> {
+        // One body per backend (the concrete txn type differs); a macro keeps
+        // them identical. Only one arm runs, so consuming `f` in each is fine.
+        macro_rules! run {
+            ($e:expr) => {{
+                let mut txn = $e.begin_write()?;
+                let out = f(&mut txn)?;
+                graph::bump_commit_seq(&mut txn)?;
+                txn.commit()?;
+                Ok(out)
+            }};
+        }
         match self {
-            Engine::Memory(e) => {
-                let mut txn = e.begin_write()?;
-                let out = f(&mut txn)?;
-                graph::bump_commit_seq(&mut txn)?;
-                txn.commit()?;
-                Ok(out)
-            }
-            Engine::Redb(e) => {
-                let mut txn = e.begin_write()?;
-                let out = f(&mut txn)?;
-                graph::bump_commit_seq(&mut txn)?;
-                txn.commit()?;
-                Ok(out)
-            }
+            Engine::Memory(e) => run!(e),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => run!(e),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => run!(e),
         }
     }
 }
@@ -93,7 +109,10 @@ impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let backend = match self.engine {
             Engine::Memory(_) => "memory",
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             Engine::Redb(_) => "redb",
+            #[cfg(feature = "native-backend")]
+            Engine::Native(_) => "native",
         };
         f.debug_struct("Database")
             .field("backend", &backend)
@@ -133,10 +152,12 @@ impl Database {
     /// Opens (creating if needed) a database file backed by redb.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let db = Self::init(
-            Engine::Redb(RedbEngine::open(path)?),
-            Some(sidecar_path(path)),
-        )?;
+        // `native-backend` takes precedence when both are enabled.
+        #[cfg(feature = "native-backend")]
+        let engine = Engine::Native(NativeEngine::open(path)?);
+        #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+        let engine = Engine::Redb(RedbEngine::open(path)?);
+        let db = Self::init(engine, Some(sidecar_path(path)))?;
         tracing::info!(path = %path.display(), "opened database");
         Ok(db)
     }
@@ -383,7 +404,10 @@ impl<'db> PlaneHandle<'db> {
     pub fn write(&self) -> Result<WriteTxn<'db>> {
         let inner = match &self.db.engine {
             Engine::Memory(e) => TxnInner::Memory(Box::new(e.begin_write()?)),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             Engine::Redb(e) => TxnInner::Redb(Box::new(e.begin_write()?)),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => TxnInner::Native(Box::new(e.begin_write()?)),
         };
         // Snapshot this plane's declared indexes so mutations can mirror into
         // them at commit without re-locking per operation.
@@ -403,7 +427,10 @@ impl<'db> PlaneHandle<'db> {
 // pointers wide, and a write transaction allocates once per begin_write.
 enum TxnInner<'db> {
     Memory(Box<MemoryWriteTxn<'db>>),
+    #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
     Redb(Box<RedbWriteTxn>),
+    #[cfg(feature = "native-backend")]
+    Native(Box<NativeWriteTxn<'db>>),
 }
 
 /// A vector-index coherence event, buffered during a write and applied to the
@@ -443,7 +470,10 @@ impl WriteTxn<'_> {
     fn txn(&mut self) -> &mut dyn WriteTransaction {
         match &mut self.inner {
             TxnInner::Memory(t) => &mut **t,
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             TxnInner::Redb(t) => &mut **t,
+            #[cfg(feature = "native-backend")]
+            TxnInner::Native(t) => &mut **t,
         }
     }
 
@@ -457,7 +487,10 @@ impl WriteTxn<'_> {
         let WriteTxn { inner, ids, .. } = self;
         let txn: &mut dyn WriteTransaction = match inner {
             TxnInner::Memory(t) => &mut **t,
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             TxnInner::Redb(t) => &mut **t,
+            #[cfg(feature = "native-backend")]
+            TxnInner::Native(t) => &mut **t,
         };
         (txn, ids)
     }
@@ -745,7 +778,10 @@ impl WriteTxn<'_> {
         // truth and rebuild-from-KV on next open restores coherence.
         match inner {
             TxnInner::Memory(t) => (*t).commit()?,
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
             TxnInner::Redb(t) => (*t).commit()?,
+            #[cfg(feature = "native-backend")]
+            TxnInner::Native(t) => (*t).commit()?,
         }
         if !events.is_empty() {
             let mut registry = db.indexes_mut();

@@ -4,6 +4,9 @@
 
 use super::engine::{StorageEngine, TableId};
 use super::memory::MemoryEngine;
+#[cfg(feature = "native-backend")]
+use super::native::NativeEngine;
+#[cfg(feature = "redb-backend")]
 use super::redb_backend::RedbEngine;
 use crate::storage::{ReadTransaction, WriteTransaction};
 
@@ -163,6 +166,7 @@ fn memory_backend_edge_cases() {
     conformance_edge_cases(&MemoryEngine::new());
 }
 
+#[cfg(feature = "redb-backend")]
 #[test]
 fn redb_backend_edge_cases() {
     let dir = tempfile::tempdir().unwrap();
@@ -170,6 +174,7 @@ fn redb_backend_edge_cases() {
     conformance_edge_cases(&eng);
 }
 
+#[cfg(feature = "redb-backend")]
 #[test]
 fn redb_backend_conformance() {
     let dir = tempfile::tempdir().unwrap();
@@ -177,6 +182,7 @@ fn redb_backend_conformance() {
     conformance(&eng);
 }
 
+#[cfg(feature = "redb-backend")]
 #[test]
 fn redb_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -188,6 +194,41 @@ fn redb_persists_across_reopen() {
         w.commit().unwrap();
     }
     let eng = RedbEngine::open(&path).unwrap();
+    let r = eng.begin_read().unwrap();
+    assert_eq!(
+        r.get(TableId::Nodes, b"persist").unwrap(),
+        Some(b"me".to_vec())
+    );
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_backend_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = NativeEngine::open(dir.path().join("edge.drsg")).unwrap();
+    conformance_edge_cases(&eng);
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_backend_conformance() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = NativeEngine::open(dir.path().join("t.drsg")).unwrap();
+    conformance(&eng);
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.drsg");
+    {
+        let eng = NativeEngine::open(&path).unwrap();
+        let mut w = eng.begin_write().unwrap();
+        w.put(TableId::Nodes, b"persist", b"me").unwrap();
+        w.commit().unwrap();
+    }
+    let eng = NativeEngine::open(&path).unwrap();
     let r = eng.begin_read().unwrap();
     assert_eq!(
         r.get(TableId::Nodes, b"persist").unwrap(),

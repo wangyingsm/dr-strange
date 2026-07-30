@@ -269,7 +269,9 @@ fn handles_have_useful_debug_output() {
     assert!(format!("{db:?}").contains("memory"));
     let dir = tempfile::tempdir().unwrap();
     let file_db = Database::open(dir.path().join("dbg.drsg")).unwrap();
-    assert!(format!("{file_db:?}").contains("redb"));
+    let dbg = format!("{file_db:?}");
+    // The on-disk backend depends on the active feature (redb or native).
+    assert!(dbg.contains("redb") || dbg.contains("native"), "got: {dbg}");
     let plane = db.plane("startup").unwrap();
     assert!(format!("{plane:?}").contains("PlaneHandle"));
 }
@@ -493,6 +495,9 @@ fn set_prop_on_missing_node_is_not_found() {
     assert!(matches!(err, Error::NotFound(_)));
 }
 
+// redb-specific: detecting a foreign redb file as corrupt is a redb behavior;
+// the native backend's on-disk form is a directory, so this doesn't apply.
+#[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 #[test]
 fn opening_a_non_drsg_file_fails_with_corrupt() {
     let dir = tempfile::tempdir().unwrap();
@@ -506,6 +511,7 @@ fn opening_a_non_drsg_file_fails_with_corrupt() {
     assert!(matches!(err, Error::Corrupt(_)), "got: {err:?}");
 }
 
+#[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 mod redb_smoke {
     use std::path::Path;
 

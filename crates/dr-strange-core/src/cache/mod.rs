@@ -562,6 +562,7 @@ mod tests {
 
     /// A chunky property map so postcard decode on read is non-trivial — the
     /// per-visit cost arch/02 says a cache should save.
+    #[cfg(feature = "redb-backend")]
     fn fat_props() -> Properties {
         use crate::types::{PropDesc, PropValue};
         let mut p = Properties::new();
@@ -577,6 +578,7 @@ mod tests {
         p
     }
 
+    #[cfg(feature = "redb-backend")]
     fn build_dense(txn: &mut dyn WriteTransaction, n: u64, fanout: u64) -> NodeId {
         graph::init(txn).unwrap();
         let ids: Vec<NodeId> = (0..n)
@@ -604,6 +606,7 @@ mod tests {
     /// Reports both a pure-expansion plan (adjacency reads) and an
     /// expand+filter plan (revisited node-record decodes) on the redb backend,
     /// where reads are B-tree + postcard decode — the case a cache can save.
+    #[cfg(feature = "redb-backend")]
     #[test]
     #[ignore]
     fn bench_cached_vs_uncached() {

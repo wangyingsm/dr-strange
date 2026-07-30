@@ -422,13 +422,14 @@ proptest! {
 }
 
 proptest! {
-    // redb spins a fresh file per case, so keep this smaller than the pure
-    // in-memory run above.
+    // The on-disk backend spins a fresh file per case, so keep this smaller
+    // than the pure in-memory run above.
     #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
 
-    /// Memory and redb backends must agree bit-for-bit on the same script.
+    /// The memory and on-disk backends (redb or native, whichever the feature
+    /// selects for `Database::open`) must agree bit-for-bit on the same script.
     #[test]
-    fn memory_and_redb_agree(ops in prop::collection::vec(op_strategy(), 0..90)) {
+    fn memory_and_disk_backend_agree(ops in prop::collection::vec(op_strategy(), 0..90)) {
         let mem = Database::in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let file = Database::open(dir.path().join("pbt.drsg")).unwrap();
