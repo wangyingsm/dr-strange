@@ -55,6 +55,13 @@ enum Command {
         #[arg(long, default_value = "startup")]
         plane: String,
     },
+    /// Run a query in the openCypher-subset language (compiled to a plan).
+    Cypher {
+        /// The query text, or `-` to read it from stdin.
+        query: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         #[arg(long)]
@@ -202,6 +209,15 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 plan
             };
             commands::query(&db, &plane, &plan, out)
+        }
+        Command::Cypher { query, plane } => {
+            let db = commands::open(&cli.db)?;
+            let query = if query == "-" {
+                io::read_to_string(io::stdin())?
+            } else {
+                query
+            };
+            commands::cypher(&db, &plane, &query, out)
         }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;

@@ -102,6 +102,19 @@ pub fn get(db: &Database, plane_name: &str, reference: &str, out: &mut dyn Write
 pub fn query(db: &Database, plane_name: &str, plan_json: &str, out: &mut dyn Write) -> Result<()> {
     let plan: LogicalPlan =
         serde_json::from_str(plan_json).context("parsing the query plan JSON")?;
+    run_plan(db, plane_name, plan, out)
+}
+
+/// Run a query written in the openCypher-subset language (arch/00 §5): compile
+/// it to a `LogicalPlan`, then execute it exactly like the JSON `query` path.
+pub fn cypher(db: &Database, plane_name: &str, query: &str, out: &mut dyn Write) -> Result<()> {
+    let plan = dr_strange_parser::parse(query).map_err(|e| anyhow!("{e}"))?;
+    run_plan(db, plane_name, plan, out)
+}
+
+/// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
+/// the similarity score when the plan produced one.
+fn run_plan(db: &Database, plane_name: &str, plan: LogicalPlan, out: &mut dyn Write) -> Result<()> {
     let p = plane(db, plane_name)?;
     for (node, score) in p.query_from_plan(plan).scored_nodes()? {
         let mut obj = jsonio::node_to_json(&node);
@@ -565,6 +578,37 @@ mod tests {
         let out = cap(|o| query(&db, "startup", plan, o));
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"external_key\":\"p2\""));
+    }
+
+    #[test]
+    fn cypher_query_over_the_graph() {
+        let db = loaded();
+        // WHERE pushdown: scan Paper, keep year >= 2021 → only p2.
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                "MATCH (n:Paper) WHERE n.year >= 2021 RETURN n",
+                o,
+            )
+        });
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"external_key\":\"p2\""));
+        // Traversal over the CITES edge: p1 → p2.
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                "MATCH (a:Paper)-[:CITES]->(b:Paper) RETURN b",
+                o,
+            )
+        });
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"external_key\":\"p2\""));
+        // An unsupported query surfaces the parser's error, not a panic.
+        let mut sink = Vec::new();
+        let err = cypher(&db, "startup", "MATCH (n)", &mut sink).unwrap_err();
+        assert!(err.to_string().contains("syntax error"), "{err}");
     }
 
     #[test]

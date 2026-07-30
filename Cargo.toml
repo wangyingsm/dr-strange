@@ -18,5 +18,6 @@ edition = "2024"
 [workspace.dependencies]
 dr-strange-core = { path = "crates/dr-strange-core" }
 dr-strange-log = { path = "crates/dr-strange-log" }
+dr-strange-parser = { path = "crates/dr-strange-parser" }
 thiserror = "2"
 tracing = "0.1"
