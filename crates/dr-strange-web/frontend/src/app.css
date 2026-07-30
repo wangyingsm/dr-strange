@@ -41,7 +41,9 @@ header {
   align-items: center;
   gap: 0.75rem;
   flex-wrap: nowrap;
+  padding-bottom: 1rem;
   margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
 }
 
 h1 {
@@ -1076,4 +1078,51 @@ textarea.doc {
 .status {
   color: var(--muted);
   font-size: 0.85rem;
+}
+
+/* ---- page footer ---- */
+.site-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.site-footer .foot-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.site-footer .foot-logo {
+  width: 1rem;
+  height: 1rem;
+  color: #d9a441;
+  flex: none;
+}
+.site-footer .foot-brand b {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+.site-footer .sep {
+  opacity: 0.5;
+}
+.site-footer a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.site-footer a:hover {
+  color: var(--accent);
+  border-bottom-color: currentColor;
+}
+.site-footer .foot-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }

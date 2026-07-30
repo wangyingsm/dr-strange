@@ -189,3 +189,19 @@
 {:else}
   <Digest {plane} {onPlaneCreated} />
 {/if}
+
+<footer class="site-footer">
+  <span class="foot-brand">
+    <svg class="foot-logo" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="32" cy="32" r="30" />
+      <rect x="16" y="16" width="32" height="32" transform="rotate(45 32 32)" />
+      <circle cx="32" cy="32" r="11" />
+    </svg>
+    Dr <b>STRANGE</b>
+  </span>
+  <span class="sep">·</span>
+  <span>an AI-native embedded graph database</span>
+  <span class="foot-right">
+    <a href="https://github.com/wangyingsm/dr-strange" target="_blank" rel="noreferrer noopener">GitHub</a>
+  </span>
+</footer>
