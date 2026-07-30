@@ -5,7 +5,6 @@
 //! by a long scan.
 
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,14 +13,19 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::Database;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::ServiceBuilder;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::ServeOptions;
 use crate::assets::static_handler;
 use crate::auth::{Access, AllowedOrigins, Auth, Authorizer, Credentials, SharedToken};
 use crate::methods::{self, Ctx};
@@ -103,7 +107,28 @@ fn resolve_credentials(
     })
 }
 
-fn router(state: Arc<AppState>) -> Router {
+fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
+    // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
+    // connection), then cap total requests in flight, then stamp defensive
+    // headers, then bound the body size. The cap counts a request as in flight
+    // until its response is produced — a slow `digest` holds a slot the whole
+    // time, which is exactly the exhaustion we want to bound.
+    let hardening = ServiceBuilder::new()
+        .layer(CatchPanicLayer::new())
+        .layer(GlobalConcurrencyLimitLayer::new(max_concurrent))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -115,9 +140,20 @@ fn router(state: Arc<AppState>) -> Router {
         // POST: the query text is the body; kept off /rpc (and thus the OpenRPC
         // schema / SDKs) as a web-only surface, like /export.
         .route("/cypher", post(cypher_http))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
+        // Unauthenticated liveness probe for load balancers / orchestrators.
+        .route("/health", get(health))
+        // `.layer` after `.fallback` so the SPA (served by the fallback) is
+        // wrapped too — axum only applies a layer to routes registered before
+        // it, and the fallback is registered here.
         .fallback(static_handler)
+        .layer(hardening)
         .with_state(state)
+}
+
+/// `GET /health` — a cheap, unauthenticated liveness check. Deliberately does
+/// no database work so a probe can't be starved by a busy server.
+async fn health() -> Response {
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -353,7 +389,7 @@ fn startup_banner() {
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
-pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> anyhow::Result<()> {
+pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
     startup_banner();
     // Read the secret once so the checker (`authorizer`) and the SPA's injected
     // copy (`bootstrap_token`) can never disagree.
@@ -375,17 +411,42 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> an
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
     });
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let app = router(state, opts.max_concurrent);
+    let listener = tokio::net::TcpListener::bind(opts.addr).await?;
     let bound = listener.local_addr()?;
-    tracing::info!(%bound, "drsg serve: dashboard + JSON-RPC listening on http://{bound}");
-    axum::serve(listener, router(state))
+    tracing::info!(
+        %bound,
+        max_concurrent = opts.max_concurrent,
+        "drsg serve: dashboard + JSON-RPC listening on http://{bound}"
+    );
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
+/// Resolves when the process is asked to stop — Ctrl-C (interactive) or SIGTERM
+/// (containers / `systemctl stop`), so orchestrated deployments drain cleanly
+/// instead of being killed mid-request.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining");
 }
 
 // ---- HTTP JSON-RPC --------------------------------------------------------

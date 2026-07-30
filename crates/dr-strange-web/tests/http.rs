@@ -30,7 +30,11 @@ fn spawn_server() -> SocketAddr {
 
     std::thread::spawn(move || {
         // Runs its own runtime and blocks until the process exits.
-        dr_strange_web::serve(db, None, addr).unwrap();
+        let opts = dr_strange_web::ServeOptions {
+            addr,
+            ..Default::default()
+        };
+        dr_strange_web::serve(db, None, opts).unwrap();
     });
     addr
 }
@@ -71,8 +75,16 @@ async fn serves_dashboard_and_rpc() {
     // The embedded SPA is served on `/`.
     let index = client.get(&base).send().await.unwrap();
     assert!(index.status().is_success());
+    // Hardening: every response carries the static defensive headers.
+    assert_eq!(index.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(index.headers()["x-frame-options"], "DENY");
     let html = index.text().await.unwrap();
     assert!(html.contains("<div id=\"app\">") || html.contains("dr-strange"));
+
+    // /health is an unauthenticated liveness probe — no Origin, no token.
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert!(health.status().is_success());
+    assert_eq!(health.json::<Value>().await.unwrap()["status"], "ok");
 
     // JSON-RPC: db.stats reflects the seeded node.
     let stats = rpc(&client, &base, "db.stats", Value::Null).await;

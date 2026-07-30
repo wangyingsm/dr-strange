@@ -21,12 +21,49 @@ use std::path::PathBuf;
 
 use dr_strange_core::Database;
 
-/// Serves `db` (whose file lives at `db_path`, if on disk) on `addr` until
-/// Ctrl-C. Synchronous: it owns a multi-threaded tokio runtime internally so
-/// the sync `drsg` CLI can call it without being async itself.
-pub fn serve(db: Database, db_path: Option<PathBuf>, addr: SocketAddr) -> anyhow::Result<()> {
+/// Default listen address when neither the CLI nor a config file specifies one.
+pub const DEFAULT_ADDR: &str = "127.0.0.1:7700";
+/// Default ceiling on requests in flight at once. Generous — a slow `digest`
+/// run legitimately holds a slot for minutes, so the cap only exists to bound
+/// pathological fan-out, not to throttle normal use.
+pub const DEFAULT_MAX_CONCURRENT: usize = 1024;
+
+/// How to serve — the knobs a `config.toml` (or the CLI) can set. Secrets and
+/// the Origin allow-list still travel through the process environment (so the
+/// auth/LLM plumbing stays a single source); this carries only what the
+/// listener itself needs.
+pub struct ServeOptions {
+    /// Address to bind.
+    pub addr: SocketAddr,
+    /// Maximum requests processed concurrently; excess requests queue.
+    pub max_concurrent: usize,
+    /// When set, serve HTTPS with this certificate/key instead of plain HTTP.
+    pub tls: Option<TlsOptions>,
+}
+
+/// A PEM certificate chain + private key for native TLS.
+pub struct TlsOptions {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            addr: DEFAULT_ADDR.parse().expect("valid default addr"),
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            tls: None,
+        }
+    }
+}
+
+/// Serves `db` (whose file lives at `db_path`, if on disk) per `opts` until a
+/// shutdown signal (Ctrl-C / SIGTERM). Synchronous: it owns a multi-threaded
+/// tokio runtime internally so the sync `drsg` CLI can call it without being
+/// async itself.
+pub fn serve(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(server::run(db, db_path, addr))
+    runtime.block_on(server::run(db, db_path, opts))
 }

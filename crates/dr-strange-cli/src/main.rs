@@ -256,9 +256,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
         Command::Serve { addr } => {
             let db = commands::open(&cli.db)?;
+            let opts = dr_strange_web::ServeOptions {
+                addr,
+                ..Default::default()
+            };
             // Hands off to the web crate, which owns its own async runtime and
-            // blocks until Ctrl-C; `out` is unused (the server logs itself).
-            dr_strange_web::serve(db, Some(cli.db.clone()), addr)
+            // blocks until a shutdown signal; `out` is unused (the server logs
+            // itself).
+            dr_strange_web::serve(db, Some(cli.db.clone()), opts)
         }
         #[cfg(feature = "digest")]
         Command::Digest {
