@@ -122,6 +122,16 @@ enum Command {
     Stats,
     /// Integrity check: scan every plane, report readability.
     Check,
+    /// Write a consistent whole-database snapshot bundle (arch §6).
+    Snapshot {
+        /// Output file for the snapshot bundle.
+        out: PathBuf,
+    },
+    /// Restore a snapshot bundle into the `--db` database, which must be empty.
+    Restore {
+        /// The snapshot bundle to restore.
+        input: PathBuf,
+    },
     /// Serve the web dashboard + JSON-RPC 2.0 API (arch/08).
     Serve {
         /// Address to listen on. Overrides `config.toml`'s `[server].addr`;
@@ -490,6 +500,14 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         Command::Check => {
             let db = commands::open(&cli.db)?;
             commands::check(&db, out)
+        }
+        Command::Snapshot { out: path } => {
+            let db = commands::open(&cli.db)?;
+            commands::snapshot(&db, &path, out)
+        }
+        Command::Restore { input } => {
+            let db = commands::open(&cli.db)?;
+            commands::restore(&db, &input, out)
         }
         Command::Serve { addr } => {
             let db = commands::open(&cli.db)?;

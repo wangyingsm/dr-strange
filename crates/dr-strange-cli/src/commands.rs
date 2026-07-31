@@ -322,7 +322,12 @@ pub fn algo_shortest_path(
                 .map(|n| n.0.to_string())
                 .collect::<Vec<_>>()
                 .join(" -> ");
-            writeln!(out, "path (cost {}, {} hops): {chain}", p.cost, p.edges.len())?;
+            writeln!(
+                out,
+                "path (cost {}, {} hops): {chain}",
+                p.cost,
+                p.edges.len()
+            )?;
         }
         None => writeln!(out, "no path from {src} to {dst}")?,
     }
@@ -369,7 +374,10 @@ pub fn keyword_index_ensure(
     out: &mut dyn Write,
 ) -> Result<()> {
     plane(db, plane_name)?.ensure_keyword_index(label, property, language)?;
-    writeln!(out, "ensured keyword index on {label}.{property} ({language:?})")?;
+    writeln!(
+        out,
+        "ensured keyword index on {label}.{property} ({language:?})"
+    )?;
     Ok(())
 }
 
@@ -526,7 +534,9 @@ pub fn ask(
     };
     let res = dr_strange_llm::ask(
         &chat,
-        embedder.as_ref().map(|e| e as &dyn dr_strange_llm::Embedder),
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_llm::Embedder),
         &p,
         question,
         &opts,
@@ -953,8 +963,18 @@ mod tests {
         // Keyword-only hybrid (no vector ⇒ no embedding needed).
         let out = cap(|o| {
             hybrid(
-                &db, "startup", "graph", Some("Doc"), None, Some("body"), Metric::Cosine, None, 10,
-                "openai", None, o,
+                &db,
+                "startup",
+                "graph",
+                Some("Doc"),
+                None,
+                Some("body"),
+                Metric::Cosine,
+                None,
+                10,
+                "openai",
+                None,
+                o,
             )
         });
         assert!(out.contains("hybrid: 2 results"), "{out}");
@@ -1132,4 +1152,41 @@ mod tests {
         assert!(get(&db, "startup", "9999", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "@nope", &mut Vec::new()).is_err());
     }
+}
+
+/// `drsg snapshot <out>` — write a consistent, whole-database snapshot bundle
+/// (ROADMAP §6) to a file. Restore it into a fresh database with `drsg restore`.
+pub fn snapshot(db: &Database, out_path: &Path, out: &mut dyn Write) -> Result<()> {
+    let file = std::fs::File::create(out_path)
+        .with_context(|| format!("creating snapshot at {}", out_path.display()))?;
+    let stats = db
+        .snapshot(std::io::BufWriter::new(file))
+        .context("writing snapshot")?;
+    writeln!(
+        out,
+        "snapshot: {} planes · {} nodes · {} edges @ seq {} -> {}",
+        stats.planes,
+        stats.nodes,
+        stats.edges,
+        stats.seq,
+        out_path.display()
+    )?;
+    Ok(())
+}
+
+/// `drsg restore <in>` — restore a snapshot bundle into the `--db` database,
+/// which must be empty (ROADMAP §6). Preserves ids, the commit sequence, and
+/// the built search indexes.
+pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()> {
+    let file = std::fs::File::open(in_path)
+        .with_context(|| format!("opening snapshot at {}", in_path.display()))?;
+    let stats = db
+        .restore(std::io::BufReader::new(file))
+        .context("restoring snapshot")?;
+    writeln!(
+        out,
+        "restored: {} planes · {} nodes · {} edges @ seq {}",
+        stats.planes, stats.nodes, stats.edges, stats.seq
+    )?;
+    Ok(())
 }
