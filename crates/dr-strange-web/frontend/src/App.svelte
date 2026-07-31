@@ -108,7 +108,7 @@
     <div class="search">
       <input
         type="search"
-        placeholder={semantic ? 'Search by meaning…' : 'Search this plane…'}
+        placeholder={semantic ? 'Search by meaning…' : 'Quick search in this plane…'}
         bind:value={q}
         onkeydown={(e) => e.key === 'Escape' && (q = '')}
       />
@@ -175,7 +175,7 @@
       Explore
     </button>
     <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
-      Digest
+      Aigest
     </button>
   </nav>
 </header>
