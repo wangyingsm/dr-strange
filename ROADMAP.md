@@ -90,10 +90,11 @@ with the plane catalog + a compact LogicalPlan-JSON spec, emits a plan,
 deserializes it (read-only by construction — no write operators), runs it, and
 repairs on parse/exec error (bounded attempts); a safety `Limit` is appended
 and `dry_run` returns the validated plan without running. Surfaced on RPC
-`plane.ask`, CLI `drsg ask`, and MCP `ask` — each returns the generated plan
-(for transparency) + result rows. Chat key stays server-side. (Follow-ups: a
-web dashboard "Ask" panel; NL→vector search once the model can request an
-embedded phrase; `ask` on more surfaces.)
+`plane.ask`, CLI `drsg ask`, MCP `ask`, and the web dashboard (an "Ask" tab in
+the Explore view that runs the plan, plots the results, and shows the generated
+plan JSON) — each returns the generated plan (for transparency) + result rows.
+Chat key stays server-side. (Follow-ups: NL→vector search once the model can
+request an embedded phrase.)
 
 **Goal.** Ask a question in English and get a graph answer: an LLM translates
 NL into a `LogicalPlan` (or openCypher-subset text) that the engine runs.
