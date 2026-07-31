@@ -170,23 +170,24 @@ slow consumer drops overflow (broadcast capacity 1024), never stalls writers.
 
 ---
 
-## 6. Full-database backup / snapshot  *(sixth — was #8)*
+## 6. Full-database backup / snapshot  *(shipped)*
 
-**Goal.** An atomic, consistent whole-database snapshot + restore (and
-point-in-time recovery), beyond the current per-plane JSONL export.
+**Status.** ✅ Shipped (2026-08-01). `Database::snapshot(w)` / `restore(r)` +
+`drsg snapshot <out>` / `drsg restore <in>`. A consistent, whole-database
+bundle at one pinned commit sequence: every plane's nodes/edges (with props),
+index declarations, and the built vector/keyword sidecars. Restores into a
+*fresh* (empty) database, preserving node/plane ids and the commit sequence via
+a no-bump write path — so the shipped `.hnsw`/`.bm25` load as-is (no rebuild)
+and future ids allocate past everything restored. Online (a pinned read
+snapshot; take it quiesced for perfect sidecar fidelity). 3 core tests + a live
+CLI round-trip.
 
-**Why AI-native.** Operational safety for a knowledge graph you're building
-continuously. The MVCC sequence again makes a **consistent snapshot cheap**
-(pin a seq, copy).
-
-**Scope sketch.** `drsg snapshot <out>` / `restore <in>`: a consistent dump
-across all planes + the vector-index sidecar at one commit sequence; native
-backend can snapshot by pinning a seq + copying SSTs/WAL. Streamed format for
-large DBs.
-
-**Forks to settle.** Format (logical JSONL bundle vs physical file copy);
-online (no-lock, via a pinned snapshot) vs offline; include/rebuild the HNSW
-sidecar; incremental backups (since-seq) vs full only.
+**Forks settled.** Logical bundle (a length-prefixed postcard-frame stream —
+restores to native/redb/memory) over a physical file copy; whole-DB into a
+fresh target (refuses a non-empty one) over selective/merge; full only (no
+incremental); ship the built sidecars (id fidelity keeps them valid) over
+rebuild-on-restore. **Follow-ups:** incremental (since-seq), selective
+plane-level restore/merge, and a web "download snapshot" action.
 
 ---
 
