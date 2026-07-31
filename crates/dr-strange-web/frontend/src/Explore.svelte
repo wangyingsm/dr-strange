@@ -103,6 +103,7 @@
   // NL→plan (ROADMAP §3): ask a question, an LLM turns it into a read-only plan.
   let askQuestion = $state('')
   let askProvider = $state('openai') // chat provider (key from the server env)
+  let askEmbed = $state('openai') // embed provider for find_edge/find_entity ('' = tools off)
   let askDryRun = $state(false) // return the plan without running it
   let askResult = $state(null) // { plan, ran, attempts, results, count } | null
 
@@ -490,12 +491,14 @@
     algoBusy = true
     error = null
     try {
-      const res = await rpc('plane.ask', {
+      const params = {
         plane,
         question: askQuestion.trim(),
         provider: askProvider,
         dry_run: askDryRun,
-      })
+      }
+      if (askEmbed) params.embed_provider = askEmbed // enable the grounding tools
+      const res = await rpc('plane.ask', params)
       askResult = res
       hyResults = null
       if (res.ran && res.results?.length) {
@@ -947,6 +950,11 @@
     <span class="algo-sp-label">chat</span>
     <select bind:value={askProvider} title="Chat provider for NL→plan (key from the server env)">
       {#each CHAT_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+    </select>
+    <span class="algo-sp-label">ground</span>
+    <select bind:value={askEmbed} title="Embedding provider for the find_edge/find_entity grounding tools (should match how the plane was embedded; off = schema only)">
+      <option value="">off</option>
+      {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
     </select>
     <label class="hy-graph" title="Generate the plan without running it">
       <input type="checkbox" bind:checked={askDryRun} /> plan only
