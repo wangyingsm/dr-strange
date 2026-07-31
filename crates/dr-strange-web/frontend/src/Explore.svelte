@@ -40,27 +40,62 @@
   let spTo = $state('') // shortest-path target
   let spDir = $state('out') // out | in | both
 
-  // Hybrid retrieval (ROADMAP §2): fuse vector + keyword + graph-proximity.
-  // The available channels are DERIVED from the indexes actually declared on
-  // the plane (plane.indexes), so the UI can't offer a channel that can't run.
+  // Hybrid retrieval (ROADMAP §2): pick a node type first, then the channels it
+  // supports. "all labels" (*) searches the whole plane semantically — keyword
+  // needs a specific label's index. A channel is only offered when it can run.
   let hyQuery = $state('') // the query text
-  let hyLabel = $state('') // node type to search (only labels that have an index)
-  let hyIndexes = $state(null) // { vector:[{label,property,…}], keyword:[{…}] } | null
-  let useVector = $state(true) // semantic channel on? (only when the label has a vector index)
-  let useKeyword = $state(true) // keyword channel on? (only when the label has a keyword index)
+  let hyLabel = $state('') // '*' = all labels, else a specific label
+  let hyIndexes = $state(null) // { vector:[{label,property,metric}], keyword:[{label,property}] } | null
+  let useVector = $state(true) // want the semantic channel? (shown only when available)
+  let useKeyword = $state(true) // want the keyword channel? (shown only when available)
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
-  let hyProvider = $state('openai') // embedding provider for the vector channel
-  let hyResults = $state(null) // [{ id, external_key, labels, score, channels }] | null
+  let hyProvider = $state('openai') // embedding provider for the semantic channel
+  let hyResults = $state(null) // ranked hits | null
 
-  // Labels that have at least one declared index (the only ones searchable).
-  let searchableLabels = $derived(
-    hyIndexes
-      ? [...new Set([...hyIndexes.vector, ...hyIndexes.keyword].map((x) => x.label))].sort()
-      : [],
+  // A label's embedding property from the catalog (a Vector-typed prop). Semantic
+  // is offered whenever one exists — a declared vector index only accelerates it;
+  // vector search brute-forces over the property without one.
+  function catVectorProp(label) {
+    const props = catLabels?.[label]?.properties ?? {}
+    return Object.keys(props).find((k) => props[k]?.types && 'Vector' in props[k].types) ?? null
+  }
+  // A plane-wide embedding property for "all labels" (prefers "embedding").
+  function anyVectorProp() {
+    const names = new Set()
+    for (const l of Object.keys(catLabels ?? {})) {
+      const p = catVectorProp(l)
+      if (p) names.add(p)
+    }
+    return names.has('embedding') ? 'embedding' : ([...names][0] ?? null)
+  }
+
+  let isAll = $derived(hyLabel === '*')
+  // "all labels" is only offered when some label actually has embeddings.
+  let hasAll = $derived(anyVectorProp() != null)
+  // Specific labels supporting a channel: an embedding prop (semantic) or a
+  // declared keyword index (keyword).
+  let searchableLabels = $derived.by(() => {
+    const set = new Set()
+    for (const x of hyIndexes?.keyword ?? []) set.add(x.label)
+    for (const l of Object.keys(catLabels ?? {})) if (catVectorProp(l)) set.add(l)
+    return [...set].sort()
+  })
+
+  // Per-channel property for the current selection (null = unavailable). Semantic
+  // prefers a declared index (for its metric); keyword needs a specific label's
+  // declared index, so it's never available for "all".
+  let vecIndex = $derived(isAll ? null : (hyIndexes?.vector.find((x) => x.label === hyLabel) ?? null))
+  let vecMetric = $derived(vecIndex?.metric ?? 'cosine')
+  let semanticProp = $derived(isAll ? anyVectorProp() : (vecIndex?.property ?? catVectorProp(hyLabel)))
+  let keywordProp = $derived(
+    isAll ? null : (hyIndexes?.keyword.find((x) => x.label === hyLabel)?.property ?? null),
   )
-  // The indexed property for the selected label, per channel (null = no index).
-  let vecProp = $derived(hyIndexes?.vector.find((x) => x.label === hyLabel)?.property ?? null)
-  let kwProp = $derived(hyIndexes?.keyword.find((x) => x.label === hyLabel)?.property ?? null)
+
+  // Effective channels (checked AND available); the query box + Search appear
+  // only once at least one is active.
+  let vectorOn = $derived(useVector && semanticProp != null)
+  let keywordOn = $derived(useKeyword && keywordProp != null)
+  let anyChannel = $derived(vectorOn || keywordOn)
 
   // "Declare an index" dialog (so the dashboard never sends you to the CLI).
   let idxOpen = $state(false)
@@ -327,23 +362,18 @@
 
   // ---- hybrid retrieval (ROADMAP §2) --------------------------------------
 
-  // Load which indexes exist on the current plane, then pick a searchable
-  // label and default each channel on iff its index exists.
+  // Load the catalog (for embedding-property detection) + the declared indexes,
+  // then pick a searchable label. Channel toggles stay a user preference (both
+  // default on); the bar only *shows* a channel when the label supports it.
   async function loadIndexes() {
+    await loadCatalog()
     try {
       hyIndexes = await rpc('plane.indexes', { plane })
     } catch {
       hyIndexes = { vector: [], keyword: [] }
     }
-    if (!searchableLabels.includes(hyLabel)) hyLabel = searchableLabels[0] ?? ''
-    useVector = vecProp != null
-    useKeyword = kwProp != null
-  }
-
-  // Switching label re-defaults the channel toggles to what that label indexes.
-  function onHyLabel() {
-    useVector = vecProp != null
-    useKeyword = kwProp != null
+    const opts = [...(hasAll ? ['*'] : []), ...searchableLabels]
+    if (!opts.includes(hyLabel)) hyLabel = opts[0] ?? ''
   }
 
   function openIndexDialog() {
@@ -386,10 +416,7 @@
       }
       idxOpen = false
       await loadIndexes() // the new indexes now appear
-      if (idxLabel !== '*') {
-        hyLabel = idxLabel
-        onHyLabel()
-      }
+      if (idxLabel !== '*') hyLabel = idxLabel // select it → its channels light up
       status =
         idxLabel === '*'
           ? `${idxKind} index declared on "${property}" across ${targets.length} labels`
@@ -400,22 +427,18 @@
   }
 
   async function runHybrid() {
-    if (!hyQuery.trim() || !hyLabel) return
-    const wantVector = useVector && vecProp
-    const wantKeyword = useKeyword && kwProp
-    if (!wantVector && !wantKeyword) {
-      error = 'pick at least the semantic or keyword channel'
-      return
-    }
+    if (!hyQuery.trim() || !anyChannel) return
     algoBusy = true
     error = null
     try {
-      const params = { plane, q: hyQuery.trim(), label: hyLabel, k: 25 }
-      if (wantVector) {
-        params.vector_prop = vecProp
+      const params = { plane, q: hyQuery.trim(), k: 25 }
+      if (!isAll) params.label = hyLabel // "all" ⇒ whole-plane semantic
+      if (vectorOn) {
+        params.vector_prop = semanticProp
+        params.metric = vecMetric
         params.provider = hyProvider
       }
-      if (wantKeyword) params.keyword_prop = kwProp
+      if (keywordOn) params.keyword_prop = keywordProp
       if (hyGraph) params.graph_hops = 1
       const res = await rpc('plane.hybrid', params)
       hyResults = res.results
@@ -700,7 +723,8 @@
     if (!started || plane === seededPlane) return
     seededPlane = plane
     labelFilter = ''
-    await loadCatalog()
+    // The catalog (labels + embedding-prop detection) is loaded by loadIndexes,
+    // which runs on the same plane-change signal — no need to fetch it twice.
     await seed()
   }
 
@@ -821,39 +845,42 @@
 
 <div class="algo-bar hybrid-bar">
   <span class="group-title">Hybrid</span>
-  {#if searchableLabels.length}
-    <input
-      class="hy-q"
-      placeholder="query text…"
-      bind:value={hyQuery}
-      onkeydown={(e) => e.key === 'Enter' && runHybrid()}
-    />
+  {#if hasAll || searchableLabels.length}
     <span class="algo-sp-label">in</span>
-    <select bind:value={hyLabel} onchange={onHyLabel} title="Node type to search">
+    <select bind:value={hyLabel} title="Node type to search">
+      {#if hasAll}<option value="*">all labels</option>{/if}
       {#each searchableLabels as l (l)}<option value={l}>{l}</option>{/each}
     </select>
     <span class="algo-sep"></span>
-    {#if vecProp}
-      <label class="hy-graph" title="Semantic (vector) similarity on {vecProp}">
+    {#if semanticProp}
+      <label class="hy-graph" title="Semantic (vector) similarity">
         <input type="checkbox" bind:checked={useVector} /> semantic
       </label>
     {/if}
-    {#if kwProp}
-      <label class="hy-graph" title="BM25 keyword match on {kwProp}">
+    {#if keywordProp}
+      <label class="hy-graph" title="BM25 keyword match on {keywordProp}">
         <input type="checkbox" bind:checked={useKeyword} /> keyword
       </label>
     {/if}
     <label class="hy-graph" title="Boost neighbours of the strongest hits (1 hop)">
       <input type="checkbox" bind:checked={hyGraph} /> graph
     </label>
-    {#if useVector && vecProp}
+    {#if anyChannel}
       <span class="algo-sep"></span>
-      <span class="algo-sp-label">embed</span>
-      <select bind:value={hyProvider} title="Embedding provider for the semantic channel">
-        {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
-      </select>
+      <input
+        class="hy-q"
+        placeholder="query text…"
+        bind:value={hyQuery}
+        onkeydown={(e) => e.key === 'Enter' && runHybrid()}
+      />
+      {#if vectorOn}
+        <span class="algo-sp-label">embed</span>
+        <select bind:value={hyProvider} title="Embedding provider for the semantic channel">
+          {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+        </select>
+      {/if}
+      <button onclick={runHybrid} disabled={algoBusy || !hyQuery.trim()} title="Run hybrid retrieval and rank by fused score">Search</button>
     {/if}
-    <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
     <span class="algo-sep"></span>
     <button class="ghost" onclick={openIndexDialog} title="Declare a new search index">＋ index</button>
   {:else}
