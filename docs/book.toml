@@ -1,0 +1,14 @@
+[book]
+title = "The Dr Strange Book"
+description = "Tutorial and guide for Dr Strange — an AI-native embedded graph database written in Rust."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+smart-punctuation = true
+
+[output.html.fold]
+enable = true
+level = 1
