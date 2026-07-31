@@ -123,6 +123,27 @@
       "result": { "name": "results", "schema": { "$ref": "#/components/schemas/FindResult" } }
     },
     {
+      "name": "plane.algo",
+      "summary": "Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot.",
+      "x-access": "read",
+      "params": [
+        { "name": "plane", "required": true, "schema": { "type": "string" } },
+        { "name": "algo", "required": true, "schema": { "type": "string", "enum": ["pagerank", "components", "shortest_path", "louvain"] } },
+        { "name": "label", "required": false, "schema": { "type": "string" } },
+        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
+        { "name": "damping", "required": false, "schema": { "type": "number", "default": 0.85 } },
+        { "name": "max_iters", "required": false, "schema": { "type": "integer", "default": 20 } },
+        { "name": "tolerance", "required": false, "schema": { "type": "number", "default": 0.000001 } },
+        { "name": "src", "required": false, "schema": { "type": "integer" } },
+        { "name": "dst", "required": false, "schema": { "type": "integer" } },
+        { "name": "dir", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
+        { "name": "weight", "required": false, "schema": { "type": "string" } },
+        { "name": "max_levels", "required": false, "schema": { "type": "integer", "default": 10 } },
+        { "name": "min_gain", "required": false, "schema": { "type": "number" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object", "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}." } }
+    },
+    {
       "name": "graph.seed",
       "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
       "x-access": "read",

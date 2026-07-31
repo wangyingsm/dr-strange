@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use dr_strange_core::Metric;
+use dr_strange_core::{Dir, Metric};
 
 #[derive(Parser)]
 #[command(name = "drsg", version, about = "dr-strange graph database CLI")]
@@ -83,6 +83,9 @@ enum Command {
         #[arg(long)]
         plane: Option<String>,
     },
+    /// Graph algorithms over a plane (ROADMAP §1): read-only, transient results.
+    #[command(subcommand)]
+    Algo(AlgoCmd),
     /// Vector index management.
     #[command(subcommand)]
     Index(IndexCmd),
@@ -150,6 +153,75 @@ enum PlaneCmd {
     Create { name: String },
     Drop { name: String },
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum AlgoCmd {
+    /// PageRank importance, most-important first.
+    Pagerank {
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Restrict to nodes carrying this label.
+        #[arg(long)]
+        label: Option<String>,
+        /// How many top-ranked nodes to print.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, default_value_t = 0.85)]
+        damping: f64,
+        #[arg(long, default_value_t = 20)]
+        max_iters: u32,
+    },
+    /// Weakly connected components (representative = smallest id).
+    Components {
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        top: usize,
+    },
+    /// Weighted shortest path between two node ids.
+    ShortestPath {
+        src: u64,
+        dst: u64,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Edge direction to follow.
+        #[arg(long, value_enum, default_value_t = DirArg::Out)]
+        dir: DirArg,
+        /// Numeric edge property to use as weight (missing ⇒ unit weight).
+        #[arg(long)]
+        weight: Option<String>,
+    },
+    /// Louvain community detection.
+    Louvain {
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        top: usize,
+    },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum DirArg {
+    Out,
+    In,
+    Both,
+}
+
+impl From<DirArg> for Dir {
+    fn from(d: DirArg) -> Self {
+        match d {
+            DirArg::Out => Dir::Out,
+            DirArg::In => Dir::In,
+            DirArg::Both => Dir::Both,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -249,6 +321,49 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;
             commands::catalog(&db, plane.as_deref(), out)
+        }
+        Command::Algo(cmd) => {
+            let db = commands::open(&cli.db)?;
+            match cmd {
+                AlgoCmd::Pagerank {
+                    plane,
+                    label,
+                    top,
+                    damping,
+                    max_iters,
+                } => commands::algo_pagerank(
+                    &db,
+                    &plane,
+                    label.as_deref(),
+                    top,
+                    damping,
+                    max_iters,
+                    out,
+                ),
+                AlgoCmd::Components { plane, label, top } => {
+                    commands::algo_components(&db, &plane, label.as_deref(), top, out)
+                }
+                AlgoCmd::ShortestPath {
+                    src,
+                    dst,
+                    plane,
+                    label,
+                    dir,
+                    weight,
+                } => commands::algo_shortest_path(
+                    &db,
+                    &plane,
+                    label.as_deref(),
+                    src,
+                    dst,
+                    dir.into(),
+                    weight,
+                    out,
+                ),
+                AlgoCmd::Louvain { plane, label, top } => {
+                    commands::algo_louvain(&db, &plane, label.as_deref(), top, out)
+                }
+            }
         }
         Command::Index(IndexCmd::Ensure {
             label,

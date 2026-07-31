@@ -12,7 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result as AnyResult;
-use dr_strange_core::{Database, Dir, LogicalPlan, Metric, NodeId, Properties, json};
+use dr_strange_core::{
+    Database, Dir, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions, Properties,
+    ShortestPathOptions, json,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -48,6 +51,47 @@ struct GetNode {
     id: Option<u64>,
     /// External key (mutually exclusive with `id`).
     key: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Algo {
+    /// Algorithm to run: `pagerank` | `components` | `shortest_path` | `louvain`.
+    algo: String,
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Restrict the run to nodes carrying this label (and edges among them).
+    #[serde(default)]
+    label: Option<String>,
+    /// Max rows to return for pagerank/components/louvain (default 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// PageRank damping factor (default 0.85).
+    #[serde(default)]
+    damping: Option<f64>,
+    /// PageRank iteration cap (default 20).
+    #[serde(default)]
+    max_iters: Option<u32>,
+    /// PageRank convergence tolerance (default 1e-6).
+    #[serde(default)]
+    tolerance: Option<f64>,
+    /// shortest_path: source node id (required for that algo).
+    #[serde(default)]
+    src: Option<u64>,
+    /// shortest_path: destination node id (required for that algo).
+    #[serde(default)]
+    dst: Option<u64>,
+    /// shortest_path: edge direction `out` | `in` | `both` (default `out`).
+    #[serde(default)]
+    dir: Option<String>,
+    /// shortest_path: numeric edge property used as weight (default unit).
+    #[serde(default)]
+    weight: Option<String>,
+    /// Louvain aggregation-level cap (default 10).
+    #[serde(default)]
+    max_levels: Option<u32>,
+    /// Louvain minimum modularity gain to move a node.
+    #[serde(default)]
+    min_gain: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -326,6 +370,82 @@ fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
     Ok(scored_rows(&rows))
 }
 
+/// Default result cap for the whole-graph algorithms (they can produce a row
+/// per node); shortest_path is unaffected.
+const ALGO_LIMIT: usize = 100;
+
+fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    let mut builder = plane.algo();
+    if let Some(label) = &req.label {
+        builder = builder.label(label.clone());
+    }
+    let limit = req.limit.unwrap_or(ALGO_LIMIT);
+
+    match req.algo.as_str() {
+        "pagerank" => {
+            let d = PageRankOptions::default();
+            let opts = PageRankOptions {
+                damping: req.damping.unwrap_or(d.damping),
+                max_iters: req.max_iters.unwrap_or(d.max_iters),
+                tolerance: req.tolerance.unwrap_or(d.tolerance),
+            };
+            let scored = builder.pagerank(opts)?;
+            let count = scored.len();
+            let results: Vec<Value> = scored
+                .into_iter()
+                .take(limit)
+                .map(|(id, s)| jval!({ "id": id.0, "score": s }))
+                .collect();
+            Ok(jval!({ "algo": "pagerank", "results": results, "count": count }))
+        }
+        "components" => {
+            let (rows, count) = builder.connected_components()?;
+            let results: Vec<Value> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(id, rep)| jval!({ "id": id.0, "component": rep.0 }))
+                .collect();
+            Ok(jval!({ "algo": "components", "results": results, "count": count }))
+        }
+        "louvain" => {
+            let d = LouvainOptions::default();
+            let opts = LouvainOptions {
+                max_levels: req.max_levels.unwrap_or(d.max_levels),
+                min_gain: req.min_gain.unwrap_or(d.min_gain),
+            };
+            let (rows, count) = builder.louvain(opts)?;
+            let results: Vec<Value> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(id, rep)| jval!({ "id": id.0, "community": rep.0 }))
+                .collect();
+            Ok(jval!({ "algo": "louvain", "results": results, "count": count }))
+        }
+        "shortest_path" => {
+            let (Some(src), Some(dst)) = (req.src, req.dst) else {
+                anyhow::bail!("shortest_path requires `src` and `dst`");
+            };
+            let opts = ShortestPathOptions {
+                dir: parse_dir(req.dir.as_deref()),
+                weight: req.weight.clone(),
+            };
+            let found = builder.shortest_path(NodeId(src), NodeId(dst), &opts)?;
+            let path = found.map(|p| {
+                jval!({
+                    "nodes": p.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "edges": p.edges.iter().map(|e| e.0).collect::<Vec<_>>(),
+                    "cost": p.cost,
+                })
+            });
+            Ok(jval!({ "algo": "shortest_path", "found": path.is_some(), "path": path }))
+        }
+        other => anyhow::bail!(
+            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain)"
+        ),
+    }
+}
+
 /// Adapts an LLM provider to the parser's `Embedder` seam so a text
 /// `SEARCH … NEAR "…"` embeds server-side (key from the process environment,
 /// never tool params).
@@ -575,6 +695,19 @@ impl DrStrange {
         self.blocking("query", move |db| query_logic(db, req)).await
     }
 
+    #[tool(description = "Run a graph algorithm over a plane (or one `label` \
+        subset), read-only at a single snapshot. Set `algo` to one of: \
+        `pagerank` (importance; returns [{id, score}] + count), `components` \
+        (weakly connected; [{id, component}] where component is the smallest \
+        member id, + component count), `shortest_path` (needs `src`/`dst`; \
+        weighted Dijkstra with optional `dir` out|in|both and numeric edge \
+        `weight` property; returns {found, path:{nodes, edges, cost}}), or \
+        `louvain` (community detection; [{id, community}] + community count). \
+        `limit` caps the ranked/labelled rows (default 100).")]
+    async fn algo(&self, Parameters(req): Parameters<Algo>) -> Result<CallToolResult, McpError> {
+        self.blocking("algo", move |db| algo_logic(db, req)).await
+    }
+
     #[tool(description = "Run a statement in the openCypher-subset query \
         language. Reads (MATCH one linear path with labels/->/<-/- and bounded \
         *m..n, SEARCH vector top-k, BEAM similarity traversal, WHERE, RETURN \
@@ -789,6 +922,31 @@ mod tests {
         .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["external_key"], jval!("d1"));
+    }
+
+    #[test]
+    fn algo_runs_over_the_fixture() {
+        let db = fixture(); // d0 (id 1) —CITES→ d1 (id 2)
+
+        let pr = algo_logic(&db, from_value(jval!({"algo": "pagerank"})).unwrap()).unwrap();
+        assert_eq!(pr["algo"], jval!("pagerank"));
+        assert_eq!(pr["count"], jval!(2));
+        assert_eq!(pr["results"][0]["id"], jval!(2)); // d1 is the cited hub
+
+        let comp = algo_logic(&db, from_value(jval!({"algo": "components"})).unwrap()).unwrap();
+        assert_eq!(comp["count"], jval!(1));
+
+        let sp = algo_logic(
+            &db,
+            from_value(jval!({"algo": "shortest_path", "src": 1, "dst": 2})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sp["found"], jval!(true));
+        assert_eq!(sp["path"]["cost"], jval!(1.0));
+
+        // Missing endpoints and unknown algo are tool-level errors.
+        assert!(algo_logic(&db, from_value(jval!({"algo": "shortest_path"})).unwrap()).is_err());
+        assert!(algo_logic(&db, from_value(jval!({"algo": "nope"})).unwrap()).is_err());
     }
 
     #[test]

@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, LogicalPlan, Metric, NodeId, NodeRecord,
-    PlaneHandle, Properties, json,
+    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, LogicalPlan, LouvainOptions, Metric,
+    NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, json,
 };
 use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
 use serde::Deserialize;
@@ -578,6 +578,126 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "total": total,
         "truncated": nodes_truncated || edges_truncated,
     }))
+}
+
+/// Default number of PageRank/Louvain rows returned when the caller sets no
+/// `limit` (whole-plane algorithms can produce very large result sets).
+const ALGO_LIMIT: usize = 100;
+
+#[derive(Deserialize)]
+pub struct Algo {
+    plane: String,
+    /// Which algorithm: `pagerank` | `components` | `shortest_path` | `louvain`.
+    algo: String,
+    /// Restrict to nodes carrying this label (and the edges among them).
+    #[serde(default)]
+    label: Option<String>,
+    /// Top-N rows to return for the ranked/labelled algorithms (default 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    // pagerank
+    #[serde(default)]
+    damping: Option<f64>,
+    #[serde(default)]
+    max_iters: Option<u32>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    // shortest_path
+    #[serde(default)]
+    src: Option<u64>,
+    #[serde(default)]
+    dst: Option<u64>,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    weight: Option<String>,
+    // louvain
+    #[serde(default)]
+    max_levels: Option<u32>,
+    #[serde(default)]
+    min_gain: Option<f64>,
+}
+
+/// `plane.algo` — run a graph algorithm (ROADMAP §1) over the plane, or one
+/// label subset, at a single snapshot. Read-only; results are transient. The
+/// `algo` field selects the operation and which extra params apply:
+/// - `pagerank` → `{ algo, results: [{id, score}], count }` (top `limit`)
+/// - `components` → `{ algo, results: [{id, component}], count }` (component count)
+/// - `shortest_path` (needs `src`/`dst`) → `{ algo, found, path: {nodes, edges, cost} }`
+/// - `louvain` → `{ algo, results: [{id, community}], count }` (community count)
+pub fn plane_algo(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Algo = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let mut builder = plane.algo();
+    if let Some(label) = &req.label {
+        builder = builder.label(label.clone());
+    }
+    let limit = req.limit.unwrap_or(ALGO_LIMIT);
+
+    match req.algo.as_str() {
+        "pagerank" => {
+            let d = PageRankOptions::default();
+            let opts = PageRankOptions {
+                damping: req.damping.unwrap_or(d.damping),
+                max_iters: req.max_iters.unwrap_or(d.max_iters),
+                tolerance: req.tolerance.unwrap_or(d.tolerance),
+            };
+            let scored = app(builder.pagerank(opts))?;
+            let count = scored.len();
+            let results: Vec<Value> = scored
+                .into_iter()
+                .take(limit)
+                .map(|(id, s)| jval!({ "id": id.0, "score": s }))
+                .collect();
+            Ok(jval!({ "algo": "pagerank", "results": results, "count": count }))
+        }
+        "components" => {
+            let (rows, count) = app(builder.connected_components())?;
+            let results: Vec<Value> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(id, rep)| jval!({ "id": id.0, "component": rep.0 }))
+                .collect();
+            Ok(jval!({ "algo": "components", "results": results, "count": count }))
+        }
+        "louvain" => {
+            let d = LouvainOptions::default();
+            let opts = LouvainOptions {
+                max_levels: req.max_levels.unwrap_or(d.max_levels),
+                min_gain: req.min_gain.unwrap_or(d.min_gain),
+            };
+            let (rows, count) = app(builder.louvain(opts))?;
+            let results: Vec<Value> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(id, rep)| jval!({ "id": id.0, "community": rep.0 }))
+                .collect();
+            Ok(jval!({ "algo": "louvain", "results": results, "count": count }))
+        }
+        "shortest_path" => {
+            let (Some(src), Some(dst)) = (req.src, req.dst) else {
+                return Err(RpcError::invalid_params(
+                    "shortest_path requires `src` and `dst`",
+                ));
+            };
+            let opts = ShortestPathOptions {
+                dir: parse_dir(req.dir.as_deref()),
+                weight: req.weight.clone(),
+            };
+            let found = app(builder.shortest_path(NodeId(src), NodeId(dst), &opts))?;
+            let path = found.map(|p| {
+                jval!({
+                    "nodes": p.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "edges": p.edges.iter().map(|e| e.0).collect::<Vec<_>>(),
+                    "cost": p.cost,
+                })
+            });
+            Ok(jval!({ "algo": "shortest_path", "found": path.is_some(), "path": path }))
+        }
+        other => Err(RpcError::invalid_params(format!(
+            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain)"
+        ))),
+    }
 }
 
 /// Semantic search: embed the query with the requested provider (key from the

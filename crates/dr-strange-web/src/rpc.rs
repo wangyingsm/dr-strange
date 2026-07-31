@@ -192,6 +192,7 @@ const METHODS: &[&str] = &[
     "plane.query",
     "plane.cypher",
     "plane.find",
+    "plane.algo",
     "graph.seed",
     "graph.expand",
     "digest.run",
@@ -242,6 +243,7 @@ fn dispatch_method(
         // even for a read query (the single-token model collapses the levels).
         "plane.cypher" => guarded!(Access::Write, methods::plane_cypher(ctx, params)),
         "plane.find" => guarded!(Access::Read, methods::plane_find(ctx, params)),
+        "plane.algo" => guarded!(Access::Read, methods::plane_algo(ctx, params)),
         "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
         "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),
         // `digest.run` writes nothing, but it spends the server's provider
@@ -549,6 +551,58 @@ mod tests {
         assert_eq!(r["nodes"][0]["id"], bob);
         assert_eq!(r["edges"].as_array().unwrap().len(), 1);
         assert_eq!(r["total"], 1);
+    }
+
+    #[test]
+    fn plane_algo_pagerank_ranks_and_counts() {
+        let (db, _alice, bob) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"pagerank"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["algo"], "pagerank");
+        assert_eq!(r["count"], 2);
+        // bob (the edge target) outranks alice, so it's first.
+        assert_eq!(r["results"][0]["id"], bob);
+        assert!(r["results"][0]["score"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn plane_algo_shortest_path_finds_route() {
+        let (db, alice, bob) = seeded_graph();
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"plane.algo","params":{{"plane":"startup","algo":"shortest_path","src":{alice},"dst":{bob}}},"id":1}}"#
+        );
+        let resp = call(&db, &body).unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["found"], true);
+        assert_eq!(r["path"]["cost"], 1.0);
+        assert_eq!(r["path"]["nodes"][0], alice);
+        assert_eq!(r["path"]["nodes"][1], bob);
+    }
+
+    #[test]
+    fn plane_algo_shortest_path_requires_endpoints() {
+        let (db, _, _) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"shortest_path"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32602);
+    }
+
+    #[test]
+    fn plane_algo_unknown_name_is_invalid_params() {
+        let (db, _, _) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"bogus"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32602);
     }
 
     // ---- auth gate --------------------------------------------------------

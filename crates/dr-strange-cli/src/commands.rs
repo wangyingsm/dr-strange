@@ -7,7 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
-    BulkEdgeById, BulkNode, Database, Dir, LogicalPlan, Metric, NodeId, PlaneHandle, Properties,
+    BulkEdgeById, BulkNode, Database, Dir, LogicalPlan, LouvainOptions, Metric, NodeId,
+    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
 };
 use serde_json::{Value, json};
 
@@ -242,6 +243,107 @@ pub fn catalog(db: &Database, plane_name: Option<&str>, out: &mut dyn Write) -> 
         None => db.catalog()?,
     };
     writeln!(out, "{}", serde_json::to_string_pretty(&cat)?)?;
+    Ok(())
+}
+
+// ---- graph algorithms (ROADMAP §1) ---------------------------------------
+
+/// Scope an algorithm run to the whole plane, or one label if given.
+fn algo_scoped<'db>(
+    db: &'db Database,
+    plane_name: &str,
+    label: Option<&str>,
+) -> Result<dr_strange_core::AlgoBuilder<'db>> {
+    let mut b = plane(db, plane_name)?.algo();
+    if let Some(l) = label {
+        b = b.label(l);
+    }
+    Ok(b)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn algo_pagerank(
+    db: &Database,
+    plane_name: &str,
+    label: Option<&str>,
+    top: usize,
+    damping: f64,
+    max_iters: u32,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let opts = PageRankOptions {
+        damping,
+        max_iters,
+        ..Default::default()
+    };
+    let scored = algo_scoped(db, plane_name, label)?.pagerank(opts)?;
+    writeln!(out, "pagerank: {} nodes (top {top})", scored.len())?;
+    for (id, s) in scored.iter().take(top) {
+        writeln!(out, "  {}\t{s:.6}", id.0)?;
+    }
+    Ok(())
+}
+
+pub fn algo_components(
+    db: &Database,
+    plane_name: &str,
+    label: Option<&str>,
+    top: usize,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let (rows, count) = algo_scoped(db, plane_name, label)?.connected_components()?;
+    writeln!(out, "components: {count} across {} nodes", rows.len())?;
+    for (id, rep) in rows.iter().take(top) {
+        writeln!(out, "  {}\tcomponent {}", id.0, rep.0)?;
+    }
+    if rows.len() > top {
+        writeln!(out, "  … and {} more", rows.len() - top)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn algo_shortest_path(
+    db: &Database,
+    plane_name: &str,
+    label: Option<&str>,
+    src: u64,
+    dst: u64,
+    dir: Dir,
+    weight: Option<String>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let opts = ShortestPathOptions { dir, weight };
+    match algo_scoped(db, plane_name, label)?.shortest_path(NodeId(src), NodeId(dst), &opts)? {
+        Some(p) => {
+            let chain = p
+                .nodes
+                .iter()
+                .map(|n| n.0.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            writeln!(out, "path (cost {}, {} hops): {chain}", p.cost, p.edges.len())?;
+        }
+        None => writeln!(out, "no path from {src} to {dst}")?,
+    }
+    Ok(())
+}
+
+pub fn algo_louvain(
+    db: &Database,
+    plane_name: &str,
+    label: Option<&str>,
+    top: usize,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let (rows, count) = algo_scoped(db, plane_name, label)?.louvain(LouvainOptions::default())?;
+    writeln!(out, "communities: {count} across {} nodes", rows.len())?;
+    for (id, rep) in rows.iter().take(top) {
+        writeln!(out, "  {}\tcommunity {}", id.0, rep.0)?;
+    }
+    if rows.len() > top {
+        writeln!(out, "  … and {} more", rows.len() - top)?;
+    }
     Ok(())
 }
 
@@ -654,6 +756,26 @@ mod tests {
         assert!(cap(|o| get(&db, "startup", "1", o)).contains("\"id\":1"));
         assert!(cap(|o| stats(&db, o)).contains("1 planes, 2 nodes, 1 edges"));
         assert!(cap(|o| check(&db, o)).contains("ok: 2 nodes"));
+    }
+
+    #[test]
+    fn algo_commands_report_over_the_loaded_graph() {
+        let db = loaded(); // p1 (id 1) —CITES→ p2 (id 2)
+        let pr = cap(|o| algo_pagerank(&db, "startup", None, 20, 0.85, 20, o));
+        assert!(pr.contains("pagerank: 2 nodes"), "{pr}");
+
+        let comp = cap(|o| algo_components(&db, "startup", None, 50, o));
+        assert!(comp.contains("components: 1 across 2 nodes"), "{comp}");
+
+        let sp = cap(|o| algo_shortest_path(&db, "startup", None, 1, 2, Dir::Out, None, o));
+        assert!(sp.contains("cost 1") && sp.contains("1 -> 2"), "{sp}");
+
+        // No forward path 2 -> 1 (edge is directed).
+        let none = cap(|o| algo_shortest_path(&db, "startup", None, 2, 1, Dir::Out, None, o));
+        assert!(none.contains("no path from 2 to 1"), "{none}");
+
+        let lv = cap(|o| algo_louvain(&db, "startup", None, 50, o));
+        assert!(lv.contains("communities: 1"), "{lv}");
     }
 
     #[test]

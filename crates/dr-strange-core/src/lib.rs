@@ -18,10 +18,11 @@ pub mod json;
 pub mod storage;
 pub mod types;
 
-pub use api::{Database, PlaneHandle, QueryBuilder, WriteTxn};
+pub use api::{AlgoBuilder, Database, PlaneHandle, QueryBuilder, WriteTxn};
 pub use compute::{
-    CatalogSnapshot, Connection, EdgeTypeStats, Expr, LabelStats, LogicalPlan, PropStats, Row,
-    SortKey, Source, Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
+    CatalogSnapshot, Connection, EdgeTypeStats, Expr, LabelStats, LogicalPlan, LouvainOptions,
+    PageRankOptions, Path, PropStats, Row, ShortestPathOptions, SortKey, Source, Step, ValueType,
+    distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
