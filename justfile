@@ -12,13 +12,14 @@ web-build:
 web-dev:
     cd crates/dr-strange-web/frontend && bun install && bun run dev
 
-# Build the tutorial book (mdBook) into docs/book.
+# Build both editions of the tutorial book (mdBook) into docs/{en,zh}/book.
 docs-build:
-    cd docs && mdbook build
+    cd docs/en && mdbook build
+    cd docs/zh && mdbook build
 
-# Live-serve the book with hot reload (opens a browser).
-docs-serve:
-    cd docs && mdbook serve --open
+# Live-serve one edition with hot reload (default English); e.g. `just docs-serve zh`.
+docs-serve lang="en":
+    cd docs/{{lang}} && mdbook serve --open
 
 # Serve a database with the dashboard + JSON-RPC API (default graph.drsg).
 # Uses the native LSM backend (the default). The db path is a directory here

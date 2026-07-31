@@ -1,5 +1,7 @@
 # Introduction
 
+> 🌐 **English** · [中文版](../../zh/book/index.html)
+
 **Dr Strange** is an AI-native embedded graph database, written in Rust.
 
 It is a graph database designed from day one for AI workloads — embeddings are a

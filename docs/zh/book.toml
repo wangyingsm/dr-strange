@@ -1,0 +1,14 @@
+[book]
+title = "Dr Strange 手册"
+description = "Dr Strange —— 一个用 Rust 编写的 AI 原生嵌入式图数据库 —— 的教程与指南。"
+language = "zh"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+smart-punctuation = false
+
+[output.html.fold]
+enable = true
+level = 1
