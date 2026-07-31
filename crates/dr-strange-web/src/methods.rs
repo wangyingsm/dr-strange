@@ -873,6 +873,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "results": results,
         "edges": edges,
         "count": results.len(),
+        "trace": res.trace,
     }))
 }
 

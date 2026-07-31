@@ -57,6 +57,9 @@ pub struct AskResult {
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
     pub ran: bool,
+    /// A per-turn log of the model's tool calls and rejected plans, for
+    /// debugging why a plan came out the way it did.
+    pub trace: Vec<String>,
 }
 
 /// Property the digest pipeline stores node embeddings under; `find_entity`
@@ -85,6 +88,9 @@ pub fn ask(
     let steps = opts.max_attempts.max(1);
     let mut turns = 0u32;
     let mut last_err = String::new();
+    // A human-readable log of what the model did each turn (tool calls +
+    // rejected plans), surfaced for debugging/refinement.
+    let mut trace: Vec<String> = Vec::new();
 
     for i in 0..steps {
         turns += 1;
@@ -97,7 +103,7 @@ pub fn ask(
                  ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
             )
         } else if tools {
-            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s): {{\"plan\": …}} or {{\"plans\": […]}}.")
+            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s). If the question asked for more than one thing, return one plan per part: {{\"plans\": […]}}; otherwise {{\"plan\": …}}.")
         } else {
             format!("{transcript}\n\nReturn the plan JSON.")
         };
@@ -112,6 +118,12 @@ pub fn ask(
         {
             let result = run_tool(embedder.expect("tools ⇒ embedder"), plane, &catalog, &call);
             let result = result.unwrap_or_else(|e| format!("tool error: {e}"));
+            trace.push(format!(
+                "{}(\"{}\") → {}",
+                call.tool,
+                call.query,
+                result.chars().take(200).collect::<String>()
+            ));
             transcript.push_str(&format!(
                 "\n\nYou called {}(\"{}\"):\n{result}",
                 call.tool, call.query
@@ -133,6 +145,7 @@ pub fn ask(
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         ran: false,
+                        trace,
                     });
                 }
                 // Run each plan and union their subgraphs into one graph.
@@ -144,6 +157,7 @@ pub fn ask(
                             nodes,
                             edges,
                             ran: true,
+                            trace,
                         });
                     }
                     Err(e) => last_err = format!("running the plan(s) failed: {e}"),
@@ -152,6 +166,7 @@ pub fn ask(
             Ok(_) => last_err = "you returned an empty plan list".to_string(),
             Err(e) => last_err = format!("that was not a valid tool call or plan JSON: {e}"),
         }
+        trace.push(format!("plan rejected: {last_err}"));
         transcript.push_str(&format!(
             "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again.",
         ));
@@ -400,8 +415,12 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            matching nodes as {key,label,description}. Use the returned `key` in SeekKeys.\n\
          - {\"plan\": <the LogicalPlan>} → your final answer (or {\"plans\": [<plan>, …]} for a \
            compound question — see below).\n\
-         Flow: find_edge for each relationship in the question, find_entity for each named entity, \
-         THEN emit the plan(s) using the EXACT edge types and keys returned. Keep tool queries short.\n"
+         Flow: FIRST decompose the question into every distinct thing it asks — clauses joined by \
+         和 / 以及 / 并 / 、 / ，/ \"and\" are SEPARATE sub-questions, each its own relationship (e.g. \
+         \"…任职于哪些公司，做了哪些项目\" = TWO: employment + projects). For EACH sub-question call \
+         find_edge on its relationship and find_entity on its entities. THEN emit ONE plan per \
+         sub-question — use {\"plans\": [ … ]} when there is more than one — with the EXACT edge \
+         types and keys returned. Keep tool queries short.\n"
     } else {
         ""
     };
@@ -449,11 +468,12 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            when the edge reaches SEVERAL distinct kinds and the question wants just that one. Do NOT \
            filter when the question's category covers all the edge's targets (e.g. 任职/employed-at → \
            Company AND Organization are both employers → return both, no filter).\n\
-         - A plan is a SINGLE linear traversal from one source and CANNOT branch. For a compound \
-           question asking two different things about an entity (e.g. \"X's companies AND X's \
-           projects\"), return MULTIPLE plans — {{\"plans\": [<planA>, <planB>]}} — one per \
-           sub-question, each starting from that entity. Their subgraphs are unioned into one graph. \
-           Never chain unrelated relationships into one pipeline.\n\
+         - A plan is a SINGLE linear traversal from one source and CANNOT branch. If the question \
+           asks for MORE THAN ONE thing about an entity (clauses joined by 和/以及/并/、/，/\"and\", \
+           e.g. \"X's companies AND X's projects\"), you MUST return one plan per sub-question in \
+           {{\"plans\": [<planA>, <planB>]}} — each starting from that entity, each with its own \
+           edge_type. Their subgraphs are unioned into one graph. NEVER chain the two relationships \
+           into a single pipeline (that traverses A→B→C and matches nothing).\n\
          - Read-only: never invent write operations. Do NOT use vector/similarity operators.\n\
          - A Filter's Expr must yield a Bool (top-level Compare/HasLabel/Logic/Not/IsNull).\n\
          \n\
