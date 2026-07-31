@@ -1497,3 +1497,83 @@ textarea.doc {
   align-items: center;
   gap: 0.75rem;
 }
+
+/* ---- time-travel / AS OF (ROADMAP §4) ---- */
+/* Gold — the Dr-Strange portal hue — signals "historical / not live". */
+:root {
+  --tt: #b8860b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --tt: #d9a441;
+  }
+}
+:root[data-theme='dark'] {
+  --tt: #d9a441;
+}
+:root[data-theme='light'] {
+  --tt: #b8860b;
+}
+
+/* Tab keeps a gold marker while a past snapshot is pinned, on any tab. */
+.tool-tabs button.travelling {
+  color: var(--tt);
+}
+.tool-tabs button.travelling.active {
+  border-bottom-color: var(--tt);
+}
+.tt-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 0.35rem;
+  border-radius: 50%;
+  background: var(--tt);
+  vertical-align: middle;
+}
+
+.tt-bar {
+  gap: 0.7rem;
+}
+.tt-slider {
+  flex: 1 1 12rem;
+  max-width: 32rem;
+  accent-color: var(--tt);
+  cursor: pointer;
+}
+.tt-readout {
+  font: 12px ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--tt);
+  white-space: nowrap;
+}
+.tt-readout.live {
+  color: var(--muted);
+}
+.tt-empty {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* Persistent "you're in the past" banner, top-right of the canvas so it never
+   collides with the top-left plot status. Click to return to live. */
+.tt-banner {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font: 12px system-ui;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--tt);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tt) 45%, var(--border));
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+}
+.tt-banner:hover {
+  border-color: var(--tt);
+}

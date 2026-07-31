@@ -478,6 +478,8 @@ pub struct Seed {
     label: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    #[serde(flatten)]
+    at: AsOfParams,
 }
 
 /// `graph.seed` — an initial canvas: up to `limit` nodes (optionally of one
@@ -486,7 +488,7 @@ pub struct Seed {
 pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Seed = params(p)?;
     let limit = req.limit.unwrap_or(SEED_LIMIT);
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = plane_at(ctx, &req.plane, &req.at)?;
 
     let all_ids = match &req.label {
         Some(label) => app(plane.query().scan_label(label.clone()).ids())?,
@@ -1144,6 +1146,8 @@ pub struct Expand {
     edge_type: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    #[serde(flatten)]
+    at: AsOfParams,
 }
 
 /// `graph.expand` — hub-safe neighbourhood expansion around one node: the
@@ -1152,7 +1156,7 @@ pub struct Expand {
 pub fn graph_expand(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Expand = params(p)?;
     let limit = req.limit.unwrap_or(EXPAND_LIMIT) as usize;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = plane_at(ctx, &req.plane, &req.at)?;
     let dir = parse_dir(req.direction.as_deref());
 
     let hops = app(plane.neighbors(NodeId(req.id), dir, req.edge_type.as_deref()))?;

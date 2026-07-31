@@ -224,7 +224,9 @@
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "label", "required": false, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 200 } }
+        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 200 } },
+        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: seed from this past commit sequence (native backend only)." },
+        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: seed from the latest commit at or before this unix-epoch millisecond (native backend only)." }
       ],
       "result": { "name": "subgraph", "schema": { "$ref": "#/components/schemas/Subgraph" } }
     },
@@ -237,7 +239,9 @@
         { "name": "id", "required": true, "schema": { "type": "integer" } },
         { "name": "direction", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
         { "name": "type", "required": false, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } }
+        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
+        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: expand within this past commit sequence (native backend only)." },
+        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: expand within the latest commit at or before this unix-epoch millisecond (native backend only)." }
       ],
       "result": { "name": "subgraph", "schema": { "$ref": "#/components/schemas/Subgraph" } }
     },

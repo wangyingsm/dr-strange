@@ -117,6 +117,49 @@
   let idxMetric = $state(loadPref('idxMetric', 'cosine'))
   let idxError = $state(null)
 
+  // ---- time-travel / AS OF (ROADMAP §4) -----------------------------------
+  // `plane.history` only answers on a native-backend server, so a successful
+  // probe both proves the capability and gives the queryable commit window.
+  // On a redb server it errors → the whole time-travel tab stays hidden.
+  let timeTravel = $state(false) // native backend? (history probe succeeded)
+  let history = $state(null) // { oldest, latest } commit-sequence window
+  let asOf = $state(null) // null = live; else a commit seq the plot is pinned to
+  let sliderSeq = $state(0) // bound slider position (equals latest when live)
+
+  // The AS OF params to fold into a graph read; empty when viewing live.
+  const atParams = () => (asOf == null ? {} : { as_of: asOf })
+
+  // Probe the time-travel window. Runs on mount / plane change; the seq axis
+  // is DB-global so it doesn't depend on the current plane.
+  async function loadHistory() {
+    try {
+      const h = await rpc('plane.history')
+      history = h
+      timeTravel = true
+      if (asOf != null && (asOf < h.oldest || asOf > h.latest)) asOf = null
+      sliderSeq = asOf ?? h.latest
+    } catch {
+      timeTravel = false
+      history = null
+      asOf = null
+    }
+  }
+
+  // Snap back to the live (latest) view.
+  async function goLive() {
+    if (asOf == null) return
+    asOf = null
+    if (history) sliderSeq = history.latest
+    await seed()
+  }
+
+  // Commit the slider to `asOf` and re-plot at that snapshot. `latest` ⇒ live.
+  async function applyTimeTravel() {
+    if (!history) return
+    asOf = sliderSeq >= history.latest ? null : sliderSeq
+    await seed()
+  }
+
   // Remember dropdown selections across reloads.
   $effect(() => {
     savePref('embedProvider', embedProvider)
@@ -217,7 +260,7 @@
     error = null
     try {
       plot.clear()
-      const params = { plane }
+      const params = { plane, ...atParams() }
       if (labelFilter) params.label = labelFilter
       const sg = await rpc('graph.seed', params)
       plot.addSubgraph(sg)
@@ -283,7 +326,7 @@
 
   async function expand(id) {
     try {
-      const sg = await rpc('graph.expand', { plane, id, direction: 'both' })
+      const sg = await rpc('graph.expand', { plane, id, direction: 'both', ...atParams() })
       plot.addSubgraph(sg, id)
       legend = plot.legendEntries()
       status = `expanded +${sg.nodes.length} nodes${
@@ -365,7 +408,7 @@
       // Bring each hop's neighbourhood onto the canvas so the whole route (and
       // its edges) is present, then light up the path and mute the rest.
       for (const id of res.path.nodes) {
-        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both' }), id)
+        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both', ...atParams() }), id)
       }
       plot.highlightPath(res.path.nodes, res.path.edges)
       algoLegend = []
@@ -757,7 +800,7 @@
       }
       plot.clear()
       plot.addSubgraph({ nodes: [node], edges: [] })
-      const sg = await rpc('graph.expand', { plane, id, direction: 'both' })
+      const sg = await rpc('graph.expand', { plane, id, direction: 'both', ...atParams() })
       plot.addSubgraph(sg, id)
       plot.selectNode(id) // keep the focused node lit
       legend = plot.legendEntries()
@@ -780,7 +823,7 @@
       plot.clear()
       plot.addSubgraph({ nodes: [src, dst].filter(Boolean), edges: [edge] })
       for (const id of [edge.src, edge.dst]) {
-        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both' }), id)
+        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both', ...atParams() }), id)
       }
       plot.selectEdge(edge.id) // keep the found edge lit
       legend = plot.legendEntries()
@@ -858,6 +901,11 @@
     plane // track
     loadIndexes()
   })
+  // Probe the time-travel window (also the native-backend capability check).
+  $effect(() => {
+    plane // track
+    loadHistory()
+  })
   $effect(() => {
     focus // track
     maybeFocus()
@@ -874,6 +922,11 @@
   <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}>Algorithms</button>
   <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}>Hybrid</button>
   <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}>Ask</button>
+  {#if timeTravel}
+    <button class:active={tab === 'timetravel'} class:travelling={asOf != null} onclick={() => (tab = 'timetravel')}>
+      Time-travel{#if asOf != null}<span class="tt-dot" aria-hidden="true"></span>{/if}
+    </button>
+  {/if}
 </div>
 
 {#if tab === 'filters'}
@@ -999,6 +1052,33 @@
     <span class="algo-sep"></span>
     <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear the result and re-plot the original graph">Reset</button>
   </div>
+{:else if tab === 'timetravel'}
+  <div class="algo-bar tt-bar">
+    {#if history && history.latest > history.oldest}
+      <span class="algo-sp-label">as of</span>
+      <input
+        class="tt-slider"
+        type="range"
+        min={history.oldest}
+        max={history.latest}
+        step="1"
+        bind:value={sliderSeq}
+        onchange={applyTimeTravel}
+        title="Drag back through commit history"
+      />
+      <span class="tt-readout" class:live={asOf == null}>
+        {#if asOf == null}
+          Live · commit {history.latest}
+        {:else}
+          commit {sliderSeq} / {history.latest} · {history.latest - sliderSeq} back
+        {/if}
+      </span>
+      <span class="algo-sep"></span>
+      <button class="ghost" onclick={goLive} disabled={asOf == null} title="Jump back to the latest state">Live</button>
+    {:else}
+      <span class="tt-empty">Only one commit so far — make more changes to travel back through history.</span>
+    {/if}
+  </div>
 {/if}
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
@@ -1108,6 +1188,16 @@
 
 <div class="canvas-wrap">
   <div class="canvas" bind:this={container}></div>
+
+  {#if asOf != null}
+    <button class="tt-banner" onclick={goLive} title="Viewing a past snapshot — click to return to live">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 3v5h5" />
+        <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" />
+      </svg>
+      as of commit {asOf}{#if history} of {history.latest}{/if} · back to live
+    </button>
+  {/if}
 
   {#if algoBusy}
     <div class="thinking-overlay plot-thinking">
