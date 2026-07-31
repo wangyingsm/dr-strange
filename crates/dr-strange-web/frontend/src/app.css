@@ -829,8 +829,8 @@ nav button.active {
   position: absolute;
   top: 3.1rem;
   left: 0.75rem;
-  width: 20rem;
-  max-height: 62%;
+  bottom: 0.75rem;
+  width: min(20rem, 38%);
   display: flex;
   flex-direction: column;
   background: color-mix(in srgb, var(--panel) 94%, transparent);
