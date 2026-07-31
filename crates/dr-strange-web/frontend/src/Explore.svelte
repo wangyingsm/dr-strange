@@ -789,8 +789,11 @@
     </div>
   {/if}
 
-  {#if algoLegend.length || legend.length}
+  <!-- The legend and the inspector share the right bar: the legend shows while
+       nothing is selected; selecting a node/edge swaps it for the props layer. -->
+  {#if !selected && (algoLegend.length || legend.length)}
     <div class="legend">
+      <p class="legend-title">Legend</p>
       {#each (algoLegend.length ? algoLegend : legend) as e (e.label)}
         <span class="swatch" style="--c:{e.color}">{e.label || '(no label)'}</span>
       {/each}
