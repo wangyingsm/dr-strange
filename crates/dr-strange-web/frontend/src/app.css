@@ -616,18 +616,18 @@ nav button.active {
 }
 
 /* ---- explore controls ---- */
-/* Section heading above each Explore tool group (Filters/Operations,
-   GraphQL/Run, Algorithms). Hugs the bar below it so the two read as a unit. */
+/* Leading label for each Explore tool group (Filters/Operations, GraphQL/Run,
+   Algorithms). A fixed-width column so the three bars line up, kept inline so
+   it doesn't add a row and push the canvas down. */
 .group-title {
-  margin: 0.95rem 0 0.35rem;
+  flex: none;
+  width: 8.5rem;
   font-size: 0.7rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   color: var(--muted);
-}
-.group-title:first-of-type {
-  margin-top: 0;
+  white-space: nowrap;
 }
 
 .controls {
@@ -685,6 +685,7 @@ nav button.active {
 /* ---- query-language bar (Explore) ---- */
 .query-bar {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
   margin-bottom: 0.75rem;
 }

@@ -582,8 +582,8 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<p class="group-title">Filters/Operations</p>
 <div class="controls">
+  <span class="group-title">Filters/Operations</span>
   <label>
     Label
     <select bind:value={labelFilter} onchange={seed}>
@@ -599,8 +599,8 @@
   <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
 </div>
 
-<p class="group-title">GraphQL/Run</p>
 <div class="query-bar">
+  <span class="group-title">GraphQL/Run</span>
   <input
     type="text"
     class="cypher"
@@ -617,8 +617,8 @@
   <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
 </div>
 
-<p class="group-title">Algorithms</p>
 <div class="algo-bar">
+  <span class="group-title">Algorithms</span>
   <button onclick={runPagerank} disabled={algoBusy} title="Size nodes by PageRank importance">PageRank</button>
   <button onclick={() => runGroups('louvain')} disabled={algoBusy} title="Colour nodes by Louvain community">Communities</button>
   <button onclick={() => runGroups('components')} disabled={algoBusy} title="Colour nodes by connected component">Components</button>
