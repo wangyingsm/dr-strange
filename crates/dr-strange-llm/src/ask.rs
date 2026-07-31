@@ -67,6 +67,10 @@ pub struct AskResult {
 const EMBED_PROP: &str = "embedding";
 /// Candidates each tool returns.
 const TOOL_K: usize = 5;
+/// find_edge returns more candidates than find_entity — edge-type names are
+/// close in embedding space (IMPLEMENTS vs IMPLEMENTED_IN vs DEVELOPS), so the
+/// right one can rank just outside a small top-k.
+const EDGE_K: usize = 10;
 
 /// Translate `question` into a [`LogicalPlan`] over `plane` and (unless
 /// `dry_run`) run it. With `embedder`, the model can call `find_edge` /
@@ -91,6 +95,13 @@ pub fn ask(
     // A human-readable log of what the model did each turn (tool calls +
     // rejected plans), surfaced for debugging/refinement.
     let mut trace: Vec<String> = Vec::new();
+    // How many sub-questions the model declared (via its `asks` decomposition);
+    // we then require one plan per sub-question.
+    let mut expected: Option<usize> = None;
+    // How many find_edge calls the model made — we require one per ask so it
+    // actually sees the ranked candidates (and every fitting edge) rather than
+    // picking a single literal edge off the schema.
+    let mut edge_searches = 0usize;
 
     for i in 0..steps {
         turns += 1;
@@ -110,19 +121,39 @@ pub fn ask(
         let reply = chat.complete(&system, &user)?;
         let json = extract_json(&reply.text).to_string();
 
+        // First, the model declares its decomposition: {"asks": ["…", "…"]}.
+        // Remember the count so we can require one plan per sub-question.
+        if tools
+            && !is_last
+            && let Some(asks) = parse_asks(&json)
+        {
+            let n = asks.len();
+            expected = Some(n);
+            trace.push(format!("decompose → {n} ask(s): {}", asks.join(" | ")));
+            transcript.push_str(&format!(
+                "\n\nYou split the question into {n} sub-question(s): {asks:?}. Now call find_edge on \
+                 EACH sub-question's relationship (one at a time), then find_entity for named \
+                 entities, then return at least {n} plan(s) — one per (sub-question × fitting edge)."
+            ));
+            continue;
+        }
+
         // A tool call short-circuits (but not on the final turn): run it, feed
         // the result back, continue.
         if tools
             && !is_last
             && let Some(call) = parse_tool_call(&json)
         {
+            if call.tool == "find_edge" {
+                edge_searches += 1;
+            }
             let result = run_tool(embedder.expect("tools ⇒ embedder"), plane, &catalog, &call);
             let result = result.unwrap_or_else(|e| format!("tool error: {e}"));
             trace.push(format!(
                 "{}(\"{}\") → {}",
                 call.tool,
                 call.query,
-                result.chars().take(200).collect::<String>()
+                result.chars().take(500).collect::<String>()
             ));
             transcript.push_str(&format!(
                 "\n\nYou called {}(\"{}\"):\n{result}",
@@ -137,6 +168,42 @@ pub fn ask(
             Ok(mut plans) if !plans.is_empty() => {
                 for p in &mut plans {
                     ensure_limit(p, opts.limit);
+                }
+                // Require a find_edge per sub-question first, so the model saw
+                // the ranked candidates (and every fitting edge) instead of
+                // picking one literal edge off the schema. Skip on the last turn.
+                if let Some(n) = expected
+                    && edge_searches < n
+                    && !is_last
+                {
+                    last_err = format!(
+                        "before planning you must call find_edge for EACH of the {n} sub-questions' \
+                         relationships (you've called it {edge_searches}× — its ranked candidates \
+                         reveal every fitting edge, e.g. both IMPLEMENTS and DEVELOPS for \"make\")"
+                    );
+                    trace.push(format!("plan rejected: {last_err}"));
+                    transcript.push_str(&format!(
+                        "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again."
+                    ));
+                    continue;
+                }
+                // Enforce the declared decomposition: one plan per sub-question
+                // (the model tends to answer only the first otherwise). Skip the
+                // check on the final turn — take what we have rather than fail.
+                if let Some(n) = expected
+                    && plans.len() < n
+                    && !is_last
+                {
+                    last_err = format!(
+                        "you split the question into {n} sub-questions but returned only {} plan(s) — \
+                         return one plan per sub-question in {{\"plans\":[…]}}",
+                        plans.len()
+                    );
+                    trace.push(format!("plan rejected: {last_err}"));
+                    transcript.push_str(&format!(
+                        "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again."
+                    ));
+                    continue;
                 }
                 if opts.dry_run {
                     return Ok(AskResult {
@@ -187,6 +254,18 @@ struct ToolCall {
     label: Option<String>,
 }
 
+/// Recognize a decomposition `{"asks": ["…", "…"]}` (non-empty). Returns the
+/// sub-question list.
+fn parse_asks(json: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.get("asks")?.as_array()?;
+    let asks: Vec<String> = arr
+        .iter()
+        .filter_map(|a| a.as_str().map(str::to_string))
+        .collect();
+    (!asks.is_empty()).then_some(asks)
+}
+
 /// Recognize a tool call `{"tool": "...", "query": "...", "label": ...}`.
 /// Returns `None` for a plan (which has no `tool` field).
 fn parse_tool_call(json: &str) -> Option<ToolCall> {
@@ -222,7 +301,7 @@ fn run_tool(
 ) -> Result<String> {
     match call.tool.as_str() {
         "find_edge" => {
-            let hits = find_edge(embedder, catalog, &call.query, TOOL_K)?;
+            let hits = find_edge(embedder, catalog, &call.query, EDGE_K)?;
             Ok(serde_json::to_string(&hits)?)
         }
         "find_entity" => {
@@ -413,14 +492,24 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            closest real edge types with their src→dst.\n\
          - {\"tool\":\"find_entity\",\"query\":\"<name or description>\",\"label\":\"<Label>\"|null} → \
            matching nodes as {key,label,description}. Use the returned `key` in SeekKeys.\n\
-         - {\"plan\": <the LogicalPlan>} → your final answer (or {\"plans\": [<plan>, …]} for a \
-           compound question — see below).\n\
-         Flow: FIRST decompose the question into every distinct thing it asks — clauses joined by \
-         和 / 以及 / 并 / 、 / ，/ \"and\" are SEPARATE sub-questions, each its own relationship (e.g. \
-         \"…任职于哪些公司，做了哪些项目\" = TWO: employment + projects). For EACH sub-question call \
-         find_edge on its relationship and find_entity on its entities. THEN emit ONE plan per \
-         sub-question — use {\"plans\": [ … ]} when there is more than one — with the EXACT edge \
-         types and keys returned. Keep tool queries short.\n"
+         - {\"asks\": [\"…\", \"…\"]} → your decomposition (see Flow step 1).\n\
+         - {\"plan\": <the LogicalPlan>} or {\"plans\": [<plan>, …]} → your final answer.\n\
+         Flow — follow IN ORDER:\n\
+         1. DECOMPOSE first: reply {\"asks\": [\"<sub-question 1>\", \"<sub-question 2>\", …]} splitting \
+            the question into EVERY distinct thing it asks. Clauses joined by 和/以及/并/、/，/\"and\" are \
+            SEPARATE asks (e.g. \"…任职于哪些公司，做了哪些项目，实现了哪些东西\" = THREE asks). A \
+            one-part question is one ask.\n\
+         2. For EACH ask you MUST call find_edge on its relationship (do NOT pick edges off the \
+            schema alone — the ranked candidates reveal every fitting edge, including near-synonyms). \
+            Then take EVERY candidate whose src is the entity's label and whose meaning fits the \
+            ask's verb: usually one, but a BROAD verb (做/实现/研发/build/make) matches SEVERAL — e.g. \
+            \"实现了哪些东西\" from a Person covers BOTH IMPLEMENTS: Person→CryptographicModule AND \
+            DEVELOPS: Person→HardwareDevice (both are \"things made\") — take them ALL. Use \
+            find_entity for named entities.\n\
+         3. Return one plan per (ask × matching edge) in {\"plans\": [ … ]} — at least one plan per \
+            ask, MORE when an ask matched several edges — using the EXACT edge types and keys. Never \
+            merge two relationships into one pipeline.\n\
+         Keep tool queries short.\n"
     } else {
         ""
     };
