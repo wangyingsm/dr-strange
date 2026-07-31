@@ -42,7 +42,7 @@
   // Hybrid retrieval (ROADMAP §2): fuse vector + keyword + graph-proximity.
   let hyQuery = $state('') // the query text
   let hyLabel = $state('') // label scope (required for the keyword channel)
-  let hyVector = $state('embedding') // embedding property for the vector channel ('' = off)
+  let hyVector = $state('embedding') // vector channel's embedding property (hidden; the default)
   let hyKeyword = $state('') // string property for the BM25 channel ('' = off)
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
   let hyProvider = $state('openai') // embedding provider for the vector channel
@@ -702,17 +702,19 @@
     bind:value={hyQuery}
     onkeydown={(e) => e.key === 'Enter' && runHybrid()}
   />
-  <input class="sp" placeholder="label" bind:value={hyLabel} title="Label scope (required for the keyword channel)" />
-  <input class="sp" placeholder="vector prop" bind:value={hyVector} title="Embedding property for the vector channel (blank = off)" />
+  <select bind:value={hyLabel} title="Label scope (required for the keyword channel)">
+    <option value="">all labels</option>
+    {#each labels as l (l)}<option value={l}>{l}</option>{/each}
+  </select>
+  <select bind:value={hyProvider} title="Embedding provider for the vector channel">
+    {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+  </select>
+  <span class="algo-sep"></span>
   <input class="sp" placeholder="keyword prop" bind:value={hyKeyword} title="String property for the BM25 keyword channel (blank = off)" />
+  <span class="algo-sep"></span>
   <label class="hy-graph" title="Add a 1-hop graph-proximity channel">
     <input type="checkbox" bind:checked={hyGraph} /> graph
   </label>
-  {#if hyVector.trim()}
-    <select bind:value={hyProvider} title="Embedding provider for the vector channel">
-      {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
-    </select>
-  {/if}
   <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
 </div>
 
