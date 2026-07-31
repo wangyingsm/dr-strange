@@ -537,6 +537,18 @@ impl<'db> PlaneHandle<'db> {
             .unwrap_or_default()
     }
 
+    /// The vector indexes declared on this plane, as `(label, property,
+    /// metric)` — what a hybrid/vector search can accelerate against.
+    pub fn vector_indexes(&self) -> Vec<(String, String, Metric)> {
+        self.db.indexes().declared(self.id)
+    }
+
+    /// The keyword indexes declared on this plane, as `(label, property,
+    /// language)` — the BM25 channel can only search these.
+    pub fn keyword_indexes(&self) -> Vec<(String, String, Language)> {
+        self.db.keywords().declared(self.id)
+    }
+
     /// Starts a write transaction scoped to this plane. Blocks while another
     /// write transaction is open (single writer, arch/01 §6).
     pub fn write(&self) -> Result<WriteTxn<'db>> {

@@ -824,6 +824,17 @@ nav button.active {
   color: var(--muted);
   white-space: nowrap;
 }
+.hybrid-bar .hy-hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.hybrid-bar .hy-hint code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.76rem;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
 
 .hy-results {
   position: absolute;

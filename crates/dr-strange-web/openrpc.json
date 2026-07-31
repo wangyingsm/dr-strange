@@ -167,6 +167,15 @@
       "result": { "name": "result", "schema": { "type": "object", "description": "{results:[{...node, score, channels:{vector,keyword,graph}}], count}." } }
     },
     {
+      "name": "plane.indexes",
+      "summary": "The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist.",
+      "x-access": "read",
+      "params": [
+        { "name": "plane", "required": true, "schema": { "type": "string" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object", "description": "{vector:[{label,property,metric}], keyword:[{label,property,language}]}." } }
+    },
+    {
       "name": "graph.seed",
       "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
       "x-access": "read",

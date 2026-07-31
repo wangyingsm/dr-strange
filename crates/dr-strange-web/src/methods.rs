@@ -806,6 +806,43 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     Ok(jval!({ "results": results, "count": results.len() }))
 }
 
+#[derive(Deserialize)]
+pub struct PlaneIndexes {
+    plane: String,
+}
+
+fn metric_name(m: Metric) -> &'static str {
+    match m {
+        Metric::Cosine => "cosine",
+        Metric::Dot => "dot",
+        Metric::L2 => "l2",
+    }
+}
+
+/// `plane.indexes` — the search indexes declared on a plane, so a UI can offer
+/// only the channels that actually exist (ROADMAP §2). Returns the vector and
+/// keyword indexes as `{label, property, …}`; the keyword channel can only
+/// search a `(label, property)` that appears under `keyword`.
+pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PlaneIndexes = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let vector: Vec<Value> = plane
+        .vector_indexes()
+        .into_iter()
+        .map(|(label, property, metric)| {
+            jval!({ "label": label, "property": property, "metric": metric_name(metric) })
+        })
+        .collect();
+    let keyword: Vec<Value> = plane
+        .keyword_indexes()
+        .into_iter()
+        .map(|(label, property, language)| {
+            jval!({ "label": label, "property": property, "language": format!("{language:?}").to_lowercase() })
+        })
+        .collect();
+    Ok(jval!({ "vector": vector, "keyword": keyword }))
+}
+
 /// Semantic search: embed the query with the requested provider (key from the
 /// server env) and return the plane's most vector-similar nodes, each carrying
 /// a `score` and a `match` hint. Errors (no key, provider down, no embed model)

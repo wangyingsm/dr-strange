@@ -194,6 +194,7 @@ const METHODS: &[&str] = &[
     "plane.find",
     "plane.algo",
     "plane.hybrid",
+    "plane.indexes",
     "graph.seed",
     "graph.expand",
     "digest.run",
@@ -248,6 +249,7 @@ fn dispatch_method(
         // Reads only, but it spends the server's embedding credentials for the
         // vector channel — the same privileged tier as `plane.find` semantic.
         "plane.hybrid" => guarded!(Access::Read, methods::plane_hybrid(ctx, params)),
+        "plane.indexes" => guarded!(Access::Read, methods::plane_indexes(ctx, params)),
         "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
         "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),
         // `digest.run` writes nothing, but it spends the server's provider
@@ -644,6 +646,41 @@ mod tests {
         // The graph-dense doc leads; every hit carries the channel breakdown.
         assert_eq!(r["results"][0]["id"], d2.0);
         assert!(r["results"][0]["channels"]["keyword"].is_number());
+    }
+
+    #[test]
+    fn plane_indexes_lists_declared_indexes() {
+        use dr_strange_core::{Language, Metric, PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            let props: Properties = [
+                ("body".to_string(), PropDesc::new(PropValue::Str("graph text".into()))),
+                ("emb".to_string(), PropDesc::new(PropValue::Vector(vec![0.0, 1.0]))),
+            ]
+            .into_iter()
+            .collect();
+            txn.create_node(&["Doc"], props).unwrap();
+            txn.commit().unwrap();
+        }
+        plane
+            .ensure_keyword_index("Doc", "body", Language::English)
+            .unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["keyword"][0]["label"], "Doc");
+        assert_eq!(r["keyword"][0]["property"], "body");
+        assert_eq!(r["keyword"][0]["language"], "english");
+        assert_eq!(r["vector"][0]["property"], "emb");
+        assert_eq!(r["vector"][0]["metric"], "l2");
     }
 
     // ---- auth gate --------------------------------------------------------

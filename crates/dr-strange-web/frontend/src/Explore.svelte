@@ -40,13 +40,26 @@
   let spDir = $state('out') // out | in | both
 
   // Hybrid retrieval (ROADMAP §2): fuse vector + keyword + graph-proximity.
+  // The available channels are DERIVED from the indexes actually declared on
+  // the plane (plane.indexes), so the UI can't offer a channel that can't run.
   let hyQuery = $state('') // the query text
-  let hyLabel = $state('') // label scope (required for the keyword channel)
-  let hyVector = $state('embedding') // vector channel's embedding property (hidden; the default)
-  let hyKeyword = $state('') // string property for the BM25 channel ('' = off)
+  let hyLabel = $state('') // node type to search (only labels that have an index)
+  let hyIndexes = $state(null) // { vector:[{label,property,…}], keyword:[{…}] } | null
+  let useVector = $state(true) // semantic channel on? (only when the label has a vector index)
+  let useKeyword = $state(true) // keyword channel on? (only when the label has a keyword index)
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
   let hyProvider = $state('openai') // embedding provider for the vector channel
   let hyResults = $state(null) // [{ id, external_key, labels, score, channels }] | null
+
+  // Labels that have at least one declared index (the only ones searchable).
+  let searchableLabels = $derived(
+    hyIndexes
+      ? [...new Set([...hyIndexes.vector, ...hyIndexes.keyword].map((x) => x.label))].sort()
+      : [],
+  )
+  // The indexed property for the selected label, per channel (null = no index).
+  let vecProp = $derived(hyIndexes?.vector.find((x) => x.label === hyLabel)?.property ?? null)
+  let kwProp = $derived(hyIndexes?.keyword.find((x) => x.label === hyLabel)?.property ?? null)
 
   // Inspector mutation state (mutation UI): edit properties + delete.
   let editing = $state(false)
@@ -286,18 +299,42 @@
 
   // ---- hybrid retrieval (ROADMAP §2) --------------------------------------
 
+  // Load which indexes exist on the current plane, then pick a searchable
+  // label and default each channel on iff its index exists.
+  async function loadIndexes() {
+    try {
+      hyIndexes = await rpc('plane.indexes', { plane })
+    } catch {
+      hyIndexes = { vector: [], keyword: [] }
+    }
+    if (!searchableLabels.includes(hyLabel)) hyLabel = searchableLabels[0] ?? ''
+    useVector = vecProp != null
+    useKeyword = kwProp != null
+  }
+
+  // Switching label re-defaults the channel toggles to what that label indexes.
+  function onHyLabel() {
+    useVector = vecProp != null
+    useKeyword = kwProp != null
+  }
+
   async function runHybrid() {
-    if (!hyQuery.trim()) return
+    if (!hyQuery.trim() || !hyLabel) return
+    const wantVector = useVector && vecProp
+    const wantKeyword = useKeyword && kwProp
+    if (!wantVector && !wantKeyword) {
+      error = 'pick at least the semantic or keyword channel'
+      return
+    }
     algoBusy = true
     error = null
     try {
-      const params = { plane, q: hyQuery.trim(), k: 25 }
-      if (hyLabel.trim()) params.label = hyLabel.trim()
-      if (hyVector.trim()) {
-        params.vector_prop = hyVector.trim()
+      const params = { plane, q: hyQuery.trim(), label: hyLabel, k: 25 }
+      if (wantVector) {
+        params.vector_prop = vecProp
         params.provider = hyProvider
       }
-      if (hyKeyword.trim()) params.keyword_prop = hyKeyword.trim()
+      if (wantKeyword) params.keyword_prop = kwProp
       if (hyGraph) params.graph_hops = 1
       const res = await rpc('plane.hybrid', params)
       hyResults = res.results
@@ -630,6 +667,12 @@
     plane // track
     reseed()
   })
+  // Refresh the searchable indexes whenever the plane changes (independent of
+  // the seed/focus flow, so it runs on the search-focus mount path too).
+  $effect(() => {
+    plane // track
+    loadIndexes()
+  })
   $effect(() => {
     focus // track
     maybeFocus()
@@ -696,28 +739,46 @@
 
 <div class="algo-bar hybrid-bar">
   <span class="group-title">Hybrid</span>
-  <input
-    class="hy-q"
-    placeholder="query text…"
-    bind:value={hyQuery}
-    onkeydown={(e) => e.key === 'Enter' && runHybrid()}
-  />
-  <span class="algo-sp-label">label</span>
-  <select bind:value={hyLabel} title="Label scope (required for the keyword channel)">
-    <option value="">all labels</option>
-    {#each labels as l (l)}<option value={l}>{l}</option>{/each}
-  </select>
-  <span class="algo-sp-label">embed</span>
-  <select bind:value={hyProvider} title="Embedding provider for the vector channel">
-    {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
-  </select>
-  <span class="algo-sep"></span>
-  <input class="sp" placeholder="keyword prop" bind:value={hyKeyword} title="String property for the BM25 keyword channel (blank = off)" />
-  <span class="algo-sep"></span>
-  <label class="hy-graph" title="Add a 1-hop graph-proximity channel">
-    <input type="checkbox" bind:checked={hyGraph} /> graph
-  </label>
-  <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
+  {#if searchableLabels.length}
+    <input
+      class="hy-q"
+      placeholder="query text…"
+      bind:value={hyQuery}
+      onkeydown={(e) => e.key === 'Enter' && runHybrid()}
+    />
+    <span class="algo-sp-label">in</span>
+    <select bind:value={hyLabel} onchange={onHyLabel} title="Node type to search">
+      {#each searchableLabels as l (l)}<option value={l}>{l}</option>{/each}
+    </select>
+    <span class="algo-sep"></span>
+    {#if vecProp}
+      <label class="hy-graph" title="Semantic (vector) similarity on {vecProp}">
+        <input type="checkbox" bind:checked={useVector} /> semantic
+      </label>
+    {/if}
+    {#if kwProp}
+      <label class="hy-graph" title="BM25 keyword match on {kwProp}">
+        <input type="checkbox" bind:checked={useKeyword} /> keyword
+      </label>
+    {/if}
+    <label class="hy-graph" title="Boost neighbours of the strongest hits (1 hop)">
+      <input type="checkbox" bind:checked={hyGraph} /> graph
+    </label>
+    {#if useVector && vecProp}
+      <span class="algo-sep"></span>
+      <span class="algo-sp-label">embed</span>
+      <select bind:value={hyProvider} title="Embedding provider for the semantic channel">
+        {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+      </select>
+    {/if}
+    <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
+  {:else}
+    <span class="hy-hint">
+      No search index on this plane — declare one with
+      <code>drsg index keyword &lt;label&gt; &lt;prop&gt;</code> or
+      <code>drsg index ensure &lt;label&gt; &lt;prop&gt;</code>.
+    </span>
+  {/if}
 </div>
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
