@@ -510,16 +510,27 @@ pub fn ask(
     limit: u64,
     chat_provider: &str,
     model: Option<&str>,
+    embed_provider: Option<&str>,
+    embed_model: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
     let p = plane(db, plane_name)?;
     let chat = dr_strange_llm::build_provider(chat_provider, model, None, None, false)?;
+    // Grounding tools are enabled when an embed provider is given.
+    let embedder = embed_provider
+        .and_then(|ep| dr_strange_llm::build_provider(ep, embed_model, None, None, true).ok());
     let opts = dr_strange_llm::AskOptions {
         max_attempts,
         dry_run,
         limit,
     };
-    let res = dr_strange_llm::ask(&chat, &p, question, &opts)?;
+    let res = dr_strange_llm::ask(
+        &chat,
+        embedder.as_ref().map(|e| e as &dyn dr_strange_llm::Embedder),
+        &p,
+        question,
+        &opts,
+    )?;
     let plural = if res.attempts == 1 { "" } else { "s" };
     writeln!(out, "plan ({} attempt{plural}):", res.attempts)?;
     writeln!(out, "{}", serde_json::to_string_pretty(&res.plan)?)?;

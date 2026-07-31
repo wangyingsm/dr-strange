@@ -168,16 +168,18 @@
     },
     {
       "name": "plane.ask",
-      "summary": "Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. Chat key from the server env.",
+      "summary": "Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env.",
       "x-access": "read",
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "question", "required": true, "schema": { "type": "string" } },
         { "name": "dry_run", "required": false, "schema": { "type": "boolean", "default": false } },
-        { "name": "max_attempts", "required": false, "schema": { "type": "integer", "default": 3 } },
+        { "name": "max_attempts", "required": false, "schema": { "type": "integer", "default": 6 } },
         { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
         { "name": "provider", "required": false, "schema": { "type": "string" } },
-        { "name": "model", "required": false, "schema": { "type": "string" } }
+        { "name": "model", "required": false, "schema": { "type": "string" } },
+        { "name": "embed_provider", "required": false, "schema": { "type": "string" } },
+        { "name": "embed_model", "required": false, "schema": { "type": "string" } }
       ],
       "result": { "name": "result", "schema": { "type": "object", "description": "{plan, ran, attempts, results:[node…], count}." } }
     },

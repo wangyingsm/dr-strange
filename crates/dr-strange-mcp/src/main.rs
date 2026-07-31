@@ -153,6 +153,12 @@ struct Ask {
     provider: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// Embedding provider for the find_edge/find_entity grounding tools (should
+    /// match how the plane was embedded). Omit to disable them (schema only).
+    #[serde(default)]
+    embed_provider: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -567,12 +573,21 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
     let provider = req.provider.as_deref().unwrap_or("openai");
     let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)?;
+    let embedder = req.embed_provider.as_deref().and_then(|ep| {
+        dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
+    });
     let opts = dr_strange_llm::AskOptions {
-        max_attempts: req.max_attempts.unwrap_or(3),
+        max_attempts: req.max_attempts.unwrap_or(6),
         dry_run: req.dry_run,
         limit: req.limit.unwrap_or(100),
     };
-    let res = dr_strange_llm::ask(&chat, &plane, &req.question, &opts)?;
+    let res = dr_strange_llm::ask(
+        &chat,
+        embedder.as_ref().map(|e| e as &dyn dr_strange_llm::Embedder),
+        &plane,
+        &req.question,
+        &opts,
+    )?;
     let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
     Ok(jval!({
         "plan": serde_json::to_value(&res.plan)?,

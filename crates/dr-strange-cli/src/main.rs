@@ -140,8 +140,8 @@ enum Command {
         /// Show the generated plan without executing it.
         #[arg(long)]
         dry_run: bool,
-        /// Total model attempts including repairs.
-        #[arg(long, default_value_t = 3)]
+        /// Total model turns including tool calls and repairs.
+        #[arg(long, default_value_t = 6)]
         max_attempts: u32,
         /// Safety row cap appended when the plan declares none.
         #[arg(long, default_value_t = 100)]
@@ -152,6 +152,13 @@ enum Command {
         /// Chat model override (default: the provider's).
         #[arg(long)]
         model: Option<String>,
+        /// Embedding provider for the find_edge/find_entity grounding tools
+        /// (should match how the plane was embedded). Omit to disable them.
+        #[arg(long)]
+        embed: Option<String>,
+        /// Embedding model override (default: the provider's).
+        #[arg(long)]
+        embed_model: Option<String>,
     },
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
@@ -501,6 +508,8 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             limit,
             chat,
             model,
+            embed,
+            embed_model,
         } => {
             let db = commands::open(&cli.db)?;
             commands::ask(
@@ -512,6 +521,8 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 limit,
                 &chat,
                 model.as_deref(),
+                embed.as_deref(),
+                embed_model.as_deref(),
                 out,
             )
         }
