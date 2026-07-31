@@ -12,6 +12,14 @@ web-build:
 web-dev:
     cd crates/dr-strange-web/frontend && bun install && bun run dev
 
+# Build the container image (multi-stage: SPA + drsg binary + runtime).
+docker-build tag="dr-strange:latest":
+    docker build -t {{tag}} .
+
+# Build and run the server via docker compose (persistent volume on :7700).
+docker-up:
+    docker compose up --build
+
 # Build both editions of the tutorial book (mdBook) into docs/{en,zh}/book.
 docs-build:
     cd docs/en && mdbook build

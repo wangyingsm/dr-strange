@@ -1,0 +1,28 @@
+# Run `drsg serve` in a container with a persistent database volume.
+#
+#   docker compose up --build
+#
+# Then open http://localhost:7700. Set DRSG_TOKEN (see below) to allow
+# programmatic access from the SDKs or curl.
+
+services:
+  drsg:
+    build: .
+    image: dr-strange:latest
+    restart: unless-stopped
+    ports:
+      - "7700:7700"
+    volumes:
+      - drsg-data:/data
+    environment:
+      # Shared bearer token. Unset ⇒ only the same-origin browser UI may call
+      # the API; set it to permit SDK / curl access.
+      DRSG_TOKEN: ${DRSG_TOKEN:-}
+      # Optional LLM provider keys — needed for AIgest, semantic search, and
+      # natural-language queries. Supply only the providers you use.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+
+volumes:
+  drsg-data:

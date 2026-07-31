@@ -1,0 +1,25 @@
+# Build artifacts and caches — the image rebuilds these from source.
+target/
+**/target/
+**/node_modules/
+crates/dr-strange-web/frontend/dist/
+docs/*/book/
+
+# Language-SDK build outputs.
+sdk/c/*.o
+sdk/c/*.a
+sdk/c/drsg-codegen
+sdk/java/target/
+
+# Local databases and their sidecars (never bake data into an image).
+*.drsg
+*.redb
+*.drsg.hnsw
+*.drsg.bm25
+native.drsg*
+db=/
+
+# VCS and editor cruft.
+.git/
+.gitignore
+*.swp
