@@ -13,10 +13,15 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.WebSocket;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicLong;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
@@ -139,5 +144,81 @@ public class Client {
         } catch (IllegalArgumentException e) {
             throw new DrsgException(-32000, "decode result: " + e.getMessage(), null);
         }
+    }
+
+    /** Receives change events from a {@link #watch} subscription. */
+    @FunctionalInterface
+    public interface ChangeListener {
+        void onChange(ChangeEvent event);
+    }
+
+    /** A live change-feed subscription; {@link #close()} stops it. */
+    public interface Subscription extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    /**
+     * Subscribe to a plane's change feed (ROADMAP §5) over a long-lived
+     * WebSocket. {@code listener} is invoked with each committed
+     * {@link ChangeEvent} until the returned {@link Subscription} is closed.
+     * Pass a {@code label} (or null) to receive only node changes carrying it.
+     *
+     * <p>Uses the JDK's built-in {@link WebSocket}. Best-effort — a slow
+     * listener can miss commits, and reconnecting after a drop is the caller's
+     * to add. The connection is established before this returns.
+     */
+    public Subscription watch(String plane, String label, ChangeListener listener) throws DrsgException {
+        String url = baseUrl.replaceFirst("^http", "ws") + "/ws"
+                + (token != null && !token.isEmpty()
+                        ? "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)
+                        : "");
+
+        WebSocket.Listener wl = new WebSocket.Listener() {
+            private final StringBuilder buf = new StringBuilder();
+
+            @Override
+            public void onOpen(WebSocket ws) {
+                ObjectNode sub = MAPPER.createObjectNode();
+                sub.put("plane", plane);
+                if (label != null && !label.isEmpty()) {
+                    sub.put("label", label);
+                }
+                ObjectNode req = MAPPER.createObjectNode();
+                req.put("jsonrpc", "2.0");
+                req.put("method", "plane.watch");
+                req.set("params", sub);
+                ws.sendText(req.toString(), true);
+                ws.request(1);
+            }
+
+            @Override
+            public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
+                buf.append(data);
+                if (last) {
+                    String msg = buf.toString();
+                    buf.setLength(0);
+                    try {
+                        JsonNode node = MAPPER.readTree(msg);
+                        if ("plane.change".equals(node.path("method").asText())) {
+                            listener.onChange(MAPPER.convertValue(node.get("params"), ChangeEvent.class));
+                        }
+                    } catch (RuntimeException | JsonProcessingException ignored) {
+                        // A malformed frame shouldn't tear down the subscription.
+                    }
+                }
+                ws.request(1);
+                return null;
+            }
+        };
+
+        final WebSocket ws;
+        try {
+            ws = http.newWebSocketBuilder().buildAsync(URI.create(url), wl).join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new DrsgException(-32000, "websocket connect failed: " + cause.getMessage(), null);
+        }
+        return () -> ws.sendClose(WebSocket.NORMAL_CLOSURE, "");
     }
 }

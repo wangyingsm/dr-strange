@@ -19,6 +19,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -133,6 +136,40 @@ class ClientE2ETest {
         Drsg db = new Drsg(baseUrl, TOKEN);
         Map<String, Object> doc = db.rpcDiscover();
         assertEquals("1.2.6", doc.get("openrpc"));
+    }
+
+    @Test
+    void changeFeedOverWebSocket() throws Exception {
+        assumeTrue(baseUrl != null, "drsg binary not found");
+        Drsg db = new Drsg(baseUrl, TOKEN);
+
+        List<ChangeEvent> events = new CopyOnWriteArrayList<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        Client.Subscription sub = db.watch("startup", "Widget", ev -> {
+            events.add(ev);
+            latch.countDown();
+        });
+        try {
+            Thread.sleep(300); // let the server register the subscription
+            db.nodeCreate(Drsg.NodeCreateParams.of("startup").withKey("ws-widget").withLabels(List.of("Widget")));
+
+            assertTrue(latch.await(3, TimeUnit.SECONDS), "no change event received over the websocket");
+            ChangeEvent ev = events.get(0);
+            assertTrue(ev.seq() > 0);
+            ChangeEvent.Change c = ev.changes().stream()
+                    .filter(x -> x.record() != null && "ws-widget".equals(x.record().get("external_key")))
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals("node", c.kind());
+            assertEquals("created", c.op());
+            assertTrue(c.labels().contains("Widget"));
+
+            // Leave the graph as we found it — crudRoundtrip asserts on the
+            // global node count and the class shares one server.
+            db.nodeDelete(Drsg.NodeDeleteParams.of("startup").withKey("ws-widget"));
+        } finally {
+            sub.close();
+        }
     }
 
     @Test
