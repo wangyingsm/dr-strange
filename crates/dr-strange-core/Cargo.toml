@@ -5,14 +5,15 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["redb-backend"]
+default = ["native-backend"]
 # JSON dialect for the wrapper layers (CLI/MCP). Off by default so the
 # library core stays JSON-free (postcard is the durable codec).
 json = ["dep:serde_json"]
 # On-disk storage backend for `Database::open`. Exactly one is expected; the
-# in-memory engine is always available for tests. `native-backend` selects the
-# hand-rolled LSM engine (arch/01 v2) and, when both are enabled, takes
-# precedence over redb.
+# in-memory engine is always available for tests. `native-backend` (the default)
+# selects the hand-rolled LSM engine (arch/01 v2) and, when both are enabled,
+# takes precedence over redb. `redb-backend` is the legacy v1 engine, still
+# opt-in via `--no-default-features --features redb-backend`.
 redb-backend = ["dep:redb"]
 native-backend = []
 

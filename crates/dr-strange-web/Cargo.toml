@@ -5,9 +5,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["redb-backend"]
-# Storage backend, forwarded to core. redb by default; `native-backend` selects
-# the hand-rolled LSM engine.
+default = ["native-backend"]
+# Storage backend, forwarded to core. The hand-rolled LSM engine is the default;
+# `redb-backend` selects the legacy v1 engine.
 redb-backend = ["dr-strange-core/redb-backend"]
 native-backend = ["dr-strange-core/native-backend"]
 
