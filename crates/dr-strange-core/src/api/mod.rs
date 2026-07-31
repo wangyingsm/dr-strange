@@ -20,6 +20,8 @@ use crate::compute::expr::{self, Expr, score};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
+use crate::keyword::KeywordRegistry;
+use crate::text::Language;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
@@ -92,6 +94,10 @@ pub struct Database {
     /// write-locked at commit to apply the coherence events a write transaction
     /// buffered.
     indexes: RwLock<VectorRegistry>,
+    /// In-memory BM25 keyword indexes (ROADMAP §2). Managed exactly like
+    /// `indexes`: sidecar-loaded when fresh else rebuilt, write-locked at commit
+    /// to apply buffered text changes.
+    keywords: RwLock<KeywordRegistry>,
     /// Cross-query, seq-stamped decoded-record cache (arch/02 §3). Memory-only;
     /// rebuilt cold on open, so it never holds durable state.
     cache: GraphCache,
@@ -99,6 +105,8 @@ pub struct Database {
     /// `None` for an in-memory database. Loaded on open when fresh; saved
     /// best-effort on drop.
     sidecar: Option<PathBuf>,
+    /// The `.bm25` keyword sidecar beside the database, or `None` in-memory.
+    keyword_sidecar: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Database {
@@ -126,21 +134,34 @@ fn sidecar_path(db: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The BM25 keyword sidecar path for a database file (`graph.drsg` →
+/// `graph.drsg.bm25`), beside the DB and the `.hnsw` sidecar.
+#[cfg(any(feature = "redb-backend", feature = "native-backend"))]
+fn keyword_sidecar_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(".bm25");
+    PathBuf::from(name)
+}
+
 impl Drop for Database {
     /// Persist the vector indexes to the sidecar so the next open can skip the
     /// rebuild-from-KV. Best-effort: the registry is kept coherent with each
     /// committed write, so stamping it with the current commit sequence is
     /// valid; any failure just means the next open rebuilds (still correct).
     fn drop(&mut self) {
-        let Some(path) = self.sidecar.clone() else {
-            return;
+        let seq = match self.engine.with_read(|txn| graph::read_commit_seq(txn)) {
+            Ok(seq) => seq,
+            Err(_) => return, // no meta ⇒ nothing coherent to stamp
         };
-        let result = self
-            .engine
-            .with_read(|txn| graph::read_commit_seq(txn))
-            .and_then(|seq| self.indexes().save_sidecar(&path, seq));
-        if let Err(e) = result {
+        if let Some(path) = self.sidecar.clone()
+            && let Err(e) = self.indexes().save_sidecar(&path, seq)
+        {
             tracing::warn!(error = %e, path = %path.display(), "failed to write HNSW sidecar");
+        }
+        if let Some(path) = self.keyword_sidecar.clone()
+            && let Err(e) = self.keywords().save_sidecar(&path, seq)
+        {
+            tracing::warn!(error = %e, path = %path.display(), "failed to write BM25 sidecar");
         }
     }
 }
@@ -157,17 +178,25 @@ impl Database {
         let engine = Engine::Native(Box::new(NativeEngine::open(path)?));
         #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
         let engine = Engine::Redb(RedbEngine::open(path)?);
-        let db = Self::init(engine, Some(sidecar_path(path)))?;
+        let db = Self::init(
+            engine,
+            Some(sidecar_path(path)),
+            Some(keyword_sidecar_path(path)),
+        )?;
         tracing::info!(path = %path.display(), "opened database");
         Ok(db)
     }
 
     /// A fresh, empty in-memory database (tests, scratch work).
     pub fn in_memory() -> Result<Self> {
-        Self::init(Engine::Memory(Box::default()), None)
+        Self::init(Engine::Memory(Box::default()), None, None)
     }
 
-    fn init(engine: Engine, sidecar: Option<PathBuf>) -> Result<Self> {
+    fn init(
+        engine: Engine,
+        sidecar: Option<PathBuf>,
+        keyword_sidecar: Option<PathBuf>,
+    ) -> Result<Self> {
         // The commit sequence of the data as last persisted — read BEFORE
         // `graph::init`, since that runs a write transaction and every write
         // bumps the sequence (arch/02 §3). This is the value the sidecar was
@@ -193,11 +222,28 @@ impl Database {
                 reg
             }
         };
+        // Keyword indexes (ROADMAP §2): same fresh-sidecar-else-rebuild dance.
+        let keywords = match keyword_sidecar.as_deref().zip(prior_seq).and_then(|(p, seq)| {
+            let reg = KeywordRegistry::load_sidecar(p, seq);
+            if reg.is_some() {
+                tracing::info!(path = %p.display(), "loaded BM25 sidecar");
+            }
+            reg
+        }) {
+            Some(reg) => reg,
+            None => {
+                let mut reg = KeywordRegistry::new();
+                engine.with_read(|txn| reg.rebuild_from(txn))?;
+                reg
+            }
+        };
         Ok(Self {
             engine,
             indexes: RwLock::new(registry),
+            keywords: RwLock::new(keywords),
             cache: GraphCache::new(CACHE_BYTES),
             sidecar,
+            keyword_sidecar,
         })
     }
 
@@ -215,6 +261,18 @@ impl Database {
 
     fn indexes_mut(&self) -> std::sync::RwLockWriteGuard<'_, VectorRegistry> {
         self.indexes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn keywords(&self) -> std::sync::RwLockReadGuard<'_, KeywordRegistry> {
+        self.keywords
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn keywords_mut(&self) -> std::sync::RwLockWriteGuard<'_, KeywordRegistry> {
+        self.keywords
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -416,6 +474,42 @@ impl<'db> PlaneHandle<'db> {
         })
     }
 
+    /// Declares (and builds) a BM25 keyword index on `(label, property)` with
+    /// `language` (ROADMAP §2). Idempotent; errors if one already exists on the
+    /// same pair with a different language. Existing string values are indexed
+    /// immediately, and later writes keep it coherent.
+    pub fn ensure_keyword_index(
+        &self,
+        label: &str,
+        property: &str,
+        language: Language,
+    ) -> Result<()> {
+        let plane = self.id;
+        self.db.engine.with_write(|txn| {
+            graph::declare_keyword_index(txn, plane, label, property, language).map(|_| ())
+        })?;
+        self.db.engine.with_read(|txn| {
+            self.db
+                .keywords_mut()
+                .build_entry(txn, plane, label, property, language)
+        })
+    }
+
+    /// BM25 keyword search over a declared index (ROADMAP §2), most-relevant
+    /// first. Empty if no keyword index is declared on `(label, property)`.
+    pub fn keyword_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Vec<(NodeId, f32)> {
+        self.db
+            .keywords()
+            .search(self.id, label, property, query, k)
+            .unwrap_or_default()
+    }
+
     /// Starts a write transaction scoped to this plane. Blocks while another
     /// write transaction is open (single writer, arch/01 §6).
     pub fn write(&self) -> Result<WriteTxn<'db>> {
@@ -429,6 +523,7 @@ impl<'db> PlaneHandle<'db> {
         // Snapshot this plane's declared indexes so mutations can mirror into
         // them at commit without re-locking per operation.
         let decls = self.db.indexes().declared(self.id);
+        let kw_decls = self.db.keywords().declared(self.id);
         Ok(WriteTxn {
             db: self.db,
             plane: self.id,
@@ -436,6 +531,8 @@ impl<'db> PlaneHandle<'db> {
             ids: IdAllocator::new(),
             decls,
             events: Vec::new(),
+            kw_decls,
+            kw_events: Vec::new(),
         })
     }
 }
@@ -467,6 +564,23 @@ enum IndexEvent {
     RemoveNode(NodeId),
 }
 
+/// A keyword-index coherence event (ROADMAP §2) — the BM25 counterpart to
+/// [`IndexEvent`], carrying the property *text* instead of a vector.
+enum KwEvent {
+    Upsert {
+        label: String,
+        property: String,
+        node: NodeId,
+        text: String,
+    },
+    Remove {
+        label: String,
+        property: String,
+        node: NodeId,
+    },
+    RemoveNode(NodeId),
+}
+
 /// A plane-scoped write transaction. Dropped without [`commit`](Self::commit)
 /// ⇒ all changes discarded.
 pub struct WriteTxn<'db> {
@@ -476,11 +590,15 @@ pub struct WriteTxn<'db> {
     /// Batched node/edge id allocator (arch/01 §2 TODO) — see
     /// `graph::IdAllocator` for the abort/commit-safety argument.
     ids: IdAllocator,
-    /// This plane's declared indexes, snapshotted at `write()` (see
+    /// This plane's declared vector indexes, snapshotted at `write()` (see
     /// `record_node_events`).
     decls: Vec<(String, String, Metric)>,
-    /// Buffered coherence events, applied to the registry at commit.
+    /// Buffered vector-index coherence events, applied at commit.
     events: Vec<IndexEvent>,
+    /// This plane's declared keyword indexes, snapshotted at `write()`.
+    kw_decls: Vec<(String, String, Language)>,
+    /// Buffered keyword-index coherence events, applied at commit.
+    kw_events: Vec<KwEvent>,
 }
 
 impl WriteTxn<'_> {
@@ -543,6 +661,7 @@ impl WriteTxn<'_> {
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, None, labels, &props)?;
         self.record_node_events(id, labels, &props);
+        self.record_kw_node_events(id, labels, &props);
         Ok(id)
     }
 
@@ -560,6 +679,7 @@ impl WriteTxn<'_> {
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
         self.record_node_events(id, labels, &props);
+        self.record_kw_node_events(id, labels, &props);
         Ok(id)
     }
 
@@ -620,6 +740,26 @@ impl WriteTxn<'_> {
             }
             self.events.extend(new_events);
         }
+        // Same for bulk-loaded text into any declared keyword index.
+        if !self.kw_decls.is_empty() {
+            let mut new_events = Vec::new();
+            for (i, node) in nodes.iter().enumerate() {
+                let node_id = NodeId(stats.node_start + i as u64);
+                for (label, property, _lang) in &self.kw_decls {
+                    if node.labels.contains(&label.as_str())
+                        && let Some(PropValue::Str(s)) = node.props.get(property).map(|p| &p.value)
+                    {
+                        new_events.push(KwEvent::Upsert {
+                            label: label.clone(),
+                            property: property.clone(),
+                            node: node_id,
+                            text: s.clone(),
+                        });
+                    }
+                }
+            }
+            self.kw_events.extend(new_events);
+        }
         Ok(stats)
     }
 
@@ -639,6 +779,7 @@ impl WriteTxn<'_> {
         let plane = self.plane;
         graph::delete_node(self.txn(), plane, id)?;
         self.events.push(IndexEvent::RemoveNode(id));
+        self.kw_events.push(KwEvent::RemoveNode(id));
         Ok(())
     }
 
@@ -654,7 +795,8 @@ impl WriteTxn<'_> {
         let plane = self.plane;
         let value = prop.value.clone();
         graph::set_node_prop(self.txn(), plane, id, key, prop)?;
-        self.record_prop_event(id, key, Some(value))
+        self.record_prop_event(id, key, Some(value.clone()))?;
+        self.record_kw_prop_event(id, key, Some(value))
     }
 
     /// Removes one property from an existing node; removing an absent key
@@ -662,7 +804,8 @@ impl WriteTxn<'_> {
     pub fn remove_prop(&mut self, id: NodeId, key: &str) -> Result<()> {
         let plane = self.plane;
         graph::remove_node_prop(self.txn(), plane, id, key)?;
-        self.record_prop_event(id, key, None)
+        self.record_prop_event(id, key, None)?;
+        self.record_kw_prop_event(id, key, None)
     }
 
     /// Replaces a node's entire label set. Errors `NotFound` if the node is
@@ -678,6 +821,9 @@ impl WriteTxn<'_> {
         graph::set_node_labels(self.txn(), plane, id, labels)?;
         if !self.decls.is_empty() {
             self.record_labels_event(id, &node.labels, labels, &node.properties);
+        }
+        if !self.kw_decls.is_empty() {
+            self.record_kw_labels_event(id, &node.labels, labels, &node.properties);
         }
         Ok(())
     }
@@ -756,6 +902,104 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    // ---- keyword-index mirrors (ROADMAP §2) ---------------------------------
+    // The BM25 counterparts to the vector `record_*` helpers above: same
+    // matching logic, but keyed off `kw_decls` and testing for a string value.
+
+    /// Buffer keyword events for a new/replaced node: `Upsert` where a declared
+    /// keyword index's property is present as a string, `Remove` otherwise.
+    fn record_kw_node_events(&mut self, node: NodeId, labels: &[&str], props: &Properties) {
+        for (label, property, _lang) in &self.kw_decls {
+            if !labels.iter().any(|l| l == label) {
+                continue;
+            }
+            match props.get(property).map(|p| &p.value) {
+                Some(PropValue::Str(s)) => self.kw_events.push(KwEvent::Upsert {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                    text: s.clone(),
+                }),
+                _ => self.kw_events.push(KwEvent::Remove {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                }),
+            }
+        }
+    }
+
+    /// Buffer keyword events for a label-set change (gained/lost a declared
+    /// index's label).
+    fn record_kw_labels_event(
+        &mut self,
+        node: NodeId,
+        old: &[String],
+        new: &[&str],
+        props: &Properties,
+    ) {
+        let mut events = Vec::new();
+        for (label, property, _lang) in &self.kw_decls {
+            let had = old.iter().any(|l| l == label);
+            let has = new.iter().any(|l| l == label);
+            if had == has {
+                continue;
+            }
+            match props.get(property).map(|p| &p.value) {
+                Some(PropValue::Str(s)) if has => events.push(KwEvent::Upsert {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                    text: s.clone(),
+                }),
+                Some(PropValue::Str(_)) => events.push(KwEvent::Remove {
+                    label: label.clone(),
+                    property: property.clone(),
+                    node,
+                }),
+                _ => {}
+            }
+        }
+        self.kw_events.extend(events);
+    }
+
+    /// Buffer keyword events for a single-property change on `node`.
+    fn record_kw_prop_event(
+        &mut self,
+        node: NodeId,
+        key: &str,
+        new_value: Option<PropValue>,
+    ) -> Result<()> {
+        if !self.kw_decls.iter().any(|(_, prop, _)| prop == key) {
+            return Ok(());
+        }
+        let plane = self.plane;
+        let labels = match graph::get_node(self.txn(), plane, node)? {
+            Some(n) => n.labels,
+            None => return Ok(()),
+        };
+        let mut new_events = Vec::new();
+        for (label, property, _lang) in &self.kw_decls {
+            if property == key && labels.iter().any(|l| l == label) {
+                new_events.push(match &new_value {
+                    Some(PropValue::Str(s)) => KwEvent::Upsert {
+                        label: label.clone(),
+                        property: property.clone(),
+                        node,
+                        text: s.clone(),
+                    },
+                    _ => KwEvent::Remove {
+                        label: label.clone(),
+                        property: property.clone(),
+                        node,
+                    },
+                });
+            }
+        }
+        self.kw_events.extend(new_events);
+        Ok(())
+    }
+
     /// Sets (inserts or overwrites) one property on an existing edge.
     /// Errors with `NotFound` if the edge does not exist.
     pub fn set_edge_prop(&mut self, id: EdgeId, key: &str, prop: PropDesc) -> Result<()> {
@@ -787,6 +1031,7 @@ impl WriteTxn<'_> {
             plane,
             inner,
             events,
+            kw_events,
             ..
         } = self;
         let index_events = events.len();
@@ -806,8 +1051,31 @@ impl WriteTxn<'_> {
                 apply_index_event(&mut registry, plane, event)?;
             }
         }
+        if !kw_events.is_empty() {
+            let mut registry = db.keywords_mut();
+            for event in kw_events {
+                apply_kw_event(&mut registry, plane, event);
+            }
+        }
         tracing::debug!(plane = plane.0, index_events, "write txn committed");
         Ok(())
+    }
+}
+
+fn apply_kw_event(registry: &mut KeywordRegistry, plane: PlaneId, event: KwEvent) {
+    match event {
+        KwEvent::Upsert {
+            label,
+            property,
+            node,
+            text,
+        } => registry.upsert(plane, &label, &property, node, &text),
+        KwEvent::Remove {
+            label,
+            property,
+            node,
+        } => registry.remove_one(plane, &label, &property, node),
+        KwEvent::RemoveNode(node) => registry.remove_node(node),
     }
 }
 
