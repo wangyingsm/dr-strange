@@ -38,7 +38,7 @@ check-drift: drsg-codegen
 		|| { echo "drift check: STALE — run 'make generate'"; exit 1; }
 
 test/e2e: test/e2e.c libdrsg.a
-	$(CC) $(ALL_CFLAGS) $< -o $@ libdrsg.a $(ALL_LIBS)
+	$(CC) $(ALL_CFLAGS) -pthread $< -o $@ libdrsg.a $(ALL_LIBS)
 
 # Build the quickstart example (run against a drsg serve on :7700).
 example: examples/quickstart.c libdrsg.a

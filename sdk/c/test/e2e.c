@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 static int failures = 0;
 
@@ -28,6 +30,57 @@ static long int_field(struct json_object *obj, const char *key) {
 static const char *str_field(struct json_object *obj, const char *key) {
     struct json_object *v = NULL;
     return json_object_object_get_ex(obj, key, &v) ? json_object_get_string(v) : NULL;
+}
+
+/* ---- change-feed (drsg_watch) test scaffolding --------------------------- */
+
+struct watch_capture {
+    volatile int got;
+    char kind[16];
+    char op[16];
+};
+
+/* Called for each change event; captures the ws-widget create and stops. */
+static int on_change(struct json_object *event, void *userdata) {
+    struct watch_capture *cap = userdata;
+    struct json_object *changes = NULL;
+    if (!json_object_object_get_ex(event, "changes", &changes)) {
+        return 0;
+    }
+    size_t n = json_object_array_length(changes);
+    for (size_t i = 0; i < n; i++) {
+        struct json_object *ch = json_object_array_get_idx(changes, i);
+        struct json_object *rec = NULL;
+        if (json_object_object_get_ex(ch, "record", &rec)) {
+            const char *key = str_field(rec, "external_key");
+            if (key && strcmp(key, "ws-widget") == 0) {
+                const char *kind = str_field(ch, "kind");
+                const char *op = str_field(ch, "op");
+                snprintf(cap->kind, sizeof cap->kind, "%s", kind ? kind : "");
+                snprintf(cap->op, sizeof cap->op, "%s", op ? op : "");
+                cap->got = 1;
+                return 1; /* stop watching */
+            }
+        }
+    }
+    return 0;
+}
+
+struct watch_args {
+    const char *base;
+    const char *token;
+    struct watch_capture *cap;
+};
+
+static void *watch_thread(void *arg) {
+    struct watch_args *wa = arg;
+    drsg_client *wc = drsg_client_new(wa->base, wa->token);
+    if (wc) {
+        drsg_error e;
+        drsg_watch(wc, "startup", "Widget", on_change, wa->cap, &e);
+        drsg_client_free(wc);
+    }
+    return NULL;
 }
 
 int main(void) {
@@ -139,6 +192,38 @@ int main(void) {
     CHECK(doc && str_field(doc, "openrpc") && strcmp(str_field(doc, "openrpc"), "1.2.6") == 0,
             "rpc.discover openrpc 1.2.6");
     json_object_put(doc);
+
+    /* Change feed over WebSocket: watch, commit, receive. Runs the blocking
+     * drsg_watch on a thread; the main thread commits a node and polls for the
+     * captured event (not joining, so a broken feed can't hang the test). */
+    struct watch_capture cap = {0};
+    struct watch_args wa = {getenv("DRSG_BASE_URL"), getenv("DRSG_TOKEN"), &cap};
+    pthread_t th;
+    if (pthread_create(&th, NULL, watch_thread, &wa) == 0) {
+        pthread_detach(th);
+        usleep(400000); /* 400ms: let the socket connect + subscription register */
+
+        struct json_object *wlabels = json_object_new_array();
+        json_object_array_add(wlabels, json_object_new_string("Widget"));
+        drsg_node_create_opts wno = {.key = "ws-widget", .labels = wlabels};
+        struct json_object *wnode = drsg_node_create(c, "startup", &wno, &err);
+        json_object_put(wnode);
+        json_object_put(wlabels);
+
+        for (int i = 0; i < 150 && !cap.got; i++) {
+            usleep(20000); /* up to ~3s */
+        }
+        CHECK(cap.got, "change feed: received ws-widget event");
+        CHECK(cap.got && strcmp(cap.kind, "node") == 0, "change kind == node");
+        CHECK(cap.got && strcmp(cap.op, "created") == 0, "change op == created");
+
+        /* Restore the graph (a later run's fresh db is independent, but tidy). */
+        drsg_node_delete_opts wdel = {.key = "ws-widget"};
+        struct json_object *wd = drsg_node_delete(c, "startup", &wdel, &err);
+        json_object_put(wd);
+    } else {
+        CHECK(0, "pthread_create for watch");
+    }
 
     /* Bad token -> auth error (-32001). */
     drsg_client *bad = drsg_client_new(getenv("DRSG_BASE_URL"), "wrong");
