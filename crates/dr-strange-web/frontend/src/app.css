@@ -799,6 +799,121 @@ nav button.active {
   background: var(--border);
 }
 
+/* ---- hybrid retrieval bar + results (ROADMAP §2) ---- */
+.hybrid-bar .hy-q {
+  flex: 1;
+  min-width: 10rem;
+  font: 13px ui-monospace, monospace;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.5rem;
+}
+.hybrid-bar .hy-q:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.hybrid-bar .hy-graph {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.hy-results {
+  position: absolute;
+  top: 3.1rem;
+  left: 0.75rem;
+  width: 20rem;
+  max-height: 62%;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+.hy-results header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.hy-results header .close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+}
+.hy-results ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+}
+.hy-results li {
+  border-bottom: 1px solid var(--border);
+}
+.hy-results li:last-child {
+  border-bottom: none;
+}
+.hy-results li button {
+  display: grid;
+  grid-template-columns: 1.4rem 1fr auto;
+  grid-template-areas: 'rank key sc' 'rank ch ch';
+  gap: 0.05rem 0.4rem;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.4rem 0.6rem;
+  color: var(--fg);
+}
+.hy-results li button:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.hy-results .rank {
+  grid-area: rank;
+  align-self: center;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.hy-results .k {
+  grid-area: key;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hy-results .sc {
+  grid-area: sc;
+  color: var(--accent);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.hy-results .ch {
+  grid-area: ch;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- plot canvas ---- */
 .canvas-wrap {
   position: relative;

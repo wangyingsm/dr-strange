@@ -39,6 +39,15 @@
   let spTo = $state('') // shortest-path target
   let spDir = $state('out') // out | in | both
 
+  // Hybrid retrieval (ROADMAP §2): fuse vector + keyword + graph-proximity.
+  let hyQuery = $state('') // the query text
+  let hyLabel = $state('') // label scope (required for the keyword channel)
+  let hyVector = $state('embedding') // embedding property for the vector channel ('' = off)
+  let hyKeyword = $state('') // string property for the BM25 channel ('' = off)
+  let hyGraph = $state(false) // add the 1-hop graph-proximity channel
+  let hyProvider = $state('openai') // embedding provider for the vector channel
+  let hyResults = $state(null) // [{ id, external_key, labels, score, channels }] | null
+
   // Inspector mutation state (mutation UI): edit properties + delete.
   let editing = $state(false)
   let draft = $state([]) // editable [{ key, value }] rows of scalar props
@@ -270,9 +279,58 @@
   function resetAlgo() {
     plot.resetStyle()
     algoLegend = []
+    hyResults = null
     legend = plot.legendEntries()
     status = 'view reset'
   }
+
+  // ---- hybrid retrieval (ROADMAP §2) --------------------------------------
+
+  async function runHybrid() {
+    if (!hyQuery.trim()) return
+    algoBusy = true
+    error = null
+    try {
+      const params = { plane, q: hyQuery.trim(), k: 25 }
+      if (hyLabel.trim()) params.label = hyLabel.trim()
+      if (hyVector.trim()) {
+        params.vector_prop = hyVector.trim()
+        params.provider = hyProvider
+      }
+      if (hyKeyword.trim()) params.keyword_prop = hyKeyword.trim()
+      if (hyGraph) params.graph_hops = 1
+      const res = await rpc('plane.hybrid', params)
+      hyResults = res.results
+      await plotHybrid(res.results)
+      const top = res.results[0]
+      status = res.count
+        ? `hybrid: ${res.count} results · top ${top.external_key ?? '#' + top.id}`
+        : 'hybrid: no results'
+    } catch (e) {
+      error = e.message
+    } finally {
+      algoBusy = false
+    }
+  }
+
+  // Plot the ranked result set: the hit nodes, the edges induced among them
+  // (for context), sized by fused score so relevance reads at a glance.
+  async function plotHybrid(results) {
+    plot.clear()
+    plot.addSubgraph({ nodes: results, edges: [] })
+    const inSet = new Set(results.map((r) => String(r.id)))
+    for (const r of results) {
+      const sg = await rpc('graph.expand', { plane, id: r.id, direction: 'both' })
+      const edges = sg.edges.filter((e) => inSet.has(String(e.src)) && inSet.has(String(e.dst)))
+      if (edges.length) plot.addSubgraph({ nodes: [], edges })
+    }
+    plot.overlayScores(new Map(results.map((r) => [String(r.id), r.score])))
+    algoLegend = []
+    legend = plot.legendEntries()
+  }
+
+  // Format a channel's raw contribution for the results list (— when absent).
+  const fmtCh = (v) => (v == null ? '—' : v.toFixed(2))
 
   // ---- inspector mutations ------------------------------------------------
 
@@ -636,6 +694,28 @@
   <button class="ghost" onclick={resetAlgo} disabled={algoBusy} title="Restore normal colours and sizes">Reset</button>
 </div>
 
+<div class="algo-bar hybrid-bar">
+  <span class="group-title">Hybrid</span>
+  <input
+    class="hy-q"
+    placeholder="query text…"
+    bind:value={hyQuery}
+    onkeydown={(e) => e.key === 'Enter' && runHybrid()}
+  />
+  <input class="sp" placeholder="label" bind:value={hyLabel} title="Label scope (required for the keyword channel)" />
+  <input class="sp" placeholder="vector prop" bind:value={hyVector} title="Embedding property for the vector channel (blank = off)" />
+  <input class="sp" placeholder="keyword prop" bind:value={hyKeyword} title="String property for the BM25 keyword channel (blank = off)" />
+  <label class="hy-graph" title="Add a 1-hop graph-proximity channel">
+    <input type="checkbox" bind:checked={hyGraph} /> graph
+  </label>
+  {#if hyVector.trim()}
+    <select bind:value={hyProvider} title="Embedding provider for the vector channel">
+      {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+    </select>
+  {/if}
+  <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
+</div>
+
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if creating === 'node'}
@@ -684,6 +764,29 @@
 
   {#if status}
     <div class="plot-status">{status}</div>
+  {/if}
+
+  {#if hyResults}
+    <div class="hy-results">
+      <header>
+        <span>Hybrid · {hyResults.length}</span>
+        <button class="close" onclick={() => (hyResults = null)} aria-label="Close">×</button>
+      </header>
+      <ol>
+        {#each hyResults as r, i (r.id)}
+          <li>
+            <button onclick={() => focusNode(r.id)} title="Focus this node">
+              <span class="rank">{i + 1}</span>
+              <span class="k">{r.external_key ?? `#${r.id}`}</span>
+              <span class="sc">{r.score.toFixed(3)}</span>
+              <span class="ch" title="vector / keyword / graph contributions">
+                v {fmtCh(r.channels?.vector)} · k {fmtCh(r.channels?.keyword)} · g {fmtCh(r.channels?.graph)}
+              </span>
+            </button>
+          </li>
+        {/each}
+      </ol>
+    </div>
   {/if}
 
   {#if algoLegend.length || legend.length}
