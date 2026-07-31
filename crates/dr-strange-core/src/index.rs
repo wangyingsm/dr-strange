@@ -101,6 +101,19 @@ impl VectorRegistry {
     /// sequence the indexes are coherent with). Best-effort caller: a failure
     /// only costs a rebuild-from-KV on the next open.
     pub fn save_sidecar(&self, path: &Path, seq: u64) -> Result<()> {
+        let bytes = self.to_bytes(seq)?;
+        // Write to a temp path then rename, so a crash mid-write can't leave a
+        // torn sidecar that decodes to garbage (rename is atomic on the same fs).
+        let tmp = path.with_extension("hnsw.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// The registry serialized to the sidecar byte form (magic + postcard),
+    /// stamped with `seq`. The in-memory equivalent of [`save_sidecar`] — used
+    /// to embed the built index in a database snapshot (ROADMAP §6).
+    pub fn to_bytes(&self, seq: u64) -> Result<Vec<u8>> {
         // Borrowing view — serialize the live indexes in place, no clone of the
         // (potentially large) graphs.
         let entries: Vec<SidecarEntryRef<'_>> = self
@@ -121,12 +134,7 @@ impl VectorRegistry {
         };
         let mut bytes = Vec::from(*SIDECAR_MAGIC);
         bytes.extend_from_slice(&postcard::to_stdvec(&sidecar).map_err(backend)?);
-        // Write to a temp path then rename, so a crash mid-write can't leave a
-        // torn sidecar that decodes to garbage (rename is atomic on the same fs).
-        let tmp = path.with_extension("hnsw.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        Ok(bytes)
     }
 
     /// Load a registry from `path`, but only if it is fresh: its stamped
@@ -135,7 +143,13 @@ impl VectorRegistry {
     /// mismatch, or any decode error — never an `Err`, since a bad sidecar is
     /// always recoverable by rebuilding.
     pub fn load_sidecar(path: &Path, expected_seq: u64) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
+        Self::from_bytes(&std::fs::read(path).ok()?, expected_seq)
+    }
+
+    /// Parse a registry from the sidecar byte form (the in-memory counterpart of
+    /// [`load_sidecar`]), only if fresh: version + `seq` must match. `None` on
+    /// any mismatch/decode error — the caller rebuilds from KV.
+    pub fn from_bytes(bytes: &[u8], expected_seq: u64) -> Option<Self> {
         let payload = bytes.strip_prefix(SIDECAR_MAGIC)?;
         let sidecar: SidecarOwned = postcard::from_bytes(payload).ok()?;
         if sidecar.version != SIDECAR_VERSION || sidecar.seq != expected_seq {

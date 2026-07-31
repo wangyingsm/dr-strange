@@ -105,6 +105,36 @@ pub fn bump_commit_seq(txn: &mut dyn WriteTransaction) -> Result<u64> {
     Ok(next)
 }
 
+/// The five id-allocation counters (next node/edge/plane/label/edge-type id),
+/// captured for a snapshot manifest and restored id-faithfully (ROADMAP §6).
+pub fn read_id_counters(txn: &dyn ReadTransaction) -> Result<[u64; 5]> {
+    let one = |k: &[u8]| -> Result<u64> { Ok(get_u64(txn, k)?.unwrap_or(1)) };
+    Ok([
+        one(keys::META_NEXT_NODE_ID)?,
+        one(keys::META_NEXT_EDGE_ID)?,
+        one(keys::META_NEXT_PLANE_ID)?,
+        one(keys::META_NEXT_LABEL_ID)?,
+        one(keys::META_NEXT_EDGE_TYPE_ID)?,
+    ])
+}
+
+/// Restore the id counters + commit sequence from a snapshot manifest, so a
+/// restored database allocates fresh ids past everything it just loaded and
+/// carries the source's commit sequence (ROADMAP §6).
+pub fn set_id_counters(txn: &mut dyn WriteTransaction, counters: [u64; 5]) -> Result<()> {
+    put_u64(txn, keys::META_NEXT_NODE_ID, counters[0])?;
+    put_u64(txn, keys::META_NEXT_EDGE_ID, counters[1])?;
+    put_u64(txn, keys::META_NEXT_PLANE_ID, counters[2])?;
+    put_u64(txn, keys::META_NEXT_LABEL_ID, counters[3])?;
+    put_u64(txn, keys::META_NEXT_EDGE_TYPE_ID, counters[4])
+}
+
+/// Set the commit sequence outright (a snapshot restore, ROADMAP §6), rather
+/// than bumping it — so the restored database resumes at the source's sequence.
+pub fn set_commit_seq(txn: &mut dyn WriteTransaction, seq: u64) -> Result<()> {
+    put_u64(txn, keys::META_COMMIT_SEQ, seq)
+}
+
 /// Wall-clock time (unix-epoch millis) of the latest commit visible at `txn`'s
 /// snapshot — the time index for time-addressed time-travel (ROADMAP §4).
 /// Absent (a pre-time-index database, or before the first stamped commit) ⇒
@@ -273,7 +303,11 @@ pub fn resolve_label(txn: &dyn ReadTransaction, id: u32) -> Result<String> {
 
 // ---- planes ---------------------------------------------------------------
 
-fn write_plane(
+/// Write a plane record at an explicit id — the id-faithful primitive a
+/// snapshot restore (ROADMAP §6) uses to rebuild planes with their original ids
+/// (so the vector/keyword sidecars, keyed by plane id, stay valid). Normal
+/// creation goes through [`create_plane`], which allocates the id.
+pub(crate) fn write_plane(
     txn: &mut dyn WriteTransaction,
     id: PlaneId,
     name: &str,

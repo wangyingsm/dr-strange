@@ -26,7 +26,7 @@ pub mod types;
 pub use api::AsOf;
 pub use api::{
     AlgoBuilder, Change, ChangeKind, ChangeOp, ChangeSet, Database, HybridBuilder, PlaneHandle,
-    QueryBuilder, WriteTxn,
+    QueryBuilder, SnapshotStats, WriteTxn,
 };
 pub use compute::{
     CatalogSnapshot, Connection, EdgeTypeStats, Expr, HybridHit, HybridWeights, LabelStats,

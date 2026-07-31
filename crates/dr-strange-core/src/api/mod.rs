@@ -40,6 +40,9 @@ use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };
 
+mod snapshot;
+pub use snapshot::SnapshotStats;
+
 enum Engine {
     // Boxed: the memory engine embeds its tables inline and dwarfs the redb
     // handle (clippy::large_enum_variant).
@@ -74,6 +77,31 @@ impl Engine {
                 let out = f(&mut txn)?;
                 graph::bump_commit_seq(&mut txn)?;
                 graph::write_commit_time(&mut txn, now_millis())?;
+                txn.commit()?;
+                Ok(out)
+            }};
+        }
+        match self {
+            Engine::Memory(e) => run!(e),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => run!(e),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => run!(e),
+        }
+    }
+
+    /// Like [`with_write`](Self::with_write) but WITHOUT bumping the commit
+    /// sequence — the caller sets it explicitly. Used only by snapshot restore
+    /// (ROADMAP §6), which must land the source's exact commit sequence so the
+    /// restored sidecars (stamped with it) stay valid.
+    fn with_write_raw<T>(
+        &self,
+        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        macro_rules! run {
+            ($e:expr) => {{
+                let mut txn = $e.begin_write()?;
+                let out = f(&mut txn)?;
                 txn.commit()?;
                 Ok(out)
             }};

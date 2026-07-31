@@ -259,6 +259,17 @@ impl KeywordRegistry {
     /// Serialize the whole registry to `path`, stamped with `seq`. Best-effort:
     /// a failure only costs a rebuild-from-KV on the next open.
     pub fn save_sidecar(&self, path: &Path, seq: u64) -> Result<()> {
+        let bytes = self.to_bytes(seq)?;
+        let tmp = path.with_extension("bm25.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// The registry serialized to the sidecar byte form (magic + postcard),
+    /// stamped with `seq` — the in-memory counterpart of [`save_sidecar`], used
+    /// to embed the built index in a database snapshot (ROADMAP §6).
+    pub fn to_bytes(&self, seq: u64) -> Result<Vec<u8>> {
         let sidecar = Sidecar {
             version: SIDECAR_VERSION,
             seq,
@@ -270,17 +281,19 @@ impl KeywordRegistry {
         };
         let mut bytes = Vec::from(*SIDECAR_MAGIC);
         bytes.extend_from_slice(&postcard::to_stdvec(&sidecar).map_err(backend)?);
-        let tmp = path.with_extension("bm25.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        Ok(bytes)
     }
 
     /// Load a registry from `path`, but only if fresh: its stamped sequence must
     /// equal `expected_seq` and its version must match. Returns `None` (→ caller
     /// rebuilds from KV) on absence, staleness, or any decode error.
     pub fn load_sidecar(path: &Path, expected_seq: u64) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
+        Self::from_bytes(&std::fs::read(path).ok()?, expected_seq)
+    }
+
+    /// Parse a registry from the sidecar byte form (the in-memory counterpart of
+    /// [`load_sidecar`]); `None` on version/`seq` mismatch or decode error.
+    pub fn from_bytes(bytes: &[u8], expected_seq: u64) -> Option<Self> {
         let payload = bytes.strip_prefix(SIDECAR_MAGIC)?;
         let sidecar: SidecarOwned = postcard::from_bytes(payload).ok()?;
         if sidecar.version != SIDECAR_VERSION || sidecar.seq != expected_seq {
@@ -321,9 +334,12 @@ mod tests {
     use crate::types::{PropDesc, PropValue, Properties};
 
     fn text_props(body: &str) -> Properties {
-        [("body".to_string(), PropDesc::new(PropValue::Str(body.into())))]
-            .into_iter()
-            .collect()
+        [(
+            "body".to_string(),
+            PropDesc::new(PropValue::Str(body.into())),
+        )]
+        .into_iter()
+        .collect()
     }
 
     /// A startup plane with three "Doc" nodes carrying `body` text, and a
@@ -392,8 +408,14 @@ mod tests {
     #[test]
     fn missing_index_is_none() {
         let (_eng, reg, _) = setup();
-        assert!(reg.search(PlaneId::STARTUP, "Ghost", "body", "x", 1).is_none());
-        assert!(reg.search(PlaneId::STARTUP, "Doc", "missing", "x", 1).is_none());
+        assert!(
+            reg.search(PlaneId::STARTUP, "Ghost", "body", "x", 1)
+                .is_none()
+        );
+        assert!(
+            reg.search(PlaneId::STARTUP, "Doc", "missing", "x", 1)
+                .is_none()
+        );
     }
 
     #[test]
@@ -404,7 +426,10 @@ mod tests {
         let hits = reg
             .search(PlaneId::STARTUP, "Doc", "body", "graph", 3)
             .unwrap();
-        assert_eq!(hits[0].0, b, "re-indexed b is now the strongest graph match");
+        assert_eq!(
+            hits[0].0, b,
+            "re-indexed b is now the strongest graph match"
+        );
 
         // Remove a: it drops out of results entirely.
         reg.remove_node(a);
