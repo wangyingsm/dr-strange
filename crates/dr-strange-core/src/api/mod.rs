@@ -9,7 +9,12 @@
 //! one place that knows concrete engine types) and owns transaction and
 //! reader lifecycles.
 
-use std::path::{Path, PathBuf};
+// `Path` is only referenced by the backend-gated `open`; `PathBuf` is used
+// unconditionally (sidecar fields), so import them separately to avoid an
+// unused-import warning in a no-backend build (e.g. dr-strange-llm's).
+#[cfg(any(feature = "redb-backend", feature = "native-backend"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};

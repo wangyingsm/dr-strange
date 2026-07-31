@@ -8,14 +8,15 @@
 //! provider abstraction ([`Chat`] + [`Embedder`]) with a plain-HTTP
 //! OpenAI-compatible implementation and a deterministic mock for tests.
 //!
-//! Still TODO (arch/07 §1, v1.5): entity-resolution proposals; NL → plan
-//! translation.
+//! Still TODO (arch/07 §1, v1.5): entity-resolution proposals.
 
+mod ask;
 mod digest;
 mod openai;
 mod preset;
 mod provider;
 
+pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
     CandidateSource, DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult,
     ExistingEntity, PlaneCandidates, digest,
