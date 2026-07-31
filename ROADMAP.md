@@ -56,8 +56,11 @@ via weighted, min-max-normalized score fusion, each hit reporting its
 per-channel breakdown. Surfaced on RPC `plane.hybrid`, CLI `drsg hybrid` +
 `drsg index keyword`, MCP `hybrid`, and the web dashboard (a "Hybrid" bar in the
 Explore view that ranks the plane, plots hits sized by fused score, and lists
-them with per-channel breakdown). (Follow-ups: RRF as an alternative fusion;
-index declaration on RPC/MCP — a gap shared with the vector index.)
+them with per-channel breakdown; and index declaration is now self-service —
+`plane.indexes` lists what's declared and `index.ensure` declares from the UI,
+so the Hybrid bar only offers real channels and can create missing ones).
+(Follow-ups: RRF as an alternative fusion; `index.ensure` on MCP too — a gap
+shared with the vector index.)
 
 **Goal.** True hybrid retrieval that combines **vector** + **keyword/full-text**
 + **graph proximity** into one ranked result, via a fusion operator
