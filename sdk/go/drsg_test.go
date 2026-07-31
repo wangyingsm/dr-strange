@@ -208,3 +208,42 @@ func TestBadTokenIsAuthError(t *testing.T) {
 		t.Fatalf("want *Error code %d, got %v", AuthErrorCode, err)
 	}
 }
+
+func TestWatchChangeFeed(t *testing.T) {
+	db := serve(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	events, err := db.Watch(ctx, "startup", WithLabel("Widget"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // let the server register the subscription
+
+	if _, err := db.NodeCreate(ctx, NodeCreateParams{
+		Plane: "startup", Key: ptr("ws-widget"), Labels: []string{"Widget"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-events:
+		if ev.Seq == 0 {
+			t.Fatalf("want a non-zero seq, got %d", ev.Seq)
+		}
+		var found *Change
+		for i := range ev.Changes {
+			if rec := ev.Changes[i].Record; rec != nil && rec["external_key"] == "ws-widget" {
+				found = &ev.Changes[i]
+			}
+		}
+		if found == nil {
+			t.Fatalf("change for ws-widget not in event: %+v", ev)
+		}
+		if found.Kind != "node" || found.Op != "created" {
+			t.Fatalf("kind=%q op=%q", found.Kind, found.Op)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no change event received over the websocket")
+	}
+}
