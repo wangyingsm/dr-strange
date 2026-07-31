@@ -145,23 +145,28 @@ default unbounded with an opt-in commit-count window bounding compaction GC.
 
 ---
 
-## 5. Change subscriptions / CDC  *(fifth — was #7)*
+## 5. Change subscriptions / CDC  *(shipped)*
 
-**Goal.** "Watch" a query, label, or plane and receive a stream of changes as
-they commit — reactive agents subscribing to graph mutations.
+**Status.** ✅ Shipped (2026-08-01). Commit-time change feed, end to end.
+`Database::on_change(observer)` fires a `ChangeSet { plane, seq, changes }`
+after every committed write; `WriteTxn` buffers `(kind, id, op)` per mutation
+(free unless an observer is registered), collapsed per entity at commit
+(create-then-delete cancels), capped, with each created/updated record read
+back at the committed snapshot. Payload is the full record with embeddings and
+`_`-prefixed internal props stripped; a delete carries id only (pair with
+`as_of(seq-1)`). Web: the observer feeds a broadcast channel; `/ws` gains
+`plane.watch { plane, label? }` / `plane.unwatch` per-connection subscriptions,
+delivering `plane.change` notifications. Dashboard: a "Live" Explore tab
+streams commits (colour-coded op badges, click-to-focus). SDKs: `watch()` over
+a long-lived WebSocket in TypeScript (native WS, auto-reconnect) and Python (a
+hand-rolled zero-dep RFC 6455 client, blocking generator). **Remaining:**
+WebSocket `watch` for the go/c/java SDKs (their generated surfaces are synced;
+the WS client is hand-written per language — Java has stdlib `java.net.http`,
+go/c need a small frame client).
 
-**Why AI-native.** Agents that react to the graph (trigger on new entities,
-maintain derived state) need push, not poll. The WebSocket already pushes
-stats; this generalizes it to change events.
-
-**Scope sketch.** A commit-time change feed (the write path already buffers
-coherence events + bumps the commit sequence) delivered over WS as a
-subscription; filter by plane / label / (later) a predicate. At-least-once with
-a resume-from-seq cursor.
-
-**Forks to settle.** Delivery semantics (best-effort vs durable log); filter
-granularity (plane/label now, predicate later); payload (full record vs id +
-change kind); backpressure / slow-consumer handling.
+**Forks settled.** Best-effort in-memory broadcast (not a durable log); filter
+plane + label now (predicate later); payload = full sanitized record inline;
+slow consumer drops overflow (broadcast capacity 1024), never stalls writers.
 
 ---
 
