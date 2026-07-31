@@ -22,6 +22,7 @@
   let appliedFocus = -1 // last focus nonce we centered (idempotent)
 
   let labels = $state([]) // catalog label names for the filter
+  let catLabels = $state({}) // full catalog: label -> { properties: { name -> { types } } }
   let labelFilter = $state('') // '' = all labels
   let cypher = $state('') // query-language text; '' = use the label seed
   let embedProvider = $state('openai') // provider for a text SEARCH … NEAR "…"
@@ -60,6 +61,21 @@
   // The indexed property for the selected label, per channel (null = no index).
   let vecProp = $derived(hyIndexes?.vector.find((x) => x.label === hyLabel)?.property ?? null)
   let kwProp = $derived(hyIndexes?.keyword.find((x) => x.label === hyLabel)?.property ?? null)
+
+  // "Declare an index" dialog (so the dashboard never sends you to the CLI).
+  let idxOpen = $state(false)
+  let idxKind = $state('keyword') // keyword | vector
+  let idxLabel = $state('')
+  let idxProperty = $state('')
+  let idxMetric = $state('cosine')
+  let idxError = $state(null)
+  // Candidate properties for the chosen label + kind: string props for keyword,
+  // vector props for semantic (from the catalog's observed types).
+  let idxProps = $derived.by(() => {
+    const props = catLabels?.[idxLabel]?.properties ?? {}
+    const want = idxKind === 'vector' ? 'Vector' : 'Str'
+    return Object.keys(props).filter((k) => props[k]?.types && want in props[k].types)
+  })
 
   // Inspector mutation state (mutation UI): edit properties + delete.
   let editing = $state(false)
@@ -122,8 +138,10 @@
     try {
       const cat = await rpc('plane.catalog', { plane })
       labels = Object.keys(cat.labels ?? {})
+      catLabels = cat.labels ?? {}
     } catch {
       labels = []
+      catLabels = {}
     }
   }
 
@@ -318,6 +336,35 @@
     useKeyword = kwProp != null
   }
 
+  function openIndexDialog() {
+    idxError = null
+    idxKind = 'keyword'
+    idxLabel = hyLabel || labels[0] || ''
+    idxProperty = ''
+    idxMetric = 'cosine'
+    idxOpen = true
+  }
+
+  async function declareIndex() {
+    idxError = null
+    if (!idxLabel || !idxProperty.trim()) {
+      idxError = 'pick a label and a property'
+      return
+    }
+    try {
+      const params = { plane, label: idxLabel, property: idxProperty.trim(), kind: idxKind }
+      if (idxKind === 'vector') params.metric = idxMetric
+      await rpc('index.ensure', params)
+      idxOpen = false
+      await loadIndexes() // the new index now appears; select its label
+      hyLabel = idxLabel
+      onHyLabel()
+      status = `${idxKind} index declared on ${idxLabel}.${idxProperty.trim()}`
+    } catch (e) {
+      idxError = e.message
+    }
+  }
+
   async function runHybrid() {
     if (!hyQuery.trim() || !hyLabel) return
     const wantVector = useVector && vecProp
@@ -503,6 +550,7 @@
     if (e.key !== 'Escape') return
     if (creating) resetCreate()
     else if (confirmingDelete) cancelDelete()
+    else if (idxOpen) idxOpen = false
   }
 
   async function createNode() {
@@ -772,12 +820,11 @@
       </select>
     {/if}
     <button onclick={runHybrid} disabled={algoBusy} title="Run hybrid retrieval and rank by fused score">Search</button>
+    <span class="algo-sep"></span>
+    <button class="ghost" onclick={openIndexDialog} title="Declare a new search index">＋ index</button>
   {:else}
-    <span class="hy-hint">
-      No search index on this plane — declare one with
-      <code>drsg index keyword &lt;label&gt; &lt;prop&gt;</code> or
-      <code>drsg index ensure &lt;label&gt; &lt;prop&gt;</code>.
-    </span>
+    <span class="hy-hint">No search index on this plane yet.</span>
+    <button class="ghost" onclick={openIndexDialog}>＋ Declare an index</button>
   {/if}
 </div>
 
@@ -816,6 +863,61 @@
         <div class="dlg-actions">
           <button class="ghost" onclick={resetCreate}>Cancel</button>
           <button class="primary" onclick={createEdge}>Create edge</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if idxOpen}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Declare an index">
+      <header>
+        New index
+        <button class="close" onclick={() => (idxOpen = false)} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <label class="idx-row">
+          <span>kind</span>
+          <select bind:value={idxKind}>
+            <option value="keyword">keyword — BM25 text</option>
+            <option value="vector">semantic — embedding</option>
+          </select>
+        </label>
+        <label class="idx-row">
+          <span>label</span>
+          <select bind:value={idxLabel}>
+            {#each labels as l (l)}<option value={l}>{l}</option>{/each}
+          </select>
+        </label>
+        <input
+          list="idx-props"
+          placeholder="property"
+          bind:value={idxProperty}
+          use:autofocus
+          onkeydown={(e) => e.key === 'Enter' && declareIndex()}
+        />
+        <datalist id="idx-props">
+          {#each idxProps as pr (pr)}<option value={pr}></option>{/each}
+        </datalist>
+        {#if idxKind === 'vector'}
+          <label class="idx-row">
+            <span>metric</span>
+            <select bind:value={idxMetric}>
+              <option value="cosine">cosine</option>
+              <option value="dot">dot</option>
+              <option value="l2">l2</option>
+            </select>
+          </label>
+        {/if}
+        <p class="idx-note">
+          Indexes {idxKind === 'vector' ? 'embedding (vector)' : 'string'} values of the chosen
+          property. The suggestions list properties of that type on the label.
+        </p>
+        {#if idxError}<p class="dlg-error">{idxError}</p>{/if}
+        <div class="dlg-actions">
+          <button class="ghost" onclick={() => (idxOpen = false)}>Cancel</button>
+          <button class="primary" onclick={declareIndex}>Create index</button>
         </div>
       </div>
     </div>

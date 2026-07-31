@@ -828,12 +828,28 @@ nav button.active {
   font-size: 0.8rem;
   color: var(--muted);
 }
-.hybrid-bar .hy-hint code {
-  font-family: ui-monospace, monospace;
+
+/* "Declare an index" dialog rows (reuses the .dlg modal shell). */
+.idx-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.idx-row span {
+  width: 3.5rem;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+}
+.idx-row select {
+  flex: 1;
+}
+.idx-note {
+  margin: 0.1rem 0 0;
   font-size: 0.76rem;
-  background: color-mix(in srgb, var(--fg) 8%, transparent);
-  padding: 0.05rem 0.3rem;
-  border-radius: 4px;
+  color: var(--muted);
 }
 
 .hy-results {

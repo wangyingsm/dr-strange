@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, HybridWeights, LogicalPlan,
+    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, HybridWeights, Language, LogicalPlan,
     LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
     ShortestPathOptions, json,
 };
@@ -816,6 +816,54 @@ fn metric_name(m: Metric) -> &'static str {
         Metric::Cosine => "cosine",
         Metric::Dot => "dot",
         Metric::L2 => "l2",
+    }
+}
+
+#[derive(Deserialize)]
+pub struct EnsureIndex {
+    plane: String,
+    label: String,
+    property: String,
+    /// `keyword` (default, BM25) or `vector` (embedding similarity).
+    #[serde(default)]
+    kind: Option<String>,
+    /// Vector metric (default cosine).
+    #[serde(default)]
+    metric: Option<String>,
+    /// Keyword analyzer language (default english).
+    #[serde(default)]
+    language: Option<String>,
+}
+
+/// `index.ensure` — declare (and build) a search index on `(label, property)`
+/// from the dashboard, so a UI need never send the user to the CLI (ROADMAP §2).
+/// `kind` selects the index type. Idempotent; errors if one already exists with
+/// different settings.
+pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: EnsureIndex = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    match req.kind.as_deref().unwrap_or("keyword") {
+        "vector" => {
+            app(plane.ensure_vector_index(
+                &req.label,
+                &req.property,
+                parse_metric(req.metric.as_deref()),
+            ))?;
+            Ok(jval!({ "kind": "vector", "label": req.label, "property": req.property }))
+        }
+        "keyword" => {
+            let language: Language = req
+                .language
+                .as_deref()
+                .unwrap_or("english")
+                .parse()
+                .map_err(|e: dr_strange_core::Error| RpcError::invalid_params(e.to_string()))?;
+            app(plane.ensure_keyword_index(&req.label, &req.property, language))?;
+            Ok(jval!({ "kind": "keyword", "label": req.label, "property": req.property }))
+        }
+        other => Err(RpcError::invalid_params(format!(
+            "unknown index kind `{other}` (expected keyword|vector)"
+        ))),
     }
 }
 

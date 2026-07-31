@@ -195,6 +195,7 @@ const METHODS: &[&str] = &[
     "plane.algo",
     "plane.hybrid",
     "plane.indexes",
+    "index.ensure",
     "graph.seed",
     "graph.expand",
     "digest.run",
@@ -250,6 +251,9 @@ fn dispatch_method(
         // vector channel — the same privileged tier as `plane.find` semantic.
         "plane.hybrid" => guarded!(Access::Read, methods::plane_hybrid(ctx, params)),
         "plane.indexes" => guarded!(Access::Read, methods::plane_indexes(ctx, params)),
+        // Declaring an index is a schema-level change (and can build over all
+        // matching nodes), so it sits at the admin tier like plane management.
+        "index.ensure" => guarded!(Access::Admin, methods::index_ensure(ctx, params)),
         "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
         "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),
         // `digest.run` writes nothing, but it spends the server's provider
@@ -681,6 +685,47 @@ mod tests {
         assert_eq!(r["keyword"][0]["language"], "english");
         assert_eq!(r["vector"][0]["property"], "emb");
         assert_eq!(r["vector"][0]["metric"], "l2");
+    }
+
+    #[test]
+    fn index_ensure_declares_then_appears_in_plane_indexes() {
+        use dr_strange_core::{PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            let props: Properties = [
+                ("body".to_string(), PropDesc::new(PropValue::Str("graph text".into()))),
+                ("emb".to_string(), PropDesc::new(PropValue::Vector(vec![0.0, 1.0]))),
+            ]
+            .into_iter()
+            .collect();
+            txn.create_node(&["Doc"], props).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Declare both index kinds via RPC.
+        let kw = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","label":"Doc","property":"body"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(kw["result"]["kind"], "keyword");
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","label":"Doc","property":"emb","kind":"vector","metric":"l2"},"id":1}"#,
+        )
+        .unwrap();
+
+        // They now show up in plane.indexes.
+        let idx = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(idx["result"]["keyword"][0]["property"], "body");
+        assert_eq!(idx["result"]["vector"][0]["property"], "emb");
     }
 
     // ---- auth gate --------------------------------------------------------

@@ -176,6 +176,20 @@
       "result": { "name": "result", "schema": { "type": "object", "description": "{vector:[{label,property,metric}], keyword:[{label,property,language}]}." } }
     },
     {
+      "name": "index.ensure",
+      "summary": "Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent.",
+      "x-access": "admin",
+      "params": [
+        { "name": "plane", "required": true, "schema": { "type": "string" } },
+        { "name": "label", "required": true, "schema": { "type": "string" } },
+        { "name": "property", "required": true, "schema": { "type": "string" } },
+        { "name": "kind", "required": false, "schema": { "type": "string", "enum": ["keyword", "vector"], "default": "keyword" } },
+        { "name": "metric", "required": false, "schema": { "type": "string", "enum": ["cosine", "dot", "l2"], "default": "cosine" } },
+        { "name": "language", "required": false, "schema": { "type": "string", "default": "english" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object", "description": "{kind, label, property}." } }
+    },
+    {
       "name": "graph.seed",
       "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
       "x-access": "read",
