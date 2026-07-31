@@ -391,14 +391,19 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            entity by name; identity lives in the key.\n\
          - Match a relationship to a SPECIFIC edge_type from SCHEMA (e.g. 任职/works at → EMPLOYED_AT) \
            and follow its direction; use edge_type null ONLY for a generic \"any connection\".\n\
-         - When the question names a result KIND (e.g. 公司/companies), add {{\"Filter\": {{\"HasLabel\": \
-           \"<Label>\"}}}} after the Expand.\n\
+         - A specific edge_type already scopes the result to its target labels (its src→dst in \
+           SCHEMA). Add {{\"Filter\": {{\"HasLabel\": \"<Label>\"}}}} ONLY to pick one kind \
+           when the edge reaches SEVERAL distinct kinds and the question wants just that one. Do NOT \
+           filter when the question's category covers all the edge's targets (e.g. 任职/employed-at → \
+           Company AND Organization are both employers → return both, no filter).\n\
          - Read-only: never invent write operations. Do NOT use vector/similarity operators.\n\
          - A Filter's Expr must yield a Bool (top-level Compare/HasLabel/Logic/Not/IsNull).\n\
          \n\
-         Example:\n\
-         Q: \"which companies does bob work at\"\n\
-         {{\"plan\":{{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"EMPLOYED_AT\"}}}},{{\"Filter\":{{\"HasLabel\":\"Company\"}}}}]}}}}\n\
+         Examples:\n\
+         Q: \"which companies does bob work at\"  (EMPLOYED_AT → Company, Organization are all employers → no label filter)\n\
+         {{\"plan\":{{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"EMPLOYED_AT\"}}}}]}}}}\n\
+         Q: \"what products did acme develop\"  (DEVELOPED reaches Product/Tool/System → narrow to the asked kind)\n\
+         {{\"plan\":{{\"source\":{{\"SeekKeys\":[\"acme\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"DEVELOPED\"}}}},{{\"Filter\":{{\"HasLabel\":\"Product\"}}}}]}}}}\n\
          \n\
          SCHEMA (plane has {} nodes, {} edges):\n{}",
         catalog.node_count,
