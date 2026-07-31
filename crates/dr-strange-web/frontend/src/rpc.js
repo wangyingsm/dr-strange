@@ -43,3 +43,27 @@ export function liveStats(onStats, onState) {
   }
   return () => ws.close()
 }
+
+/**
+ * Subscribe to the live change feed for a plane (ROADMAP §5). Opens a WebSocket,
+ * sends `plane.watch { plane, label }` on connect, and calls `onChange(params)`
+ * for each `plane.change` notification ({ plane, seq, truncated, changes }).
+ * `onState(open)` fires on connect/disconnect. Returns a disposer.
+ */
+export function liveChanges(plane, label, onChange, onState) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const q = TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''
+  const ws = new WebSocket(`${proto}://${location.host}/ws${q}`)
+  ws.onopen = () => {
+    onState?.(true)
+    const params = { plane }
+    if (label) params.label = label
+    ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'plane.watch', params, id: 1 }))
+  }
+  ws.onclose = () => onState?.(false)
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data)
+    if (msg.method === 'plane.change') onChange(msg.params)
+  }
+  return () => ws.close()
+}

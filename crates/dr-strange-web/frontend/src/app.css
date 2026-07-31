@@ -1607,3 +1607,149 @@ textarea.doc {
   border-color: var(--tt);
   background: color-mix(in srgb, var(--tt) 20%, transparent);
 }
+
+/* ---- live change feed (ROADMAP §5) ---- */
+:root {
+  --live: #16a34a;
+  --op-new: #16a34a;
+  --op-del: #dc2626;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --live: #4ade80;
+    --op-new: #4ade80;
+    --op-del: #f87171;
+  }
+}
+:root[data-theme='dark'] {
+  --live: #4ade80;
+  --op-new: #4ade80;
+  --op-del: #f87171;
+}
+:root[data-theme='light'] {
+  --live: #16a34a;
+  --op-new: #16a34a;
+  --op-del: #dc2626;
+}
+
+/* Pulsing green dot: on the Live tab and the feed header while connected. */
+.live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  vertical-align: middle;
+  margin-left: 0.35rem;
+}
+.tool-tabs button.active .live-dot,
+.live-head.on .live-dot {
+  background: var(--live);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 55%, transparent);
+  }
+  50% {
+    opacity: 0.65;
+    box-shadow: 0 0 0 4px transparent;
+  }
+}
+
+.live-bar select {
+  font: 13px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.4rem;
+}
+.live-bar button.active {
+  border-color: var(--live);
+  color: var(--live);
+}
+.live-status {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.live-status.on {
+  color: var(--live);
+}
+
+/* The feed panel reuses `.hy-results`, but its rows have their own layout. */
+.live-feed .live-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.1rem;
+  color: var(--muted);
+}
+.live-feed .live-head.on {
+  color: var(--live);
+}
+.live-feed li button {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  grid-template-columns: none;
+  grid-template-areas: none;
+}
+.live-feed li button:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.live-feed .op {
+  flex: none;
+  font-size: 0.64rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.08rem 0.3rem;
+  border-radius: 4px;
+  color: #fff;
+}
+.op-created {
+  background: var(--op-new);
+}
+.op-updated {
+  background: var(--accent);
+}
+.op-deleted {
+  background: var(--op-del);
+}
+.live-feed .ck {
+  flex: none;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.live-feed .k {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.live-feed .cl {
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 8rem;
+}
+.live-feed .cseq {
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.live-empty {
+  padding: 0.6rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}

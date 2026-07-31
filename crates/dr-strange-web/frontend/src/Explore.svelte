@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
-  import { rpc, authHeaders } from './rpc.js'
+  import { rpc, authHeaders, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import CreatePlane from './CreatePlane.svelte'
@@ -160,6 +160,40 @@
   // Snap back to the live (latest) view; the effect above re-plots.
   function goLive() {
     asOf = null
+  }
+
+  // ---- live change feed (ROADMAP §5) --------------------------------------
+  // A WebSocket `plane.watch` subscription streams commits as they land. The
+  // feed is a capped, newest-first list; clicking an entry focuses that node.
+  const FEED_CAP = 200
+  let feed = $state([]) // [{ seq, kind, op, id, labels, record }], newest first
+  let feedLabel = $state('') // '' = all labels, else narrow the subscription
+  let feedPaused = $state(false) // stop streaming without leaving the tab
+  let feedLive = $state(false) // WebSocket connected?
+
+  function onChange(params) {
+    // Flatten the commit's changes newest-first, tag each with the commit seq.
+    const incoming = (params.changes ?? []).map((c) => ({ ...c, seq: params.seq }))
+    if (incoming.length) feed = [...incoming.reverse(), ...feed].slice(0, FEED_CAP)
+  }
+
+  // Manage the subscription's lifecycle: connect while the Live tab is active,
+  // for the current plane + label filter, and not paused. Re-subscribes (fresh
+  // feed) when any of those change; disconnects on leave/unmount.
+  $effect(() => {
+    if (tab !== 'live' || !plane || feedPaused) return
+    const label = feedLabel // capture the filter for this subscription
+    feed = []
+    feedLive = false
+    const dispose = liveChanges(plane, label || null, onChange, (open) => (feedLive = open))
+    return () => {
+      dispose()
+      feedLive = false
+    }
+  })
+
+  function opClass(op) {
+    return op === 'created' ? 'op-created' : op === 'deleted' ? 'op-deleted' : 'op-updated'
   }
 
   // Commit the slider to `asOf`; `latest` ⇒ live. The effect above re-plots.
@@ -930,6 +964,9 @@
       Time-travel{#if asOf != null}<span class="tt-dot" aria-hidden="true"></span>{/if}
     </button>
   {/if}
+  <button class:active={tab === 'live'} onclick={() => (tab = 'live')}>
+    Live{#if tab === 'live' && feedLive}<span class="live-dot" aria-hidden="true"></span>{/if}
+  </button>
 </div>
 
 {#if tab === 'filters'}
@@ -1081,6 +1118,27 @@
     {:else}
       <span class="tt-empty">Only one commit so far — make more changes to travel back through history.</span>
     {/if}
+  </div>
+{:else if tab === 'live'}
+  <div class="algo-bar live-bar">
+    <button
+      class:active={!feedPaused}
+      onclick={() => (feedPaused = !feedPaused)}
+      title={feedPaused ? 'Resume streaming changes' : 'Stop streaming changes'}
+    >
+      {feedPaused ? 'Resume' : 'Pause'}
+    </button>
+    <span class="algo-sp-label">label</span>
+    <select bind:value={feedLabel} title="Only stream changes to nodes of this label">
+      <option value="">all</option>
+      {#each labels as l (l)}<option value={l}>{l}</option>{/each}
+    </select>
+    <span class="live-status" class:on={feedLive && !feedPaused}>
+      {#if feedPaused}paused{:else if feedLive}watching “{plane}”{:else}connecting…{/if}
+      · {feed.length} change{feed.length === 1 ? '' : 's'}
+    </span>
+    <span class="algo-sep"></span>
+    <button class="ghost" onclick={() => (feed = [])} disabled={!feed.length} title="Clear the feed">Clear</button>
   </div>
 {/if}
 
@@ -1262,6 +1320,41 @@
         </span>
       </header>
       <pre>{JSON.stringify(askResult.plans, null, 2)}</pre>
+    </div>
+  {/if}
+
+  {#if tab === 'live'}
+    <div class="hy-results live-feed">
+      <header>
+        <span class="live-head" class:on={feedLive && !feedPaused}>
+          <span class="live-dot" aria-hidden="true"></span>
+          Live changes · {feed.length}
+        </span>
+        <button class="close" onclick={() => (feed = [])} aria-label="Clear" title="Clear">×</button>
+      </header>
+      {#if feed.length}
+        <ol>
+          {#each feed as c, i (`${c.seq}:${c.kind}:${c.id}:${i}`)}
+            <li>
+              <button
+                onclick={() => c.kind === 'node' && c.op !== 'deleted' && focusNode(c.id)}
+                disabled={c.kind !== 'node' || c.op === 'deleted'}
+                title={c.kind === 'node' && c.op !== 'deleted' ? 'Focus this node' : ''}
+              >
+                <span class="op {opClass(c.op)}">{c.op}</span>
+                <span class="ck">{c.kind}</span>
+                <span class="k">{c.record?.external_key ?? `#${c.id}`}</span>
+                {#if c.labels?.length}<span class="cl">{c.labels.join(', ')}</span>{/if}
+                <span class="cseq">@{c.seq}</span>
+              </button>
+            </li>
+          {/each}
+        </ol>
+      {:else}
+        <p class="live-empty">
+          {feedPaused ? 'Paused.' : 'Watching for changes… commit something to see it here.'}
+        </p>
+      {/if}
     </div>
   {/if}
 
