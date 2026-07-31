@@ -138,3 +138,33 @@ def test_bad_token_raises_auth_error(base_url):
     with pytest.raises(DrsgAuthError) as exc:
         db.db_stats()
     assert exc.value.code == -32001
+
+
+def test_change_feed_over_websocket(base_url):
+    import threading
+
+    db = Drsg(base_url=base_url, token=TOKEN)
+    events: list[dict] = []
+
+    def consume() -> None:
+        # Blocking generator; a daemon thread so it dies with the process /
+        # when the server (module fixture) tears down and the socket EOFs.
+        for event in db.watch("startup", label="Widget"):
+            events.append(event)
+
+    threading.Thread(target=consume, daemon=True).start()
+    time.sleep(0.5)  # let the socket connect + the server register the watch
+
+    db.node_create(plane="startup", key="ws-widget", labels=["Widget"])
+
+    deadline = time.time() + 3.0
+    while not events and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert events, "no change event received over the websocket"
+    changes = [c for e in events for c in e["changes"]]
+    created = next(c for c in changes if c.get("record", {}).get("external_key") == "ws-widget")
+    assert created["kind"] == "node"
+    assert created["op"] == "created"
+    assert "Widget" in created["labels"]
+    assert events[0]["seq"] > 0

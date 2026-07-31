@@ -60,7 +60,7 @@ class Drsg(_Client):
             _p["key"] = key
         return self._call("node.get", _p)
 
-    def plane_neighbors(self, plane, id, direction=None, type=None) -> Any:
+    def plane_neighbors(self, plane, id, direction=None, type=None, as_of=None, as_of_ms=None) -> Any:
         """1-hop expansion as {node, edge} id pairs.
 
         Access: read."""
@@ -71,7 +71,17 @@ class Drsg(_Client):
             _p["direction"] = direction
         if type is not None:
             _p["type"] = type
+        if as_of is not None:
+            _p["as_of"] = as_of
+        if as_of_ms is not None:
+            _p["as_of_ms"] = as_of_ms
         return self._call("plane.neighbors", _p)
+
+    def plane_history(self) -> Any:
+        """Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only).
+
+        Access: read."""
+        return self._call("plane.history")
 
     def plane_search(self, plane, property, query, label=None, k=None, metric=None) -> Any:
         """Vector top-k over a property; returns scored node records.
@@ -89,13 +99,17 @@ class Drsg(_Client):
             _p["metric"] = metric
         return self._call("plane.search", _p)
 
-    def plane_query(self, plane, plan) -> Any:
+    def plane_query(self, plane, plan, as_of=None, as_of_ms=None) -> Any:
         """Run a serialized logical plan verbatim; returns scored rows.
 
         Access: read."""
         _p: dict = {}
         _p["plane"] = plane
         _p["plan"] = plan
+        if as_of is not None:
+            _p["as_of"] = as_of
+        if as_of_ms is not None:
+            _p["as_of_ms"] = as_of_ms
         return self._call("plane.query", _p)
 
     def plane_cypher(self, plane, query, embed=None, params=None) -> Any:
@@ -111,7 +125,7 @@ class Drsg(_Client):
             _p["params"] = params
         return self._call("plane.cypher", _p)
 
-    def plane_find(self, plane, q, limit=None, semantic=None, provider=None, embed_model=None) -> Any:
+    def plane_find(self, plane, q, limit=None, semantic=None, provider=None, embed_model=None, as_of=None, as_of_ms=None) -> Any:
         """Text (or semantic) search over the plane's nodes and edges.
 
         Access: read."""
@@ -126,9 +140,126 @@ class Drsg(_Client):
             _p["provider"] = provider
         if embed_model is not None:
             _p["embed_model"] = embed_model
+        if as_of is not None:
+            _p["as_of"] = as_of
+        if as_of_ms is not None:
+            _p["as_of_ms"] = as_of_ms
         return self._call("plane.find", _p)
 
-    def graph_seed(self, plane, label=None, limit=None) -> Any:
+    def plane_algo(self, plane, algo, label=None, limit=None, damping=None, max_iters=None, tolerance=None, src=None, dst=None, dir=None, weight=None, max_levels=None, min_gain=None) -> Any:
+        """Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot.
+
+        Access: read."""
+        _p: dict = {}
+        _p["plane"] = plane
+        _p["algo"] = algo
+        if label is not None:
+            _p["label"] = label
+        if limit is not None:
+            _p["limit"] = limit
+        if damping is not None:
+            _p["damping"] = damping
+        if max_iters is not None:
+            _p["max_iters"] = max_iters
+        if tolerance is not None:
+            _p["tolerance"] = tolerance
+        if src is not None:
+            _p["src"] = src
+        if dst is not None:
+            _p["dst"] = dst
+        if dir is not None:
+            _p["dir"] = dir
+        if weight is not None:
+            _p["weight"] = weight
+        if max_levels is not None:
+            _p["max_levels"] = max_levels
+        if min_gain is not None:
+            _p["min_gain"] = min_gain
+        return self._call("plane.algo", _p)
+
+    def plane_hybrid(self, plane, q, label=None, vector_prop=None, keyword_prop=None, metric=None, graph_hops=None, graph_decay=None, w_vector=None, w_keyword=None, w_graph=None, k=None, candidates=None, provider=None, embed_model=None) -> Any:
+        """Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side.
+
+        Access: read."""
+        _p: dict = {}
+        _p["plane"] = plane
+        _p["q"] = q
+        if label is not None:
+            _p["label"] = label
+        if vector_prop is not None:
+            _p["vector_prop"] = vector_prop
+        if keyword_prop is not None:
+            _p["keyword_prop"] = keyword_prop
+        if metric is not None:
+            _p["metric"] = metric
+        if graph_hops is not None:
+            _p["graph_hops"] = graph_hops
+        if graph_decay is not None:
+            _p["graph_decay"] = graph_decay
+        if w_vector is not None:
+            _p["w_vector"] = w_vector
+        if w_keyword is not None:
+            _p["w_keyword"] = w_keyword
+        if w_graph is not None:
+            _p["w_graph"] = w_graph
+        if k is not None:
+            _p["k"] = k
+        if candidates is not None:
+            _p["candidates"] = candidates
+        if provider is not None:
+            _p["provider"] = provider
+        if embed_model is not None:
+            _p["embed_model"] = embed_model
+        return self._call("plane.hybrid", _p)
+
+    def plane_ask(self, plane, question, dry_run=None, max_attempts=None, limit=None, provider=None, model=None, embed_provider=None, embed_model=None) -> Any:
+        """Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env.
+
+        Access: read."""
+        _p: dict = {}
+        _p["plane"] = plane
+        _p["question"] = question
+        if dry_run is not None:
+            _p["dry_run"] = dry_run
+        if max_attempts is not None:
+            _p["max_attempts"] = max_attempts
+        if limit is not None:
+            _p["limit"] = limit
+        if provider is not None:
+            _p["provider"] = provider
+        if model is not None:
+            _p["model"] = model
+        if embed_provider is not None:
+            _p["embed_provider"] = embed_provider
+        if embed_model is not None:
+            _p["embed_model"] = embed_model
+        return self._call("plane.ask", _p)
+
+    def plane_indexes(self, plane) -> Any:
+        """The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist.
+
+        Access: read."""
+        _p: dict = {}
+        _p["plane"] = plane
+        return self._call("plane.indexes", _p)
+
+    def index_ensure(self, plane, label, property, kind=None, metric=None, language=None) -> Any:
+        """Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent.
+
+        Access: admin."""
+        _p: dict = {}
+        _p["plane"] = plane
+        _p["label"] = label
+        _p["property"] = property
+        if kind is not None:
+            _p["kind"] = kind
+        if metric is not None:
+            _p["metric"] = metric
+        if language is not None:
+            _p["language"] = language
+        return self._call("index.ensure", _p)
+
+    def graph_seed(self, plane, label=None, limit=None, as_of=None, as_of_ms=None) -> Any:
         """An initial canvas: up to `limit` nodes plus the edges induced among them.
 
         Access: read."""
@@ -138,9 +269,13 @@ class Drsg(_Client):
             _p["label"] = label
         if limit is not None:
             _p["limit"] = limit
+        if as_of is not None:
+            _p["as_of"] = as_of
+        if as_of_ms is not None:
+            _p["as_of_ms"] = as_of_ms
         return self._call("graph.seed", _p)
 
-    def graph_expand(self, plane, id, direction=None, type=None, limit=None) -> Any:
+    def graph_expand(self, plane, id, direction=None, type=None, limit=None, as_of=None, as_of_ms=None) -> Any:
         """Hub-safe 1-hop neighbourhood around a node: neighbour + connecting-edge records.
 
         Access: read."""
@@ -153,6 +288,10 @@ class Drsg(_Client):
             _p["type"] = type
         if limit is not None:
             _p["limit"] = limit
+        if as_of is not None:
+            _p["as_of"] = as_of
+        if as_of_ms is not None:
+            _p["as_of_ms"] = as_of_ms
         return self._call("graph.expand", _p)
 
     def digest_run(self, plane, text, chat=None, embed=None, model=None, embed_model=None, source=None, no_embed=None, link=None) -> Any:
