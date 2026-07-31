@@ -77,6 +77,10 @@ public class Drsg extends Client {
             long planes,
             long nodes,
             long edges,
+            long labels,
+            long edgeTypes,
+            long indexes,
+            long commitSeq,
             boolean persistent,
             Long fileSize) {
     }

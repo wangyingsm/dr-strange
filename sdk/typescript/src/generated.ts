@@ -65,6 +65,10 @@ export interface DbStats {
   planes: number;
   nodes: number;
   edges: number;
+  labels: number;
+  edge_types: number;
+  indexes: number;
+  commit_seq: number;
   persistent: boolean;
   file_size?: number | null;
 }
