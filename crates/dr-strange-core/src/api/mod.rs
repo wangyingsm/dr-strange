@@ -15,7 +15,7 @@
 #[cfg(any(feature = "redb-backend", feature = "native-backend"))]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
@@ -154,6 +154,64 @@ pub enum AsOf {
     Time(i64),
 }
 
+/// Whether a [`Change`] is a node or an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeKind {
+    Node,
+    Edge,
+}
+
+/// What happened to an entity in a committed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeOp {
+    Created,
+    Updated,
+    Deleted,
+}
+
+/// One node or edge that changed in a commit (ROADMAP §5 change feed). For a
+/// `Created`/`Updated` node or edge the full committed record is attached, with
+/// embeddings and `_`-prefixed internal/provenance properties stripped; a
+/// `Deleted` change carries only the id (the record is gone) — pair it with a
+/// time-travel read `as_of(seq - 1)` to recover the pre-delete state.
+#[derive(Debug, Clone)]
+pub struct Change {
+    pub kind: ChangeKind,
+    pub op: ChangeOp,
+    /// Node id or edge id.
+    pub id: u64,
+    /// The node's labels (empty for edges, and for a deleted node whose record
+    /// is already gone) — the granularity a `plane + label` subscription filters on.
+    pub labels: Vec<String>,
+    /// The committed node record for a node create/update (sanitized).
+    pub node: Option<NodeRecord>,
+    /// The committed edge record for an edge create/update (sanitized).
+    pub edge: Option<EdgeRecord>,
+}
+
+/// The set of changes a single commit produced, tagged with the plane and the
+/// commit sequence they landed at (ROADMAP §5). Delivered to a [`Database`]
+/// change observer registered with [`Database::on_change`].
+#[derive(Debug, Clone)]
+pub struct ChangeSet {
+    pub plane: PlaneId,
+    /// The commit sequence these changes landed at (as [`Database::commit_seq`]).
+    pub seq: u64,
+    pub changes: Vec<Change>,
+    /// A very large commit's change list was capped; some changes are omitted.
+    pub truncated: bool,
+}
+
+/// A registered commit-time change observer. Invoked synchronously on the
+/// committing thread, so it must be cheap and non-blocking — the web layer just
+/// forwards into a broadcast channel.
+type ChangeObserver = Arc<dyn Fn(ChangeSet) + Send + Sync>;
+
+/// Most a single commit's change feed carries in full detail; beyond this the
+/// set is truncated (best-effort — a bulk load shouldn't read back thousands of
+/// records at commit just to notify).
+const CHANGE_DETAIL_CAP: usize = 256;
+
 pub struct Database {
     engine: Engine,
     /// In-memory vector indexes (arch/01 §5). On open, loaded from the `.hnsw`
@@ -174,6 +232,10 @@ pub struct Database {
     sidecar: Option<PathBuf>,
     /// The `.bm25` keyword sidecar beside the database, or `None` in-memory.
     keyword_sidecar: Option<PathBuf>,
+    /// A commit-time change observer (ROADMAP §5), set by a host that wants a
+    /// change feed (the web layer forwards it to WebSocket subscribers). `None`
+    /// ⇒ commits skip building change sets entirely.
+    change_observer: RwLock<Option<ChangeObserver>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -314,6 +376,7 @@ impl Database {
             cache: GraphCache::new(CACHE_BYTES),
             sidecar,
             keyword_sidecar,
+            change_observer: RwLock::new(None),
         })
     }
 
@@ -321,6 +384,37 @@ impl Database {
     /// Reads it from a fresh snapshot.
     pub fn commit_seq(&self) -> Result<u64> {
         self.engine.with_read(|txn| graph::read_commit_seq(txn))
+    }
+
+    /// Register a commit-time change observer (ROADMAP §5): after every
+    /// committed write, `f` is called with the [`ChangeSet`] that landed. Only
+    /// one observer at a time — a second call replaces the first. The callback
+    /// runs synchronously on the committing thread, so keep it cheap (the web
+    /// layer just forwards into a broadcast channel). Node/edge data changes are
+    /// reported; plane/schema/index-declaration writes are not.
+    pub fn on_change(&self, f: impl Fn(ChangeSet) + Send + Sync + 'static) {
+        *self
+            .change_observer
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
+    }
+
+    fn has_change_observer(&self) -> bool {
+        self.change_observer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn notify_change(&self, changes: ChangeSet) {
+        let observer = self
+            .change_observer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(changes);
+        }
     }
 
     /// The retained history window as commit sequences: `(oldest queryable,
@@ -794,6 +888,7 @@ impl<'db> PlaneHandle<'db> {
             events: Vec::new(),
             kw_decls,
             kw_events: Vec::new(),
+            changes: Vec::new(),
         })
     }
 }
@@ -860,6 +955,10 @@ pub struct WriteTxn<'db> {
     kw_decls: Vec<(String, String, Language)>,
     /// Buffered keyword-index coherence events, applied at commit.
     kw_events: Vec<KwEvent>,
+    /// Node/edge mutations this txn made, in order (ROADMAP §5 change feed).
+    /// Collapsed per entity and resolved to full records at commit — only when
+    /// a change observer is registered, so it's free otherwise.
+    changes: Vec<(ChangeKind, u64, ChangeOp)>,
 }
 
 impl WriteTxn<'_> {
@@ -916,6 +1015,13 @@ impl WriteTxn<'_> {
         }
     }
 
+    /// Note a node/edge mutation for the change feed (ROADMAP §5). Cheap — just
+    /// buffers `(kind, id, op)`; the full record is resolved at commit, and only
+    /// if a change observer is registered.
+    fn record_change(&mut self, kind: ChangeKind, id: u64, op: ChangeOp) {
+        self.changes.push((kind, id, op));
+    }
+
     pub fn create_node(&mut self, labels: &[&str], props: Properties) -> Result<NodeId> {
         let plane = self.plane;
         let (txn, ids) = self.txn_and_ids();
@@ -923,6 +1029,7 @@ impl WriteTxn<'_> {
         graph::insert_node(txn, plane, id, None, labels, &props)?;
         self.record_node_events(id, labels, &props);
         self.record_kw_node_events(id, labels, &props);
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Created);
         Ok(id)
     }
 
@@ -941,6 +1048,7 @@ impl WriteTxn<'_> {
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
         self.record_node_events(id, labels, &props);
         self.record_kw_node_events(id, labels, &props);
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Created);
         Ok(id)
     }
 
@@ -957,6 +1065,7 @@ impl WriteTxn<'_> {
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_edge_id(txn)?;
         graph::insert_edge(txn, plane, id, src, dst, ty, &props)?;
+        self.record_change(ChangeKind::Edge, id.0, ChangeOp::Created);
         Ok(id)
     }
 
@@ -977,6 +1086,14 @@ impl WriteTxn<'_> {
     ) -> Result<BulkStats> {
         let plane = self.plane;
         let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges)?;
+
+        // Change feed (ROADMAP §5): bulk-loaded nodes are creates over a known
+        // contiguous id range. Edges are omitted (bulk assigns their ids
+        // internally and the endpoints-by-key path doesn't surface them);
+        // subscribers on a bulk ingest can time-travel the seq for the edges.
+        for i in 0..stats.nodes {
+            self.record_change(ChangeKind::Node, stats.node_start + i, ChangeOp::Created);
+        }
 
         // Mirror bulk-loaded vectors into any declared in-memory index. Almost
         // always a no-op: bulk load precedes index declaration (which rebuilds
@@ -1041,13 +1158,16 @@ impl WriteTxn<'_> {
         graph::delete_node(self.txn(), plane, id)?;
         self.events.push(IndexEvent::RemoveNode(id));
         self.kw_events.push(KwEvent::RemoveNode(id));
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Deleted);
         Ok(())
     }
 
     /// Deletes an edge and both of its adjacency entries. Idempotent.
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<()> {
         let plane = self.plane;
-        graph::delete_edge(self.txn(), plane, id)
+        graph::delete_edge(self.txn(), plane, id)?;
+        self.record_change(ChangeKind::Edge, id.0, ChangeOp::Deleted);
+        Ok(())
     }
 
     /// Sets (inserts or overwrites) one property on an existing node.
@@ -1057,7 +1177,9 @@ impl WriteTxn<'_> {
         let value = prop.value.clone();
         graph::set_node_prop(self.txn(), plane, id, key, prop)?;
         self.record_prop_event(id, key, Some(value.clone()))?;
-        self.record_kw_prop_event(id, key, Some(value))
+        self.record_kw_prop_event(id, key, Some(value))?;
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Updated);
+        Ok(())
     }
 
     /// Removes one property from an existing node; removing an absent key
@@ -1066,7 +1188,9 @@ impl WriteTxn<'_> {
         let plane = self.plane;
         graph::remove_node_prop(self.txn(), plane, id, key)?;
         self.record_prop_event(id, key, None)?;
-        self.record_kw_prop_event(id, key, None)
+        self.record_kw_prop_event(id, key, None)?;
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Updated);
+        Ok(())
     }
 
     /// Replaces a node's entire label set. Errors `NotFound` if the node is
@@ -1086,6 +1210,7 @@ impl WriteTxn<'_> {
         if !self.kw_decls.is_empty() {
             self.record_kw_labels_event(id, &node.labels, labels, &node.properties);
         }
+        self.record_change(ChangeKind::Node, id.0, ChangeOp::Updated);
         Ok(())
     }
 
@@ -1265,7 +1390,9 @@ impl WriteTxn<'_> {
     /// Errors with `NotFound` if the edge does not exist.
     pub fn set_edge_prop(&mut self, id: EdgeId, key: &str, prop: PropDesc) -> Result<()> {
         let plane = self.plane;
-        graph::set_edge_prop(self.txn(), plane, id, key, prop)
+        graph::set_edge_prop(self.txn(), plane, id, key, prop)?;
+        self.record_change(ChangeKind::Edge, id.0, ChangeOp::Updated);
+        Ok(())
     }
 
     /// Changes an existing edge's type. Errors `NotFound` if the edge is
@@ -1273,21 +1400,25 @@ impl WriteTxn<'_> {
     /// bookkeeping.)
     pub fn set_edge_type(&mut self, id: EdgeId, ty: &str) -> Result<()> {
         let plane = self.plane;
-        graph::set_edge_type(self.txn(), plane, id, ty)
+        graph::set_edge_type(self.txn(), plane, id, ty)?;
+        self.record_change(ChangeKind::Edge, id.0, ChangeOp::Updated);
+        Ok(())
     }
 
     /// Removes one property from an existing edge; removing an absent key
     /// is not an error.
     pub fn remove_edge_prop(&mut self, id: EdgeId, key: &str) -> Result<()> {
         let plane = self.plane;
-        graph::remove_edge_prop(self.txn(), plane, id, key)
+        graph::remove_edge_prop(self.txn(), plane, id, key)?;
+        self.record_change(ChangeKind::Edge, id.0, ChangeOp::Updated);
+        Ok(())
     }
 
     pub fn commit(mut self) -> Result<()> {
         // Bump the commit sequence inside the txn (arch/02 §3) so it commits
         // atomically with the data — advances the cache's version stamp — and
         // stamp the wall-clock time for time-addressed time-travel (ROADMAP §4).
-        graph::bump_commit_seq(self.txn())?;
+        let seq = graph::bump_commit_seq(self.txn())?;
         graph::write_commit_time(self.txn(), now_millis())?;
         let WriteTxn {
             db,
@@ -1295,6 +1426,7 @@ impl WriteTxn<'_> {
             inner,
             events,
             kw_events,
+            changes,
             ..
         } = self;
         let index_events = events.len();
@@ -1321,8 +1453,125 @@ impl WriteTxn<'_> {
             }
         }
         tracing::debug!(plane = plane.0, index_events, "write txn committed");
+
+        // Change feed (ROADMAP §5): once the data is durable, resolve the
+        // buffered mutations to a change set and hand it to any observer.
+        // Skipped entirely when nobody is listening, so it costs nothing then.
+        if !changes.is_empty() && db.has_change_observer() {
+            match build_change_set(db, plane, seq, &changes) {
+                Ok(Some(cs)) => db.notify_change(cs),
+                Ok(None) => {}
+                // A change-set read failing must not fail the (already durable)
+                // commit — the feed is best-effort.
+                Err(e) => tracing::warn!(error = %e, "change feed: skipped a commit"),
+            }
+        }
         Ok(())
     }
+}
+
+/// Clone a property map for the change feed with embeddings and `_`-prefixed
+/// internal/provenance properties stripped (ROADMAP §5) — the same policy the
+/// NL-query schema summary uses, keeping vectors and internals off the wire.
+fn sanitized_properties(props: &Properties) -> Properties {
+    let mut out = Properties::new();
+    for (k, desc) in props.iter() {
+        if k.starts_with('_') || matches!(desc.value, PropValue::Vector(_)) {
+            continue;
+        }
+        out.insert(k.clone(), desc.clone());
+    }
+    out
+}
+
+/// Resolve a write txn's buffered `(kind, id, op)` mutations into a
+/// [`ChangeSet`] (ROADMAP §5): collapse repeats per entity (a create-then-delete
+/// cancels), cap the detail, and read back each surviving created/updated record
+/// at the just-committed snapshot (sanitized). Returns `None` if nothing
+/// survived collapsing.
+fn build_change_set(
+    db: &Database,
+    plane: PlaneId,
+    seq: u64,
+    buffered: &[(ChangeKind, u64, ChangeOp)],
+) -> Result<Option<ChangeSet>> {
+    use std::collections::BTreeMap;
+    // Collapse per (kind, id) preserving first-seen order, tracking whether the
+    // entity was created / updated / deleted in this txn.
+    let mut order: Vec<(ChangeKind, u64)> = Vec::new();
+    let mut flags: BTreeMap<(ChangeKind, u64), (bool, bool, bool)> = BTreeMap::new();
+    for &(kind, id, op) in buffered {
+        let entry = flags.entry((kind, id)).or_insert_with(|| {
+            order.push((kind, id));
+            (false, false, false)
+        });
+        match op {
+            ChangeOp::Created => entry.0 = true,
+            ChangeOp::Updated => entry.1 = true,
+            ChangeOp::Deleted => entry.2 = true,
+        }
+    }
+
+    // Net op per entity: created+deleted in the same txn cancels out.
+    let mut resolved: Vec<(ChangeKind, u64, ChangeOp)> = Vec::new();
+    for (kind, id) in order {
+        let (created, updated, deleted) = flags[&(kind, id)];
+        let op = match (created, deleted) {
+            (true, true) => continue, // created then deleted → no net change
+            (true, false) => ChangeOp::Created,
+            (false, true) => ChangeOp::Deleted,
+            (false, false) if updated => ChangeOp::Updated,
+            (false, false) => continue,
+        };
+        resolved.push((kind, id, op));
+    }
+    if resolved.is_empty() {
+        return Ok(None);
+    }
+
+    let truncated = resolved.len() > CHANGE_DETAIL_CAP;
+    resolved.truncate(CHANGE_DETAIL_CAP);
+
+    // Read the surviving created/updated records at the committed snapshot.
+    let changes = db.engine.with_read(|txn| {
+        let mut out = Vec::with_capacity(resolved.len());
+        for (kind, id, op) in resolved {
+            let mut change = Change {
+                kind,
+                op,
+                id,
+                labels: Vec::new(),
+                node: None,
+                edge: None,
+            };
+            if op != ChangeOp::Deleted {
+                match kind {
+                    ChangeKind::Node => {
+                        if let Some(mut n) = graph::get_node(txn, plane, NodeId(id))? {
+                            change.labels = n.labels.clone();
+                            n.properties = sanitized_properties(&n.properties);
+                            change.node = Some(n);
+                        }
+                    }
+                    ChangeKind::Edge => {
+                        if let Some(mut e) = graph::get_edge(txn, plane, EdgeId(id))? {
+                            e.properties = sanitized_properties(&e.properties);
+                            change.edge = Some(e);
+                        }
+                    }
+                }
+            }
+            out.push(change);
+        }
+        Ok(out)
+    })?;
+
+    Ok(Some(ChangeSet {
+        plane,
+        seq,
+        changes,
+        truncated,
+    }))
 }
 
 fn apply_kw_event(registry: &mut KeywordRegistry, plane: PlaneId, event: KwEvent) {
@@ -2158,5 +2407,159 @@ mod time_travel_tests {
 
         let past = plane.as_of(AsOf::Seq(s1)).unwrap();
         assert_eq!(status_of(&past.node(id).unwrap().unwrap()), "original");
+    }
+}
+
+/// Commit-time change feed (ROADMAP §5). Backend-agnostic, so these run on the
+/// in-memory engine.
+#[cfg(test)]
+mod change_feed_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+    use std::sync::Mutex;
+
+    fn collector(db: &Database) -> Arc<Mutex<Vec<ChangeSet>>> {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let into = sink.clone();
+        db.on_change(move |cs| into.lock().unwrap().push(cs));
+        sink
+    }
+
+    fn props(pairs: &[(&str, PropValue)]) -> Properties {
+        let mut p = Properties::new();
+        for (k, v) in pairs {
+            p.insert((*k).into(), PropDesc::new(v.clone()));
+        }
+        p
+    }
+
+    #[test]
+    fn create_update_delete_are_reported() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let sink = collector(&db);
+
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w
+                .create_node_with_key("n1", &["Doc"], props(&[("title", "hi".into())]))
+                .unwrap();
+            w.commit().unwrap();
+            id
+        };
+        {
+            let mut w = plane.write().unwrap();
+            w.set_prop(id, "title", PropDesc::new(PropValue::Str("bye".into())))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        {
+            let mut w = plane.write().unwrap();
+            w.delete_node(id).unwrap();
+            w.commit().unwrap();
+        }
+
+        let sets = sink.lock().unwrap();
+        assert_eq!(sets.len(), 3, "one change set per commit");
+
+        assert_eq!(sets[0].changes[0].op, ChangeOp::Created);
+        assert_eq!(sets[0].changes[0].kind, ChangeKind::Node);
+        assert_eq!(sets[0].changes[0].id, id.0);
+        assert_eq!(sets[0].changes[0].labels, vec!["Doc".to_string()]);
+        assert!(sets[0].changes[0].node.is_some());
+
+        assert_eq!(sets[1].changes[0].op, ChangeOp::Updated);
+
+        assert_eq!(sets[2].changes[0].op, ChangeOp::Deleted);
+        assert!(
+            sets[2].changes[0].node.is_none(),
+            "deleted carries no record"
+        );
+
+        assert!(sets[1].seq > sets[0].seq && sets[2].seq > sets[1].seq);
+    }
+
+    #[test]
+    fn embeddings_and_inner_props_are_stripped() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let sink = collector(&db);
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key(
+                "n",
+                &["Doc"],
+                props(&[
+                    ("title", PropValue::Str("x".into())),
+                    ("embedding", PropValue::Vector(vec![0.1, 0.2])),
+                    ("_model", PropValue::Str("provenance".into())),
+                ]),
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        let sets = sink.lock().unwrap();
+        let rec = sets[0].changes[0].node.as_ref().unwrap();
+        assert!(rec.properties.get("title").is_some());
+        assert!(
+            rec.properties.get("embedding").is_none(),
+            "embedding vector stripped from the feed"
+        );
+        assert!(
+            rec.properties.get("_model").is_none(),
+            "underscore-prefixed inner prop stripped from the feed"
+        );
+    }
+
+    #[test]
+    fn create_then_delete_in_one_txn_cancels() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let sink = collector(&db);
+        {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+            w.delete_node(id).unwrap();
+            w.commit().unwrap();
+        }
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "a create+delete in the same commit is no net change"
+        );
+    }
+
+    #[test]
+    fn edges_are_reported() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let (a, b) = {
+            let mut w = plane.write().unwrap();
+            let a = w.create_node(&["N"], Properties::new()).unwrap();
+            let b = w.create_node(&["N"], Properties::new()).unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+        let sink = collector(&db); // after the node creates, so we only see the edge
+        {
+            let mut w = plane.write().unwrap();
+            w.create_edge(a, b, "LINKS", Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+        let sets = sink.lock().unwrap();
+        assert_eq!(sets.len(), 1);
+        let c = &sets[0].changes[0];
+        assert_eq!(c.kind, ChangeKind::Edge);
+        assert_eq!(c.op, ChangeOp::Created);
+        assert!(c.edge.is_some());
+    }
+
+    #[test]
+    fn no_observer_is_a_no_op() {
+        // A commit with no registered observer must still succeed (and cheaply).
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let mut w = plane.write().unwrap();
+        w.create_node(&["N"], Properties::new()).unwrap();
+        w.commit().unwrap();
     }
 }

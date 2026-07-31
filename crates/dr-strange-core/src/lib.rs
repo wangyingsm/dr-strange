@@ -24,7 +24,10 @@ pub mod types;
 /// prior versions AS OF needs, so the type ships only with `native-backend`.
 #[cfg(feature = "native-backend")]
 pub use api::AsOf;
-pub use api::{AlgoBuilder, Database, HybridBuilder, PlaneHandle, QueryBuilder, WriteTxn};
+pub use api::{
+    AlgoBuilder, Change, ChangeKind, ChangeOp, ChangeSet, Database, HybridBuilder, PlaneHandle,
+    QueryBuilder, WriteTxn,
+};
 pub use compute::{
     CatalogSnapshot, Connection, EdgeTypeStats, Expr, HybridHit, HybridWeights, LabelStats,
     LogicalPlan, LouvainOptions, PageRankOptions, Path, PropStats, Row, ShortestPathOptions,
