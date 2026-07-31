@@ -20,11 +20,11 @@ pub mod storage;
 pub mod text;
 pub mod types;
 
-pub use api::{AlgoBuilder, Database, PlaneHandle, QueryBuilder, WriteTxn};
+pub use api::{AlgoBuilder, Database, HybridBuilder, PlaneHandle, QueryBuilder, WriteTxn};
 pub use compute::{
-    CatalogSnapshot, Connection, EdgeTypeStats, Expr, LabelStats, LogicalPlan, LouvainOptions,
-    PageRankOptions, Path, PropStats, Row, ShortestPathOptions, SortKey, Source, Step, ValueType,
-    distance, has_label, hops, lit, p, score, similarity,
+    CatalogSnapshot, Connection, EdgeTypeStats, Expr, HybridHit, HybridWeights, LabelStats,
+    LogicalPlan, LouvainOptions, PageRankOptions, Path, PropStats, Row, ShortestPathOptions,
+    SortKey, Source, Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
 pub use text::{Analyzer, Language};

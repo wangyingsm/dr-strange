@@ -16,6 +16,7 @@ use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
+use crate::compute::hybrid::{self, Channel, HybridHit, HybridWeights};
 use crate::compute::expr::{self, Expr, score};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
@@ -454,6 +455,32 @@ impl<'db> PlaneHandle<'db> {
         AlgoBuilder {
             plane: *self,
             label: None,
+        }
+    }
+
+    /// Starts a hybrid retrieval query (ROADMAP §2): fuse vector similarity,
+    /// BM25 keyword, and graph-proximity channels into one ranking. Add the
+    /// channels you want, then `run`:
+    ///
+    /// ```ignore
+    /// let hits = plane.hybrid()
+    ///     .label("Doc")
+    ///     .vector("emb", query_vec, Metric::Cosine)   // caller pre-embeds the text
+    ///     .keyword("body", "graph databases")
+    ///     .graph(2, 0.5)                               // proximity boost, 2 hops
+    ///     .k(10)
+    ///     .run()?;
+    /// ```
+    pub fn hybrid(&self) -> HybridBuilder<'db> {
+        HybridBuilder {
+            plane: *self,
+            label: None,
+            vector: None,
+            keyword: None,
+            graph: None,
+            weights: HybridWeights::default(),
+            candidates: 100,
+            k: 10,
         }
     }
 
@@ -1458,5 +1485,169 @@ impl<'db> AlgoBuilder<'db> {
     /// (representative = smallest id in the community) plus the community count.
     pub fn louvain(&self, opts: LouvainOptions) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
         self.with_reader(|r| algo::louvain(r, self.label.as_deref(), opts))
+    }
+}
+
+// ---- hybrid retrieval (ROADMAP §2) ---------------------------------------
+
+struct VectorChannelCfg {
+    property: String,
+    query: Vec<f32>,
+    metric: Metric,
+}
+
+struct KeywordChannelCfg {
+    property: String,
+    query: String,
+}
+
+struct GraphChannelCfg {
+    hops: u32,
+    decay: f32,
+    seeds: usize,
+}
+
+/// Number of top hits per primary channel used to seed the graph-proximity
+/// channel, when `.graph(..)` is enabled without an explicit seed count.
+const DEFAULT_GRAPH_SEEDS: usize = 10;
+
+/// Builder for a hybrid retrieval query (ROADMAP §2). Built with
+/// [`PlaneHandle::hybrid`]; add channels, then [`run`](Self::run). All channels
+/// are optional, but at least one should be set. The vector channel takes a
+/// *pre-embedded* query vector (the core never calls an LLM); surfaces embed
+/// the query text server-side first.
+pub struct HybridBuilder<'db> {
+    plane: PlaneHandle<'db>,
+    label: Option<String>,
+    vector: Option<VectorChannelCfg>,
+    keyword: Option<KeywordChannelCfg>,
+    graph: Option<GraphChannelCfg>,
+    weights: HybridWeights,
+    candidates: usize,
+    k: usize,
+}
+
+impl<'db> HybridBuilder<'db> {
+    /// Scope every channel to nodes carrying this label. Required when the
+    /// keyword channel is used (its index is keyed on the label).
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Add the vector channel over `property`, ranking by distance to the
+    /// (already embedded) `query` vector under `metric`.
+    pub fn vector(mut self, property: impl Into<String>, query: Vec<f32>, metric: Metric) -> Self {
+        self.vector = Some(VectorChannelCfg {
+            property: property.into(),
+            query,
+            metric,
+        });
+        self
+    }
+
+    /// Add the BM25 keyword channel over `property` for the text `query`.
+    pub fn keyword(mut self, property: impl Into<String>, query: impl Into<String>) -> Self {
+        self.keyword = Some(KeywordChannelCfg {
+            property: property.into(),
+            query: query.into(),
+        });
+        self
+    }
+
+    /// Add the graph-proximity channel: seed from the strongest vector/keyword
+    /// hits, expand `hops` outward, decaying the boost by `decay` per hop.
+    pub fn graph(mut self, hops: u32, decay: f32) -> Self {
+        self.graph = Some(GraphChannelCfg {
+            hops,
+            decay,
+            seeds: DEFAULT_GRAPH_SEEDS,
+        });
+        self
+    }
+
+    /// Override the per-channel fusion weights (defaults: vector 1, keyword 1,
+    /// graph 0.5).
+    pub fn weights(mut self, weights: HybridWeights) -> Self {
+        self.weights = weights;
+        self
+    }
+
+    /// Per-channel candidate pool size fetched before fusion (default 100).
+    pub fn candidates(mut self, candidates: usize) -> Self {
+        self.candidates = candidates.max(1);
+        self
+    }
+
+    /// Number of fused results to return (default 10).
+    pub fn k(mut self, k: usize) -> Self {
+        self.k = k;
+        self
+    }
+
+    /// Run the query: gather each enabled channel over one read snapshot and
+    /// fuse them. Errors if the keyword channel is used without a label.
+    pub fn run(&self) -> Result<Vec<HybridHit>> {
+        let plane_id = self.plane.id;
+        let label = self.label.as_deref();
+        let registry = self.plane.db.indexes();
+        let cache = &self.plane.db.cache;
+        self.plane.db.engine.with_read(|txn| {
+            let seq = graph::read_commit_seq(txn)?;
+            let reader = CachedReader::with_cache(txn, plane_id, &registry, cache, seq);
+
+            let vector_ch = match &self.vector {
+                Some(v) => {
+                    let hits =
+                        reader.vector_search(label, &v.property, &v.query, v.metric, self.candidates)?;
+                    Some(Channel {
+                        hits: hits.into_iter().map(|h| (NodeId(h.id), h.distance)).collect(),
+                        higher_better: false,
+                    })
+                }
+                None => None,
+            };
+
+            let keyword_ch = match &self.keyword {
+                Some(kw) => {
+                    let label = label.ok_or_else(|| {
+                        Error::InvalidArgument(
+                            "hybrid keyword channel requires a label (.label(..))".into(),
+                        )
+                    })?;
+                    let hits = self
+                        .plane
+                        .db
+                        .keywords()
+                        .search(plane_id, label, &kw.property, &kw.query, self.candidates)
+                        .unwrap_or_default();
+                    Some(Channel {
+                        hits,
+                        higher_better: true,
+                    })
+                }
+                None => None,
+            };
+
+            let graph_ch = match &self.graph {
+                Some(g) => {
+                    let seeds = hybrid::top_seeds(&vector_ch, &keyword_ch, g.seeds);
+                    let prox = hybrid::graph_proximity(&reader, &seeds, g.hops, g.decay)?;
+                    Some(Channel {
+                        hits: prox,
+                        higher_better: true,
+                    })
+                }
+                None => None,
+            };
+
+            Ok(hybrid::fuse(
+                vector_ch,
+                keyword_ch,
+                graph_ch,
+                self.weights,
+                self.k,
+            ))
+        })
     }
 }
