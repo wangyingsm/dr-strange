@@ -14,7 +14,14 @@ surfaces: `drsg` CLI, MCP server, web dashboard, JSON-RPC API, 6 SDKs.
 
 ---
 
-## 1. Graph algorithms  *(first)*
+## 1. Graph algorithms  *(shipped)*
+
+**Status.** ✅ Shipped (2026-07-31). `compute::algo` + `plane.algo()` with
+PageRank, weakly-connected components, weighted shortest path (Dijkstra), and
+Louvain community detection — whole-plane or label-scoped, read-only/transient
+results. Exposed on all three surfaces: RPC `plane.algo`, CLI `drsg algo …`,
+MCP `algo` tool. (Follow-ups: subgraph/seeded scoping and optional
+property-materialization of scores; SDK regeneration from the new OpenRPC entry.)
 
 **Goal.** A library of classic graph algorithms exposed as first-class
 operations: **PageRank / centrality** (node importance), **shortest path**
