@@ -157,12 +157,12 @@ back at the committed snapshot. Payload is the full record with embeddings and
 `as_of(seq-1)`). Web: the observer feeds a broadcast channel; `/ws` gains
 `plane.watch { plane, label? }` / `plane.unwatch` per-connection subscriptions,
 delivering `plane.change` notifications. Dashboard: a "Live" Explore tab
-streams commits (colour-coded op badges, click-to-focus). SDKs: `watch()` over
-a long-lived WebSocket in TypeScript (native WS, auto-reconnect) and Python (a
-hand-rolled zero-dep RFC 6455 client, blocking generator). **Remaining:**
-WebSocket `watch` for the go/c/java SDKs (their generated surfaces are synced;
-the WS client is hand-written per language — Java has stdlib `java.net.http`,
-go/c need a small frame client).
+streams commits (colour-coded op badges, click-to-focus). SDKs: a long-lived
+WebSocket `watch` in **all five** — TypeScript (native WS + auto-reconnect),
+Python (blocking generator), Go (channel), Java (JDK `java.net.http.WebSocket`
++ listener), C (`drsg_watch` callback). TS uses the platform WebSocket and Java
+the JDK's; Python/Go/C hand-roll a minimal RFC 6455 client (the installed
+libcurl 7.81 predates its WS API). Each has an e2e test against a real server.
 
 **Forks settled.** Best-effort in-memory broadcast (not a durable log); filter
 plane + label now (predicate later); payload = full sanitized record inline;
