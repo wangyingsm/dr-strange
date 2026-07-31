@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync } from "node:fs";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { DrsgAuthError, Drsg } from "../src/index";
+import { DrsgAuthError, Drsg, type ChangeEvent } from "../src/index";
 
 const TOKEN = "test-token";
 const ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -115,6 +115,38 @@ t("rpc.discover returns the OpenRPC document", async () => {
   expect(doc.openrpc).toBe("1.2.6");
   const methods = doc.methods as Array<{ name: string }>;
   expect(methods.some((m) => m.name === "node.create")).toBe(true);
+});
+
+t("live change feed over WebSocket", async () => {
+  const db = new Drsg({ baseUrl, token: TOKEN });
+  const events: ChangeEvent[] = [];
+
+  let onOpen!: () => void;
+  const opened = new Promise<void>((r) => (onOpen = r));
+  const sub = db.watch("startup", (e) => events.push(e), {
+    onState: (open) => open && onOpen(),
+    reconnect: false,
+  });
+
+  try {
+    await opened; // connected + plane.watch sent
+    await sleep(100); // let the server register the subscription before we write
+
+    await db.nodeCreate({ plane: "startup", key: "watched", labels: ["Widget"] });
+
+    for (let i = 0; i < 100 && events.length === 0; i++) await sleep(20);
+
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[0].seq).toBeGreaterThan(0);
+    const change = events
+      .flatMap((e) => e.changes)
+      .find((c) => (c.record as { external_key?: string })?.external_key === "watched");
+    expect(change?.kind).toBe("node");
+    expect(change?.op).toBe("created");
+    expect(change?.labels).toContain("Widget");
+  } finally {
+    sub.close();
+  }
 });
 
 t("a bad token raises DrsgAuthError", async () => {

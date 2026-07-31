@@ -102,8 +102,13 @@ export class Drsg extends Client {
   }
 
   /** 1-hop expansion as {node, edge} id pairs. (access: read) */
-  planeNeighbors(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string }): Promise<Array<{ node?: number; edge?: number }>> {
+  planeNeighbors(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string; as_of?: number; as_of_ms?: number }): Promise<Array<{ node?: number; edge?: number }>> {
     return this._call("plane.neighbors", params) as Promise<Array<{ node?: number; edge?: number }>>;
+  }
+
+  /** Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only). (access: read) */
+  planeHistory(): Promise<{ oldest?: number; latest?: number }> {
+    return this._call("plane.history") as Promise<{ oldest?: number; latest?: number }>;
   }
 
   /** Vector top-k over a property; returns scored node records. (access: read) */
@@ -112,7 +117,7 @@ export class Drsg extends Client {
   }
 
   /** Run a serialized logical plan verbatim; returns scored rows. (access: read) */
-  planeQuery(params: { plane: string; plan: Record<string, unknown> }): Promise<Array<NodeRecord>> {
+  planeQuery(params: { plane: string; plan: Record<string, unknown>; as_of?: number; as_of_ms?: number }): Promise<Array<NodeRecord>> {
     return this._call("plane.query", params) as Promise<Array<NodeRecord>>;
   }
 
@@ -122,17 +127,42 @@ export class Drsg extends Client {
   }
 
   /** Text (or semantic) search over the plane's nodes and edges. (access: read) */
-  planeFind(params: { plane: string; q: string; limit?: number; semantic?: boolean; provider?: string; embed_model?: string }): Promise<FindResult> {
+  planeFind(params: { plane: string; q: string; limit?: number; semantic?: boolean; provider?: string; embed_model?: string; as_of?: number; as_of_ms?: number }): Promise<FindResult> {
     return this._call("plane.find", params) as Promise<FindResult>;
   }
 
+  /** Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+  planeAlgo(params: { plane: string; algo: "pagerank" | "components" | "shortest_path" | "louvain"; label?: string; limit?: number; damping?: number; max_iters?: number; tolerance?: number; src?: number; dst?: number; dir?: "out" | "in" | "both"; weight?: string; max_levels?: number; min_gain?: number }): Promise<Record<string, unknown>> {
+    return this._call("plane.algo", params) as Promise<Record<string, unknown>>;
+  }
+
+  /** Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side. (access: read) */
+  planeHybrid(params: { plane: string; q: string; label?: string; vector_prop?: string; keyword_prop?: string; metric?: "cosine" | "dot" | "l2"; graph_hops?: number; graph_decay?: number; w_vector?: number; w_keyword?: number; w_graph?: number; k?: number; candidates?: number; provider?: string; embed_model?: string }): Promise<Record<string, unknown>> {
+    return this._call("plane.hybrid", params) as Promise<Record<string, unknown>>;
+  }
+
+  /** Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env. (access: read) */
+  planeAsk(params: { plane: string; question: string; dry_run?: boolean; max_attempts?: number; limit?: number; provider?: string; model?: string; embed_provider?: string; embed_model?: string }): Promise<Record<string, unknown>> {
+    return this._call("plane.ask", params) as Promise<Record<string, unknown>>;
+  }
+
+  /** The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist. (access: read) */
+  planeIndexes(params: { plane: string }): Promise<Record<string, unknown>> {
+    return this._call("plane.indexes", params) as Promise<Record<string, unknown>>;
+  }
+
+  /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+  indexEnsure(params: { plane: string; label: string; property: string; kind?: "keyword" | "vector"; metric?: "cosine" | "dot" | "l2"; language?: string }): Promise<Record<string, unknown>> {
+    return this._call("index.ensure", params) as Promise<Record<string, unknown>>;
+  }
+
   /** An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
-  graphSeed(params: { plane: string; label?: string; limit?: number }): Promise<Subgraph> {
+  graphSeed(params: { plane: string; label?: string; limit?: number; as_of?: number; as_of_ms?: number }): Promise<Subgraph> {
     return this._call("graph.seed", params) as Promise<Subgraph>;
   }
 
   /** Hub-safe 1-hop neighbourhood around a node: neighbour + connecting-edge records. (access: read) */
-  graphExpand(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string; limit?: number }): Promise<Subgraph> {
+  graphExpand(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string; limit?: number; as_of?: number; as_of_ms?: number }): Promise<Subgraph> {
     return this._call("graph.expand", params) as Promise<Subgraph>;
   }
 
