@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
+use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
@@ -379,6 +380,23 @@ impl<'db> PlaneHandle<'db> {
     /// CLI's `query` command. Terminals work as usual.
     pub fn query_from_plan(&self, plan: LogicalPlan) -> QueryBuilder<'db> {
         QueryBuilder { plane: *self, plan }
+    }
+
+    /// Starts a graph-algorithm run in this plane (ROADMAP §1). Whole-plane by
+    /// default; scope to one label with [`AlgoBuilder::label`]. Each terminal
+    /// runs over a single read snapshot and returns a transient, read-only
+    /// result — no graph mutation:
+    ///
+    /// ```ignore
+    /// let ranks = plane.algo().pagerank(Default::default())?;   // [(id, score)]
+    /// let (comp, n) = plane.algo().label("Doc").connected_components()?;
+    /// let path = plane.algo().shortest_path(a, b, &Default::default())?;
+    /// ```
+    pub fn algo(&self) -> AlgoBuilder<'db> {
+        AlgoBuilder {
+            plane: *self,
+            label: None,
+        }
     }
 
     /// Declares (and builds) a vector index on `(label, property)` with
@@ -1103,5 +1121,74 @@ impl<'db> QueryBuilder<'db> {
             }
             Ok(out)
         })
+    }
+}
+
+/// A graph-algorithm run scoped to one plane (ROADMAP §1). Built with
+/// [`PlaneHandle::algo`]. Optionally narrowed to a single label; each terminal
+/// materializes the graph from one read snapshot and returns a transient,
+/// read-only result.
+#[derive(Clone)]
+pub struct AlgoBuilder<'db> {
+    plane: PlaneHandle<'db>,
+    label: Option<String>,
+}
+
+impl std::fmt::Debug for AlgoBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlgoBuilder")
+            .field("plane", &self.plane.id())
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl<'db> AlgoBuilder<'db> {
+    /// Restrict the run to nodes carrying `label` (and the edges among them);
+    /// otherwise the algorithm covers the whole plane.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Run `f` over a `CachedReader` bound to one read snapshot — the same
+    /// read path the query executor uses (memoizes decoded records/adjacency,
+    /// which the repeated neighbor/edge lookups here benefit from).
+    fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
+        let registry = self.plane.db.indexes();
+        let cache = &self.plane.db.cache;
+        self.plane.db.engine.with_read(|txn| {
+            let seq = graph::read_commit_seq(txn)?;
+            let reader = CachedReader::with_cache(txn, self.plane.id(), &registry, cache, seq);
+            f(&reader)
+        })
+    }
+
+    /// PageRank importance scores, sorted most-important first.
+    pub fn pagerank(&self, opts: PageRankOptions) -> Result<Vec<(NodeId, f64)>> {
+        self.with_reader(|r| algo::pagerank(r, self.label.as_deref(), opts))
+    }
+
+    /// Weakly connected components: `(node, representative)` for every node
+    /// (representative = smallest id in the component) plus the component count.
+    pub fn connected_components(&self) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
+        self.with_reader(|r| algo::connected_components(r, self.label.as_deref()))
+    }
+
+    /// Weighted shortest path from `src` to `dst`; `None` if unreachable or an
+    /// endpoint is outside the scope.
+    pub fn shortest_path(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        opts: &ShortestPathOptions,
+    ) -> Result<Option<algo::Path>> {
+        self.with_reader(|r| algo::shortest_path(r, self.label.as_deref(), src, dst, opts))
+    }
+
+    /// Louvain community detection: `(node, representative)` for every node
+    /// (representative = smallest id in the community) plus the community count.
+    pub fn louvain(&self, opts: LouvainOptions) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
+        self.with_reader(|r| algo::louvain(r, self.label.as_deref(), opts))
     }
 }
