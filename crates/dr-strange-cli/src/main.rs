@@ -141,7 +141,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Total model turns including tool calls and repairs.
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 8)]
         max_attempts: u32,
         /// Safety row cap appended when the plan declares none.
         #[arg(long, default_value_t = 100)]

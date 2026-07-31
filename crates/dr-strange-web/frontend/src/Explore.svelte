@@ -1082,7 +1082,7 @@
   <div class="canvas" bind:this={container}></div>
 
   {#if algoBusy}
-    <div class="plot-busy"><span class="spinner"></span> working…</div>
+    <div class="plot-progress" role="progressbar" aria-label="working"><div class="bar"></div></div>
   {/if}
 
   {#if status}

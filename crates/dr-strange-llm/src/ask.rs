@@ -38,7 +38,7 @@ pub struct AskOptions {
 impl Default for AskOptions {
     fn default() -> Self {
         Self {
-            max_attempts: 6,
+            max_attempts: 8,
             dry_run: false,
             limit: 100,
         }
@@ -82,21 +82,28 @@ pub fn ask(
     let mut turns = 0u32;
     let mut last_err = String::new();
 
-    for _ in 0..steps {
+    for i in 0..steps {
         turns += 1;
-        let user = if tools {
+        // Reserve the final turn for the plan, so a tool-happy model can't burn
+        // the whole budget searching and never answer.
+        let is_last = i + 1 == steps;
+        let user = if tools && !is_last {
             format!(
                 "{transcript}\n\nReply with ONE JSON object — a tool call \
                  ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
             )
+        } else if tools {
+            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan: {{\"plan\": …}}.")
         } else {
             format!("{transcript}\n\nReturn the plan JSON.")
         };
         let reply = chat.complete(&system, &user)?;
         let json = extract_json(&reply.text).to_string();
 
-        // A tool call short-circuits: run it, feed the result back, continue.
+        // A tool call short-circuits (but not on the final turn): run it, feed
+        // the result back, continue.
         if tools
+            && !is_last
             && let Some(call) = parse_tool_call(&json)
         {
             let result = run_tool(embedder.expect("tools ⇒ embedder"), plane, &catalog, &call);
@@ -138,7 +145,12 @@ pub fn ask(
             "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again.",
         ));
     }
-    bail!("couldn't produce a runnable plan after {turns} steps: {last_err}")
+    let reason = if last_err.is_empty() {
+        "the model kept calling tools without emitting a plan".to_string()
+    } else {
+        last_err
+    };
+    bail!("couldn't produce a runnable plan after {turns} steps: {reason}")
 }
 
 // ---- tools ----------------------------------------------------------------

@@ -142,7 +142,7 @@ struct Ask {
     /// Return the generated plan without executing it.
     #[serde(default)]
     dry_run: bool,
-    /// Total model attempts including repairs (default 3).
+    /// Total model turns including tool calls and repairs (default 8).
     #[serde(default)]
     max_attempts: Option<u32>,
     /// Safety row cap appended when the plan declares none (default 100).
@@ -577,7 +577,7 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
         dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
     });
     let opts = dr_strange_llm::AskOptions {
-        max_attempts: req.max_attempts.unwrap_or(6),
+        max_attempts: req.max_attempts.unwrap_or(8),
         dry_run: req.dry_run,
         limit: req.limit.unwrap_or(100),
     };
