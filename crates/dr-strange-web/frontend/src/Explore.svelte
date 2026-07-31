@@ -318,7 +318,7 @@
   }
 
   // Keyword autocomplete for the GraphQL/Cypher box: once the word being typed
-  // is >2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
+  // is ≥2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
   // shown after the caret; Tab accepts it.
   const CYPHER_KEYWORDS = [
     'MATCH', 'WHERE', 'RETURN', 'LIMIT', 'ORDER BY', 'SKIP', 'CREATE', 'MERGE',
@@ -327,7 +327,7 @@
   ]
   let cypherGhost = $derived.by(() => {
     const m = cypher.match(/([A-Za-z]+)$/) // the word currently being typed
-    if (!m || m[1].length < 3) return ''
+    if (!m || m[1].length < 2) return ''
     const up = m[1].toUpperCase()
     const kw = CYPHER_KEYWORDS.find((k) => k.startsWith(up) && k.length > up.length)
     return kw ? kw.slice(m[1].length) : ''
