@@ -702,10 +702,12 @@
     bind:value={hyQuery}
     onkeydown={(e) => e.key === 'Enter' && runHybrid()}
   />
+  <span class="algo-sp-label">label</span>
   <select bind:value={hyLabel} title="Label scope (required for the keyword channel)">
     <option value="">all labels</option>
     {#each labels as l (l)}<option value={l}>{l}</option>{/each}
   </select>
+  <span class="algo-sp-label">embed</span>
   <select bind:value={hyProvider} title="Embedding provider for the vector channel">
     {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
   </select>
