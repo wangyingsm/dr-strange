@@ -83,7 +83,17 @@ default weights; whether graph proximity is a third channel or a re-rank pass.
 
 ---
 
-## 3. Natural-language querying (NL→plan)  *(third)*
+## 3. Natural-language querying (NL→plan)  *(shipped)*
+
+**Status.** ✅ Shipped (2026-07-31). `dr_strange_llm::ask` grounds the model
+with the plane catalog + a compact LogicalPlan-JSON spec, emits a plan,
+deserializes it (read-only by construction — no write operators), runs it, and
+repairs on parse/exec error (bounded attempts); a safety `Limit` is appended
+and `dry_run` returns the validated plan without running. Surfaced on RPC
+`plane.ask`, CLI `drsg ask`, and MCP `ask` — each returns the generated plan
+(for transparency) + result rows. Chat key stays server-side. (Follow-ups: a
+web dashboard "Ask" panel; NL→vector search once the model can request an
+embedded phrase; `ask` on more surfaces.)
 
 **Goal.** Ask a question in English and get a graph answer: an LLM translates
 NL into a `LogicalPlan` (or openCypher-subset text) that the engine runs.
