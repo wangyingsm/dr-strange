@@ -112,6 +112,38 @@ authorized to call the API. To permit programmatic access from the SDKs or
 $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```
 
+### Configuration file
+
+Server, logging, and provider settings may be supplied through a TOML
+configuration file instead of individual flags and environment variables. The
+file is resolved from `--config <path>`, then `$DRSG_CONFIG`, then `./drsg.toml`
+if present. Unknown keys are rejected.
+
+```toml
+[server]
+addr = "0.0.0.0:7700"                       # bind address (CLI --addr overrides)
+token = "please-change-me"                  # shared API token (→ DRSG_TOKEN)
+max_concurrent = 256                        # ceiling on in-flight requests
+allowed_origins = ["https://app.example.com"]  # additional browser origins
+
+[server.tls]                                # present ⇒ serve HTTPS
+cert = "/etc/drsg/cert.pem"                 # PEM certificate chain
+key  = "/etc/drsg/key.pem"                  # PEM private key
+
+[logging]
+dir = "/var/log/drsg"                       # directory for the rolling log file
+
+[llm]                                       # provider keys, exported to the environment
+OPENAI_API_KEY = "sk-…"
+DEEPSEEK_API_KEY = "…"
+DASHSCOPE_API_KEY = "…"
+```
+
+Precedence is fixed: an environment variable already set in the process always
+takes precedence over the corresponding file value, and the `--addr` flag
+overrides `[server].addr`. Providing `[server.tls]` switches the server to
+HTTPS.
+
 ## Container image
 
 A multi-stage `Dockerfile` compiles the dashboard, builds the binary with the

@@ -102,6 +102,35 @@ $ drsg --db graph.drsg serve
 $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```
 
+### 配置文件
+
+服务、日志与提供方设置也可以通过一个 TOML 配置文件提供，而非逐个使用命令行标志与
+环境变量。配置文件的解析顺序为：`--config <路径>`，其次 `$DRSG_CONFIG`，再次为
+当前目录下的 `./drsg.toml`（若存在）。未知键将被拒绝。
+
+```toml
+[server]
+addr = "0.0.0.0:7700"                       # 监听地址（命令行 --addr 覆盖此项）
+token = "please-change-me"                  # 共享 API 令牌（→ DRSG_TOKEN）
+max_concurrent = 256                        # 并发请求上限
+allowed_origins = ["https://app.example.com"]  # 额外允许的浏览器来源
+
+[server.tls]                                # 存在此节 ⇒ 以 HTTPS 提供服务
+cert = "/etc/drsg/cert.pem"                 # PEM 证书链
+key  = "/etc/drsg/key.pem"                  # PEM 私钥
+
+[logging]
+dir = "/var/log/drsg"                       # 滚动日志文件所在目录
+
+[llm]                                       # 提供方密钥，导出至进程环境
+OPENAI_API_KEY = "sk-…"
+DEEPSEEK_API_KEY = "…"
+DASHSCOPE_API_KEY = "…"
+```
+
+优先级是固定的：进程中已设置的环境变量始终优先于配置文件中对应的取值，而 `--addr`
+标志覆盖 `[server].addr`。提供 `[server.tls]` 会将服务切换为 HTTPS。
+
 ## 容器镜像
 
 一个多阶段 `Dockerfile` 会编译仪表盘、构建内嵌该仪表盘的二进制，并产出一个精简的
