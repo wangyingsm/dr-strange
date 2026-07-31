@@ -229,6 +229,7 @@
       return
     }
     error = null
+    algoBusy = true
     try {
       const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(embedProvider)}`
       const res = await fetch(url, {
@@ -262,6 +263,8 @@
       status = `${out.count} nodes · ${out.edges.length} edges`
     } catch (e) {
       error = e.message
+    } finally {
+      algoBusy = false
     }
   }
 
@@ -362,12 +365,14 @@
     }
   }
 
-  function resetAlgo() {
-    plot.resetStyle()
+  // Clear any overlay/result and re-plot the plane's original graph (respecting
+  // the current label filter). Shared "Reset" for every tab.
+  async function resetView() {
     algoLegend = []
     hyResults = null
-    legend = plot.legendEntries()
-    status = 'view reset'
+    askResult = null
+    selected = null
+    await seed()
   }
 
   // ---- hybrid retrieval (ROADMAP §2) --------------------------------------
@@ -875,6 +880,7 @@
       </select>
     </label>
     <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
+    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear results and re-plot the original graph">Reset</button>
   </div>
 {:else if tab === 'algorithms'}
   <div class="algo-bar">
@@ -892,7 +898,7 @@
     </select>
     <button onclick={runShortestPath} disabled={algoBusy} title="Shortest path between the two nodes">Find path</button>
     <span class="algo-sep"></span>
-    <button class="ghost" onclick={resetAlgo} disabled={algoBusy} title="Restore normal colours and sizes">Reset</button>
+    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear overlays and re-plot the original graph">Reset</button>
   </div>
 {:else if tab === 'hybrid'}
   <div class="algo-bar hybrid-bar">
@@ -938,6 +944,8 @@
       <span class="hy-hint">No search index on this plane yet.</span>
       <button class="ghost" onclick={openIndexDialog}>＋ Declare an index</button>
     {/if}
+    <span class="algo-sep"></span>
+    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear results and re-plot the original graph">Reset</button>
   </div>
 {:else if tab === 'ask'}
   <div class="algo-bar hybrid-bar">
@@ -960,6 +968,8 @@
       <input type="checkbox" bind:checked={askDryRun} /> plan only
     </label>
     <button onclick={runAsk} disabled={algoBusy || !askQuestion.trim()} title="Turn the question into a read-only plan and run it">Ask</button>
+    <span class="algo-sep"></span>
+    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear the result and re-plot the original graph">Reset</button>
   </div>
 {/if}
 
@@ -1070,6 +1080,10 @@
 
 <div class="canvas-wrap">
   <div class="canvas" bind:this={container}></div>
+
+  {#if algoBusy}
+    <div class="plot-busy"><span class="spinner"></span> working…</div>
+  {/if}
 
   {#if status}
     <div class="plot-status">{status}</div>

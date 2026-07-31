@@ -749,6 +749,18 @@ nav button.active {
 .query-bar .run-btn:hover {
   filter: brightness(1.08);
 }
+.query-bar .ghost {
+  font: 14px system-ui;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+.query-bar .ghost:hover {
+  border-color: var(--accent);
+}
 
 /* ---- analyze bar (graph algorithms, ROADMAP §1) ---- */
 .algo-bar {
@@ -1005,6 +1017,34 @@ nav button.active {
   border-radius: 8px;
   padding: 0.35rem 0.6rem;
   pointer-events: none;
+}
+
+/* Busy overlay while a long op runs (Ask, hybrid, algorithms, a Cypher run). */
+.plot-busy {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  z-index: 5;
+  color: var(--muted);
+  font-size: 0.9rem;
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  pointer-events: none;
+}
+.spinner {
+  width: 1.4rem;
+  height: 1.4rem;
+  border: 2.5px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Right-docked full-height bar, sharing the right edge with the inspector:
