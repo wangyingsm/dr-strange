@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { rpc, liveStats, authHeaders } from './rpc.js'
   import CreatePlane from './CreatePlane.svelte'
+  import Icon from './Icon.svelte'
 
   let {
     plane = 'startup', // the app-wide current plane (for highlighting)
@@ -138,17 +139,20 @@
 {/if}
 
 <section class="health">
-  <div class="stat"><span class="n">{fmtNum(stats?.planes)}</span><span class="l">planes</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.nodes)}</span><span class="l">nodes</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.edges)}</span><span class="l">edges</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.labels)}</span><span class="l">labels</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.edge_types)}</span><span class="l">edge types</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.indexes)}</span><span class="l">indexes</span></div>
-  <div class="stat"><span class="n">{avgDegree}</span><span class="l">avg degree</span></div>
-  <div class="stat"><span class="n">{fmtNum(stats?.commit_seq)}</span><span class="l">commits</span></div>
+  <div class="stat"><Icon name="planes" size={22} /><div class="v"><span class="n">{fmtNum(stats?.planes)}</span><span class="l">planes</span></div></div>
+  <div class="stat"><Icon name="nodes" size={22} /><div class="v"><span class="n">{fmtNum(stats?.nodes)}</span><span class="l">nodes</span></div></div>
+  <div class="stat"><Icon name="edges" size={22} /><div class="v"><span class="n">{fmtNum(stats?.edges)}</span><span class="l">edges</span></div></div>
+  <div class="stat"><Icon name="labels" size={22} /><div class="v"><span class="n">{fmtNum(stats?.labels)}</span><span class="l">labels</span></div></div>
+  <div class="stat"><Icon name="edgetypes" size={22} /><div class="v"><span class="n">{fmtNum(stats?.edge_types)}</span><span class="l">edge types</span></div></div>
+  <div class="stat"><Icon name="indexes" size={22} /><div class="v"><span class="n">{fmtNum(stats?.indexes)}</span><span class="l">indexes</span></div></div>
+  <div class="stat"><Icon name="degree" size={22} /><div class="v"><span class="n">{avgDegree}</span><span class="l">avg degree</span></div></div>
+  <div class="stat"><Icon name="commits" size={22} /><div class="v"><span class="n">{fmtNum(stats?.commit_seq)}</span><span class="l">commits</span></div></div>
   <div class="stat">
-    <span class="n">{stats?.persistent ? fmtBytes(stats?.file_size) : 'in-mem'}</span>
-    <span class="l">on disk</span>
+    <Icon name="disk" size={22} />
+    <div class="v">
+      <span class="n">{stats?.persistent ? fmtBytes(stats?.file_size) : 'in-mem'}</span>
+      <span class="l">on disk</span>
+    </div>
   </div>
 </section>
 
