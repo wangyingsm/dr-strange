@@ -207,11 +207,19 @@ pub fn rpc_discover(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 
 // ---- methods --------------------------------------------------------------
 
-/// `db.stats` — the dashboard's health panel: plane/node/edge counts plus the
-/// file size when the backend is on disk.
+/// `db.stats` — the dashboard's health panel: plane/node/edge counts, soft-schema
+/// breadth (labels, edge types), declared search indexes, the commit sequence,
+/// and the file size when the backend is on disk.
 pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let planes = app(ctx.db.planes())?;
     let cat = app(ctx.db.catalog())?;
+    let commit_seq = app(ctx.db.commit_seq())?;
+    // Declared vector + keyword indexes across every plane.
+    let mut indexes = 0usize;
+    for (_, name) in &planes {
+        let plane = app(ctx.db.plane(name))?;
+        indexes += plane.vector_indexes().len() + plane.keyword_indexes().len();
+    }
     let file_size = ctx
         .db_path
         .and_then(|p| std::fs::metadata(p).ok())
@@ -220,6 +228,10 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         "planes": planes.len(),
         "nodes": cat.node_count,
         "edges": cat.edge_count,
+        "labels": cat.labels.len(),
+        "edge_types": cat.edge_types.len(),
+        "indexes": indexes,
+        "commit_seq": commit_seq,
         "persistent": ctx.db_path.is_some(),
         "file_size": file_size,
     }))

@@ -485,10 +485,14 @@
           "planes": { "type": "integer" },
           "nodes": { "type": "integer" },
           "edges": { "type": "integer" },
+          "labels": { "type": "integer", "description": "Distinct node labels across all planes." },
+          "edge_types": { "type": "integer", "description": "Distinct edge types across all planes." },
+          "indexes": { "type": "integer", "description": "Declared vector + keyword search indexes." },
+          "commit_seq": { "type": "integer", "description": "The current commit sequence (total committed writes)." },
           "persistent": { "type": "boolean" },
           "file_size": { "type": ["integer", "null"] }
         },
-        "required": ["planes", "nodes", "edges", "persistent"]
+        "required": ["planes", "nodes", "edges", "labels", "edge_types", "indexes", "commit_seq", "persistent"]
       }
     }
   }

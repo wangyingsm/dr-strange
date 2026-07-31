@@ -105,6 +105,13 @@
     return `${n.toFixed(i === 0 ? 0 : 1)} ${u[i]}`
   }
 
+  const fmtNum = (n) => (typeof n === 'number' ? n.toLocaleString() : '—')
+
+  // Mean undirected degree (each edge touches two nodes).
+  let avgDegree = $derived.by(() =>
+    stats?.nodes ? ((stats.edges * 2) / stats.nodes).toFixed(1) : '—',
+  )
+
   onMount(() => {
     rpc('db.stats')
       .then((s) => (stats = s))
@@ -131,9 +138,14 @@
 {/if}
 
 <section class="health">
-  <div class="stat"><span class="n">{stats?.planes ?? '—'}</span><span class="l">planes</span></div>
-  <div class="stat"><span class="n">{stats?.nodes ?? '—'}</span><span class="l">nodes</span></div>
-  <div class="stat"><span class="n">{stats?.edges ?? '—'}</span><span class="l">edges</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.planes)}</span><span class="l">planes</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.nodes)}</span><span class="l">nodes</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.edges)}</span><span class="l">edges</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.labels)}</span><span class="l">labels</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.edge_types)}</span><span class="l">edge types</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.indexes)}</span><span class="l">indexes</span></div>
+  <div class="stat"><span class="n">{avgDegree}</span><span class="l">avg degree</span></div>
+  <div class="stat"><span class="n">{fmtNum(stats?.commit_seq)}</span><span class="l">commits</span></div>
   <div class="stat">
     <span class="n">{stats?.persistent ? fmtBytes(stats?.file_size) : 'in-mem'}</span>
     <span class="l">on disk</span>
