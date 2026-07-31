@@ -15,7 +15,9 @@ pub mod error;
 pub mod index;
 #[cfg(feature = "json")]
 pub mod json;
+pub mod keyword;
 pub mod storage;
+pub mod text;
 pub mod types;
 
 pub use api::{AlgoBuilder, Database, PlaneHandle, QueryBuilder, WriteTxn};
@@ -25,6 +27,7 @@ pub use compute::{
     distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
+pub use text::{Analyzer, Language};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
 pub use storage::vector::Metric;
 pub use types::{

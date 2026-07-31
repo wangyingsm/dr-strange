@@ -26,17 +26,17 @@ pub use bulk::{BulkEdge, BulkEdgeById, BulkNode, BulkStats, bulk_load, bulk_load
 
 pub(crate) use meta::IdAllocator;
 pub use meta::{
-    DEFAULT_PLANE_NAME, FORMAT_VERSION, bump_commit_seq, create_plane, declare_vector_index,
-    drop_plane, init, intern_edge_type, intern_label, list_planes, list_vector_indexes,
-    lookup_edge_type, lookup_label, plane_id_by_name, read_commit_seq, read_plane, rename_plane,
-    resolve_label, set_plane_properties,
+    DEFAULT_PLANE_NAME, FORMAT_VERSION, bump_commit_seq, create_plane, declare_keyword_index,
+    declare_vector_index, drop_plane, init, intern_edge_type, intern_label, list_keyword_indexes,
+    list_planes, list_vector_indexes, lookup_edge_type, lookup_label, plane_id_by_name,
+    read_commit_seq, read_plane, rename_plane, resolve_label, set_plane_properties,
 };
 
 pub(crate) use node::insert_node;
 pub use node::{
     create_node, create_node_with_key, delete_node, get_node, get_node_by_external_key,
-    node_id_by_external_key, node_vector, remove_node_prop, scan_all, scan_label, set_node_labels,
-    set_node_prop,
+    node_id_by_external_key, node_text, node_vector, remove_node_prop, scan_all, scan_label,
+    set_node_labels, set_node_prop,
 };
 
 pub(crate) use edge::insert_edge;

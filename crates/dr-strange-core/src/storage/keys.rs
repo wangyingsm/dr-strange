@@ -40,11 +40,35 @@ pub fn vindex_decl_key(plane: PlaneId, label: &str, property: &str) -> Vec<u8> {
 
 /// Parses a `vidx:` declaration key back into `(plane, label, property)`.
 pub fn parse_vindex_decl_key(key: &[u8]) -> Result<(PlaneId, String, String)> {
+    parse_index_decl_key(VINDEX_PREFIX, key)
+}
+
+/// Keyword-index declarations, laid out exactly like [`VINDEX_PREFIX`] but
+/// under `kidx:`, value = the [`Language`](crate::text::Language) tag byte.
+pub const KINDEX_PREFIX: &[u8] = b"kidx:";
+
+pub fn kindex_decl_key(plane: PlaneId, label: &str, property: &str) -> Vec<u8> {
+    let mut k = KINDEX_PREFIX.to_vec();
+    k.extend_from_slice(&plane.0.to_be_bytes());
+    k.extend_from_slice(label.as_bytes());
+    k.push(0);
+    k.extend_from_slice(property.as_bytes());
+    k
+}
+
+/// Parses a `kidx:` declaration key back into `(plane, label, property)`.
+pub fn parse_kindex_decl_key(key: &[u8]) -> Result<(PlaneId, String, String)> {
+    parse_index_decl_key(KINDEX_PREFIX, key)
+}
+
+/// Shared parser for the `prefix · plane · label · \0 · property` layout used
+/// by both the vector- and keyword-index declaration keys.
+fn parse_index_decl_key(prefix: &[u8], key: &[u8]) -> Result<(PlaneId, String, String)> {
     let rest = key
-        .strip_prefix(VINDEX_PREFIX)
-        .ok_or_else(|| Error::Corrupt("vindex key missing prefix".into()))?;
+        .strip_prefix(prefix)
+        .ok_or_else(|| Error::Corrupt("index key missing prefix".into()))?;
     if rest.len() < 4 {
-        return Err(Error::Corrupt("vindex key too short".into()));
+        return Err(Error::Corrupt("index key too short".into()));
     }
     let plane = PlaneId(u32::from_be_bytes(
         rest[..4].try_into().expect("checked length"),
@@ -53,11 +77,11 @@ pub fn parse_vindex_decl_key(key: &[u8]) -> Result<(PlaneId, String, String)> {
     let sep = tail
         .iter()
         .position(|&b| b == 0)
-        .ok_or_else(|| Error::Corrupt("vindex key missing separator".into()))?;
+        .ok_or_else(|| Error::Corrupt("index key missing separator".into()))?;
     let label = String::from_utf8(tail[..sep].to_vec())
-        .map_err(|_| Error::Corrupt("bad vindex label".into()))?;
+        .map_err(|_| Error::Corrupt("bad index label".into()))?;
     let property = String::from_utf8(tail[sep + 1..].to_vec())
-        .map_err(|_| Error::Corrupt("bad vindex property".into()))?;
+        .map_err(|_| Error::Corrupt("bad index property".into()))?;
     Ok((plane, label, property))
 }
 

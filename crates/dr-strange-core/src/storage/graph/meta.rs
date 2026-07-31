@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::storage::engine::{ReadTransaction, TableId, WriteTransaction, prefix_successor};
 use crate::storage::vector::Metric;
 use crate::storage::{codec, keys};
+use crate::text::Language;
 use crate::types::{EdgeId, NodeId, PlaneId, Properties};
 
 /// v2 (M1): node records gained an inline `external_key` field
@@ -459,6 +460,57 @@ pub fn list_vector_indexes(
             .and_then(|&t| Metric::from_tag(t))
             .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
         out.push((plane, label, property, metric));
+    }
+    Ok(out)
+}
+
+// ---- keyword index declarations (ROADMAP §2) ------------------------------
+// Same durable-declaration model as vector indexes: only which
+// (plane,label,property) is keyword-indexed, and its analyzer language, lives
+// in `meta`; the BM25 index itself is rebuilt from the KV (see crate::keyword).
+
+/// Records that `(plane, label, property)` is keyword-indexed with `language`.
+/// Returns whether this was a new declaration. Errors if it already exists with
+/// a different language (re-declaring with the same language is idempotent).
+pub fn declare_keyword_index(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    label: &str,
+    property: &str,
+    language: Language,
+) -> Result<bool> {
+    let key = keys::kindex_decl_key(plane, label, property);
+    if let Some(existing) = txn.get(TableId::Meta, &key)? {
+        let current = existing
+            .first()
+            .and_then(|&t| Language::from_tag(t))
+            .ok_or_else(|| Error::Corrupt("bad kindex language tag".into()))?;
+        if current != language {
+            return Err(Error::InvalidArgument(format!(
+                "keyword index on {label}.{property} already exists with a different language"
+            )));
+        }
+        return Ok(false);
+    }
+    txn.put(TableId::Meta, &key, &[language.tag()])?;
+    Ok(true)
+}
+
+/// All declared keyword indexes, `(plane, label, property, language)`.
+pub fn list_keyword_indexes(
+    txn: &dyn ReadTransaction,
+) -> Result<Vec<(PlaneId, String, String, Language)>> {
+    let prefix = keys::KINDEX_PREFIX;
+    let end = prefix_successor(prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::Meta, prefix, end.as_deref())? {
+        let (key, value) = item?;
+        let (plane, label, property) = keys::parse_kindex_decl_key(&key)?;
+        let language = value
+            .first()
+            .and_then(|&t| Language::from_tag(t))
+            .ok_or_else(|| Error::Corrupt("bad kindex language tag".into()))?;
+        out.push((plane, label, property, language));
     }
     Ok(out)
 }

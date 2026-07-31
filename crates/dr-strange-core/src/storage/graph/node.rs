@@ -167,6 +167,23 @@ pub fn node_vector(
     })
 }
 
+/// Reads a node's `property` as text for the keyword index (ROADMAP §2): the
+/// value if it is a string, else `None` (mirrors [`node_vector`]).
+pub fn node_text(
+    txn: &dyn ReadTransaction,
+    plane: PlaneId,
+    id: NodeId,
+    property: &str,
+) -> Result<Option<String>> {
+    let Some(node) = get_node(txn, plane, id)? else {
+        return Ok(None);
+    };
+    Ok(match node.properties.get(property).map(|p| &p.value) {
+        Some(PropValue::Str(s)) => Some(s.clone()),
+        _ => None,
+    })
+}
+
 /// Sets (inserts or overwrites) one property on an existing node. Errors
 /// with `NotFound` if the node does not exist (unlike delete, a mutation
 /// needs somewhere real to land — arch/01 §4: properties may expand or
