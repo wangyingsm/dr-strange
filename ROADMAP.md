@@ -93,8 +93,12 @@ and `dry_run` returns the validated plan without running. Surfaced on RPC
 `plane.ask`, CLI `drsg ask`, MCP `ask`, and the web dashboard (an "Ask" tab in
 the Explore view that runs the plan, plots the results, and shows the generated
 plan JSON) — each returns the generated plan (for transparency) + result rows.
-Chat key stays server-side. (Follow-ups: NL→vector search once the model can
-request an embedded phrase.)
+Chat key stays server-side. **Agentic grounding:** given an embedder, `ask` is
+a ReAct tool loop — the model calls `find_edge` (embed a relationship phrase →
+rank real edge types, cross-lingual: 任职→EMPLOYED_AT) and `find_entity` (embed
+a name → vector-search node embeddings for the real key) before planning, so it
+stops guessing edge types / entity keys. (Follow-ups: NL→vector-search
+*operators* in the plan itself.)
 
 **Goal.** Ask a question in English and get a graph answer: an LLM translates
 NL into a `LogicalPlan` (or openCypher-subset text) that the engine runs.
