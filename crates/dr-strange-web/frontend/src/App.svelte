@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte'
   import { rpc } from './rpc.js'
+  import { loadPref, savePref } from './prefs.js'
   import Dashboard from './Dashboard.svelte'
   import Explore from './Explore.svelte'
   import Digest from './Digest.svelte'
@@ -10,12 +11,18 @@
 
   let view = $state('dashboard')
   let planes = $state([]) // [{ id, name, ... }]
-  let plane = $state('startup') // app-wide current plane (browse + search)
+  let plane = $state(loadPref('plane', 'startup')) // app-wide current plane
   let q = $state('') // search box
   let semantic = $state(false) // text substring vs embedding-similarity search
-  let embedProvider = $state('openai')
+  let embedProvider = $state(loadPref('embedProvider', 'openai'))
   let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
+
+  // Remember the current plane + provider across reloads.
+  $effect(() => {
+    savePref('plane', plane)
+    savePref('embedProvider', embedProvider)
+  })
 
   let nonce = 0
   let timer

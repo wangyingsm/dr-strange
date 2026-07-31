@@ -925,6 +925,25 @@ nav button.active {
   line-height: 1;
   padding: 0;
 }
+.hy-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.hy-head-actions .copy {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.68rem;
+  padding: 0.1rem 0.4rem;
+}
+.hy-head-actions .copy:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .hy-results ol {
   list-style: none;
   margin: 0;

@@ -1,6 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
   import { rpc, authHeaders } from './rpc.js'
+  import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import CreatePlane from './CreatePlane.svelte'
 
@@ -28,7 +29,7 @@
   let catLabels = $state({}) // full catalog: label -> { properties: { name -> { types } } }
   let labelFilter = $state('') // '' = all labels
   let cypher = $state('') // query-language text; '' = use the label seed
-  let embedProvider = $state('openai') // provider for a text SEARCH … NEAR "…"
+  let embedProvider = $state(loadPref('embedProvider', 'openai')) // text SEARCH … NEAR provider
   let selected = $state(null) // { kind: 'node'|'edge', data }
   let legend = $state([])
   let status = $state('')
@@ -41,7 +42,7 @@
   let algoLegend = $state([]) // [{ label, color }] for a group overlay
   let spFrom = $state('') // shortest-path source (id or @key)
   let spTo = $state('') // shortest-path target
-  let spDir = $state('out') // out | in | both
+  let spDir = $state(loadPref('spDir', 'out')) // out | in | both
 
   // Hybrid retrieval (ROADMAP §2): pick a node type first, then the channels it
   // supports. "all labels" (*) searches the whole plane semantically — keyword
@@ -52,7 +53,7 @@
   let useVector = $state(true) // want the semantic channel? (shown only when available)
   let useKeyword = $state(true) // want the keyword channel? (shown only when available)
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
-  let hyProvider = $state('openai') // embedding provider for the semantic channel
+  let hyProvider = $state(loadPref('hyProvider', 'openai')) // embedding provider for the semantic channel
   let hyResults = $state(null) // ranked hits | null
 
   // A label's embedding property from the catalog (a Vector-typed prop). Semantic
@@ -102,18 +103,30 @@
 
   // NL→plan (ROADMAP §3): ask a question, an LLM turns it into a read-only plan.
   let askQuestion = $state('')
-  let askProvider = $state('openai') // chat provider (key from the server env)
-  let askEmbed = $state('openai') // embed provider for find_edge/find_entity ('' = tools off)
+  let askProvider = $state(loadPref('askProvider', 'openai')) // chat provider (key from the server env)
+  let askEmbed = $state(loadPref('askEmbed', 'openai')) // embed provider for find_edge/find_entity ('' = tools off)
   let askDryRun = $state(false) // return the plan without running it
-  let askResult = $state(null) // { plan, ran, attempts, results, count } | null
+  let askResult = $state(null) // { plans, ran, attempts, results, count } | null
+  let copied = $state(false) // "copied" flash on the plan copy button
 
   // "Declare an index" dialog (so the dashboard never sends you to the CLI).
   let idxOpen = $state(false)
-  let idxKind = $state('keyword') // keyword | vector
+  let idxKind = $state(loadPref('idxKind', 'keyword')) // keyword | vector
   let idxLabel = $state('')
   let idxProperty = $state('')
-  let idxMetric = $state('cosine')
+  let idxMetric = $state(loadPref('idxMetric', 'cosine'))
   let idxError = $state(null)
+
+  // Remember dropdown selections across reloads.
+  $effect(() => {
+    savePref('embedProvider', embedProvider)
+    savePref('spDir', spDir)
+    savePref('hyProvider', hyProvider)
+    savePref('askProvider', askProvider)
+    savePref('askEmbed', askEmbed)
+    savePref('idxKind', idxKind)
+    savePref('idxMetric', idxMetric)
+  })
   // Candidate properties for the chosen label + kind: string props for keyword,
   // vector props for semantic (from the catalog's observed types). For the
   // "all labels" target, the union of matching-typed property names.
@@ -522,6 +535,20 @@
       error = e.message
     } finally {
       algoBusy = false
+    }
+  }
+
+  // Copy the generated plan JSON to the clipboard (brief "copied" flash).
+  let copyTimer
+  async function copyPlans() {
+    if (!askResult?.plans) return
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(askResult.plans, null, 2))
+      copied = true
+      clearTimeout(copyTimer)
+      copyTimer = setTimeout(() => (copied = false), 1200)
+    } catch {
+      error = 'clipboard copy failed'
     }
   }
 
@@ -1136,7 +1163,10 @@
           Plan · {askResult.attempts} attempt{askResult.attempts === 1 ? '' : 's'}
           {#if !askResult.ran} · dry run{:else} · {askResult.count} results{/if}
         </span>
-        <button class="close" onclick={() => (askResult = null)} aria-label="Close">×</button>
+        <span class="hy-head-actions">
+          <button class="copy" onclick={copyPlans} title="Copy the plan JSON">{copied ? 'copied' : 'copy'}</button>
+          <button class="close" onclick={() => (askResult = null)} aria-label="Close">×</button>
+        </span>
       </header>
       <pre>{JSON.stringify(askResult.plans, null, 2)}</pre>
     </div>

@@ -1,5 +1,6 @@
 <script>
   import { rpc, authHeaders } from './rpc.js'
+  import { loadPref, savePref } from './prefs.js'
   import CreatePlane from './CreatePlane.svelte'
 
   const PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
@@ -9,8 +10,14 @@
   let { plane, onPlaneCreated = () => {} } = $props()
   let newPlaneOpen = $state(false) // new-plane popup open?
   let text = $state('')
-  let chat = $state('openai')
-  let embed = $state('openai')
+  let chat = $state(loadPref('digestChat', 'openai'))
+  let embed = $state(loadPref('digestEmbed', 'openai'))
+
+  // Remember the provider selections across reloads.
+  $effect(() => {
+    savePref('digestChat', chat)
+    savePref('digestEmbed', embed)
+  })
   let noEmbed = $state(false)
   let link = $state(true)
   let proposal = $state(null) // { report, nodes, edges }
