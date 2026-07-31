@@ -116,19 +116,34 @@ public class Drsg extends Client {
             String plane,
             long id,
             String direction,
-            String type) {
+            String type,
+            Long asOf,
+            Long asOfMs) {
 
         public static PlaneNeighborsParams of(String plane, long id) {
-            return new PlaneNeighborsParams(plane, id, null, null);
+            return new PlaneNeighborsParams(plane, id, null, null, null, null);
         }
 
         public PlaneNeighborsParams withDirection(String direction) {
-            return new PlaneNeighborsParams(plane, id, direction, type);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
         }
 
         public PlaneNeighborsParams withType(String type) {
-            return new PlaneNeighborsParams(plane, id, direction, type);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
         }
+
+        public PlaneNeighborsParams withAsOf(Long asOf) {
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+        }
+
+        public PlaneNeighborsParams withAsOfMs(Long asOfMs) {
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+        }
+    }
+
+    public record PlaneHistoryResult(
+            Long oldest,
+            Long latest) {
     }
 
     public record PlaneSearchParams(
@@ -158,10 +173,20 @@ public class Drsg extends Client {
 
     public record PlaneQueryParams(
             String plane,
-            Map<String, Object> plan) {
+            Map<String, Object> plan,
+            Long asOf,
+            Long asOfMs) {
 
         public static PlaneQueryParams of(String plane, Map<String, Object> plan) {
-            return new PlaneQueryParams(plane, plan);
+            return new PlaneQueryParams(plane, plan, null, null);
+        }
+
+        public PlaneQueryParams withAsOf(Long asOf) {
+            return new PlaneQueryParams(plane, plan, asOf, asOfMs);
+        }
+
+        public PlaneQueryParams withAsOfMs(Long asOfMs) {
+            return new PlaneQueryParams(plane, plan, asOf, asOfMs);
         }
     }
 
@@ -190,44 +215,279 @@ public class Drsg extends Client {
             Long limit,
             Boolean semantic,
             String provider,
-            String embedModel) {
+            String embedModel,
+            Long asOf,
+            Long asOfMs) {
 
         public static PlaneFindParams of(String plane, String q) {
-            return new PlaneFindParams(plane, q, null, null, null, null);
+            return new PlaneFindParams(plane, q, null, null, null, null, null, null);
         }
 
         public PlaneFindParams withLimit(Long limit) {
-            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel);
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
         }
 
         public PlaneFindParams withSemantic(Boolean semantic) {
-            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel);
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
         }
 
         public PlaneFindParams withProvider(String provider) {
-            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel);
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
         }
 
         public PlaneFindParams withEmbedModel(String embedModel) {
-            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel);
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
+        }
+
+        public PlaneFindParams withAsOf(Long asOf) {
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
+        }
+
+        public PlaneFindParams withAsOfMs(Long asOfMs) {
+            return new PlaneFindParams(plane, q, limit, semantic, provider, embedModel, asOf, asOfMs);
+        }
+    }
+
+    public record PlaneAlgoParams(
+            String plane,
+            String algo,
+            String label,
+            Long limit,
+            Double damping,
+            Long maxIters,
+            Double tolerance,
+            Long src,
+            Long dst,
+            String dir,
+            String weight,
+            Long maxLevels,
+            Double minGain) {
+
+        public static PlaneAlgoParams of(String plane, String algo) {
+            return new PlaneAlgoParams(plane, algo, null, null, null, null, null, null, null, null, null, null, null);
+        }
+
+        public PlaneAlgoParams withLabel(String label) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withLimit(Long limit) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withDamping(Double damping) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withMaxIters(Long maxIters) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withTolerance(Double tolerance) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withSrc(Long src) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withDst(Long dst) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withDir(String dir) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withWeight(String weight) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withMaxLevels(Long maxLevels) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+
+        public PlaneAlgoParams withMinGain(Double minGain) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+        }
+    }
+
+    public record PlaneHybridParams(
+            String plane,
+            String q,
+            String label,
+            String vectorProp,
+            String keywordProp,
+            String metric,
+            Long graphHops,
+            Double graphDecay,
+            Double wVector,
+            Double wKeyword,
+            Double wGraph,
+            Long k,
+            Long candidates,
+            String provider,
+            String embedModel) {
+
+        public static PlaneHybridParams of(String plane, String q) {
+            return new PlaneHybridParams(plane, q, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        }
+
+        public PlaneHybridParams withLabel(String label) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withVectorProp(String vectorProp) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withKeywordProp(String keywordProp) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withMetric(String metric) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withGraphHops(Long graphHops) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withGraphDecay(Double graphDecay) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withWVector(Double wVector) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withWKeyword(Double wKeyword) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withWGraph(Double wGraph) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withK(Long k) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withCandidates(Long candidates) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withProvider(String provider) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+
+        public PlaneHybridParams withEmbedModel(String embedModel) {
+            return new PlaneHybridParams(plane, q, label, vectorProp, keywordProp, metric, graphHops, graphDecay, wVector, wKeyword, wGraph, k, candidates, provider, embedModel);
+        }
+    }
+
+    public record PlaneAskParams(
+            String plane,
+            String question,
+            Boolean dryRun,
+            Long maxAttempts,
+            Long limit,
+            String provider,
+            String model,
+            String embedProvider,
+            String embedModel) {
+
+        public static PlaneAskParams of(String plane, String question) {
+            return new PlaneAskParams(plane, question, null, null, null, null, null, null, null);
+        }
+
+        public PlaneAskParams withDryRun(Boolean dryRun) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withMaxAttempts(Long maxAttempts) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withLimit(Long limit) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withProvider(String provider) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withModel(String model) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withEmbedProvider(String embedProvider) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+
+        public PlaneAskParams withEmbedModel(String embedModel) {
+            return new PlaneAskParams(plane, question, dryRun, maxAttempts, limit, provider, model, embedProvider, embedModel);
+        }
+    }
+
+    public record PlaneIndexesParams(
+            String plane) {
+
+        public static PlaneIndexesParams of(String plane) {
+            return new PlaneIndexesParams(plane);
+        }
+    }
+
+    public record IndexEnsureParams(
+            String plane,
+            String label,
+            String property,
+            String kind,
+            String metric,
+            String language) {
+
+        public static IndexEnsureParams of(String plane, String label, String property) {
+            return new IndexEnsureParams(plane, label, property, null, null, null);
+        }
+
+        public IndexEnsureParams withKind(String kind) {
+            return new IndexEnsureParams(plane, label, property, kind, metric, language);
+        }
+
+        public IndexEnsureParams withMetric(String metric) {
+            return new IndexEnsureParams(plane, label, property, kind, metric, language);
+        }
+
+        public IndexEnsureParams withLanguage(String language) {
+            return new IndexEnsureParams(plane, label, property, kind, metric, language);
         }
     }
 
     public record GraphSeedParams(
             String plane,
             String label,
-            Long limit) {
+            Long limit,
+            Long asOf,
+            Long asOfMs) {
 
         public static GraphSeedParams of(String plane) {
-            return new GraphSeedParams(plane, null, null);
+            return new GraphSeedParams(plane, null, null, null, null);
         }
 
         public GraphSeedParams withLabel(String label) {
-            return new GraphSeedParams(plane, label, limit);
+            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
         }
 
         public GraphSeedParams withLimit(Long limit) {
-            return new GraphSeedParams(plane, label, limit);
+            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+        }
+
+        public GraphSeedParams withAsOf(Long asOf) {
+            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+        }
+
+        public GraphSeedParams withAsOfMs(Long asOfMs) {
+            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
         }
     }
 
@@ -236,22 +496,32 @@ public class Drsg extends Client {
             long id,
             String direction,
             String type,
-            Long limit) {
+            Long limit,
+            Long asOf,
+            Long asOfMs) {
 
         public static GraphExpandParams of(String plane, long id) {
-            return new GraphExpandParams(plane, id, null, null, null);
+            return new GraphExpandParams(plane, id, null, null, null, null, null);
         }
 
         public GraphExpandParams withDirection(String direction) {
-            return new GraphExpandParams(plane, id, direction, type, limit);
+            return new GraphExpandParams(plane, id, direction, type, limit, asOf, asOfMs);
         }
 
         public GraphExpandParams withType(String type) {
-            return new GraphExpandParams(plane, id, direction, type, limit);
+            return new GraphExpandParams(plane, id, direction, type, limit, asOf, asOfMs);
         }
 
         public GraphExpandParams withLimit(Long limit) {
-            return new GraphExpandParams(plane, id, direction, type, limit);
+            return new GraphExpandParams(plane, id, direction, type, limit, asOf, asOfMs);
+        }
+
+        public GraphExpandParams withAsOf(Long asOf) {
+            return new GraphExpandParams(plane, id, direction, type, limit, asOf, asOfMs);
+        }
+
+        public GraphExpandParams withAsOfMs(Long asOfMs) {
+            return new GraphExpandParams(plane, id, direction, type, limit, asOf, asOfMs);
         }
     }
 
@@ -515,6 +785,11 @@ public class Drsg extends Client {
         return call("plane.neighbors", params, new TypeReference<List<PlaneNeighborsItem>>() {});
     }
 
+    /** Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only). (access: read) */
+    public PlaneHistoryResult planeHistory() throws DrsgException {
+        return call("plane.history", null, new TypeReference<PlaneHistoryResult>() {});
+    }
+
     /** Vector top-k over a property; returns scored node records. (access: read) */
     public List<NodeRecord> planeSearch(PlaneSearchParams params) throws DrsgException {
         return call("plane.search", params, new TypeReference<List<NodeRecord>>() {});
@@ -533,6 +808,31 @@ public class Drsg extends Client {
     /** Text (or semantic) search over the plane's nodes and edges. (access: read) */
     public FindResult planeFind(PlaneFindParams params) throws DrsgException {
         return call("plane.find", params, new TypeReference<FindResult>() {});
+    }
+
+    /** Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+    public Map<String, Object> planeAlgo(PlaneAlgoParams params) throws DrsgException {
+        return call("plane.algo", params, new TypeReference<Map<String, Object>>() {});
+    }
+
+    /** Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side. (access: read) */
+    public Map<String, Object> planeHybrid(PlaneHybridParams params) throws DrsgException {
+        return call("plane.hybrid", params, new TypeReference<Map<String, Object>>() {});
+    }
+
+    /** Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env. (access: read) */
+    public Map<String, Object> planeAsk(PlaneAskParams params) throws DrsgException {
+        return call("plane.ask", params, new TypeReference<Map<String, Object>>() {});
+    }
+
+    /** The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist. (access: read) */
+    public Map<String, Object> planeIndexes(PlaneIndexesParams params) throws DrsgException {
+        return call("plane.indexes", params, new TypeReference<Map<String, Object>>() {});
+    }
+
+    /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+    public Map<String, Object> indexEnsure(IndexEnsureParams params) throws DrsgException {
+        return call("index.ensure", params, new TypeReference<Map<String, Object>>() {});
     }
 
     /** An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */

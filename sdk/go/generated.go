@@ -91,6 +91,13 @@ type PlaneNeighborsParams struct {
 	ID        int64   `json:"id"`
 	Direction *string `json:"direction,omitempty"`
 	Type      *string `json:"type,omitempty"`
+	AsOf      *int64  `json:"as_of,omitempty"`
+	AsOfMs    *int64  `json:"as_of_ms,omitempty"`
+}
+
+type PlaneHistoryResult struct {
+	Latest *int64 `json:"latest,omitempty"`
+	Oldest *int64 `json:"oldest,omitempty"`
 }
 
 type PlaneSearchParams struct {
@@ -103,8 +110,10 @@ type PlaneSearchParams struct {
 }
 
 type PlaneQueryParams struct {
-	Plane string         `json:"plane"`
-	Plan  map[string]any `json:"plan"`
+	Plane  string         `json:"plane"`
+	Plan   map[string]any `json:"plan"`
+	AsOf   *int64         `json:"as_of,omitempty"`
+	AsOfMs *int64         `json:"as_of_ms,omitempty"`
 }
 
 type PlaneCypherParams struct {
@@ -121,12 +130,75 @@ type PlaneFindParams struct {
 	Semantic   *bool   `json:"semantic,omitempty"`
 	Provider   *string `json:"provider,omitempty"`
 	EmbedModel *string `json:"embed_model,omitempty"`
+	AsOf       *int64  `json:"as_of,omitempty"`
+	AsOfMs     *int64  `json:"as_of_ms,omitempty"`
+}
+
+type PlaneAlgoParams struct {
+	Plane     string   `json:"plane"`
+	Algo      string   `json:"algo"`
+	Label     *string  `json:"label,omitempty"`
+	Limit     *int64   `json:"limit,omitempty"`
+	Damping   *float64 `json:"damping,omitempty"`
+	MaxIters  *int64   `json:"max_iters,omitempty"`
+	Tolerance *float64 `json:"tolerance,omitempty"`
+	Src       *int64   `json:"src,omitempty"`
+	Dst       *int64   `json:"dst,omitempty"`
+	Dir       *string  `json:"dir,omitempty"`
+	Weight    *string  `json:"weight,omitempty"`
+	MaxLevels *int64   `json:"max_levels,omitempty"`
+	MinGain   *float64 `json:"min_gain,omitempty"`
+}
+
+type PlaneHybridParams struct {
+	Plane       string   `json:"plane"`
+	Q           string   `json:"q"`
+	Label       *string  `json:"label,omitempty"`
+	VectorProp  *string  `json:"vector_prop,omitempty"`
+	KeywordProp *string  `json:"keyword_prop,omitempty"`
+	Metric      *string  `json:"metric,omitempty"`
+	GraphHops   *int64   `json:"graph_hops,omitempty"`
+	GraphDecay  *float64 `json:"graph_decay,omitempty"`
+	WVector     *float64 `json:"w_vector,omitempty"`
+	WKeyword    *float64 `json:"w_keyword,omitempty"`
+	WGraph      *float64 `json:"w_graph,omitempty"`
+	K           *int64   `json:"k,omitempty"`
+	Candidates  *int64   `json:"candidates,omitempty"`
+	Provider    *string  `json:"provider,omitempty"`
+	EmbedModel  *string  `json:"embed_model,omitempty"`
+}
+
+type PlaneAskParams struct {
+	Plane         string  `json:"plane"`
+	Question      string  `json:"question"`
+	DryRun        *bool   `json:"dry_run,omitempty"`
+	MaxAttempts   *int64  `json:"max_attempts,omitempty"`
+	Limit         *int64  `json:"limit,omitempty"`
+	Provider      *string `json:"provider,omitempty"`
+	Model         *string `json:"model,omitempty"`
+	EmbedProvider *string `json:"embed_provider,omitempty"`
+	EmbedModel    *string `json:"embed_model,omitempty"`
+}
+
+type PlaneIndexesParams struct {
+	Plane string `json:"plane"`
+}
+
+type IndexEnsureParams struct {
+	Plane    string  `json:"plane"`
+	Label    string  `json:"label"`
+	Property string  `json:"property"`
+	Kind     *string `json:"kind,omitempty"`
+	Metric   *string `json:"metric,omitempty"`
+	Language *string `json:"language,omitempty"`
 }
 
 type GraphSeedParams struct {
-	Plane string  `json:"plane"`
-	Label *string `json:"label,omitempty"`
-	Limit *int64  `json:"limit,omitempty"`
+	Plane  string  `json:"plane"`
+	Label  *string `json:"label,omitempty"`
+	Limit  *int64  `json:"limit,omitempty"`
+	AsOf   *int64  `json:"as_of,omitempty"`
+	AsOfMs *int64  `json:"as_of_ms,omitempty"`
 }
 
 type GraphExpandParams struct {
@@ -135,6 +207,8 @@ type GraphExpandParams struct {
 	Direction *string `json:"direction,omitempty"`
 	Type      *string `json:"type,omitempty"`
 	Limit     *int64  `json:"limit,omitempty"`
+	AsOf      *int64  `json:"as_of,omitempty"`
+	AsOfMs    *int64  `json:"as_of_ms,omitempty"`
 }
 
 type DigestRunParams struct {
@@ -271,6 +345,13 @@ func (c *Client) PlaneNeighbors(ctx context.Context, p PlaneNeighborsParams) ([]
 	return out, err
 }
 
+// PlaneHistory Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only). (access: read)
+func (c *Client) PlaneHistory(ctx context.Context) (*PlaneHistoryResult, error) {
+	var out *PlaneHistoryResult
+	err := c.call(ctx, "plane.history", nil, &out)
+	return out, err
+}
+
 // PlaneSearch Vector top-k over a property; returns scored node records. (access: read)
 func (c *Client) PlaneSearch(ctx context.Context, p PlaneSearchParams) ([]NodeRecord, error) {
 	var out []NodeRecord
@@ -296,6 +377,41 @@ func (c *Client) PlaneCypher(ctx context.Context, p PlaneCypherParams) (map[stri
 func (c *Client) PlaneFind(ctx context.Context, p PlaneFindParams) (*FindResult, error) {
 	var out *FindResult
 	err := c.call(ctx, "plane.find", p, &out)
+	return out, err
+}
+
+// PlaneAlgo Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read)
+func (c *Client) PlaneAlgo(ctx context.Context, p PlaneAlgoParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "plane.algo", p, &out)
+	return out, err
+}
+
+// PlaneHybrid Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side. (access: read)
+func (c *Client) PlaneHybrid(ctx context.Context, p PlaneHybridParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "plane.hybrid", p, &out)
+	return out, err
+}
+
+// PlaneAsk Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env. (access: read)
+func (c *Client) PlaneAsk(ctx context.Context, p PlaneAskParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "plane.ask", p, &out)
+	return out, err
+}
+
+// PlaneIndexes The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist. (access: read)
+func (c *Client) PlaneIndexes(ctx context.Context, p PlaneIndexesParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "plane.indexes", p, &out)
+	return out, err
+}
+
+// IndexEnsure Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin)
+func (c *Client) IndexEnsure(ctx context.Context, p IndexEnsureParams) (map[string]any, error) {
+	var out map[string]any
+	err := c.call(ctx, "index.ensure", p, &out)
 	return out, err
 }
 

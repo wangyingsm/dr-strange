@@ -30,10 +30,15 @@ struct json_object *drsg_node_get(drsg_client *c, const char *plane, const drsg_
 typedef struct {
     const char *direction;
     const char *type;
+    const int64_t *as_of;
+    const int64_t *as_of_ms;
 } drsg_plane_neighbors_opts;
 
 /* 1-hop expansion as {node, edge} id pairs. (access: read) */
 struct json_object *drsg_plane_neighbors(drsg_client *c, const char *plane, int64_t id, const drsg_plane_neighbors_opts *opts, drsg_error *err);
+
+/* Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only). (access: read) */
+struct json_object *drsg_plane_history(drsg_client *c, drsg_error *err);
 
 typedef struct {
     const char *label;
@@ -44,8 +49,13 @@ typedef struct {
 /* Vector top-k over a property; returns scored node records. (access: read) */
 struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const char *property, struct json_object *query, const drsg_plane_search_opts *opts, drsg_error *err);
 
+typedef struct {
+    const int64_t *as_of;
+    const int64_t *as_of_ms;
+} drsg_plane_query_opts;
+
 /* Run a serialized logical plan verbatim; returns scored rows. (access: read) */
-struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct json_object *plan, drsg_error *err);
+struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct json_object *plan, const drsg_plane_query_opts *opts, drsg_error *err);
 
 typedef struct {
     const char *embed;
@@ -60,6 +70,8 @@ typedef struct {
     const int *semantic;
     const char *provider;
     const char *embed_model;
+    const int64_t *as_of;
+    const int64_t *as_of_ms;
 } drsg_plane_find_opts;
 
 /* Text (or semantic) search over the plane's nodes and edges. (access: read) */
@@ -68,6 +80,69 @@ struct json_object *drsg_plane_find(drsg_client *c, const char *plane, const cha
 typedef struct {
     const char *label;
     const int64_t *limit;
+    const double *damping;
+    const int64_t *max_iters;
+    const double *tolerance;
+    const int64_t *src;
+    const int64_t *dst;
+    const char *dir;
+    const char *weight;
+    const int64_t *max_levels;
+    const double *min_gain;
+} drsg_plane_algo_opts;
+
+/* Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const char *algo, const drsg_plane_algo_opts *opts, drsg_error *err);
+
+typedef struct {
+    const char *label;
+    const char *vector_prop;
+    const char *keyword_prop;
+    const char *metric;
+    const int64_t *graph_hops;
+    const double *graph_decay;
+    const double *w_vector;
+    const double *w_keyword;
+    const double *w_graph;
+    const int64_t *k;
+    const int64_t *candidates;
+    const char *provider;
+    const char *embed_model;
+} drsg_plane_hybrid_opts;
+
+/* Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side. (access: read) */
+struct json_object *drsg_plane_hybrid(drsg_client *c, const char *plane, const char *q, const drsg_plane_hybrid_opts *opts, drsg_error *err);
+
+typedef struct {
+    const int *dry_run;
+    const int64_t *max_attempts;
+    const int64_t *limit;
+    const char *provider;
+    const char *model;
+    const char *embed_provider;
+    const char *embed_model;
+} drsg_plane_ask_opts;
+
+/* Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env. (access: read) */
+struct json_object *drsg_plane_ask(drsg_client *c, const char *plane, const char *question, const drsg_plane_ask_opts *opts, drsg_error *err);
+
+/* The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist. (access: read) */
+struct json_object *drsg_plane_indexes(drsg_client *c, const char *plane, drsg_error *err);
+
+typedef struct {
+    const char *kind;
+    const char *metric;
+    const char *language;
+} drsg_index_ensure_opts;
+
+/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const char *label, const char *property, const drsg_index_ensure_opts *opts, drsg_error *err);
+
+typedef struct {
+    const char *label;
+    const int64_t *limit;
+    const int64_t *as_of;
+    const int64_t *as_of_ms;
 } drsg_graph_seed_opts;
 
 /* An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
@@ -77,6 +152,8 @@ typedef struct {
     const char *direction;
     const char *type;
     const int64_t *limit;
+    const int64_t *as_of;
+    const int64_t *as_of_ms;
 } drsg_graph_expand_opts;
 
 /* Hub-safe 1-hop neighbourhood around a node: neighbour + connecting-edge records. (access: read) */

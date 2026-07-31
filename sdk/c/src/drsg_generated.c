@@ -69,9 +69,20 @@ struct json_object *drsg_plane_neighbors(drsg_client *c, const char *plane, int6
     if (opts) {
         if (opts->direction) json_object_object_add(p, "direction", json_object_new_string(opts->direction));
         if (opts->type) json_object_object_add(p, "type", json_object_new_string(opts->type));
+        if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
+        if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.neighbors", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only). (access: read) */
+struct json_object *drsg_plane_history(drsg_client *c, drsg_error *err) {
+    struct json_object *p = NULL;
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.history", p, &result, err);
     if (p) json_object_put(p);
     return rc == 0 ? result : NULL;
 }
@@ -94,10 +105,14 @@ struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const c
 }
 
 /* Run a serialized logical plan verbatim; returns scored rows. (access: read) */
-struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct json_object *plan, drsg_error *err) {
+struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct json_object *plan, const drsg_plane_query_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
     json_object_object_add(p, "plan", json_object_get(plan));
+    if (opts) {
+        if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
+        if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
+    }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.query", p, &result, err);
     if (p) json_object_put(p);
@@ -129,9 +144,108 @@ struct json_object *drsg_plane_find(drsg_client *c, const char *plane, const cha
         if (opts->semantic) json_object_object_add(p, "semantic", json_object_new_boolean(*opts->semantic));
         if (opts->provider) json_object_object_add(p, "provider", json_object_new_string(opts->provider));
         if (opts->embed_model) json_object_object_add(p, "embed_model", json_object_new_string(opts->embed_model));
+        if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
+        if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.find", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const char *algo, const drsg_plane_algo_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    json_object_object_add(p, "algo", json_object_new_string(algo));
+    if (opts) {
+        if (opts->label) json_object_object_add(p, "label", json_object_new_string(opts->label));
+        if (opts->limit) json_object_object_add(p, "limit", json_object_new_int64(*opts->limit));
+        if (opts->damping) json_object_object_add(p, "damping", json_object_new_double(*opts->damping));
+        if (opts->max_iters) json_object_object_add(p, "max_iters", json_object_new_int64(*opts->max_iters));
+        if (opts->tolerance) json_object_object_add(p, "tolerance", json_object_new_double(*opts->tolerance));
+        if (opts->src) json_object_object_add(p, "src", json_object_new_int64(*opts->src));
+        if (opts->dst) json_object_object_add(p, "dst", json_object_new_int64(*opts->dst));
+        if (opts->dir) json_object_object_add(p, "dir", json_object_new_string(opts->dir));
+        if (opts->weight) json_object_object_add(p, "weight", json_object_new_string(opts->weight));
+        if (opts->max_levels) json_object_object_add(p, "max_levels", json_object_new_int64(*opts->max_levels));
+        if (opts->min_gain) json_object_object_add(p, "min_gain", json_object_new_double(*opts->min_gain));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.algo", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side. (access: read) */
+struct json_object *drsg_plane_hybrid(drsg_client *c, const char *plane, const char *q, const drsg_plane_hybrid_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    json_object_object_add(p, "q", json_object_new_string(q));
+    if (opts) {
+        if (opts->label) json_object_object_add(p, "label", json_object_new_string(opts->label));
+        if (opts->vector_prop) json_object_object_add(p, "vector_prop", json_object_new_string(opts->vector_prop));
+        if (opts->keyword_prop) json_object_object_add(p, "keyword_prop", json_object_new_string(opts->keyword_prop));
+        if (opts->metric) json_object_object_add(p, "metric", json_object_new_string(opts->metric));
+        if (opts->graph_hops) json_object_object_add(p, "graph_hops", json_object_new_int64(*opts->graph_hops));
+        if (opts->graph_decay) json_object_object_add(p, "graph_decay", json_object_new_double(*opts->graph_decay));
+        if (opts->w_vector) json_object_object_add(p, "w_vector", json_object_new_double(*opts->w_vector));
+        if (opts->w_keyword) json_object_object_add(p, "w_keyword", json_object_new_double(*opts->w_keyword));
+        if (opts->w_graph) json_object_object_add(p, "w_graph", json_object_new_double(*opts->w_graph));
+        if (opts->k) json_object_object_add(p, "k", json_object_new_int64(*opts->k));
+        if (opts->candidates) json_object_object_add(p, "candidates", json_object_new_int64(*opts->candidates));
+        if (opts->provider) json_object_object_add(p, "provider", json_object_new_string(opts->provider));
+        if (opts->embed_model) json_object_object_add(p, "embed_model", json_object_new_string(opts->embed_model));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.hybrid", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env. (access: read) */
+struct json_object *drsg_plane_ask(drsg_client *c, const char *plane, const char *question, const drsg_plane_ask_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    json_object_object_add(p, "question", json_object_new_string(question));
+    if (opts) {
+        if (opts->dry_run) json_object_object_add(p, "dry_run", json_object_new_boolean(*opts->dry_run));
+        if (opts->max_attempts) json_object_object_add(p, "max_attempts", json_object_new_int64(*opts->max_attempts));
+        if (opts->limit) json_object_object_add(p, "limit", json_object_new_int64(*opts->limit));
+        if (opts->provider) json_object_object_add(p, "provider", json_object_new_string(opts->provider));
+        if (opts->model) json_object_object_add(p, "model", json_object_new_string(opts->model));
+        if (opts->embed_provider) json_object_object_add(p, "embed_provider", json_object_new_string(opts->embed_provider));
+        if (opts->embed_model) json_object_object_add(p, "embed_model", json_object_new_string(opts->embed_model));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.ask", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist. (access: read) */
+struct json_object *drsg_plane_indexes(drsg_client *c, const char *plane, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.indexes", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const char *label, const char *property, const drsg_index_ensure_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    json_object_object_add(p, "label", json_object_new_string(label));
+    json_object_object_add(p, "property", json_object_new_string(property));
+    if (opts) {
+        if (opts->kind) json_object_object_add(p, "kind", json_object_new_string(opts->kind));
+        if (opts->metric) json_object_object_add(p, "metric", json_object_new_string(opts->metric));
+        if (opts->language) json_object_object_add(p, "language", json_object_new_string(opts->language));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "index.ensure", p, &result, err);
     if (p) json_object_put(p);
     return rc == 0 ? result : NULL;
 }
@@ -143,6 +257,8 @@ struct json_object *drsg_graph_seed(drsg_client *c, const char *plane, const drs
     if (opts) {
         if (opts->label) json_object_object_add(p, "label", json_object_new_string(opts->label));
         if (opts->limit) json_object_object_add(p, "limit", json_object_new_int64(*opts->limit));
+        if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
+        if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "graph.seed", p, &result, err);
@@ -159,6 +275,8 @@ struct json_object *drsg_graph_expand(drsg_client *c, const char *plane, int64_t
         if (opts->direction) json_object_object_add(p, "direction", json_object_new_string(opts->direction));
         if (opts->type) json_object_object_add(p, "type", json_object_new_string(opts->type));
         if (opts->limit) json_object_object_add(p, "limit", json_object_new_int64(*opts->limit));
+        if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
+        if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "graph.expand", p, &result, err);
