@@ -20,6 +20,10 @@ pub mod storage;
 pub mod text;
 pub mod types;
 
+/// Time-travel address (ROADMAP §4) — only the native LSM backend keeps the
+/// prior versions AS OF needs, so the type ships only with `native-backend`.
+#[cfg(feature = "native-backend")]
+pub use api::AsOf;
 pub use api::{AlgoBuilder, Database, HybridBuilder, PlaneHandle, QueryBuilder, WriteTxn};
 pub use compute::{
     CatalogSnapshot, Connection, EdgeTypeStats, Expr, HybridHit, HybridWeights, LabelStats,
@@ -27,9 +31,9 @@ pub use compute::{
     SortKey, Source, Step, ValueType, distance, has_label, hops, lit, p, score, similarity,
 };
 pub use error::{Error, Result};
-pub use text::{Analyzer, Language};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
 pub use storage::vector::Metric;
+pub use text::{Analyzer, Language};
 pub use types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };

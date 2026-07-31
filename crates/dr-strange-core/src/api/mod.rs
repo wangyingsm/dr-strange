@@ -88,18 +88,17 @@ impl Engine {
     }
 
     /// Runs `f` over a read transaction pinned to a past commit `snapshot`
-    /// (time-travel / AS OF). Native-only: the other backends keep no prior
-    /// versions and reject it.
+    /// (time-travel / AS OF). Native-only — only the LSM engine keeps prior
+    /// versions — so the whole method is gated to it; a memory database (the
+    /// one other variant a native build can hold) has no history and errors.
+    #[cfg(feature = "native-backend")]
     fn with_read_at<T>(
         &self,
         snapshot: u64,
         f: impl FnOnce(&dyn ReadTransaction) -> Result<T>,
     ) -> Result<T> {
         match self {
-            #[cfg(feature = "native-backend")]
             Engine::Native(e) => f(&e.begin_read_at(snapshot)?),
-            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
-            Engine::Redb(_) => Err(no_time_travel()),
             Engine::Memory(_) => Err(no_time_travel()),
         }
     }
@@ -107,21 +106,20 @@ impl Engine {
     /// The latest committed sequence, and the oldest sequence retention keeps
     /// queryable — the inclusive snapshot window `[floor, latest]` time-travel
     /// may address. Native-only.
+    #[cfg(feature = "native-backend")]
     fn snapshot_window(&self) -> Result<(u64, u64)> {
         match self {
-            #[cfg(feature = "native-backend")]
             Engine::Native(e) => Ok((e.retained_floor(), e.committed_seq())),
-            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
-            Engine::Redb(_) => Err(no_time_travel()),
             Engine::Memory(_) => Err(no_time_travel()),
         }
     }
 }
 
-/// The error a non-native backend returns for any time-travel request.
+/// The error a memory database returns for a time-travel request (no history).
+#[cfg(feature = "native-backend")]
 fn no_time_travel() -> Error {
     Error::InvalidArgument(
-        "time-travel (AS OF) requires the native backend; this database uses another engine".into(),
+        "time-travel (AS OF) needs an on-disk native database; this one is in memory".into(),
     )
 }
 
@@ -143,9 +141,11 @@ fn now_millis() -> i64 {
 }
 
 /// A past point to read the graph at — the address for a time-travel (AS OF)
-/// query (ROADMAP §4). Resolved to a storage snapshot by the native backend;
-/// other backends reject it. Both forms use "at or before" semantics: a value
-/// between two commits resolves to the latest commit that is not after it.
+/// query (ROADMAP §4). Resolved to a storage snapshot by the native backend,
+/// the only engine that keeps the history AS OF needs — hence gated to it. Both
+/// forms use "at or before" semantics: a value between two commits resolves to
+/// the latest commit that is not after it.
+#[cfg(feature = "native-backend")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsOf {
     /// A commit sequence, as returned by [`Database::commit_seq`].
@@ -326,6 +326,7 @@ impl Database {
     /// The retained history window as commit sequences: `(oldest queryable,
     /// latest)` — the inclusive range [`AsOf::Seq`] can address. Native-only
     /// (time-travel needs the LSM engine's versioning).
+    #[cfg(feature = "native-backend")]
     pub fn history(&self) -> Result<(u64, u64)> {
         let (floor, latest) = self.engine.snapshot_window()?;
         let oldest = self
@@ -338,15 +339,14 @@ impl Database {
     }
 
     /// Bound how far back time-travel can reach: keep the last `keep_commits`
-    /// commits queryable (`None` ⇒ unbounded, the default). Native-only; a
-    /// no-op on other backends. Takes effect at the next compaction and never
-    /// resurrects versions an earlier compaction already reclaimed.
+    /// commits queryable (`None` ⇒ unbounded, the default). Takes effect at the
+    /// next compaction and never resurrects versions an earlier compaction
+    /// already reclaimed. A no-op on a memory database (no history to bound).
+    #[cfg(feature = "native-backend")]
     pub fn set_retention(&self, keep_commits: Option<u64>) {
-        #[cfg(feature = "native-backend")]
         if let Engine::Native(e) = &self.engine {
             e.set_retention(keep_commits);
         }
-        let _ = keep_commits;
     }
 
     /// Resolve a time-travel address ([`AsOf`]) to the storage snapshot to pin.
@@ -357,6 +357,7 @@ impl Database {
     /// non-decreasing in the storage snapshot, so the target snapshot is the
     /// binary-search boundary over the retained window — O(log history) small
     /// meta reads, no per-commit index to maintain.
+    #[cfg(feature = "native-backend")]
     fn resolve_as_of(&self, at: AsOf) -> Result<u64> {
         let (floor, latest) = self.engine.snapshot_window()?;
         match at {
@@ -385,6 +386,7 @@ impl Database {
     /// Largest snapshot in `[floor, latest]` whose `probe` value is `<= target`
     /// (the value is monotonic non-decreasing in the snapshot). Errors if even
     /// `floor` is already past `target` — the point predates retained history.
+    #[cfg(feature = "native-backend")]
     fn search_at_or_before<V: Ord + Copy>(
         &self,
         floor: u64,
@@ -444,6 +446,7 @@ impl Database {
         Ok(PlaneHandle {
             db: self,
             id,
+            #[cfg(feature = "native-backend")]
             as_of: None,
         })
     }
@@ -458,6 +461,7 @@ impl Database {
         Ok(PlaneHandle {
             db: self,
             id,
+            #[cfg(feature = "native-backend")]
             as_of: None,
         })
     }
@@ -497,6 +501,8 @@ pub struct PlaneHandle<'db> {
     /// When set, every read on this handle is pinned to this past storage
     /// snapshot (time-travel / AS OF, ROADMAP §4) instead of the latest commit.
     /// Reads only — writes always target the current state. `None` ⇒ live.
+    /// Gated to the native backend, the only one that can be time-travelled.
+    #[cfg(feature = "native-backend")]
     as_of: Option<u64>,
 }
 
@@ -516,15 +522,17 @@ impl<'db> PlaneHandle<'db> {
     /// and lookup made through it sees the state at that commit. Read-only:
     /// writes on the returned handle still target the current state.
     ///
-    /// Native backend only; errors on other engines, or if the point is older
+    /// Native backend only (hence gated to it); errors if the point is older
     /// than the retained history. A point beyond the latest commit clamps to
     /// the latest (i.e. "now").
+    #[cfg(feature = "native-backend")]
     pub fn as_of(mut self, at: AsOf) -> Result<Self> {
         self.as_of = Some(self.db.resolve_as_of(at)?);
         Ok(self)
     }
 
     /// The snapshot this handle reads at, if it is time-travelling.
+    #[cfg(feature = "native-backend")]
     pub fn as_of_snapshot(&self) -> Option<u64> {
         self.as_of
     }
@@ -532,11 +540,13 @@ impl<'db> PlaneHandle<'db> {
     /// Run `f` over a read txn — pinned to this handle's `as_of` snapshot when
     /// time-travelling, else the latest committed snapshot. The single seam
     /// every read on this handle flows through, so AS OF applies uniformly.
+    /// On non-native builds there is no `as_of`, so it is always the latest.
     fn with_read<T>(&self, f: impl FnOnce(&dyn ReadTransaction) -> Result<T>) -> Result<T> {
-        match self.as_of {
-            Some(snapshot) => self.db.engine.with_read_at(snapshot, f),
-            None => self.db.engine.with_read(f),
+        #[cfg(feature = "native-backend")]
+        if let Some(snapshot) = self.as_of {
+            return self.db.engine.with_read_at(snapshot, f);
         }
+        self.db.engine.with_read(f)
     }
 
     /// Like [`with_read`](Self::with_read) but hands `f` a full
