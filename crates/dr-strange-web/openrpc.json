@@ -181,7 +181,7 @@
         { "name": "embed_provider", "required": false, "schema": { "type": "string" } },
         { "name": "embed_model", "required": false, "schema": { "type": "string" } }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "{plan, ran, attempts, results:[node…], edges:[edge…], count} — the matched subgraph (nodes + connecting edges)." } }
+      "result": { "name": "result", "schema": { "type": "object", "description": "{plans:[plan…], ran, attempts, results:[node…], edges:[edge…], count} — the generated plan(s) and their unioned matched subgraph (nodes + connecting edges)." } }
     },
     {
       "name": "plane.indexes",

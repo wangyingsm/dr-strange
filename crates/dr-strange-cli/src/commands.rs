@@ -532,8 +532,13 @@ pub fn ask(
         &opts,
     )?;
     let plural = if res.attempts == 1 { "" } else { "s" };
-    writeln!(out, "plan ({} attempt{plural}):", res.attempts)?;
-    writeln!(out, "{}", serde_json::to_string_pretty(&res.plan)?)?;
+    writeln!(
+        out,
+        "{} plan(s) ({} turn{plural}):",
+        res.plans.len(),
+        res.attempts
+    )?;
+    writeln!(out, "{}", serde_json::to_string_pretty(&res.plans)?)?;
     if res.ran {
         writeln!(
             out,

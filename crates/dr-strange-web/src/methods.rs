@@ -861,13 +861,13 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         &opts,
     )
     .map_err(|e| RpcError::server(e.to_string()))?;
-    let plan = serde_json::to_value(&res.plan).map_err(|e| RpcError::server(e.to_string()))?;
-    // The matched subgraph: nodes + the edges among them, so the answer plots
-    // connected (source + traversal), not as disconnected endpoints.
+    let plans = serde_json::to_value(&res.plans).map_err(|e| RpcError::server(e.to_string()))?;
+    // The matched subgraph: nodes + the edges among them (union of all plans),
+    // so the answer plots connected, not as disconnected endpoints.
     let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
     let edges: Vec<Value> = res.edges.iter().map(edge_to_json).collect();
     Ok(jval!({
-        "plan": plan,
+        "plans": plans,
         "ran": res.ran,
         "attempts": res.attempts,
         "results": results,

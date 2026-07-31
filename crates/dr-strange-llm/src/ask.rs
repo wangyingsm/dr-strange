@@ -45,13 +45,14 @@ impl Default for AskOptions {
     }
 }
 
-/// The outcome of an [`ask`]: the plan that ran (or would run), how many model
-/// turns it took, and the matched **subgraph** — the nodes and the edges among
-/// them (source + traversal), so the answer plots as a connected graph rather
-/// than disconnected endpoints. Both empty when `dry_run`.
+/// The outcome of an [`ask`]: the plan(s) that ran (or would run), how many
+/// model turns it took, and the matched **subgraph** — the union of every
+/// plan's nodes and the edges among them, so a compound question ("X's
+/// companies AND X's projects") plots as one connected graph. A single-traversal
+/// question yields one plan; nodes/edges are empty when `dry_run`.
 #[derive(Debug)]
 pub struct AskResult {
-    pub plan: LogicalPlan,
+    pub plans: Vec<LogicalPlan>,
     pub attempts: u32,
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
@@ -96,7 +97,7 @@ pub fn ask(
                  ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
             )
         } else if tools {
-            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan: {{\"plan\": …}}.")
+            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s): {{\"plan\": …}} or {{\"plans\": […]}}.")
         } else {
             format!("{transcript}\n\nReturn the plan JSON.")
         };
@@ -118,32 +119,37 @@ pub fn ask(
             continue;
         }
 
-        // Otherwise it should be a plan (bare or wrapped in {"plan": …}).
-        match serde_json::from_str::<LogicalPlan>(&unwrap_plan(&json)) {
-            Ok(mut plan) => {
-                ensure_limit(&mut plan, opts.limit);
+        // Otherwise it should be a plan, or several: {"plan": …}, a bare plan
+        // object, or {"plans": [ … ]} for a compound question.
+        match parse_plans(&json) {
+            Ok(mut plans) if !plans.is_empty() => {
+                for p in &mut plans {
+                    ensure_limit(p, opts.limit);
+                }
                 if opts.dry_run {
                     return Ok(AskResult {
-                        plan,
+                        plans,
                         attempts: turns,
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         ran: false,
                     });
                 }
-                match plane.query_from_plan(plan.clone()).subgraph() {
+                // Run each plan and union their subgraphs into one graph.
+                match run_plans(plane, &plans) {
                     Ok((nodes, edges)) => {
                         return Ok(AskResult {
-                            plan,
+                            plans,
                             attempts: turns,
                             nodes,
                             edges,
                             ran: true,
                         });
                     }
-                    Err(e) => last_err = format!("running that plan failed: {e}"),
+                    Err(e) => last_err = format!("running the plan(s) failed: {e}"),
                 }
             }
+            Ok(_) => last_err = "you returned an empty plan list".to_string(),
             Err(e) => last_err = format!("that was not a valid tool call or plan JSON: {e}"),
         }
         transcript.push_str(&format!(
@@ -327,15 +333,44 @@ fn ensure_limit(plan: &mut LogicalPlan, limit: u64) {
     }
 }
 
-/// Unwrap a `{"plan": <plan>}` envelope to the inner plan; otherwise return the
-/// JSON unchanged (a bare plan object).
-fn unwrap_plan(json: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json)
-        && let Some(plan) = v.get("plan")
-    {
-        return plan.to_string();
+/// Parse the model's final answer into one or more plans: `{"plans": [ … ]}`
+/// (compound question), `{"plan": <p>}`, or a bare plan object.
+fn parse_plans(json: &str) -> Result<Vec<LogicalPlan>> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    if let Some(arr) = v.get("plans").and_then(|p| p.as_array()) {
+        arr.iter()
+            .map(|p| serde_json::from_value::<LogicalPlan>(p.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    } else if let Some(p) = v.get("plan") {
+        Ok(vec![serde_json::from_value(p.clone())?])
+    } else {
+        Ok(vec![serde_json::from_value(v)?])
     }
-    json.to_string()
+}
+
+/// Run every plan and union the matched subgraphs (nodes by id, edges by id) —
+/// so several traversals from the same entity become one connected graph.
+fn run_plans(
+    plane: &PlaneHandle<'_>,
+    plans: &[LogicalPlan],
+) -> Result<(Vec<NodeRecord>, Vec<EdgeRecord>)> {
+    use std::collections::BTreeMap;
+    let mut nodes: BTreeMap<u64, NodeRecord> = BTreeMap::new();
+    let mut edges: BTreeMap<u64, EdgeRecord> = BTreeMap::new();
+    for plan in plans {
+        let (ns, es) = plane
+            .query_from_plan(plan.clone())
+            .subgraph()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for n in ns {
+            nodes.entry(n.id.0).or_insert(n);
+        }
+        for e in es {
+            edges.entry(e.id.0).or_insert(e);
+        }
+    }
+    Ok((nodes.into_values().collect(), edges.into_values().collect()))
 }
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
@@ -363,9 +398,10 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            closest real edge types with their src→dst.\n\
          - {\"tool\":\"find_entity\",\"query\":\"<name or description>\",\"label\":\"<Label>\"|null} → \
            matching nodes as {key,label,description}. Use the returned `key` in SeekKeys.\n\
-         - {\"plan\": <the LogicalPlan>} → your final answer.\n\
+         - {\"plan\": <the LogicalPlan>} → your final answer (or {\"plans\": [<plan>, …]} for a \
+           compound question — see below).\n\
          Flow: find_edge for each relationship in the question, find_entity for each named entity, \
-         THEN emit {\"plan\":…} using the EXACT edge types and keys returned. Keep tool queries short.\n"
+         THEN emit the plan(s) using the EXACT edge types and keys returned. Keep tool queries short.\n"
     } else {
         ""
     };
@@ -413,14 +449,19 @@ fn system_prompt(catalog: &CatalogSnapshot, tools: bool) -> String {
            when the edge reaches SEVERAL distinct kinds and the question wants just that one. Do NOT \
            filter when the question's category covers all the edge's targets (e.g. 任职/employed-at → \
            Company AND Organization are both employers → return both, no filter).\n\
+         - A plan is a SINGLE linear traversal from one source and CANNOT branch. For a compound \
+           question asking two different things about an entity (e.g. \"X's companies AND X's \
+           projects\"), return MULTIPLE plans — {{\"plans\": [<planA>, <planB>]}} — one per \
+           sub-question, each starting from that entity. Their subgraphs are unioned into one graph. \
+           Never chain unrelated relationships into one pipeline.\n\
          - Read-only: never invent write operations. Do NOT use vector/similarity operators.\n\
          - A Filter's Expr must yield a Bool (top-level Compare/HasLabel/Logic/Not/IsNull).\n\
          \n\
          Examples:\n\
          Q: \"which companies does bob work at\"  (EMPLOYED_AT → Company, Organization are all employers → no label filter)\n\
          {{\"plan\":{{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"EMPLOYED_AT\"}}}}]}}}}\n\
-         Q: \"what products did acme develop\"  (DEVELOPED reaches Product/Tool/System → narrow to the asked kind)\n\
-         {{\"plan\":{{\"source\":{{\"SeekKeys\":[\"acme\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"DEVELOPED\"}}}},{{\"Filter\":{{\"HasLabel\":\"Product\"}}}}]}}}}\n\
+         Q: \"which companies does bob work at, and what projects did he do\"  (compound → one plan per part, unioned)\n\
+         {{\"plans\":[{{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"EMPLOYED_AT\"}}}}]}},{{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"WORKS_ON\"}}}}]}}]}}\n\
          \n\
          SCHEMA (plane has {} nodes, {} edges):\n{}",
         catalog.node_count,
@@ -558,6 +599,21 @@ mod tests {
     }
 
     #[test]
+    fn compound_question_unions_multiple_plans() {
+        let db = seeded();
+        let plane = db.plane("startup").unwrap();
+        // Two plans: recent papers + all authors. Their subgraphs union.
+        let two = format!(
+            r#"{{"plans":[{PLAN_2020},{{"source":{{"ScanLabel":"Author"}},"steps":[]}}]}}"#
+        );
+        let chat = MockProvider::new(vec![two], 4);
+        let res = ask(&chat, None, &plane, "recent papers and authors", &AskOptions::default())
+            .unwrap();
+        assert_eq!(res.plans.len(), 2);
+        assert_eq!(res.nodes.len(), 3); // 2 papers (≥2020) + 1 author, deduped union
+    }
+
+    #[test]
     fn repairs_after_a_bad_plan() {
         let db = seeded();
         let plane = db.plane("startup").unwrap();
@@ -578,7 +634,8 @@ mod tests {
         };
         let res = ask(&chat, None, &plane, "recent papers", &opts).unwrap();
         assert!(!res.ran && res.nodes.is_empty());
-        assert!(matches!(res.plan.steps.last(), Some(Step::Limit(100))));
+        assert_eq!(res.plans.len(), 1);
+        assert!(matches!(res.plans[0].steps.last(), Some(Step::Limit(100))));
     }
 
     #[test]

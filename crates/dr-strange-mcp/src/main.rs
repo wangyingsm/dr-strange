@@ -601,7 +601,7 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
         })
         .collect();
     Ok(jval!({
-        "plan": serde_json::to_value(&res.plan)?,
+        "plans": serde_json::to_value(&res.plans)?,
         "ran": res.ran,
         "attempts": res.attempts,
         "results": results,

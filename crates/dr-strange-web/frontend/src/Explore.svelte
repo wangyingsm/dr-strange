@@ -1138,7 +1138,7 @@
         </span>
         <button class="close" onclick={() => (askResult = null)} aria-label="Close">×</button>
       </header>
-      <pre>{JSON.stringify(askResult.plan, null, 2)}</pre>
+      <pre>{JSON.stringify(askResult.plans, null, 2)}</pre>
     </div>
   {/if}
 
