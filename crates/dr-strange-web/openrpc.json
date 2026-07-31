@@ -68,9 +68,18 @@
         { "name": "plane", "required": true, "schema": { "type": "string" } },
         { "name": "id", "required": true, "schema": { "type": "integer" } },
         { "name": "direction", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
-        { "name": "type", "required": false, "schema": { "type": "string" } }
+        { "name": "type", "required": false, "schema": { "type": "string" } },
+        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: pin the read to this past commit sequence (native backend only)." },
+        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: pin the read to the latest commit at or before this unix-epoch millisecond (native backend only)." }
       ],
       "result": { "name": "hops", "schema": { "type": "array", "items": { "type": "object", "properties": { "node": { "type": "integer" }, "edge": { "type": "integer" } } } } }
+    },
+    {
+      "name": "plane.history",
+      "summary": "Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only).",
+      "x-access": "read",
+      "params": [],
+      "result": { "name": "window", "schema": { "type": "object", "properties": { "oldest": { "type": "integer" }, "latest": { "type": "integer" } } } }
     },
     {
       "name": "plane.search",
@@ -92,7 +101,9 @@
       "x-access": "read",
       "params": [
         { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "plan", "required": true, "schema": { "type": "object", "description": "A serialized core LogicalPlan." } }
+        { "name": "plan", "required": true, "schema": { "type": "object", "description": "A serialized core LogicalPlan." } },
+        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: run the plan against this past commit sequence (native backend only)." },
+        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: run the plan against the latest commit at or before this unix-epoch millisecond (native backend only)." }
       ],
       "result": { "name": "rows", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } } }
     },

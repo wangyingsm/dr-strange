@@ -187,6 +187,7 @@ const METHODS: &[&str] = &[
     "plane.list",
     "plane.catalog",
     "node.get",
+    "plane.history",
     "plane.neighbors",
     "plane.search",
     "plane.query",
@@ -240,6 +241,7 @@ fn dispatch_method(
         "plane.list" => guarded!(Access::Read, methods::plane_list(ctx)),
         "plane.catalog" => guarded!(Access::Read, methods::plane_catalog(ctx, params)),
         "node.get" => guarded!(Access::Read, methods::node_get(ctx, params)),
+        "plane.history" => guarded!(Access::Read, methods::plane_history(ctx, params)),
         "plane.neighbors" => guarded!(Access::Read, methods::plane_neighbors(ctx, params)),
         "plane.search" => guarded!(Access::Read, methods::plane_search(ctx, params)),
         "plane.query" => guarded!(Access::Read, methods::plane_query(ctx, params)),
@@ -628,13 +630,22 @@ mod tests {
         let d2 = {
             let mut txn = plane.write().unwrap();
             let mk = |body: &str| -> Properties {
-                [("body".to_string(), PropDesc::new(PropValue::Str(body.into())))]
-                    .into_iter()
-                    .collect()
+                [(
+                    "body".to_string(),
+                    PropDesc::new(PropValue::Str(body.into())),
+                )]
+                .into_iter()
+                .collect()
             };
-            let d0 = txn.create_node(&["Doc"], mk("graph databases store data")).unwrap();
-            let _d1 = txn.create_node(&["Doc"], mk("vector search similarity")).unwrap();
-            let d2 = txn.create_node(&["Doc"], mk("graph graph graph queries")).unwrap();
+            let d0 = txn
+                .create_node(&["Doc"], mk("graph databases store data"))
+                .unwrap();
+            let _d1 = txn
+                .create_node(&["Doc"], mk("vector search similarity"))
+                .unwrap();
+            let d2 = txn
+                .create_node(&["Doc"], mk("graph graph graph queries"))
+                .unwrap();
             txn.create_edge(d0, d2, "LINKS", Properties::new()).unwrap();
             txn.commit().unwrap();
             d2
@@ -665,8 +676,14 @@ mod tests {
         {
             let mut txn = plane.write().unwrap();
             let props: Properties = [
-                ("body".to_string(), PropDesc::new(PropValue::Str("graph text".into()))),
-                ("emb".to_string(), PropDesc::new(PropValue::Vector(vec![0.0, 1.0]))),
+                (
+                    "body".to_string(),
+                    PropDesc::new(PropValue::Str("graph text".into())),
+                ),
+                (
+                    "emb".to_string(),
+                    PropDesc::new(PropValue::Vector(vec![0.0, 1.0])),
+                ),
             ]
             .into_iter()
             .collect();
@@ -700,8 +717,14 @@ mod tests {
         {
             let mut txn = plane.write().unwrap();
             let props: Properties = [
-                ("body".to_string(), PropDesc::new(PropValue::Str("graph text".into()))),
-                ("emb".to_string(), PropDesc::new(PropValue::Vector(vec![0.0, 1.0]))),
+                (
+                    "body".to_string(),
+                    PropDesc::new(PropValue::Str("graph text".into())),
+                ),
+                (
+                    "emb".to_string(),
+                    PropDesc::new(PropValue::Vector(vec![0.0, 1.0])),
+                ),
             ]
             .into_iter()
             .collect();

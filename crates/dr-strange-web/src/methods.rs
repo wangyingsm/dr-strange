@@ -12,6 +12,9 @@ use dr_strange_core::{
     LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
     ShortestPathOptions, json,
 };
+// Time-travel address type — ships only with the native backend (ROADMAP §4).
+#[cfg(feature = "native-backend")]
+use dr_strange_core::AsOf;
 use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
@@ -36,6 +39,52 @@ fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
 /// bad plan), so they ride the server-error code, not `-32603 internal`.
 fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
     r.map_err(|e| RpcError::server(e.to_string()))
+}
+
+/// Optional time-travel address on a read request (ROADMAP §4): pin the read to
+/// a past commit `as_of` (sequence) or `as_of_ms` (unix-epoch milliseconds). At
+/// most one; `#[serde(flatten)]` this into a request struct.
+#[derive(Deserialize, Default)]
+pub struct AsOfParams {
+    #[serde(default)]
+    as_of: Option<u64>,
+    #[serde(default)]
+    as_of_ms: Option<i64>,
+}
+
+/// Resolve a plane handle, applying the request's AS OF address if present.
+/// Native backend: pins the historical snapshot.
+#[cfg(feature = "native-backend")]
+fn plane_at<'a>(
+    ctx: &'a Ctx<'a>,
+    plane: &str,
+    at: &AsOfParams,
+) -> Result<PlaneHandle<'a>, RpcError> {
+    let handle = app(ctx.db.plane(plane))?;
+    match (at.as_of, at.as_of_ms) {
+        (Some(_), Some(_)) => Err(RpcError::invalid_params(
+            "specify only one of as_of / as_of_ms",
+        )),
+        (Some(seq), None) => app(handle.as_of(AsOf::Seq(seq))),
+        (None, Some(ms)) => app(handle.as_of(AsOf::Time(ms))),
+        (None, None) => Ok(handle),
+    }
+}
+
+/// Non-native backends keep no history: reject an AS OF request outright,
+/// otherwise resolve the plane as usual.
+#[cfg(not(feature = "native-backend"))]
+fn plane_at<'a>(
+    ctx: &'a Ctx<'a>,
+    plane: &str,
+    at: &AsOfParams,
+) -> Result<PlaneHandle<'a>, RpcError> {
+    if at.as_of.is_some() || at.as_of_ms.is_some() {
+        return Err(RpcError::invalid_params(
+            "time-travel (as_of / as_of_ms) requires the native backend",
+        ));
+    }
+    app(ctx.db.plane(plane))
 }
 
 fn parse_metric(s: Option<&str>) -> Metric {
@@ -182,13 +231,33 @@ pub struct Neighbors {
     direction: Option<String>,
     #[serde(default, rename = "type")]
     edge_type: Option<String>,
+    #[serde(flatten)]
+    at: AsOfParams,
 }
 
 /// `plane.neighbors` — 1-hop expansion as `{node, edge}` id pairs. Chunk 2's
 /// plot enriches these into full records; chunk 1 keeps it to the raw hop.
+/// `plane.history` — the time-travel window (ROADMAP §4): the oldest and latest
+/// commit sequences a read can be pinned to (`as_of` / `as_of_ms` on read
+/// methods). The wire method exists on every backend (the OpenRPC contract is
+/// uniform), but only the native engine can answer it.
+#[cfg(feature = "native-backend")]
+pub fn plane_history(ctx: &Ctx<'_>, _p: Value) -> Result<Value, RpcError> {
+    let (oldest, latest) = app(ctx.db.history())?;
+    Ok(jval!({ "oldest": oldest, "latest": latest }))
+}
+
+/// Non-native backends keep no history, so the window is unavailable.
+#[cfg(not(feature = "native-backend"))]
+pub fn plane_history(_ctx: &Ctx<'_>, _p: Value) -> Result<Value, RpcError> {
+    Err(RpcError::invalid_params(
+        "time-travel history requires the native backend",
+    ))
+}
+
 pub fn plane_neighbors(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Neighbors = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = plane_at(ctx, &req.plane, &req.at)?;
     let dir = parse_dir(req.direction.as_deref());
     let hops = app(plane.neighbors(NodeId(req.id), dir, req.edge_type.as_deref()))?;
     Ok(Value::Array(
@@ -232,6 +301,8 @@ pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 pub struct RunPlan {
     plane: String,
     plan: Value,
+    #[serde(flatten)]
+    at: AsOfParams,
 }
 
 /// `plane.query` — run a serialized logical plan verbatim (the params ride the
@@ -240,7 +311,7 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: RunPlan = params(p)?;
     let plan: LogicalPlan =
         serde_json::from_value(req.plan).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    let rows = app(app(ctx.db.plane(&req.plane))?
+    let rows = app(plane_at(ctx, &req.plane, &req.at)?
         .query_from_plan(plan)
         .scored_nodes())?;
     Ok(scored_rows(&rows))
@@ -756,8 +827,9 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
     if let Some(prop) = &req.vector_prop {
         let provider = req.provider.as_deref().unwrap_or("openai");
-        let embedder = dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)
-            .map_err(|e| RpcError::server(format!("embedding provider: {e}")))?;
+        let embedder =
+            dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)
+                .map_err(|e| RpcError::server(format!("embedding provider: {e}")))?;
         let reply = embedder
             .embed(std::slice::from_ref(&req.q))
             .map_err(|e| RpcError::server(format!("embedding failed: {e}")))?;
@@ -855,7 +927,9 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     };
     let res = dr_strange_llm::ask(
         &chat,
-        embedder.as_ref().map(|e| e as &dyn dr_strange_llm::Embedder),
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_llm::Embedder),
         &plane,
         &req.question,
         &opts,
