@@ -496,6 +496,44 @@ pub struct DigestArgs<'a> {
     pub embed_key_env: Option<&'a str>,
 }
 
+/// Natural-language query (ROADMAP §3): an LLM turns `question` into a
+/// read-only plan grounded in the plane's schema, runs it (unless `dry_run`),
+/// and prints the generated plan plus the matching nodes.
+#[cfg(feature = "digest")]
+#[allow(clippy::too_many_arguments)]
+pub fn ask(
+    db: &Database,
+    plane_name: &str,
+    question: &str,
+    dry_run: bool,
+    max_attempts: u32,
+    limit: u64,
+    chat_provider: &str,
+    model: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let p = plane(db, plane_name)?;
+    let chat = dr_strange_llm::build_provider(chat_provider, model, None, None, false)?;
+    let opts = dr_strange_llm::AskOptions {
+        max_attempts,
+        dry_run,
+        limit,
+    };
+    let res = dr_strange_llm::ask(&chat, &p, question, &opts)?;
+    let plural = if res.attempts == 1 { "" } else { "s" };
+    writeln!(out, "plan ({} attempt{plural}):", res.attempts)?;
+    writeln!(out, "{}", serde_json::to_string_pretty(&res.plan)?)?;
+    if res.ran {
+        writeln!(out, "{} results:", res.nodes.len())?;
+        for n in &res.nodes {
+            writeln!(out, "{}", jsonio::node_to_json(n))?;
+        }
+    } else {
+        writeln!(out, "(dry run — not executed)")?;
+    }
+    Ok(())
+}
+
 /// Digests a document into the plane: an LLM extracts entities/relations
 /// (labels chosen purely from the document), they're embedded and stamped with
 /// provenance, and — only with `apply` — written through the bulk path.

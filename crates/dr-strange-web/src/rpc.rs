@@ -194,6 +194,7 @@ const METHODS: &[&str] = &[
     "plane.find",
     "plane.algo",
     "plane.hybrid",
+    "plane.ask",
     "plane.indexes",
     "index.ensure",
     "graph.seed",
@@ -250,6 +251,9 @@ fn dispatch_method(
         // Reads only, but it spends the server's embedding credentials for the
         // vector channel — the same privileged tier as `plane.find` semantic.
         "plane.hybrid" => guarded!(Access::Read, methods::plane_hybrid(ctx, params)),
+        // Read-only (the generated plan can't write), but spends the server's
+        // chat credentials — same privileged-read tier as hybrid/semantic.
+        "plane.ask" => guarded!(Access::Read, methods::plane_ask(ctx, params)),
         "plane.indexes" => guarded!(Access::Read, methods::plane_indexes(ctx, params)),
         // Declaring an index is a schema-level change (and can build over all
         // matching nodes), so it sits at the admin tier like plane management.

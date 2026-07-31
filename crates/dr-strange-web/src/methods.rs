@@ -807,6 +807,55 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+pub struct Ask {
+    plane: String,
+    /// The natural-language question.
+    question: String,
+    /// Return the generated plan without executing it.
+    #[serde(default)]
+    dry_run: bool,
+    /// Total model attempts including repairs (default 3).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Safety row cap appended when the plan declares none (default 100).
+    #[serde(default)]
+    limit: Option<u64>,
+    /// Chat provider (preset or base URL); key from the server env.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// `plane.ask` — natural-language query (ROADMAP §3): an LLM turns `question`
+/// into a read-only LogicalPlan, which is run (unless `dry_run`). Returns the
+/// generated plan for transparency plus the result node records. Read-only by
+/// construction; the chat key comes from the server env, never params.
+pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Ask = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let provider = req.provider.as_deref().unwrap_or("openai");
+    let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)
+        .map_err(|e| RpcError::server(format!("chat provider: {e}")))?;
+    let opts = dr_strange_llm::AskOptions {
+        max_attempts: req.max_attempts.unwrap_or(3),
+        dry_run: req.dry_run,
+        limit: req.limit.unwrap_or(100),
+    };
+    let res = dr_strange_llm::ask(&chat, &plane, &req.question, &opts)
+        .map_err(|e| RpcError::server(e.to_string()))?;
+    let plan = serde_json::to_value(&res.plan).map_err(|e| RpcError::server(e.to_string()))?;
+    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
+    Ok(jval!({
+        "plan": plan,
+        "ran": res.ran,
+        "attempts": res.attempts,
+        "results": results,
+        "count": results.len(),
+    }))
+}
+
+#[derive(Deserialize)]
 pub struct PlaneIndexes {
     plane: String,
 }

@@ -134,6 +134,28 @@ struct Hybrid {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct Ask {
+    /// A natural-language question about the graph.
+    question: String,
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Return the generated plan without executing it.
+    #[serde(default)]
+    dry_run: bool,
+    /// Total model attempts including repairs (default 3).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Safety row cap appended when the plan declares none (default 100).
+    #[serde(default)]
+    limit: Option<u64>,
+    /// Chat provider (preset or base URL); key from the server env.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct Digest {
     /// The document text to digest into a graph.
     text: String,
@@ -541,6 +563,26 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
     Ok(jval!({ "results": results, "count": results.len() }))
 }
 
+fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    let provider = req.provider.as_deref().unwrap_or("openai");
+    let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)?;
+    let opts = dr_strange_llm::AskOptions {
+        max_attempts: req.max_attempts.unwrap_or(3),
+        dry_run: req.dry_run,
+        limit: req.limit.unwrap_or(100),
+    };
+    let res = dr_strange_llm::ask(&chat, &plane, &req.question, &opts)?;
+    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
+    Ok(jval!({
+        "plan": serde_json::to_value(&res.plan)?,
+        "ran": res.ran,
+        "attempts": res.attempts,
+        "results": results,
+        "count": results.len(),
+    }))
+}
+
 /// Adapts an LLM provider to the parser's `Embedder` seam so a text
 /// `SEARCH … NEAR "…"` embeds server-side (key from the process environment,
 /// never tool params).
@@ -813,6 +855,16 @@ impl DrStrange {
         channel's raw contribution. Embedding keys come from the server env.")]
     async fn hybrid(&self, Parameters(req): Parameters<Hybrid>) -> Result<CallToolResult, McpError> {
         self.blocking("hybrid", move |db| hybrid_logic(db, req)).await
+    }
+
+    #[tool(description = "Natural-language query (ROADMAP §3): ask a question in \
+        plain language and an LLM turns it into a read-only query plan over this \
+        plane's schema, runs it, and returns the matching node records. Grounded \
+        in the plane catalog; repairs its own plan on error. Set `dry_run` to get \
+        the generated plan WITHOUT executing it. Read-only — it can never mutate \
+        the graph. Chat provider key comes from the server env, never params.")]
+    async fn ask(&self, Parameters(req): Parameters<Ask>) -> Result<CallToolResult, McpError> {
+        self.blocking("ask", move |db| ask_logic(db, req)).await
     }
 
     #[tool(description = "Run a statement in the openCypher-subset query \

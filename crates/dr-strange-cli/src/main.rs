@@ -129,6 +129,30 @@ enum Command {
         #[arg(long)]
         addr: Option<SocketAddr>,
     },
+    /// Ask a natural-language question; an LLM turns it into a read-only plan
+    /// and runs it (ROADMAP §3).
+    #[cfg(feature = "digest")]
+    Ask {
+        /// The question, in plain language.
+        question: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Show the generated plan without executing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Total model attempts including repairs.
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
+        /// Safety row cap appended when the plan declares none.
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        /// Chat provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        chat: String,
+        /// Chat model override (default: the provider's).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
@@ -467,6 +491,29 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             // blocks until a shutdown signal; `out` is unused (the server logs
             // itself).
             dr_strange_web::serve(db, Some(cli.db.clone()), opts)
+        }
+        #[cfg(feature = "digest")]
+        Command::Ask {
+            question,
+            plane,
+            dry_run,
+            max_attempts,
+            limit,
+            chat,
+            model,
+        } => {
+            let db = commands::open(&cli.db)?;
+            commands::ask(
+                &db,
+                &plane,
+                &question,
+                dry_run,
+                max_attempts,
+                limit,
+                &chat,
+                model.as_deref(),
+                out,
+            )
         }
         #[cfg(feature = "digest")]
         Command::Digest {
