@@ -163,6 +163,10 @@ fn system_prompt(catalog: &CatalogSnapshot) -> String {
          \n\
          Rules:\n\
          - Use ONLY the labels, properties, and edge types in SCHEMA below, matching their exact case.\n\
+         - To reference a SPECIFIC named entity (a person, company, product, …), select it with \
+           {{\"SeekKeys\": [\"<name>\"]}}: an entity's key IS its canonical name exactly as written \
+           (a Chinese name stays Chinese, e.g. \"王滢\"). Do NOT ScanLabel then Filter on a property \
+           to find one entity by name — identity lives in the key; there is usually no name property.\n\
          - Read-only: there are no write operations — never invent any.\n\
          - Do NOT use vector/similarity operators; you cannot produce embeddings.\n\
          - A Filter's Expr must yield a Bool (top-level Compare/HasLabel/Logic/Not/IsNull).\n\
@@ -193,6 +197,10 @@ fn schema_summary(catalog: &CatalogSnapshot) -> String {
         let props: Vec<String> = stats
             .properties
             .iter()
+            // Hide `_`-prefixed provenance metadata (e.g. _model/_source/_run):
+            // it's digest bookkeeping, not a queryable attribute, and the model
+            // otherwise mistakes it for a name field.
+            .filter(|(name, _)| !name.starts_with('_'))
             .map(|(name, ps)| {
                 let ty = ps
                     .types
@@ -241,6 +249,9 @@ mod tests {
         [
             ("year".to_string(), PropDesc::new(PropValue::Int(year))),
             ("title".to_string(), PropDesc::new(PropValue::Str(title.into()))),
+            // A digest-style provenance property, which must NOT leak into the
+            // schema shown to the model.
+            ("_model".to_string(), PropDesc::new(PropValue::Str("gpt".into()))),
         ]
         .into_iter()
         .collect()
@@ -266,9 +277,14 @@ mod tests {
         let db = seeded();
         let cat = db.plane("startup").unwrap().catalog().unwrap();
         let p = system_prompt(&cat);
+        // Real properties show; the `_model` provenance property is hidden.
         assert!(p.contains("- Paper (3 nodes): title:Str, year:Int"));
+        assert!(!p.contains("_model"));
         assert!(p.contains("- Author"));
         assert!(p.contains("Read-only"));
+        // Named-entity lookups are steered to SeekKeys, not property filters.
+        assert!(p.contains("SeekKeys"));
+        assert!(p.contains("identity lives in the key"));
     }
 
     #[test]
