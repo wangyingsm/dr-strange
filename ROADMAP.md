@@ -54,9 +54,10 @@ HNSW registry — declared, coherent on writes, `.bm25` sidecar) + a
 `plane.hybrid()` fusion of **three** channels (vector + BM25 + graph proximity)
 via weighted, min-max-normalized score fusion, each hit reporting its
 per-channel breakdown. Surfaced on RPC `plane.hybrid`, CLI `drsg hybrid` +
-`drsg index keyword`, and MCP `hybrid`. (Follow-ups: a web dashboard hybrid
-mode; RRF as an alternative fusion; index declaration on RPC/MCP — a gap shared
-with the vector index.)
+`drsg index keyword`, MCP `hybrid`, and the web dashboard (a "Hybrid" bar in the
+Explore view that ranks the plane, plots hits sized by fused score, and lists
+them with per-channel breakdown). (Follow-ups: RRF as an alternative fusion;
+index declaration on RPC/MCP — a gap shared with the vector index.)
 
 **Goal.** True hybrid retrieval that combines **vector** + **keyword/full-text**
 + **graph proximity** into one ranked result, via a fusion operator
