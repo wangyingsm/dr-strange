@@ -1389,6 +1389,43 @@ impl<'db> QueryBuilder<'db> {
         })
     }
 
+    /// The connected **subgraph** the plan matched: every node and edge that
+    /// appears on any matching row's path (source → … → current node), not just
+    /// the final current nodes. So a traversal like `SeekKeys → Expand` returns
+    /// the seed node, the edges walked, and their targets — a graph you can
+    /// plot, rather than disconnected endpoints. A non-traversal query (scan +
+    /// filter) yields just the matching nodes with no edges. Nodes are ordered
+    /// by id, edges by id.
+    pub fn subgraph(&self) -> Result<(Vec<NodeRecord>, Vec<EdgeRecord>)> {
+        use std::collections::BTreeMap;
+        self.with_reader(|reader| {
+            let mut nodes: BTreeMap<u64, NodeRecord> = BTreeMap::new();
+            let mut edges: BTreeMap<u64, EdgeRecord> = BTreeMap::new();
+            let mut add_node = |id: NodeId, reader: &CachedReader| -> Result<()> {
+                if let std::collections::btree_map::Entry::Vacant(e) = nodes.entry(id.0)
+                    && let Some(n) = reader.node(id)?
+                {
+                    e.insert((*n).clone());
+                }
+                Ok(())
+            };
+            for r in exec::execute(&self.plan, reader)? {
+                let row = r?;
+                add_node(row.head, reader)?;
+                // Each traversed edge carries its endpoints, so walking the
+                // trail recovers every intermediate node *and* the source.
+                for (edge_id, _) in row.path() {
+                    if let Some(edge) = reader.edge(edge_id)? {
+                        add_node(edge.src, reader)?;
+                        add_node(edge.dst, reader)?;
+                        edges.entry(edge_id.0).or_insert_with(|| (*edge).clone());
+                    }
+                }
+            }
+            Ok((nodes.into_values().collect(), edges.into_values().collect()))
+        })
+    }
+
     /// Like [`nodes`](Self::nodes) but pairs each with its similarity score
     /// (`None` for rows that never passed through a vector operator).
     pub fn scored_nodes(&self) -> Result<Vec<(NodeRecord, Option<f32>)>> {

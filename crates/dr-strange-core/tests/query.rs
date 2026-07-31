@@ -213,6 +213,29 @@ fn run_query_suite(db: &Database) {
 }
 
 #[test]
+fn subgraph_returns_source_and_traversed_edges() {
+    // A traversal's subgraph is the connected structure it matched — the seed,
+    // the edges walked, and their targets — not just the final nodes.
+    let db = Database::in_memory().unwrap();
+    build_fixture(&db);
+    let plane = db.plane("startup").unwrap();
+    let (nodes, edges) = plane
+        .query()
+        .seek_keys(["p1"])
+        .expand_out("CITES")
+        .subgraph()
+        .unwrap();
+    let keys: std::collections::BTreeSet<String> =
+        nodes.iter().filter_map(|n| n.external_key.clone()).collect();
+    // `.nodes()` here would be just [p2, p3]; the subgraph also keeps the source.
+    assert!(keys.contains("p1"), "source node present: {keys:?}");
+    assert!(keys.contains("p2") && keys.contains("p3"));
+    // The two CITES edges p1→p2 and p1→p3 connect them.
+    assert_eq!(edges.len(), 2);
+    assert!(edges.iter().all(|e| e.ty == "CITES"));
+}
+
+#[test]
 fn query_suite_memory() {
     run_query_suite(&Database::in_memory().unwrap());
 }

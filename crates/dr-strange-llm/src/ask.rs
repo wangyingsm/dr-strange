@@ -17,7 +17,7 @@
 
 use anyhow::{Result, bail};
 use dr_strange_core::{
-    CatalogSnapshot, LogicalPlan, Metric, NodeRecord, PlaneHandle, PropValue, Step,
+    CatalogSnapshot, EdgeRecord, LogicalPlan, Metric, NodeRecord, PlaneHandle, PropValue, Step,
 };
 use serde::Serialize;
 
@@ -46,12 +46,15 @@ impl Default for AskOptions {
 }
 
 /// The outcome of an [`ask`]: the plan that ran (or would run), how many model
-/// turns it took, and the result rows (empty when `dry_run`).
+/// turns it took, and the matched **subgraph** — the nodes and the edges among
+/// them (source + traversal), so the answer plots as a connected graph rather
+/// than disconnected endpoints. Both empty when `dry_run`.
 #[derive(Debug)]
 pub struct AskResult {
     pub plan: LogicalPlan,
     pub attempts: u32,
     pub nodes: Vec<NodeRecord>,
+    pub edges: Vec<EdgeRecord>,
     pub ran: bool,
 }
 
@@ -124,15 +127,17 @@ pub fn ask(
                         plan,
                         attempts: turns,
                         nodes: Vec::new(),
+                        edges: Vec::new(),
                         ran: false,
                     });
                 }
-                match plane.query_from_plan(plan.clone()).nodes() {
-                    Ok(nodes) => {
+                match plane.query_from_plan(plan.clone()).subgraph() {
+                    Ok((nodes, edges)) => {
                         return Ok(AskResult {
                             plan,
                             attempts: turns,
                             nodes,
+                            edges,
                             ran: true,
                         });
                     }

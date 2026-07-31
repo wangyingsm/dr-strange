@@ -506,16 +506,17 @@
       const res = await rpc('plane.ask', params)
       askResult = res
       hyResults = null
-      if (res.ran && res.results?.length) {
-        await plotResultNodes(res.results)
-      } else if (res.ran) {
+      if (res.ran) {
+        // Plot the matched subgraph directly — its nodes AND the edges among
+        // them (source + traversal) — so the answer is a connected graph.
         plot.clear()
-        legend = []
+        plot.addSubgraph({ nodes: res.results ?? [], edges: res.edges ?? [] })
+        legend = plot.legendEntries()
         algoLegend = []
       }
       const tries = `${res.attempts} attempt${res.attempts === 1 ? '' : 's'}`
       status = res.ran
-        ? `ask: ${res.count} results · ${tries}`
+        ? `ask: ${res.results.length} nodes · ${res.edges?.length ?? 0} edges · ${tries}`
         : `ask: plan generated (dry run) · ${tries}`
     } catch (e) {
       error = e.message

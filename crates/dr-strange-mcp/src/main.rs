@@ -588,12 +588,24 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
         &req.question,
         &opts,
     )?;
+    // The matched subgraph: nodes + edges among them (source + traversal).
     let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
+    let edges: Vec<Value> = res
+        .edges
+        .iter()
+        .map(|e| {
+            jval!({
+                "id": e.id.0, "src": e.src.0, "dst": e.dst.0, "type": e.ty,
+                "properties": json::properties_to_json(&e.properties),
+            })
+        })
+        .collect();
     Ok(jval!({
         "plan": serde_json::to_value(&res.plan)?,
         "ran": res.ran,
         "attempts": res.attempts,
         "results": results,
+        "edges": edges,
         "count": results.len(),
     }))
 }

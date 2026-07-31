@@ -535,9 +535,17 @@ pub fn ask(
     writeln!(out, "plan ({} attempt{plural}):", res.attempts)?;
     writeln!(out, "{}", serde_json::to_string_pretty(&res.plan)?)?;
     if res.ran {
-        writeln!(out, "{} results:", res.nodes.len())?;
+        writeln!(
+            out,
+            "subgraph: {} nodes, {} edges",
+            res.nodes.len(),
+            res.edges.len()
+        )?;
         for n in &res.nodes {
             writeln!(out, "{}", jsonio::node_to_json(n))?;
+        }
+        for e in &res.edges {
+            writeln!(out, "  {} --{}--> {}", e.src.0, e.ty, e.dst.0)?;
         }
     } else {
         writeln!(out, "(dry run — not executed)")?;
