@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, HybridWeights, Language, LogicalPlan,
-    LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
-    ShortestPathOptions, json,
+    BulkEdge, BulkNode, Change, ChangeKind, ChangeOp, ChangeSet, Database, Dir, EdgeId, EdgeRecord,
+    HybridWeights, Language, LogicalPlan, LouvainOptions, Metric, NodeId, NodeRecord,
+    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, json,
 };
 // Time-travel address type — ships only with the native backend (ROADMAP §4).
 #[cfg(feature = "native-backend")]
@@ -117,6 +117,66 @@ fn edge_to_json(e: &EdgeRecord) -> Value {
         "type": e.ty,
         "properties": json::properties_to_json(&e.properties),
     })
+}
+
+/// One change-feed entry as JSON (ROADMAP §5): kind/op/id, plus the node's
+/// labels and the sanitized record for a create/update (a delete carries id
+/// only). Mirrors the `scored_rows` node shape so the UI can plot it directly.
+fn change_to_json(c: &Change) -> Value {
+    let kind = match c.kind {
+        ChangeKind::Node => "node",
+        ChangeKind::Edge => "edge",
+    };
+    let op = match c.op {
+        ChangeOp::Created => "created",
+        ChangeOp::Updated => "updated",
+        ChangeOp::Deleted => "deleted",
+    };
+    let mut obj = jval!({ "kind": kind, "op": op, "id": c.id });
+    if let Value::Object(map) = &mut obj {
+        if !c.labels.is_empty() {
+            map.insert("labels".into(), jval!(c.labels));
+        }
+        if let Some(n) = &c.node {
+            map.insert("record".into(), json::node_to_json(n));
+        } else if let Some(e) = &c.edge {
+            map.insert("record".into(), edge_to_json(e));
+        }
+    }
+    obj
+}
+
+/// Build the `plane.change` WebSocket notification for a subscriber watching
+/// `plane_name`, optionally narrowed to node `label`. Returns `None` when no
+/// change in the set matches the filter (nothing to send). A label filter keeps
+/// node changes carrying that label; edge changes pass only on an unfiltered
+/// (plane-wide) subscription (edges have no label — arch/01).
+pub fn change_message(cs: &ChangeSet, plane_name: &str, label: Option<&str>) -> Option<String> {
+    let changes: Vec<Value> = cs
+        .changes
+        .iter()
+        .filter(|c| match label {
+            None => true,
+            Some(l) => c.kind == ChangeKind::Node && c.labels.iter().any(|x| x == l),
+        })
+        .map(change_to_json)
+        .collect();
+    if changes.is_empty() {
+        return None;
+    }
+    Some(
+        jval!({
+            "jsonrpc": "2.0",
+            "method": "plane.change",
+            "params": {
+                "plane": plane_name,
+                "seq": cs.seq,
+                "truncated": cs.truncated,
+                "changes": changes,
+            }
+        })
+        .to_string(),
+    )
 }
 
 fn scored_rows(rows: &[(NodeRecord, Option<f32>)]) -> Value {
@@ -1718,4 +1778,98 @@ pub fn plane_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     };
     app(ctx.db.drop_plane(id))?;
     Ok(jval!({ "deleted": true, "id": id.0 }))
+}
+
+#[cfg(test)]
+mod change_feed_tests {
+    use super::*;
+    use dr_strange_core::{Database, PlaneHandle, Properties};
+    use std::sync::{Arc, Mutex};
+
+    /// Run `build` under a registered change observer and return the one
+    /// ChangeSet it commits.
+    fn one_change_set(build: impl FnOnce(&PlaneHandle<'_>)) -> ChangeSet {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let sink: Arc<Mutex<Option<ChangeSet>>> = Arc::new(Mutex::new(None));
+        let into = sink.clone();
+        db.on_change(move |cs| *into.lock().unwrap() = Some(cs));
+        build(&plane);
+        sink.lock()
+            .unwrap()
+            .take()
+            .expect("a change set was produced")
+    }
+
+    fn changes_of(msg: &str) -> Value {
+        serde_json::from_str::<Value>(msg).unwrap()
+    }
+
+    #[test]
+    fn label_filter_keeps_matching_nodes_and_drops_others() {
+        let cs = one_change_set(|plane| {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("a", &["Person"], Properties::new())
+                .unwrap();
+            w.create_node_with_key("b", &["Company"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        });
+
+        // Watching "Person" → only the Person change, framed as a notification.
+        let v = changes_of(&change_message(&cs, "p", Some("Person")).unwrap());
+        assert_eq!(v["method"], "plane.change");
+        assert_eq!(v["params"]["plane"], "p");
+        let arr = v["params"]["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["labels"][0], "Person");
+        assert_eq!(arr[0]["op"], "created");
+
+        // A label with no matching change → nothing to send.
+        assert!(change_message(&cs, "p", Some("Nope")).is_none());
+
+        // Plane-wide → both changes.
+        let v = changes_of(&change_message(&cs, "p", None).unwrap());
+        assert_eq!(v["params"]["changes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn edges_pass_only_on_an_unfiltered_watch() {
+        let cs = one_change_set(|plane| {
+            let mut w = plane.write().unwrap();
+            let a = w.create_node(&["N"], Properties::new()).unwrap();
+            let b = w.create_node(&["N"], Properties::new()).unwrap();
+            w.create_edge(a, b, "LINKS", Properties::new()).unwrap();
+            w.commit().unwrap();
+        });
+
+        // Plane-wide: 2 nodes + 1 edge.
+        let v = changes_of(&change_message(&cs, "p", None).unwrap());
+        assert_eq!(v["params"]["changes"].as_array().unwrap().len(), 3);
+
+        // Label "N": only the two nodes; the edge is dropped.
+        let v = changes_of(&change_message(&cs, "p", Some("N")).unwrap());
+        let arr = v["params"]["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.iter().all(|c| c["kind"] == "node"));
+    }
+
+    #[test]
+    fn deleted_change_carries_id_only() {
+        let cs = one_change_set(|plane| {
+            let id = {
+                let mut w = plane.write().unwrap();
+                let id = w.create_node(&["N"], Properties::new()).unwrap();
+                w.commit().unwrap();
+                id
+            };
+            let mut w = plane.write().unwrap();
+            w.delete_node(id).unwrap();
+            w.commit().unwrap();
+        });
+        let v = changes_of(&change_message(&cs, "p", None).unwrap());
+        let c = &v["params"]["changes"][0];
+        assert_eq!(c["op"], "deleted");
+        assert!(c.get("record").is_none(), "a delete carries no record");
+    }
 }

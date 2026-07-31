@@ -11,6 +11,18 @@
       "-32602": "invalid params",
       "-32000": "application error (bad plane, dangling edge endpoint, conflict, …)",
       "-32001": "unauthorized (missing or invalid credential)"
+    },
+    "x-websocket": {
+      "description": "The `/ws` endpoint answers these request/response methods AND a change-feed subscription (ROADMAP §5). Send `plane.watch` to start receiving `plane.change` notifications for a plane; `plane.unwatch` to stop. Best-effort: a subscriber that falls too far behind drops events. These are WebSocket-only (not in the HTTP dispatch table).",
+      "plane.watch": {
+        "params": { "plane": "string (required)", "label": "string (optional) — only node changes carrying this label; edges pass only when omitted" },
+        "result": { "watching": "plane name", "label": "the label filter or null" }
+      },
+      "plane.unwatch": { "params": {}, "result": { "watching": "null" } },
+      "plane.change": {
+        "note": "server → client notification (no id)",
+        "params": { "plane": "string", "seq": "commit sequence", "truncated": "bool", "changes": "[{ kind: node|edge, op: created|updated|deleted, id, labels?, record? }] — record is the sanitized node/edge (no embeddings, no _-prefixed props); a delete carries id only" }
+      }
     }
   },
   "methods": [

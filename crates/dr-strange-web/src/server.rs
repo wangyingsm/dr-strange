@@ -17,9 +17,9 @@ use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use dr_strange_core::Database;
+use dr_strange_core::{ChangeSet, Database, PlaneId};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceBuilder;
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -35,6 +35,11 @@ use crate::rpc;
 /// How often a WebSocket connection pushes a fresh `db.stats` snapshot. The
 /// dashboard renders these live (arch/08 §2.1).
 const STATS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Buffered commits in the change-feed broadcast channel (ROADMAP §5). A
+/// subscriber slower than this many commits behind loses the overflow (a
+/// `Lagged` skip) rather than stalling writers — best-effort delivery.
+const CHANGE_FEED_CAPACITY: usize = 1024;
 
 /// Upload ceiling for `/digest/extract` and `/rpc`. axum defaults to 2 MiB,
 /// which rejects real PDFs (and digest.write payloads carrying embeddings)
@@ -55,6 +60,11 @@ pub struct AppState {
     /// authenticate (see [`crate::assets`]). `None` when unset. Same value the
     /// `authorizer` checks against, so the injected token always works.
     pub bootstrap_token: Option<String>,
+    /// Commit-time change feed (ROADMAP §5): the core observer publishes each
+    /// committed `ChangeSet` here, and every `/ws` subscriber that ran
+    /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
+    /// drops events rather than stalling writers.
+    pub changes: broadcast::Sender<Arc<ChangeSet>>,
 }
 
 impl AppState {
@@ -405,12 +415,23 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
             "no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
         );
     }
+    // Change feed (ROADMAP §5): publish every committed ChangeSet to a
+    // broadcast channel that `/ws` subscribers drain. Registered before the db
+    // is shared, and best-effort — `send` failing (no live subscriber) is fine.
+    let (changes, _) = broadcast::channel::<Arc<ChangeSet>>(CHANGE_FEED_CAPACITY);
+    {
+        let tx = changes.clone();
+        db.on_change(move |cs| {
+            let _ = tx.send(Arc::new(cs));
+        });
+    }
     let state = Arc::new(AppState {
         db: Arc::new(db),
         db_path,
         authorizer: Arc::new(authorizer),
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
+        changes,
     });
     let app = router(state, opts.max_concurrent);
     // Bind a std listener up front so we can report the actual port (handy when
@@ -562,6 +583,11 @@ async fn ws_upgrade(
 /// stats the moment it connects.
 async fn ws_task(mut socket: WebSocket, state: Arc<AppState>, creds: Credentials) {
     let mut ticker = tokio::time::interval(STATS_INTERVAL);
+    // Change-feed subscription (ROADMAP §5): a receiver is always live so no
+    // events are missed between `plane.watch` and the first select; `watch`
+    // holds the active filter — `(plane id, plane name, optional label)`.
+    let mut changes = state.changes.subscribe();
+    let mut watch: Option<(PlaneId, String, Option<String>)> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -571,9 +597,37 @@ async fn ws_task(mut socket: WebSocket, state: Arc<AppState>, creds: Credentials
                     break;
                 }
             }
+            // A committed change set: forward it if this connection is watching
+            // its plane and the filter matches. Lagged = dropped overflow
+            // (best-effort); Closed = the sender is gone (shouldn't happen).
+            recv = changes.recv() => {
+                match recv {
+                    Ok(cs) => {
+                        if let Some((pid, name, label)) = &watch
+                            && cs.plane == *pid
+                            && let Some(msg) = methods::change_message(&cs, name, label.as_deref())
+                            && socket.send(Message::Text(msg.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        // `plane.watch` / `plane.unwatch` are per-connection and
+                        // stateful, so they can't go through the stateless RPC
+                        // dispatch — handle them here; everything else is a
+                        // normal request/response.
+                        if let Some(reply) = handle_ws_subscription(&state, &mut watch, &text).await {
+                            if socket.send(Message::Text(reply.into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         let body = text.as_bytes().to_vec();
                         let st = state.clone();
                         let creds = creds.clone();
@@ -598,6 +652,70 @@ async fn ws_task(mut socket: WebSocket, state: Arc<AppState>, creds: Credentials
             }
         }
     }
+}
+
+/// Handle a `plane.watch` / `plane.unwatch` control message on a WebSocket,
+/// mutating this connection's `watch` filter. Returns the JSON-RPC ack to send
+/// back, or `None` if the message isn't a subscription control (so the caller
+/// falls through to normal dispatch). Read-authorized already at upgrade.
+async fn handle_ws_subscription(
+    state: &Arc<AppState>,
+    watch: &mut Option<(PlaneId, String, Option<String>)>,
+    text: &str,
+) -> Option<String> {
+    let msg: serde_json::Value = serde_json::from_str(text).ok()?;
+    let method = msg.get("method").and_then(|m| m.as_str())?;
+    let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let params = msg
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let result = match method {
+        "plane.watch" => {
+            let plane = params.get("plane").and_then(|p| p.as_str());
+            let label = params
+                .get("label")
+                .and_then(|l| l.as_str())
+                .map(str::to_string);
+            match plane {
+                None => Err("plane.watch requires a `plane`"),
+                Some(name) => {
+                    // Resolve name → id once, so the hot forward path is a
+                    // cheap integer compare.
+                    let name = name.to_string();
+                    let st = state.clone();
+                    let want = name.clone();
+                    let pid = tokio::task::spawn_blocking(move || {
+                        st.db.plane(&want).map(|h| h.id()).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    match pid {
+                        Some(pid) => {
+                            *watch = Some((pid, name.clone(), label.clone()));
+                            Ok(json!({ "watching": name, "label": label }))
+                        }
+                        None => Err("no such plane"),
+                    }
+                }
+            }
+        }
+        "plane.unwatch" => {
+            *watch = None;
+            Ok(json!({ "watching": serde_json::Value::Null }))
+        }
+        _ => return None, // not a subscription control — fall through to dispatch
+    };
+
+    Some(match result {
+        Ok(value) => json!({ "jsonrpc": "2.0", "result": value, "id": id }).to_string(),
+        Err(message) => {
+            json!({ "jsonrpc": "2.0", "error": { "code": -32602, "message": message }, "id": id })
+                .to_string()
+        }
+    })
 }
 
 /// Computes a `db.stats` notification off-thread, or `None` if the snapshot
