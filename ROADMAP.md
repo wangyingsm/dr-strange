@@ -120,24 +120,28 @@ executing (agent-safe) vs auto-run.
 
 ---
 
-## 4. Time-travel / temporal queries  *(fourth)*
+## 4. Time-travel / temporal queries  *(shipped)*
 
-**Goal.** Query the graph as of a past point: "what did this look like at
-sequence/time T".
+**Status.** ✅ Shipped (2026-08-01). Native backend only — the LSM engine keeps
+prior versions keyed by commit sequence, so historical snapshots are near-free.
+`native-backend` is now the default engine for the whole workspace (redb is the
+opt-in legacy path). `NativeEngine::begin_read_at(seq)` pins a past snapshot
+(registered like a live reader so compaction honours it) with a retention
+window (`Database::set_retention`, default unbounded) that floors compaction GC
+so history stays reachable. `AsOf::{Seq,Time}` + `PlaneHandle::as_of(..)` return
+a read-only handle whose queries, traversals, algorithms, hybrid search, and
+point lookups all observe the historical snapshot; the address resolves by
+binary search over the retained window (commit seq / wall-clock time are both
+monotonic in the snapshot — no per-commit index). `Database::history()` reports
+the queryable window. Web RPC: `plane.history` + `as_of`/`as_of_ms` on
+`plane.query`/`plane.neighbors`. The whole surface is compile-time gated to
+`native-backend` in the core (the wire contract stays uniform and errors
+clearly on redb). **Remaining surface:** CLI (`drsg`), MCP tool, web dashboard
+time slider.
 
-**Why AI-native.** Agents need historical state for auditing, replay, and
-"what changed". The native engine's **MVCC sequence numbers make historical
-snapshots nearly free** — the machinery exists, only the surface is missing.
-
-**Scope sketch.** Expose a read snapshot pinned to a chosen commit sequence
-(or a wall-clock → seq mapping), plumbed through `PlaneHandle` reads and a
-query option (`AS OF <seq|time>`). Requires the native backend's retention to
-keep the needed versions (interacts with compaction GC — a pinned historical
-snapshot must be honored like a live reader, or bounded by a retention window).
-
-**Forks to settle.** Backend support (native MVCC only, or emulate on redb?);
-seq vs timestamp addressing (needs a seq→time index if timestamps);
-retention policy (unbounded history vs a TTL/window bounding compaction GC).
+**Forks settled.** Native MVCC only (redb/memory reject AS OF); both seq and
+timestamp addressing (commit-time stamped in Meta on every write); retention
+default unbounded with an opt-in commit-count window bounding compaction GC.
 
 ---
 
