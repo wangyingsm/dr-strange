@@ -14,7 +14,17 @@
   // `plane` is the app-wide current plane (App owns it); `focus` is a
   // { id, nonce } signal from the header search — center that node.
   // `onPlaneCreated` bubbles a new plane up to App (refresh picker + switch).
-  let { plane, focus, onPlaneCreated = () => {} } = $props()
+  // `asOf` is the app-wide time-travel cursor (App owns it so the header search
+  // and this plot stay in sync); `history` / `timeTravel` come from App's
+  // `plane.history` probe. `asOf` is bindable so this view's slider can drive it.
+  let {
+    plane,
+    focus,
+    onPlaneCreated = () => {},
+    asOf = $bindable(null),
+    history = null,
+    timeTravel = false,
+  } = $props()
 
   let newPlaneOpen = $state(false) // new-plane popup open?
   let tab = $state('filters') // active toolbar tab: filters | graphql | algorithms | hybrid
@@ -118,46 +128,44 @@
   let idxError = $state(null)
 
   // ---- time-travel / AS OF (ROADMAP §4) -----------------------------------
-  // `plane.history` only answers on a native-backend server, so a successful
-  // probe both proves the capability and gives the queryable commit window.
-  // On a redb server it errors → the whole time-travel tab stays hidden.
-  let timeTravel = $state(false) // native backend? (history probe succeeded)
-  let history = $state(null) // { oldest, latest } commit-sequence window
-  let asOf = $state(null) // null = live; else a commit seq the plot is pinned to
+  // The cursor (`asOf`) and window (`history`) are owned by App; this view only
+  // drives the slider and re-plots. `sliderSeq` is the slider's own position.
   let sliderSeq = $state(0) // bound slider position (equals latest when live)
+  let sliderInit = false // seeded the slider from the window yet?
+  let lastAsOf = null // last cursor value we re-plotted at (dedup guard)
 
   // The AS OF params to fold into a graph read; empty when viewing live.
   const atParams = () => (asOf == null ? {} : { as_of: asOf })
 
-  // Probe the time-travel window. Runs on mount / plane change; the seq axis
-  // is DB-global so it doesn't depend on the current plane.
-  async function loadHistory() {
-    try {
-      const h = await rpc('plane.history')
-      history = h
-      timeTravel = true
-      if (asOf != null && (asOf < h.oldest || asOf > h.latest)) asOf = null
-      sliderSeq = asOf ?? h.latest
-    } catch {
-      timeTravel = false
-      history = null
-      asOf = null
+  // Position the slider once the window is known (don't fight an active drag,
+  // which moves `sliderSeq` while `asOf` stays put until release).
+  $effect(() => {
+    if (history && !sliderInit) {
+      sliderInit = true
+      sliderSeq = asOf ?? history.latest
     }
-  }
+  })
 
-  // Snap back to the live (latest) view.
-  async function goLive() {
-    if (asOf == null) return
+  // Re-plot whenever the cursor actually changes — whether from this view's
+  // slider/Live button or App's header chip. Skips the drag (which only moves
+  // `sliderSeq`) and the no-op initial run.
+  $effect(() => {
+    const cur = asOf
+    if (cur === lastAsOf) return
+    lastAsOf = cur
+    if (history) sliderSeq = cur ?? history.latest
+    if (started) seed()
+  })
+
+  // Snap back to the live (latest) view; the effect above re-plots.
+  function goLive() {
     asOf = null
-    if (history) sliderSeq = history.latest
-    await seed()
   }
 
-  // Commit the slider to `asOf` and re-plot at that snapshot. `latest` ⇒ live.
-  async function applyTimeTravel() {
+  // Commit the slider to `asOf`; `latest` ⇒ live. The effect above re-plots.
+  function applyTimeTravel() {
     if (!history) return
     asOf = sliderSeq >= history.latest ? null : sliderSeq
-    await seed()
   }
 
   // Remember dropdown selections across reloads.
@@ -900,11 +908,6 @@
   $effect(() => {
     plane // track
     loadIndexes()
-  })
-  // Probe the time-travel window (also the native-backend capability check).
-  $effect(() => {
-    plane // track
-    loadHistory()
   })
   $effect(() => {
     focus // track

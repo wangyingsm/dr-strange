@@ -1577,3 +1577,33 @@ textarea.doc {
 .tt-banner:hover {
   border-color: var(--tt);
 }
+
+/* Header search hints that it is searching a past snapshot. */
+.tools .search input.travelling {
+  border-color: color-mix(in srgb, var(--tt) 55%, var(--border));
+}
+.tools .search input.travelling::placeholder {
+  color: var(--tt);
+}
+
+/* Header "as of N" chip — the global "you're in the past" affordance, clickable
+   to return the whole dashboard to live. */
+.tt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font: 12px system-ui;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--tt);
+  background: color-mix(in srgb, var(--tt) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tt) 45%, var(--border));
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tt-chip:hover {
+  border-color: var(--tt);
+  background: color-mix(in srgb, var(--tt) 20%, transparent);
+}

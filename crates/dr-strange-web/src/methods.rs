@@ -544,6 +544,8 @@ pub struct Find {
     provider: Option<String>,
     #[serde(default)]
     embed_model: Option<String>,
+    #[serde(flatten)]
+    at: AsOfParams,
 }
 
 /// `plane.find` — text search over the plane. Nodes match on external key,
@@ -561,7 +563,7 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         );
     }
 
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = plane_at(ctx, &req.plane, &req.at)?;
 
     // Semantic mode: embed the query and rank nodes by vector similarity. Any
     // failure — no key, provider error, or a plane with no embeddings — falls

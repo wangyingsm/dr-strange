@@ -18,6 +18,32 @@
   let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
 
+  // Time-travel (ROADMAP §4): an app-wide "viewing as of" cursor. `plane.history`
+  // answers only on a native server, so a successful probe both proves the
+  // capability and gives the queryable commit window. When `asOf` is set, the
+  // header search and the Explore plot both read that past snapshot.
+  let timeTravel = $state(false) // native backend? (history probe succeeded)
+  let history = $state(null) // { oldest, latest } commit-sequence window
+  let asOf = $state(null) // null = live; else a commit seq everything reads at
+
+  async function loadHistory() {
+    try {
+      const h = await rpc('plane.history')
+      history = h
+      timeTravel = true
+      if (asOf != null && (asOf < h.oldest || asOf > h.latest)) asOf = null
+    } catch {
+      timeTravel = false
+      history = null
+      asOf = null
+    }
+  }
+
+  // Snap the whole dashboard back to the live (latest) state.
+  function goLive() {
+    asOf = null
+  }
+
   // Remember the current plane + provider across reloads.
   $effect(() => {
     savePref('plane', plane)
@@ -54,11 +80,21 @@
     }
   })
 
-  // Debounced search over the current plane; re-runs when the query, plane, or
-  // search mode/provider change.
+  // Probe the time-travel window / capability on load and whenever the plane
+  // changes (the commit seq is DB-global, so any plane works as the trigger).
+  $effect(() => {
+    plane // track
+    loadHistory()
+  })
+
+  // Debounced search over the current plane; re-runs when the query, plane,
+  // search mode/provider, or the time-travel cursor change. When `asOf` is set
+  // the search runs against that past snapshot (text scans it; semantic
+  // brute-forces it, since the vector index only knows the latest commit).
   $effect(() => {
     const query = q.trim()
     const params = { plane, q: query, semantic, provider: embedProvider }
+    if (asOf != null) params.as_of = asOf
     clearTimeout(timer)
     if (!query) {
       results = null
@@ -115,7 +151,12 @@
     <div class="search">
       <input
         type="search"
-        placeholder={semantic ? 'Search by meaning…' : 'Quick search in this plane…'}
+        class:travelling={asOf != null}
+        placeholder={asOf != null
+          ? `Search as of commit ${asOf}…`
+          : semantic
+            ? 'Search by meaning…'
+            : 'Quick search in this plane…'}
         bind:value={q}
         onkeydown={(e) => e.key === 'Escape' && (q = '')}
       />
@@ -172,6 +213,15 @@
         {#each EMBED_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
       </select>
     {/if}
+    {#if asOf != null}
+      <button class="tt-chip" onclick={goLive} title="The whole view is pinned to a past commit — click to return to live">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 3v5h5" />
+          <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" />
+        </svg>
+        as of {asOf}{#if history} / {history.latest}{/if}
+      </button>
+    {/if}
   </div>
 
   <nav>
@@ -192,7 +242,7 @@
 {#if view === 'dashboard'}
   <Dashboard {plane} {onPlaneCreated} {onPlaneDeleted} onSelectPlane={(name) => (plane = name)} />
 {:else if view === 'explore'}
-  <Explore {plane} {focus} {onPlaneCreated} />
+  <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} />
 {:else}
   <Digest {plane} {onPlaneCreated} />
 {/if}

@@ -264,6 +264,20 @@ impl<'a> CachedReader<'a> {
         Self::build(txn, plane, Some(registry), Some((cache, seq)))
     }
 
+    /// Like [`with_cache`](Self::with_cache) but with no vector index, so every
+    /// vector search takes the exact brute-force path over this snapshot. Used
+    /// by time-travel reads (ROADMAP §4): the live HNSW index is built from the
+    /// latest commit and can't answer a historical snapshot, so a pinned read
+    /// scans instead — correct, just unindexed.
+    pub(crate) fn with_cache_no_index(
+        txn: &'a dyn ReadTransaction,
+        plane: PlaneId,
+        cache: &'a GraphCache,
+        seq: u64,
+    ) -> Self {
+        Self::build(txn, plane, None, Some((cache, seq)))
+    }
+
     fn build(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,

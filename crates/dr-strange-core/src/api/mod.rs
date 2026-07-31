@@ -555,12 +555,23 @@ impl<'db> PlaneHandle<'db> {
     fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
         let registry = self.db.indexes();
         let cache = &self.db.cache;
+        // A time-travelling read drops the live vector index (built from the
+        // latest commit, so it can't answer a past snapshot); its vector
+        // searches then brute-force the pinned snapshot — correct, unindexed.
+        #[cfg(feature = "native-backend")]
+        let historical = self.as_of.is_some();
+        #[cfg(not(feature = "native-backend"))]
+        let historical = false;
         self.with_read(|txn| {
             // The snapshot's own commit seq stamps the cache — for a historical
             // read that is the past seq, so the exact-seq cache never serves
             // "latest" records to a time-travelling query.
             let seq = graph::read_commit_seq(txn)?;
-            let reader = CachedReader::with_cache(txn, self.id, &registry, cache, seq);
+            let reader = if historical {
+                CachedReader::with_cache_no_index(txn, self.id, cache, seq)
+            } else {
+                CachedReader::with_cache(txn, self.id, &registry, cache, seq)
+            };
             f(&reader)
         })
     }
@@ -2057,6 +2068,64 @@ mod time_travel_tests {
         // The epoch predates every real commit → resolves to the empty graph.
         let epoch = plane.as_of(AsOf::Time(0)).unwrap();
         assert!(epoch.node(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn as_of_vector_search_is_historical() {
+        // A declared HNSW index reflects only the latest commit, so a
+        // time-travelling vector search must brute-force the snapshot: a node
+        // added after the pinned point must not appear in its results.
+        use crate::storage::vector::Metric;
+
+        fn embed(v: f32) -> Properties {
+            let mut p = Properties::new();
+            p.insert(
+                "embedding".into(),
+                PropDesc::new(PropValue::Vector(vec![v, 0.0])),
+            );
+            p
+        }
+
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        plane
+            .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+            .unwrap();
+
+        let a = {
+            let mut w = plane.write().unwrap();
+            let a = w.create_node_with_key("a", &["Doc"], embed(1.0)).unwrap();
+            w.commit().unwrap();
+            a
+        };
+        let s1 = db.commit_seq().unwrap();
+
+        // A second, closer-to-the-query node lands later.
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("b", &["Doc"], embed(0.9)).unwrap();
+            w.commit().unwrap();
+        }
+
+        let query = vec![0.95f32, 0.0];
+        // Live: both nodes are candidates.
+        let now = plane
+            .query()
+            .vector_top_k(Some("Doc"), "embedding", query.clone(), Metric::Cosine, 10)
+            .ids()
+            .unwrap();
+        assert_eq!(now.len(), 2);
+
+        // As of s1: only `a` existed, so `b` cannot appear even though the live
+        // index knows it.
+        let past = plane
+            .as_of(AsOf::Seq(s1))
+            .unwrap()
+            .query()
+            .vector_top_k(Some("Doc"), "embedding", query, Metric::Cosine, 10)
+            .ids()
+            .unwrap();
+        assert_eq!(past, vec![a]);
     }
 
     #[test]

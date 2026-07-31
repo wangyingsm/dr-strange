@@ -129,7 +129,9 @@
         { "name": "limit", "required": false, "schema": { "type": "integer", "default": 50 } },
         { "name": "semantic", "required": false, "schema": { "type": "boolean", "default": false } },
         { "name": "provider", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_model", "required": false, "schema": { "type": "string" } }
+        { "name": "embed_model", "required": false, "schema": { "type": "string" } },
+        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: search this past commit sequence (native backend only). Semantic search brute-forces the snapshot, since the vector index reflects only the latest commit." },
+        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: search the latest commit at or before this unix-epoch millisecond (native backend only)." }
       ],
       "result": { "name": "results", "schema": { "$ref": "#/components/schemas/FindResult" } }
     },
