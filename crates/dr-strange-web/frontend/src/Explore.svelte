@@ -582,6 +582,7 @@
 
 <svelte:window onkeydown={onKeydown} />
 
+<p class="group-title">Filters/Operations</p>
 <div class="controls">
   <label>
     Label
@@ -593,12 +594,12 @@
     </select>
   </label>
   <button onclick={seed}>Reload</button>
-  <span class="status">{status}</span>
   <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
   <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
   <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
 </div>
 
+<p class="group-title">GraphQL/Run</p>
 <div class="query-bar">
   <input
     type="text"
@@ -616,8 +617,8 @@
   <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
 </div>
 
+<p class="group-title">Algorithms</p>
 <div class="algo-bar">
-  <span class="algo-label">Analyze</span>
   <button onclick={runPagerank} disabled={algoBusy} title="Size nodes by PageRank importance">PageRank</button>
   <button onclick={() => runGroups('louvain')} disabled={algoBusy} title="Colour nodes by Louvain community">Communities</button>
   <button onclick={() => runGroups('components')} disabled={algoBusy} title="Colour nodes by connected component">Components</button>
@@ -680,6 +681,10 @@
 
 <div class="canvas-wrap">
   <div class="canvas" bind:this={container}></div>
+
+  {#if status}
+    <div class="plot-status">{status}</div>
+  {/if}
 
   {#if algoLegend.length || legend.length}
     <div class="legend">

@@ -616,6 +616,20 @@ nav button.active {
 }
 
 /* ---- explore controls ---- */
+/* Section heading above each Explore tool group (Filters/Operations,
+   GraphQL/Run, Algorithms). Hugs the bar below it so the two read as a unit. */
+.group-title {
+  margin: 0.95rem 0 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.group-title:first-of-type {
+  margin-top: 0;
+}
+
 .controls {
   display: flex;
   align-items: center;
@@ -643,11 +657,6 @@ nav button.active {
   text-transform: none;
   letter-spacing: normal;
   cursor: pointer;
-}
-.controls .status {
-  color: var(--muted);
-  font-size: 0.85rem;
-  font-variant-numeric: tabular-nums;
 }
 .controls button.active {
   border-color: var(--accent);
@@ -800,6 +809,24 @@ nav button.active {
 .canvas {
   width: 100%;
   height: min(72vh, 760px);
+}
+
+/* Live status readout, pinned to the plot's top-left in the accent colour so
+   the latest result (seed counts, algorithm output, path cost) is easy to spot. */
+.plot-status {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  max-width: 60%;
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  pointer-events: none;
 }
 
 .legend {
