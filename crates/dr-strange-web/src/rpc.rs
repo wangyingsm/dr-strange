@@ -193,6 +193,7 @@ const METHODS: &[&str] = &[
     "plane.cypher",
     "plane.find",
     "plane.algo",
+    "plane.hybrid",
     "graph.seed",
     "graph.expand",
     "digest.run",
@@ -244,6 +245,9 @@ fn dispatch_method(
         "plane.cypher" => guarded!(Access::Write, methods::plane_cypher(ctx, params)),
         "plane.find" => guarded!(Access::Read, methods::plane_find(ctx, params)),
         "plane.algo" => guarded!(Access::Read, methods::plane_algo(ctx, params)),
+        // Reads only, but it spends the server's embedding credentials for the
+        // vector channel — the same privileged tier as `plane.find` semantic.
+        "plane.hybrid" => guarded!(Access::Read, methods::plane_hybrid(ctx, params)),
         "graph.seed" => guarded!(Access::Read, methods::graph_seed(ctx, params)),
         "graph.expand" => guarded!(Access::Read, methods::graph_expand(ctx, params)),
         // `digest.run` writes nothing, but it spends the server's provider
@@ -603,6 +607,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(err_code(&resp), -32602);
+    }
+
+    #[test]
+    fn plane_hybrid_keyword_and_graph_channels() {
+        use dr_strange_core::{Language, PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let d2 = {
+            let mut txn = plane.write().unwrap();
+            let mk = |body: &str| -> Properties {
+                [("body".to_string(), PropDesc::new(PropValue::Str(body.into())))]
+                    .into_iter()
+                    .collect()
+            };
+            let d0 = txn.create_node(&["Doc"], mk("graph databases store data")).unwrap();
+            let _d1 = txn.create_node(&["Doc"], mk("vector search similarity")).unwrap();
+            let d2 = txn.create_node(&["Doc"], mk("graph graph graph queries")).unwrap();
+            txn.create_edge(d0, d2, "LINKS", Properties::new()).unwrap();
+            txn.commit().unwrap();
+            d2
+        };
+        plane
+            .ensure_keyword_index("Doc", "body", Language::English)
+            .unwrap();
+
+        // Keyword + graph channels (no vector ⇒ no embedding needed).
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.hybrid","params":{"plane":"startup","label":"Doc","q":"graph","keyword_prop":"body","graph_hops":1},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert!(r["count"].as_u64().unwrap() >= 2);
+        // The graph-dense doc leads; every hit carries the channel breakdown.
+        assert_eq!(r["results"][0]["id"], d2.0);
+        assert!(r["results"][0]["channels"]["keyword"].is_number());
     }
 
     // ---- auth gate --------------------------------------------------------

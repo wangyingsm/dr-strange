@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
-    BulkEdgeById, BulkNode, Database, Dir, LogicalPlan, LouvainOptions, Metric, NodeId,
+    BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
     PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
 };
 use serde_json::{Value, json};
@@ -357,6 +357,93 @@ pub fn index_ensure(
 ) -> Result<()> {
     plane(db, plane_name)?.ensure_vector_index(label, property, metric)?;
     writeln!(out, "ensured vector index on {label}.{property}")?;
+    Ok(())
+}
+
+pub fn keyword_index_ensure(
+    db: &Database,
+    plane_name: &str,
+    label: &str,
+    property: &str,
+    language: Language,
+    out: &mut dyn Write,
+) -> Result<()> {
+    plane(db, plane_name)?.ensure_keyword_index(label, property, language)?;
+    writeln!(out, "ensured keyword index on {label}.{property} ({language:?})")?;
+    Ok(())
+}
+
+// ---- hybrid retrieval (ROADMAP §2) ---------------------------------------
+
+fn fmt_channel(v: Option<f32>) -> String {
+    v.map_or_else(|| "-".to_string(), |x| format!("{x:.3}"))
+}
+
+/// Embed a query string for the vector channel. Needs the `digest` feature
+/// (the LLM provider layer); otherwise a clear error.
+#[cfg(feature = "digest")]
+fn embed_query(query: &str, provider: &str, model: Option<&str>) -> Result<Vec<f32>> {
+    use dr_strange_llm::Embedder;
+    let embedder = dr_strange_llm::build_provider(provider, model, None, None, true)?;
+    let reply = embedder.embed(std::slice::from_ref(&query.to_string()))?;
+    reply
+        .vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("embedder returned no vector"))
+}
+
+#[cfg(not(feature = "digest"))]
+fn embed_query(_query: &str, _provider: &str, _model: Option<&str>) -> Result<Vec<f32>> {
+    bail!("the vector channel needs the `digest` build feature (LLM embedding)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid(
+    db: &Database,
+    plane_name: &str,
+    query: &str,
+    label: Option<&str>,
+    vector_prop: Option<&str>,
+    keyword_prop: Option<&str>,
+    metric: Metric,
+    graph: Option<(u32, f32)>,
+    k: usize,
+    embed_provider: &str,
+    embed_model: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let p = plane(db, plane_name)?;
+    let mut b = p.hybrid();
+    if let Some(l) = label {
+        b = b.label(l);
+    }
+    if let Some(prop) = vector_prop {
+        let vec = embed_query(query, embed_provider, embed_model)?;
+        b = b.vector(prop, vec, metric);
+    }
+    if let Some(prop) = keyword_prop {
+        b = b.keyword(prop, query);
+    }
+    if let Some((hops, decay)) = graph {
+        b = b.graph(hops, decay);
+    }
+    let hits = b.k(k).run()?;
+    writeln!(out, "hybrid: {} results", hits.len())?;
+    for h in &hits {
+        let name = p
+            .node(h.node)?
+            .and_then(|n| n.external_key)
+            .unwrap_or_else(|| format!("#{}", h.node.0));
+        writeln!(
+            out,
+            "  {:.4}\t{name}\t[v={} k={} g={}]",
+            h.score,
+            fmt_channel(h.vector),
+            fmt_channel(h.keyword),
+            fmt_channel(h.graph),
+        )?;
+    }
     Ok(())
 }
 
@@ -776,6 +863,40 @@ mod tests {
 
         let lv = cap(|o| algo_louvain(&db, "startup", None, 50, o));
         assert!(lv.contains("communities: 1"), "{lv}");
+    }
+
+    #[test]
+    fn hybrid_keyword_channel_ranks_and_declares_index() {
+        use dr_strange_core::{PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        {
+            let plane = db.plane("startup").unwrap();
+            let mut txn = plane.write().unwrap();
+            let mk = |b: &str| -> Properties {
+                [("body".to_string(), PropDesc::new(PropValue::Str(b.into())))]
+                    .into_iter()
+                    .collect()
+            };
+            txn.create_node_with_key("d0", &["Doc"], mk("graph databases store data"))
+                .unwrap();
+            txn.create_node_with_key("d1", &["Doc"], mk("graph graph graph queries"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let declared =
+            cap(|o| keyword_index_ensure(&db, "startup", "Doc", "body", Language::English, o));
+        assert!(declared.contains("ensured keyword index on Doc.body"));
+
+        // Keyword-only hybrid (no vector ⇒ no embedding needed).
+        let out = cap(|o| {
+            hybrid(
+                &db, "startup", "graph", Some("Doc"), None, Some("body"), Metric::Cosine, None, 10,
+                "openai", None, o,
+            )
+        });
+        assert!(out.contains("hybrid: 2 results"), "{out}");
+        assert!(out.contains("d1"), "graph-dense doc present: {out}");
     }
 
     #[test]

@@ -8,8 +8,9 @@
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, LogicalPlan, LouvainOptions, Metric,
-    NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, json,
+    BulkEdge, BulkNode, Database, Dir, EdgeId, EdgeRecord, HybridWeights, LogicalPlan,
+    LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
+    ShortestPathOptions, json,
 };
 use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
 use serde::Deserialize;
@@ -698,6 +699,111 @@ pub fn plane_algo(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain)"
         ))),
     }
+}
+
+#[derive(Deserialize)]
+pub struct Hybrid {
+    plane: String,
+    /// The query text: embedded for the vector channel, tokenized for keyword.
+    q: String,
+    /// Label scope (required when the keyword channel is on).
+    #[serde(default)]
+    label: Option<String>,
+    /// Enable the vector channel over this embedding property.
+    #[serde(default)]
+    vector_prop: Option<String>,
+    /// Enable the BM25 keyword channel over this string property.
+    #[serde(default)]
+    keyword_prop: Option<String>,
+    /// Vector metric (default cosine).
+    #[serde(default)]
+    metric: Option<String>,
+    /// Enable the graph-proximity channel with this many hops.
+    #[serde(default)]
+    graph_hops: Option<u32>,
+    /// Per-hop decay for the graph channel (default 0.5).
+    #[serde(default)]
+    graph_decay: Option<f32>,
+    #[serde(default)]
+    w_vector: Option<f32>,
+    #[serde(default)]
+    w_keyword: Option<f32>,
+    #[serde(default)]
+    w_graph: Option<f32>,
+    #[serde(default)]
+    k: Option<usize>,
+    #[serde(default)]
+    candidates: Option<usize>,
+    /// Embedding provider for the vector channel (key from the server env).
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
+}
+
+/// `plane.hybrid` — hybrid retrieval (ROADMAP §2): fuse vector, BM25 keyword,
+/// and graph-proximity channels into one ranking. Enable a channel by naming
+/// its property (`vector_prop` / `keyword_prop`) or setting `graph_hops`. The
+/// vector channel embeds `q` server-side (provider key from the environment).
+/// Returns node records with the fused `score` and each channel's raw
+/// contribution (`vector`/`keyword`/`graph`).
+pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: Hybrid = params(p)?;
+    let plane = app(ctx.db.plane(&req.plane))?;
+    let mut builder = plane.hybrid();
+    if let Some(label) = &req.label {
+        builder = builder.label(label.clone());
+    }
+    if let Some(prop) = &req.vector_prop {
+        let provider = req.provider.as_deref().unwrap_or("openai");
+        let embedder = dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)
+            .map_err(|e| RpcError::server(format!("embedding provider: {e}")))?;
+        let reply = embedder
+            .embed(std::slice::from_ref(&req.q))
+            .map_err(|e| RpcError::server(format!("embedding failed: {e}")))?;
+        let query = reply
+            .vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| RpcError::server("embedder returned no vector"))?;
+        builder = builder.vector(prop.clone(), query, parse_metric(req.metric.as_deref()));
+    }
+    if let Some(prop) = &req.keyword_prop {
+        builder = builder.keyword(prop.clone(), req.q.clone());
+    }
+    if let Some(hops) = req.graph_hops {
+        builder = builder.graph(hops, req.graph_decay.unwrap_or(0.5));
+    }
+    if req.w_vector.is_some() || req.w_keyword.is_some() || req.w_graph.is_some() {
+        let d = HybridWeights::default();
+        builder = builder.weights(HybridWeights {
+            vector: req.w_vector.unwrap_or(d.vector),
+            keyword: req.w_keyword.unwrap_or(d.keyword),
+            graph: req.w_graph.unwrap_or(d.graph),
+        });
+    }
+    if let Some(c) = req.candidates {
+        builder = builder.candidates(c);
+    }
+    builder = builder.k(req.k.unwrap_or(10));
+
+    let hits = app(builder.run())?;
+    let mut results = Vec::with_capacity(hits.len());
+    for h in &hits {
+        let mut obj = match app(plane.node(h.node))? {
+            Some(node) => json::node_to_json(&node),
+            None => jval!({ "id": h.node.0 }),
+        };
+        if let Value::Object(map) = &mut obj {
+            map.insert("score".into(), jval!(h.score));
+            map.insert(
+                "channels".into(),
+                jval!({ "vector": h.vector, "keyword": h.keyword, "graph": h.graph }),
+            );
+        }
+        results.push(obj);
+    }
+    Ok(jval!({ "results": results, "count": results.len() }))
 }
 
 /// Semantic search: embed the query with the requested provider (key from the

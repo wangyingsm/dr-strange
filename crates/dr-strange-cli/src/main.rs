@@ -86,6 +86,35 @@ enum Command {
     /// Graph algorithms over a plane (ROADMAP §1): read-only, transient results.
     #[command(subcommand)]
     Algo(AlgoCmd),
+    /// Hybrid retrieval (ROADMAP §2): fuse vector + keyword + graph-proximity.
+    Hybrid {
+        /// The query text (embedded for the vector channel, tokenized for keyword).
+        query: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Embedding property to enable the vector channel (needs `digest`).
+        #[arg(long)]
+        vector: Option<String>,
+        /// String property to enable the BM25 keyword channel.
+        #[arg(long)]
+        keyword: Option<String>,
+        #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
+        metric: MetricArg,
+        /// Enable the graph-proximity channel with this many hops.
+        #[arg(long)]
+        graph_hops: Option<u32>,
+        #[arg(long, default_value_t = 0.5)]
+        graph_decay: f32,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Embedding provider for the vector channel (preset or base URL).
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        #[arg(long)]
+        embed_model: Option<String>,
+    },
     /// Vector index management.
     #[command(subcommand)]
     Index(IndexCmd),
@@ -235,6 +264,16 @@ enum IndexCmd {
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
     },
+    /// Declare (and build) a BM25 keyword index on a `(label, property)`.
+    Keyword {
+        label: String,
+        property: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Analyzer language (name or code, e.g. `english`/`en`, `french`/`fr`).
+        #[arg(long, default_value = "english")]
+        lang: String,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -365,6 +404,35 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 }
             }
         }
+        Command::Hybrid {
+            query,
+            plane,
+            label,
+            vector,
+            keyword,
+            metric,
+            graph_hops,
+            graph_decay,
+            k,
+            embed,
+            embed_model,
+        } => {
+            let db = commands::open(&cli.db)?;
+            commands::hybrid(
+                &db,
+                &plane,
+                &query,
+                label.as_deref(),
+                vector.as_deref(),
+                keyword.as_deref(),
+                metric.into(),
+                graph_hops.map(|h| (h, graph_decay)),
+                k,
+                &embed,
+                embed_model.as_deref(),
+                out,
+            )
+        }
         Command::Index(IndexCmd::Ensure {
             label,
             property,
@@ -373,6 +441,16 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         }) => {
             let db = commands::open(&cli.db)?;
             commands::index_ensure(&db, &plane, &label, &property, metric.into(), out)
+        }
+        Command::Index(IndexCmd::Keyword {
+            label,
+            property,
+            plane,
+            lang,
+        }) => {
+            let db = commands::open(&cli.db)?;
+            let language = lang.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+            commands::keyword_index_ensure(&db, &plane, &label, &property, language, out)
         }
         Command::Stats => {
             let db = commands::open(&cli.db)?;

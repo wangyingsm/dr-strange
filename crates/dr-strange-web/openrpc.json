@@ -144,6 +144,29 @@
       "result": { "name": "result", "schema": { "type": "object", "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}." } }
     },
     {
+      "name": "plane.hybrid",
+      "summary": "Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side.",
+      "x-access": "read",
+      "params": [
+        { "name": "plane", "required": true, "schema": { "type": "string" } },
+        { "name": "q", "required": true, "schema": { "type": "string" } },
+        { "name": "label", "required": false, "schema": { "type": "string" } },
+        { "name": "vector_prop", "required": false, "schema": { "type": "string" } },
+        { "name": "keyword_prop", "required": false, "schema": { "type": "string" } },
+        { "name": "metric", "required": false, "schema": { "type": "string", "enum": ["cosine", "dot", "l2"], "default": "cosine" } },
+        { "name": "graph_hops", "required": false, "schema": { "type": "integer" } },
+        { "name": "graph_decay", "required": false, "schema": { "type": "number", "default": 0.5 } },
+        { "name": "w_vector", "required": false, "schema": { "type": "number", "default": 1.0 } },
+        { "name": "w_keyword", "required": false, "schema": { "type": "number", "default": 1.0 } },
+        { "name": "w_graph", "required": false, "schema": { "type": "number", "default": 0.5 } },
+        { "name": "k", "required": false, "schema": { "type": "integer", "default": 10 } },
+        { "name": "candidates", "required": false, "schema": { "type": "integer", "default": 100 } },
+        { "name": "provider", "required": false, "schema": { "type": "string" } },
+        { "name": "embed_model", "required": false, "schema": { "type": "string" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object", "description": "{results:[{...node, score, channels:{vector,keyword,graph}}], count}." } }
+    },
+    {
       "name": "graph.seed",
       "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
       "x-access": "read",

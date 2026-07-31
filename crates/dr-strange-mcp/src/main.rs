@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use anyhow::Result as AnyResult;
 use dr_strange_core::{
-    Database, Dir, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions, Properties,
-    ShortestPathOptions, json,
+    Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions,
+    Properties, ShortestPathOptions, json,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -92,6 +92,45 @@ struct Algo {
     /// Louvain minimum modularity gain to move a node.
     #[serde(default)]
     min_gain: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Hybrid {
+    /// Query text: embedded for the vector channel, tokenized for keyword.
+    query: String,
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Label scope (required when the keyword channel is used).
+    #[serde(default)]
+    label: Option<String>,
+    /// Enable the vector channel over this embedding property.
+    #[serde(default)]
+    vector_prop: Option<String>,
+    /// Enable the BM25 keyword channel over this string property.
+    #[serde(default)]
+    keyword_prop: Option<String>,
+    /// Vector metric: `cosine` (default) | `dot` | `l2`.
+    #[serde(default)]
+    metric: Option<String>,
+    /// Enable the graph-proximity channel with this many hops.
+    #[serde(default)]
+    graph_hops: Option<u32>,
+    /// Per-hop decay for the graph channel (default 0.5).
+    #[serde(default)]
+    graph_decay: Option<f32>,
+    #[serde(default)]
+    w_vector: Option<f32>,
+    #[serde(default)]
+    w_keyword: Option<f32>,
+    #[serde(default)]
+    w_graph: Option<f32>,
+    #[serde(default)]
+    k: Option<usize>,
+    /// Embedding provider for the vector channel (key from the server env).
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -446,6 +485,62 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
     }
 }
 
+fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    let mut b = plane.hybrid();
+    if let Some(label) = &req.label {
+        b = b.label(label.clone());
+    }
+    if let Some(prop) = &req.vector_prop {
+        let provider = req.provider.as_deref().unwrap_or("openai");
+        let embedder: Box<dyn dr_strange_llm::Embedder> = Box::new(dr_strange_llm::build_provider(
+            provider,
+            req.embed_model.as_deref(),
+            None,
+            None,
+            true,
+        )?);
+        let reply = embedder.embed(std::slice::from_ref(&req.query))?;
+        let vector = reply
+            .vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+        b = b.vector(prop.clone(), vector, parse_metric(req.metric.as_deref()));
+    }
+    if let Some(prop) = &req.keyword_prop {
+        b = b.keyword(prop.clone(), req.query.clone());
+    }
+    if let Some(hops) = req.graph_hops {
+        b = b.graph(hops, req.graph_decay.unwrap_or(0.5));
+    }
+    if req.w_vector.is_some() || req.w_keyword.is_some() || req.w_graph.is_some() {
+        let d = HybridWeights::default();
+        b = b.weights(HybridWeights {
+            vector: req.w_vector.unwrap_or(d.vector),
+            keyword: req.w_keyword.unwrap_or(d.keyword),
+            graph: req.w_graph.unwrap_or(d.graph),
+        });
+    }
+    let hits = b.k(req.k.unwrap_or(10)).run()?;
+    let mut results = Vec::with_capacity(hits.len());
+    for h in &hits {
+        let mut obj = match plane.node(h.node)? {
+            Some(node) => json::node_to_json(&node),
+            None => jval!({ "id": h.node.0 }),
+        };
+        if let Value::Object(map) = &mut obj {
+            map.insert("score".into(), jval!(h.score));
+            map.insert(
+                "channels".into(),
+                jval!({ "vector": h.vector, "keyword": h.keyword, "graph": h.graph }),
+            );
+        }
+        results.push(obj);
+    }
+    Ok(jval!({ "results": results, "count": results.len() }))
+}
+
 /// Adapts an LLM provider to the parser's `Embedder` seam so a text
 /// `SEARCH … NEAR "…"` embeds server-side (key from the process environment,
 /// never tool params).
@@ -708,6 +803,18 @@ impl DrStrange {
         self.blocking("algo", move |db| algo_logic(db, req)).await
     }
 
+    #[tool(description = "Hybrid retrieval (ROADMAP §2): fuse vector similarity, \
+        BM25 keyword, and graph-proximity into one ranking. Enable a channel by \
+        naming its property — `vector_prop` (embedding; `query` is embedded \
+        server-side), `keyword_prop` (BM25 over a declared keyword index; needs \
+        `label`) — and/or set `graph_hops` to boost neighbours of the strongest \
+        hits. Optional per-channel weights (`w_vector`/`w_keyword`/`w_graph`), \
+        `metric`, and `k`. Returns node records with the fused `score` and each \
+        channel's raw contribution. Embedding keys come from the server env.")]
+    async fn hybrid(&self, Parameters(req): Parameters<Hybrid>) -> Result<CallToolResult, McpError> {
+        self.blocking("hybrid", move |db| hybrid_logic(db, req)).await
+    }
+
     #[tool(description = "Run a statement in the openCypher-subset query \
         language. Reads (MATCH one linear path with labels/->/<-/- and bounded \
         *m..n, SEARCH vector top-k, BEAM similarity traversal, WHERE, RETURN \
@@ -947,6 +1054,47 @@ mod tests {
         // Missing endpoints and unknown algo are tool-level errors.
         assert!(algo_logic(&db, from_value(jval!({"algo": "shortest_path"})).unwrap()).is_err());
         assert!(algo_logic(&db, from_value(jval!({"algo": "nope"})).unwrap()).is_err());
+    }
+
+    #[test]
+    fn hybrid_keyword_channel_fuses_and_reports() {
+        use dr_strange_core::{Language, PropDesc, PropValue, Properties};
+
+        let db = Database::in_memory().unwrap();
+        {
+            let plane = db.plane("startup").unwrap();
+            let mut txn = plane.write().unwrap();
+            let mk = |b: &str| -> Properties {
+                [("body".to_string(), PropDesc::new(PropValue::Str(b.into())))]
+                    .into_iter()
+                    .collect()
+            };
+            txn.create_node_with_key("d0", &["Doc"], mk("graph databases store data"))
+                .unwrap();
+            txn.create_node_with_key("d1", &["Doc"], mk("graph graph graph queries"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        db.plane("startup")
+            .unwrap()
+            .ensure_keyword_index("Doc", "body", Language::English)
+            .unwrap();
+
+        let out = hybrid_logic(
+            &db,
+            from_value(jval!({"query": "graph", "label": "Doc", "keyword_prop": "body"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["count"], jval!(2));
+        assert_eq!(out["results"][0]["external_key"], jval!("d1")); // graph-dense doc
+        assert!(out["results"][0]["channels"]["keyword"].is_number());
+        assert!(out["results"][0]["channels"]["vector"].is_null());
+
+        // Keyword channel without a label is a tool-level error.
+        assert!(
+            hybrid_logic(&db, from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
