@@ -31,6 +31,14 @@
   let error = $state(null)
   let vectorView = $state(null) // { k, values } — floats popup, null = closed
 
+  // Algorithm overlays (ROADMAP §1): decorate the plotted graph with a
+  // `plane.algo` result. `algoLegend` (when set) supersedes the category legend.
+  let algoBusy = $state(false)
+  let algoLegend = $state([]) // [{ label, color }] for a group overlay
+  let spFrom = $state('') // shortest-path source (id or @key)
+  let spTo = $state('') // shortest-path target
+  let spDir = $state('out') // out | in | both
+
   // Inspector mutation state (mutation UI): edit properties + delete.
   let editing = $state(false)
   let draft = $state([]) // editable [{ key, value }] rows of scalar props
@@ -173,6 +181,97 @@
     } catch (e) {
       error = e.message
     }
+  }
+
+  // ---- algorithm overlays (ROADMAP §1) ------------------------------------
+
+  // A high cap so the overlay covers every visible node (the RPC returns a
+  // ranked/grouped list capped at `limit`; whole-plane runs can be large).
+  const ALGO_CAP = 1_000_000
+
+  // Resolve a "id or @key" reference to a numeric node id (for shortest path).
+  async function resolveRef(s) {
+    const t = s.trim()
+    if (!t) return null
+    if (/^\d+$/.test(t)) return Number(t)
+    const key = t.startsWith('@') ? t.slice(1) : t
+    const node = await rpc('node.get', { plane, key })
+    return node?.id ?? null
+  }
+
+  async function runPagerank() {
+    algoBusy = true
+    error = null
+    try {
+      const res = await rpc('plane.algo', { plane, algo: 'pagerank', limit: ALGO_CAP })
+      const scoreOf = new Map(res.results.map((r) => [String(r.id), r.score]))
+      plot.overlayScores(scoreOf)
+      algoLegend = []
+      const top = res.results[0]
+      status = top
+        ? `PageRank · ${res.count} nodes · top #${top.id} (${top.score.toFixed(4)})`
+        : `PageRank · no nodes`
+    } catch (e) {
+      error = e.message
+    } finally {
+      algoBusy = false
+    }
+  }
+
+  // Louvain communities or connected components — both recolour by group.
+  async function runGroups(algo) {
+    algoBusy = true
+    error = null
+    const isComm = algo === 'louvain'
+    const key = isComm ? 'community' : 'component'
+    const prefix = isComm ? 'community' : 'component'
+    try {
+      const res = await rpc('plane.algo', { plane, algo, limit: ALGO_CAP })
+      const groupOf = new Map(res.results.map((r) => [String(r.id), r[key]]))
+      algoLegend = plot.overlayGroups(groupOf, prefix)
+      status = `${isComm ? 'Communities' : 'Components'} · ${res.count} groups over ${res.results.length} nodes`
+    } catch (e) {
+      error = e.message
+    } finally {
+      algoBusy = false
+    }
+  }
+
+  async function runShortestPath() {
+    algoBusy = true
+    error = null
+    try {
+      const [src, dst] = await Promise.all([resolveRef(spFrom), resolveRef(spTo)])
+      if (src == null || dst == null) {
+        error = 'enter two known nodes (id or @key) for the path'
+        return
+      }
+      const res = await rpc('plane.algo', { plane, algo: 'shortest_path', src, dst, dir: spDir })
+      if (!res.found) {
+        status = `no ${spDir} path from ${spFrom} to ${spTo}`
+        return
+      }
+      // Bring each hop's neighbourhood onto the canvas so the whole route (and
+      // its edges) is present, then light up the path and mute the rest.
+      for (const id of res.path.nodes) {
+        plot.addSubgraph(await rpc('graph.expand', { plane, id, direction: 'both' }), id)
+      }
+      plot.highlightPath(res.path.nodes, res.path.edges)
+      algoLegend = []
+      legend = plot.legendEntries()
+      status = `path · ${res.path.nodes.length} nodes · ${res.path.edges.length} hops · cost ${res.path.cost}`
+    } catch (e) {
+      error = e.message
+    } finally {
+      algoBusy = false
+    }
+  }
+
+  function resetAlgo() {
+    plot.resetStyle()
+    algoLegend = []
+    legend = plot.legendEntries()
+    status = 'view reset'
   }
 
   // ---- inspector mutations ------------------------------------------------
@@ -517,6 +616,25 @@
   <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
 </div>
 
+<div class="algo-bar">
+  <span class="algo-label">Analyze</span>
+  <button onclick={runPagerank} disabled={algoBusy} title="Size nodes by PageRank importance">PageRank</button>
+  <button onclick={() => runGroups('louvain')} disabled={algoBusy} title="Colour nodes by Louvain community">Communities</button>
+  <button onclick={() => runGroups('components')} disabled={algoBusy} title="Colour nodes by connected component">Components</button>
+  <span class="algo-sep"></span>
+  <span class="algo-sp-label">Path</span>
+  <input class="sp" placeholder="from (id/@key)" bind:value={spFrom} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
+  <input class="sp" placeholder="to (id/@key)" bind:value={spTo} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
+  <select bind:value={spDir} title="Edge direction to follow">
+    <option value="out">→ out</option>
+    <option value="in">← in</option>
+    <option value="both">↔ both</option>
+  </select>
+  <button onclick={runShortestPath} disabled={algoBusy} title="Shortest path between the two nodes">Find path</button>
+  <span class="algo-sep"></span>
+  <button class="ghost" onclick={resetAlgo} disabled={algoBusy} title="Restore normal colours and sizes">Reset</button>
+</div>
+
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if creating === 'node'}
@@ -563,9 +681,9 @@
 <div class="canvas-wrap">
   <div class="canvas" bind:this={container}></div>
 
-  {#if legend.length}
+  {#if algoLegend.length || legend.length}
     <div class="legend">
-      {#each legend as e (e.label)}
+      {#each (algoLegend.length ? algoLegend : legend) as e (e.label)}
         <span class="swatch" style="--c:{e.color}">{e.label || '(no label)'}</span>
       {/each}
     </div>

@@ -33,6 +33,11 @@ function colorFor(label, legend) {
 }
 
 const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
+// Algorithm-overlay colours (ROADMAP §1). PATH reuses the amber accent; MUTED
+// greys read on both themes so a highlighted route/group pops against them.
+const PATH_COLOR = '#f59e0b'
+const MUTED_NODE = '#9aa0aa'
+const MUTED_EDGE = '#c7ccd4'
 // Connect-drag endpoints: the node the drag started on (source) and the one
 // under the cursor (target) get loud, distinct solid colours while dragging.
 const CONNECT_SRC = '#16a34a' // green
@@ -518,6 +523,91 @@ export class Plot {
 
   legendEntries() {
     return [...this.legend.entries()].map(([label, color]) => ({ label, color }))
+  }
+
+  // ---- algorithm overlays (ROADMAP §1) ------------------------------------
+  // These decorate whatever nodes are currently on the canvas from a
+  // `plane.algo` result (keyed by String(id)); `resetStyle` undoes them.
+
+  /**
+   * Scale each on-canvas node's radius by its score (PageRank importance),
+   * normalized across the visible nodes so the biggest is always readable.
+   * Nodes absent from the map keep the minimum size.
+   */
+  overlayScores(scoreOf, { min = 4, max = 26 } = {}) {
+    let lo = Infinity
+    let hi = -Infinity
+    this.graph.forEachNode((n) => {
+      const s = scoreOf.get(n)
+      if (s == null) return
+      if (s < lo) lo = s
+      if (s > hi) hi = s
+    })
+    const span = hi - lo || 1
+    this.graph.forEachNode((n) => {
+      const s = scoreOf.get(n)
+      const size = s == null ? min : min + (max - min) * Math.sqrt((s - lo) / span)
+      this.graph.setNodeAttribute(n, 'size', size)
+    })
+    this.sigma.refresh()
+  }
+
+  /**
+   * Recolor on-canvas nodes by group (component / community). Groups are
+   * numbered in first-seen order for a stable, readable legend; nodes with no
+   * group are muted. Returns `[{label, color}]` for the groups shown.
+   */
+  overlayGroups(groupOf, prefix = 'group') {
+    const order = new Map() // rawGroup -> { color, idx }
+    this.graph.forEachNode((node) => {
+      const g = groupOf.get(node)
+      if (g == null) {
+        this.graph.setNodeAttribute(node, 'color', MUTED_NODE)
+        return
+      }
+      if (!order.has(g)) order.set(g, { color: PALETTE[order.size % PALETTE.length], idx: order.size })
+      this.graph.setNodeAttribute(node, 'color', order.get(g).color)
+    })
+    this.sigma.refresh()
+    return [...order.values()]
+      .sort((a, b) => a.idx - b.idx)
+      .map(({ color, idx }) => ({ label: `${prefix} ${idx + 1}`, color }))
+  }
+
+  /**
+   * Emphasize a path: its nodes/edges glow in the accent colour (endpoints
+   * enlarged), everything else is muted so the route stands out. `nodeIds` /
+   * `edgeIds` are the raw ids from a `shortest_path` result.
+   */
+  highlightPath(nodeIds, edgeIds) {
+    const np = new Set(nodeIds.map(String))
+    const ep = new Set(edgeIds.map((id) => 'e' + id))
+    this.graph.forEachNode((n) => {
+      const on = np.has(n)
+      this.graph.setNodeAttribute(n, 'color', on ? PATH_COLOR : MUTED_NODE)
+      this.graph.setNodeAttribute(n, 'size', on ? 11 : 4)
+    })
+    this.graph.forEachEdge((e) => {
+      const on = ep.has(e)
+      this.graph.setEdgeAttribute(e, 'color', on ? PATH_COLOR : MUTED_EDGE)
+      this.graph.setEdgeAttribute(e, 'size', on ? 6 : 2)
+    })
+    this.sigma.refresh()
+  }
+
+  /** Undo any overlay: restore category colours + degree sizing. */
+  resetStyle() {
+    this.graph.forEachNode((n) => {
+      const rec = this.graph.getNodeAttribute(n, 'record')
+      const label = rec?.labels?.[0] ?? ''
+      this.graph.setNodeAttribute(n, 'color', colorFor(label, this.legend))
+    })
+    this.graph.forEachEdge((e) => {
+      this.graph.removeEdgeAttribute(e, 'color')
+      this.graph.setEdgeAttribute(e, 'size', 4)
+    })
+    this._sizeByDegree()
+    this.sigma.refresh()
   }
 
   destroy() {
