@@ -14,6 +14,7 @@
   let { plane, focus, onPlaneCreated = () => {} } = $props()
 
   let newPlaneOpen = $state(false) // new-plane popup open?
+  let tab = $state('filters') // active toolbar tab: filters | graphql | algorithms | hybrid
 
   let container // canvas div (bind:this)
   let plot = null
@@ -789,63 +790,67 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="controls">
-  <span class="group-title">Filters/Operations</span>
-  <label>
-    Label
-    <select bind:value={labelFilter} onchange={seed}>
-      <option value="">all</option>
-      {#each labels as l (l)}
-        <option value={l}>{l}</option>
-      {/each}
+<div class="tool-tabs">
+  <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}>Filters / Operations</button>
+  <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}>GraphQL / Run</button>
+  <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}>Algorithms</button>
+  <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}>Hybrid</button>
+</div>
+
+{#if tab === 'filters'}
+  <div class="controls">
+    <label>
+      Label
+      <select bind:value={labelFilter} onchange={seed}>
+        <option value="">all</option>
+        {#each labels as l (l)}
+          <option value={l}>{l}</option>
+        {/each}
+      </select>
+    </label>
+    <button onclick={seed}>Reload</button>
+    <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
+    <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
+    <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
+  </div>
+{:else if tab === 'graphql'}
+  <div class="query-bar">
+    <input
+      type="text"
+      class="cypher"
+      placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
+      bind:value={cypher}
+      onkeydown={(e) => e.key === 'Enter' && runCypher()}
+    />
+    <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
+      embed
+      <select bind:value={embedProvider}>
+        {#each EMBED_PROVIDERS as pv (pv)}<option value={pv}>{pv}</option>{/each}
+      </select>
+    </label>
+    <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
+  </div>
+{:else if tab === 'algorithms'}
+  <div class="algo-bar">
+    <button onclick={runPagerank} disabled={algoBusy} title="Size nodes by PageRank importance">PageRank</button>
+    <button onclick={() => runGroups('louvain')} disabled={algoBusy} title="Colour nodes by Louvain community">Communities</button>
+    <button onclick={() => runGroups('components')} disabled={algoBusy} title="Colour nodes by connected component">Components</button>
+    <span class="algo-sep"></span>
+    <span class="algo-sp-label">Path</span>
+    <input class="sp" placeholder="from (id/@key)" bind:value={spFrom} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
+    <input class="sp" placeholder="to (id/@key)" bind:value={spTo} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
+    <select bind:value={spDir} title="Edge direction to follow">
+      <option value="out">→ out</option>
+      <option value="in">← in</option>
+      <option value="both">↔ both</option>
     </select>
-  </label>
-  <button onclick={seed}>Reload</button>
-  <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
-  <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
-  <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
-</div>
-
-<div class="query-bar">
-  <span class="group-title">GraphQL/Run</span>
-  <input
-    type="text"
-    class="cypher"
-    placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
-    bind:value={cypher}
-    onkeydown={(e) => e.key === 'Enter' && runCypher()}
-  />
-  <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
-    embed
-    <select bind:value={embedProvider}>
-      {#each EMBED_PROVIDERS as pv (pv)}<option value={pv}>{pv}</option>{/each}
-    </select>
-  </label>
-  <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
-</div>
-
-<div class="algo-bar">
-  <span class="group-title">Algorithms</span>
-  <button onclick={runPagerank} disabled={algoBusy} title="Size nodes by PageRank importance">PageRank</button>
-  <button onclick={() => runGroups('louvain')} disabled={algoBusy} title="Colour nodes by Louvain community">Communities</button>
-  <button onclick={() => runGroups('components')} disabled={algoBusy} title="Colour nodes by connected component">Components</button>
-  <span class="algo-sep"></span>
-  <span class="algo-sp-label">Path</span>
-  <input class="sp" placeholder="from (id/@key)" bind:value={spFrom} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
-  <input class="sp" placeholder="to (id/@key)" bind:value={spTo} onkeydown={(e) => e.key === 'Enter' && runShortestPath()} />
-  <select bind:value={spDir} title="Edge direction to follow">
-    <option value="out">→ out</option>
-    <option value="in">← in</option>
-    <option value="both">↔ both</option>
-  </select>
-  <button onclick={runShortestPath} disabled={algoBusy} title="Shortest path between the two nodes">Find path</button>
-  <span class="algo-sep"></span>
-  <button class="ghost" onclick={resetAlgo} disabled={algoBusy} title="Restore normal colours and sizes">Reset</button>
-</div>
-
-<div class="algo-bar hybrid-bar">
-  <span class="group-title">Hybrid</span>
-  {#if hasAll || searchableLabels.length}
+    <button onclick={runShortestPath} disabled={algoBusy} title="Shortest path between the two nodes">Find path</button>
+    <span class="algo-sep"></span>
+    <button class="ghost" onclick={resetAlgo} disabled={algoBusy} title="Restore normal colours and sizes">Reset</button>
+  </div>
+{:else if tab === 'hybrid'}
+  <div class="algo-bar hybrid-bar">
+    {#if hasAll || searchableLabels.length}
     <span class="algo-sp-label">in</span>
     <select bind:value={hyLabel} title="Node type to search">
       {#if hasAll}<option value="*">all labels</option>{/if}
@@ -883,11 +888,12 @@
     {/if}
     <span class="algo-sep"></span>
     <button class="ghost" onclick={openIndexDialog} title="Declare a new search index">＋ index</button>
-  {:else}
-    <span class="hy-hint">No search index on this plane yet.</span>
-    <button class="ghost" onclick={openIndexDialog}>＋ Declare an index</button>
-  {/if}
-</div>
+    {:else}
+      <span class="hy-hint">No search index on this plane yet.</span>
+      <button class="ghost" onclick={openIndexDialog}>＋ Declare an index</button>
+    {/if}
+  </div>
+{/if}
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 

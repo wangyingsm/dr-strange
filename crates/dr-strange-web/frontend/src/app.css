@@ -616,18 +616,32 @@ nav button.active {
 }
 
 /* ---- explore controls ---- */
-/* Leading label for each Explore tool group (Filters/Operations, GraphQL/Run,
-   Algorithms). A fixed-width column so the three bars line up, kept inline so
-   it doesn't add a row and push the canvas down. */
-.group-title {
-  flex: none;
-  width: 8.5rem;
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+/* Explore tool groups are tabs: one tab strip + the active group's controls on
+   the next line, so only one bar takes vertical space at a time. */
+.tool-tabs {
+  display: flex;
+  gap: 0.15rem;
+  margin-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tool-tabs button {
+  font: 13px system-ui;
   color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.4rem 0.85rem;
+  cursor: pointer;
   white-space: nowrap;
+}
+.tool-tabs button:hover {
+  color: var(--fg);
+}
+.tool-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
 }
 
 .controls {
