@@ -21,13 +21,12 @@ use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
-use crate::compute::hybrid::{self, Channel, HybridHit, HybridWeights};
 use crate::compute::expr::{self, Expr, score};
+use crate::compute::hybrid::{self, Channel, HybridHit, HybridWeights};
 use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
-use crate::text::Language;
 use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
 use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
@@ -36,6 +35,7 @@ use crate::storage::native::{NativeEngine, NativeWriteTxn};
 #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::storage::vector::Metric;
+use crate::text::Language;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
 };
@@ -73,6 +73,7 @@ impl Engine {
                 let mut txn = $e.begin_write()?;
                 let out = f(&mut txn)?;
                 graph::bump_commit_seq(&mut txn)?;
+                graph::write_commit_time(&mut txn, now_millis())?;
                 txn.commit()?;
                 Ok(out)
             }};
@@ -85,6 +86,43 @@ impl Engine {
             Engine::Native(e) => run!(e),
         }
     }
+
+    /// Runs `f` over a read transaction pinned to a past commit `snapshot`
+    /// (time-travel / AS OF). Native-only: the other backends keep no prior
+    /// versions and reject it.
+    fn with_read_at<T>(
+        &self,
+        snapshot: u64,
+        f: impl FnOnce(&dyn ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => f(&e.begin_read_at(snapshot)?),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(_) => Err(no_time_travel()),
+            Engine::Memory(_) => Err(no_time_travel()),
+        }
+    }
+
+    /// The latest committed sequence, and the oldest sequence retention keeps
+    /// queryable — the inclusive snapshot window `[floor, latest]` time-travel
+    /// may address. Native-only.
+    fn snapshot_window(&self) -> Result<(u64, u64)> {
+        match self {
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => Ok((e.retained_floor(), e.committed_seq())),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(_) => Err(no_time_travel()),
+            Engine::Memory(_) => Err(no_time_travel()),
+        }
+    }
+}
+
+/// The error a non-native backend returns for any time-travel request.
+fn no_time_travel() -> Error {
+    Error::InvalidArgument(
+        "time-travel (AS OF) requires the native backend; this database uses another engine".into(),
+    )
 }
 
 /// An embedded dr-strange database. Cheap to share behind `&`; all reads run
@@ -92,6 +130,29 @@ impl Engine {
 /// Cross-query decoded-object cache budget (arch/02 §4). Modest by default —
 /// embedded-library ethos; a host can size it up when it wants to.
 const CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Current wall-clock time as unix-epoch milliseconds, stamped on each commit
+/// for time-addressed time-travel. Saturates to `0` on the (impossible)
+/// pre-epoch clock so the commit never fails on a clock quirk.
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A past point to read the graph at — the address for a time-travel (AS OF)
+/// query (ROADMAP §4). Resolved to a storage snapshot by the native backend;
+/// other backends reject it. Both forms use "at or before" semantics: a value
+/// between two commits resolves to the latest commit that is not after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsOf {
+    /// A commit sequence, as returned by [`Database::commit_seq`].
+    Seq(u64),
+    /// A wall-clock instant in unix-epoch milliseconds.
+    Time(i64),
+}
 
 pub struct Database {
     engine: Engine,
@@ -229,13 +290,16 @@ impl Database {
             }
         };
         // Keyword indexes (ROADMAP §2): same fresh-sidecar-else-rebuild dance.
-        let keywords = match keyword_sidecar.as_deref().zip(prior_seq).and_then(|(p, seq)| {
-            let reg = KeywordRegistry::load_sidecar(p, seq);
-            if reg.is_some() {
-                tracing::info!(path = %p.display(), "loaded BM25 sidecar");
-            }
-            reg
-        }) {
+        let keywords = match keyword_sidecar
+            .as_deref()
+            .zip(prior_seq)
+            .and_then(|(p, seq)| {
+                let reg = KeywordRegistry::load_sidecar(p, seq);
+                if reg.is_some() {
+                    tracing::info!(path = %p.display(), "loaded BM25 sidecar");
+                }
+                reg
+            }) {
             Some(reg) => reg,
             None => {
                 let mut reg = KeywordRegistry::new();
@@ -257,6 +321,94 @@ impl Database {
     /// Reads it from a fresh snapshot.
     pub fn commit_seq(&self) -> Result<u64> {
         self.engine.with_read(|txn| graph::read_commit_seq(txn))
+    }
+
+    /// The retained history window as commit sequences: `(oldest queryable,
+    /// latest)` — the inclusive range [`AsOf::Seq`] can address. Native-only
+    /// (time-travel needs the LSM engine's versioning).
+    pub fn history(&self) -> Result<(u64, u64)> {
+        let (floor, latest) = self.engine.snapshot_window()?;
+        let oldest = self
+            .engine
+            .with_read_at(floor, |txn| graph::read_commit_seq(txn))?;
+        let newest = self
+            .engine
+            .with_read_at(latest, |txn| graph::read_commit_seq(txn))?;
+        Ok((oldest, newest))
+    }
+
+    /// Bound how far back time-travel can reach: keep the last `keep_commits`
+    /// commits queryable (`None` ⇒ unbounded, the default). Native-only; a
+    /// no-op on other backends. Takes effect at the next compaction and never
+    /// resurrects versions an earlier compaction already reclaimed.
+    pub fn set_retention(&self, keep_commits: Option<u64>) {
+        #[cfg(feature = "native-backend")]
+        if let Engine::Native(e) = &self.engine {
+            e.set_retention(keep_commits);
+        }
+        let _ = keep_commits;
+    }
+
+    /// Resolve a time-travel address ([`AsOf`]) to the storage snapshot to pin.
+    /// Both `Seq` and `Time` use "at or before" semantics; a value beyond the
+    /// latest commit clamps to it, one older than retained history errors.
+    ///
+    /// The graph commit sequence and commit time are both monotonic
+    /// non-decreasing in the storage snapshot, so the target snapshot is the
+    /// binary-search boundary over the retained window — O(log history) small
+    /// meta reads, no per-commit index to maintain.
+    fn resolve_as_of(&self, at: AsOf) -> Result<u64> {
+        let (floor, latest) = self.engine.snapshot_window()?;
+        match at {
+            AsOf::Seq(target) => {
+                self.search_at_or_before(floor, latest, target, "commit sequence", |snap| {
+                    self.engine
+                        .with_read_at(snap, |txn| graph::read_commit_seq(txn))
+                })
+            }
+            AsOf::Time(target) => self.search_at_or_before(
+                floor,
+                latest,
+                target,
+                "timestamp",
+                // A pre-time-index snapshot (no stamp) counts as "infinitely
+                // old" so it never shadows a later, stamped commit.
+                |snap| {
+                    self.engine.with_read_at(snap, |txn| {
+                        Ok(graph::read_commit_time(txn)?.unwrap_or(i64::MIN))
+                    })
+                },
+            ),
+        }
+    }
+
+    /// Largest snapshot in `[floor, latest]` whose `probe` value is `<= target`
+    /// (the value is monotonic non-decreasing in the snapshot). Errors if even
+    /// `floor` is already past `target` — the point predates retained history.
+    fn search_at_or_before<V: Ord + Copy>(
+        &self,
+        floor: u64,
+        latest: u64,
+        target: V,
+        kind: &str,
+        probe: impl Fn(u64) -> Result<V>,
+    ) -> Result<u64> {
+        if probe(floor)? > target {
+            return Err(Error::InvalidArgument(format!(
+                "requested {kind} is older than the retained history \
+                 (raise retention or pick a more recent point)"
+            )));
+        }
+        let (mut lo, mut hi) = (floor, latest);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2); // upper mid ⇒ converge on the max
+            if probe(mid)? <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Ok(lo)
     }
 
     fn indexes(&self) -> std::sync::RwLockReadGuard<'_, VectorRegistry> {
@@ -289,7 +441,11 @@ impl Database {
             .engine
             .with_read(|txn| graph::plane_id_by_name(txn, name))?
             .ok_or_else(|| Error::NotFound(format!("plane '{name}'")))?;
-        Ok(PlaneHandle { db: self, id })
+        Ok(PlaneHandle {
+            db: self,
+            id,
+            as_of: None,
+        })
     }
 
     /// Creates a new, empty plane (arch/09 §3). Errors with `PlaneExists`
@@ -299,7 +455,11 @@ impl Database {
             .engine
             .with_write(|txn| graph::create_plane(txn, name, &props))?;
         tracing::info!(name, id = id.0, "created plane");
-        Ok(PlaneHandle { db: self, id })
+        Ok(PlaneHandle {
+            db: self,
+            id,
+            as_of: None,
+        })
     }
 
     /// Deletes a plane and everything on it (arch/09 §3). Idempotent for an
@@ -334,6 +494,10 @@ impl Database {
 pub struct PlaneHandle<'db> {
     db: &'db Database,
     id: PlaneId,
+    /// When set, every read on this handle is pinned to this past storage
+    /// snapshot (time-travel / AS OF, ROADMAP §4) instead of the latest commit.
+    /// Reads only — writes always target the current state. `None` ⇒ live.
+    as_of: Option<u64>,
 }
 
 impl std::fmt::Debug for PlaneHandle<'_> {
@@ -345,6 +509,50 @@ impl std::fmt::Debug for PlaneHandle<'_> {
 impl<'db> PlaneHandle<'db> {
     pub fn id(&self) -> PlaneId {
         self.id
+    }
+
+    /// Returns a handle whose reads observe the graph **as of** a past point
+    /// (time-travel / AS OF, ROADMAP §4) — every query, traversal, algorithm,
+    /// and lookup made through it sees the state at that commit. Read-only:
+    /// writes on the returned handle still target the current state.
+    ///
+    /// Native backend only; errors on other engines, or if the point is older
+    /// than the retained history. A point beyond the latest commit clamps to
+    /// the latest (i.e. "now").
+    pub fn as_of(mut self, at: AsOf) -> Result<Self> {
+        self.as_of = Some(self.db.resolve_as_of(at)?);
+        Ok(self)
+    }
+
+    /// The snapshot this handle reads at, if it is time-travelling.
+    pub fn as_of_snapshot(&self) -> Option<u64> {
+        self.as_of
+    }
+
+    /// Run `f` over a read txn — pinned to this handle's `as_of` snapshot when
+    /// time-travelling, else the latest committed snapshot. The single seam
+    /// every read on this handle flows through, so AS OF applies uniformly.
+    fn with_read<T>(&self, f: impl FnOnce(&dyn ReadTransaction) -> Result<T>) -> Result<T> {
+        match self.as_of {
+            Some(snapshot) => self.db.engine.with_read_at(snapshot, f),
+            None => self.db.engine.with_read(f),
+        }
+    }
+
+    /// Like [`with_read`](Self::with_read) but hands `f` a full
+    /// [`CachedReader`] (vector registry + the cross-query cache stamped with
+    /// this snapshot's commit seq). The query/algorithm/hybrid terminals use it.
+    fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
+        let registry = self.db.indexes();
+        let cache = &self.db.cache;
+        self.with_read(|txn| {
+            // The snapshot's own commit seq stamps the cache — for a historical
+            // read that is the past seq, so the exact-seq cache never serves
+            // "latest" records to a time-travelling query.
+            let seq = graph::read_commit_seq(txn)?;
+            let reader = CachedReader::with_cache(txn, self.id, &registry, cache, seq);
+            f(&reader)
+        })
     }
 
     /// This plane's name.
@@ -359,9 +567,7 @@ impl<'db> PlaneHandle<'db> {
     }
 
     fn read_plane(&self) -> Result<(String, Properties)> {
-        self.db
-            .engine
-            .with_read(|txn| graph::read_plane(txn, self.id))?
+        self.with_read(|txn| graph::read_plane(txn, self.id))?
             .ok_or_else(|| Error::NotFound(format!("plane {}", self.id.0)))
     }
 
@@ -383,41 +589,31 @@ impl<'db> PlaneHandle<'db> {
     /// Fetches one node with decoded labels and properties; `None` if the id
     /// does not exist in this plane.
     pub fn node(&self, id: NodeId) -> Result<Option<NodeRecord>> {
-        self.db
-            .engine
-            .with_read(|txn| graph::get_node(txn, self.id, id))
+        self.with_read(|txn| graph::get_node(txn, self.id, id))
     }
 
     /// Fetches the node bound to a caller-supplied external key (arch/01 §2);
     /// `None` if no node in this plane carries that key.
     pub fn node_by_key(&self, external_key: &str) -> Result<Option<NodeRecord>> {
-        self.db
-            .engine
-            .with_read(|txn| graph::get_node_by_external_key(txn, self.id, external_key))
+        self.with_read(|txn| graph::get_node_by_external_key(txn, self.id, external_key))
     }
 
     /// Fetches one edge with its resolved type name and properties; `None`
     /// if the id does not exist in this plane.
     pub fn edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>> {
-        self.db
-            .engine
-            .with_read(|txn| graph::get_edge(txn, self.id, id))
+        self.with_read(|txn| graph::get_edge(txn, self.id, id))
     }
 
     /// 1-hop expansion; `ty = None` means any edge type.
     pub fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Vec<Neighbor>> {
-        self.db
-            .engine
-            .with_read(|txn| graph::neighbors(txn, self.id, id, dir, ty))
+        self.with_read(|txn| graph::neighbors(txn, self.id, id, dir, ty))
     }
 
     /// This plane's soft-schema catalog (arch/03 §5) — the descriptive shape
     /// (labels, property types/descriptions, edge-type connectivity, counts)
     /// the MCP layer serves as "schema". Computed by scanning the plane.
     pub fn catalog(&self) -> Result<CatalogSnapshot> {
-        self.db
-            .engine
-            .with_read(|txn| catalog::compute(txn, self.id))
+        self.with_read(|txn| catalog::compute(txn, self.id))
     }
 
     /// Starts a query in this plane (arch/03, arch/04 §3). Defaults to
@@ -1068,8 +1264,10 @@ impl WriteTxn<'_> {
 
     pub fn commit(mut self) -> Result<()> {
         // Bump the commit sequence inside the txn (arch/02 §3) so it commits
-        // atomically with the data — advances the cache's version stamp.
+        // atomically with the data — advances the cache's version stamp — and
+        // stamp the wall-clock time for time-addressed time-travel (ROADMAP §4).
         graph::bump_commit_seq(self.txn())?;
+        graph::write_commit_time(self.txn(), now_millis())?;
         let WriteTxn {
             db,
             plane,
@@ -1351,19 +1549,9 @@ impl<'db> QueryBuilder<'db> {
     // ---- terminals (execute) ---------------------------------------------
 
     fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
-        // Hold a read lock on the index registry for the query's lifetime so
-        // `VectorTopK` can consult declared indexes (arch/01 §5). The reader
-        // memoizes decoded records/adjacency for this one query (arch/02): a
-        // revisit-heavy traversal decodes each hot node once, not per visit.
-        let registry = self.plane.db.indexes();
-        let cache = &self.plane.db.cache;
-        self.plane.db.engine.with_read(|txn| {
-            // The snapshot's commit seq, read from the same txn — so it's
-            // consistent with what this reader sees, the L2 version stamp.
-            let seq = graph::read_commit_seq(txn)?;
-            let reader = CachedReader::with_cache(txn, self.plane.id(), &registry, cache, seq);
-            f(&reader)
-        })
+        // Delegates to the plane handle's reader seam, so an AS OF handle runs
+        // the whole query against its historical snapshot (arch/01 §5, arch/02).
+        self.plane.with_reader(f)
     }
 
     /// Current-node ids of the matching rows, in pipeline order.
@@ -1502,15 +1690,11 @@ impl<'db> AlgoBuilder<'db> {
 
     /// Run `f` over a `CachedReader` bound to one read snapshot — the same
     /// read path the query executor uses (memoizes decoded records/adjacency,
-    /// which the repeated neighbor/edge lookups here benefit from).
+    /// which the repeated neighbor/edge lookups here benefit from). Honours the
+    /// plane handle's AS OF snapshot, so `plane.as_of(..).algo()` runs the
+    /// algorithm over historical state.
     fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
-        let registry = self.plane.db.indexes();
-        let cache = &self.plane.db.cache;
-        self.plane.db.engine.with_read(|txn| {
-            let seq = graph::read_commit_seq(txn)?;
-            let reader = CachedReader::with_cache(txn, self.plane.id(), &registry, cache, seq);
-            f(&reader)
-        })
+        self.plane.with_reader(f)
     }
 
     /// PageRank importance scores, sorted most-important first.
@@ -1646,16 +1830,26 @@ impl<'db> HybridBuilder<'db> {
         let label = self.label.as_deref();
         let registry = self.plane.db.indexes();
         let cache = &self.plane.db.cache;
-        self.plane.db.engine.with_read(|txn| {
+        // `with_read` honours the plane handle's AS OF snapshot, so a hybrid
+        // search can run over historical state too.
+        self.plane.with_read(|txn| {
             let seq = graph::read_commit_seq(txn)?;
             let reader = CachedReader::with_cache(txn, plane_id, &registry, cache, seq);
 
             let vector_ch = match &self.vector {
                 Some(v) => {
-                    let hits =
-                        reader.vector_search(label, &v.property, &v.query, v.metric, self.candidates)?;
+                    let hits = reader.vector_search(
+                        label,
+                        &v.property,
+                        &v.query,
+                        v.metric,
+                        self.candidates,
+                    )?;
                     Some(Channel {
-                        hits: hits.into_iter().map(|h| (NodeId(h.id), h.distance)).collect(),
+                        hits: hits
+                            .into_iter()
+                            .map(|h| (NodeId(h.id), h.distance))
+                            .collect(),
                         higher_better: false,
                     })
                 }
@@ -1703,5 +1897,187 @@ impl<'db> HybridBuilder<'db> {
                 self.k,
             ))
         })
+    }
+}
+
+/// Time-travel / AS OF (ROADMAP §4). Native-backend only — the LSM engine keeps
+/// prior versions keyed by commit sequence; these tests pin past snapshots and
+/// check reads see the historical state.
+#[cfg(all(test, feature = "native-backend"))]
+mod time_travel_tests {
+    use super::*;
+    use crate::types::{Dir, PropDesc, PropValue};
+
+    fn status_prop(v: &str) -> Properties {
+        let mut p = Properties::new();
+        p.insert("status".into(), PropDesc::new(PropValue::Str(v.into())));
+        p
+    }
+
+    fn status_of(n: &NodeRecord) -> String {
+        match n.properties.get("status").map(|d| &d.value) {
+            Some(PropValue::Str(s)) => s.clone(),
+            other => panic!("expected a status string, got {other:?}"),
+        }
+    }
+
+    fn open() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn as_of_seq_reads_the_historical_property() {
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w
+                .create_node_with_key("n1", &["Doc"], status_prop("draft"))
+                .unwrap();
+            w.commit().unwrap();
+            id
+        };
+        let s1 = db.commit_seq().unwrap();
+
+        {
+            let mut w = plane.write().unwrap();
+            w.set_prop(id, "status", PropDesc::new(PropValue::Str("final".into())))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        let s2 = db.commit_seq().unwrap();
+        assert!(s2 > s1, "second commit must advance the sequence");
+
+        // Live read sees the newest value.
+        assert_eq!(status_of(&plane.node(id).unwrap().unwrap()), "final");
+
+        // Pinned to s1, the same node reads its old value.
+        let past = plane.as_of(AsOf::Seq(s1)).unwrap();
+        assert_eq!(status_of(&past.node(id).unwrap().unwrap()), "draft");
+
+        // A future sequence clamps to "now" (at-or-before semantics).
+        let future = plane.as_of(AsOf::Seq(s2 + 100)).unwrap();
+        assert_eq!(status_of(&future.node(id).unwrap().unwrap()), "final");
+
+        // The original handle is unchanged (as_of returns a new handle).
+        assert_eq!(status_of(&plane.node(id).unwrap().unwrap()), "final");
+    }
+
+    #[test]
+    fn as_of_hides_edges_added_later() {
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+
+        let (a, b) = {
+            let mut w = plane.write().unwrap();
+            let a = w
+                .create_node_with_key("a", &["N"], Properties::new())
+                .unwrap();
+            let b = w
+                .create_node_with_key("b", &["N"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+        let before_edge = db.commit_seq().unwrap();
+
+        {
+            let mut w = plane.write().unwrap();
+            w.create_edge(a, b, "LINKS", Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+
+        // Now: one out-neighbour. As of `before_edge`: none.
+        assert_eq!(plane.neighbors(a, Dir::Out, None).unwrap().len(), 1);
+        let past = plane.as_of(AsOf::Seq(before_edge)).unwrap();
+        assert!(past.neighbors(a, Dir::Out, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_reports_the_window_and_retention_bounds_it() {
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let s_first = db.commit_seq().unwrap();
+
+        for i in 0..4 {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key(&format!("n{i}"), &["N"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        let (oldest, latest) = db.history().unwrap();
+        assert_eq!(latest, db.commit_seq().unwrap());
+        assert!(
+            oldest <= s_first,
+            "unbounded history reaches the first commit"
+        );
+
+        // Bounding retention refuses reads older than the window.
+        db.set_retention(Some(1));
+        assert!(
+            plane.as_of(AsOf::Seq(s_first)).is_err(),
+            "a commit below the retained floor must be rejected"
+        );
+        // A recent point still resolves.
+        assert!(plane.as_of(AsOf::Seq(latest)).is_ok());
+        db.set_retention(None); // restore unbounded
+        assert!(plane.as_of(AsOf::Seq(s_first)).is_ok());
+    }
+
+    #[test]
+    fn as_of_time_resolves_at_or_before() {
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w
+                .create_node_with_key("n1", &["Doc"], status_prop("v1"))
+                .unwrap();
+            w.commit().unwrap();
+            id
+        };
+
+        // Far future → newest state.
+        let future = plane.as_of(AsOf::Time(i64::MAX)).unwrap();
+        assert_eq!(status_of(&future.node(id).unwrap().unwrap()), "v1");
+
+        // The epoch predates every real commit → resolves to the empty graph.
+        let epoch = plane.as_of(AsOf::Time(0)).unwrap();
+        assert!(epoch.node(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn as_of_survives_compaction() {
+        // With unbounded retention, an old snapshot stays readable even after
+        // enough commits to trigger compaction (the versions aren't reclaimed).
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w
+                .create_node_with_key("n1", &["Doc"], status_prop("original"))
+                .unwrap();
+            w.commit().unwrap();
+            id
+        };
+        let s1 = db.commit_seq().unwrap();
+
+        // Churn the same key many times to build several versions/runs.
+        for i in 0..64 {
+            let mut w = plane.write().unwrap();
+            w.set_prop(
+                id,
+                "status",
+                PropDesc::new(PropValue::Str(format!("rev{i}"))),
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+
+        let past = plane.as_of(AsOf::Seq(s1)).unwrap();
+        assert_eq!(status_of(&past.node(id).unwrap().unwrap()), "original");
     }
 }

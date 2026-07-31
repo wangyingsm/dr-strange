@@ -105,6 +105,28 @@ pub fn bump_commit_seq(txn: &mut dyn WriteTransaction) -> Result<u64> {
     Ok(next)
 }
 
+/// Wall-clock time (unix-epoch millis) of the latest commit visible at `txn`'s
+/// snapshot — the time index for time-addressed time-travel (ROADMAP §4).
+/// Absent (a pre-time-index database, or before the first stamped commit) ⇒
+/// `None`.
+pub fn read_commit_time(txn: &dyn ReadTransaction) -> Result<Option<i64>> {
+    txn.get(TableId::Meta, keys::META_COMMIT_TIME)?
+        .map(|v| {
+            v.as_slice()
+                .try_into()
+                .map(i64::from_be_bytes)
+                .map_err(|_| Error::Corrupt("bad i64 commit_time in meta".into()))
+        })
+        .transpose()
+}
+
+/// Stamps the current commit's wall-clock time (unix-epoch millis), within the
+/// caller's write txn so it commits atomically with the data. Called once per
+/// committed write, right after [`bump_commit_seq`].
+pub fn write_commit_time(txn: &mut dyn WriteTransaction, millis: i64) -> Result<()> {
+    txn.put(TableId::Meta, keys::META_COMMIT_TIME, &millis.to_be_bytes())
+}
+
 /// Allocates the next id from a meta counter, one meta write per call. Used
 /// for planes/labels/edge-types, which are created rarely — no need for
 /// [`IdAllocator`]'s batching there. `pub(super)` for node/edge creation.

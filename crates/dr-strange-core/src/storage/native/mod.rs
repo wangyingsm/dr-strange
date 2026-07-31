@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, backend};
+use crate::error::{Error, Result, backend};
 use crate::storage::engine::{
     KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction, prefix_successor,
 };
@@ -127,6 +127,12 @@ pub struct NativeEngine {
     /// Shared SST block cache + the monotonic id counter that keys it.
     blocks: Arc<BlockCache>,
     next_sst_id: AtomicU64,
+    /// History-retention window for time-travel (ROADMAP §4): how many commits
+    /// back stay queryable. `0` ⇒ unbounded (never GC across versions — any
+    /// past snapshot is reachable, disk grows with history). `n > 0` ⇒ keep
+    /// versions down to `committed_seq - n`; older snapshots are compacted away.
+    /// Compaction floors its GC at `min(oldest live reader, this)`.
+    retain_commits: AtomicU64,
 }
 
 impl NativeEngine {
@@ -187,6 +193,9 @@ impl NativeEngine {
             readers: Mutex::new(BTreeMap::new()),
             blocks,
             next_sst_id: AtomicU64::new(next_id),
+            // Unbounded history by default (keep every version): time-travel to
+            // any past commit "just works". A host caps it via `set_retention`.
+            retain_commits: AtomicU64::new(0),
         })
     }
 
@@ -217,18 +226,89 @@ impl NativeEngine {
         Ok(())
     }
 
+    /// Set the time-travel retention window: keep the last `keep_commits`
+    /// commits queryable (`None` ⇒ unbounded, the default). Takes effect on the
+    /// next compaction; it never resurrects versions an earlier compaction has
+    /// already reclaimed.
+    pub fn set_retention(&self, keep_commits: Option<u64>) {
+        self.retain_commits
+            .store(keep_commits.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The latest committed sequence — the newest snapshot a reader can pin.
+    pub fn committed_seq(&self) -> u64 {
+        self.store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed_seq
+    }
+
+    /// The oldest sequence retention keeps queryable at `committed_seq`: the
+    /// floor below which time-travel is refused. `0` under unbounded retention.
+    fn retention_floor(&self, committed_seq: u64) -> u64 {
+        match self.retain_commits.load(Ordering::Relaxed) {
+            0 => 0, // unbounded — keep everything reachable
+            keep => committed_seq.saturating_sub(keep),
+        }
+    }
+
+    /// The oldest sequence still retained (a reader may pin any snapshot in
+    /// `[retained_floor, committed_seq]`).
+    pub fn retained_floor(&self) -> u64 {
+        self.retention_floor(self.committed_seq())
+    }
+
+    /// A read transaction pinned to a past commit sequence (time-travel / AS
+    /// OF, ROADMAP §4). Like [`begin_read`](StorageEngine::begin_read) it
+    /// registers the snapshot under the store read lock, so a concurrent
+    /// compaction honours it and won't reclaim versions it needs. Errors if
+    /// `snapshot` is in the future (beyond the latest commit) or older than the
+    /// retained history.
+    pub fn begin_read_at(&self, snapshot: u64) -> Result<NativeReadTxn<'_>> {
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        let committed = store.committed_seq;
+        if snapshot > committed {
+            return Err(Error::InvalidArgument(format!(
+                "cannot read as of {snapshot}: the latest commit is {committed}"
+            )));
+        }
+        let floor = self.retention_floor(committed);
+        if snapshot < floor {
+            return Err(Error::InvalidArgument(format!(
+                "cannot read as of {snapshot}: older than the retained history \
+                 (oldest retained commit is {floor})"
+            )));
+        }
+        *self
+            .readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(snapshot)
+            .or_insert(0) += 1;
+        drop(store);
+        Ok(NativeReadTxn {
+            engine: self,
+            snapshot,
+        })
+    }
+
     /// The oldest sequence any live reader can still observe — the floor below
     /// which older versions are unreachable and may be reclaimed. With no
     /// readers, that's the committed sequence (everything below the newest
-    /// version per key is dead).
+    /// version per key is dead), unless retention pins history further back.
     fn min_snapshot(&self, committed_seq: u64) -> u64 {
-        let readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
-        readers
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(committed_seq)
-            .min(committed_seq)
+        let reader_floor = {
+            let readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+            readers
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(committed_seq)
+                .min(committed_seq)
+        };
+        // Retention lowers the floor so bounded history (or an unbounded 0) keeps
+        // more than live readers alone would.
+        reader_floor.min(self.retention_floor(committed_seq))
     }
 
     /// If enough runs have accumulated, merge them all into one, dropping

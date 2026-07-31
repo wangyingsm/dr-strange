@@ -23,6 +23,11 @@ pub const META_NEXT_EDGE_TYPE_ID: &[u8] = b"next_edge_type_id";
 /// reader reads it from its own snapshot — the cache's version stamp.
 pub const META_COMMIT_SEQ: &[u8] = b"commit_seq";
 
+/// Wall-clock time (unix-epoch milliseconds, i64 BE) of the latest commit,
+/// stamped inside every write txn. The time index for time-addressed
+/// time-travel (ROADMAP §4): `AS OF <timestamp>` resolves against it.
+pub const META_COMMIT_TIME: &[u8] = b"commit_time";
+
 /// Vector-index declarations live in `meta`, keyed
 /// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag.
 /// The `\0` separates the two variable-length names unambiguously (labels
