@@ -5,6 +5,7 @@
   import Dashboard from './Dashboard.svelte'
   import Explore from './Explore.svelte'
   import Digest from './Digest.svelte'
+  import Icon from './Icon.svelte'
 
   // Providers with an embedding endpoint (deepseek is chat-only, so excluded).
   const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
@@ -226,13 +227,13 @@
 
   <nav>
     <button class:active={view === 'dashboard'} onclick={() => (view = 'dashboard')}>
-      Dashboard
+      <Icon name="dashboard" /> Dashboard
     </button>
     <button class:active={view === 'explore'} onclick={() => (view = 'explore')}>
-      Explore
+      <Icon name="explore" /> Explore
     </button>
     <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
-      AIgest
+      <Icon name="aigest" /> AIgest
     </button>
   </nav>
 </header>

@@ -1753,3 +1753,56 @@ textarea.doc {
   font-size: 0.82rem;
   color: var(--muted);
 }
+
+/* ---- menu / tab icons ---- */
+.icon {
+  flex: none;
+  vertical-align: -0.15em;
+  opacity: 0.9;
+}
+nav button,
+.tool-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* ---- GraphQL keyword ghost hint ---- */
+.cypher-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.cypher-wrap .cypher {
+  width: 100%;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+.cypher-ghost {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  box-sizing: border-box;
+  font: 13px/1.4 ui-monospace, monospace; /* must match .cypher */
+  padding: 0.4rem 0.6rem; /* must match .cypher */
+  border: 1px solid transparent; /* match border metrics so text lines up */
+  border-radius: 8px;
+  background: var(--panel);
+  white-space: pre;
+  overflow: hidden;
+  color: var(--muted);
+  opacity: 0.75;
+  pointer-events: none;
+}
+.cypher-ghost .typed {
+  color: transparent; /* occupies the typed text's width, invisibly */
+}
+.cypher-ghost .tab-key {
+  margin-left: 0.5rem;
+  font: 10px system-ui;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 0.25rem;
+  opacity: 0.8;
+}

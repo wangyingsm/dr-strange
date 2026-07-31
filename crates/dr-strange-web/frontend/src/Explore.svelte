@@ -4,6 +4,7 @@
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import CreatePlane from './CreatePlane.svelte'
+  import Icon from './Icon.svelte'
 
   // Providers with an embedding endpoint (deepseek is chat-only, so excluded) —
   // used to embed a text `SEARCH … NEAR "…"`.
@@ -313,6 +314,30 @@
       }`
     } catch (e) {
       error = e.message
+    }
+  }
+
+  // Keyword autocomplete for the GraphQL/Cypher box: once the word being typed
+  // is >2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
+  // shown after the caret; Tab accepts it.
+  const CYPHER_KEYWORDS = [
+    'MATCH', 'WHERE', 'RETURN', 'LIMIT', 'ORDER BY', 'SKIP', 'CREATE', 'MERGE',
+    'SET', 'DELETE', 'REMOVE', 'DETACH', 'WITH', 'SEARCH', 'NEAR', 'TOPK',
+    'DISTINCT', 'AND', 'OR', 'NOT', 'AS', 'ON',
+  ]
+  let cypherGhost = $derived.by(() => {
+    const m = cypher.match(/([A-Za-z]+)$/) // the word currently being typed
+    if (!m || m[1].length < 3) return ''
+    const up = m[1].toUpperCase()
+    const kw = CYPHER_KEYWORDS.find((k) => k.startsWith(up) && k.length > up.length)
+    return kw ? kw.slice(m[1].length) : ''
+  })
+  function onCypherKey(e) {
+    if (e.key === 'Enter') {
+      runCypher()
+    } else if (e.key === 'Tab' && cypherGhost) {
+      e.preventDefault()
+      cypher = cypher + cypherGhost + ' '
     }
   }
 
@@ -954,18 +979,18 @@
 <svelte:window onkeydown={onKeydown} />
 
 <div class="tool-tabs">
-  <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}>Filters / Operations</button>
-  <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}>GraphQL / Run</button>
-  <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}>Algorithms</button>
-  <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}>Hybrid</button>
-  <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}>Ask</button>
+  <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}><Icon name="filters" /> Filters / Operations</button>
+  <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}><Icon name="graphql" /> GraphQL / Run</button>
+  <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}><Icon name="algorithms" /> Algorithms</button>
+  <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}><Icon name="hybrid" /> Hybrid</button>
+  <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}><Icon name="ask" /> Ask</button>
   {#if timeTravel}
     <button class:active={tab === 'timetravel'} class:travelling={asOf != null} onclick={() => (tab = 'timetravel')}>
-      Time-travel{#if asOf != null}<span class="tt-dot" aria-hidden="true"></span>{/if}
+      <Icon name="timetravel" /> Time-travel{#if asOf != null}<span class="tt-dot" aria-hidden="true"></span>{/if}
     </button>
   {/if}
   <button class:active={tab === 'live'} onclick={() => (tab = 'live')}>
-    Live{#if tab === 'live' && feedLive}<span class="live-dot" aria-hidden="true"></span>{/if}
+    <Icon name="live" /> Live{#if tab === 'live' && feedLive}<span class="live-dot" aria-hidden="true"></span>{/if}
   </button>
 </div>
 
@@ -987,13 +1012,18 @@
   </div>
 {:else if tab === 'graphql'}
   <div class="query-bar">
-    <input
-      type="text"
-      class="cypher"
-      placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
-      bind:value={cypher}
-      onkeydown={(e) => e.key === 'Enter' && runCypher()}
-    />
+    <div class="cypher-wrap">
+      {#if cypherGhost}
+        <div class="cypher-ghost"><span class="typed">{cypher}</span>{cypherGhost}<span class="tab-key">Tab</span></div>
+      {/if}
+      <input
+        type="text"
+        class="cypher"
+        placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
+        bind:value={cypher}
+        onkeydown={onCypherKey}
+      />
+    </div>
     <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
       embed
       <select bind:value={embedProvider}>
