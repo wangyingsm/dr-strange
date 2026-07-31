@@ -170,13 +170,20 @@ fn system_prompt(catalog: &CatalogSnapshot) -> String {
          - Read-only: there are no write operations — never invent any.\n\
          - Do NOT use vector/similarity operators; you cannot produce embeddings.\n\
          - A Filter's Expr must yield a Bool (top-level Compare/HasLabel/Logic/Not/IsNull).\n\
-         - Follow edge_type directions per SCHEMA (e.g. WROTE: Author→Paper means dir Out from an Author).\n\
+         - Match the relationship in the question to a SPECIFIC edge_type from SCHEMA (e.g. \
+           \"works at\"/\"任职\" → EMPLOYED_AT) and follow its direction (WROTE: Author→Paper means \
+           dir Out from an Author). Use edge_type null ONLY when the question truly means \"any \
+           connection\".\n\
+         - When the question asks for a specific KIND of result (e.g. \"companies\"/\"公司\"), add \
+           {{\"Filter\": {{\"HasLabel\": \"<Label>\"}}}} after the Expand so only that label is kept.\n\
          \n\
          Examples:\n\
          Q: \"papers from 2020 or later, newest first, top 10\"\n\
          {{\"source\":{{\"ScanLabel\":\"Paper\"}},\"steps\":[{{\"Filter\":{{\"Compare\":{{\"op\":\"Ge\",\"lhs\":{{\"Property\":\"year\"}},\"rhs\":{{\"Literal\":{{\"Int\":2020}}}}}}}}}},{{\"Sort\":[{{\"expr\":{{\"Property\":\"year\"}},\"descending\":true}}]}},{{\"Limit\":10}}]}}\n\
          Q: \"who does alice know\"\n\
          {{\"source\":{{\"SeekKeys\":[\"alice\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"KNOWS\"}}}}]}}\n\
+         Q: \"which companies does bob work at\" (named entity → specific edge → filter by result label)\n\
+         {{\"source\":{{\"SeekKeys\":[\"bob\"]}},\"steps\":[{{\"Expand\":{{\"dir\":\"Out\",\"edge_type\":\"EMPLOYED_AT\"}}}},{{\"Filter\":{{\"HasLabel\":\"Company\"}}}}]}}\n\
          \n\
          SCHEMA (plane has {} nodes, {} edges):\n{}",
         catalog.node_count,
@@ -282,9 +289,12 @@ mod tests {
         assert!(!p.contains("_model"));
         assert!(p.contains("- Author"));
         assert!(p.contains("Read-only"));
-        // Named-entity lookups are steered to SeekKeys, not property filters.
+        // Named-entity lookups are steered to SeekKeys, not property filters;
+        // relationships to a specific edge type; results to a label filter.
         assert!(p.contains("SeekKeys"));
         assert!(p.contains("identity lives in the key"));
+        assert!(p.contains("SPECIFIC edge_type"));
+        assert!(p.contains("HasLabel"));
     }
 
     #[test]
