@@ -38,7 +38,7 @@ pub struct AskOptions {
 impl Default for AskOptions {
     fn default() -> Self {
         Self {
-            max_attempts: 8,
+            max_attempts: 20,
             dry_run: false,
             limit: 100,
         }

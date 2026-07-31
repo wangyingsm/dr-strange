@@ -1082,7 +1082,23 @@
   <div class="canvas" bind:this={container}></div>
 
   {#if algoBusy}
-    <div class="plot-progress" role="progressbar" aria-label="working"><div class="bar"></div></div>
+    <div class="thinking-overlay plot-thinking">
+      <div class="thinking-box">
+        <svg class="portal" viewBox="0 0 64 64" fill="none" stroke="#d9a441" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+          <g class="cw">
+            <circle cx="32" cy="32" r="30" />
+            <circle cx="32" cy="32" r="25.5" stroke-width="3" stroke-dasharray="1.2 3" />
+          </g>
+          <g class="ccw">
+            <rect x="16" y="16" width="32" height="32" />
+            <rect x="16" y="16" width="32" height="32" transform="rotate(45 32 32)" />
+            <circle cx="32" cy="32" r="11" />
+          </g>
+          <circle class="core" cx="32" cy="32" r="3.5" fill="#d9a441" stroke="none" />
+        </svg>
+        <p>working…</p>
+      </div>
+    </div>
   {/if}
 
   {#if status}

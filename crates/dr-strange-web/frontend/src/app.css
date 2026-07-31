@@ -1020,34 +1020,11 @@ nav button.active {
 }
 
 /* Busy indicator while a long op runs (Ask, hybrid, algorithms, a Cypher run):
-   the same accent progress bar as the Digest view, animated indeterminate
-   (sliding) since these ops have no percentage. Pinned to the plot's top edge. */
-.plot-progress {
+   the same spinning-portal animation the Digest view shows while the LLM works,
+   but constrained to the plot area instead of the whole viewport. */
+.thinking-overlay.plot-thinking {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 8px;
   z-index: 6;
-  overflow: hidden;
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-}
-.plot-progress .bar {
-  position: absolute;
-  top: 0;
-  height: 100%;
-  width: 28%;
-  border-radius: 999px;
-  background: var(--accent);
-  animation: indeterminate 1.1s ease-in-out infinite;
-}
-@keyframes indeterminate {
-  0% {
-    left: -28%;
-  }
-  100% {
-    left: 100%;
-  }
 }
 
 /* Right-docked full-height bar, sharing the right edge with the inspector:

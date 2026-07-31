@@ -849,7 +849,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
     });
     let opts = dr_strange_llm::AskOptions {
-        max_attempts: req.max_attempts.unwrap_or(8),
+        max_attempts: req.max_attempts.unwrap_or(20),
         dry_run: req.dry_run,
         limit: req.limit.unwrap_or(100),
     };
