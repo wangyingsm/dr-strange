@@ -70,11 +70,21 @@
   let idxMetric = $state('cosine')
   let idxError = $state(null)
   // Candidate properties for the chosen label + kind: string props for keyword,
-  // vector props for semantic (from the catalog's observed types).
+  // vector props for semantic (from the catalog's observed types). For the
+  // "all labels" target, the union of matching-typed property names.
   let idxProps = $derived.by(() => {
-    const props = catLabels?.[idxLabel]?.properties ?? {}
     const want = idxKind === 'vector' ? 'Vector' : 'Str'
-    return Object.keys(props).filter((k) => props[k]?.types && want in props[k].types)
+    const hasType = (p) => p?.types && want in p.types
+    if (idxLabel === '*') {
+      const names = new Set()
+      for (const l of Object.keys(catLabels ?? {})) {
+        const props = catLabels[l]?.properties ?? {}
+        for (const k of Object.keys(props)) if (hasType(props[k])) names.add(k)
+      }
+      return [...names].sort()
+    }
+    const props = catLabels?.[idxLabel]?.properties ?? {}
+    return Object.keys(props).filter((k) => hasType(props[k]))
   })
 
   // Inspector mutation state (mutation UI): edit properties + delete.
@@ -347,19 +357,43 @@
 
   async function declareIndex() {
     idxError = null
-    if (!idxLabel || !idxProperty.trim()) {
+    const property = idxProperty.trim()
+    if (!idxLabel || !property) {
       idxError = 'pick a label and a property'
       return
     }
     try {
-      const params = { plane, label: idxLabel, property: idxProperty.trim(), kind: idxKind }
-      if (idxKind === 'vector') params.metric = idxMetric
-      await rpc('index.ensure', params)
+      const want = idxKind === 'vector' ? 'Vector' : 'Str'
+      const hasType = (p) => p?.types && want in p.types
+      // "All labels" expands to every label that actually has a matching-typed
+      // property of that name, so we never declare an index on a label without it.
+      let targets
+      if (idxLabel === '*') {
+        targets = Object.keys(catLabels ?? {}).filter((l) =>
+          hasType(catLabels[l]?.properties?.[property]),
+        )
+        if (!targets.length) {
+          idxError = `no label has a ${idxKind === 'vector' ? 'vector' : 'string'} "${property}" property`
+          return
+        }
+      } else {
+        targets = [idxLabel]
+      }
+      for (const l of targets) {
+        const params = { plane, label: l, property, kind: idxKind }
+        if (idxKind === 'vector') params.metric = idxMetric
+        await rpc('index.ensure', params)
+      }
       idxOpen = false
-      await loadIndexes() // the new index now appears; select its label
-      hyLabel = idxLabel
-      onHyLabel()
-      status = `${idxKind} index declared on ${idxLabel}.${idxProperty.trim()}`
+      await loadIndexes() // the new indexes now appear
+      if (idxLabel !== '*') {
+        hyLabel = idxLabel
+        onHyLabel()
+      }
+      status =
+        idxLabel === '*'
+          ? `${idxKind} index declared on "${property}" across ${targets.length} labels`
+          : `${idxKind} index declared on ${idxLabel}.${property}`
     } catch (e) {
       idxError = e.message
     }
@@ -887,6 +921,7 @@
         <label class="idx-row">
           <span>label</span>
           <select bind:value={idxLabel}>
+            <option value="*">✱ all labels</option>
             {#each labels as l (l)}<option value={l}>{l}</option>{/each}
           </select>
         </label>
@@ -912,7 +947,13 @@
         {/if}
         <p class="idx-note">
           Indexes {idxKind === 'vector' ? 'embedding (vector)' : 'string'} values of the chosen
-          property. The suggestions list properties of that type on the label.
+          property.{' '}
+          {#if idxLabel === '*'}
+            Declares it on every label that has such a property (e.g.
+            <code>description</code> across all types).
+          {:else}
+            The suggestions list properties of that type on the label.
+          {/if}
         </p>
         {#if idxError}<p class="dlg-error">{idxError}</p>{/if}
         <div class="dlg-actions">

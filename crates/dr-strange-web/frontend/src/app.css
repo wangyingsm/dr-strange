@@ -851,6 +851,12 @@ nav button.active {
   font-size: 0.76rem;
   color: var(--muted);
 }
+.idx-note code {
+  font-family: ui-monospace, monospace;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  padding: 0.02rem 0.28rem;
+  border-radius: 4px;
+}
 
 .hy-results {
   position: absolute;
