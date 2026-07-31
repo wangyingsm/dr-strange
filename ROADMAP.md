@@ -143,6 +143,37 @@ sidecar; incremental backups (since-seq) vs full only.
 
 ---
 
+## 7. Conversational AI chat → plan → run  *(seventh — capstone)*
+
+**Goal.** A multi-turn **chat** surface over the graph: the user converses in
+natural language, the assistant builds (and iteratively refines) a
+`LogicalPlan`, runs it, and grounds its answers in the results — carrying
+conversation context across turns ("now filter those to last week", "why?").
+
+**Why AI-native.** This is the capstone that ties the whole DB together. Item 3
+(NL→plan) is the one-shot primitive; this is the *agentic* loop around it —
+memory of prior turns, follow-up refinement, tool-use over the query engine
+(`plane.ask` for retrieval, `plane.algo` for reasoning, hybrid retrieval for
+grounding), and self-correction when a generated plan fails. It turns
+dr-strange from a queryable graph into a graph you can *talk to*.
+
+**Scope sketch.** A `plane.chat` surface (RPC + CLI REPL + MCP + web chat panel):
+a conversation state (history + the schema catalog + last result set as
+context) drives an LLM tool-use loop whose tools are the existing query
+primitives (NL→plan, algorithms, hybrid search, raw plan execution). Each turn:
+plan → validate → execute → summarize, with a repair loop on failure. Reuses
+the `dr-strange-llm` provider layer; keys stay server-side. Built **last**
+because it depends on items 1–3 (algorithms + hybrid retrieval + NL→plan) as
+its toolset.
+
+**Forks to settle.** Where conversation state lives (client-held vs
+server-session vs persisted in a plane); tool-use protocol (native LLM
+tool-calling vs a hand-rolled ReAct loop); read-only vs write-capable chat
+(let it mutate the graph?); streaming responses; how much result data to feed
+back as grounding vs summarize; per-conversation cost/turn limits.
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.
