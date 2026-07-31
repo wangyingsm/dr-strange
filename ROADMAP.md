@@ -46,7 +46,17 @@ properties).
 
 ---
 
-## 2. Hybrid retrieval + fusion  *(second)*
+## 2. Hybrid retrieval + fusion  *(shipped)*
+
+**Status.** ✅ Shipped (2026-07-31). BM25 keyword index (`text::Analyzer` with
+Snowball stemming + per-index language; `keyword::KeywordRegistry` mirroring the
+HNSW registry — declared, coherent on writes, `.bm25` sidecar) + a
+`plane.hybrid()` fusion of **three** channels (vector + BM25 + graph proximity)
+via weighted, min-max-normalized score fusion, each hit reporting its
+per-channel breakdown. Surfaced on RPC `plane.hybrid`, CLI `drsg hybrid` +
+`drsg index keyword`, and MCP `hybrid`. (Follow-ups: a web dashboard hybrid
+mode; RRF as an alternative fusion; index declaration on RPC/MCP — a gap shared
+with the vector index.)
 
 **Goal.** True hybrid retrieval that combines **vector** + **keyword/full-text**
 + **graph proximity** into one ranked result, via a fusion operator
