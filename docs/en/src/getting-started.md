@@ -1,51 +1,59 @@
 # Getting Started
 
-This chapter takes you from an empty directory to a running graph you can query
-from the command line and explore in the browser.
+This chapter covers building Dr Strange from source, initializing a database,
+issuing queries from the command line, and running the server — both locally and
+as a container image.
 
 ## Prerequisites
 
-- A recent **Rust toolchain** (stable), via [rustup](https://rustup.rs).
-- Optional, for the web dashboard: **[bun](https://bun.sh)** (to build the
-  single-page app) and **[just](https://github.com/casey/just)** (task runner).
+- A current **Rust toolchain** (stable channel), installed via
+  [rustup](https://rustup.rs).
+- For the web dashboard: **[bun](https://bun.sh)** to compile the single-page
+  application, and optionally **[just](https://github.com/casey/just)** as the
+  task runner.
+- For the container workflow: **Docker** (Engine 24+ with BuildKit).
 
-## Building
+The build links TLS through rustls/ring; no OpenSSL toolchain is required.
 
-Dr Strange is a Cargo workspace. Build the command-line tool, `drsg`:
+## Building from source
+
+Dr Strange is a Cargo workspace. Compile the command-line binary, `drsg`:
 
 ```console
 $ cargo build --release -p dr-strange-cli
 ```
 
-That produces `target/release/drsg`. The default build uses the native LSM
-storage engine; a legacy redb backend is available behind a feature flag if you
-ever need it.
+The artifact is `target/release/drsg`. The default build selects the native LSM
+storage engine; the legacy redb backend remains available behind a feature flag.
 
-To ship the **real dashboard** (rather than a placeholder page) inside the
-binary, build the web SPA first — it is embedded at compile time:
+The web dashboard is embedded into the binary at compile time by the web crate's
+build script. To embed the compiled dashboard rather than a placeholder page,
+build the single-page application before the binary:
 
 ```console
-$ just web-build          # bun install + vite build
+$ just web-build          # bun install && vite build
 $ cargo build --release -p dr-strange-cli
 ```
 
-## The database on disk
+## On-disk layout
 
-Point `--db` at a path. With the native backend the database is a **directory**
-(the write-ahead log and sorted SST files live inside it), with two sidecar
-files beside it for the search indexes:
+The `--db` argument selects the database path. Under the native backend the
+database is a **directory** — the write-ahead log and the sorted SST files reside
+within it — accompanied by two sidecar files that hold the search indexes:
 
 ```text
-graph.drsg/          ← the database (WAL + SST files)
-graph.drsg.hnsw      ← vector-index sidecar
-graph.drsg.bm25      ← keyword-index sidecar
+graph.drsg/          database (WAL + SST files)
+graph.drsg.hnsw      vector-index sidecar
+graph.drsg.bm25      keyword-index sidecar
 ```
 
-The database is created on first use; there is no separate "init" step.
+The database is created on first access; there is no separate initialization
+step.
 
-## Your first graph
+## Creating a graph
 
-Create a plane, then add some data. You can write it in the openCypher subset:
+Create a plane, then insert data. The openCypher subset compiles to the same
+logical plan the engine executes directly:
 
 ```console
 $ drsg --db graph.drsg plane create social
@@ -56,26 +64,26 @@ $ drsg --db graph.drsg cypher --plane social \
             (a)-[:KNOWS]->(b)'
 ```
 
-Read it back:
+Query the result:
 
 ```console
 $ drsg --db graph.drsg cypher --plane social \
     'MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q'
 ```
 
-Check the shape of what you have:
+Inspect the resulting shape and soft schema:
 
 ```console
 $ drsg --db graph.drsg stats
 $ drsg --db graph.drsg catalog --plane social
 ```
 
-## Adding an embedding and searching by meaning
+## Vector index and similarity search
 
-Vectors are ordinary properties. Declare an index on a `(label, property)` pair,
-then search it. Embedding a *text* query happens server-side, so the process
-needs a provider key in its environment (e.g. `OPENAI_API_KEY`); alternatively
-you can search with a literal vector and no provider.
+Vectors are ordinary property values. Declare an index on a `(label, property)`
+pair, then query it. Embedding a text query is performed server-side and
+therefore requires a provider key in the process environment (for example,
+`OPENAI_API_KEY`); a query against a literal vector requires no provider.
 
 ```console
 $ drsg --db graph.drsg index ensure Doc embedding --plane social
@@ -84,32 +92,54 @@ $ OPENAI_API_KEY=… drsg --db graph.drsg cypher --plane social \
     'SEARCH (d:Doc) ON embedding NEAR "a friendly greeting" TOPK 5 RETURN d'
 ```
 
-Because the results are graph nodes, you can traverse onward from them — this is
-the GraphRAG pattern from Chapter 1.
+Because the results are graph nodes, traversal can continue from them — the
+GraphRAG pattern introduced in Chapter 1.
 
-## Serving the dashboard
+## Running the server
 
 ```console
 $ drsg --db graph.drsg serve
 ```
 
-This starts the JSON-RPC API, the WebSocket change feed, and the embedded
-dashboard, and prints the address (default `http://127.0.0.1:7700`). Open it to
-explore the graph, ingest documents, run queries, and watch changes live.
+This starts the JSON-RPC 2.0 API, the WebSocket change feed, and the embedded
+dashboard, and reports the bound address (default `127.0.0.1:7700`).
 
-**Authentication.** With no token set, only the same-origin browser UI is
-allowed to call the API. To permit programmatic access (SDKs, `curl`), set a
-shared token before serving and present it as a bearer token:
+**Authentication.** With no token configured, only the same-origin browser UI is
+authorized to call the API. To permit programmatic access from the SDKs or
+`curl`, configure a shared token and present it as a bearer credential:
 
 ```console
 $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```
 
-## Where to go next
+## Container image
+
+A multi-stage `Dockerfile` compiles the dashboard, builds the binary with the
+dashboard embedded, and produces a minimal runtime image. Build and run it:
+
+```console
+$ docker build -t dr-strange:latest .
+$ docker run -p 7700:7700 -v drsg-data:/data \
+    -e DRSG_TOKEN=please-change-me \
+    dr-strange:latest
+```
+
+The runtime image binds to `0.0.0.0:7700` and stores the database on the `/data`
+volume (the native backend database is a directory, which the volume persists).
+Provider keys are supplied as environment variables.
+
+For a persistent deployment, `docker-compose.yml` defines an equivalent service
+with a named volume:
+
+```console
+$ DRSG_TOKEN=please-change-me docker compose up --build
+```
+
+## Next steps
 
 - **Chapter 3 — AI Native:** embeddings, hybrid retrieval, natural-language
-  querying, and document ingest.
-- **Chapter 4 — Query Language:** the full openCypher subset and the logical
-  plan beneath it.
-- Prefer code? Jump to **Chapter 6 — SDK**. Prefer the shell? **Chapter 7 —
-  Embedded CLI**. Building an agent? **Chapter 8 — MCP**.
+  querying, and document ingestion.
+- **Chapter 4 — Query Language:** the openCypher subset and the underlying
+  logical plan.
+- By interface: **Chapter 6 — SDK** (application code), **Chapter 7 — Embedded
+  CLI** (operations), **Chapter 8 — MCP** (LLM agents).

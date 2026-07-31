@@ -1,8 +1,9 @@
 # Architecture
 
-This chapter opens the hood. Dr Strange is built in clean layers, each with a
-narrow seam to the next, so the engine can be embedded, served, or swapped at
-the storage level without disturbing the layers above.
+This chapter documents the internal architecture. Dr Strange is built in
+distinct layers, each with a narrow seam to the next, so the engine can be
+embedded, served, or swapped at the storage level without disturbing the layers
+above.
 
 ## The layers
 

@@ -1,9 +1,9 @@
 # What is Dr Strange?
 
-Dr Strange is an **AI-native embedded graph database**, written in Rust. That
-sentence packs in three ideas, and the rest of this chapter unpacks them: it
-stores a **graph**, it is **embedded**, and it is **AI-native** — designed for
-AI workloads from the first commit rather than retrofitted with them.
+Dr Strange is an **AI-native embedded graph database**, written in Rust. This
+sentence makes three claims, examined in turn below: it stores a **graph**, it
+is **embedded**, and it is **AI-native** — designed for AI workloads from the
+outset rather than retrofitted.
 
 ## The data model: a property graph, in planes
 
@@ -25,20 +25,21 @@ Data is organized into **planes** — independent, named graph namespaces that
 live in one database file. A plane is like a schema or a namespace: you might
 keep one graph per project, per tenant, or per experiment. Ids are globally
 unique across the whole database, but **every query runs in the context of one
-plane**, so planes stay cleanly separated. A fresh database always has a
-`startup` plane to get you going.
+plane**, so planes remain cleanly separated. A new database always contains a
+`startup` plane.
 
 ## The AI-native thesis
 
-Most databases that "do AI" are a classic engine with a vector column and a
-call-out to an external model. Dr Strange is built the other way around — the
-things an AI application needs are core engine features:
+Most databases that add AI capabilities pair a conventional engine with a vector
+column and a call to an external model. Dr Strange inverts this arrangement: the
+capabilities an AI application requires are core engine features:
 
 - **Embeddings are first-class.** A vector is a property value like any other,
   indexed natively with HNSW, so similarity search is fast and lives *inside*
   the query engine.
 - **Retrieval fuses signals.** Vector similarity, BM25 keyword relevance, and
-  graph proximity combine into a single ranked result — the heart of GraphRAG.
+  graph proximity combine into a single ranked result — the core of the GraphRAG
+  pattern.
 - **The engine talks to agents.** Ask a question in plain language and get a
   query plan back, run it, and receive a connected subgraph. Subscribe to a
   plane and receive mutations as they commit. Read the graph *as of* any past
@@ -54,10 +55,10 @@ nodes. A GraphRAG lookup is a single query:
 SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 5 RETURN d
 ```
 
-That embeds the question, finds the five most similar documents, and — because
-the results are graph nodes — you can immediately **expand** from them to pull
-in the concepts they mention and the documents that cite them, assembling
-grounded context that a pure vector store could never reach on its own.
+This embeds the question, retrieves the five most similar documents, and —
+because the results are graph nodes — traversal continues directly from them,
+into the concepts they mention and the documents that cite them, assembling
+grounded context beyond the reach of a standalone vector store.
 
 ## Where Dr Strange fits
 
@@ -70,8 +71,9 @@ grounded context that a pure vector store could never reach on its own.
 - **Unlike a pure vector database**, the unit of storage is a *graph*: you get
   relationships, traversal, and graph algorithms, not just nearest neighbors.
 
-If your application is a knowledge graph, a GraphRAG pipeline, or an agent's
-long-term memory, Dr Strange aims to be the one store that holds all of it.
+For applications built around a knowledge graph, a GraphRAG pipeline, or an
+agent's long-term memory, Dr Strange is intended to serve as the single store
+for all of it.
 
 ## Feature tour
 
