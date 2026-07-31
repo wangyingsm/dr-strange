@@ -7,6 +7,8 @@
   // Providers with an embedding endpoint (deepseek is chat-only, so excluded) —
   // used to embed a text `SEARCH … NEAR "…"`.
   const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
+  // Chat providers for NL→plan (`plane.ask`); deepseek is chat-capable.
+  const CHAT_PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
 
   // `plane` is the app-wide current plane (App owns it); `focus` is a
   // { id, nonce } signal from the header search — center that node.
@@ -97,6 +99,12 @@
   let vectorOn = $derived(useVector && semanticProp != null)
   let keywordOn = $derived(useKeyword && keywordProp != null)
   let anyChannel = $derived(vectorOn || keywordOn)
+
+  // NL→plan (ROADMAP §3): ask a question, an LLM turns it into a read-only plan.
+  let askQuestion = $state('')
+  let askProvider = $state('openai') // chat provider (key from the server env)
+  let askDryRun = $state(false) // return the plan without running it
+  let askResult = $state(null) // { plan, ran, attempts, results, count } | null
 
   // "Declare an index" dialog (so the dashboard never sends you to the CLI).
   let idxOpen = $state(false)
@@ -443,7 +451,8 @@
       if (hyGraph) params.graph_hops = 1
       const res = await rpc('plane.hybrid', params)
       hyResults = res.results
-      await plotHybrid(res.results)
+      askResult = null
+      await plotResultNodes(res.results)
       const top = res.results[0]
       status = res.count
         ? `hybrid: ${res.count} results · top ${top.external_key ?? '#' + top.id}`
@@ -455,9 +464,9 @@
     }
   }
 
-  // Plot the ranked result set: the hit nodes, the edges induced among them
-  // (for context), sized by fused score so relevance reads at a glance.
-  async function plotHybrid(results) {
+  // Plot a result set: the hit nodes plus the edges induced among them (for
+  // context), sized by score where present (hybrid) or uniformly (ask).
+  async function plotResultNodes(results) {
     plot.clear()
     plot.addSubgraph({ nodes: results, edges: [] })
     const inSet = new Set(results.map((r) => String(r.id)))
@@ -473,6 +482,39 @@
 
   // Format a channel's raw contribution for the results list (— when absent).
   const fmtCh = (v) => (v == null ? '—' : v.toFixed(2))
+
+  // ---- NL→plan ask (ROADMAP §3) -------------------------------------------
+
+  async function runAsk() {
+    if (!askQuestion.trim()) return
+    algoBusy = true
+    error = null
+    try {
+      const res = await rpc('plane.ask', {
+        plane,
+        question: askQuestion.trim(),
+        provider: askProvider,
+        dry_run: askDryRun,
+      })
+      askResult = res
+      hyResults = null
+      if (res.ran && res.results?.length) {
+        await plotResultNodes(res.results)
+      } else if (res.ran) {
+        plot.clear()
+        legend = []
+        algoLegend = []
+      }
+      const tries = `${res.attempts} attempt${res.attempts === 1 ? '' : 's'}`
+      status = res.ran
+        ? `ask: ${res.count} results · ${tries}`
+        : `ask: plan generated (dry run) · ${tries}`
+    } catch (e) {
+      error = e.message
+    } finally {
+      algoBusy = false
+    }
+  }
 
   // ---- inspector mutations ------------------------------------------------
 
@@ -795,6 +837,7 @@
   <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}>GraphQL / Run</button>
   <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}>Algorithms</button>
   <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}>Hybrid</button>
+  <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}>Ask</button>
 </div>
 
 {#if tab === 'filters'}
@@ -892,6 +935,23 @@
       <span class="hy-hint">No search index on this plane yet.</span>
       <button class="ghost" onclick={openIndexDialog}>＋ Declare an index</button>
     {/if}
+  </div>
+{:else if tab === 'ask'}
+  <div class="algo-bar hybrid-bar">
+    <input
+      class="hy-q ask-q"
+      placeholder="ask a question in plain language…"
+      bind:value={askQuestion}
+      onkeydown={(e) => e.key === 'Enter' && runAsk()}
+    />
+    <span class="algo-sp-label">chat</span>
+    <select bind:value={askProvider} title="Chat provider for NL→plan (key from the server env)">
+      {#each CHAT_PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
+    </select>
+    <label class="hy-graph" title="Generate the plan without running it">
+      <input type="checkbox" bind:checked={askDryRun} /> plan only
+    </label>
+    <button onclick={runAsk} disabled={algoBusy || !askQuestion.trim()} title="Turn the question into a read-only plan and run it">Ask</button>
   </div>
 {/if}
 
@@ -1007,7 +1067,7 @@
     <div class="plot-status">{status}</div>
   {/if}
 
-  {#if hyResults}
+  {#if hyResults && tab === 'hybrid'}
     <div class="hy-results">
       <header>
         <span>Hybrid · {hyResults.length}</span>
@@ -1027,6 +1087,19 @@
           </li>
         {/each}
       </ol>
+    </div>
+  {/if}
+
+  {#if askResult && tab === 'ask'}
+    <div class="hy-results ask-plan">
+      <header>
+        <span>
+          Plan · {askResult.attempts} attempt{askResult.attempts === 1 ? '' : 's'}
+          {#if !askResult.ran} · dry run{:else} · {askResult.count} results{/if}
+        </span>
+        <button class="close" onclick={() => (askResult = null)} aria-label="Close">×</button>
+      </header>
+      <pre>{JSON.stringify(askResult.plan, null, 2)}</pre>
     </div>
   {/if}
 

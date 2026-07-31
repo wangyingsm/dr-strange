@@ -828,6 +828,12 @@ nav button.active {
   outline: none;
   border-color: var(--accent);
 }
+/* The Ask question is free-form and longer, so it grows to fill the bar. */
+.hybrid-bar .ask-q {
+  flex: 1;
+  width: auto;
+  min-width: 14rem;
+}
 .hybrid-bar .hy-graph {
   display: flex;
   align-items: center;
@@ -959,6 +965,15 @@ nav button.active {
   font-size: 0.72rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+/* The Ask panel reuses the .hy-results shell but shows the generated plan JSON. */
+.ask-plan pre {
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  overflow: auto;
+  font: 12px/1.5 ui-monospace, monospace;
+  color: var(--fg);
+  white-space: pre;
 }
 
 /* ---- plot canvas ---- */
