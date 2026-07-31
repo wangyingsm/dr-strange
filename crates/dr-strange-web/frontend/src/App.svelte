@@ -175,7 +175,7 @@
       Explore
     </button>
     <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
-      Aigest
+      AIgest
     </button>
   </nav>
 </header>

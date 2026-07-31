@@ -541,7 +541,10 @@ fn system_prompt(link: bool) -> String {
          \"relations\":[{\"src\":\"entity key\",\"dst\":\"entity key\",\"type\":\"REL_TYPE\",\
          \"description\":\"one concise sentence\"}]}\n\
          Use the SAME key for an entity every time it appears so mentions collapse to one node. \
-         Relations must reference entity keys you also emit.",
+         Relations must reference entity keys you also emit.\n\
+         Write every `description` in the SAME language as the key it describes — a Chinese key \
+         like \"数据库\" gets a Chinese description, an English key an English one; never translate \
+         to English. Describe each relation in the language of its endpoint keys.",
     );
     if link {
         p.push_str(
@@ -616,6 +619,9 @@ mod tests {
         assert!(!p.contains("Existing relation types"));
         // No linking ⇒ no reuse-candidate instructions.
         assert!(!p.contains("EXISTING ENTITIES"));
+        // Descriptions follow the key's language, not always English.
+        assert!(p.contains("SAME language as the key"));
+        assert!(p.contains("never translate"));
     }
 
     #[test]
