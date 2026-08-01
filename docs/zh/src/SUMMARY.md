@@ -11,3 +11,5 @@
 - [嵌入式命令行](./embedded-cli.md)
 - [MCP](./mcp.md)
 - [架构](./architecture.md)
+- [附录 A：JSON-RPC 接口清单](./appendix-a.md)
+- [附录 B：是否需要 LLM](./appendix-b.md)
