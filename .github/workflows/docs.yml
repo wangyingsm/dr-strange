@@ -1,10 +1,10 @@
 name: Docs
 
 # Publish the tutorial book (both editions) to GitHub Pages on every push to
-# main. Enable once under Settings → Pages → Source: GitHub Actions.
+# master. Enable once under Settings → Pages → Source: GitHub Actions.
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths: ["docs/**", ".github/workflows/docs.yml"]
   workflow_dispatch:
 

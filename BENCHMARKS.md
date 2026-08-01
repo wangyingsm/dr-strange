@@ -31,7 +31,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 - **Durability differs.** SQLite runs WAL + `synchronous=NORMAL`; drsg uses redb's default durability; Kùzu and Neo4j use their own defaults. These are not equalized — load numbers especially are sensitive to it.
 - **Deployment differs.** dr-strange, Kùzu and SQLite are embedded (in-process, no client/server hop). Neo4j is a server reached over Bolt with JVM warmup and per-query network + transaction overhead, so its per-op latencies carry a fixed tax the embedded engines don't — read it as a different class, not a head-to-head loss.
-- **Maturity differs.** dr-strange is a from-scratch engine at M6; the others are mature. Where we're slower (e.g. vector-index build), that's the point of measuring — it says where to invest next.
+- **Maturity differs.** dr-strange is a young, from-scratch engine at its 1.0 release; the others are mature. Where we're slower (e.g. vector-index build), that's the point of measuring — it says where to invest next.
 - **Synthetic data.** A uniform-random graph with average degree ~5; real workloads have skew/hubs that stress traversal differently.
 
 ## Takeaways for dr-strange
