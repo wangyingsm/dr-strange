@@ -90,6 +90,26 @@ above the core.
   [API](arch/04-api.md),
   [planes](arch/09-planes.md).
 
+## Benchmarks
+
+A cross-engine comparison against an embedded graph DB (Kùzu), the universal
+embedded baseline (SQLite), and the industry-standard server (Neo4j). Every
+engine loads the **same** deterministic dataset — 100 K nodes, 500 K edges,
+128-dim vectors — and runs the **same** query sets on its own optimal path.
+
+| Operation (median latency, ↓ better) | dr-strange | Kùzu | SQLite | Neo4j |
+|---|---|---|---|---|
+| Point lookup by key | **3.4 µs** | 397.6 µs | 5.5 µs | 978.6 µs |
+| 1-hop expansion | **6.7 µs** | 2.37 ms | 13.7 µs | 799.5 µs |
+| 2-hop reachable set | **37.0 µs** | 9.84 ms | 94.7 µs | 1.56 ms |
+| Vector top-k query | **387.7 µs** | 10.39 ms | — | 3.57 ms |
+
+The embedded KV design delivers microsecond point and graph queries and a vector
+top-k below both Kùzu and Neo4j; bulk load still trails the mature columnar
+engines. Numbers are single-run, warm, on one machine — **indicative, not a
+leaderboard**. Methodology, caveats, the load-throughput figures, and how to
+re-run (`just bench-compare`) are in **[BENCHMARKS.md](BENCHMARKS.md)**.
+
 ## License
 
 Licensed under either of
