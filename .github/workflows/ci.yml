@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (native backend)
+        run: cargo clippy --workspace --all-targets
+      - name: Test (native backend)
+        run: cargo test --workspace
+      # The legacy redb engine is opt-in; smoke-test it so it never rots.
+      - name: Test (redb backend)
+        run: cargo test -p dr-strange-core --no-default-features --features redb-backend,json
+      # Ship the CLI binary to the SDK jobs so they don't each rebuild it. The
+      # web crate's build.rs emits a placeholder dashboard when frontend/dist is
+      # absent, so `drsg` builds here without the bun toolchain — the SDK e2e
+      # suites exercise /rpc and /ws, not the SPA.
+      - name: Build drsg
+        run: cargo build -p dr-strange-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drsg
+          path: target/debug/drsg
+          if-no-files-found: error
+          retention-days: 1
+
+  frontend:
+    name: Frontend — build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install
+        run: bun install --frozen-lockfile
+        working-directory: crates/dr-strange-web/frontend
+      - name: Build
+        run: bun run build
+        working-directory: crates/dr-strange-web/frontend
+
+  docs:
+    name: Docs — mdBook build (en + zh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - name: Build (en)
+        run: mdbook build docs/en
+      - name: Build (zh)
+        run: mdbook build docs/zh
+
+  sdk-typescript:
+    name: SDK — TypeScript
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: sdk/typescript
+      - name: Test (drift + e2e)
+        run: bun test
+        working-directory: sdk/typescript
+
+  sdk-python:
+    name: SDK — Python
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@v5
+      - name: Test (drift + e2e)
+        run: uv run --with pytest pytest -q
+        working-directory: sdk/python
+
+  sdk-go:
+    name: SDK — Go
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: sdk/go/go.sum
+      - name: Test (drift + e2e)
+        run: go test ./...
+        working-directory: sdk/go
+
+  sdk-java:
+    name: SDK — Java
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Test (drift + e2e)
+        run: ./mvnw -q -B test
+        working-directory: sdk/java
+
+  sdk-c:
+    name: SDK — C
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev
+      - name: Test (drift + e2e)
+        run: make test
+        working-directory: sdk/c

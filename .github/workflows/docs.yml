@@ -1,0 +1,59 @@
+name: Docs
+
+# Publish the tutorial book (both editions) to GitHub Pages on every push to
+# main. Enable once under Settings → Pages → Source: GitHub Actions.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; don't cancel a publish mid-flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      # Keep the en/book + zh/book layout so the cross-edition links
+      # (../../zh/book/index.html) resolve, and land visitors on the English
+      # edition from the site root.
+      - name: Build both editions
+        run: |
+          mdbook build docs/en
+          mdbook build docs/zh
+          mkdir -p _site/en _site/zh
+          cp -r docs/en/book _site/en/book
+          cp -r docs/zh/book _site/zh/book
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=./en/book/index.html">
+          <link rel="canonical" href="./en/book/index.html">
+          <title>Dr Strange — Documentation</title>
+          <a href="./en/book/index.html">Dr Strange documentation</a>
+          HTML
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
