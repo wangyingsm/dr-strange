@@ -1,81 +1,71 @@
 # Appendix A: JSON-RPC API List
 
-This appendix lists the JSON-RPC 2.0 methods exposed by `drsg serve`. The
-`OpenRPC` schema at `crates/dr-strange-web/openrpc.json` is the authoritative
+This appendix is a reference for the JSON-RPC 2.0 methods exposed by `drsg serve`.
+The `OpenRPC` schema at `crates/dr-strange-web/openrpc.json` is the authoritative
 source — the server returns it from `rpc.discover`, and the SDKs are generated
-from it. Each method carries an **access** tier (`read`, `write`, or `admin`);
-under the single shared token all three require the same token.
+from it.
+
+Each entry shows the method, its **access** tier (`read` / `write` / `admin`;
+under the single shared token all three require the same token), a one-line
+summary, and its parameters. A parameter is written `name` type; **`!` marks a
+required parameter**. Types are JSON values; `Properties` is the property-map
+dialect (`{"$vector":[…]}`, `{"$desc":…,"$value":…}`), and `NodeRef` is a node id
+or an external key.
 
 ## Discovery and database
 
-| Method | Access | Summary |
-|---|---|---|
-| `rpc.discover` | read | the OpenRPC service description |
-| `db.stats` | read | plane/node/edge counts, labels, edge types, indexes, commits, on-disk size |
-| `db.catalog` | read | the soft-schema catalog rolled up across every plane |
+- **`rpc.discover`** · read — the OpenRPC service description. Params: none.
+- **`db.stats`** · read — plane/node/edge counts, labels, edge types, indexes, commits, on-disk size. Params: none.
+- **`db.catalog`** · read — the soft-schema catalog across every plane. Params: none.
 
 ## Planes
 
-| Method | Access | Summary |
-|---|---|---|
-| `plane.list` | read | every plane with id, name, counts, and properties |
-| `plane.catalog` | read | one plane's soft schema |
-| `plane.indexes` | read | the search indexes declared on a plane |
-| `plane.history` | read | the time-travel window (native backend only) |
-| `plane.create` | admin | create an empty plane |
-| `plane.rename` | admin | rename a plane |
-| `plane.set_props` | admin | replace a plane's property map |
-| `plane.delete` | admin | drop a plane and its contents |
+- **`plane.list`** · read — every plane with id, name, counts, properties. Params: none.
+- **`plane.catalog`** · read — one plane's soft schema. Params: `plane` string!.
+- **`plane.indexes`** · read — the search indexes declared on a plane. Params: `plane` string!.
+- **`plane.history`** · read — the time-travel window (native backend only). Params: none.
+- **`plane.create`** · admin — create an empty plane. Params: `name` string!, `properties` Properties.
+- **`plane.rename`** · admin — rename a plane. Params: `plane` string!, `to` string!.
+- **`plane.set_props`** · admin — replace a plane's property map. Params: `plane` string!, `properties` Properties!.
+- **`plane.delete`** · admin — drop a plane and its contents. Params: `plane` string!.
 
 ## Nodes and edges
 
-| Method | Access | Summary |
-|---|---|---|
-| `node.get` | read | one node by id or external key |
-| `node.create` | write | add a node with optional key and labels |
-| `node.update` | write | patch a node's properties and labels |
-| `node.delete` | write | delete a node, cascading its edges |
-| `edge.create` | write | add a directed edge between two nodes |
-| `edge.update` | write | patch an edge's properties or type |
-| `edge.delete` | write | delete one edge |
+- **`node.get`** · read — one node by id or external key. Params: `plane` string!, `id` integer, `key` string.
+- **`node.create`** · write — add a node with optional key and labels. Params: `plane` string!, `key` string, `labels` array, `properties` Properties.
+- **`node.update`** · write — patch properties (`set`/`unset`) and labels. Params: `plane` string!, `id` integer, `key` string, `set` Properties, `unset` array, `labels` array.
+- **`node.delete`** · write — delete a node, cascading its edges. Params: `plane` string!, `id` integer, `key` string.
+- **`edge.create`** · write — add a directed edge between two nodes. Params: `plane` string!, `src` NodeRef!, `dst` NodeRef!, `type` string!, `properties` Properties.
+- **`edge.update`** · write — patch properties (`set`/`unset`) or the type. Params: `plane` string!, `edge` integer!, `set` Properties, `unset` array, `type` string.
+- **`edge.delete`** · write — delete one edge. Params: `plane` string!, `edge` integer!.
 
 ## Query and retrieval
 
-| Method | Access | Summary |
-|---|---|---|
-| `plane.neighbors` | read | 1-hop expansion as `{node, edge}` id pairs |
-| `plane.query` | read | run a serialized logical plan |
-| `plane.cypher` | write | run an openCypher-subset statement (write-gated) |
-| `plane.find` | read | text or semantic search over a plane |
-| `plane.search` | read | vector top-*k* over a property |
-| `plane.hybrid` | read | fused vector + keyword + graph-proximity search |
-| `plane.algo` | read | a graph algorithm (pagerank / components / shortest_path / louvain) |
-| `plane.ask` | read | natural-language query → plan → run |
-| `graph.seed` | read | an initial canvas of nodes plus induced edges |
-| `graph.expand` | read | hub-safe 1-hop neighbourhood around a node |
-
-`plane.query`, `plane.neighbors`, `plane.find`, `graph.seed`, and `graph.expand`
-accept optional `as_of` (commit sequence) or `as_of_ms` (timestamp) parameters
-for time-travel reads (native backend only).
+- **`plane.neighbors`** · read — 1-hop expansion as `{node, edge}` id pairs. Params: `plane` string!, `id` integer!, `direction` string, `type` string, `as_of` integer, `as_of_ms` integer.
+- **`plane.query`** · read — run a serialized logical plan. Params: `plane` string!, `plan` object!, `as_of` integer, `as_of_ms` integer.
+- **`plane.cypher`** · write — run an openCypher-subset statement (write-gated). Params: `plane` string!, `query` string!, `embed` string, `params` object.
+- **`plane.find`** · read — text or semantic search over a plane. Params: `plane` string!, `q` string!, `limit` integer, `semantic` boolean, `provider` string, `embed_model` string, `as_of` integer, `as_of_ms` integer.
+- **`plane.search`** · read — vector top-*k* over a property. Params: `plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string.
+- **`plane.hybrid`** · read — fused vector + keyword + graph-proximity search. Params: `plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string.
+- **`plane.algo`** · read — a graph algorithm over a plane or label subset. Params: `plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number.
+- **`plane.ask`** · read — natural-language query → plan → run. Params: `plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string.
+- **`graph.seed`** · read — an initial canvas of nodes plus induced edges. Params: `plane` string!, `label` string, `limit` integer, `as_of` integer, `as_of_ms` integer.
+- **`graph.expand`** · read — hub-safe 1-hop neighbourhood around a node. Params: `plane` string!, `id` integer!, `direction` string, `type` string, `limit` integer, `as_of` integer, `as_of_ms` integer.
 
 ## Indexes and ingestion
 
-| Method | Access | Summary |
-|---|---|---|
-| `index.ensure` | admin | declare a vector or keyword index on `(label, property)` |
-| `digest.run` | write | extract a node/edge proposal from text via the LLM (dry run) |
-| `digest.write` | write | write a previously-computed proposal (no LLM call) |
+- **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
+- **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean.
+- **`digest.write`** · write — write a previously-computed proposal (no LLM call). Params: `plane` string!, `nodes` array!, `edges` array.
 
 ## WebSocket subscription
 
 The `/ws` endpoint answers the same request/response methods and additionally
 supports the change feed (these are WebSocket-only):
 
-| Message | Direction | Summary |
-|---|---|---|
-| `plane.watch` | client → server | subscribe to a plane's changes (optional `label`) |
-| `plane.unwatch` | client → server | stop the subscription |
-| `plane.change` | server → client | a committed change set `{plane, seq, truncated, changes}` |
+- **`plane.watch`** · client → server — subscribe to a plane's changes. Params: `plane` string!, `label` string.
+- **`plane.unwatch`** · client → server — stop the subscription. Params: none.
+- **`plane.change`** · server → client — a committed change set. Fields: `plane`, `seq`, `truncated`, `changes`.
 
 ## Error codes
 
