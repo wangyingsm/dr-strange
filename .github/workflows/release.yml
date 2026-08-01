@@ -88,11 +88,24 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      # Pull this version's section out of CHANGELOG.md for the release body.
+      # The auto-generated commit list is appended below it.
+      - name: Extract release notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { flag = 1; next }
+            flag && /^## \[/ { exit }
+            flag && $0 !~ /^\[[0-9]/ { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          echo "----- release body -----"; cat RELEASE_NOTES.md
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
@@ -101,6 +114,7 @@ jobs:
             dist/dr-strange-*.tar.gz.sha256
             dist/dr-strange-*.zip
             dist/dr-strange-*.zip.sha256
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
 
   docker:
