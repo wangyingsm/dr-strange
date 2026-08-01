@@ -32,6 +32,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
       # Build the real dashboard so it is embedded into the release binary
       # rather than the build.rs placeholder.
       - name: Build frontend

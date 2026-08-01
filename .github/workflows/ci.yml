@@ -55,6 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
       - name: Install
         run: bun install --frozen-lockfile
         working-directory: crates/dr-strange-web/frontend
@@ -90,6 +92,8 @@ jobs:
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
       - run: bun install --frozen-lockfile
         working-directory: sdk/typescript
       - name: Test (drift + e2e)
