@@ -9,7 +9,8 @@
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 📖 **Dr Strange 手册** —— 完整教程与指南：
-[English](docs/en/src/introduction.md) · [中文](docs/zh/src/introduction.md)。
+[English](https://wangyingsm.github.io/dr-strange/en/book/introduction.html) ·
+[中文](https://wangyingsm.github.io/dr-strange/zh/book/introduction.html)。
 
 ## 简介
 
@@ -41,7 +42,7 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **接口** | Web 控制台、五种语言 SDK、命令行工具与 MCP 服务器 |
 
 依赖模型的功能（自然语言查询、文档摄取与文本嵌入检索）会调用外部或本地的 LLM；其余
-功能均无需任何模型即可运行。参见[附录 B](docs/zh/src/appendix-b.md)。
+功能均无需任何模型即可运行。参见[附录 B](https://wangyingsm.github.io/dr-strange/zh/book/appendix-b.html)。
 
 ## 快速上手
 
@@ -60,18 +61,19 @@ $ drsg --db graph.drsg serve
 
 完整的操作流程——构建、磁盘布局、向量嵌入与相似度检索、服务端及其配置，以及容器
 镜像——参见手册的**快速上手**章节：
-[English](docs/en/src/getting-started.md) · [中文](docs/zh/src/getting-started.md)。
+[English](https://wangyingsm.github.io/dr-strange/en/book/getting-started.html) ·
+[中文](https://wangyingsm.github.io/dr-strange/zh/book/getting-started.html)。
 
 ## 文档
 
 手册逐一深入讲解各个部分：
-[AI 原生](docs/zh/src/ai-native.md) ·
-[查询语言](docs/zh/src/query-language.md) ·
-[Web 控制台](docs/zh/src/web-ui.md) ·
-[SDK](docs/zh/src/sdk.md) ·
-[嵌入式 CLI](docs/zh/src/embedded-cli.md) ·
-[MCP](docs/zh/src/mcp.md) ·
-[JSON-RPC API 清单](docs/zh/src/appendix-a.md)。
+[AI 原生](https://wangyingsm.github.io/dr-strange/zh/book/ai-native.html) ·
+[查询语言](https://wangyingsm.github.io/dr-strange/zh/book/query-language.html) ·
+[Web 控制台](https://wangyingsm.github.io/dr-strange/zh/book/web-ui.html) ·
+[SDK](https://wangyingsm.github.io/dr-strange/zh/book/sdk.html) ·
+[嵌入式 CLI](https://wangyingsm.github.io/dr-strange/zh/book/embedded-cli.html) ·
+[MCP](https://wangyingsm.github.io/dr-strange/zh/book/mcp.html) ·
+[JSON-RPC API 清单](https://wangyingsm.github.io/dr-strange/zh/book/appendix-a.html)。
 
 在本地构建（mdBook）：`just docs-serve zh`（中文）或 `just docs-serve`（英文）。
 
@@ -81,7 +83,7 @@ Dr Strange 由清晰分层构成——存储（手写的、支持 MVCC 的 LSM �
 缓存、计算、API 层，以及横贯各层的平面模型——外围的封装层（Web、SDK、CLI、MCP、
 LLM）则位于内核之上。
 
-- **[架构章节](docs/zh/src/architecture.md)** —— 分层全景图，以及提交序列
+- **[架构章节](https://wangyingsm.github.io/dr-strange/zh/book/architecture.html)** —— 分层全景图，以及提交序列
   （commit sequence）如何统一 MVCC、缓存、时间旅行与变更流。
 - **[`arch/`](arch/)** —— 各层详细的设计笔记：
   [总览](arch/00-overview.md)、

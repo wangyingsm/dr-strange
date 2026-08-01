@@ -9,7 +9,8 @@
 <p align="center"><strong>English</strong> · <a href="README.zh.md">简体中文</a></p>
 
 📖 **The Dr Strange Book** — the full tutorial and guide:
-[English](docs/en/src/introduction.md) · [中文](docs/zh/src/introduction.md).
+[English](https://wangyingsm.github.io/dr-strange/en/book/introduction.html) ·
+[中文](https://wangyingsm.github.io/dr-strange/zh/book/introduction.html).
 
 ## Introduction
 
@@ -44,7 +45,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 
 The model-backed features (natural-language query, document ingestion, and
 text-embedding search) call an external or local LLM; everything else runs with
-no model at all. See [Appendix B](docs/en/src/appendix-b.md).
+no model at all. See [Appendix B](https://wangyingsm.github.io/dr-strange/en/book/appendix-b.html).
 
 ## Getting Started
 
@@ -64,18 +65,19 @@ $ drsg --db graph.drsg serve
 The full walkthrough — building, the on-disk layout, embeddings and similarity
 search, the server and its configuration, and the container image — is in the
 book's **Getting Started** chapter:
-[English](docs/en/src/getting-started.md) · [中文](docs/zh/src/getting-started.md).
+[English](https://wangyingsm.github.io/dr-strange/en/book/getting-started.html) ·
+[中文](https://wangyingsm.github.io/dr-strange/zh/book/getting-started.html).
 
 ## Documentation
 
 The book covers each part in depth:
-[AI Native](docs/en/src/ai-native.md) ·
-[Query Language](docs/en/src/query-language.md) ·
-[Web UI](docs/en/src/web-ui.md) ·
-[SDK](docs/en/src/sdk.md) ·
-[Embedded CLI](docs/en/src/embedded-cli.md) ·
-[MCP](docs/en/src/mcp.md) ·
-[JSON-RPC API list](docs/en/src/appendix-a.md).
+[AI Native](https://wangyingsm.github.io/dr-strange/en/book/ai-native.html) ·
+[Query Language](https://wangyingsm.github.io/dr-strange/en/book/query-language.html) ·
+[Web UI](https://wangyingsm.github.io/dr-strange/en/book/web-ui.html) ·
+[SDK](https://wangyingsm.github.io/dr-strange/en/book/sdk.html) ·
+[Embedded CLI](https://wangyingsm.github.io/dr-strange/en/book/embedded-cli.html) ·
+[MCP](https://wangyingsm.github.io/dr-strange/en/book/mcp.html) ·
+[JSON-RPC API list](https://wangyingsm.github.io/dr-strange/en/book/appendix-a.html).
 
 Build it locally (mdBook): `just docs-serve` (English) or `just docs-serve zh`.
 
@@ -86,7 +88,7 @@ MVCC), a version-stamped cache, computation, the API surface, and the
 cross-cutting plane model — with the wrapper layers (web, SDKs, CLI, MCP, LLM)
 above the core.
 
-- **[Architecture chapter](docs/en/src/architecture.md)** — the layer map and how
+- **[Architecture chapter](https://wangyingsm.github.io/dr-strange/en/book/architecture.html)** — the layer map and how
   the commit sequence unifies MVCC, caching, time-travel, and the change feed.
 - **[`arch/`](arch/)** — the detailed, per-layer design notes:
   [overview](arch/00-overview.md),
