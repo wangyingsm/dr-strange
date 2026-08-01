@@ -26,6 +26,19 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 对于围绕知识图谱、GraphRAG 流水线或智能体长期记忆构建的应用，Dr Strange 力求成为
 承载这一切的单一存储。
 
+## Web UI 截图
+
+<table>
+  <tr>
+    <td width="50%"><a href="screenshots/00.jpg"><img src="screenshots/00.jpg" width="100%" alt="Dashboard —— 平面统计与管理"></a><br><sub><b>Dashboard</b> —— 实时的平面统计与管理</sub></td>
+    <td width="50%"><a href="screenshots/01.jpg"><img src="screenshots/01.jpg" width="100%" alt="Explore —— 交互式图谱与节点详情"></a><br><sub><b>Explore</b> —— 交互式图谱与节点详情</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="screenshots/02.jpg"><img src="screenshots/02.jpg" width="100%" alt="Algorithms —— 图上的最短路径"></a><br><sub><b>Algorithms</b> —— PageRank、社区发现与最短路径</sub></td>
+    <td width="50%"><a href="screenshots/03.jpg"><img src="screenshots/03.jpg" width="100%" alt="AIgest —— LLM 文档摄取，抽取实体与关系"></a><br><sub><b>AIgest</b> —— LLM 文档摄取，抽取实体与关系</sub></td>
+  </tr>
+</table>
+
 ## 特性
 
 | 能力 | 提供的价值 |
