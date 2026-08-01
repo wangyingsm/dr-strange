@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+#
+# Release runtime image — reuses the `drsg` binary the `binaries` job already
+# built NATIVELY per architecture, so there is NO in-image compilation (the
+# from-source build lives in ./Dockerfile). This avoids the ~50-minute QEMU
+# arm64 Rust compile: the multi-arch build here is just a COPY.
+#
+# The build context must provide `bin/<arch>/drsg` for each target; the arch is
+# the predefined `TARGETARCH` build arg (`amd64` / `arm64`). The binary already
+# has the dashboard SPA embedded (build.rs), and links TLS via rustls/ring.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY bin/${TARGETARCH}/drsg /usr/local/bin/drsg
+
+# The native-backend database is a directory; persist it on a volume.
+VOLUME /data
+EXPOSE 7700
+
+# Bind to all interfaces inside the container (the default is loopback-only).
+ENTRYPOINT ["drsg"]
+CMD ["--db", "/data/graph.drsg", "serve", "--addr", "0.0.0.0:7700"]
