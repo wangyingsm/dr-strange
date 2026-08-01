@@ -55,10 +55,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
       - name: Install
-        run: bun install --frozen-lockfile
+        # Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2
+        # (written by a bun canary) which setup-bun's stable bun can't parse;
+        # let it resolve fresh instead of failing to read the lock.
+        run: bun install
         working-directory: crates/dr-strange-web/frontend
       - name: Build
         run: bun run build
@@ -92,9 +93,7 @@ jobs:
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
-      - run: bun install --frozen-lockfile
+      - run: bun install # not --frozen: the committed lock is a bun-canary format
         working-directory: sdk/typescript
       - name: Test (drift + e2e)
         run: bun test

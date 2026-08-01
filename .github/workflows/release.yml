@@ -32,13 +32,13 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.0" # matches the committed bun.lock (lockfileVersion 2)
       # Build the real dashboard so it is embedded into the release binary
       # rather than the build.rs placeholder.
       - name: Build frontend
+        # Not --frozen-lockfile: the committed bun.lock is a bun-canary format
+        # (lockfileVersion 2) that setup-bun's stable bun can't parse.
         run: |
-          bun install --frozen-lockfile
+          bun install
           bun run build
         working-directory: crates/dr-strange-web/frontend
       - name: Build binaries
