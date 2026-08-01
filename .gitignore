@@ -1,8 +1,11 @@
 /target
 
-# Local database files created by drsg / just serve.
+# Local database files created by drsg / just serve, including the native
+# LSM engine's on-disk sidecars (HNSW vector index, BM25 keyword index).
 *.drsg
 *.drsg.jsonl
+*.drsg.hnsw
+*.drsg.bm25
 
 # Runtime logs from dr-strange-log (DRSG_LOG_DIR, default ./logs) — the server
 # writes ./logs relative to its cwd, so ignore the dir anywhere.
