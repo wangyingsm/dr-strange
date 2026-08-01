@@ -1,8 +1,12 @@
-# Dr Strange
+<p align="center">
+  <img src="crates/dr-strange-web/frontend/public/magic-circle.svg" alt="Dr Strange" width="120" height="120">
+</p>
 
-> 一个 AI 原生的嵌入式图数据库，使用 Rust 编写。
+<h1 align="center">Dr Strange</h1>
 
-[English](README.md) · **简体中文**
+<p align="center"><em>一个 AI 原生的嵌入式图数据库，使用 Rust 编写。</em></p>
+
+<p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 📖 **Dr Strange 手册** —— 完整教程与指南：
 [English](docs/en/src/introduction.md) · [中文](docs/zh/src/introduction.md)。

@@ -1,8 +1,12 @@
-# Dr Strange
+<p align="center">
+  <img src="crates/dr-strange-web/frontend/public/magic-circle.svg" alt="Dr Strange" width="120" height="120">
+</p>
 
-> An AI-native embedded graph database, written in Rust.
+<h1 align="center">Dr Strange</h1>
 
-**English** · [简体中文](README.zh.md)
+<p align="center"><em>An AI-native embedded graph database, written in Rust.</em></p>
+
+<p align="center"><strong>English</strong> · <a href="README.zh.md">简体中文</a></p>
 
 📖 **The Dr Strange Book** — the full tutorial and guide:
 [English](docs/en/src/introduction.md) · [中文](docs/zh/src/introduction.md).
