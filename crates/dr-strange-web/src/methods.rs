@@ -1328,6 +1328,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         run_id: format!("web-{}", now_secs()),
         chunk_chars: 4000,
         embed,
+        concurrency: 8,
     };
     let plane = app(ctx.db.plane(&req.plane))?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);

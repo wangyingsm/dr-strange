@@ -754,6 +754,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         run_id,
         chunk_chars: 4000,
         embed,
+        concurrency: 8,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

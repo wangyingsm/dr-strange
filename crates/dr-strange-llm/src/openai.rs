@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::preset::preset;
-use crate::provider::{Chat, ChatReply, EmbedReply, Embedder};
+use crate::provider::{Chat, ChatReply, EmbedReply, Embedder, OutputTruncated};
 
 /// Output-token ceiling for extraction replies. Generous headroom so a chunk's
 /// JSON is not cut off mid-object (which yields unparseable output). Chunks are
@@ -154,10 +154,10 @@ impl Chat for OpenAiProvider {
                 max_output_tokens = MAX_OUTPUT_TOKENS,
                 "provider reply truncated at the output-token limit"
             );
-            bail!(
-                "the model's reply hit the {MAX_OUTPUT_TOKENS}-token output limit and was cut off \
-                 — the text is too dense to extract in one pass; try a smaller chunk size"
-            );
+            // Typed, recoverable: digest splits the chunk and retries.
+            return Err(anyhow::Error::new(OutputTruncated {
+                limit: MAX_OUTPUT_TOKENS,
+            }));
         }
         let text = choice["message"]["content"]
             .as_str()

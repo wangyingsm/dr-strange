@@ -18,6 +18,27 @@ pub struct ChatReply {
     pub output_tokens: u64,
 }
 
+/// The provider's reply was cut off at the model's output-token limit. A dense
+/// extraction chunk can trigger this; [`crate::digest`] recovers by splitting
+/// the chunk and retrying, so it is a typed, recoverable error a caller can
+/// match on rather than a plain message.
+#[derive(Debug)]
+pub struct OutputTruncated {
+    pub limit: u32,
+}
+
+impl std::fmt::Display for OutputTruncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model's reply hit the {}-token output limit and was cut off",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for OutputTruncated {}
+
 /// Batch text → vectors, with token accounting.
 pub trait Embedder {
     fn embed(&self, texts: &[String]) -> Result<EmbedReply>;

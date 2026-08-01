@@ -23,4 +23,4 @@ pub use digest::{
 };
 pub use openai::{OpenAiProvider, build_provider};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
-pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider};
+pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};

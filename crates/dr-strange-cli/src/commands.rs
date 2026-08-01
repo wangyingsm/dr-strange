@@ -490,6 +490,8 @@ pub struct DigestArgs<'a> {
     pub plane: &'a str,
     pub apply: bool,
     pub chunk_chars: usize,
+    /// Per-chunk extraction chat calls to run concurrently.
+    pub concurrency: usize,
     pub embed: bool,
     /// Link extracted entities to existing plane nodes via vector retrieval.
     pub link: bool,
@@ -615,6 +617,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         run_id,
         chunk_chars: args.chunk_chars,
         embed: args.embed,
+        concurrency: args.concurrency,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

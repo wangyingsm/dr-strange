@@ -23,6 +23,7 @@ fn opts(embed: bool) -> DigestOptions {
         run_id: "run-42".into(),
         chunk_chars: 4000,
         embed,
+        concurrency: 1,
     }
 }
 
@@ -137,5 +138,52 @@ fn linking_dedups_existing_entity_but_keeps_its_edge() {
     assert_eq!(
         (e.src.as_str(), e.ty.as_str(), e.dst.as_str()),
         ("alice", "WORKS_AT", "acme")
+    );
+}
+
+#[test]
+fn re_splits_a_chunk_that_overflows_the_output_limit() {
+    use dr_strange_llm::{Chat, ChatReply, OutputTruncated};
+    use std::sync::Mutex;
+
+    // A chat that truncates on any prompt with more than `limit_words` words,
+    // and otherwise returns one entity keyed by the prompt's first word.
+    struct DenseChat {
+        limit_words: usize,
+        calls: Mutex<usize>,
+    }
+    impl Chat for DenseChat {
+        fn complete(&self, _system: &str, user: &str) -> Result<ChatReply> {
+            *self.calls.lock().unwrap() += 1;
+            if user.split_whitespace().count() > self.limit_words {
+                return Err(anyhow::Error::new(OutputTruncated { limit: 8192 }));
+            }
+            let first = user.split_whitespace().next().unwrap_or("x");
+            Ok(ChatReply {
+                input_tokens: 1,
+                output_tokens: 1,
+                text: format!(
+                    r#"{{"entities":[{{"key":"{first}","label":"Chunk","properties":{{}}}}],"relations":[]}}"#
+                ),
+            })
+        }
+    }
+
+    // 100 distinct words (~700 chars) form one chunk that overflows the output
+    // limit; splitting halves it into pieces small enough to extract.
+    let document: String = (0..100).map(|i| format!("w{i:02} ")).collect();
+    let dense = DenseChat {
+        limit_words: 60,
+        calls: Mutex::new(0),
+    };
+    let mock = MockProvider::new(vec![], 8);
+
+    let result = digest(&document, &dense, &mock, None, &opts(false)).unwrap();
+
+    // The single dense chunk was split and every piece extracted.
+    assert!(result.nodes.len() >= 2, "chunk should have been re-split");
+    assert!(
+        *dense.calls.lock().unwrap() >= 3,
+        "one truncated call plus one per piece"
     );
 }

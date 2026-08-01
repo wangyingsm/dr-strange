@@ -207,6 +207,9 @@ enum Command {
         /// Target chunk size in characters.
         #[arg(long, default_value_t = 4000)]
         chunk_chars: usize,
+        /// Per-chunk extraction requests to run concurrently (1 = sequential).
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
         /// Skip embedding generation.
         #[arg(long)]
         no_embed: bool,
@@ -558,6 +561,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             chat_key_env,
             embed_key_env,
             chunk_chars,
+            concurrency,
             no_embed,
             no_link,
         } => {
@@ -567,6 +571,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 plane: &plane,
                 apply,
                 chunk_chars,
+                concurrency,
                 embed: !no_embed,
                 link: !no_link,
                 chat_provider: &chat,

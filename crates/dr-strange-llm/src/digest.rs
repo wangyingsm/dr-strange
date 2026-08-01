@@ -19,6 +19,8 @@
 //! resolves those keys against the plane.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use dr_strange_core::json;
@@ -28,7 +30,7 @@ use dr_strange_core::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provider::{Chat, Embedder};
+use crate::provider::{Chat, Embedder, OutputTruncated};
 
 /// How many existing entities to retrieve per chunk as reuse candidates.
 const LINK_K: usize = 8;
@@ -173,6 +175,10 @@ pub struct DigestOptions {
     pub chunk_chars: usize,
     /// Whether to embed entities into `embedding` vectors.
     pub embed: bool,
+    /// How many per-chunk extraction chat calls to run concurrently. `1` is
+    /// fully sequential; higher values overlap the (slow, network-bound) LLM
+    /// requests. Clamped to `[1, chunk count]`.
+    pub concurrency: usize,
 }
 
 impl DigestResult {
@@ -209,7 +215,7 @@ impl DigestResult {
 
 pub fn digest(
     document: &str,
-    chat: &dyn Chat,
+    chat: &(dyn Chat + Sync),
     embedder: &dyn Embedder,
     candidates: Option<&dyn CandidateSource>,
     opts: &DigestOptions,
@@ -226,9 +232,6 @@ pub fn digest(
     .entered();
     let system = system_prompt(candidates.is_some());
 
-    let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
-    let mut edges: Vec<DigestEdge> = Vec::new();
-    let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
     // Existing graph entities surfaced across all chunks (key → entity). Used
     // to (a) skip re-creating them as nodes and (b) treat them as valid
     // relation endpoints so new→existing edges survive.
@@ -238,10 +241,11 @@ pub fn digest(
         ..Default::default()
     };
 
+    // Phase A (sequential): entity-link each chunk into a reuse-context block.
+    // Kept sequential so the candidate graph reads are never concurrent.
+    let mut blocks: Vec<Option<String>> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        // Entity linking: retrieve existing entities similar to this chunk and
-        // prepend them as reuse context (arch/07 §1 v1.5).
-        let user = match candidates {
+        let block = match candidates {
             Some(src) => {
                 let emb = embedder.embed(std::slice::from_ref(chunk))?;
                 report.embed_tokens += emb.tokens;
@@ -253,25 +257,27 @@ pub fn digest(
                 for e in cands {
                     existing.entry(e.key.clone()).or_insert(e);
                 }
-                block.map(|b| format!("{b}\n---\n{chunk}"))
+                block
             }
             None => None,
         };
-        let user = user.as_deref().unwrap_or(chunk);
+        blocks.push(block);
+    }
 
-        let reply = chat.complete(&system, user)?;
-        report.chat_requests += 1;
-        report.input_tokens += reply.input_tokens;
-        report.output_tokens += reply.output_tokens;
-        tracing::debug!(
-            chunk = report.chat_requests,
-            of = chunks.len(),
-            input_tokens = reply.input_tokens,
-            output_tokens = reply.output_tokens,
-            "digest chunk extracted",
-        );
+    // Phase B (concurrent): the per-chunk extraction chat calls — the slow,
+    // network-bound part. Each recovers from a truncated reply by re-splitting.
+    let extracts = extract_all(chat, &system, &chunks, &blocks, opts.concurrency)?;
 
-        let extraction = parse_extraction(&reply.text)?;
+    // Phase C (sequential, in chunk order): merge entities and relations. The
+    // order is deterministic (chunk order, then sub-chunk order) despite the
+    // parallel extraction above.
+    let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
+    let mut edges: Vec<DigestEdge> = Vec::new();
+    let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
+    for extraction in extracts {
+        report.chat_requests += extraction.chat_requests;
+        report.input_tokens += extraction.input_tokens;
+        report.output_tokens += extraction.output_tokens;
         for e in extraction.entities {
             let node = entities.entry(e.key.clone()).or_insert_with(|| DigestNode {
                 key: e.key.clone(),
@@ -464,6 +470,100 @@ fn dedup(texts: &[String]) -> (Vec<String>, Vec<usize>) {
 
 /// Paragraph-aware chunking: accumulate paragraphs until the next would exceed
 /// `size`. A single oversized paragraph becomes its own chunk.
+/// One chunk's extracted entities and relations plus its token/request tally.
+/// Produced in parallel (Phase B) and merged in chunk order (Phase C).
+#[derive(Default)]
+struct ChunkExtract {
+    entities: Vec<ExEntity>,
+    relations: Vec<ExRelation>,
+    input_tokens: u64,
+    output_tokens: u64,
+    chat_requests: usize,
+}
+
+/// Runs every chunk's extraction chat call, up to `concurrency` at once, and
+/// returns the results in chunk order. A bounded scoped-thread pool over an
+/// atomic cursor; the chat provider is `Sync` and only immutable data is shared,
+/// so no locks are held across a request. The first chunk to error aborts.
+fn extract_all(
+    chat: &(dyn Chat + Sync),
+    system: &str,
+    chunks: &[String],
+    blocks: &[Option<String>],
+    concurrency: usize,
+) -> Result<Vec<ChunkExtract>> {
+    let n = chunks.len();
+    let slots: Vec<Mutex<Option<Result<ChunkExtract>>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = concurrency.clamp(1, n.max(1));
+    let slots_ref = &slots;
+    let cursor_ref = &cursor;
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(move || {
+                loop {
+                    let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let out = extract_chunk(chat, system, blocks[i].as_deref(), &chunks[i]);
+                    *slots_ref[i].lock().unwrap() = Some(out);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().expect("every chunk was processed"))
+        .collect()
+}
+
+/// Extracts one chunk. On a truncated reply (the chunk is too dense to fit the
+/// model's output-token cap), splits the chunk and extracts each piece,
+/// recursing until the pieces are small enough — or the chunk can no longer be
+/// divided, in which case the truncation error is surfaced.
+fn extract_chunk(
+    chat: &(dyn Chat + Sync),
+    system: &str,
+    block: Option<&str>,
+    text: &str,
+) -> Result<ChunkExtract> {
+    let user = match block {
+        Some(b) => format!("{b}\n---\n{text}"),
+        None => text.to_string(),
+    };
+    match chat.complete(system, &user) {
+        Ok(reply) => {
+            let extraction = parse_extraction(&reply.text)?;
+            Ok(ChunkExtract {
+                entities: extraction.entities,
+                relations: extraction.relations,
+                input_tokens: reply.input_tokens,
+                output_tokens: reply.output_tokens,
+                chat_requests: 1,
+            })
+        }
+        Err(e) if e.downcast_ref::<OutputTruncated>().is_some() => {
+            let pieces = chunk(text, text.chars().count() / 2);
+            if pieces.len() < 2 {
+                return Err(e); // indivisible — surface the truncation
+            }
+            let mut acc = ChunkExtract::default();
+            for piece in &pieces {
+                let sub = extract_chunk(chat, system, block, piece)?;
+                acc.entities.extend(sub.entities);
+                acc.relations.extend(sub.relations);
+                acc.input_tokens += sub.input_tokens;
+                acc.output_tokens += sub.output_tokens;
+                acc.chat_requests += sub.chat_requests;
+            }
+            Ok(acc)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn chunk(doc: &str, size: usize) -> Vec<String> {
     let size = size.max(200);
     let mut chunks = Vec::new();
