@@ -2,6 +2,8 @@
 
 > An AI-native embedded graph database, written in Rust.
 
+**English** · [简体中文](README.zh.md)
+
 📖 **The Dr Strange Book** — the full tutorial and guide:
 [English](docs/en/src/introduction.md) · [中文](docs/zh/src/introduction.md).
 
