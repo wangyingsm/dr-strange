@@ -2528,13 +2528,13 @@ mod change_feed_tests {
         }
         let sets = sink.lock().unwrap();
         let rec = sets[0].changes[0].node.as_ref().unwrap();
-        assert!(rec.properties.get("title").is_some());
+        assert!(rec.properties.contains_key("title"));
         assert!(
-            rec.properties.get("embedding").is_none(),
+            !rec.properties.contains_key("embedding"),
             "embedding vector stripped from the feed"
         );
         assert!(
-            rec.properties.get("_model").is_none(),
+            !rec.properties.contains_key("_model"),
             "underscore-prefixed inner prop stripped from the feed"
         );
     }

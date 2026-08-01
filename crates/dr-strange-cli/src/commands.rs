@@ -869,6 +869,43 @@ pub fn export(db: &Database, plane_name: &str, out: &mut dyn Write) -> Result<()
     Ok(())
 }
 
+/// `drsg snapshot <out>` — write a consistent, whole-database snapshot bundle
+/// (ROADMAP §6) to a file. Restore it into a fresh database with `drsg restore`.
+pub fn snapshot(db: &Database, out_path: &Path, out: &mut dyn Write) -> Result<()> {
+    let file = std::fs::File::create(out_path)
+        .with_context(|| format!("creating snapshot at {}", out_path.display()))?;
+    let stats = db
+        .snapshot(std::io::BufWriter::new(file))
+        .context("writing snapshot")?;
+    writeln!(
+        out,
+        "snapshot: {} planes · {} nodes · {} edges @ seq {} -> {}",
+        stats.planes,
+        stats.nodes,
+        stats.edges,
+        stats.seq,
+        out_path.display()
+    )?;
+    Ok(())
+}
+
+/// `drsg restore <in>` — restore a snapshot bundle into the `--db` database,
+/// which must be empty (ROADMAP §6). Preserves ids, the commit sequence, and
+/// the built search indexes.
+pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()> {
+    let file = std::fs::File::open(in_path)
+        .with_context(|| format!("opening snapshot at {}", in_path.display()))?;
+    let stats = db
+        .restore(std::io::BufReader::new(file))
+        .context("restoring snapshot")?;
+    writeln!(
+        out,
+        "restored: {} planes · {} nodes · {} edges @ seq {}",
+        stats.planes, stats.nodes, stats.edges, stats.seq
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,41 +1189,4 @@ mod tests {
         assert!(get(&db, "startup", "9999", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "@nope", &mut Vec::new()).is_err());
     }
-}
-
-/// `drsg snapshot <out>` — write a consistent, whole-database snapshot bundle
-/// (ROADMAP §6) to a file. Restore it into a fresh database with `drsg restore`.
-pub fn snapshot(db: &Database, out_path: &Path, out: &mut dyn Write) -> Result<()> {
-    let file = std::fs::File::create(out_path)
-        .with_context(|| format!("creating snapshot at {}", out_path.display()))?;
-    let stats = db
-        .snapshot(std::io::BufWriter::new(file))
-        .context("writing snapshot")?;
-    writeln!(
-        out,
-        "snapshot: {} planes · {} nodes · {} edges @ seq {} -> {}",
-        stats.planes,
-        stats.nodes,
-        stats.edges,
-        stats.seq,
-        out_path.display()
-    )?;
-    Ok(())
-}
-
-/// `drsg restore <in>` — restore a snapshot bundle into the `--db` database,
-/// which must be empty (ROADMAP §6). Preserves ids, the commit sequence, and
-/// the built search indexes.
-pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()> {
-    let file = std::fs::File::open(in_path)
-        .with_context(|| format!("opening snapshot at {}", in_path.display()))?;
-    let stats = db
-        .restore(std::io::BufReader::new(file))
-        .context("restoring snapshot")?;
-    writeln!(
-        out,
-        "restored: {} planes · {} nodes · {} edges @ seq {}",
-        stats.planes, stats.nodes, stats.edges, stats.seq
-    )?;
-    Ok(())
 }
