@@ -11,7 +11,9 @@
 FROM oven/bun:1 AS web
 WORKDIR /web
 COPY crates/dr-strange-web/frontend/package.json crates/dr-strange-web/frontend/bun.lock ./
-RUN bun install --frozen-lockfile
+# Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2 (bun canary),
+# which this stable bun image can't parse; let it resolve fresh instead.
+RUN bun install
 COPY crates/dr-strange-web/frontend/ ./
 RUN bun run build
 

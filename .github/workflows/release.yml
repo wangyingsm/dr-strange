@@ -25,6 +25,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,20 +47,40 @@ jobs:
         working-directory: crates/dr-strange-web/frontend
       - name: Build binaries
         run: cargo build --release --target ${{ matrix.target }} -p dr-strange-cli -p dr-strange-mcp
+      # bash on every runner (Git Bash on Windows) so one script covers all
+      # platforms; Windows ships .exe binaries and a .zip, the rest tar.gz.
       - name: Package
+        shell: bash
         run: |
-          dist="dr-strange-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          target="${{ matrix.target }}"
+          dist="dr-strange-${GITHUB_REF_NAME}-$target"
+          bin="target/$target/release"
+          ext=""
+          [[ "$target" == *windows* ]] && ext=".exe"
           mkdir "$dist"
-          cp "target/${{ matrix.target }}/release/drsg" "target/${{ matrix.target }}/release/drsg-mcp" "$dist/"
+          cp "$bin/drsg$ext" "$bin/drsg-mcp$ext" "$dist/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$dist/"
-          tar -czf "$dist.tar.gz" "$dist"
-          sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          if [[ "$target" == *windows* ]]; then
+            archive="$dist.zip"
+            7z a -tzip "$archive" "$dist" > /dev/null
+          else
+            archive="$dist.tar.gz"
+            tar -czf "$archive" "$dist"
+          fi
+          # sha256sum on Linux; shasum on macOS.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: |
             dr-strange-*.tar.gz
             dr-strange-*.tar.gz.sha256
+            dr-strange-*.zip
+            dr-strange-*.zip.sha256
           if-no-files-found: error
 
   release:
@@ -75,6 +99,8 @@ jobs:
           files: |
             dist/dr-strange-*.tar.gz
             dist/dr-strange-*.tar.gz.sha256
+            dist/dr-strange-*.zip
+            dist/dr-strange-*.zip.sha256
           generate_release_notes: true
 
   docker:
