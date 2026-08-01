@@ -15,6 +15,12 @@ All notable changes to Dr Strange are documented here. The format is based on
   default 8), with entity-linking kept sequential and results merged in order so
   output stays deterministic.
 
+### Added
+- Server-side digest tuning. A `[digest]` config section (`concurrency`,
+  `chunk_chars`) sets the defaults for `drsg serve`, and the `digest.run` RPC
+  accepts per-request `concurrency` / `chunk_chars` overrides (typed in all
+  SDKs). Precedence: request param → config → built-in (8 / 4000).
+
 ## [1.0.2] - 2026-08-01
 
 Initial public release of **Dr Strange** — an AI-native, embedded graph database

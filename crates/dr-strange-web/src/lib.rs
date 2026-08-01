@@ -39,6 +39,8 @@ pub struct ServeOptions {
     pub max_concurrent: usize,
     /// When set, serve HTTPS with this certificate/key instead of plain HTTP.
     pub tls: Option<TlsOptions>,
+    /// Server-side defaults for `digest.run` when the request omits them.
+    pub digest: DigestDefaults,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -47,12 +49,36 @@ pub struct TlsOptions {
     pub key: PathBuf,
 }
 
+/// Default digest tuning applied by `digest.run` unless the request overrides
+/// it (precedence: request param → these → the built-in constants).
+#[derive(Debug, Clone, Copy)]
+pub struct DigestDefaults {
+    /// Per-chunk extraction chat calls to run concurrently.
+    pub concurrency: usize,
+    /// Target chunk size in characters (paragraph-aware).
+    pub chunk_chars: usize,
+}
+
+impl Default for DigestDefaults {
+    fn default() -> Self {
+        Self {
+            concurrency: DEFAULT_DIGEST_CONCURRENCY,
+            chunk_chars: DEFAULT_DIGEST_CHUNK_CHARS,
+        }
+    }
+}
+
+/// Built-in digest defaults (used when neither the request nor config sets them).
+pub const DEFAULT_DIGEST_CONCURRENCY: usize = 8;
+pub const DEFAULT_DIGEST_CHUNK_CHARS: usize = 4000;
+
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             addr: DEFAULT_ADDR.parse().expect("valid default addr"),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             tls: None,
+            digest: DigestDefaults::default(),
         }
     }
 }

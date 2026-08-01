@@ -65,6 +65,8 @@ pub struct AppState {
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
     /// drops events rather than stalling writers.
     pub changes: broadcast::Sender<Arc<ChangeSet>>,
+    /// Server-side `digest.run` defaults (from `[digest]` config / built-ins).
+    pub digest: crate::DigestDefaults,
 }
 
 impl AppState {
@@ -72,6 +74,7 @@ impl AppState {
         Ctx {
             db: self.db.as_ref(),
             db_path: self.db_path.as_deref(),
+            digest: self.digest,
         }
     }
 }
@@ -432,6 +435,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
         changes,
+        digest: opts.digest,
     });
     let app = router(state, opts.max_concurrent);
     // Bind a std listener up front so we can report the actual port (handy when

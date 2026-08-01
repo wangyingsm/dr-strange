@@ -15,13 +15,29 @@
     "x-websocket": {
       "description": "The `/ws` endpoint answers these request/response methods AND a change-feed subscription (ROADMAP §5). Send `plane.watch` to start receiving `plane.change` notifications for a plane; `plane.unwatch` to stop. Best-effort: a subscriber that falls too far behind drops events. These are WebSocket-only (not in the HTTP dispatch table).",
       "plane.watch": {
-        "params": { "plane": "string (required)", "label": "string (optional) — only node changes carrying this label; edges pass only when omitted" },
-        "result": { "watching": "plane name", "label": "the label filter or null" }
+        "params": {
+          "plane": "string (required)",
+          "label": "string (optional) — only node changes carrying this label; edges pass only when omitted"
+        },
+        "result": {
+          "watching": "plane name",
+          "label": "the label filter or null"
+        }
       },
-      "plane.unwatch": { "params": {}, "result": { "watching": "null" } },
+      "plane.unwatch": {
+        "params": {},
+        "result": {
+          "watching": "null"
+        }
+      },
       "plane.change": {
         "note": "server → client notification (no id)",
-        "params": { "plane": "string", "seq": "commit sequence", "truncated": "bool", "changes": "[{ kind: node|edge, op: created|updated|deleted, id, labels?, record? }] — record is the sanitized node/edge (no embeddings, no _-prefixed props); a delete carries id only" }
+        "params": {
+          "plane": "string",
+          "seq": "commit sequence",
+          "truncated": "bool",
+          "changes": "[{ kind: node|edge, op: created|updated|deleted, id, labels?, record? }] — record is the sanitized node/edge (no embeddings, no _-prefixed props); a delete carries id only"
+        }
       }
     }
   },
@@ -31,371 +47,1491 @@
       "summary": "This OpenRPC service description.",
       "x-access": "read",
       "params": [],
-      "result": { "name": "openrpc", "schema": { "type": "object" } }
+      "result": {
+        "name": "openrpc",
+        "schema": {
+          "type": "object"
+        }
+      }
     },
     {
       "name": "db.stats",
       "summary": "Plane/node/edge counts plus the on-disk file size when persistent.",
       "x-access": "read",
       "params": [],
-      "result": { "name": "stats", "schema": { "$ref": "#/components/schemas/DbStats" } }
+      "result": {
+        "name": "stats",
+        "schema": {
+          "$ref": "#/components/schemas/DbStats"
+        }
+      }
     },
     {
       "name": "db.catalog",
       "summary": "The soft-schema catalog rolled up across every plane.",
       "x-access": "read",
       "params": [],
-      "result": { "name": "catalog", "schema": { "type": "object" } }
+      "result": {
+        "name": "catalog",
+        "schema": {
+          "type": "object"
+        }
+      }
     },
     {
       "name": "plane.list",
       "summary": "Every plane with its id, name, counts, and own properties.",
       "x-access": "read",
       "params": [],
-      "result": { "name": "planes", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/PlaneCard" } } }
+      "result": {
+        "name": "planes",
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/components/schemas/PlaneCard"
+          }
+        }
+      }
     },
     {
       "name": "plane.catalog",
       "summary": "One plane's soft schema (labels, property descriptions, edge types, counts).",
       "x-access": "read",
-      "params": [{ "name": "plane", "required": true, "schema": { "type": "string" } }],
-      "result": { "name": "catalog", "schema": { "type": "object" } }
+      "params": [
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "catalog",
+        "schema": {
+          "type": "object"
+        }
+      }
     },
     {
       "name": "node.get",
       "summary": "One node by id or external key; null if absent.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "id", "required": false, "schema": { "type": "integer" } },
-        { "name": "key", "required": false, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "key",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "node", "schema": { "oneOf": [{ "$ref": "#/components/schemas/NodeRecord" }, { "type": "null" }] } }
+      "result": {
+        "name": "node",
+        "schema": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/NodeRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     },
     {
       "name": "plane.neighbors",
       "summary": "1-hop expansion as {node, edge} id pairs.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "id", "required": true, "schema": { "type": "integer" } },
-        { "name": "direction", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
-        { "name": "type", "required": false, "schema": { "type": "string" } },
-        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: pin the read to this past commit sequence (native backend only)." },
-        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: pin the read to the latest commit at or before this unix-epoch millisecond (native backend only)." }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "direction",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "out",
+              "in",
+              "both"
+            ],
+            "default": "out"
+          }
+        },
+        {
+          "name": "type",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "as_of",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: pin the read to this past commit sequence (native backend only)."
+        },
+        {
+          "name": "as_of_ms",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: pin the read to the latest commit at or before this unix-epoch millisecond (native backend only)."
+        }
       ],
-      "result": { "name": "hops", "schema": { "type": "array", "items": { "type": "object", "properties": { "node": { "type": "integer" }, "edge": { "type": "integer" } } } } }
+      "result": {
+        "name": "hops",
+        "schema": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "integer"
+              },
+              "edge": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
     },
     {
       "name": "plane.history",
       "summary": "Time-travel window: oldest and latest commit sequences a read can be pinned to (native backend only).",
       "x-access": "read",
       "params": [],
-      "result": { "name": "window", "schema": { "type": "object", "properties": { "oldest": { "type": "integer" }, "latest": { "type": "integer" } } } }
+      "result": {
+        "name": "window",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "oldest": {
+              "type": "integer"
+            },
+            "latest": {
+              "type": "integer"
+            }
+          }
+        }
+      }
     },
     {
       "name": "plane.search",
       "summary": "Vector top-k over a property; returns scored node records.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "property", "required": true, "schema": { "type": "string" } },
-        { "name": "query", "required": true, "schema": { "type": "array", "items": { "type": "number" } } },
-        { "name": "label", "required": false, "schema": { "type": "string" } },
-        { "name": "k", "required": false, "schema": { "type": "integer", "default": 10 } },
-        { "name": "metric", "required": false, "schema": { "type": "string", "enum": ["cosine", "dot", "l2"], "default": "cosine" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "property",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "query",
+          "required": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        },
+        {
+          "name": "label",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "k",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 10
+          }
+        },
+        {
+          "name": "metric",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "dot",
+              "l2"
+            ],
+            "default": "cosine"
+          }
+        }
       ],
-      "result": { "name": "hits", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } } }
+      "result": {
+        "name": "hits",
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/components/schemas/NodeRecord"
+          }
+        }
+      }
     },
     {
       "name": "plane.query",
       "summary": "Run a serialized logical plan verbatim; returns scored rows.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "plan", "required": true, "schema": { "type": "object", "description": "A serialized core LogicalPlan." } },
-        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: run the plan against this past commit sequence (native backend only)." },
-        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: run the plan against the latest commit at or before this unix-epoch millisecond (native backend only)." }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "description": "A serialized core LogicalPlan."
+          }
+        },
+        {
+          "name": "as_of",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: run the plan against this past commit sequence (native backend only)."
+        },
+        {
+          "name": "as_of_ms",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: run the plan against the latest commit at or before this unix-epoch millisecond (native backend only)."
+        }
       ],
-      "result": { "name": "rows", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } } }
+      "result": {
+        "name": "rows",
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/components/schemas/NodeRecord"
+          }
+        }
+      }
     },
     {
       "name": "plane.cypher",
       "summary": "Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "query", "required": true, "schema": { "type": "string", "description": "The query-language statement." } },
-        { "name": "embed", "required": false, "schema": { "type": "string", "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env." } },
-        { "name": "params", "required": false, "schema": { "type": "object", "description": "Values for $name placeholders in the query (no string interpolation)." } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "query",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "description": "The query-language statement."
+          }
+        },
+        {
+          "name": "embed",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env."
+          }
+        },
+        {
+          "name": "params",
+          "required": false,
+          "schema": {
+            "type": "object",
+            "description": "Values for $name placeholders in the query (no string interpolation)."
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "Read: {nodes, edges, count}. Write: {write, nodes_created, edges_created, props_set, labels_set, nodes_deleted, edges_deleted}." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "Read: {nodes, edges, count}. Write: {write, nodes_created, edges_created, props_set, labels_set, nodes_deleted, edges_deleted}."
+        }
+      }
     },
     {
       "name": "plane.find",
       "summary": "Text (or semantic) search over the plane's nodes and edges.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "q", "required": true, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 50 } },
-        { "name": "semantic", "required": false, "schema": { "type": "boolean", "default": false } },
-        { "name": "provider", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_model", "required": false, "schema": { "type": "string" } },
-        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: search this past commit sequence (native backend only). Semantic search brute-forces the snapshot, since the vector index reflects only the latest commit." },
-        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: search the latest commit at or before this unix-epoch millisecond (native backend only)." }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "q",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 50
+          }
+        },
+        {
+          "name": "semantic",
+          "required": false,
+          "schema": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        {
+          "name": "provider",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed_model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "as_of",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: search this past commit sequence (native backend only). Semantic search brute-forces the snapshot, since the vector index reflects only the latest commit."
+        },
+        {
+          "name": "as_of_ms",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: search the latest commit at or before this unix-epoch millisecond (native backend only)."
+        }
       ],
-      "result": { "name": "results", "schema": { "$ref": "#/components/schemas/FindResult" } }
+      "result": {
+        "name": "results",
+        "schema": {
+          "$ref": "#/components/schemas/FindResult"
+        }
+      }
     },
     {
       "name": "plane.algo",
       "summary": "Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "algo", "required": true, "schema": { "type": "string", "enum": ["pagerank", "components", "shortest_path", "louvain"] } },
-        { "name": "label", "required": false, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
-        { "name": "damping", "required": false, "schema": { "type": "number", "default": 0.85 } },
-        { "name": "max_iters", "required": false, "schema": { "type": "integer", "default": 20 } },
-        { "name": "tolerance", "required": false, "schema": { "type": "number", "default": 0.000001 } },
-        { "name": "src", "required": false, "schema": { "type": "integer" } },
-        { "name": "dst", "required": false, "schema": { "type": "integer" } },
-        { "name": "dir", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
-        { "name": "weight", "required": false, "schema": { "type": "string" } },
-        { "name": "max_levels", "required": false, "schema": { "type": "integer", "default": 10 } },
-        { "name": "min_gain", "required": false, "schema": { "type": "number" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "algo",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "pagerank",
+              "components",
+              "shortest_path",
+              "louvain"
+            ]
+          }
+        },
+        {
+          "name": "label",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 100
+          }
+        },
+        {
+          "name": "damping",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 0.85
+          }
+        },
+        {
+          "name": "max_iters",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 20
+          }
+        },
+        {
+          "name": "tolerance",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 0.000001
+          }
+        },
+        {
+          "name": "src",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "dst",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "dir",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "out",
+              "in",
+              "both"
+            ],
+            "default": "out"
+          }
+        },
+        {
+          "name": "weight",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "max_levels",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 10
+          }
+        },
+        {
+          "name": "min_gain",
+          "required": false,
+          "schema": {
+            "type": "number"
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}."
+        }
+      }
     },
     {
       "name": "plane.hybrid",
       "summary": "Hybrid retrieval: fuse vector similarity, BM25 keyword, and graph-proximity channels into one ranking. Enable a channel by naming its property (vector_prop/keyword_prop) or setting graph_hops; the vector channel embeds q server-side.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "q", "required": true, "schema": { "type": "string" } },
-        { "name": "label", "required": false, "schema": { "type": "string" } },
-        { "name": "vector_prop", "required": false, "schema": { "type": "string" } },
-        { "name": "keyword_prop", "required": false, "schema": { "type": "string" } },
-        { "name": "metric", "required": false, "schema": { "type": "string", "enum": ["cosine", "dot", "l2"], "default": "cosine" } },
-        { "name": "graph_hops", "required": false, "schema": { "type": "integer" } },
-        { "name": "graph_decay", "required": false, "schema": { "type": "number", "default": 0.5 } },
-        { "name": "w_vector", "required": false, "schema": { "type": "number", "default": 1.0 } },
-        { "name": "w_keyword", "required": false, "schema": { "type": "number", "default": 1.0 } },
-        { "name": "w_graph", "required": false, "schema": { "type": "number", "default": 0.5 } },
-        { "name": "k", "required": false, "schema": { "type": "integer", "default": 10 } },
-        { "name": "candidates", "required": false, "schema": { "type": "integer", "default": 100 } },
-        { "name": "provider", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_model", "required": false, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "q",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "label",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "vector_prop",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "keyword_prop",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "metric",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "dot",
+              "l2"
+            ],
+            "default": "cosine"
+          }
+        },
+        {
+          "name": "graph_hops",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "graph_decay",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 0.5
+          }
+        },
+        {
+          "name": "w_vector",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 1.0
+          }
+        },
+        {
+          "name": "w_keyword",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 1.0
+          }
+        },
+        {
+          "name": "w_graph",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "default": 0.5
+          }
+        },
+        {
+          "name": "k",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 10
+          }
+        },
+        {
+          "name": "candidates",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 100
+          }
+        },
+        {
+          "name": "provider",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed_model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "{results:[{...node, score, channels:{vector,keyword,graph}}], count}." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "{results:[{...node, score, channels:{vector,keyword,graph}}], count}."
+        }
+      }
     },
     {
       "name": "plane.ask",
       "summary": "Natural-language query: an LLM turns the question into a read-only LogicalPlan, runs it (unless dry_run), and returns the generated plan plus result node records. With embed_provider, the model can call find_edge/find_entity embedding tools to ground the plan. Keys from the server env.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "question", "required": true, "schema": { "type": "string" } },
-        { "name": "dry_run", "required": false, "schema": { "type": "boolean", "default": false } },
-        { "name": "max_attempts", "required": false, "schema": { "type": "integer", "default": 6 } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
-        { "name": "provider", "required": false, "schema": { "type": "string" } },
-        { "name": "model", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_provider", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_model", "required": false, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "question",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "dry_run",
+          "required": false,
+          "schema": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        {
+          "name": "max_attempts",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 6
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 100
+          }
+        },
+        {
+          "name": "provider",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed_provider",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed_model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "{plans:[plan…], ran, attempts, results:[node…], edges:[edge…], count} — the generated plan(s) and their unioned matched subgraph (nodes + connecting edges)." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "{plans:[plan…], ran, attempts, results:[node…], edges:[edge…], count} — the generated plan(s) and their unioned matched subgraph (nodes + connecting edges)."
+        }
+      }
     },
     {
       "name": "plane.indexes",
       "summary": "The search indexes declared on a plane (vector + keyword), so a client can offer only the channels that actually exist.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "{vector:[{label,property,metric}], keyword:[{label,property,language}]}." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "{vector:[{label,property,metric}], keyword:[{label,property,language}]}."
+        }
+      }
     },
     {
       "name": "index.ensure",
       "summary": "Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent.",
       "x-access": "admin",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "label", "required": true, "schema": { "type": "string" } },
-        { "name": "property", "required": true, "schema": { "type": "string" } },
-        { "name": "kind", "required": false, "schema": { "type": "string", "enum": ["keyword", "vector"], "default": "keyword" } },
-        { "name": "metric", "required": false, "schema": { "type": "string", "enum": ["cosine", "dot", "l2"], "default": "cosine" } },
-        { "name": "language", "required": false, "schema": { "type": "string", "default": "english" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "label",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "property",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "keyword",
+              "vector"
+            ],
+            "default": "keyword"
+          }
+        },
+        {
+          "name": "metric",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "dot",
+              "l2"
+            ],
+            "default": "cosine"
+          }
+        },
+        {
+          "name": "language",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "default": "english"
+          }
+        }
       ],
-      "result": { "name": "result", "schema": { "type": "object", "description": "{kind, label, property}." } }
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "description": "{kind, label, property}."
+        }
+      }
     },
     {
       "name": "graph.seed",
       "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "label", "required": false, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 200 } },
-        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: seed from this past commit sequence (native backend only)." },
-        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: seed from the latest commit at or before this unix-epoch millisecond (native backend only)." }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "label",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 200
+          }
+        },
+        {
+          "name": "as_of",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: seed from this past commit sequence (native backend only)."
+        },
+        {
+          "name": "as_of_ms",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: seed from the latest commit at or before this unix-epoch millisecond (native backend only)."
+        }
       ],
-      "result": { "name": "subgraph", "schema": { "$ref": "#/components/schemas/Subgraph" } }
+      "result": {
+        "name": "subgraph",
+        "schema": {
+          "$ref": "#/components/schemas/Subgraph"
+        }
+      }
     },
     {
       "name": "graph.expand",
       "summary": "Hub-safe 1-hop neighbourhood around a node: neighbour + connecting-edge records.",
       "x-access": "read",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "id", "required": true, "schema": { "type": "integer" } },
-        { "name": "direction", "required": false, "schema": { "type": "string", "enum": ["out", "in", "both"], "default": "out" } },
-        { "name": "type", "required": false, "schema": { "type": "string" } },
-        { "name": "limit", "required": false, "schema": { "type": "integer", "default": 100 } },
-        { "name": "as_of", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: expand within this past commit sequence (native backend only)." },
-        { "name": "as_of_ms", "required": false, "schema": { "type": "integer" }, "description": "Time-travel: expand within the latest commit at or before this unix-epoch millisecond (native backend only)." }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "direction",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "out",
+              "in",
+              "both"
+            ],
+            "default": "out"
+          }
+        },
+        {
+          "name": "type",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 100
+          }
+        },
+        {
+          "name": "as_of",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: expand within this past commit sequence (native backend only)."
+        },
+        {
+          "name": "as_of_ms",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Time-travel: expand within the latest commit at or before this unix-epoch millisecond (native backend only)."
+        }
       ],
-      "result": { "name": "subgraph", "schema": { "$ref": "#/components/schemas/Subgraph" } }
+      "result": {
+        "name": "subgraph",
+        "schema": {
+          "$ref": "#/components/schemas/Subgraph"
+        }
+      }
     },
     {
       "name": "digest.run",
       "summary": "Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits).",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "text", "required": true, "schema": { "type": "string" } },
-        { "name": "chat", "required": false, "schema": { "type": "string" } },
-        { "name": "embed", "required": false, "schema": { "type": "string" } },
-        { "name": "model", "required": false, "schema": { "type": "string" } },
-        { "name": "embed_model", "required": false, "schema": { "type": "string" } },
-        { "name": "source", "required": false, "schema": { "type": "string" } },
-        { "name": "no_embed", "required": false, "schema": { "type": "boolean", "default": false } },
-        { "name": "link", "required": false, "schema": { "type": "boolean", "default": true } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "text",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "chat",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed_model",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "source",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "no_embed",
+          "required": false,
+          "schema": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        {
+          "name": "link",
+          "required": false,
+          "schema": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        {
+          "name": "concurrency",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 8
+          }
+        },
+        {
+          "name": "chunk_chars",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "default": 4000
+          }
+        }
       ],
-      "result": { "name": "proposal", "schema": { "type": "object" } }
+      "result": {
+        "name": "proposal",
+        "schema": {
+          "type": "object"
+        }
+      }
     },
     {
       "name": "digest.write",
       "summary": "Write a previously-computed proposal into the plane via the bulk path (no LLM call).",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "nodes", "required": true, "schema": { "type": "array", "items": { "type": "object" } } },
-        { "name": "edges", "required": false, "schema": { "type": "array", "items": { "type": "object" } } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "nodes",
+          "required": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        {
+          "name": "edges",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
       ],
-      "result": { "name": "written", "schema": { "type": "object", "properties": { "nodes_written": { "type": "integer" }, "edges_written": { "type": "integer" } } } }
+      "result": {
+        "name": "written",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "nodes_written": {
+              "type": "integer"
+            },
+            "edges_written": {
+              "type": "integer"
+            }
+          }
+        }
+      }
     },
     {
       "name": "node.create",
       "summary": "Add a node with an optional stable external key and labels.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "key", "required": false, "schema": { "type": "string" } },
-        { "name": "labels", "required": false, "schema": { "type": "array", "items": { "type": "string" } } },
-        { "name": "properties", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "key",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "name": "properties",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        }
       ],
-      "result": { "name": "node", "schema": { "$ref": "#/components/schemas/NodeRecord" } }
+      "result": {
+        "name": "node",
+        "schema": {
+          "$ref": "#/components/schemas/NodeRecord"
+        }
+      }
     },
     {
       "name": "node.update",
       "summary": "Patch a node: `set`/`unset` its properties, and `labels` (when present) replaces its label set.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "id", "required": false, "schema": { "type": "integer" } },
-        { "name": "key", "required": false, "schema": { "type": "string" } },
-        { "name": "set", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } },
-        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } },
-        { "name": "labels", "required": false, "schema": { "type": "array", "items": { "type": "string" } } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "key",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "set",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        },
+        {
+          "name": "unset",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       ],
-      "result": { "name": "node", "schema": { "$ref": "#/components/schemas/NodeRecord" } }
+      "result": {
+        "name": "node",
+        "schema": {
+          "$ref": "#/components/schemas/NodeRecord"
+        }
+      }
     },
     {
       "name": "node.delete",
       "summary": "Delete a node and cascade to its incident edges.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "id", "required": false, "schema": { "type": "integer" } },
-        { "name": "key", "required": false, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "key",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "deleted", "schema": { "$ref": "#/components/schemas/Deleted" } }
+      "result": {
+        "name": "deleted",
+        "schema": {
+          "$ref": "#/components/schemas/Deleted"
+        }
+      }
     },
     {
       "name": "edge.create",
       "summary": "Add a directed edge between two existing nodes (each named by id or key).",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "src", "required": true, "schema": { "$ref": "#/components/schemas/NodeRef" } },
-        { "name": "dst", "required": true, "schema": { "$ref": "#/components/schemas/NodeRef" } },
-        { "name": "type", "required": true, "schema": { "type": "string" } },
-        { "name": "properties", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "src",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/NodeRef"
+          }
+        },
+        {
+          "name": "dst",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/NodeRef"
+          }
+        },
+        {
+          "name": "type",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "properties",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        }
       ],
-      "result": { "name": "edge", "schema": { "$ref": "#/components/schemas/EdgeRecord" } }
+      "result": {
+        "name": "edge",
+        "schema": {
+          "$ref": "#/components/schemas/EdgeRecord"
+        }
+      }
     },
     {
       "name": "edge.update",
       "summary": "Patch an edge: `set`/`unset` its properties, and `type` (when present) changes its type.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "edge", "required": true, "schema": { "type": "integer" } },
-        { "name": "set", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } },
-        { "name": "unset", "required": false, "schema": { "type": "array", "items": { "type": "string" } } },
-        { "name": "type", "required": false, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "edge",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "set",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        },
+        {
+          "name": "unset",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "name": "type",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "edge", "schema": { "$ref": "#/components/schemas/EdgeRecord" } }
+      "result": {
+        "name": "edge",
+        "schema": {
+          "$ref": "#/components/schemas/EdgeRecord"
+        }
+      }
     },
     {
       "name": "edge.delete",
       "summary": "Delete one edge.",
       "x-access": "write",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "edge", "required": true, "schema": { "type": "integer" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "edge",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
       ],
-      "result": { "name": "deleted", "schema": { "$ref": "#/components/schemas/Deleted" } }
+      "result": {
+        "name": "deleted",
+        "schema": {
+          "$ref": "#/components/schemas/Deleted"
+        }
+      }
     },
     {
       "name": "plane.create",
       "summary": "Make a new, empty plane.",
       "x-access": "admin",
       "params": [
-        { "name": "name", "required": true, "schema": { "type": "string" } },
-        { "name": "properties", "required": false, "schema": { "$ref": "#/components/schemas/Properties" } }
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "properties",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        }
       ],
-      "result": { "name": "plane", "schema": { "$ref": "#/components/schemas/PlaneRef" } }
+      "result": {
+        "name": "plane",
+        "schema": {
+          "$ref": "#/components/schemas/PlaneRef"
+        }
+      }
     },
     {
       "name": "plane.rename",
       "summary": "Rename an existing plane.",
       "x-access": "admin",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "to", "required": true, "schema": { "type": "string" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "to",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
       ],
-      "result": { "name": "plane", "schema": { "$ref": "#/components/schemas/PlaneRef" } }
+      "result": {
+        "name": "plane",
+        "schema": {
+          "$ref": "#/components/schemas/PlaneRef"
+        }
+      }
     },
     {
       "name": "plane.set_props",
       "summary": "Replace a plane's own property map.",
       "x-access": "admin",
       "params": [
-        { "name": "plane", "required": true, "schema": { "type": "string" } },
-        { "name": "properties", "required": true, "schema": { "$ref": "#/components/schemas/Properties" } }
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "properties",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Properties"
+          }
+        }
       ],
-      "result": { "name": "plane", "schema": { "type": "object" } }
+      "result": {
+        "name": "plane",
+        "schema": {
+          "type": "object"
+        }
+      }
     },
     {
       "name": "plane.delete",
       "summary": "Drop a plane and everything on it (the startup plane cannot be dropped).",
       "x-access": "admin",
-      "params": [{ "name": "plane", "required": true, "schema": { "type": "string" } }],
-      "result": { "name": "deleted", "schema": { "$ref": "#/components/schemas/Deleted" } }
+      "params": [
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "deleted",
+        "schema": {
+          "$ref": "#/components/schemas/Deleted"
+        }
+      }
     }
   ],
   "components": {
@@ -406,93 +1542,257 @@
       },
       "NodeRef": {
         "description": "A node reference: a numeric id or an external key.",
-        "oneOf": [{ "type": "integer" }, { "type": "string" }]
+        "oneOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          }
+        ]
       },
       "NodeRecord": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer" },
-          "external_key": { "type": ["string", "null"] },
-          "labels": { "type": "array", "items": { "type": "string" } },
-          "properties": { "$ref": "#/components/schemas/Properties" },
-          "score": { "type": "number", "description": "Present on scored results (search/query)." },
-          "match": { "type": "string", "description": "Present on plane.find hits: which field matched." }
+          "id": {
+            "type": "integer"
+          },
+          "external_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "$ref": "#/components/schemas/Properties"
+          },
+          "score": {
+            "type": "number",
+            "description": "Present on scored results (search/query)."
+          },
+          "match": {
+            "type": "string",
+            "description": "Present on plane.find hits: which field matched."
+          }
         },
-        "required": ["id", "labels", "properties"]
+        "required": [
+          "id",
+          "labels",
+          "properties"
+        ]
       },
       "EdgeRecord": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer" },
-          "src": { "type": "integer" },
-          "dst": { "type": "integer" },
-          "type": { "type": "string" },
-          "properties": { "$ref": "#/components/schemas/Properties" },
-          "match": { "type": "string" }
+          "id": {
+            "type": "integer"
+          },
+          "src": {
+            "type": "integer"
+          },
+          "dst": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          },
+          "properties": {
+            "$ref": "#/components/schemas/Properties"
+          },
+          "match": {
+            "type": "string"
+          }
         },
-        "required": ["id", "src", "dst", "type", "properties"]
+        "required": [
+          "id",
+          "src",
+          "dst",
+          "type",
+          "properties"
+        ]
       },
       "Subgraph": {
         "type": "object",
         "properties": {
-          "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } },
-          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/EdgeRecord" } },
-          "total": { "type": "integer" },
-          "truncated": { "type": "boolean" }
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeRecord"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EdgeRecord"
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
         },
-        "required": ["nodes", "edges", "total", "truncated"]
+        "required": [
+          "nodes",
+          "edges",
+          "total",
+          "truncated"
+        ]
       },
       "FindResult": {
         "type": "object",
         "properties": {
-          "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/NodeRecord" } },
-          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/EdgeRecord" } },
-          "mode": { "type": "string", "enum": ["text", "semantic"] },
-          "note": { "type": ["string", "null"] },
-          "scanned": { "type": "integer" },
-          "total": { "type": "integer" },
-          "truncated": { "type": "boolean" }
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeRecord"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EdgeRecord"
+            }
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "text",
+              "semantic"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scanned": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
         },
-        "required": ["nodes", "edges", "mode"]
+        "required": [
+          "nodes",
+          "edges",
+          "mode"
+        ]
       },
       "Deleted": {
         "type": "object",
         "properties": {
-          "deleted": { "type": "boolean" },
-          "id": { "type": "integer" }
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer"
+          }
         },
-        "required": ["deleted"]
+        "required": [
+          "deleted"
+        ]
       },
       "PlaneRef": {
         "type": "object",
-        "properties": { "id": { "type": "integer" }, "name": { "type": "string" } },
-        "required": ["id", "name"]
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
       },
       "PlaneCard": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer" },
-          "name": { "type": "string" },
-          "nodes": { "type": "integer" },
-          "edges": { "type": "integer" },
-          "properties": { "$ref": "#/components/schemas/Properties" }
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nodes": {
+            "type": "integer"
+          },
+          "edges": {
+            "type": "integer"
+          },
+          "properties": {
+            "$ref": "#/components/schemas/Properties"
+          }
         },
-        "required": ["id", "name", "nodes", "edges"]
+        "required": [
+          "id",
+          "name",
+          "nodes",
+          "edges"
+        ]
       },
       "DbStats": {
         "type": "object",
         "properties": {
-          "planes": { "type": "integer" },
-          "nodes": { "type": "integer" },
-          "edges": { "type": "integer" },
-          "labels": { "type": "integer", "description": "Distinct node labels across all planes." },
-          "edge_types": { "type": "integer", "description": "Distinct edge types across all planes." },
-          "indexes": { "type": "integer", "description": "Declared vector + keyword search indexes." },
-          "commit_seq": { "type": "integer", "description": "The current commit sequence (total committed writes)." },
-          "persistent": { "type": "boolean" },
-          "file_size": { "type": ["integer", "null"] }
+          "planes": {
+            "type": "integer"
+          },
+          "nodes": {
+            "type": "integer"
+          },
+          "edges": {
+            "type": "integer"
+          },
+          "labels": {
+            "type": "integer",
+            "description": "Distinct node labels across all planes."
+          },
+          "edge_types": {
+            "type": "integer",
+            "description": "Distinct edge types across all planes."
+          },
+          "indexes": {
+            "type": "integer",
+            "description": "Declared vector + keyword search indexes."
+          },
+          "commit_seq": {
+            "type": "integer",
+            "description": "The current commit sequence (total committed writes)."
+          },
+          "persistent": {
+            "type": "boolean"
+          },
+          "file_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
         },
-        "required": ["planes", "nodes", "edges", "labels", "edge_types", "indexes", "commit_seq", "persistent"]
+        "required": [
+          "planes",
+          "nodes",
+          "edges",
+          "labels",
+          "edge_types",
+          "indexes",
+          "commit_seq",
+          "persistent"
+        ]
       }
     }
   }

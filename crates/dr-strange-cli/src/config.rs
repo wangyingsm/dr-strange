@@ -34,6 +34,20 @@ pub struct Config {
     /// layer (which looks keys up by name) to read.
     #[serde(default)]
     pub llm: BTreeMap<String, String>,
+    /// Server-side defaults for `digest.run` (the web AIgest ingest); a request
+    /// param overrides these, which override the built-ins (8 / 4000).
+    #[serde(default)]
+    pub digest: DigestCfg,
+}
+
+/// The `[digest]` section — server-side ingestion tuning.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DigestCfg {
+    /// Per-chunk extraction chat calls to run concurrently (default 8).
+    pub concurrency: Option<usize>,
+    /// Target chunk size in characters (default 4000).
+    pub chunk_chars: Option<usize>,
 }
 
 /// The `[server]` section.
@@ -136,6 +150,12 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
             key: tls.key.clone(),
         });
     }
+    if let Some(c) = cfg.digest.concurrency {
+        opts.digest.concurrency = c;
+    }
+    if let Some(c) = cfg.digest.chunk_chars {
+        opts.digest.chunk_chars = c;
+    }
     opts
 }
 
@@ -163,6 +183,10 @@ mod tests {
             [llm]
             OPENAI_API_KEY = "sk-abc"
             DASHSCOPE_API_KEY = "ds-xyz"
+
+            [digest]
+            concurrency = 16
+            chunk_chars = 6000
             "#,
         );
         assert_eq!(cfg.server.addr.unwrap().to_string(), "0.0.0.0:9000");
@@ -174,6 +198,8 @@ mod tests {
             cfg.llm.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-abc")
         );
+        assert_eq!(cfg.digest.concurrency, Some(16));
+        assert_eq!(cfg.digest.chunk_chars, Some(6000));
     }
 
     #[test]

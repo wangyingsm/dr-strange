@@ -216,15 +216,17 @@ type GraphExpandParams struct {
 }
 
 type DigestRunParams struct {
-	Plane      string  `json:"plane"`
-	Text       string  `json:"text"`
-	Chat       *string `json:"chat,omitempty"`
-	Embed      *string `json:"embed,omitempty"`
-	Model      *string `json:"model,omitempty"`
-	EmbedModel *string `json:"embed_model,omitempty"`
-	Source     *string `json:"source,omitempty"`
-	NoEmbed    *bool   `json:"no_embed,omitempty"`
-	Link       *bool   `json:"link,omitempty"`
+	Plane       string  `json:"plane"`
+	Text        string  `json:"text"`
+	Chat        *string `json:"chat,omitempty"`
+	Embed       *string `json:"embed,omitempty"`
+	Model       *string `json:"model,omitempty"`
+	EmbedModel  *string `json:"embed_model,omitempty"`
+	Source      *string `json:"source,omitempty"`
+	NoEmbed     *bool   `json:"no_embed,omitempty"`
+	Link        *bool   `json:"link,omitempty"`
+	Concurrency *int64  `json:"concurrency,omitempty"`
+	ChunkChars  *int64  `json:"chunk_chars,omitempty"`
 }
 
 type DigestWriteResult struct {

@@ -27,6 +27,8 @@ use crate::rpc::RpcError;
 pub struct Ctx<'a> {
     pub db: &'a Database,
     pub db_path: Option<&'a Path>,
+    /// Server-side `digest.run` defaults (request params override these).
+    pub digest: crate::DigestDefaults,
 }
 
 // ---- param decoding -------------------------------------------------------
@@ -1297,6 +1299,14 @@ pub struct DigestRun {
     /// (default true). Off ⇒ every entity is proposed as new.
     #[serde(default)]
     link: Option<bool>,
+    /// Per-chunk extraction chat calls to run concurrently. Omit to use the
+    /// server default (`[digest].concurrency`, else 8).
+    #[serde(default)]
+    concurrency: Option<usize>,
+    /// Target chunk size in characters. Omit to use the server default
+    /// (`[digest].chunk_chars`, else 4000).
+    #[serde(default)]
+    chunk_chars: Option<usize>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
@@ -1326,9 +1336,9 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         source: req.source.unwrap_or_else(|| "web-digest".into()),
         model: chat_model,
         run_id: format!("web-{}", now_secs()),
-        chunk_chars: 4000,
+        chunk_chars: req.chunk_chars.unwrap_or(ctx.digest.chunk_chars),
         embed,
-        concurrency: 8,
+        concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
     };
     let plane = app(ctx.db.plane(&req.plane))?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);

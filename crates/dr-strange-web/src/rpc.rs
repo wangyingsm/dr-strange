@@ -317,14 +317,22 @@ mod tests {
     }
 
     fn call(db: &Database, body: &str) -> Option<Value> {
-        let ctx = Ctx { db, db_path: None };
+        let ctx = Ctx {
+            db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+        };
         handle(&ctx, &Auth::allow_all(), body.as_bytes())
     }
 
     /// Dispatch `body` under an explicit authorizer + credentials (for the auth
     /// gate tests).
     fn call_as(db: &Database, auth: &Auth<'_>, body: &str) -> Option<Value> {
-        let ctx = Ctx { db, db_path: None };
+        let ctx = Ctx {
+            db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+        };
         handle(&ctx, auth, body.as_bytes())
     }
 
