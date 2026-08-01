@@ -3,6 +3,11 @@ name = "dr-strange-llm"
 description = "LLM helpers for dr-strange: embeddings, digestion, entity resolution (arch/07)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 dr-strange-core = { workspace = true, features = ["json"] }

@@ -3,6 +3,11 @@ name = "drsg-bench"
 description = "Cross-engine benchmark harness for dr-strange (dev-only; not part of the shipped product)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "drsg-bench"

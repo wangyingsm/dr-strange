@@ -3,6 +3,11 @@ name = "dr-strange-log"
 description = "Tracing subscriber setup for dr-strange binaries — stderr + rolling file"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 tracing = { workspace = true }

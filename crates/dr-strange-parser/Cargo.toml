@@ -3,6 +3,11 @@ name = "dr-strange-parser"
 description = "openCypher-subset query language for dr-strange — parses text into a core LogicalPlan (arch/00 §5, arch/03 §2)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 # Only the plan types, never the json feature — the parser is pure text→plan.
