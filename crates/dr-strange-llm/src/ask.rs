@@ -114,7 +114,9 @@ pub fn ask(
                  ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
             )
         } else if tools {
-            format!("{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s). If the question asked for more than one thing, return one plan per part: {{\"plans\": […]}}; otherwise {{\"plan\": …}}.")
+            format!(
+                "{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s). If the question asked for more than one thing, return one plan per part: {{\"plans\": […]}}; otherwise {{\"plan\": …}}."
+            )
         } else {
             format!("{transcript}\n\nReturn the plan JSON.")
         };
@@ -273,7 +275,11 @@ fn parse_tool_call(json: &str) -> Option<ToolCall> {
     let tool = v.get("tool")?.as_str()?.to_string();
     Some(ToolCall {
         tool,
-        query: v.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string(),
+        query: v
+            .get("query")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .to_string(),
         label: v.get("label").and_then(|l| l.as_str()).map(str::to_string),
     })
 }
@@ -640,8 +646,14 @@ mod tests {
     fn paper(year: i64, title: &str) -> Properties {
         [
             ("year".to_string(), PropDesc::new(PropValue::Int(year))),
-            ("title".to_string(), PropDesc::new(PropValue::Str(title.into()))),
-            ("_model".to_string(), PropDesc::new(PropValue::Str("gpt".into()))),
+            (
+                "title".to_string(),
+                PropDesc::new(PropValue::Str(title.into())),
+            ),
+            (
+                "_model".to_string(),
+                PropDesc::new(PropValue::Str("gpt".into())),
+            ),
         ]
         .into_iter()
         .collect()
@@ -683,7 +695,14 @@ mod tests {
         let db = seeded();
         let plane = db.plane("startup").unwrap();
         let chat = MockProvider::new(vec![PLAN_2020.to_string()], 4);
-        let res = ask(&chat, None, &plane, "papers from 2020 on", &AskOptions::default()).unwrap();
+        let res = ask(
+            &chat,
+            None,
+            &plane,
+            "papers from 2020 on",
+            &AskOptions::default(),
+        )
+        .unwrap();
         assert_eq!(res.attempts, 1);
         assert_eq!(res.nodes.len(), 2);
     }
@@ -702,7 +721,14 @@ mod tests {
         );
         // Same mock is the embedder (its mock vectors make find_edge harmless
         // on this edge-less graph). The loop should run the tool then the plan.
-        let res = ask(&chat, Some(&chat), &plane, "recent papers", &AskOptions::default()).unwrap();
+        let res = ask(
+            &chat,
+            Some(&chat),
+            &plane,
+            "recent papers",
+            &AskOptions::default(),
+        )
+        .unwrap();
         assert_eq!(res.attempts, 2, "one tool turn, then the plan turn");
         assert_eq!(res.nodes.len(), 2);
     }
@@ -716,8 +742,14 @@ mod tests {
             r#"{{"plans":[{PLAN_2020},{{"source":{{"ScanLabel":"Author"}},"steps":[]}}]}}"#
         );
         let chat = MockProvider::new(vec![two], 4);
-        let res = ask(&chat, None, &plane, "recent papers and authors", &AskOptions::default())
-            .unwrap();
+        let res = ask(
+            &chat,
+            None,
+            &plane,
+            "recent papers and authors",
+            &AskOptions::default(),
+        )
+        .unwrap();
         assert_eq!(res.plans.len(), 2);
         assert_eq!(res.nodes.len(), 3); // 2 papers (≥2020) + 1 author, deduped union
     }
@@ -726,7 +758,10 @@ mod tests {
     fn repairs_after_a_bad_plan() {
         let db = seeded();
         let plane = db.plane("startup").unwrap();
-        let chat = MockProvider::new(vec!["not json at all".to_string(), PLAN_2020.to_string()], 4);
+        let chat = MockProvider::new(
+            vec!["not json at all".to_string(), PLAN_2020.to_string()],
+            4,
+        );
         let res = ask(&chat, None, &plane, "recent papers", &AskOptions::default()).unwrap();
         assert_eq!(res.attempts, 2);
         assert_eq!(res.nodes.len(), 2);

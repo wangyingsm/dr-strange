@@ -7,9 +7,12 @@ use dr_strange_core::{Database, Language, NodeId, PropDesc, PropValue, Propertie
 use tempfile::TempDir;
 
 fn body(text: &str) -> Properties {
-    [("body".to_string(), PropDesc::new(PropValue::Str(text.into())))]
-        .into_iter()
-        .collect()
+    [(
+        "body".to_string(),
+        PropDesc::new(PropValue::Str(text.into())),
+    )]
+    .into_iter()
+    .collect()
 }
 
 /// Create three Doc nodes with body text; returns their ids.
@@ -23,7 +26,10 @@ fn seed(db: &Database) -> [NodeId; 3] {
         .create_node(&["Doc"], body("vector search finds similar embeddings"))
         .unwrap();
     let c = txn
-        .create_node(&["Doc"], body("a graph database indexes graph structure for graph queries"))
+        .create_node(
+            &["Doc"],
+            body("a graph database indexes graph structure for graph queries"),
+        )
         .unwrap();
     txn.commit().unwrap();
     [a, b, c]
@@ -71,8 +77,12 @@ fn writes_after_declaration_stay_coherent() {
     // Re-indexing an existing node's text is reflected.
     {
         let mut txn = plane2.write().unwrap();
-        txn.set_prop(b, "body", PropDesc::new(PropValue::Str("nothing relevant".into())))
-            .unwrap();
+        txn.set_prop(
+            b,
+            "body",
+            PropDesc::new(PropValue::Str("nothing relevant".into())),
+        )
+        .unwrap();
         txn.commit().unwrap();
     }
     assert!(

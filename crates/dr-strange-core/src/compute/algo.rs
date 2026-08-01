@@ -140,8 +140,12 @@ pub fn pagerank<R: GraphReader + ?Sized>(
         }
     }
 
-    let mut scored: Vec<(NodeId, f64)> =
-        frame.nodes.iter().zip(&rank).map(|(&id, &s)| (id, s)).collect();
+    let mut scored: Vec<(NodeId, f64)> = frame
+        .nodes
+        .iter()
+        .zip(&rank)
+        .map(|(&id, &s)| (id, s))
+        .collect();
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
@@ -264,8 +268,12 @@ pub fn shortest_path<R: GraphReader + ?Sized>(
     opts: &ShortestPathOptions,
 ) -> Result<Option<Path>> {
     let frame = Frame::build(reader, label)?;
-    let index: HashMap<NodeId, usize> =
-        frame.nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let index: HashMap<NodeId, usize> = frame
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i))
+        .collect();
     let (Some(&s), Some(&t)) = (index.get(&src), index.get(&dst)) else {
         return Ok(None);
     };
@@ -488,7 +496,12 @@ impl WGraph {
     /// Total edge weight `m` (`2m` in modularity): sum of all pairwise weights
     /// (each undirected pair counted once) plus self-loop weights.
     fn total_weight(&self) -> f64 {
-        let pairwise: f64 = self.adj.iter().map(|a| a.values().sum::<f64>()).sum::<f64>() / 2.0;
+        let pairwise: f64 = self
+            .adj
+            .iter()
+            .map(|a| a.values().sum::<f64>())
+            .sum::<f64>()
+            / 2.0;
         pairwise + self.self_w.iter().sum::<f64>()
     }
 
@@ -702,7 +715,11 @@ mod tests {
             weight: None,
         };
         assert!(
-            plane.algo().shortest_path(n[3], n[0], &both).unwrap().is_some(),
+            plane
+                .algo()
+                .shortest_path(n[3], n[0], &both)
+                .unwrap()
+                .is_some(),
             "Both direction reaches 0 from 3"
         );
     }

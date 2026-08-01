@@ -113,7 +113,11 @@ pub(crate) fn fuse(
     }
 
     let contrib = |norm: &Option<HashMap<NodeId, f32>>, w: f32, node: NodeId| -> f32 {
-        norm.as_ref().and_then(|m| m.get(&node)).copied().unwrap_or(0.0) * w
+        norm.as_ref()
+            .and_then(|m| m.get(&node))
+            .copied()
+            .unwrap_or(0.0)
+            * w
     };
     let raw = |m: &Option<HashMap<NodeId, f32>>, node: NodeId| -> Option<f32> {
         m.as_ref().and_then(|m| m.get(&node)).copied()
@@ -220,7 +224,13 @@ mod tests {
         // but node 1 also appears weakly in keyword, tipping it ahead.
         let vector = ch(&[(1, 0.0), (2, 1.0)], false); // 1→1.0, 2→0.0
         let keyword = ch(&[(2, 10.0), (1, 5.0)], true); // 2→1.0, 1→0.0
-        let fused = fuse(Some(vector), Some(keyword), None, HybridWeights::default(), 10);
+        let fused = fuse(
+            Some(vector),
+            Some(keyword),
+            None,
+            HybridWeights::default(),
+            10,
+        );
         // node 1: 1.0*1 + 0.0*1 = 1.0 ; node 2: 0.0 + 1.0 = 1.0 → tie, id order.
         assert_eq!(fused[0].node, NodeId(1));
         assert_eq!(fused.len(), 2);

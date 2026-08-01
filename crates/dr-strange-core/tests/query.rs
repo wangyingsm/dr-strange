@@ -225,8 +225,10 @@ fn subgraph_returns_source_and_traversed_edges() {
         .expand_out("CITES")
         .subgraph()
         .unwrap();
-    let keys: std::collections::BTreeSet<String> =
-        nodes.iter().filter_map(|n| n.external_key.clone()).collect();
+    let keys: std::collections::BTreeSet<String> = nodes
+        .iter()
+        .filter_map(|n| n.external_key.clone())
+        .collect();
     // `.nodes()` here would be just [p2, p3]; the subgraph also keeps the source.
     assert!(keys.contains("p1"), "source node present: {keys:?}");
     assert!(keys.contains("p2") && keys.contains("p3"));

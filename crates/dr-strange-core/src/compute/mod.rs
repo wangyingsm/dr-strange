@@ -21,7 +21,7 @@ pub mod plan;
 
 pub use algo::{LouvainOptions, PageRankOptions, Path, ShortestPathOptions};
 pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};
-pub use hybrid::{HybridHit, HybridWeights};
 pub use exec::Row;
 pub use expr::{Expr, distance, has_label, hops, lit, p, score, similarity};
+pub use hybrid::{HybridHit, HybridWeights};
 pub use plan::{LogicalPlan, SortKey, Source, Step};

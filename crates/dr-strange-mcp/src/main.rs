@@ -583,7 +583,9 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
     };
     let res = dr_strange_llm::ask(
         &chat,
-        embedder.as_ref().map(|e| e as &dyn dr_strange_llm::Embedder),
+        embedder
+            .as_ref()
+            .map(|e| e as &dyn dr_strange_llm::Embedder),
         &plane,
         &req.question,
         &opts,
@@ -872,24 +874,32 @@ impl DrStrange {
         self.blocking("algo", move |db| algo_logic(db, req)).await
     }
 
-    #[tool(description = "Hybrid retrieval (ROADMAP §2): fuse vector similarity, \
+    #[tool(
+        description = "Hybrid retrieval (ROADMAP §2): fuse vector similarity, \
         BM25 keyword, and graph-proximity into one ranking. Enable a channel by \
         naming its property — `vector_prop` (embedding; `query` is embedded \
         server-side), `keyword_prop` (BM25 over a declared keyword index; needs \
         `label`) — and/or set `graph_hops` to boost neighbours of the strongest \
         hits. Optional per-channel weights (`w_vector`/`w_keyword`/`w_graph`), \
         `metric`, and `k`. Returns node records with the fused `score` and each \
-        channel's raw contribution. Embedding keys come from the server env.")]
-    async fn hybrid(&self, Parameters(req): Parameters<Hybrid>) -> Result<CallToolResult, McpError> {
-        self.blocking("hybrid", move |db| hybrid_logic(db, req)).await
+        channel's raw contribution. Embedding keys come from the server env."
+    )]
+    async fn hybrid(
+        &self,
+        Parameters(req): Parameters<Hybrid>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("hybrid", move |db| hybrid_logic(db, req))
+            .await
     }
 
-    #[tool(description = "Natural-language query (ROADMAP §3): ask a question in \
+    #[tool(
+        description = "Natural-language query (ROADMAP §3): ask a question in \
         plain language and an LLM turns it into a read-only query plan over this \
         plane's schema, runs it, and returns the matching node records. Grounded \
         in the plane catalog; repairs its own plan on error. Set `dry_run` to get \
         the generated plan WITHOUT executing it. Read-only — it can never mutate \
-        the graph. Chat provider key comes from the server env, never params.")]
+        the graph. Chat provider key comes from the server env, never params."
+    )]
     async fn ask(&self, Parameters(req): Parameters<Ask>) -> Result<CallToolResult, McpError> {
         self.blocking("ask", move |db| ask_logic(db, req)).await
     }
@@ -1171,8 +1181,11 @@ mod tests {
 
         // Keyword channel without a label is a tool-level error.
         assert!(
-            hybrid_logic(&db, from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap())
-                .is_err()
+            hybrid_logic(
+                &db,
+                from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap()
+            )
+            .is_err()
         );
     }
 

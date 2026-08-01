@@ -6,7 +6,10 @@ use dr_strange_core::{Database, Language, Metric, NodeId, PropDesc, PropValue, P
 /// A Doc with both an `emb` vector and a `body` text property.
 fn doc(body: &str, emb: Vec<f32>) -> Properties {
     [
-        ("body".to_string(), PropDesc::new(PropValue::Str(body.into()))),
+        (
+            "body".to_string(),
+            PropDesc::new(PropValue::Str(body.into())),
+        ),
         ("emb".to_string(), PropDesc::new(PropValue::Vector(emb))),
     ]
     .into_iter()
@@ -22,16 +25,28 @@ fn setup() -> (Database, [NodeId; 4]) {
     let ids = {
         let mut txn = plane.write().unwrap();
         let d0 = txn
-            .create_node(&["Doc"], doc("graph databases store connected data", vec![0.0, 0.0]))
+            .create_node(
+                &["Doc"],
+                doc("graph databases store connected data", vec![0.0, 0.0]),
+            )
             .unwrap();
         let d1 = txn
-            .create_node(&["Doc"], doc("vector search finds similar items", vec![1.0, 0.0]))
+            .create_node(
+                &["Doc"],
+                doc("vector search finds similar items", vec![1.0, 0.0]),
+            )
             .unwrap();
         let d2 = txn
-            .create_node(&["Doc"], doc("graph graph structure and graph queries", vec![6.0, 0.0]))
+            .create_node(
+                &["Doc"],
+                doc("graph graph structure and graph queries", vec![6.0, 0.0]),
+            )
             .unwrap();
         let d3 = txn
-            .create_node(&["Doc"], doc("entirely unrelated subject matter", vec![0.0, 4.0]))
+            .create_node(
+                &["Doc"],
+                doc("entirely unrelated subject matter", vec![0.0, 4.0]),
+            )
             .unwrap();
         txn.create_edge(d0, d3, "LINKS", Properties::new()).unwrap();
         txn.commit().unwrap();
@@ -92,7 +107,10 @@ fn vector_only_matches_plain_vector_ranking() {
         .run()
         .unwrap();
     assert_eq!(hits[0].node, d0, "closest embedding leads");
-    assert!(hits.iter().all(|h| h.keyword.is_none() && h.graph.is_none()));
+    assert!(
+        hits.iter()
+            .all(|h| h.keyword.is_none() && h.graph.is_none())
+    );
 }
 
 #[test]
@@ -115,5 +133,8 @@ fn weights_shift_the_ranking() {
         .run()
         .unwrap();
     let rank = |id: NodeId| hits.iter().position(|h| h.node == id).unwrap();
-    assert!(rank(d2) < rank(d0), "BM25-only ranks the graph-dense doc first");
+    assert!(
+        rank(d2) < rank(d0),
+        "BM25-only ranks the graph-dense doc first"
+    );
 }
