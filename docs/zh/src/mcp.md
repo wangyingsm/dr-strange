@@ -14,7 +14,9 @@ MCP 本身就是 JSON-RPC 2.0——与 Web 后端所讲的是同一套协议—�
 
 ## 运行与配置
 
-服务以其第一个参数作为数据库路径，其次为 `$DRSG_DB`，再次为 `graph.drsg`：
+`drsg-mcp` 是一个独立的二进制，以 `cargo build --release -p dr-strange-mcp`
+构建（[第 2 章](./getting-started.md#从源码构建)）。它以其第一个参数作为数据库路径，
+其次为 `$DRSG_DB`，再次为 `graph.drsg`：
 
 ```console
 $ drsg-mcp /path/to/graph.drsg
@@ -29,11 +31,19 @@ $ drsg-mcp /path/to/graph.drsg
     "dr-strange": {
       "command": "drsg-mcp",
       "args": ["/path/to/graph.drsg"],
-      "env": { "OPENAI_API_KEY": "sk-…" }
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "DEEPSEEK_API_KEY": "...",
+        "DASHSCOPE_API_KEY": "..."
+      }
     }
   }
 }
 ```
+
+`crates/dr-strange-mcp/mcp.json` 提供了一份可直接编辑的该配置副本；将 `command` 设为
+`drsg-mcp`（位于 `PATH` 中）或该二进制的绝对路径，令 `args` 指向你的数据库，并只提供
+你所使用的提供方密钥。
 
 由于它在进程内打开数据库，`drsg-mcp` 不应对一个 `drsg serve` 当前正持有打开的数据库
 运行。

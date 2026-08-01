@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "dr-strange": {
+      "command": "drsg-mcp",
+      "args": ["/path/to/graph.drsg"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "DEEPSEEK_API_KEY": "...",
+        "DASHSCOPE_API_KEY": "..."
+      }
+    }
+  }
+}

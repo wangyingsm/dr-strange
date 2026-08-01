@@ -31,6 +31,14 @@ $ just web-build          # bun install && vite build
 $ cargo build --release -p dr-strange-cli
 ```
 
+面向 LLM 智能体的 **MCP 服务**（[第 8 章](./mcp.md)）是一个独立的二进制 `drsg-mcp`：
+
+```console
+$ cargo build --release -p dr-strange-mcp
+```
+
+产物为 `target/release/drsg-mcp`。将其置于 `PATH` 中，或在宿主配置里以绝对路径引用它。
+
 ## 磁盘布局
 
 `--db` 参数用于选择数据库路径。在原生后端下，数据库是一个**目录**——预写日志（WAL）

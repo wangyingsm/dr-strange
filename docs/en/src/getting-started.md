@@ -35,6 +35,16 @@ $ just web-build          # bun install && vite build
 $ cargo build --release -p dr-strange-cli
 ```
 
+The **MCP server** for LLM agents ([Chapter 8](./mcp.md)) is a separate binary,
+`drsg-mcp`:
+
+```console
+$ cargo build --release -p dr-strange-mcp
+```
+
+The artifact is `target/release/drsg-mcp`. Place it on the `PATH`, or reference
+it by absolute path in the host configuration.
+
 ## On-disk layout
 
 The `--db` argument selects the database path. Under the native backend the

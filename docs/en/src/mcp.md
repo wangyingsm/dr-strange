@@ -17,8 +17,10 @@ and a rolling file, never to stdout, which carries the protocol.
 
 ## Running and configuring
 
-The server takes the database path as its first argument, else `$DRSG_DB`, else
-`graph.drsg`:
+`drsg-mcp` is a separate binary, built with
+`cargo build --release -p dr-strange-mcp` ([Chapter
+2](./getting-started.md#building-from-source)). It takes the database path as its
+first argument, else `$DRSG_DB`, else `graph.drsg`:
 
 ```console
 $ drsg-mcp /path/to/graph.drsg
@@ -34,11 +36,20 @@ keys the graph tools need:
     "dr-strange": {
       "command": "drsg-mcp",
       "args": ["/path/to/graph.drsg"],
-      "env": { "OPENAI_API_KEY": "sk-…" }
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "DEEPSEEK_API_KEY": "...",
+        "DASHSCOPE_API_KEY": "..."
+      }
     }
   }
 }
 ```
+
+A ready-to-edit copy of this configuration is provided at
+`crates/dr-strange-mcp/mcp.json`; set `command` to `drsg-mcp` (on the `PATH`) or
+an absolute path to the binary, point `args` at your database, and supply only
+the provider keys you use.
 
 Because it opens the database in-process, `drsg-mcp` should not run against a
 database a `drsg serve` currently holds open.
