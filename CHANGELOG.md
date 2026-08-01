@@ -4,6 +4,17 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-02
+
+### Changed
+- **LLM document ingestion is more robust and faster.** A chunk whose extraction
+  reply hits the model's output-token cap now **auto-splits** and retries each
+  half (recursing until it fits) instead of aborting the run, so large or dense
+  documents self-heal. The per-chunk extraction calls also run **concurrently**
+  through a bounded worker pool (configurable; `drsg digest --concurrency`,
+  default 8), with entity-linking kept sequential and results merged in order so
+  output stays deterministic.
+
 ## [1.0.2] - 2026-08-01
 
 Initial public release of **Dr Strange** — an AI-native, embedded graph database
@@ -63,4 +74,5 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
+[1.1.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.1.0
 [1.0.2]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.0.2
