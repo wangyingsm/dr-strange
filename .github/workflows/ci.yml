@@ -22,7 +22,7 @@ jobs:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,7 +42,7 @@ jobs:
       # suites exercise /rpc and /ws, not the SPA.
       - name: Build drsg
         run: cargo build -p dr-strange-cli
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: drsg
           path: target/debug/drsg
@@ -53,7 +53,7 @@ jobs:
     name: Frontend — build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - name: Install
         # Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2
@@ -69,7 +69,7 @@ jobs:
     name: Docs — mdBook build (en + zh)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: taiki-e/install-action@v2
         with:
           tool: mdbook
@@ -83,8 +83,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: drsg
           path: bin
@@ -104,8 +104,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: drsg
           path: bin
@@ -123,8 +123,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: drsg
           path: bin
@@ -145,8 +145,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: drsg
           path: bin
@@ -168,8 +168,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: drsg
           path: bin
