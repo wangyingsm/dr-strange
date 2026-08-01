@@ -8,7 +8,7 @@
 - 当前的 **Rust 工具链**（stable 通道），经 [rustup](https://rustup.rs) 安装。
 - 用于 Web 仪表盘：**[bun](https://bun.sh)** 编译单页应用，以及可选的
   **[just](https://github.com/casey/just)** 作为任务运行器。
-- 用于容器工作流：**Docker**（Engine 24+，启用 BuildKit）。
+- 用于容器工作流：**Docker**（Engine 24+；仅在自行构建镜像时才需要 BuildKit）。
 
 构建通过 rustls/ring 链接 TLS，无需 OpenSSL 工具链。
 
@@ -141,24 +141,28 @@ DASHSCOPE_API_KEY = "…"
 
 ## 容器镜像
 
-一个多阶段 `Dockerfile` 会编译仪表盘、构建内嵌该仪表盘的二进制，并产出一个精简的
-运行时镜像。构建并运行：
+一个多架构镜像（`linux/amd64` 与 `linux/arm64`）已发布至 GitHub 容器镜像仓库
+（GHCR）。直接拉取并运行，无需构建：
 
 ```console
-$ docker build -t dr-strange:latest .
 $ docker run -p 7700:7700 -v drsg-data:/data \
     -e DRSG_TOKEN=please-change-me \
-    dr-strange:latest
+    ghcr.io/wangyingsm/dr-strange:latest
 ```
 
-运行时镜像绑定到 `0.0.0.0:7700`，并将数据库存放于 `/data` 卷（原生后端数据库是一个
-目录，由该卷持久化）。提供方密钥以环境变量形式提供。
+`docker run` 会在首次使用时拉取镜像。若需可复现的部署，请以版本标签
+`ghcr.io/wangyingsm/dr-strange:1.0.2` 替代 `:latest`。运行时镜像绑定到
+`0.0.0.0:7700`，并将数据库存放于 `/data` 卷（原生后端数据库是一个目录，由该卷
+持久化）。提供方密钥以环境变量形式提供。
 
-对于持久化部署，`docker-compose.yml` 以具名卷定义了一个等价的服务：
+对于持久化部署，`docker-compose.yml` 拉取同一镜像并定义了一个具名卷：
 
 ```console
-$ DRSG_TOKEN=please-change-me docker compose up --build
+$ DRSG_TOKEN=please-change-me docker compose up
 ```
+
+若想改为在本地构建镜像，仓库提供了一个多阶段 `Dockerfile`：它会编译仪表盘、将其
+内嵌进二进制，并产出一个精简的运行时镜像：`docker build -t dr-strange:latest .`。
 
 ## 下一步
 

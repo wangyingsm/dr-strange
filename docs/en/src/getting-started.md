@@ -11,7 +11,8 @@ as a container image.
 - For the web dashboard: **[bun](https://bun.sh)** to compile the single-page
   application, and optionally **[just](https://github.com/casey/just)** as the
   task runner.
-- For the container workflow: **Docker** (Engine 24+ with BuildKit).
+- For the container workflow: **Docker** (Engine 24+; BuildKit is only needed if
+  you build the image yourself).
 
 The build links TLS through rustls/ring; no OpenSSL toolchain is required.
 
@@ -156,26 +157,31 @@ HTTPS.
 
 ## Container image
 
-A multi-stage `Dockerfile` compiles the dashboard, builds the binary with the
-dashboard embedded, and produces a minimal runtime image. Build and run it:
+A multi-arch image (`linux/amd64` and `linux/arm64`) is published to the GitHub
+Container Registry. Pull and run it — no build required:
 
 ```console
-$ docker build -t dr-strange:latest .
 $ docker run -p 7700:7700 -v drsg-data:/data \
     -e DRSG_TOKEN=please-change-me \
-    dr-strange:latest
+    ghcr.io/wangyingsm/dr-strange:latest
 ```
 
-The runtime image binds to `0.0.0.0:7700` and stores the database on the `/data`
-volume (the native backend database is a directory, which the volume persists).
-Provider keys are supplied as environment variables.
+`docker run` pulls the image on first use. Pin a release with a version tag —
+`ghcr.io/wangyingsm/dr-strange:1.0.2` — instead of `:latest` for reproducible
+deployments. The runtime image binds to `0.0.0.0:7700` and stores the database on
+the `/data` volume (the native backend database is a directory, which the volume
+persists). Provider keys are supplied as environment variables.
 
-For a persistent deployment, `docker-compose.yml` defines an equivalent service
-with a named volume:
+For a persistent deployment, `docker-compose.yml` pulls the same image and defines
+a named volume:
 
 ```console
-$ DRSG_TOKEN=please-change-me docker compose up --build
+$ DRSG_TOKEN=please-change-me docker compose up
 ```
+
+To build the image locally instead, the repository ships a multi-stage
+`Dockerfile` that compiles the dashboard, embeds it in the binary, and produces a
+minimal runtime image: `docker build -t dr-strange:latest .`.
 
 ## Next steps
 

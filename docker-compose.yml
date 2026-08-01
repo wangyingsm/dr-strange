@@ -1,14 +1,15 @@
 # Run `drsg serve` in a container with a persistent database volume.
 #
-#   docker compose up --build
+#   docker compose up
 #
-# Then open http://localhost:7700. Set DRSG_TOKEN (see below) to allow
-# programmatic access from the SDKs or curl.
+# Pulls the published multi-arch image from GHCR. Then open
+# http://localhost:7700. Set DRSG_TOKEN (see below) to allow programmatic
+# access from the SDKs or curl. To build locally instead, run
+# `docker compose up --build` after adding `build: .` back to the service.
 
 services:
   drsg:
-    build: .
-    image: dr-strange:latest
+    image: ghcr.io/wangyingsm/dr-strange:latest
     restart: unless-stopped
     ports:
       - "7700:7700"
