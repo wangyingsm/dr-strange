@@ -66,7 +66,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 
 The model-backed features (natural-language query, document ingestion, and
 text-embedding search) call an external or local LLM; everything else runs with
-no model at all. See [Appendix B](https://wangyingsm.github.io/dr-strange/en/book/appendix-b.html).
+no model at all. See [Appendix C](https://wangyingsm.github.io/dr-strange/en/book/appendix-c.html).
 
 ## Install
 
@@ -151,7 +151,8 @@ The book covers each part in depth:
 [SDK](https://wangyingsm.github.io/dr-strange/en/book/sdk.html) ·
 [Embedded CLI](https://wangyingsm.github.io/dr-strange/en/book/embedded-cli.html) ·
 [MCP](https://wangyingsm.github.io/dr-strange/en/book/mcp.html) ·
-[JSON-RPC API list](https://wangyingsm.github.io/dr-strange/en/book/appendix-a.html).
+[JSON-RPC API list](https://wangyingsm.github.io/dr-strange/en/book/appendix-a.html) ·
+[Query-language grammar](https://wangyingsm.github.io/dr-strange/en/book/appendix-b.html).
 
 Build it locally (mdBook): `just docs-serve` (English) or `just docs-serve zh`.
 

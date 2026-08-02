@@ -63,7 +63,7 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **接口** | Web 控制台、五种语言 SDK、命令行工具与 MCP 服务器 |
 
 依赖模型的功能（自然语言查询、文档摄取与文本嵌入检索）会调用外部或本地的 LLM；其余
-功能均无需任何模型即可运行。参见[附录 B](https://wangyingsm.github.io/dr-strange/zh/book/appendix-b.html)。
+功能均无需任何模型即可运行。参见[附录 C](https://wangyingsm.github.io/dr-strange/zh/book/appendix-c.html)。
 
 ## 安装
 
@@ -143,7 +143,8 @@ $ drsg --db graph.drsg serve
 [SDK](https://wangyingsm.github.io/dr-strange/zh/book/sdk.html) ·
 [嵌入式 CLI](https://wangyingsm.github.io/dr-strange/zh/book/embedded-cli.html) ·
 [MCP](https://wangyingsm.github.io/dr-strange/zh/book/mcp.html) ·
-[JSON-RPC API 清单](https://wangyingsm.github.io/dr-strange/zh/book/appendix-a.html)。
+[JSON-RPC API 清单](https://wangyingsm.github.io/dr-strange/zh/book/appendix-a.html) ·
+[查询语言文法](https://wangyingsm.github.io/dr-strange/zh/book/appendix-b.html)。
 
 在本地构建（mdBook）：`just docs-serve zh`（中文）或 `just docs-serve`（英文）。
 

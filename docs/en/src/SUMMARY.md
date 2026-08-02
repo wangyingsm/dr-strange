@@ -12,4 +12,5 @@
 - [MCP](./mcp.md)
 - [Architecture](./architecture.md)
 - [Appendix A: JSON-RPC API List](./appendix-a.md)
-- [Appendix B: LLM Included or Not](./appendix-b.md)
+- [Appendix B: Query-Language Grammar](./appendix-b.md)
+- [Appendix C: LLM Included or Not](./appendix-c.md)

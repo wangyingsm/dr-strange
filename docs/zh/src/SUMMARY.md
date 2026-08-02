@@ -12,4 +12,5 @@
 - [MCP](./mcp.md)
 - [架构](./architecture.md)
 - [附录 A：JSON-RPC 接口清单](./appendix-a.md)
-- [附录 B：是否需要 LLM](./appendix-b.md)
+- [附录 B：查询语言文法](./appendix-b.md)
+- [附录 C：是否需要 LLM](./appendix-c.md)

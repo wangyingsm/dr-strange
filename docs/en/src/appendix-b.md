@@ -1,123 +1,232 @@
-# Appendix B: LLM Included or Not
+# Appendix B: Query-Language Grammar
 
-Dr Strange calls an external language model for a specific, bounded set of
-features. Everything else — the graph store, vector and keyword indexes, hybrid
-retrieval over pre-computed vectors, graph algorithms, time-travel, the change
-feed, and backup — runs with no model at all.
+The complete grammar of the openCypher subset, as the parser accepts it. The
+dashboard labels its query tab **GraphQL**; the language is not GraphQL but an
+openCypher subset, and this appendix is its reference. [Chapter
+4](./query-language.md) explains what each construct is *for*; this one states
+exactly what parses.
 
-This appendix delineates exactly which features require model support, how to run
-Dr Strange with none, and how to point the model features at a local model
-instead of a hosted API. In all cases, provider API keys are read from the
-server's environment (or the `[llm]` configuration section), never from a request
-or tool parameter.
+Notation: `|` alternatives, `[…]` optional, `{…}` zero or more, `'…'` a literal
+token. Keywords are **case-insensitive** (`match` = `MATCH`); identifiers are
+not.
 
-## What features need LLM support
+## Statement
 
-A model is invoked in two situations: to **embed text** (turn a string into a
-vector), and to **chat** (generate structure or a plan). The features that depend
-on one or both:
+```text
+statement      ::= read-query | write-statement
+```
 
-| Feature | Needs | Why |
+A read compiles to a logical plan and returns rows; a write mutates the plane
+and returns change counts.
+
+## Reads
+
+```text
+read-query     ::= source { beam } [ where ] return
+                   [ order-by ] [ skip ] [ limit ] [ as-of ]
+```
+
+Every source binds exactly one node pattern and may continue with a
+relationship tail, so a typed hop follows a retrieval or algorithm seed exactly
+as it follows a `MATCH` node.
+
+```text
+source         ::= 'MATCH'  pattern
+                 | 'SEARCH' node-pat vector-seed  tail
+                 | 'SEARCH' node-pat keyword-seed tail
+                 | 'HYBRID' node-pat { hybrid-part } tail
+                 | 'CALL'   ident '(' [ call-args ] ')' 'ON' node-pat tail
+
+tail           ::= { rel-pat node-pat }
+
+vector-seed    ::= [ 'ON' ident ] 'NEAR' vec-arg [ 'METRIC' metric ] [ 'TOPK' uint ]
+keyword-seed   ::= 'ON' ident 'MATCHING' string [ 'TOPK' uint ]
+
+hybrid-part    ::= 'VECTOR'  [ 'ON' ident ] 'NEAR' vec-arg
+                     [ 'METRIC' metric ] [ 'WEIGHT' number ]
+                 | 'KEYWORD' 'ON' ident 'MATCHING' string [ 'WEIGHT' number ]
+                 | 'GRAPH'   'HOPS' uint [ 'DECAY' number ]
+                     [ 'SEEDS' uint ] [ 'WEIGHT' number ]
+                 | 'CANDIDATES' uint
+                 | 'TOPK' uint
+
+call-args      ::= call-arg { ',' call-arg }
+call-arg       ::= ident ':' value
+```
+
+`HYBRID` requires at least one of `VECTOR` or `KEYWORD` — `GRAPH` only boosts
+what those find. Parts may appear in any order, each at most once.
+
+### Traversal
+
+```text
+beam           ::= 'BEAM' node-pat direction [ ':' ident ] [ 'ON' ident ]
+                   'NEAR' vec-arg [ 'METRIC' metric ] 'WIDTH' uint 'DEPTH' uint
+
+direction      ::= 'OUT' | 'IN' | 'BOTH'
+
+pattern        ::= node-pat { rel-pat node-pat }
+node-pat       ::= '(' [ ident ] [ ':' ident ] ')'
+rel-pat        ::= [ '<' ] '-' [ '[' rel-body ']' ] '-' [ '>' ]
+rel-body       ::= [ ident ] [ ':' ident ] [ var-len ]
+var-len        ::= '*' [ uint ] [ '..' [ uint ] ]
+```
+
+A relationship's direction comes from its arrows: `-[…]->` out, `<-[…]-` in,
+`-[…]-` both. `<-…->` is rejected. A relationship variable parses but is not
+bound. `var-len` must have an upper bound (`*1..3`, `*2`, `*..4`); an unbounded
+`*` or `*2..` is a clear error.
+
+### Tail clauses
+
+```text
+where          ::= 'WHERE' expr
+return         ::= 'RETURN' [ 'DISTINCT' ] ( ident | '*' )
+order-by       ::= 'ORDER' 'BY' order-key { ',' order-key }
+order-key      ::= expr [ 'ASC' | 'DESC' ]
+skip           ::= 'SKIP' uint
+limit          ::= 'LIMIT' uint
+as-of          ::= 'AS' 'OF' ( uint | string | 'TIME' int )
+```
+
+`RETURN` names the pattern's **last** variable, or `*`. `AS OF` is last: a bare
+integer is a commit sequence, a quoted string an RFC-3339 instant, and `TIME`
+takes unix-epoch milliseconds.
+
+## Expressions
+
+Loosest to tightest:
+
+```text
+expr           ::= or-expr
+or-expr        ::= and-expr { 'OR' and-expr }
+and-expr       ::= not-expr { 'AND' not-expr }
+not-expr       ::= 'NOT' not-expr | comparison
+comparison     ::= additive [ 'IS' [ 'NOT' ] 'NULL'
+                            | 'IN' '[' [ expr { ',' expr } ] ']'
+                            | cmp-op additive ]
+cmp-op         ::= '=' | '<>' | '!=' | '<' | '<=' | '>' | '>='
+additive       ::= multiplicative { ( '+' | '-' ) multiplicative }
+multiplicative ::= unary { ( '*' | '/' ) unary }
+unary          ::= '-' unary | primary
+primary        ::= '(' expr ')' | param | literal | term
+term           ::= ident '.' ident            (* a property *)
+                 | ident ':' ident            (* a label test *)
+                 | function
+function       ::= 'score' '(' ')'
+                 | 'hops' '(' ')'
+                 | 'key' '(' ident ')'
+                 | ( 'similarity' | 'distance' )
+                   '(' ident '.' ident ',' vec-arg [ ',' metric ] ')'
+```
+
+`score()` is the row's score channel — a seed's relevance, or an algorithm's
+per-node result. `hops()` is the path length. `key(n)` is the node's external
+key; on the source variable, `key(n) = "…"` and `key(n) IN […]` compile to a
+key seek rather than a scan-and-filter. `x IN [a, b]` is sugar for equalities.
+
+A `WHERE` condition may reference only one pattern variable — the compiler
+places it at that variable's position in the pipeline.
+
+## Writes
+
+```text
+write-statement ::= 'CREATE' create-path { ',' create-path }
+                  | 'MERGE'  create-path { merge-on }
+                  | 'MATCH'  pattern [ 'WHERE' expr ] mutate-op { mutate-op }
+
+merge-on       ::= 'ON' ( 'CREATE' | 'MATCH' ) 'SET' set-item { ',' set-item }
+
+mutate-op      ::= 'SET' set-item { ',' set-item }
+                 | 'REMOVE' remove-item { ',' remove-item }
+                 | [ 'DETACH' ] 'DELETE' ident { ',' ident }
+                 | 'CREATE' create-path { ',' create-path }
+                 | 'MERGE'  create-path { merge-on }
+
+set-item       ::= ident '.' ident '=' value
+                 | ident ':' ident
+                 | ident '+=' prop-map
+remove-item    ::= ident '.' ident | ident ':' ident
+
+create-path    ::= create-node { create-rel create-node }
+create-node    ::= '(' [ ident ] [ ':' ident ] [ prop-map ] ')'
+create-rel     ::= [ '<' ] '-' '[' ':' ident [ prop-map ] ']' '-' [ '>' ]
+prop-map       ::= '{' [ prop-entry { ',' prop-entry } ] '}'
+prop-entry     ::= ident ':' value
+```
+
+In a `create-node`, a string-valued `key:` entry sets the node's external key
+rather than becoming a property. A created edge must be directed and must name
+a type. `MATCH … mutate-op` operates on the pattern's terminal variable.
+
+## Terminals
+
+```text
+ident          ::= ( letter | '_' ) { letter | digit | '_' }
+uint           ::= digit { digit }
+int            ::= [ '-' ] uint
+number         ::= [ '-' ] digit { digit } [ '.' digit { digit } ]
+string         ::= '"' { any character except '"' } '"'
+                 | "'" { any character except "'" } "'"
+vector         ::= '[' [ number { ',' number } ] ']'
+vec-arg        ::= string | vector
+metric         ::= 'cosine' | 'dot' | 'l2'
+param          ::= '$' ident
+literal        ::= number | string | 'true' | 'false' | 'null' | vector
+value          ::= param | literal
+```
+
+Strings have no escape sequences in this cut, so a quote cannot appear inside a
+string of the same kind. Whitespace between tokens is insignificant; there are
+no comments. A `$name` parameter stands where a value does, resolved from the
+caller's parameter map at parse time — the injection-safe way to pass values.
+
+## Defaults
+
+| Omitted | Value | Why |
 |---|---|---|
-| Embedding a **text** similarity query (`SEARCH … NEAR "text"`, semantic `plane.find`, a hybrid vector channel from text) | embedding provider | the query string is embedded server-side before the search |
-| **Natural-language query** (`ask` / `plane.ask`) | chat provider (+ embedding provider for the grounding tools) | the model compiles the question into a plan, optionally calling embedding-backed `find_edge` / `find_entity` tools |
-| **Document ingestion** (`digest` / AIgest) | chat + embedding providers | the model extracts entities and relations; the entities are embedded |
+| `ON <property>` before `NEAR` | `embedding` | what the ingestion pipeline writes |
+| `METRIC` | `cosine` | |
+| `TOPK` | `10` | |
+| `HYBRID … CANDIDATES` | `100` | per-channel pool before fusion |
+| `GRAPH … DECAY` | `0.5` | matches the RPC, MCP and CLI surfaces |
+| `GRAPH … SEEDS` | `10` | top hits per channel used as seeds |
+| `WEIGHT` | vector `1.0`, keyword `1.0`, graph `0.5` | |
+| `CALL pagerank` args | `damping: 0.85, iterations: 20, tolerance: 1e-6` | |
+| `CALL louvain` args | `max_levels: 10, min_gain: 1e-9` | |
+| `CALL shortest_path` `dir` | `out` | `from` and `to` are required |
 
-Everything else requires no model:
+`MATCHING` has no property default: keyword indexes are declared per `(label,
+property)` and those properties follow no convention, so `ON` is required — as
+is a label, for the same reason.
 
-- **Storing and searching vectors you already have.** A vector is an ordinary
-  property; declare an index and search it with a **literal** vector
-  (`SEARCH … NEAR $vec`). Only *text* queries need embedding.
-- **Keyword search.** BM25 is purely lexical.
-- **Graph queries and traversal.** `MATCH`, `SEARCH … NEAR $vec`, `plane.query`,
-  `plane.neighbors`, `graph.seed` / `graph.expand`.
-- **Graph algorithms.** PageRank, components, shortest path, Louvain.
-- **Time-travel, the change feed, and backup/restore.**
-- **The hybrid keyword and graph channels**, and the vector channel when given a
-  literal vector.
+## Algorithms
 
-In short: the model is needed only to turn *text* into vectors, and to drive
-`ask` and `digest`. If you embed your data with your own pipeline and query by
-literal vector, keyword, and graph, Dr Strange needs no model.
-
-## Running Dr Strange without LLM
-
-There are two independent ways to run without a model: simply not using the model
-features, and building a binary with the model code excluded entirely.
-
-### Not using the model features
-
-The model-backed operations call a provider only when invoked. Supply no provider
-keys and avoid `ask`, `digest`, and text-embedding queries, and the rest of the
-system is fully functional. Embed your data with your own pipeline, store the
-vectors as properties, and query by:
-
-- **literal-vector similarity** — `SEARCH (d:Doc) ON embedding NEAR $vec TOPK 10`,
-- **keyword** — a BM25 index (`index keyword …`),
-- **graph** — `MATCH`, traversal, and the graph algorithms.
-
-A served instance still exposes `ask` and `digest`, but they return a clear error
-when no provider key is configured; nothing else is affected.
-
-### Building without the model code
-
-The command-line tool gates the model features behind the `digest` Cargo feature,
-which pulls in the LLM crate. Build without it for a lean binary that has no model
-dependency at all:
-
-```console
-$ cargo build --release -p dr-strange-cli --no-default-features --features native-backend
+```text
+CALL 'pagerank'      ( [ damping: number ] [ iterations: uint ] [ tolerance: number ] )
+CALL 'components'    ( )                      (* alias: connected_components *)
+CALL 'louvain'       ( [ max_levels: uint ] [ min_gain: number ] )
+CALL 'shortest_path' ( from: key-or-id , to: key-or-id [ , dir: string ]
+                       [ , weight: string ] )
 ```
 
-The resulting `drsg` omits the `ask` and `digest` commands; every other command
-— planes, import/export, queries, indexes, hybrid (keyword and literal-vector
-channels), algorithms, snapshot/restore, and `serve` — is unchanged.
+`key-or-id` is a string (an external key) or a whole number (a node id). Each
+algorithm reports its per-node result through `score()`: the rank for
+`pagerank`, a dense 0-based group index for `components` and `louvain`, and the
+node's position along the path for `shortest_path`. An unknown algorithm or
+argument name is an error, never a silently ignored setting.
 
-## Use local LLM / models
+## Not supported
 
-The model features do not require a hosted API. A provider is either a **preset**
-name or a **base URL**, so any OpenAI-compatible endpoint — including a local one
-— can serve chat and embeddings.
+Each of these is a clear error, never a silent mis-compile:
 
-### Ollama
-
-[Ollama](https://ollama.com) exposes an OpenAI-compatible API locally. The
-built-in `ollama` preset points at `http://localhost:11434/v1`, needs no key, and
-defaults to `llama3.1` for chat and `nomic-embed-text` for embeddings:
-
-```console
-$ ollama pull llama3.1
-$ ollama pull nomic-embed-text
-
-$ drsg --db graph.drsg ask "which companies does Ada work for?" \
-    --plane social --chat ollama --embed ollama
-
-$ drsg --db graph.drsg digest notes.md --plane social --apply \
-    --chat ollama --embed ollama
-```
-
-Override the models with `--model` and `--embed-model` as needed.
-
-### Any OpenAI-compatible server
-
-A local inference server that speaks the OpenAI API — vLLM, LM Studio,
-llama.cpp's server, and others — is addressed by passing its **base URL** as the
-provider, with the model named explicitly:
-
-```console
-$ drsg --db graph.drsg ask "…" --plane social \
-    --chat  http://localhost:8000/v1 --model       my-chat-model \
-    --embed http://localhost:8000/v1 --embed-model my-embed-model
-```
-
-If the endpoint requires a key, set it in the environment and name its variable
-with the key-environment options; a keyless local server needs none.
-
-### In the dashboard, server, and MCP
-
-The same providers apply everywhere the model is used. The **AIgest** page and the
-semantic search selector list the presets, including `ollama`; the server and the
-MCP host read the provider keys (or none, for a keyless local server) from their
-environment. Chat and embedding providers are chosen independently, so a local
-chat model may be paired with a local — or hosted — embedding model, and vice
-versa.
+- projections and aggregation — `RETURN a.name, count(*)`, `GROUP BY`, `WITH`
+  pipelining. The row model carries one current node, so these need a
+  multi-binding row contract (a deliberate deferral).
+- returning or ordering by any variable but the pattern's last.
+- predicates spanning two variables — `WHERE p.year < q.year`.
+- reusing a pattern variable, which would express a graph constraint.
+- branching patterns — one linear path per statement.
+- unbounded variable-length relationships — `*`, `*2..`.
+- undirected or untyped created edges.
+- comments, string escapes, and `WITH`.

@@ -29,6 +29,13 @@ All notable changes to Dr Strange are documented here. The format is based on
     surfaces. `MATCHING` still requires `ON` — keyword properties follow no
     convention to default to, and it now says so.
 
+### Documentation
+- **Appendix B — Query-Language Grammar** (English and 中文): the complete
+  grammar of the openCypher subset in one place, with every default, the
+  algorithm signatures, and the constructs that are deliberately unsupported.
+  The chapter explains what each construct is for; the appendix states exactly
+  what parses. "LLM Included or Not" moves to Appendix C.
+
 ### Fixed
 - A malformed clause reports its own position instead of blaming the query's
   first token: once a clause's leading keyword matches, the parser commits, so

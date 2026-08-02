@@ -5,6 +5,10 @@ pipeline of operators. A plan may be authored directly as a serializable
 structure, or written in an **openCypher-subset** language that compiles to the
 same plan. The two are equivalent; the language is a surface over the plan.
 
+This chapter explains what each construct is for. [Appendix B](./appendix-b.md)
+states the complete grammar — every clause, every default, and everything that
+is deliberately not supported.
+
 ## The logical plan
 
 A plan is a **source** followed by a sequence of **steps**. Each row flows
