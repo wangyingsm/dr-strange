@@ -475,7 +475,7 @@ fn run_plans(
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
 /// leading/trailing prose.
-fn extract_json(raw: &str) -> &str {
+pub(crate) fn extract_json(raw: &str) -> &str {
     let t = raw.trim();
     let t = t
         .strip_prefix("```json")

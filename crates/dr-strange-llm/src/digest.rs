@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::provider::{Chat, Embedder, OutputTruncated};
+use crate::reconcile::{self, ReconcileReport};
 
 /// How many existing entities to retrieve per chunk as reuse candidates.
 const LINK_K: usize = 8;
@@ -152,6 +153,13 @@ pub struct DigestReport {
     /// and were linked to rather than re-created.
     pub linked: usize,
     pub dropped_relations: usize,
+    /// Relations that became the same `(src, dst, type)` once edge types were
+    /// reconciled, and so collapsed into one.
+    pub merged_relations: usize,
+    /// What reconciling the entity-label vocabulary cost and changed (ROADMAP §8).
+    pub labels: ReconcileReport,
+    /// The same, for the edge-type vocabulary.
+    pub edge_types: ReconcileReport,
     pub chat_requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -179,6 +187,10 @@ pub struct DigestOptions {
     /// fully sequential; higher values overlap the (slow, network-bound) LLM
     /// requests. Clamped to `[1, chunk count]`.
     pub concurrency: usize,
+    /// Reconcile the label and edge-type vocabularies after extraction
+    /// (ROADMAP §8 stage 1). Costs O(1) chat calls in document size and folds
+    /// the spelling variants independent chunks inevitably produce.
+    pub reconcile: bool,
 }
 
 impl DigestResult {
@@ -312,6 +324,66 @@ pub fn digest(
                 });
             }
         }
+    }
+
+    // Stage 1 of extraction precision (ROADMAP §8): the chunks were read
+    // independently, so the label and edge-type vocabularies never converged.
+    // Reconcile each *set* — O(1) calls in document size — before anything
+    // downstream sees them, keeping the document's own wording as an alias.
+    if opts.reconcile {
+        let label_counts = reconcile::tally(
+            entities
+                .values()
+                .map(|n| n.label.as_str())
+                .filter(|l| !l.is_empty()),
+        );
+        let (renames, r) = reconcile::reconcile(chat, "entity label", "", &label_counts)?;
+        report.labels = r;
+        for node in entities.values_mut() {
+            if let Some(canonical) = renames.get(&node.label) {
+                reconcile::note_original(
+                    &mut node.props,
+                    "_label_as_written",
+                    "label as the document wrote it, before reconciliation",
+                    &node.label,
+                );
+                node.label = canonical.clone();
+            }
+        }
+
+        let type_counts = reconcile::tally(edges.iter().map(|e| e.ty.as_str()));
+        let (renames, r) =
+            reconcile::reconcile(chat, "edge type", reconcile::EDGE_RULE, &type_counts)?;
+        report.edge_types = r;
+        for edge in &mut edges {
+            if let Some(canonical) = renames.get(&edge.ty) {
+                reconcile::note_original(
+                    &mut edge.props,
+                    "_type_as_written",
+                    "edge type as the document wrote it, before reconciliation",
+                    &edge.ty,
+                );
+                edge.ty = canonical.clone();
+            }
+        }
+        // Renaming can make two edges the same `(src, dst, ty)` triple; keep the
+        // first in the existing deterministic order.
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        let before = edges.len();
+        edges.retain(|e| seen.insert((e.src.clone(), e.dst.clone(), e.ty.clone())));
+        report.merged_relations = before - edges.len();
+
+        report.chat_requests += report.labels.chat_requests + report.edge_types.chat_requests;
+        report.input_tokens += report.labels.input_tokens + report.edge_types.input_tokens;
+        report.output_tokens += report.labels.output_tokens + report.edge_types.output_tokens;
+        tracing::info!(
+            labels = format!("{}→{}", report.labels.before, report.labels.after),
+            edge_types = format!("{}→{}", report.edge_types.before, report.edge_types.after),
+            folded = report.labels.folded + report.edge_types.folded,
+            merged = report.labels.merged + report.edge_types.merged,
+            collapsed_relations = report.merged_relations,
+            "vocabulary reconciled",
+        );
     }
 
     // Entities the model reused an existing key for are linked, not re-created:

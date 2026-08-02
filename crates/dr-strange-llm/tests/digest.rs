@@ -24,6 +24,9 @@ fn opts(embed: bool) -> DigestOptions {
         chunk_chars: 4000,
         embed,
         concurrency: 1,
+        // The mock provider serves one canned reply; the reconciliation pass
+        // would consume replies these tests do not provide.
+        reconcile: false,
     }
 }
 
@@ -186,4 +189,149 @@ fn re_splits_a_chunk_that_overflows_the_output_limit() {
         *dense.calls.lock().unwrap() >= 3,
         "one truncated call plus one per piece"
     );
+}
+
+// ---- vocabulary reconciliation (ROADMAP §8 stage 1) -----------------------
+
+/// Two chunks reading the same material independently, exactly as the real
+/// pipeline produces: the same entity kind spelled two ways, and one
+/// relationship named two ways. Chunk order is deterministic, so reply order is.
+const CHUNK_A: &str = r#"{
+  "entities": [
+    {"key":"transformer","label":"Model Architecture","description":"The Transformer."},
+    {"key":"bytenet","label":"Model Architecture","description":"ByteNet."}
+  ],
+  "relations": [
+    {"src":"transformer","dst":"bytenet","type":"COMPARED_WITH","description":"Compared."}
+  ]
+}"#;
+const CHUNK_B: &str = r#"{
+  "entities": [
+    {"key":"convs2s","label":"ModelArchitecture","description":"ConvS2S."}
+  ],
+  "relations": [
+    {"src":"transformer","dst":"convs2s","type":"CONTRASTS_WITH","description":"Contrasted."}
+  ]
+}"#;
+/// The label vocabulary needs no model at all here — folding collapses the two
+/// spellings to one name, and one name is canonical by definition — so only the
+/// edge types, which no string rule can equate, reach the model.
+const TYPE_MERGE: &str = r#"{"merge":{"CONTRASTS_WITH":"COMPARED_WITH"}}"#;
+
+/// Two paragraphs that cannot share a chunk: `chunk` floors the target size at
+/// 200 characters, so each paragraph is 150 and the pair overruns it.
+fn two_chunk_doc() -> String {
+    format!("{}\n\n{}", "a".repeat(150), "b".repeat(150))
+}
+
+#[test]
+fn reconciliation_folds_spellings_and_merges_synonyms() -> Result<()> {
+    let chat = MockProvider::new(vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200; // the floor; two 150-char paragraphs cannot share one
+    o.reconcile = true;
+    o.concurrency = 1; // keep reply order aligned with chunk order
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+
+    // One label survives: the spelling variant folded, model-free.
+    let labels: Vec<&str> = res.nodes.iter().map(|n| n.label.as_str()).collect();
+    assert!(
+        labels.iter().all(|l| *l == "Model Architecture"),
+        "labels not reconciled: {labels:?}"
+    );
+    assert_eq!(res.report.labels.before, 2);
+    assert_eq!(res.report.labels.after, 1);
+    assert_eq!(res.report.labels.folded, 1);
+    assert_eq!(
+        res.report.labels.chat_requests, 0,
+        "folding settled the labels, so the model was never asked"
+    );
+
+    // One edge type survives, this time on the model's judgement.
+    let types: Vec<&str> = res.edges.iter().map(|e| e.ty.as_str()).collect();
+    assert!(
+        types.iter().all(|t| *t == "COMPARED_WITH"),
+        "edge types not reconciled: {types:?}"
+    );
+    assert_eq!(res.report.edge_types.merged, 1);
+    assert_eq!(res.report.edge_types.after, 1);
+    Ok(())
+}
+
+#[test]
+fn the_wording_the_document_used_survives_as_an_alias() -> Result<()> {
+    let chat = MockProvider::new(vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.reconcile = true;
+    o.concurrency = 1;
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+
+    // The renamed node records what the document wrote; untouched ones don't.
+    let renamed = res.nodes.iter().find(|n| n.key == "convs2s").unwrap();
+    assert_eq!(
+        renamed.props.get("_label_as_written").map(|p| &p.value),
+        Some(&PropValue::Str("ModelArchitecture".into()))
+    );
+    let untouched = res.nodes.iter().find(|n| n.key == "bytenet").unwrap();
+    assert!(!untouched.props.contains_key("_label_as_written"));
+
+    let renamed = res
+        .edges
+        .iter()
+        .find(|e| e.dst == "convs2s")
+        .expect("the contrasted edge");
+    assert_eq!(
+        renamed.props.get("_type_as_written").map(|p| &p.value),
+        Some(&PropValue::Str("CONTRASTS_WITH".into()))
+    );
+    Ok(())
+}
+
+#[test]
+fn reconciliation_is_off_by_request_and_costs_two_calls_when_on() -> Result<()> {
+    let replies: Vec<String> = vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()];
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+
+    o.reconcile = false;
+    let chat = MockProvider::new(replies.clone(), 4);
+    let off = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+    assert_eq!(off.report.chat_requests, 2, "one call per chunk");
+    assert_eq!(off.report.labels, Default::default());
+    // Without the pass both spellings survive — the state ROADMAP §8 describes.
+    let mut labels: Vec<&str> = off.nodes.iter().map(|n| n.label.as_str()).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels, vec!["Model Architecture", "ModelArchitecture"]);
+
+    o.reconcile = true;
+    let chat = MockProvider::new(replies, 4);
+    let on = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+    // One call for the edge types; none for the labels, which folding settled.
+    assert_eq!(
+        on.report.chat_requests, 3,
+        "at most +1 per vocabulary, O(1) in doc size"
+    );
+    assert_eq!(on.report.edge_types.chat_requests, 1);
+    Ok(())
+}
+
+#[test]
+fn renaming_collapses_relations_that_became_the_same_triple() -> Result<()> {
+    // Both chunks state the same pair, under two names for one relationship.
+    const A: &str = r#"{"entities":[{"key":"x","label":"L"},{"key":"y","label":"L"}],
+        "relations":[{"src":"x","dst":"y","type":"COMPARED_WITH"}]}"#;
+    const B: &str = r#"{"entities":[{"key":"x","label":"L"}],
+        "relations":[{"src":"x","dst":"y","type":"CONTRASTS_WITH"}]}"#;
+    let chat = MockProvider::new(vec![A.into(), B.into(), TYPE_MERGE.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.reconcile = true;
+    o.concurrency = 1;
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+    assert_eq!(res.edges.len(), 1, "the duplicate triple collapsed");
+    assert_eq!(res.report.merged_relations, 1);
+    Ok(())
 }

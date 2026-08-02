@@ -194,6 +194,10 @@ struct Digest {
     /// (default true). Off ⇒ every entity is proposed as new.
     #[serde(default)]
     link: Option<bool>,
+    /// Reconcile the label / edge-type vocabularies after extraction, folding
+    /// the spelling variants independent chunks produce (default true).
+    #[serde(default)]
+    reconcile: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -778,6 +782,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         chunk_chars: 4000,
         embed,
         concurrency: 8,
+        reconcile: req.reconcile.unwrap_or(true),
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

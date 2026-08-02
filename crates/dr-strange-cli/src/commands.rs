@@ -518,6 +518,8 @@ pub struct DigestArgs<'a> {
     pub embed: bool,
     /// Link extracted entities to existing plane nodes via vector retrieval.
     pub link: bool,
+    /// Reconcile the label / edge-type vocabularies after extraction.
+    pub reconcile: bool,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -641,6 +643,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         chunk_chars: args.chunk_chars,
         embed: args.embed,
         concurrency: args.concurrency,
+        reconcile: args.reconcile,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

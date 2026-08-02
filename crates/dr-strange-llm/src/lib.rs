@@ -15,6 +15,7 @@ mod digest;
 mod openai;
 mod preset;
 mod provider;
+mod reconcile;
 
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
@@ -24,3 +25,4 @@ pub use digest::{
 pub use openai::{OpenAiProvider, build_provider};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
+pub use reconcile::ReconcileReport;

@@ -1335,6 +1335,10 @@ pub struct DigestRun {
     /// (`[digest].chunk_chars`, else 4000).
     #[serde(default)]
     chunk_chars: Option<usize>,
+    /// Reconcile the label / edge-type vocabularies after extraction
+    /// (default true). Costs O(1) extra chat calls in document size.
+    #[serde(default)]
+    reconcile: Option<bool>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
@@ -1367,6 +1371,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         chunk_chars: req.chunk_chars.unwrap_or(ctx.digest.chunk_chars),
         embed,
         concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
+        reconcile: req.reconcile.unwrap_or(true),
     };
     let plane = app(ctx.db.plane(&req.plane))?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);

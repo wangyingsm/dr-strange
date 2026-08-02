@@ -217,6 +217,11 @@ enum Command {
         /// entity as new; skips the per-chunk vector retrieval).
         #[arg(long)]
         no_link: bool,
+        /// Skip vocabulary reconciliation (ROADMAP §8 stage 1): keep every
+        /// label and edge type exactly as each chunk wrote it, spelling
+        /// variants and all. Saves two chat calls per run.
+        #[arg(long)]
+        no_reconcile: bool,
     },
 }
 
@@ -564,6 +569,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             concurrency,
             no_embed,
             no_link,
+            no_reconcile,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -574,6 +580,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 concurrency,
                 embed: !no_embed,
                 link: !no_link,
+                reconcile: !no_reconcile,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),
