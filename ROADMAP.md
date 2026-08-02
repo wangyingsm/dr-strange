@@ -233,8 +233,99 @@ node — it addresses the plane handle — so it rides on `ReadQuery` beside the
 plan for a surface to apply. The keyword / hybrid / algorithm / temporal forms
 are read-only.
 
-**Follow-ups.** Re-enable an NL→Cypher route (`ask_cypher`) now that the subset
-is at parity, and expose the new sources in the dashboard's query surface.
+**Follow-ups.** Expose the new sources in the dashboard's query surface.
+
+---
+
+## 8. Extraction precision — AIgest in three passes
+
+**Goal.** Make the graph AIgest produces *precise*: one node per real entity,
+one label per real kind, one edge type per real relationship, and properties
+drawn from everything the document says about an entity rather than from
+whichever chunk happened to mention it first.
+
+**The problem, measured.** Extraction is one round: each chunk goes to the model
+alone and the results are merged positionally. `merge_props` is explicit about
+the consequence — *"never clobbering an existing key (first chunk wins)"* — so an
+entity's properties, its `description`, and even its **label** are fixed by its
+earliest mention, and every later, better mention is discarded. Relations dedup
+on `(src, dst, ty)`, first wins likewise. No chunk ever sees what another chunk
+extracted, so nothing converges on a shared vocabulary. Digesting the
+"Attention Is All You Need" paper into the `attention` plane gives, for 108
+nodes and 113 edges:
+
+- **43 distinct labels**, including `Attention Mechanism` vs `AttentionMechanism`;
+- **48 distinct edge types**, including `COMPARED_TO`, `COMPARED_WITH`,
+  `COMPARED_IN` and `CONTRASTS_WITH` side by side — only the last holds the
+  answer to "what is the Transformer compared with", which makes the graph
+  hostile to both humans and NL→query;
+- **10 key pairs differing only in case or spacing** — `Multi-Head Attention` /
+  `Multi-head attention`, `Self-Attention` / `Self-attention`, `Softmax` /
+  `softmax`, `d_model` / `dmodel`, `K` / `k`, `Q` / `q`;
+- **split identities**: `K` and `Key` are two nodes, as are `Q`/`Query`,
+  `V`/`Value`, and `Transformer` / `Transformer (base model)` /
+  `Transformer (big)`;
+- **two external keys held by two nodes each** (`ByteNet`, `ConvS2S`) — a key
+  lookup silently returns one of them.
+
+That last one is a correctness bug, not a quality complaint: duplicate
+prevention runs *entirely* through vector linking (`PlaneCandidates` → the
+`existing` set), so a plane whose nodes carry no usable embedding — as this one
+does, every `embedding` being an empty vector — links nothing and re-creates
+nodes under keys the plane already holds. There is no exact-key fallback.
+
+**Why AI-native.** Ingestion quality is the ceiling on everything above it. A
+fragmented vocabulary defeats NL→query (the model picks a plausible edge type
+that holds no data), defeats hybrid retrieval (the same entity's signal is split
+across duplicate nodes), and defeats traversal (a question anchored on
+`Transformer` misses what is attached to `Transformer (base model)`). This is
+the highest-leverage remaining work: it improves every read path at once,
+without changing any of them.
+
+**Scope sketch — three passes, delivered in order, each shippable alone.**
+
+*Stage 1 — vocabulary reconciliation (cheapest, largest win).* After round 1,
+send the model the **label set** and the **edge-type set** alone — a few hundred
+tokens, one or two calls regardless of document size — and have it return a
+canonical mapping (`AttentionMechanism → Attention Mechanism`,
+`COMPARED_TO|COMPARED_WITH|CONTRASTS_WITH → COMPARED_WITH`). Apply it to the
+extraction before merge. Cost is O(1) in the document; the win is most of the
+fragmentation above.
+
+*Stage 2 — identity resolution.* Merge nodes that denote the same entity
+(`K`/`Key`, case variants) and decide the containment cases deliberately — is
+`Transformer (big)` its own node, or a property of `Transformer`? Includes the
+bug fix: an **exact-key check against the plane** before creating a node, so
+duplicate prevention no longer depends on embeddings being present and usable.
+Candidate pairs come from cheap signals first (normalized key equality, prefix
+containment) with the model adjudicating only the genuinely ambiguous ones.
+
+*Stage 3 — per-entity refinement.* For each surviving entity, gather **every**
+occurrence in the document plus its relations, and re-ask the model for that
+entity's properties and description with the full picture in front of it. This
+is the round that repairs first-chunk-wins. Run concurrently like round 1, merge
+in a deterministic order. Occurrences come from the chunks that produced the
+entity (recorded during round 1 — not tracked today, and cheap to add) widened
+by BM25 over the chunk text, reusing the in-tree `text::Analyzer` so it needs no
+embedder.
+
+**Forks to settle.**
+- *Cost control on stage 3* — it is O(entities) chat calls where round 1 is
+  O(chunks), roughly 10× on a paper-sized document. Refine every entity, or
+  triage to those mentioned in ≥2 chunks / above a degree threshold?
+- *Edges are visited twice* in stage 3, once from each endpoint, yielding two
+  refinements of one edge. Resolve by endpoint order, by confidence, or refine
+  edges in their own pass?
+- *Drift* — "here is every mention, refine" invites invention. Constrain the
+  round to the supplied contexts, and require evidence (a quote or offset) for
+  a changed value, versus trusting the model's judgement?
+- *Where reconciliation applies* — rewrite the extraction before it is merged,
+  or write both and record the canonical form as an alias property (keeping the
+  document's own wording recoverable)?
+- *Scope of stage 2* — within one digest run only, or also against entities
+  already in the target plane (which is where the duplicate-key bug bites)?
+- *Determinism* — stage 1's mapping and stage 3's merge must be reproducible
+  for the same input, as round 1's chunk-order merge already is.
 
 ---
 
