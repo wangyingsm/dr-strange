@@ -4,6 +4,53 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-03
+
+### Added
+- **Extraction precision — AIgest in three passes (ROADMAP §8).** Digestion no
+  longer stops at one round of per-chunk extraction. Three clean-up passes now
+  follow it, exposed as a single `mode` on every surface rather than as five
+  separate knobs:
+  - `coarse` — **vocabulary reconciliation.** The label set and the edge-type
+    set are canonicalized as *sets*, so the pass costs O(1) chat calls however
+    long the document is. Names differing only in case or separators fold with
+    no model involved; the model adjudicates the rest. Measured on one paper:
+    70 labels → 39, 67 edge types → 32.
+  - `fine` (the default) — **identity resolution.** Entities that name the same
+    thing are merged (`Multi-Head Attention` / `Multi-head attention`, `K` /
+    `Key`), edge endpoints are rewritten onto the survivor, and the duplicate
+    triples and self-loops that creates are collapsed. Candidates come from
+    cheap signals; only ambiguous pairs cost a call, and a pair whose entities
+    carry different labels is never proposed.
+  - `super` — **per-entity refinement.** Every entity mentioned outside the
+    chunks that produced it is re-read against *all* of its passages plus its
+    relations, repairing the properties that first-chunk-wins froze. Entities
+    with nothing new to read are skipped without a call. Runs concurrently,
+    merges in a deterministic order, and a failed refinement costs that entity
+    rather than the run. Measured: 368 properties added and 109 revised across
+    104 entities — and **~15× the input token usage**, stated in the CLI help,
+    the OpenRPC summary, and an amber notice in the dashboard.
+  - Reconciliation and merging keep the document's own wording beside the
+    canonical form as `_label_as_written` / `_type_as_written` /
+    `_key_as_written`, written only where the two differ.
+- `--mode` on `drsg digest`, `mode` on `digest.run` (RPC + MCP, regenerated into
+  all five SDKs), and a Mode select in the dashboard's AIgest view — remembered
+  like the provider choices, with the cost of `super` shown where it is chosen.
+
+### Fixed
+- **A digested key could be written twice.** Duplicate prevention ran entirely
+  through vector linking, so a plane whose nodes carry no usable embedding — as
+  a digest without an embedder leaves them — matched nothing and created a
+  second node under a key the plane already held, after which a key lookup
+  silently answered with one of them. Exact-key matching against the plane no
+  longer depends on embeddings.
+- **A transient provider failure no longer discards a digest.** Requests are
+  retried up to four times with exponential backoff (500 ms → 8 s), honouring
+  `Retry-After`, but only for failures that might pass: transport errors, 429
+  and 5xx. Every other 4xx is reported on the first try. Each provider
+  round-trip is also bounded by a 300 s timeout, so a hung socket surfaces as an
+  error instead of stalling the run indefinitely.
+
 ## [1.2.0] - 2026-08-02
 
 ### Added
