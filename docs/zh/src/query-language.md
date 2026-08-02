@@ -127,9 +127,10 @@ MATCH (p:Person) WHERE p.age >= $min RETURN p
 SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 10 RETURN d
 ```
 
-`ON <属性>` 选定向量属性；`TOPK <k>` 限定结果数量。文本参数（`NEAR "…"`）在服务端
-被嵌入；字面量向量（`NEAR $vec`）则无需任何提供方。此子句编译为一个 `VectorTopK`
-数据源，可从其继续进行遍历：
+`ON <属性>` 选定向量属性，且可以省略——每个 `NEAR` 默认取 `embedding`，即文档摄取
+流水线所写入的那个属性，因此 `SEARCH (d:Doc) NEAR "…"` 即为其简写形式。`TOPK <k>`
+限定结果数量。文本参数（`NEAR "…"`）在服务端被嵌入；字面量向量（`NEAR $vec`）则无需
+任何提供方。此子句编译为一个 `VectorTopK` 数据源，可从其继续进行遍历：
 
 ```text
 SEARCH (d:Doc) ON embedding NEAR "time travel" TOPK 10
@@ -149,13 +150,15 @@ SEARCH (d:Doc) ON body MATCHING "graph database" TOPK 10
 RETURN d ORDER BY score() DESC
 ```
 
-标签是必需的——关键词索引按 `(标签, 属性)` 声明，没有标签便无从检索。与可回退为
-精确扫描的向量检索不同，未声明索引时关键词检索返回空结果。
+此处标签与 `ON <属性>` 均为必需。关键词索引按 `(标签, 属性)` 声明，二者缺一便无从
+检索；且与向量属性不同，关键词属性并无一个值得作为默认的约定名。与可回退为精确扫描
+的向量检索不同，未声明索引时关键词检索返回空结果。
 
 ## 查询中的混合检索
 
 `HYBRID` 将至多三路排序通道融合为单一次序。各通道均为可选（`VECTOR` 与 `KEYWORD`
-至少需其一），可携带 `WEIGHT`，且书写次序任意：
+至少需其一），可携带 `WEIGHT`，且书写次序任意。`VECTOR` 通道对属性的默认处理与
+`SEARCH … NEAR` 完全一致，故 `VECTOR NEAR "…"` 即为其简写形式：
 
 ```text
 HYBRID (d:Doc)

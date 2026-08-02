@@ -167,7 +167,7 @@ pub fn compile(
             Hop::Beam(b) => steps.push(Step::ExpandBeam {
                 dir: b.dir,
                 edge_type: b.edge_type.clone(),
-                property: b.property.clone(),
+                property: vector_property(&b.property),
                 query: resolve(&b.query, embedder)?,
                 metric: b.metric,
                 width: b.width,
@@ -232,6 +232,19 @@ pub fn compile(
     Ok(LogicalPlan { source, steps })
 }
 
+/// The vector property a `NEAR` clause searches when `ON <prop>` is omitted.
+/// This is the property the digest pipeline stores node embeddings under, and
+/// what the dashboard prefers when a label has several vector properties — so
+/// it is the convention across the system, not a guess local to the parser.
+const DEFAULT_VECTOR_PROPERTY: &str = "embedding";
+
+/// Resolve an optional `ON <prop>` against that convention.
+fn vector_property(property: &Option<String>) -> String {
+    property
+        .clone()
+        .unwrap_or_else(|| DEFAULT_VECTOR_PROPERTY.to_string())
+}
+
 /// Compile a query's source clause into a plan [`Source`]. The first node's
 /// label is consumed here (as the scan's label, or the retrieval scope), so it
 /// never becomes a redundant filter.
@@ -253,20 +266,26 @@ fn compile_source(
             k,
         } => Source::VectorTopK {
             label,
-            property: property.clone(),
+            property: vector_property(property),
             query: resolve(query, embedder)?,
             metric: *metric,
             k: *k,
         },
         SourceKind::Keyword { property, query, k } => Source::KeywordTopK {
             // BM25 indexes are declared per `(label, property)`, so unlike a
-            // vector search there is nothing to search without a label.
+            // vector search there is nothing to search without a label — nor
+            // any conventional property name to fall back on.
             label: label.ok_or_else(|| {
                 "a keyword SEARCH needs a label — the BM25 index is declared on \
                  (label, property), e.g. SEARCH (d:Doc) ON body MATCHING \"…\""
                     .to_string()
             })?,
-            property: property.clone(),
+            property: property.clone().ok_or_else(|| {
+                "a keyword SEARCH needs ON <property> — keyword properties follow \
+                 no convention, so there is nothing to default to. \
+                 (Only NEAR defaults, to `embedding`.)"
+                    .to_string()
+            })?,
             query: query.clone(),
             k: *k,
         },
@@ -306,7 +325,7 @@ fn compile_hybrid(
                 weights.vector = w;
             }
             Some(VectorChannel {
-                property: v.property.clone(),
+                property: vector_property(&v.property),
                 query: resolve(&v.query, embedder)?,
                 metric: v.metric,
             })

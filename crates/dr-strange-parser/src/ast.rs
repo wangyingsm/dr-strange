@@ -36,7 +36,7 @@ pub enum AsOfSpec {
     Time(i64),
 }
 
-/// `BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR <query>
+/// `BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] [ON prop] NEAR <query>
 /// [METRIC m] WIDTH w DEPTH d` — similarity-guided beam traversal from the
 /// current frontier (compiles to `Step::ExpandBeam`), binding `result` as the
 /// new current node.
@@ -45,7 +45,8 @@ pub struct BeamClause {
     pub node: NodePat,
     pub dir: Dir,
     pub edge_type: Option<String>,
-    pub property: String,
+    /// `None` ⇒ the conventional embedding property (see [`crate::compile`]).
+    pub property: Option<String>,
     pub query: VecArg,
     pub metric: Metric,
     pub width: u32,
@@ -68,18 +69,20 @@ pub struct QuerySource {
 pub enum SourceKind {
     /// `MATCH (a:Label)…` — a scan of the first node's label.
     Match,
-    /// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` — the
+    /// `SEARCH (v:Label) [ON prop] NEAR "text"|[..] [METRIC m] [TOPK k]` — the
     /// indexed vector seed (`Source::VectorTopK`).
     Search {
-        property: String,
+        /// `None` ⇒ the conventional embedding property (see [`crate::compile`]).
+        property: Option<String>,
         query: VecArg,
         metric: Metric,
         k: u64,
     },
     /// `SEARCH (v:Label) ON prop MATCHING "text" [TOPK k]` — the BM25 keyword
-    /// seed (`Source::KeywordTopK`).
+    /// seed (`Source::KeywordTopK`). `ON` is required here: keyword properties
+    /// follow no convention, so there is nothing sound to default to.
     Keyword {
-        property: String,
+        property: Option<String>,
         query: String,
         k: u64,
     },
@@ -104,7 +107,8 @@ pub struct HybridClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HybridVector {
-    pub property: String,
+    /// `None` ⇒ the conventional embedding property (see [`crate::compile`]).
+    pub property: Option<String>,
     pub query: VecArg,
     pub metric: Metric,
     pub weight: Option<f32>,

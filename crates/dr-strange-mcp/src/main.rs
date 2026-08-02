@@ -935,9 +935,10 @@ impl DrStrange {
         per-node result. Every source binds one node pattern and may continue \
         with a typed hop (put hops in the pattern, before WHERE): \
         MATCH one linear path (labels, ->/<-/-, bounded *m..n); \
-        SEARCH (v:L) ON prop NEAR \"text\"|[..] [METRIC m] [TOPK k] — vector \
-        top-k; SEARCH (v:L) ON prop MATCHING \"text\" [TOPK k] — BM25 keyword \
-        search (label required); HYBRID (v:L) [VECTOR ON p NEAR q [WEIGHT w]] \
+        SEARCH (v:L) [ON prop] NEAR \"text\"|[..] [METRIC m] [TOPK k] — vector \
+        top-k, where ON defaults to the `embedding` property; \
+        SEARCH (v:L) ON prop MATCHING \"text\" [TOPK k] — BM25 keyword \
+        search (label and ON both required); HYBRID (v:L) [VECTOR [ON p] NEAR q [WEIGHT w]] \
         [KEYWORD ON p MATCHING \"text\" [WEIGHT w]] [GRAPH HOPS h DECAY d \
         [WEIGHT w]] [CANDIDATES n] [TOPK k] — fused retrieval; \
         CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \

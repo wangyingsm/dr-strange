@@ -18,14 +18,16 @@
 //! does off a `MATCH` node (ROADMAP §7).
 //! - `MATCH` one linear path: `(a:Label)`, `-[:TYPE]->` / `<-[:TYPE]-` / `-[:T]-`
 //!   (in/out/both), bare `-->`/`--`, and bounded variable-length `-[:T*1..3]->`.
-//! - **`SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]`** — an
+//! - **`SEARCH (v:Label) [ON prop] NEAR "text"|[..] [METRIC m] [TOPK k]`** — an
 //!   indexed vector seed (`Source::VectorTopK`). `"text"` is embedded server-side
-//!   via [`parse_with_embedder`]; `[..]` is a literal escape hatch.
+//!   via [`parse_with_embedder`]; `[..]` is a literal escape hatch. `ON` may be
+//!   omitted: every `NEAR` defaults to the `embedding` property, which is what
+//!   the digest pipeline writes.
 //! - **`SEARCH (v:Label) ON prop MATCHING "text" [TOPK k]`** — a BM25 keyword
 //!   seed (`Source::KeywordTopK`) over a declared keyword index. Same verb as
 //!   the vector seed, different operator: `NEAR` compares meaning, `MATCHING`
 //!   compares words.
-//! - **`HYBRID (v:Label) [VECTOR ON p NEAR q [METRIC m] [WEIGHT w]]
+//! - **`HYBRID (v:Label) [VECTOR [ON p] NEAR q [METRIC m] [WEIGHT w]]
 //!   [KEYWORD ON p MATCHING "text" [WEIGHT w]]
 //!   [GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]] [CANDIDATES n] [TOPK k]`** —
 //!   fused retrieval (`Source::Hybrid`); channels in any order, at least one of

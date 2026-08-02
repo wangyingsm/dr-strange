@@ -1225,3 +1225,56 @@ fn as_of_rejects_a_malformed_timestamp() {
         ParseError::Syntax(_)
     ));
 }
+
+// ---- the `ON <property>` default -----------------------------------------
+
+#[test]
+fn near_defaults_the_property_to_embedding() {
+    // `embedding` is what the digest pipeline writes, so a NEAR clause need
+    // not repeat it. Explicit and implicit compile identically.
+    assert_eq!(
+        plan("SEARCH (d:Doc) NEAR [1.0, 2.0] TOPK 3 RETURN d"),
+        plan("SEARCH (d:Doc) ON embedding NEAR [1.0, 2.0] TOPK 3 RETURN d")
+    );
+    assert_eq!(
+        plan("SEARCH (d:Doc) NEAR [1.0] RETURN d").source,
+        Source::VectorTopK {
+            label: Some("Doc".into()),
+            property: "embedding".into(),
+            query: vec![1.0],
+            metric: Metric::Cosine,
+            k: 10,
+        }
+    );
+}
+
+#[test]
+fn hybrid_vector_channel_defaults_the_property_too() {
+    assert_eq!(
+        plan(r#"HYBRID (d:Doc) VECTOR NEAR [1.0] GRAPH HOPS 2 DECAY 0.5 RETURN d"#),
+        plan(r#"HYBRID (d:Doc) VECTOR ON embedding NEAR [1.0] GRAPH HOPS 2 DECAY 0.5 RETURN d"#)
+    );
+}
+
+#[test]
+fn beam_defaults_the_property_too() {
+    assert_eq!(
+        plan("MATCH (a:Doc) BEAM (b) OUT :CITES NEAR [1.0] WIDTH 4 DEPTH 2 RETURN b"),
+        plan("MATCH (a:Doc) BEAM (b) OUT :CITES ON embedding NEAR [1.0] WIDTH 4 DEPTH 2 RETURN b")
+    );
+}
+
+#[test]
+fn matching_still_requires_an_explicit_property() {
+    // Keyword properties follow no convention (body/text/description), so
+    // guessing would silently search nothing.
+    let e = err(r#"SEARCH (d:Doc) MATCHING "rust" RETURN d"#);
+    assert!(
+        matches!(&e, ParseError::Compile(m) if m.contains("ON <property>")),
+        "expected a clear compile error, got {e}"
+    );
+    assert!(matches!(
+        err(r#"HYBRID (d:Doc) KEYWORD MATCHING "rust" RETURN d"#),
+        ParseError::Syntax(_) | ParseError::Compile(_)
+    ));
+}

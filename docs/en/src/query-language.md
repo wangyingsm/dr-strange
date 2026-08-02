@@ -134,7 +134,9 @@ traversal compose in one statement:
 SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 10 RETURN d
 ```
 
-`ON <property>` selects the vector property; `TOPK <k>` bounds the result. A text
+`ON <property>` selects the vector property and may be omitted — every `NEAR`
+defaults to `embedding`, the property the document-ingestion pipeline writes, so
+`SEARCH (d:Doc) NEAR "…"` is the short form. `TOPK <k>` bounds the result. A text
 argument (`NEAR "…"`) is embedded server-side; a literal vector (`NEAR $vec`)
 requires no provider. This clause compiles to a `VectorTopK` source, from which
 traversal may continue:
@@ -158,15 +160,19 @@ SEARCH (d:Doc) ON body MATCHING "graph database" TOPK 10
 RETURN d ORDER BY score() DESC
 ```
 
-A label is required — the keyword index is declared per `(label, property)`, so
-there is nothing to search without one. Unlike vector search, which falls back
-to an exact scan, keyword search returns nothing when no index is declared.
+Both a label and `ON <property>` are required here. The keyword index is
+declared per `(label, property)`, so there is nothing to search without them —
+and unlike the vector property, keyword properties follow no convention worth
+defaulting to. Unlike vector search, which falls back to an exact scan, keyword
+search returns nothing when no index is declared.
 
 ## Hybrid retrieval in a query
 
 `HYBRID` fuses up to three ranked channels into a single ordering. Each channel
 is optional (at least one of `VECTOR` or `KEYWORD` is required), may carry a
-`WEIGHT`, and they may appear in any order:
+`WEIGHT`, and they may appear in any order. The `VECTOR` channel defaults its
+property exactly as `SEARCH … NEAR` does, so `VECTOR NEAR "…"` is the short
+form:
 
 ```text
 HYBRID (d:Doc)

@@ -608,8 +608,9 @@ fn match_query(i: &str) -> IResult<&str, Query> {
 fn search_query(i: &str) -> IResult<&str, Query> {
     let (i, _) = kw("search")(i)?;
     let (i, first) = node_pat(i)?;
-    let (i, _) = kw("on")(i)?;
-    let (i, property) = ident(i)?;
+    // Optional for `NEAR` (the compiler fills in the conventional embedding
+    // property); the compiler insists on it for `MATCHING`.
+    let (i, property) = opt(preceded(kw("on"), ident))(i)?;
     let (i, kind) = alt((
         |i| {
             let (i, _) = kw("near")(i)?;
@@ -694,11 +695,10 @@ fn hybrid_query(i: &str) -> IResult<&str, Query> {
     Ok((i, assemble(source, beams, tail)))
 }
 
-/// `VECTOR ON prop NEAR "text"|[..] [METRIC m] [WEIGHT w]`
+/// `VECTOR [ON prop] NEAR "text"|[..] [METRIC m] [WEIGHT w]`
 fn hybrid_vector(i: &str) -> IResult<&str, HybridVector> {
     let (i, _) = kw("vector")(i)?;
-    let (i, _) = kw("on")(i)?;
-    let (i, property) = ident(i)?;
+    let (i, property) = opt(preceded(kw("on"), ident))(i)?;
     let (i, _) = kw("near")(i)?;
     let (i, query) = vec_arg(i)?;
     let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
@@ -867,8 +867,7 @@ fn beam_clause(i: &str) -> IResult<&str, BeamClause> {
     let (i, node) = node_pat(i)?;
     let (i, dir) = beam_dir(i)?;
     let (i, edge_type) = opt(preceded(preceded(multispace0, char(':')), ident))(i)?;
-    let (i, _) = kw("on")(i)?;
-    let (i, property) = ident(i)?;
+    let (i, property) = opt(preceded(kw("on"), ident))(i)?;
     let (i, _) = kw("near")(i)?;
     let (i, query) = vec_arg(i)?;
     let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
