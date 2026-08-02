@@ -295,7 +295,7 @@ class Drsg(_Client):
         return self._call("graph.expand", _p)
 
     def digest_run(self, plane, text, chat=None, embed=None, model=None, embed_model=None, source=None, no_embed=None, link=None, concurrency=None, chunk_chars=None, mode=None) -> Any:
-        """Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits).
+        """Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage.
 
         Access: write."""
         _p: dict = {}

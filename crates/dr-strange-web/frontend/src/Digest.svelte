@@ -18,6 +18,18 @@
     savePref('digestChat', chat)
     savePref('digestEmbed', embed)
   })
+  // How much clean-up follows extraction (ROADMAP §8). Remembered like the
+  // provider choices, since it is a standing preference rather than a per-run
+  // decision.
+  let mode = $state(loadPref('digestMode', 'fine'))
+  const MODES = [
+    ['coarse', 'reconcile the label and edge-type vocabularies only'],
+    ['fine', 'also merge entities that name the same thing — the default'],
+    [
+      'super',
+      're-read every entity against all the passages mentioning it: the most accurate, and ~15× the input token usage',
+    ],
+  ]
   let noEmbed = $state(false)
   let link = $state(true)
   let proposal = $state(null) // { report, nodes, edges }
@@ -108,6 +120,7 @@
         embed,
         no_embed: noEmbed,
         link,
+        mode,
       })
       const r = proposal.report
       const linked = r.linked ? `, ${r.linked} linked to existing` : ''
@@ -154,6 +167,12 @@
       {#each PROVIDERS as p (p)}<option value={p}>{p}</option>{/each}
     </select>
   </label>
+  <label title={MODES.find((m) => m[0] === mode)?.[1]}>
+    Mode
+    <select bind:value={mode} onchange={() => savePref('digestMode', mode)}>
+      {#each MODES as [name, what] (name)}<option value={name} title={what}>{name}</option>{/each}
+    </select>
+  </label>
   <label class="check"><input type="checkbox" bind:checked={noEmbed} /> no embeddings</label>
   <label class="check" title="Retrieve similar entities already in the plane and let the LLM reuse their keys / add edges to them, instead of creating duplicates">
     <input type="checkbox" bind:checked={link} /> link to existing nodes
@@ -166,6 +185,14 @@
 </div>
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
+
+{#if mode === 'super'}
+  <p class="hint">
+    <strong>super</strong> re-reads every entity against all the passages mentioning it — the most
+    accurate digest, and <strong>~15× the input token usage</strong>: one extra request per entity
+    that has something new to read.
+  </p>
+{/if}
 
 {#if error}<p class="error">{error}</p>{/if}
 {#if status}<p class="status">{status}</p>{/if}

@@ -170,7 +170,7 @@ export class Drsg extends Client {
     return this._call("graph.expand", params) as Promise<Subgraph>;
   }
 
-  /** Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write) */
+  /** Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage. (access: write) */
   digestRun(params: { plane: string; text: string; chat?: string; embed?: string; model?: string; embed_model?: string; source?: string; no_embed?: boolean; link?: boolean; concurrency?: number; chunk_chars?: number; mode?: "coarse" | "fine" | "super" }): Promise<Record<string, unknown>> {
     return this._call("digest.run", params) as Promise<Record<string, unknown>>;
   }

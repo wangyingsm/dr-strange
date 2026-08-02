@@ -436,7 +436,7 @@ func (c *Client) GraphExpand(ctx context.Context, p GraphExpandParams) (*Subgrap
 	return out, err
 }
 
-// DigestRun Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write)
+// DigestRun Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage. (access: write)
 func (c *Client) DigestRun(ctx context.Context, p DigestRunParams) (map[string]any, error) {
 	var out map[string]any
 	err := c.call(ctx, "digest.run", p, &out)

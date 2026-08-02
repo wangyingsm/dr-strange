@@ -172,7 +172,7 @@ typedef struct {
     const char *mode;
 } drsg_digest_run_opts;
 
-/* Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write) */
+/* Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage. (access: write) */
 struct json_object *drsg_digest_run(drsg_client *c, const char *plane, const char *text, const drsg_digest_run_opts *opts, drsg_error *err);
 
 typedef struct {

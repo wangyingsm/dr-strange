@@ -864,7 +864,7 @@ public class Drsg extends Client {
         return call("graph.expand", params, new TypeReference<Subgraph>() {});
     }
 
-    /** Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write) */
+    /** Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage. (access: write) */
     public Map<String, Object> digestRun(DigestRunParams params) throws DrsgException {
         return call("digest.run", params, new TypeReference<Map<String, Object>>() {});
     }

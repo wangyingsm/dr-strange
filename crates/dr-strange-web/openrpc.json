@@ -1027,7 +1027,7 @@
     },
     {
       "name": "digest.run",
-      "summary": "Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits).",
+      "summary": "Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage.",
       "x-access": "write",
       "params": [
         {
@@ -1113,7 +1113,7 @@
         },
         {
           "name": "mode",
-          "summary": "How thoroughly to clean up the extraction, trading cost for precision. `coarse` reconciles the label and edge-type vocabularies, which chunks read independently never converge on. `fine` (the default) also merges entities that name the same thing and checks every key against the graph exactly, so a re-digest links rather than duplicating. `super` also re-reads every entity against all the passages mentioning it, repairing properties that one-round extraction fixed from whichever chunk mentioned it first — the most accurate, and an order of magnitude more input tokens than the rest of the digest.",
+          "summary": "How thoroughly to clean up the extraction, trading cost for precision. `coarse` reconciles the label and edge-type vocabularies, which chunks read independently never converge on. `fine` (the default) also merges entities that name the same thing and checks every key against the graph exactly, so a re-digest links rather than duplicating. `super` also re-reads every entity against all the passages mentioning it, repairing properties that one-round extraction fixed from whichever chunk mentioned it first — the most accurate, and by far the most expensive (~15x input token usage), since every eligible entity carries its passages into a call of its own.",
           "required": false,
           "schema": {
             "type": "string",
