@@ -1327,32 +1327,31 @@ nav button.active {
   margin-top: 0.6rem;
 }
 
-/* Cost warning for `super` digest mode — a red the eye catches before the
-   request is sent, not a muted hint discovered afterwards. Its own colours
-   rather than `.error`'s: nothing has gone wrong, something is about to get
-   expensive. Themed three ways, so a manual toggle cannot leave dark text on
-   a dark panel. */
+/* Cost warning for `super` digest mode — amber, not red: nothing has gone
+   wrong, something is about to get expensive, and a user who learns to read
+   red as "expensive" will start ignoring it where it means "broken". Themed
+   three ways, so a manual toggle cannot leave dark text on a dark panel. */
 :root {
-  --warn-bg: #fef2f2;
-  --warn-fg: #991b1b;
-  --warn-edge: #dc2626;
+  --warn-bg: #fffbeb;
+  --warn-fg: #854d0e;
+  --warn-edge: #d97706;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --warn-bg: #3f1d1d;
-    --warn-fg: #fca5a5;
-    --warn-edge: #ef4444;
+    --warn-bg: #3a2c0c;
+    --warn-fg: #fcd34d;
+    --warn-edge: #f59e0b;
   }
 }
 :root[data-theme='dark'] {
-  --warn-bg: #3f1d1d;
-  --warn-fg: #fca5a5;
-  --warn-edge: #ef4444;
+  --warn-bg: #3a2c0c;
+  --warn-fg: #fcd34d;
+  --warn-edge: #f59e0b;
 }
 :root[data-theme='light'] {
-  --warn-bg: #fef2f2;
-  --warn-fg: #991b1b;
-  --warn-edge: #dc2626;
+  --warn-bg: #fffbeb;
+  --warn-fg: #854d0e;
+  --warn-edge: #d97706;
 }
 
 .cost-warn {
