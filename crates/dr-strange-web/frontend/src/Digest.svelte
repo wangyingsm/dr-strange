@@ -187,10 +187,13 @@
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
 
 {#if mode === 'super'}
-  <p class="hint">
-    <strong>super</strong> re-reads every entity against all the passages mentioning it — the most
-    accurate digest, and <strong>~15× the input token usage</strong>: one extra request per entity
-    that has something new to read.
+  <p class="cost-warn" role="alert">
+    <span class="cost-mark" aria-hidden="true">⚠</span>
+    <span>
+      <strong>super</strong> re-reads every entity against all the passages mentioning it: the most
+      accurate digest, and <strong>~15× the input token usage</strong> — one extra request per
+      entity that has something new to read.
+    </span>
   </p>
 {/if}
 

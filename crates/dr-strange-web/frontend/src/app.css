@@ -1327,6 +1327,54 @@ nav button.active {
   margin-top: 0.6rem;
 }
 
+/* Cost warning for `super` digest mode — a red the eye catches before the
+   request is sent, not a muted hint discovered afterwards. Its own colours
+   rather than `.error`'s: nothing has gone wrong, something is about to get
+   expensive. Themed three ways, so a manual toggle cannot leave dark text on
+   a dark panel. */
+:root {
+  --warn-bg: #fef2f2;
+  --warn-fg: #991b1b;
+  --warn-edge: #dc2626;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --warn-bg: #3f1d1d;
+    --warn-fg: #fca5a5;
+    --warn-edge: #ef4444;
+  }
+}
+:root[data-theme='dark'] {
+  --warn-bg: #3f1d1d;
+  --warn-fg: #fca5a5;
+  --warn-edge: #ef4444;
+}
+:root[data-theme='light'] {
+  --warn-bg: #fef2f2;
+  --warn-fg: #991b1b;
+  --warn-edge: #dc2626;
+}
+
+.cost-warn {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-left: 4px solid var(--warn-edge);
+  padding: 0.6rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  margin-top: 0.6rem;
+}
+.cost-warn .cost-mark {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.cost-warn strong {
+  color: var(--warn-edge);
+}
+
 /* ---- digest page ---- */
 .controls .check {
   text-transform: none;
