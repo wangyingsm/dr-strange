@@ -319,17 +319,56 @@
 
   // Keyword autocomplete for the GraphQL/Cypher box: once the word being typed
   // is ≥2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
-  // shown after the caret; Tab accepts it.
+  // shown after the caret; Tab accepts it. Ordered shortest-prefix first, so
+  // MATCH is offered before MATCHING and the longer one is still reachable by
+  // typing one more character.
   const CYPHER_KEYWORDS = [
-    'MATCH', 'WHERE', 'RETURN', 'LIMIT', 'ORDER BY', 'SKIP', 'CREATE', 'MERGE',
-    'SET', 'DELETE', 'REMOVE', 'DETACH', 'WITH', 'SEARCH', 'NEAR', 'TOPK',
-    'DISTINCT', 'AND', 'OR', 'NOT', 'AS', 'ON',
+    // sources and the clauses that follow them
+    'MATCH', 'MATCHING', 'SEARCH', 'HYBRID', 'CALL', 'BEAM', 'WHERE', 'RETURN',
+    'DISTINCT', 'ORDER BY', 'SKIP', 'LIMIT', 'AS OF', 'TIME',
+    // expression terms — ahead of the knobs so `key(` wins over KEYWORD, which
+    // is only valid inside HYBRID
+    // (`hops()` is deliberately absent: it would shadow the GRAPH channel's
+    // required HOPS keyword, which is typed far more often)
+    'key()', 'score()', 'similarity(', 'distance(',
+    // retrieval knobs: the vector/keyword seeds, the hybrid channels, the beam
+    'NEAR', 'METRIC', 'TOPK', 'VECTOR', 'KEYWORD', 'GRAPH', 'HOPS', 'DECAY',
+    'SEEDS', 'WEIGHT', 'CANDIDATES', 'WIDTH', 'DEPTH',
+    // algorithm names for CALL — lower-case, as they read in a query (the
+    // compiler folds case, so an accepted completion parses either way)
+    'pagerank', 'components', 'shortest_path', 'louvain',
+    // writes
+    'CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'DETACH',
+    // operators
+    'AND', 'OR', 'NOT', 'ON', 'IN', 'IS', 'NULL', 'DESC',
   ]
+
+  // True when the caret sits inside an unterminated string literal. The words
+  // typed there are data — a document's text, an entity's key — not syntax, so
+  // completing them to keywords is noise. The language has no escapes, so this
+  // scan is exact.
+  function inStringLiteral(s) {
+    let quote = null
+    for (const ch of s) {
+      if (quote) {
+        if (ch === quote) quote = null
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      }
+    }
+    return quote !== null
+  }
+
   let cypherGhost = $derived.by(() => {
+    if (inStringLiteral(cypher)) return ''
     const m = cypher.match(/([A-Za-z]+)$/) // the word currently being typed
     if (!m || m[1].length < 2) return ''
     const up = m[1].toUpperCase()
-    const kw = CYPHER_KEYWORDS.find((k) => k.startsWith(up) && k.length > up.length)
+    // Case-insensitive match, but complete with the keyword's own casing, so
+    // the lower-case algorithm names stay lower-case.
+    const kw = CYPHER_KEYWORDS.find(
+      (k) => k.toUpperCase().startsWith(up) && k.length > up.length,
+    )
     return kw ? kw.slice(m[1].length) : ''
   })
   function onCypherKey(e) {
@@ -1019,7 +1058,7 @@
       <input
         type="text"
         class="cypher"
-        placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) ON embedding NEAR "some text" TOPK 10 RETURN n'}
+        placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) NEAR "some text" TOPK 10 RETURN n   ·   SEARCH (n:Label) ON body MATCHING "some words" RETURN n   ·   CALL pagerank() ON (n:Label) RETURN n ORDER BY score() DESC'}
         bind:value={cypher}
         onkeydown={onCypherKey}
       />
