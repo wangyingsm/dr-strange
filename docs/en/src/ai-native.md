@@ -100,10 +100,10 @@ inspection.
 ## Document ingestion (AIgest)
 
 Ingestion turns unstructured text into graph structure. A document is chunked;
-an LLM extracts entities and typed relations from each chunk; the entities are
-embedded; each is linked to a similar existing node when one is found (avoiding
-duplicates) or created otherwise; and the result is written through the bulk
-path.
+an LLM extracts entities and typed relations from each chunk; the extraction is
+cleaned up (below); the entities are embedded; each is linked to an existing
+node when one is found (avoiding duplicates) or created otherwise; and the
+result is written through the bulk path.
 
 ```console
 # Preview only (the default): report the entities and relations that would be written.
@@ -113,10 +113,49 @@ $ drsg --db graph.drsg digest notes.md --plane social --chat openai --embed open
 $ drsg --db graph.drsg digest notes.md --plane social --apply
 ```
 
+### Extraction precision
+
+Chunks are extracted independently, so nothing makes them converge: the same
+kind of thing acquires several labels, the same relationship several edge types,
+the same entity several names — and because chunks merge positionally, an
+entity's properties are fixed by whichever chunk mentioned it *first*, with
+every later and better mention discarded.
+
+Three clean-up passes follow the extraction. They are not configured
+individually; one option selects how many of them run, since they form a cost
+ordering:
+
+| `--mode` | passes | what it buys |
+|---|---|---|
+| `coarse` | vocabulary reconciliation | one label per kind, one edge type per relationship |
+| `fine` *(default)* | \+ identity resolution | one node per entity |
+| `super` | \+ per-entity refinement | properties drawn from the whole document |
+
+- **Vocabulary reconciliation** canonicalizes the label set and the edge-type
+  set — as *sets*, so it costs a constant number of model calls however long the
+  document is. Names differing only in case or separators fold with no model
+  involved.
+- **Identity resolution** merges entities that name the same thing, rewrites
+  edge endpoints onto the survivor, and collapses the duplicate edges and
+  self-loops that produces. It also checks each key against the plane exactly,
+  so re-digesting a document links rather than duplicating.
+- **Per-entity refinement** re-reads each entity against *every* passage
+  mentioning it, together with its relations, and asks for its properties again
+  with the full picture in view. Entities with nothing to read beyond the chunks
+  that produced them are skipped without a call. This is the pass that repairs
+  first-chunk-wins — and it is expensive: **roughly 15× the input tokens** of
+  `fine`, because each eligible entity carries its passages into a request of
+  its own.
+
+Wherever a name is canonicalized or merged, the form the document actually used
+is kept beside it as `_label_as_written` / `_type_as_written` /
+`_key_as_written`. Underscore-prefixed properties are provenance: they are
+hidden from the schema summary the model reads, so an alias costs the read paths
+nothing while keeping the document's own words recoverable.
+
 The command-line tool ingests text and Markdown; the dashboard's **AIgest** page
 additionally extracts PDF and DOCX, and previews the proposed entities and
-relations before writing. Extraction runs the LLM once; committing the preview
-performs no further model calls.
+relations before writing. Committing a preview performs no further model calls.
 
 ## Providers and keys
 

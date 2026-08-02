@@ -52,7 +52,7 @@
 ## 索引与导入
 
 - **`index.ensure`** · admin —— 在 `(标签, 属性)` 上声明一个向量或关键词索引。参数：`plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string。
-- **`digest.run`** · write —— 经由 LLM 从文本抽取节点/边方案（dry-run）。参数：`plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean。
+- **`digest.run`** · write —— 经由 LLM 从文本抽取节点/边方案（dry-run）。参数：`plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string（`coarse` \| `fine` \| `super`，默认 `fine`——见[第 3 章](./ai-native.md#抽取精度)；`super` 的输入 token 用量约为 15 倍）。
 - **`digest.write`** · write —— 写入一个先前算得的方案（不调用 LLM）。参数：`plane` string!, `nodes` array!, `edges` array。
 
 ## WebSocket 订阅

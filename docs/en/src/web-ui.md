@@ -88,10 +88,17 @@ and narrowed to one label; selecting a node change focuses it in the canvas.
 
 The AIgest view ingests a document into the current plane (see [Chapter
 3](./ai-native.md)). Upload or paste text — Markdown, plain text, PDF, or DOCX —
-choose the chat and embedding providers, and **Preview**: the model runs once and
-proposes the entities and relations it extracted. **Write to graph** commits the
+choose the chat and embedding providers, and **Preview**: the model extracts the
+entities and relations and proposes them. **Write to graph** commits the
 previewed proposal with no further model call. Options include linking to
 existing nodes (to avoid duplicates) and skipping embeddings.
+
+**Mode** selects how thoroughly the extraction is cleaned up — `coarse`, `fine`
+(the default), or `super` — and is remembered like the provider choices, since
+it is a standing preference rather than a per-run decision. Choosing `super`
+raises a notice directly under the control: it re-reads every entity against all
+of its passages, at roughly 15× the input token usage. See [Chapter
+3](./ai-native.md#extraction-precision) for what each mode buys.
 
 ## Design
 

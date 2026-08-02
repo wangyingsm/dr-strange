@@ -84,7 +84,7 @@ database a `drsg serve` currently holds open.
 | `write_edges` | write | create edges (batched) by endpoint keys |
 | `create_plane` | write | create an empty plane |
 | `drop_plane` | write | delete a plane and its contents (requires confirmation) |
-| `digest` | write | ingest a document (dry-run by default) |
+| `digest` | write | ingest a document (dry-run by default; `mode` sets extraction precision) |
 
 ## Mapping to the rest of the system
 

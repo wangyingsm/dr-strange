@@ -237,7 +237,34 @@ are read-only.
 
 ---
 
-## 8. Extraction precision — AIgest in three passes
+## 8. Extraction precision — AIgest in three passes  *(shipped)*
+
+**Status.** ✅ Shipped (2026-08-03). All three passes are built, live-run
+against the paper this section measured, and exposed as a single choice —
+`DigestMode::{Coarse, Fine, Super}` — on every surface (`--mode`, `digest.run`'s
+`mode`, the MCP tool, and a select in the dashboard's AIgest view). Each mode
+adds a pass to the one before it, so the ordering is the cost ordering and a
+caller picks a point on it rather than assembling a combination of knobs.
+
+**Measured, one `super` run over the same document:**
+
+| | before | after |
+|---|---|---|
+| labels | 70 | **39** (5 folded, 61 merged) |
+| edge types | 67 | **32** |
+| entities | 248 | **230** (3 folded, 15 merged, 27 pairs adjudicated) |
+| properties | — | **368 added, 109 revised** across 104 refined entities |
+
+104 of 230 entities had something to read outside the chunks that produced
+them; the other 126 were skipped without a call, as the gate intends. No
+refinement failed. Cost is the headline: **21.6k input tokens at `fine`,
+320k at `super`** — ~15×, since every eligible entity carries its passages into
+a call of its own. That figure is stated in the CLI help, the OpenRPC method
+summary (which is what reaches SDK users), and an amber notice in the dashboard.
+
+The duplicate-key correctness bug is fixed: `CandidateSource` gains an exact-key
+lookup, so duplicate prevention no longer depends on embeddings being present
+and usable.
 
 **Goal.** Make the graph AIgest produces *precise*: one node per real entity,
 one label per real kind, one edge type per real relationship, and properties
@@ -345,20 +372,37 @@ words recoverable. Stage 2 inherits this mechanism unchanged: an entity merged
 into another carries the same alias record forward rather than inventing a
 second scheme.
 
-**Forks to settle.**
-- *Edges are visited twice* in stage 3, once from each endpoint, yielding two
-  refinements of one edge. Resolve by endpoint order, by confidence, or refine
-  edges in their own pass?
-- *Drift* — "here is every mention, refine" invites invention. Constrain the
-  round to the supplied contexts, and require evidence (a quote or offset) for
-  a changed value, versus trusting the model's judgement?
-- *Where reconciliation applies* — rewrite the extraction before it is merged,
-  or write both and record the canonical form as an alias property (keeping the
-  document's own wording recoverable)?
-- *Scope of stage 2* — within one digest run only, or also against entities
-  already in the target plane (which is where the duplicate-key bug bites)?
-- *Determinism* — stage 1's mapping and stage 3's merge must be reproducible
-  for the same input, as round 1's chunk-order merge already is.
+**Forks settled.**
+- *Edges visited twice* — dissolved rather than decided. Stage 3 rewrites node
+  properties only; an entity's relations go **into** the prompt as context and
+  never come back out as writes, so no edge is refined twice because none is
+  refined at all. Edge-property refinement is a follow-up, not a fork.
+- *Drift* — constrained to the supplied contexts, without demanding a quote per
+  value. The prompt is one entity and its passages; a value not in them has
+  nothing to come from. Two hard rules do the rest: provenance properties
+  (`_`-prefixed) and `embedding` are never writable by refinement, and a
+  refinement that fails costs that entity rather than the run.
+- *Where reconciliation applies* — both. The extraction is rewritten before the
+  merge (so the merge itself converges), and the form the document used is kept
+  beside it as `_label_as_written` / `_type_as_written` / `_key_as_written`,
+  written only where the two differ.
+- *Scope of stage 2* — split by cost of being wrong. **Exact** key matching runs
+  against the plane, which is what closes the duplicate-key bug; **fuzzy**
+  matching stays within the run. Merging an extracted entity into an existing
+  node on a model's word is a larger question, deliberately left open.
+- *Determinism* — stage 1 asks for *groups* of names rather than a from→into
+  map, and a name claimed by an earlier group is not re-claimed by a later one,
+  so the result no longer depends on rename order. Stage 3's concurrent workers
+  tally locally and merge in candidate order. Both are reproducible for the same
+  model output. (The un-grouped phrasing was measurably unstable: the same
+  document, model and prompt merged 78 names on one run and 15 on the next.)
+
+**Follow-ups.**
+- Stage 2 only *proposes* pairs by containment, so two genuinely different names
+  for one thing (`self-attention` / `intra-attention`) remain invisible without
+  a similarity signal.
+- Fuzzy matching against entities already in the target plane (see above).
+- Refining edge properties, which stage 3 currently reads but never writes.
 
 ---
 

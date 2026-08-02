@@ -26,7 +26,7 @@ server for concurrent access, and the CLI for offline operations.
 | `hybrid <query> --plane` | fused vector + keyword + graph-proximity search |
 | `index ensure \| keyword` | declare a vector or keyword index |
 | `ask <question> --plane` | natural-language query |
-| `digest <file> --plane` | ingest a document via an LLM |
+| `digest <file> --plane [--mode]` | ingest a document via an LLM |
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |
 | `stats` / `check` | summary counts / integrity scan |
 | `serve [--addr]` | run the web dashboard + JSON-RPC API |
@@ -95,7 +95,15 @@ $ drsg --db graph.drsg ask "which companies does Ada work for?" \
     --plane social --chat deepseek --embed qwen
 
 $ drsg --db graph.drsg digest notes.md --plane social --apply
+
+$ drsg --db graph.drsg digest paper.md --plane papers --mode super --apply
 ```
+
+`--mode` selects how thoroughly the extraction is cleaned up: `coarse`
+reconciles the label and edge-type vocabularies, `fine` (the default) also
+merges entities that name the same thing, and `super` also re-reads every entity
+against all of its passages — the most accurate, at roughly 15× the input token
+usage ([Chapter 3](./ai-native.md#extraction-precision)).
 
 ## Backup and integrity
 

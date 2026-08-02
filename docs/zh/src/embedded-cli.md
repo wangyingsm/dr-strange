@@ -23,7 +23,7 @@
 | `hybrid <查询> --plane` | 融合的向量 + 关键词 + 图邻近度检索 |
 | `index ensure \| keyword` | 声明一个向量或关键词索引 |
 | `ask <问题> --plane` | 自然语言查询 |
-| `digest <文件> --plane` | 经由 LLM 导入一篇文档 |
+| `digest <文件> --plane [--mode]` | 经由 LLM 导入一篇文档 |
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |
 | `stats` / `check` | 汇总计数 / 完整性扫描 |
 | `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 |
@@ -90,7 +90,13 @@ $ drsg --db graph.drsg ask "which companies does Ada work for?" \
     --plane social --chat deepseek --embed qwen
 
 $ drsg --db graph.drsg digest notes.md --plane social --apply
+
+$ drsg --db graph.drsg digest paper.md --plane papers --mode super --apply
 ```
+
+`--mode` 决定抽取结果被清理到何种程度：`coarse` 归一标签与边类型的词表，`fine`
+（默认）在此之上合并指称同一事物的实体，`super` 再将每个实体与其全部段落一并重读
+——最为准确，输入 token 用量约为 15 倍（[第 3 章](./ai-native.md#抽取精度)）。
 
 ## 备份与完整性
 

@@ -78,7 +78,7 @@ $ drsg-mcp /path/to/graph.drsg
 | `write_edges` | 写 | 按端点键创建边（批量） |
 | `create_plane` | 写 | 创建一个空平面 |
 | `drop_plane` | 写 | 删除一个平面及其内容（需确认） |
-| `digest` | 写 | 导入一篇文档（默认为 dry-run） |
+| `digest` | 写 | 导入一篇文档（默认为 dry-run；`mode` 决定抽取精度） |
 
 ## 与系统其余部分的映射
 

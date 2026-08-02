@@ -55,7 +55,7 @@ or an external key.
 ## Indexes and ingestion
 
 - **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
-- **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean.
+- **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string (`coarse` \| `fine` \| `super`, default `fine` — see [Chapter 3](./ai-native.md#extraction-precision); `super` costs ~15× the input tokens).
 - **`digest.write`** · write — write a previously-computed proposal (no LLM call). Params: `plane` string!, `nodes` array!, `edges` array.
 
 ## WebSocket subscription

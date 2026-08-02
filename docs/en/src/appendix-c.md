@@ -21,7 +21,7 @@ on one or both:
 |---|---|---|
 | Embedding a **text** similarity query (`SEARCH … NEAR "text"`, semantic `plane.find`, a hybrid vector channel from text) | embedding provider | the query string is embedded server-side before the search |
 | **Natural-language query** (`ask` / `plane.ask`) | chat provider (+ embedding provider for the grounding tools) | the model compiles the question into a plan, optionally calling embedding-backed `find_edge` / `find_entity` tools |
-| **Document ingestion** (`digest` / AIgest) | chat + embedding providers | the model extracts entities and relations; the entities are embedded |
+| **Document ingestion** (`digest` / AIgest) | chat + embedding providers | the model extracts entities and relations, then cleans up the extraction (`--mode`); the entities are embedded |
 
 Everything else requires no model:
 
