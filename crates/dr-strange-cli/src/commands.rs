@@ -522,6 +522,10 @@ pub struct DigestArgs<'a> {
     pub reconcile: bool,
     /// Merge entities naming the same thing; check keys against the graph.
     pub resolve_identity: bool,
+    /// Re-read each entity against every passage mentioning it.
+    pub refine: bool,
+    pub refine_max_entities: Option<usize>,
+    pub refine_max_context: Option<usize>,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -647,6 +651,9 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         concurrency: args.concurrency,
         reconcile: args.reconcile,
         resolve_identity: args.resolve_identity,
+        refine: args.refine,
+        refine_max_entities: args.refine_max_entities,
+        refine_max_context: args.refine_max_context,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

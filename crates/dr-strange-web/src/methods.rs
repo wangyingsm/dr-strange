@@ -1344,6 +1344,17 @@ pub struct DigestRun {
     /// (default true).
     #[serde(default)]
     resolve_identity: Option<bool>,
+    /// Re-read each entity against every passage mentioning it (default false):
+    /// the most accurate digest, and the most expensive — one call per entity
+    /// with something new to read.
+    #[serde(default)]
+    refine: Option<bool>,
+    /// Cap on entities refined; omit for every eligible one.
+    #[serde(default)]
+    refine_max_entities: Option<usize>,
+    /// Cap on passages shown per entity; omit for every mention.
+    #[serde(default)]
+    refine_max_context: Option<usize>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
@@ -1378,6 +1389,9 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
         reconcile: req.reconcile.unwrap_or(true),
         resolve_identity: req.resolve_identity.unwrap_or(true),
+        refine: req.refine.unwrap_or(false),
+        refine_max_entities: req.refine_max_entities,
+        refine_max_context: req.refine_max_context,
     };
     let plane = app(ctx.db.plane(&req.plane))?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);

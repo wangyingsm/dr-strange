@@ -227,6 +227,18 @@ enum Command {
         /// vector linking alone to avoid duplicating existing nodes.
         #[arg(long)]
         no_resolve_identity: bool,
+        /// Re-read every entity against all passages mentioning it (ROADMAP §8
+        /// stage 3). The most accurate digest and the most expensive: one
+        /// extra chat call per entity that has something new to read.
+        #[arg(long)]
+        refine: bool,
+        /// Cap entities refined (default: every eligible one).
+        #[arg(long)]
+        refine_max_entities: Option<usize>,
+        /// Cap passages shown per entity (default: every mention). The budget
+        /// that matters — a hub can otherwise carry most of the document.
+        #[arg(long)]
+        refine_max_context: Option<usize>,
     },
 }
 
@@ -576,6 +588,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             no_link,
             no_reconcile,
             no_resolve_identity,
+            refine,
+            refine_max_entities,
+            refine_max_context,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -588,6 +603,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 link: !no_link,
                 reconcile: !no_reconcile,
                 resolve_identity: !no_resolve_identity,
+                refine,
+                refine_max_entities,
+                refine_max_context,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),

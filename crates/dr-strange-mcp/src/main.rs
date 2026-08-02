@@ -202,6 +202,10 @@ struct Digest {
     /// against the graph exactly so a re-digest links (default true).
     #[serde(default)]
     resolve_identity: Option<bool>,
+    /// Re-read each entity against every passage mentioning it (default
+    /// false) — the most accurate digest, and the most expensive.
+    #[serde(default)]
+    refine: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -788,6 +792,9 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         concurrency: 8,
         reconcile: req.reconcile.unwrap_or(true),
         resolve_identity: req.resolve_identity.unwrap_or(true),
+        refine: req.refine.unwrap_or(false),
+        refine_max_entities: None,
+        refine_max_context: None,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

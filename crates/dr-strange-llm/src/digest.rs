@@ -18,7 +18,7 @@
 //! linked (not re-created) and relations to them are kept — the bulk loader
 //! resolves those keys against the plane.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,6 +33,7 @@ use serde_json::Value;
 use crate::identity::{self, IdentityReport};
 use crate::provider::{Chat, Embedder, OutputTruncated};
 use crate::reconcile::{self, ReconcileReport};
+use crate::refine::{self, RefineReport};
 
 /// How many existing entities to retrieve per chunk as reuse candidates.
 const LINK_K: usize = 8;
@@ -198,6 +199,8 @@ pub struct DigestReport {
     pub edge_types: ReconcileReport,
     /// What identity resolution cost and changed (ROADMAP §8 stage 2).
     pub identity: IdentityReport,
+    /// What per-entity refinement cost and changed (ROADMAP §8 stage 3).
+    pub refined: RefineReport,
     pub chat_requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -233,6 +236,18 @@ pub struct DigestOptions {
     /// and check every remaining key against the graph exactly so a re-digest
     /// links rather than duplicating.
     pub resolve_identity: bool,
+    /// Re-read each entity against every passage mentioning it (ROADMAP §8
+    /// stage 3), repairing properties that one-round extraction fixed from
+    /// whichever chunk mentioned the entity first. Costs one call per entity
+    /// that has something new to read; the two caps below bound it.
+    pub refine: bool,
+    /// Cap on entities refined. `None` — the default — refines every eligible
+    /// one, with the cost visible in the report.
+    pub refine_max_entities: Option<usize>,
+    /// Cap on passages shown per entity. `None` refines against every mention;
+    /// this is the budget that matters, since a hub can otherwise carry most of
+    /// the document into one call.
+    pub refine_max_context: Option<usize>,
 }
 
 impl DigestResult {
@@ -328,11 +343,19 @@ pub fn digest(
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
     let mut edges: Vec<DigestEdge> = Vec::new();
     let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
-    for extraction in extracts {
+    // Which chunk(s) produced each entity — stage 3 needs it to tell an entity
+    // that has more to say elsewhere in the document from one that does not
+    // (ROADMAP §8), and nothing else records it.
+    let mut origins: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for (chunk_index, extraction) in extracts.into_iter().enumerate() {
         report.chat_requests += extraction.chat_requests;
         report.input_tokens += extraction.input_tokens;
         report.output_tokens += extraction.output_tokens;
         for e in extraction.entities {
+            origins
+                .entry(e.key.clone())
+                .or_default()
+                .insert(chunk_index);
             let node = entities.entry(e.key.clone()).or_insert_with(|| DigestNode {
                 key: e.key.clone(),
                 label: String::new(),
@@ -457,6 +480,9 @@ pub fn digest(
                 let Some(absorbed) = entities.remove(from) else {
                     continue;
                 };
+                // The absorbed name's chunks are the survivor's chunks now.
+                let moved = origins.remove(from).unwrap_or_default();
+                origins.entry(into.clone()).or_default().extend(moved);
                 let survivor = entities.entry(into.clone()).or_insert_with(|| DigestNode {
                     key: into.clone(),
                     label: absorbed.label.clone(),
@@ -504,6 +530,77 @@ pub fn digest(
             adjudicated = report.identity.adjudicated,
             collapsed_relations = report.identity.merged_relations,
             "identity resolved",
+        );
+    }
+
+    // Stage 3 (ROADMAP §8): the graph now holds the right things under the
+    // right names, but each still says only what its first chunk said. Re-read
+    // every entity that is mentioned somewhere its own chunks did not cover.
+    if opts.refine {
+        let degrees = {
+            let mut d: BTreeMap<String, usize> = BTreeMap::new();
+            for e in &edges {
+                *d.entry(e.src.clone()).or_default() += 1;
+                *d.entry(e.dst.clone()).or_default() += 1;
+            }
+            d
+        };
+        let prop_counts: BTreeMap<String, usize> = entities
+            .iter()
+            .map(|(k, n)| {
+                let visible = n.props.keys().filter(|p| !p.starts_with('_')).count();
+                (k.clone(), visible)
+            })
+            .collect();
+        let mut candidates = refine::candidates(
+            &chunks,
+            &origins,
+            &degrees,
+            &prop_counts,
+            opts.refine_max_context,
+        );
+        report.refined.eligible = candidates.len();
+        report.refined.skipped_nothing_new = entities.len().saturating_sub(candidates.len());
+        if let Some(cap) = opts.refine_max_entities {
+            candidates.truncate(cap);
+        }
+
+        for candidate in &candidates {
+            let Some(node) = entities.get(&candidate.key) else {
+                continue;
+            };
+            // How this entity sits in the graph — the relations are what make a
+            // passage's mention interpretable.
+            let relations: Vec<String> = edges
+                .iter()
+                .filter(|e| e.src == candidate.key || e.dst == candidate.key)
+                .map(|e| format!("{} --{}--> {}", e.src, e.ty, e.dst))
+                .collect();
+            let refined = refine::refine_one(
+                chat,
+                &chunks,
+                candidate,
+                &node.label,
+                &node.props,
+                &relations,
+                &mut report.refined,
+            )?;
+            if let (Some(r), Some(node)) = (refined, entities.get_mut(&candidate.key)) {
+                refine::apply(&mut node.props, &r, &mut report.refined);
+                report.refined.refined += 1;
+            }
+        }
+
+        report.chat_requests += report.refined.chat_requests;
+        report.input_tokens += report.refined.input_tokens;
+        report.output_tokens += report.refined.output_tokens;
+        tracing::info!(
+            eligible = report.refined.eligible,
+            refined = report.refined.refined,
+            skipped = report.refined.skipped_nothing_new,
+            props_added = report.refined.props_added,
+            props_revised = report.refined.props_revised,
+            "entities refined",
         );
     }
 
@@ -591,7 +688,7 @@ pub fn digest(
 
 // ---- helpers -------------------------------------------------------------
 
-fn prop(value: PropValue) -> PropDesc {
+pub(crate) fn prop(value: PropValue) -> PropDesc {
     PropDesc {
         description: None,
         value,

@@ -28,6 +28,9 @@ fn opts(embed: bool) -> DigestOptions {
         // would consume replies these tests do not provide.
         reconcile: false,
         resolve_identity: false,
+        refine: false,
+        refine_max_entities: None,
+        refine_max_context: None,
     }
 }
 
@@ -486,5 +489,119 @@ fn identity_resolution_is_off_by_request() -> Result<()> {
     assert!(keys.contains(&"softmax") && keys.contains(&"Softmax"));
     assert!(keys.contains(&"K") && keys.contains(&"Key"));
     assert_eq!(res.report.identity, Default::default());
+    Ok(())
+}
+
+// ---- per-entity refinement (ROADMAP §8 stage 3) ---------------------------
+
+/// Chunk 0 introduces the Transformer thinly; chunk 1 is where the detail is.
+/// One-round extraction keeps chunk 0's account and discards chunk 1's — this
+/// is the pass that repairs that.
+const REF_A: &str = r#"{
+  "entities": [{"key":"Transformer","label":"Model","properties":{"layers":4},
+                "description":"A model."}],
+  "relations": []
+}"#;
+const REF_B: &str = r#"{
+  "entities": [{"key":"Softmax","label":"Function","description":"Normalizes."}],
+  "relations": []
+}"#;
+/// What the model returns once it can see every passage at once.
+const REFINED: &str = r#"{"properties":{"layers":6,"heads":8},
+    "description":"An encoder-decoder architecture built on self-attention."}"#;
+
+fn refine_doc() -> String {
+    format!(
+        "{}\n\n{}",
+        format_args!("The Transformer is described here. {}", "x".repeat(120)),
+        format_args!(
+            "The Transformer has 6 layers and 8 heads. {}",
+            "y".repeat(110)
+        )
+    )
+}
+
+#[test]
+fn refinement_repairs_what_the_first_chunk_got_wrong() -> Result<()> {
+    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    o.refine = true;
+    let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
+
+    let t = res.nodes.iter().find(|n| n.key == "Transformer").unwrap();
+    assert_eq!(
+        t.props.get("layers").map(|p| &p.value),
+        Some(&PropValue::Int(6)),
+        "the fuller reading corrected the first chunk's 4"
+    );
+    assert_eq!(
+        t.props.get("heads").map(|p| &p.value),
+        Some(&PropValue::Int(8))
+    );
+    assert_eq!(
+        res.report.refined.props_revised, 2,
+        "`layers` corrected and the thin description rewritten"
+    );
+    assert_eq!(
+        res.report.refined.props_added, 1,
+        "`heads`, which chunk 0 never saw"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_entity_with_nothing_new_to_read_is_never_asked_about() -> Result<()> {
+    // Softmax is named in one chunk only, and that is the chunk it came from.
+    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    o.refine = true;
+    let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
+
+    assert_eq!(res.report.refined.eligible, 1, "only the Transformer");
+    assert_eq!(
+        res.report.refined.chat_requests, 1,
+        "one call, not one per entity"
+    );
+    assert!(res.report.refined.skipped_nothing_new >= 1);
+    Ok(())
+}
+
+#[test]
+fn the_entity_budget_bounds_the_calls() -> Result<()> {
+    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    o.refine = true;
+    o.refine_max_entities = Some(0);
+    let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
+    assert_eq!(
+        res.report.refined.chat_requests, 0,
+        "budget of zero asks nothing"
+    );
+    assert_eq!(
+        res.report.refined.eligible, 1,
+        "but still reports what it would have"
+    );
+    Ok(())
+}
+
+#[test]
+fn refinement_is_off_by_default() -> Result<()> {
+    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into()], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
+    assert_eq!(res.report.refined, Default::default());
+    let t = res.nodes.iter().find(|n| n.key == "Transformer").unwrap();
+    assert_eq!(
+        t.props.get("layers").map(|p| &p.value),
+        Some(&PropValue::Int(4))
+    );
     Ok(())
 }
