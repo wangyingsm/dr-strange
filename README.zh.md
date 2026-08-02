@@ -65,12 +65,61 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 依赖模型的功能（自然语言查询、文档摄取与文本嵌入检索）会调用外部或本地的 LLM；其余
 功能均无需任何模型即可运行。参见[附录 B](https://wangyingsm.github.io/dr-strange/zh/book/appendix-b.html)。
 
+## 安装
+
+一行命令，无需任何工具链。安装脚本会下载对应平台的发行版二进制、校验其 SHA-256，
+并将其放入 `PATH`。可安装的二进制有两个：命令行与服务端 `drsg`，以及面向 LLM
+智能体的 MCP 服务 `drsg-mcp`。
+
+**Linux**
+
+```console
+# 命令行与服务端 —— drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP 服务 —— drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**macOS**（同一个脚本；Apple 芯片与 Intel 均可）
+
+```console
+# 命令行与服务端 —— drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP 服务 —— drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**Windows**（PowerShell）
+
+```console
+# 命令行与服务端 —— drsg
+PS> irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1 | iex
+
+# MCP 服务 —— drsg-mcp（以代码块方式运行：管道送入的脚本无法接收参数）
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+`--bin all` 同时安装两个二进制；`--version v1.1.0` 指定某个发行版本，`--dir <path>`
+指定安装目录（默认 `~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\Programs\drsg\bin`）。
+在 Windows 上对应的参数为 `-Bin`、`-Version` 与 `-Dir`。
+
+其他方式：容器镜像 `ghcr.io/wangyingsm/dr-strange:latest`，或
+[发行页](https://github.com/wangyingsm/dr-strange/releases)上的归档包与校验和。
+
+**从源码构建**——最后的选择，适用于没有发布二进制的平台，或需要构建工作副本的场景。
+需要 [Rust 工具链](https://rustup.rs)；仪表盘在编译期嵌入二进制，因此请先构建单页应用
+（`just web-build`，需要 [bun](https://bun.sh)），否则二进制中只会带有占位页。
+
+```console
+$ cargo build --release -p dr-strange-cli   # → target/release/drsg
+$ cargo build --release -p dr-strange-mcp   # → target/release/drsg-mcp
+```
+
 ## 快速上手
 
 ```console
-# 构建命令行工具（drsg）。
-$ cargo build --release -p dr-strange-cli
-
 # 创建一个平面，写入数据并查询。
 $ drsg --db graph.drsg plane create social
 $ drsg --db graph.drsg cypher --plane social \

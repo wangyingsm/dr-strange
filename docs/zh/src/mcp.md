@@ -14,9 +14,21 @@ MCP 本身就是 JSON-RPC 2.0——与 Web 后端所讲的是同一套协议—�
 
 ## 运行与配置
 
-`drsg-mcp` 是一个独立的二进制，以 `cargo build --release -p dr-strange-mcp`
-构建（[第 2 章](./getting-started.md#从源码构建)）。它以其第一个参数作为数据库路径，
-其次为 `$DRSG_DB`，再次为 `graph.drsg`：
+`drsg-mcp` 是一个独立的二进制。一行命令即可安装发行版本
+（[第 2 章](./getting-started.md#安装发行版二进制)）：
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+在 Windows 的 PowerShell 中：
+
+```console
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+它同样可以从源码构建：`cargo build --release -p dr-strange-mcp`。它以其第一个参数
+作为数据库路径，其次为 `$DRSG_DB`，再次为 `graph.drsg`：
 
 ```console
 $ drsg-mcp /path/to/graph.drsg

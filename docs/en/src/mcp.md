@@ -17,10 +17,22 @@ and a rolling file, never to stdout, which carries the protocol.
 
 ## Running and configuring
 
-`drsg-mcp` is a separate binary, built with
-`cargo build --release -p dr-strange-mcp` ([Chapter
-2](./getting-started.md#building-from-source)). It takes the database path as its
-first argument, else `$DRSG_DB`, else `graph.drsg`:
+`drsg-mcp` is a separate binary. Install a release with one line ([Chapter
+2](./getting-started.md#installing-a-released-binary)):
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+On Windows, in PowerShell:
+
+```console
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+It can equally be built from source with `cargo build --release -p
+dr-strange-mcp`. It takes the database path as its first argument, else
+`$DRSG_DB`, else `graph.drsg`:
 
 ```console
 $ drsg-mcp /path/to/graph.drsg

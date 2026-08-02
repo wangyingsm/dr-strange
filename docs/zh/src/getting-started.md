@@ -1,16 +1,77 @@
 # 快速上手
 
-本章介绍如何从源码构建 Dr Strange、初始化数据库、在命令行中发起查询，以及运行
-服务——既包括本地方式，也包括以容器镜像方式部署。
+本章介绍如何安装 Dr Strange——既可使用发行版二进制，也可从源码构建——以及初始化
+数据库、在命令行中发起查询，并运行服务：既包括本地方式，也包括以容器镜像方式部署。
 
 ## 环境准备
 
-- 当前的 **Rust 工具链**（stable 通道），经 [rustup](https://rustup.rs) 安装。
-- 用于 Web 仪表盘：**[bun](https://bun.sh)** 编译单页应用，以及可选的
+安装发行版二进制除 `curl`（Windows 上为 PowerShell）之外别无所需。以下准备仅适用于
+其他方式：
+
+- 从源码构建：当前的 **Rust 工具链**（stable 通道），经 [rustup](https://rustup.rs) 安装。
+- Web 仪表盘：**[bun](https://bun.sh)** 编译单页应用，以及可选的
   **[just](https://github.com/casey/just)** 作为任务运行器。
-- 用于容器工作流：**Docker**（Engine 24+；仅在自行构建镜像时才需要 BuildKit）。
+- 容器工作流：**Docker**（Engine 24+；仅在自行构建镜像时才需要 BuildKit）。
 
 构建通过 rustls/ring 链接 TLS，无需 OpenSSL 工具链。
+
+## 安装发行版二进制
+
+每个打了标签的发行版都会发布 Linux、macOS 与 Windows 的二进制。安装脚本会选取与宿主
+平台匹配的归档包，校验其发布的 SHA-256，并将二进制置入 `PATH`。可安装的二进制有两个：
+命令行工具与服务端 `drsg`，以及面向 LLM 智能体的 MCP 服务 `drsg-mcp`（[第 8 章](./mcp.md)）。
+
+**Linux**
+
+```console
+# 命令行与服务端 —— drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP 服务 —— drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**macOS**——同一个脚本；Apple 芯片与 Intel 版本均有发布。
+
+```console
+# 命令行与服务端 —— drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP 服务 —— drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**Windows**，在 PowerShell 中执行。第二种写法将脚本作为代码块运行，因为以管道送入
+`iex` 的脚本无法接收参数。
+
+```console
+# 命令行与服务端 —— drsg
+PS> irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1 | iex
+
+# MCP 服务 —— drsg-mcp
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+三个选项可调整安装行为，每个都有对应的环境变量，便于在非交互场景中使用：
+
+| 选项（Windows） | 环境变量 | 作用 |
+|---|---|---|
+| `--bin drsg-mcp`（`-Bin`） | `DRSG_INSTALL_BIN` | 安装哪个二进制——`drsg`（默认）、`drsg-mcp` 或 `all` |
+| `--version v1.1.0`（`-Version`） | `DRSG_VERSION` | 指定某个发行版本，而非最新版 |
+| `--dir <path>`（`-Dir`） | `DRSG_INSTALL_DIR` | 安装目录 |
+
+安装目录默认为 `~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\Programs\drsg\bin`，且脚本
+会将该目录加入用户 `PATH`。在 Linux 与 macOS 上，若该目录尚不在 `PATH` 中，请将其写入
+shell 配置：
+
+```console
+$ export PATH="$HOME/.local/bin:$PATH"
+```
+
+归档包及其校验和亦可从[发行页](https://github.com/wangyingsm/dr-strange/releases)直接
+下载；安装脚本只是针对同一批产物的便捷封装，两个脚本均位于
+[`scripts/`](https://github.com/wangyingsm/dr-strange/tree/master/scripts)，可在使用前
+自行审阅。
 
 ## 从源码构建
 

@@ -68,12 +68,65 @@ The model-backed features (natural-language query, document ingestion, and
 text-embedding search) call an external or local LLM; everything else runs with
 no model at all. See [Appendix B](https://wangyingsm.github.io/dr-strange/en/book/appendix-b.html).
 
+## Install
+
+One line, no toolchain. The installer downloads the released binary for your
+platform, verifies its SHA-256, and puts it on your `PATH`. Two binaries are
+available: the CLI and server, `drsg`, and the MCP server for LLM agents,
+`drsg-mcp`.
+
+**Linux**
+
+```console
+# CLI and server — drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP server — drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**macOS** (the same script; Apple silicon and Intel)
+
+```console
+# CLI and server — drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP server — drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**Windows** (PowerShell)
+
+```console
+# CLI and server — drsg
+PS> irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1 | iex
+
+# MCP server — drsg-mcp (run as a block: a piped script cannot take arguments)
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+`--bin all` installs both binaries; `--version v1.1.0` pins a release, and
+`--dir <path>` chooses the destination (default `~/.local/bin`, or
+`%LOCALAPPDATA%\Programs\drsg\bin` on Windows). On Windows the flags are
+`-Bin`, `-Version`, and `-Dir`.
+
+Alternatives: the container image, `ghcr.io/wangyingsm/dr-strange:latest`, or the
+archives and checksums on the
+[releases page](https://github.com/wangyingsm/dr-strange/releases).
+
+**From source** — a last resort, for platforms with no published binary or to
+build a working copy. Requires a [Rust toolchain](https://rustup.rs); the
+dashboard is embedded at compile time, so build the SPA first (`just web-build`,
+which needs [bun](https://bun.sh)) or the binary ships a placeholder page.
+
+```console
+$ cargo build --release -p dr-strange-cli   # → target/release/drsg
+$ cargo build --release -p dr-strange-mcp   # → target/release/drsg-mcp
+```
+
 ## Getting Started
 
 ```console
-# Build the command-line tool (drsg).
-$ cargo build --release -p dr-strange-cli
-
 # Create a plane, add data, and query it.
 $ drsg --db graph.drsg plane create social
 $ drsg --db graph.drsg cypher --plane social \

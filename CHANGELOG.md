@@ -4,6 +4,18 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **One-line installers** for the released binaries — `scripts/install.sh`
+  (Linux and macOS) and `scripts/install.ps1` (Windows). Each picks the archive
+  for the host platform, verifies its published SHA-256, and installs `drsg`,
+  `drsg-mcp`, or both onto the `PATH`; `--bin` / `--version` / `--dir` (and
+  `DRSG_INSTALL_BIN` / `DRSG_VERSION` / `DRSG_INSTALL_DIR`) adjust the
+  installation.
+- Release binaries for **Intel macOS** (`x86_64-apple-darwin`), so the macOS
+  installer covers both architectures.
+
 ## [1.1.0] - 2026-08-02
 
 ### Changed
@@ -80,5 +92,6 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.1.0
 [1.0.2]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.0.2

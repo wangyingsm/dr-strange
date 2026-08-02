@@ -1,20 +1,86 @@
 # Getting Started
 
-This chapter covers building Dr Strange from source, initializing a database,
-issuing queries from the command line, and running the server — both locally and
-as a container image.
+This chapter covers installing Dr Strange — from a released binary or from
+source — initializing a database, issuing queries from the command line, and
+running the server, both locally and as a container image.
 
 ## Prerequisites
 
-- A current **Rust toolchain** (stable channel), installed via
-  [rustup](https://rustup.rs).
-- For the web dashboard: **[bun](https://bun.sh)** to compile the single-page
+Installing a released binary requires nothing beyond `curl` (or PowerShell on
+Windows). The remaining prerequisites apply only to the other routes:
+
+- Building from source: a current **Rust toolchain** (stable channel), installed
+  via [rustup](https://rustup.rs).
+- The web dashboard: **[bun](https://bun.sh)** to compile the single-page
   application, and optionally **[just](https://github.com/casey/just)** as the
   task runner.
-- For the container workflow: **Docker** (Engine 24+; BuildKit is only needed if
-  you build the image yourself).
+- The container workflow: **Docker** (Engine 24+; BuildKit is only needed if you
+  build the image yourself).
 
 The build links TLS through rustls/ring; no OpenSSL toolchain is required.
+
+## Installing a released binary
+
+Every tagged release publishes binaries for Linux, macOS, and Windows. The
+installer selects the archive matching the host platform, verifies its published
+SHA-256, and places the binary on the `PATH`. Two binaries are available: the
+command-line tool and server, `drsg`, and the MCP server for LLM agents,
+`drsg-mcp` ([Chapter 8](./mcp.md)).
+
+**Linux**
+
+```console
+# CLI and server — drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP server — drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**macOS** — the same script; both Apple silicon and Intel are published.
+
+```console
+# CLI and server — drsg
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
+
+# MCP server — drsg-mcp
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
+```
+
+**Windows**, in PowerShell. The second form runs the script as a block because a
+script piped into `iex` cannot receive arguments.
+
+```console
+# CLI and server — drsg
+PS> irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1 | iex
+
+# MCP server — drsg-mcp
+PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
+```
+
+Three options adjust the installation, each with an environment-variable
+equivalent for non-interactive use:
+
+| Option (Windows) | Environment variable | Effect |
+|---|---|---|
+| `--bin drsg-mcp` (`-Bin`) | `DRSG_INSTALL_BIN` | which binary — `drsg` (default), `drsg-mcp`, or `all` |
+| `--version v1.1.0` (`-Version`) | `DRSG_VERSION` | pin a release instead of the latest |
+| `--dir <path>` (`-Dir`) | `DRSG_INSTALL_DIR` | destination directory |
+
+The destination defaults to `~/.local/bin`, and to
+`%LOCALAPPDATA%\Programs\drsg\bin` on Windows, where the installer also adds the
+directory to the user `PATH`. On Linux and macOS, add it to the shell profile if
+it is not already present:
+
+```console
+$ export PATH="$HOME/.local/bin:$PATH"
+```
+
+The archives and their checksums may also be downloaded directly from the
+[releases page](https://github.com/wangyingsm/dr-strange/releases); the
+installers are a convenience over the same assets, and both scripts live in
+[`scripts/`](https://github.com/wangyingsm/dr-strange/tree/master/scripts) for
+inspection before use.
 
 ## Building from source
 
