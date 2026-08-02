@@ -217,28 +217,13 @@ enum Command {
         /// entity as new; skips the per-chunk vector retrieval).
         #[arg(long)]
         no_link: bool,
-        /// Skip vocabulary reconciliation (ROADMAP §8 stage 1): keep every
-        /// label and edge type exactly as each chunk wrote it, spelling
-        /// variants and all. Saves two chat calls per run.
-        #[arg(long)]
-        no_reconcile: bool,
-        /// Skip identity resolution (ROADMAP §8 stage 2): keep every extracted
-        /// entity separate even where two names denote one thing, and rely on
-        /// vector linking alone to avoid duplicating existing nodes.
-        #[arg(long)]
-        no_resolve_identity: bool,
-        /// Re-read every entity against all passages mentioning it (ROADMAP §8
-        /// stage 3). The most accurate digest and the most expensive: one
-        /// extra chat call per entity that has something new to read.
-        #[arg(long)]
-        refine: bool,
-        /// Cap entities refined (default: every eligible one).
-        #[arg(long)]
-        refine_max_entities: Option<usize>,
-        /// Cap passages shown per entity (default: every mention). The budget
-        /// that matters — a hub can otherwise carry most of the document.
-        #[arg(long)]
-        refine_max_context: Option<usize>,
+        /// How thoroughly to clean up the extraction (ROADMAP §8), trading
+        /// cost for precision: `coarse` reconciles the label and edge-type
+        /// vocabularies; `fine` also merges entities that name the same thing;
+        /// `super` also re-reads every entity against all the passages
+        /// mentioning it — the most accurate, and by far the most expensive.
+        #[arg(long, default_value = "fine")]
+        mode: String,
     },
 }
 
@@ -586,11 +571,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             concurrency,
             no_embed,
             no_link,
-            no_reconcile,
-            no_resolve_identity,
-            refine,
-            refine_max_entities,
-            refine_max_context,
+            mode,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -601,11 +582,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 concurrency,
                 embed: !no_embed,
                 link: !no_link,
-                reconcile: !no_reconcile,
-                resolve_identity: !no_resolve_identity,
-                refine,
-                refine_max_entities,
-                refine_max_context,
+                mode: &mode,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),

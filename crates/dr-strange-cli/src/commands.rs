@@ -518,14 +518,8 @@ pub struct DigestArgs<'a> {
     pub embed: bool,
     /// Link extracted entities to existing plane nodes via vector retrieval.
     pub link: bool,
-    /// Reconcile the label / edge-type vocabularies after extraction.
-    pub reconcile: bool,
-    /// Merge entities naming the same thing; check keys against the graph.
-    pub resolve_identity: bool,
-    /// Re-read each entity against every passage mentioning it.
-    pub refine: bool,
-    pub refine_max_entities: Option<usize>,
-    pub refine_max_context: Option<usize>,
+    /// How thoroughly to clean up the extraction: `coarse` / `fine` / `super`.
+    pub mode: &'a str,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -649,11 +643,14 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         chunk_chars: args.chunk_chars,
         embed: args.embed,
         concurrency: args.concurrency,
-        reconcile: args.reconcile,
-        resolve_identity: args.resolve_identity,
-        refine: args.refine,
-        refine_max_entities: args.refine_max_entities,
-        refine_max_context: args.refine_max_context,
+        mode: dr_strange_llm::DigestMode::parse(args.mode).ok_or_else(|| {
+            anyhow!(
+                "unknown digest mode `{}` — expected coarse, fine or super",
+                args.mode
+            )
+        })?,
+        refine_max_entities: None,
+        refine_max_context: None,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

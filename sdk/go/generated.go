@@ -227,6 +227,7 @@ type DigestRunParams struct {
 	Link        *bool   `json:"link,omitempty"`
 	Concurrency *int64  `json:"concurrency,omitempty"`
 	ChunkChars  *int64  `json:"chunk_chars,omitempty"`
+	Mode        *string `json:"mode,omitempty"`
 }
 
 type DigestWriteResult struct {

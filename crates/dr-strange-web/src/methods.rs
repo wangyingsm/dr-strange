@@ -1335,26 +1335,12 @@ pub struct DigestRun {
     /// (`[digest].chunk_chars`, else 4000).
     #[serde(default)]
     chunk_chars: Option<usize>,
-    /// Reconcile the label / edge-type vocabularies after extraction
-    /// (default true). Costs O(1) extra chat calls in document size.
+    /// How thoroughly to clean up the extraction: `coarse` reconciles the
+    /// label and edge-type vocabularies, `fine` (the default) also merges
+    /// entities naming the same thing, `super` also re-reads every entity
+    /// against all the passages mentioning it.
     #[serde(default)]
-    reconcile: Option<bool>,
-    /// Merge extracted entities naming the same thing, and check keys against
-    /// the graph exactly so a re-digest links rather than duplicating
-    /// (default true).
-    #[serde(default)]
-    resolve_identity: Option<bool>,
-    /// Re-read each entity against every passage mentioning it (default false):
-    /// the most accurate digest, and the most expensive — one call per entity
-    /// with something new to read.
-    #[serde(default)]
-    refine: Option<bool>,
-    /// Cap on entities refined; omit for every eligible one.
-    #[serde(default)]
-    refine_max_entities: Option<usize>,
-    /// Cap on passages shown per entity; omit for every mention.
-    #[serde(default)]
-    refine_max_context: Option<usize>,
+    mode: Option<String>,
 }
 
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
@@ -1387,11 +1373,16 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         chunk_chars: req.chunk_chars.unwrap_or(ctx.digest.chunk_chars),
         embed,
         concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
-        reconcile: req.reconcile.unwrap_or(true),
-        resolve_identity: req.resolve_identity.unwrap_or(true),
-        refine: req.refine.unwrap_or(false),
-        refine_max_entities: req.refine_max_entities,
-        refine_max_context: req.refine_max_context,
+        mode: match req.mode.as_deref() {
+            None => dr_strange_llm::DigestMode::default(),
+            Some(m) => dr_strange_llm::DigestMode::parse(m).ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "unknown digest mode `{m}` — expected coarse, fine or super"
+                ))
+            })?,
+        },
+        refine_max_entities: None,
+        refine_max_context: None,
     };
     let plane = app(ctx.db.plane(&req.plane))?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);

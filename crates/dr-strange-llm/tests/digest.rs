@@ -3,7 +3,79 @@
 
 use anyhow::Result;
 use dr_strange_core::{Database, Dir, PropValue};
-use dr_strange_llm::{CandidateSource, DigestOptions, ExistingEntity, MockProvider, digest};
+use dr_strange_llm::{
+    CandidateSource, DigestMode, DigestOptions, ExistingEntity, MockProvider, digest,
+};
+
+/// A chat that answers according to *which pass is asking*, rather than the
+/// order calls happen to arrive in. Positional mocks broke every time a pass
+/// was added to the pipeline; this states what each stage should hear.
+struct Scripted {
+    /// Extraction replies, one per chunk, in chunk order.
+    chunks: Vec<String>,
+    /// Stage 1's answer, for both the label and the edge-type vocabulary.
+    reconcile: String,
+    /// Stage 2's verdict on the containment pairs.
+    identity: String,
+    /// Stage 3's re-reading of an entity.
+    refine: String,
+    next_chunk: std::sync::Mutex<usize>,
+}
+
+impl Scripted {
+    fn new(chunks: Vec<&str>) -> Self {
+        Self {
+            chunks: chunks.into_iter().map(str::to_string).collect(),
+            reconcile: r#"{"groups":[]}"#.into(),
+            identity: r#"{"same":[]}"#.into(),
+            refine: r#"{"properties":{}}"#.into(),
+            next_chunk: std::sync::Mutex::new(0),
+        }
+    }
+    fn reconciling(mut self, reply: &str) -> Self {
+        self.reconcile = reply.into();
+        self
+    }
+    fn identifying(mut self, reply: &str) -> Self {
+        self.identity = reply.into();
+        self
+    }
+    fn refining(mut self, reply: &str) -> Self {
+        self.refine = reply.into();
+        self
+    }
+}
+
+impl dr_strange_llm::Embedder for Scripted {
+    fn embed(&self, texts: &[String]) -> Result<dr_strange_llm::EmbedReply> {
+        Ok(dr_strange_llm::EmbedReply {
+            vectors: texts.iter().map(|_| vec![0.0; 4]).collect(),
+            tokens: 0,
+        })
+    }
+}
+
+impl dr_strange_llm::Chat for Scripted {
+    fn complete(&self, system: &str, _user: &str) -> Result<dr_strange_llm::ChatReply> {
+        let text = if system.starts_with("You reconcile the") {
+            self.reconcile.clone()
+        } else if system.starts_with("You decide which") {
+            self.identity.clone()
+        } else if system.starts_with("You re-read one entity") {
+            self.refine.clone()
+        } else {
+            let mut n = self.next_chunk.lock().unwrap();
+            let r = self.chunks[*n % self.chunks.len()].clone();
+            *n += 1;
+            r
+        };
+        Ok(dr_strange_llm::ChatReply {
+            text,
+            input_tokens: 0,
+            output_tokens: 0,
+        })
+    }
+}
 
 const REPLY: &str = r#"{
   "entities": [
@@ -26,9 +98,9 @@ fn opts(embed: bool) -> DigestOptions {
         concurrency: 1,
         // The mock provider serves one canned reply; the reconciliation pass
         // would consume replies these tests do not provide.
-        reconcile: false,
-        resolve_identity: false,
-        refine: false,
+        // Most tests assert the raw extraction, so they opt out of the
+        // clean-up passes the mock has no replies for.
+        mode: DigestMode::Coarse,
         refine_max_entities: None,
         refine_max_context: None,
     }
@@ -50,7 +122,9 @@ fn digests_entities_relations_provenance_and_embeddings() {
     assert_eq!(result.report.entities, 2);
     assert_eq!(result.report.relations, 1);
     assert_eq!(result.report.dropped_relations, 1);
-    assert_eq!(result.report.chat_requests, 1);
+    // One extraction call, plus the label and edge-type reconciliations that
+    // every mode performs.
+    assert_eq!(result.report.chat_requests, 3);
 
     // Nodes carry label, extracted props, a description, provenance, and a vector.
     let alice = result.nodes.iter().find(|n| n.key == "alice").unwrap();
@@ -230,10 +304,10 @@ fn two_chunk_doc() -> String {
 
 #[test]
 fn reconciliation_folds_spellings_and_merges_synonyms() -> Result<()> {
-    let chat = MockProvider::new(vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()], 4);
+    let chat = Scripted::new(vec![CHUNK_A, CHUNK_B]).reconciling(TYPE_MERGE);
     let mut o = opts(false);
     o.chunk_chars = 200; // the floor; two 150-char paragraphs cannot share one
-    o.reconcile = true;
+    o.mode = DigestMode::Coarse;
     o.concurrency = 1; // keep reply order aligned with chunk order
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
 
@@ -264,10 +338,10 @@ fn reconciliation_folds_spellings_and_merges_synonyms() -> Result<()> {
 
 #[test]
 fn the_wording_the_document_used_survives_as_an_alias() -> Result<()> {
-    let chat = MockProvider::new(vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()], 4);
+    let chat = Scripted::new(vec![CHUNK_A, CHUNK_B]).reconciling(TYPE_MERGE);
     let mut o = opts(false);
     o.chunk_chars = 200;
-    o.reconcile = true;
+    o.mode = DigestMode::Coarse;
     o.concurrency = 1;
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
 
@@ -293,32 +367,56 @@ fn the_wording_the_document_used_survives_as_an_alias() -> Result<()> {
 }
 
 #[test]
-fn reconciliation_is_off_by_request_and_costs_two_calls_when_on() -> Result<()> {
-    let replies: Vec<String> = vec![CHUNK_A.into(), CHUNK_B.into(), TYPE_MERGE.into()];
+fn each_mode_buys_exactly_the_passes_it_names() -> Result<()> {
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
 
-    o.reconcile = false;
-    let chat = MockProvider::new(replies.clone(), 4);
-    let off = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
-    assert_eq!(off.report.chat_requests, 2, "one call per chunk");
-    assert_eq!(off.report.labels, Default::default());
-    // Without the pass both spellings survive — the state ROADMAP §8 describes.
-    let mut labels: Vec<&str> = off.nodes.iter().map(|n| n.label.as_str()).collect();
-    labels.sort_unstable();
-    labels.dedup();
-    assert_eq!(labels, vec!["Model Architecture", "ModelArchitecture"]);
-
-    o.reconcile = true;
-    let chat = MockProvider::new(replies, 4);
-    let on = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
-    // One call for the edge types; none for the labels, which folding settled.
-    assert_eq!(
-        on.report.chat_requests, 3,
-        "at most +1 per vocabulary, O(1) in doc size"
+    // `coarse` settles the vocabulary and stops there: the two spellings of
+    // one edge type become one, but `K` and `Key` remain two entities.
+    o.mode = DigestMode::Coarse;
+    let chat = Scripted::new(vec![ID_A, ID_B])
+        .reconciling(r#"{"groups":[]}"#)
+        .identifying(SAME_REPLY);
+    let coarse = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+    let keys: Vec<&str> = coarse.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert!(
+        keys.contains(&"K") && keys.contains(&"Key"),
+        "identity untouched"
     );
-    assert_eq!(on.report.edge_types.chat_requests, 1);
+    assert_eq!(coarse.report.identity, Default::default());
+    assert_eq!(coarse.report.refined, Default::default());
+    // And the *key* spellings still diverge: folding entity names is stage 2's
+    // job, not stage 1's — stage 1 reconciles the label and edge-type
+    // vocabularies, which are a different thing from the entities themselves.
+    assert!(
+        keys.contains(&"Softmax") && keys.contains(&"softmax"),
+        "{keys:?}"
+    );
+
+    // `fine` adds identity: the abbreviation is absorbed.
+    o.mode = DigestMode::Fine;
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
+    let fine = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+    let keys: Vec<&str> = fine.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert!(!keys.contains(&"K") && keys.contains(&"Key"), "{keys:?}");
+    assert!(
+        !keys.contains(&"softmax"),
+        "and the spelling folds too: {keys:?}"
+    );
+    assert_eq!(fine.report.identity.merged, 1);
+    assert_eq!(
+        fine.report.refined,
+        Default::default(),
+        "still no re-reading"
+    );
+
+    // Stage 1's cost stays O(1) in the document: at most one call per
+    // vocabulary however long the text was.
+    assert!(
+        fine.report.labels.chat_requests + fine.report.edge_types.chat_requests <= 2,
+        "reconciliation must not scale with the document"
+    );
     Ok(())
 }
 
@@ -332,7 +430,7 @@ fn renaming_collapses_relations_that_became_the_same_triple() -> Result<()> {
     let chat = MockProvider::new(vec![A.into(), B.into(), TYPE_MERGE.into()], 4);
     let mut o = opts(false);
     o.chunk_chars = 200;
-    o.reconcile = true;
+    o.mode = DigestMode::Coarse;
     o.concurrency = 1;
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
     assert_eq!(res.edges.len(), 1, "the duplicate triple collapsed");
@@ -368,13 +466,13 @@ fn id_opts() -> DigestOptions {
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
-    o.resolve_identity = true;
+    o.mode = DigestMode::Fine;
     o
 }
 
 #[test]
 fn identity_folds_spellings_merges_aliases_and_keeps_variants() -> Result<()> {
-    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
 
     let keys: Vec<&str> = res.nodes.iter().map(|n| n.key.as_str()).collect();
@@ -401,7 +499,7 @@ fn identity_folds_spellings_merges_aliases_and_keeps_variants() -> Result<()> {
 
 #[test]
 fn merging_rewires_edges_onto_the_survivor() -> Result<()> {
-    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
 
     // Both USES edges pointed at a spelling of softmax; both must now point at
@@ -421,7 +519,7 @@ fn merging_rewires_edges_onto_the_survivor() -> Result<()> {
 
 #[test]
 fn an_absorbed_key_survives_as_an_alias() -> Result<()> {
-    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
 
     let key_node = res.nodes.iter().find(|n| n.key == "Key").unwrap();
@@ -457,7 +555,7 @@ impl CandidateSource for KeyedPlaneNoVectors {
 
 #[test]
 fn an_exact_key_check_prevents_a_duplicate_when_vectors_cannot() -> Result<()> {
-    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
     let res = digest(
         &two_chunk_doc(),
         &chat,
@@ -480,9 +578,9 @@ fn an_exact_key_check_prevents_a_duplicate_when_vectors_cannot() -> Result<()> {
 
 #[test]
 fn identity_resolution_is_off_by_request() -> Result<()> {
-    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let chat = Scripted::new(vec![ID_A, ID_B]).identifying(SAME_REPLY);
     let mut o = id_opts();
-    o.resolve_identity = false;
+    o.mode = DigestMode::Coarse;
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
 
     let keys: Vec<&str> = res.nodes.iter().map(|n| n.key.as_str()).collect();
@@ -523,11 +621,11 @@ fn refine_doc() -> String {
 
 #[test]
 fn refinement_repairs_what_the_first_chunk_got_wrong() -> Result<()> {
-    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let chat = Scripted::new(vec![REF_A, REF_B]).refining(REFINED);
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
-    o.refine = true;
+    o.mode = DigestMode::Super;
     let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
 
     let t = res.nodes.iter().find(|n| n.key == "Transformer").unwrap();
@@ -554,11 +652,11 @@ fn refinement_repairs_what_the_first_chunk_got_wrong() -> Result<()> {
 #[test]
 fn an_entity_with_nothing_new_to_read_is_never_asked_about() -> Result<()> {
     // Softmax is named in one chunk only, and that is the chunk it came from.
-    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let chat = Scripted::new(vec![REF_A, REF_B]).refining(REFINED);
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
-    o.refine = true;
+    o.mode = DigestMode::Super;
     let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
 
     assert_eq!(res.report.refined.eligible, 1, "only the Transformer");
@@ -572,11 +670,11 @@ fn an_entity_with_nothing_new_to_read_is_never_asked_about() -> Result<()> {
 
 #[test]
 fn the_entity_budget_bounds_the_calls() -> Result<()> {
-    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into(), REFINED.into()], 4);
+    let chat = Scripted::new(vec![REF_A, REF_B]).refining(REFINED);
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
-    o.refine = true;
+    o.mode = DigestMode::Super;
     o.refine_max_entities = Some(0);
     let res = digest(&refine_doc(), &chat, &chat, None, &o)?;
     assert_eq!(
@@ -592,7 +690,7 @@ fn the_entity_budget_bounds_the_calls() -> Result<()> {
 
 #[test]
 fn refinement_is_off_by_default() -> Result<()> {
-    let chat = MockProvider::new(vec![REF_A.into(), REF_B.into()], 4);
+    let chat = Scripted::new(vec![REF_A, REF_B]);
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
@@ -609,7 +707,7 @@ fn refinement_is_off_by_default() -> Result<()> {
 /// A chat that extracts fine but fails every refinement — the provider blip
 /// that killed a live run before refinement was made best-effort.
 struct FailsOnRefine {
-    inner: MockProvider,
+    inner: Scripted,
 }
 impl dr_strange_llm::Chat for FailsOnRefine {
     fn complete(&self, system: &str, user: &str) -> Result<dr_strange_llm::ChatReply> {
@@ -623,13 +721,13 @@ impl dr_strange_llm::Chat for FailsOnRefine {
 #[test]
 fn a_failed_refinement_costs_that_entity_only() -> Result<()> {
     let chat = FailsOnRefine {
-        inner: MockProvider::new(vec![REF_A.into(), REF_B.into()], 4),
+        inner: Scripted::new(vec![REF_A, REF_B]),
     };
     let embed = MockProvider::new(vec![], 4);
     let mut o = opts(false);
     o.chunk_chars = 200;
     o.concurrency = 1;
-    o.refine = true;
+    o.mode = DigestMode::Super;
     let res = digest(&refine_doc(), &chat, &embed, None, &o)?;
 
     // The digest still produced its graph, and the entity kept what

@@ -542,7 +542,7 @@
           "required": false,
           "schema": {
             "type": "number",
-            "default": 0.000001
+            "default": 1e-06
           }
         },
         {
@@ -1109,6 +1109,20 @@
           "schema": {
             "type": "integer",
             "default": 4000
+          }
+        },
+        {
+          "name": "mode",
+          "summary": "How thoroughly to clean up the extraction, trading cost for precision. `coarse` reconciles the label and edge-type vocabularies, which chunks read independently never converge on. `fine` (the default) also merges entities that name the same thing and checks every key against the graph exactly, so a re-digest links rather than duplicating. `super` also re-reads every entity against all the passages mentioning it, repairing properties that one-round extraction fixed from whichever chunk mentioned it first — the most accurate, and an order of magnitude more input tokens than the rest of the digest.",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "coarse",
+              "fine",
+              "super"
+            ],
+            "default": "fine"
           }
         }
       ],

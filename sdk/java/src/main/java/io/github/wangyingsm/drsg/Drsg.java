@@ -540,46 +540,51 @@ public class Drsg extends Client {
             Boolean noEmbed,
             Boolean link,
             Long concurrency,
-            Long chunkChars) {
+            Long chunkChars,
+            String mode) {
 
         public static DigestRunParams of(String plane, String text) {
-            return new DigestRunParams(plane, text, null, null, null, null, null, null, null, null, null);
+            return new DigestRunParams(plane, text, null, null, null, null, null, null, null, null, null, null);
         }
 
         public DigestRunParams withChat(String chat) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withEmbed(String embed) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withModel(String model) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withEmbedModel(String embedModel) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withSource(String source) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withNoEmbed(Boolean noEmbed) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withLink(Boolean link) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withConcurrency(Long concurrency) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
 
         public DigestRunParams withChunkChars(Long chunkChars) {
-            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars);
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
+        }
+
+        public DigestRunParams withMode(String mode) {
+            return new DigestRunParams(plane, text, chat, embed, model, embedModel, source, noEmbed, link, concurrency, chunkChars, mode);
         }
     }
 

@@ -213,6 +213,55 @@ pub struct DigestResult {
     pub report: DigestReport,
 }
 
+/// How much work to spend making the extraction precise (ROADMAP §8). Each
+/// mode adds a pass to the one before it, and each pass costs more than the
+/// last, so this is the single knob that trades money and time for accuracy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DigestMode {
+    /// Reconcile the label and edge-type vocabularies (stage 1) and nothing
+    /// more: chunks read independently never converge on shared names, and
+    /// this fixes that for O(1) chat calls in document size.
+    Coarse,
+    /// Also merge entities that name the same thing, and check every key
+    /// against the graph exactly so a re-digest links rather than duplicating
+    /// (stage 2). One further call, and the default: the two cheap passes.
+    #[default]
+    Fine,
+    /// Also re-read every entity against all the passages mentioning it
+    /// (stage 3), repairing properties that one-round extraction fixed from
+    /// whichever chunk happened to mention the entity first. One call per
+    /// entity with something new to read — measurably the most accurate and,
+    /// on a paper-sized document, an order of magnitude more input tokens
+    /// than the rest of the digest put together.
+    Super,
+}
+
+impl DigestMode {
+    /// The word a caller passes on the command line or over the wire.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "coarse" => Some(Self::Coarse),
+            "fine" => Some(Self::Fine),
+            "super" => Some(Self::Super),
+            _ => None,
+        }
+    }
+
+    /// Every mode reconciles the vocabulary — it is the cheapest pass and the
+    /// one the others build on.
+    pub fn reconciles(self) -> bool {
+        true
+    }
+
+    pub fn resolves_identity(self) -> bool {
+        matches!(self, Self::Fine | Self::Super)
+    }
+
+    pub fn refines(self) -> bool {
+        self == Self::Super
+    }
+}
+
 pub struct DigestOptions {
     /// Provenance: the source document's name/path.
     pub source: String,
@@ -228,25 +277,15 @@ pub struct DigestOptions {
     /// fully sequential; higher values overlap the (slow, network-bound) LLM
     /// requests. Clamped to `[1, chunk count]`.
     pub concurrency: usize,
-    /// Reconcile the label and edge-type vocabularies after extraction
-    /// (ROADMAP §8 stage 1). Costs O(1) chat calls in document size and folds
-    /// the spelling variants independent chunks inevitably produce.
-    pub reconcile: bool,
-    /// Merge extracted entities that name the same thing (ROADMAP §8 stage 2),
-    /// and check every remaining key against the graph exactly so a re-digest
-    /// links rather than duplicating.
-    pub resolve_identity: bool,
-    /// Re-read each entity against every passage mentioning it (ROADMAP §8
-    /// stage 3), repairing properties that one-round extraction fixed from
-    /// whichever chunk mentioned the entity first. Costs one call per entity
-    /// that has something new to read; the two caps below bound it.
-    pub refine: bool,
-    /// Cap on entities refined. `None` — the default — refines every eligible
-    /// one, with the cost visible in the report.
+    /// How thoroughly to clean up after extraction (ROADMAP §8).
+    pub mode: DigestMode,
+    /// Cap on entities refined under [`DigestMode::Super`]. `None` — the
+    /// default — refines every eligible one, with the cost visible in the
+    /// report. Library-level tuning; the surfaces expose only the mode.
     pub refine_max_entities: Option<usize>,
-    /// Cap on passages shown per entity. `None` refines against every mention;
-    /// this is the budget that matters, since a hub can otherwise carry most of
-    /// the document into one call.
+    /// Cap on passages shown per refined entity. `None` uses every mention.
+    /// The budget that matters, since a hub mentioned throughout a document
+    /// would otherwise carry most of the text into one call.
     pub refine_max_context: Option<usize>,
 }
 
@@ -395,7 +434,7 @@ pub fn digest(
     // independently, so the label and edge-type vocabularies never converged.
     // Reconcile each *set* — O(1) calls in document size — before anything
     // downstream sees them, keeping the document's own wording as an alias.
-    if opts.reconcile {
+    if opts.mode.reconciles() {
         let label_counts = reconcile::tally(
             entities
                 .values()
@@ -454,7 +493,7 @@ pub fn digest(
     // Stage 2 of extraction precision (ROADMAP §8): the vocabulary is settled,
     // now the entities themselves. Independent chunks name one thing several
     // ways; merge those, keeping every absorbed key as an alias.
-    if opts.resolve_identity {
+    if opts.mode.resolves_identity() {
         let key_counts = reconcile::tally(entities.keys().map(String::as_str));
         let descriptions: BTreeMap<String, String> = entities
             .iter()
@@ -536,7 +575,7 @@ pub fn digest(
     // Stage 3 (ROADMAP §8): the graph now holds the right things under the
     // right names, but each still says only what its first chunk said. Re-read
     // every entity that is mentioned somewhere its own chunks did not cover.
-    if opts.refine {
+    if opts.mode.refines() {
         let degrees = {
             let mut d: BTreeMap<String, usize> = BTreeMap::new();
             for e in &edges {

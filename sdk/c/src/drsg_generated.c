@@ -299,6 +299,7 @@ struct json_object *drsg_digest_run(drsg_client *c, const char *plane, const cha
         if (opts->link) json_object_object_add(p, "link", json_object_new_boolean(*opts->link));
         if (opts->concurrency) json_object_object_add(p, "concurrency", json_object_new_int64(*opts->concurrency));
         if (opts->chunk_chars) json_object_object_add(p, "chunk_chars", json_object_new_int64(*opts->chunk_chars));
+        if (opts->mode) json_object_object_add(p, "mode", json_object_new_string(opts->mode));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "digest.run", p, &result, err);

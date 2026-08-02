@@ -169,6 +169,7 @@ typedef struct {
     const int *link;
     const int64_t *concurrency;
     const int64_t *chunk_chars;
+    const char *mode;
 } drsg_digest_run_opts;
 
 /* Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write) */

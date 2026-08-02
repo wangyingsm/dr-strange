@@ -171,7 +171,7 @@ export class Drsg extends Client {
   }
 
   /** Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). (access: write) */
-  digestRun(params: { plane: string; text: string; chat?: string; embed?: string; model?: string; embed_model?: string; source?: string; no_embed?: boolean; link?: boolean; concurrency?: number; chunk_chars?: number }): Promise<Record<string, unknown>> {
+  digestRun(params: { plane: string; text: string; chat?: string; embed?: string; model?: string; embed_model?: string; source?: string; no_embed?: boolean; link?: boolean; concurrency?: number; chunk_chars?: number; mode?: "coarse" | "fine" | "super" }): Promise<Record<string, unknown>> {
     return this._call("digest.run", params) as Promise<Record<string, unknown>>;
   }
 

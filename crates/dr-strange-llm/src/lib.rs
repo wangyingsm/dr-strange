@@ -21,7 +21,7 @@ mod refine;
 
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
-    CandidateSource, DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult,
+    CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport, DigestResult,
     ExistingEntity, PlaneCandidates, digest,
 };
 pub use identity::IdentityReport;

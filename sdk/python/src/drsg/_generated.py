@@ -294,7 +294,7 @@ class Drsg(_Client):
             _p["as_of_ms"] = as_of_ms
         return self._call("graph.expand", _p)
 
-    def digest_run(self, plane, text, chat=None, embed=None, model=None, embed_model=None, source=None, no_embed=None, link=None, concurrency=None, chunk_chars=None) -> Any:
+    def digest_run(self, plane, text, chat=None, embed=None, model=None, embed_model=None, source=None, no_embed=None, link=None, concurrency=None, chunk_chars=None, mode=None) -> Any:
         """Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits).
 
         Access: write."""
@@ -319,6 +319,8 @@ class Drsg(_Client):
             _p["concurrency"] = concurrency
         if chunk_chars is not None:
             _p["chunk_chars"] = chunk_chars
+        if mode is not None:
+            _p["mode"] = mode
         return self._call("digest.run", _p)
 
     def digest_write(self, plane, nodes, edges=None) -> Any:

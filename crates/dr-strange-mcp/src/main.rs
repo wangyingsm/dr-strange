@@ -194,18 +194,12 @@ struct Digest {
     /// (default true). Off ⇒ every entity is proposed as new.
     #[serde(default)]
     link: Option<bool>,
-    /// Reconcile the label / edge-type vocabularies after extraction, folding
-    /// the spelling variants independent chunks produce (default true).
+    /// How thoroughly to clean up the extraction: `coarse` reconciles the
+    /// label and edge-type vocabularies, `fine` (the default) also merges
+    /// entities naming the same thing, `super` also re-reads every entity
+    /// against all the passages mentioning it — most accurate, most costly.
     #[serde(default)]
-    reconcile: Option<bool>,
-    /// Merge extracted entities that name the same thing, and check keys
-    /// against the graph exactly so a re-digest links (default true).
-    #[serde(default)]
-    resolve_identity: Option<bool>,
-    /// Re-read each entity against every passage mentioning it (default
-    /// false) — the most accurate digest, and the most expensive.
-    #[serde(default)]
-    refine: Option<bool>,
+    mode: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -790,9 +784,11 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         chunk_chars: 4000,
         embed,
         concurrency: 8,
-        reconcile: req.reconcile.unwrap_or(true),
-        resolve_identity: req.resolve_identity.unwrap_or(true),
-        refine: req.refine.unwrap_or(false),
+        mode: match req.mode.as_deref() {
+            None => dr_strange_llm::DigestMode::default(),
+            Some(m) => dr_strange_llm::DigestMode::parse(m)
+                .ok_or_else(|| anyhow::anyhow!("unknown digest mode `{m}`"))?,
+        },
         refine_max_entities: None,
         refine_max_context: None,
     };
