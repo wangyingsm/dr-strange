@@ -8,6 +8,8 @@
 //! from different providers (e.g. DeepSeek chat + Qwen embeddings): build two
 //! instances and pass each to the role it serves.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
@@ -19,6 +21,11 @@ use crate::provider::{Chat, ChatReply, EmbedReply, Embedder, OutputTruncated};
 /// size-bounded upstream, so this is rarely the binding limit; it also fits the
 /// preset models' output caps (deepseek-chat / qwen-plus are 8K).
 const MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// Ceiling on one provider round-trip. Long enough for a slow model writing a
+/// full extraction reply, short enough that a hung connection surfaces as an
+/// error the caller can retry rather than an indefinite stall.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Build an [`OpenAiProvider`] from a provider name (a [`preset`] or a raw base
 /// URL) plus optional overrides, reading the API key from the environment. The
@@ -90,7 +97,13 @@ impl OpenAiProvider {
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}/{path}", self.base_url);
-        let mut req = ureq::post(&url).set("Content-Type", "application/json");
+        // Bounded: ureq applies no timeout of its own, so a provider that
+        // accepts the connection and then stops responding would wedge the
+        // caller forever — an `ask` loop or a digest run with no way out but
+        // Ctrl-C. A generous cap still ends the wait.
+        let mut req = ureq::post(&url)
+            .timeout(REQUEST_TIMEOUT)
+            .set("Content-Type", "application/json");
         if !self.api_key.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.api_key));
         }
