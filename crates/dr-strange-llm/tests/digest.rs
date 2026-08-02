@@ -605,3 +605,42 @@ fn refinement_is_off_by_default() -> Result<()> {
     );
     Ok(())
 }
+
+/// A chat that extracts fine but fails every refinement — the provider blip
+/// that killed a live run before refinement was made best-effort.
+struct FailsOnRefine {
+    inner: MockProvider,
+}
+impl dr_strange_llm::Chat for FailsOnRefine {
+    fn complete(&self, system: &str, user: &str) -> Result<dr_strange_llm::ChatReply> {
+        if system.starts_with("You re-read one entity") {
+            anyhow::bail!("chat/completions: Connection Failed: connection timed out");
+        }
+        self.inner.complete(system, user)
+    }
+}
+
+#[test]
+fn a_failed_refinement_costs_that_entity_only() -> Result<()> {
+    let chat = FailsOnRefine {
+        inner: MockProvider::new(vec![REF_A.into(), REF_B.into()], 4),
+    };
+    let embed = MockProvider::new(vec![], 4);
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    o.refine = true;
+    let res = digest(&refine_doc(), &chat, &embed, None, &o)?;
+
+    // The digest still produced its graph, and the entity kept what
+    // extraction gave it.
+    assert_eq!(res.report.refined.failed, 1);
+    assert_eq!(res.report.refined.refined, 0);
+    let t = res.nodes.iter().find(|n| n.key == "Transformer").unwrap();
+    assert_eq!(
+        t.props.get("layers").map(|p| &p.value),
+        Some(&PropValue::Int(4)),
+        "unrefined, not lost"
+    );
+    Ok(())
+}

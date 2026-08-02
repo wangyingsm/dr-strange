@@ -615,7 +615,18 @@ pub fn digest(
         });
 
         for (slot, (candidate, ..)) in slots.into_iter().zip(&asks) {
-            let (refined, cost) = slot.into_inner().unwrap().expect("every ask was run")?;
+            // A refinement that failed leaves its entity exactly as extraction
+            // left it. Aborting instead would throw away every chunk's
+            // extraction and both earlier passes over one timed-out request —
+            // and with one call per entity, some request failing is ordinary.
+            let (refined, cost) = match slot.into_inner().unwrap().expect("every ask was run") {
+                Ok(out) => out,
+                Err(e) => {
+                    report.refined.failed += 1;
+                    tracing::warn!(entity = %candidate.key, error = %e, "entity left unrefined");
+                    continue;
+                }
+            };
             report.refined.chat_requests += cost.chat_requests;
             report.refined.input_tokens += cost.input_tokens;
             report.refined.output_tokens += cost.output_tokens;
@@ -634,6 +645,7 @@ pub fn digest(
             skipped = report.refined.skipped_nothing_new,
             props_added = report.refined.props_added,
             props_revised = report.refined.props_revised,
+            failed = report.refined.failed,
             "entities refined",
         );
     }

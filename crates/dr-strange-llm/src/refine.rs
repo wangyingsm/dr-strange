@@ -40,6 +40,10 @@ pub struct RefineReport {
     pub refined: usize,
     /// Entities skipped because nothing outside their own chunks mentions them.
     pub skipped_nothing_new: usize,
+    /// Entities whose re-read failed — a provider error, a timeout. They keep
+    /// the values extraction gave them; refinement only ever *improves* a
+    /// graph, so a failure to improve one entity must not cost the run.
+    pub failed: usize,
     /// Properties added that extraction had missed.
     pub props_added: usize,
     /// Properties whose value the fuller reading changed.
