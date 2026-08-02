@@ -565,26 +565,60 @@ pub fn digest(
             candidates.truncate(cap);
         }
 
-        for candidate in &candidates {
-            let Some(node) = entities.get(&candidate.key) else {
-                continue;
-            };
-            // How this entity sits in the graph — the relations are what make a
-            // passage's mention interpretable.
-            let relations: Vec<String> = edges
-                .iter()
-                .filter(|e| e.src == candidate.key || e.dst == candidate.key)
-                .map(|e| format!("{} --{}--> {}", e.src, e.ty, e.dst))
-                .collect();
-            let refined = refine::refine_one(
-                chat,
-                &chunks,
-                candidate,
-                &node.label,
-                &node.props,
-                &relations,
-                &mut report.refined,
-            )?;
+        // One call per entity, run concurrently like the extraction round and
+        // collected in candidate order, so a re-run applies the same answers in
+        // the same sequence however the requests interleave.
+        /// One entity's question: what to ask about, and everything the ask
+        /// needs that lives in the entity map.
+        type Ask<'a> = (&'a refine::Candidate, String, Properties, Vec<String>);
+        let asks: Vec<Ask<'_>> = candidates
+            .iter()
+            .filter_map(|c| {
+                let node = entities.get(&c.key)?;
+                // How the entity sits in the graph: the relations are what make
+                // a passage's mention interpretable.
+                let relations: Vec<String> = edges
+                    .iter()
+                    .filter(|e| e.src == c.key || e.dst == c.key)
+                    .map(|e| format!("{} --{}--> {}", e.src, e.ty, e.dst))
+                    .collect();
+                Some((c, node.label.clone(), node.props.clone(), relations))
+            })
+            .collect();
+
+        let n = asks.len();
+        type Answer = Result<(Option<refine::Refined>, RefineReport)>;
+        let slots: Vec<Mutex<Option<Answer>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        let cursor = AtomicUsize::new(0);
+        let workers = opts.concurrency.clamp(1, n.max(1));
+        let (slots_ref, cursor_ref, asks_ref, chunks_ref) = (&slots, &cursor, &asks, &chunks);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(move || {
+                    loop {
+                        let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let (c, label, props, relations) = &asks_ref[i];
+                        // Each worker tallies its own cost; the totals are
+                        // summed in order below, so they never race.
+                        let mut local = RefineReport::default();
+                        let out = refine::refine_one(
+                            chat, chunks_ref, c, label, props, relations, &mut local,
+                        )
+                        .map(|r| (r, local));
+                        *slots_ref[i].lock().unwrap() = Some(out);
+                    }
+                });
+            }
+        });
+
+        for (slot, (candidate, ..)) in slots.into_iter().zip(&asks) {
+            let (refined, cost) = slot.into_inner().unwrap().expect("every ask was run")?;
+            report.refined.chat_requests += cost.chat_requests;
+            report.refined.input_tokens += cost.input_tokens;
+            report.refined.output_tokens += cost.output_tokens;
             if let (Some(r), Some(node)) = (refined, entities.get_mut(&candidate.key)) {
                 refine::apply(&mut node.props, &r, &mut report.refined);
                 report.refined.refined += 1;
