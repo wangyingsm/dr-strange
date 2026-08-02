@@ -335,6 +335,16 @@ The pass must report refined / skipped / why plus the mention-spread histogram,
 so the thresholds are tuned from real runs rather than guessed — that
 distribution is unknown today because chunk provenance is not recorded.
 
+**Settled — reconciliation keeps the original wording.** A canonicalized label
+or edge type carries the canonical form, and the form the document actually used
+is recorded beside it as an underscore-prefixed provenance property
+(`_label_as_written` / `_type_as_written`), written only where the two differ.
+Provenance properties are already hidden from the schema summary the model
+reads, so aliases cost the read paths nothing while keeping the document's own
+words recoverable. Stage 2 inherits this mechanism unchanged: an entity merged
+into another carries the same alias record forward rather than inventing a
+second scheme.
+
 **Forks to settle.**
 - *Edges are visited twice* in stage 3, once from each endpoint, yielding two
   refinements of one edge. Resolve by endpoint order, by confidence, or refine
