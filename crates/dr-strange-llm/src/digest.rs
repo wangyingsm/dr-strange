@@ -30,6 +30,7 @@ use dr_strange_core::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::identity::{self, IdentityReport};
 use crate::provider::{Chat, Embedder, OutputTruncated};
 use crate::reconcile::{self, ReconcileReport};
 
@@ -53,6 +54,20 @@ pub trait CandidateSource {
     /// Existing entities similar to `query`, most-similar first (may be empty).
     /// Best-effort: an empty result simply means "propose everything as new".
     fn similar(&self, query: &[f32], k: usize) -> Result<Vec<ExistingEntity>>;
+
+    /// Which of `keys` the target graph already holds, looked up **exactly**.
+    ///
+    /// Similarity search cannot answer this: it depends on the plane's nodes
+    /// carrying usable embeddings, and a plane digested without an embedder
+    /// carries none — every vector empty, every search empty, every entity
+    /// proposed as new, and a second digest writing a *second* node under a key
+    /// the plane already holds (ROADMAP §8). An exact lookup has no such
+    /// dependency, so identity survives whatever the embeddings are doing.
+    ///
+    /// Defaults to "none", for sources that cannot look keys up.
+    fn existing_keys(&self, _keys: &[String]) -> Result<Vec<ExistingEntity>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The default [`CandidateSource`]: cosine top-k over a plane's `embedding`
@@ -93,6 +108,27 @@ impl CandidateSource for PlaneCandidates<'_> {
                 })
             })
             .collect())
+    }
+
+    fn existing_keys(&self, keys: &[String]) -> Result<Vec<ExistingEntity>> {
+        let mut found = Vec::new();
+        for key in keys {
+            let node = self
+                .plane
+                .node_by_key(key)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(n) = node {
+                found.push(ExistingEntity {
+                    key: key.clone(),
+                    label: n.labels.into_iter().next().unwrap_or_default(),
+                    description: match n.properties.get("description").map(|p| &p.value) {
+                        Some(PropValue::Str(s)) => s.clone(),
+                        _ => String::new(),
+                    },
+                });
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -160,6 +196,8 @@ pub struct DigestReport {
     pub labels: ReconcileReport,
     /// The same, for the edge-type vocabulary.
     pub edge_types: ReconcileReport,
+    /// What identity resolution cost and changed (ROADMAP §8 stage 2).
+    pub identity: IdentityReport,
     pub chat_requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -191,6 +229,10 @@ pub struct DigestOptions {
     /// (ROADMAP §8 stage 1). Costs O(1) chat calls in document size and folds
     /// the spelling variants independent chunks inevitably produce.
     pub reconcile: bool,
+    /// Merge extracted entities that name the same thing (ROADMAP §8 stage 2),
+    /// and check every remaining key against the graph exactly so a re-digest
+    /// links rather than duplicating.
+    pub resolve_identity: bool,
 }
 
 impl DigestResult {
@@ -384,6 +426,92 @@ pub fn digest(
             collapsed_relations = report.merged_relations,
             "vocabulary reconciled",
         );
+    }
+
+    // Stage 2 of extraction precision (ROADMAP §8): the vocabulary is settled,
+    // now the entities themselves. Independent chunks name one thing several
+    // ways; merge those, keeping every absorbed key as an alias.
+    if opts.resolve_identity {
+        let key_counts = reconcile::tally(entities.keys().map(String::as_str));
+        let descriptions: BTreeMap<String, String> = entities
+            .iter()
+            .filter_map(
+                |(k, n)| match n.props.get("description").map(|p| &p.value) {
+                    Some(PropValue::Str(d)) => Some((k.clone(), d.clone())),
+                    _ => None,
+                },
+            )
+            .collect();
+        let (renames, r) = identity::resolve(chat, &key_counts, &descriptions)?;
+        report.identity = r;
+
+        if !renames.is_empty() {
+            // Fold each absorbed entity into its survivor: properties fill gaps
+            // rather than overwrite (the survivor was named more often, so its
+            // account is the better-attested one), and the absorbed key is kept.
+            for (from, into) in &renames {
+                let Some(absorbed) = entities.remove(from) else {
+                    continue;
+                };
+                let survivor = entities.entry(into.clone()).or_insert_with(|| DigestNode {
+                    key: into.clone(),
+                    label: absorbed.label.clone(),
+                    props: Properties::new(),
+                });
+                if survivor.label.is_empty() {
+                    survivor.label = absorbed.label;
+                }
+                for (k, v) in absorbed.props {
+                    survivor.props.entry(k).or_insert(v);
+                }
+                reconcile::note_original(
+                    &mut survivor.props,
+                    "_key_as_written",
+                    "another name this entity was written under, before identity resolution",
+                    from,
+                );
+            }
+            // Move every edge onto the surviving endpoints, then collapse the
+            // duplicates that creates — and the self-loops, which are what two
+            // names for one entity related to each other become.
+            for edge in &mut edges {
+                if let Some(into) = renames.get(&edge.src) {
+                    edge.src = into.clone();
+                }
+                if let Some(into) = renames.get(&edge.dst) {
+                    edge.dst = into.clone();
+                }
+            }
+            let mut seen: HashSet<(String, String, String)> = HashSet::new();
+            let before = edges.len();
+            edges.retain(|e| {
+                e.src != e.dst && seen.insert((e.src.clone(), e.dst.clone(), e.ty.clone()))
+            });
+            report.identity.merged_relations = before - edges.len();
+        }
+
+        report.chat_requests += report.identity.chat_requests;
+        report.input_tokens += report.identity.input_tokens;
+        report.output_tokens += report.identity.output_tokens;
+        tracing::info!(
+            entities = format!("{}→{}", report.identity.before, report.identity.after),
+            folded = report.identity.folded,
+            merged = report.identity.merged,
+            adjudicated = report.identity.adjudicated,
+            collapsed_relations = report.identity.merged_relations,
+            "identity resolved",
+        );
+    }
+
+    // Whatever keys remain, check them against the graph *exactly* — the one
+    // duplicate-prevention path that does not depend on the plane's embeddings
+    // being present and usable (ROADMAP §8). Without it a re-digest of a plane
+    // with empty vectors writes a second node under a key it already holds.
+    if let Some(src) = candidates {
+        let keys: Vec<String> = entities.keys().cloned().collect();
+        for e in src.existing_keys(&keys)? {
+            existing.entry(e.key.clone()).or_insert(e);
+        }
     }
 
     // Entities the model reused an existing key for are linked, not re-created:

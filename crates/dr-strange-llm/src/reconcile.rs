@@ -62,7 +62,7 @@ struct MergeReply {
 
 /// Normalized form used to decide that two names are the same name written
 /// differently: case, and every separator, ignored.
-fn fold_key(name: &str) -> String {
+pub(crate) fn fold_key(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
@@ -142,7 +142,7 @@ fn adjudicate(
 
 /// Collapse `A→B, B→C` into `A→C` so applying the map once is enough, and break
 /// any cycle the model may have produced by dropping the offending entry.
-fn resolve_chains(renames: Renames) -> Renames {
+pub(crate) fn resolve_chains(renames: Renames) -> Renames {
     let mut out = Renames::new();
     for from in renames.keys() {
         let mut target = &renames[from];

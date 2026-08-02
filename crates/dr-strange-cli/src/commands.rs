@@ -520,6 +520,8 @@ pub struct DigestArgs<'a> {
     pub link: bool,
     /// Reconcile the label / edge-type vocabularies after extraction.
     pub reconcile: bool,
+    /// Merge entities naming the same thing; check keys against the graph.
+    pub resolve_identity: bool,
     /// Provider preset name (openai/deepseek/qwen/ollama) or a raw base URL.
     pub chat_provider: &'a str,
     pub embed_provider: &'a str,
@@ -644,6 +646,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         embed: args.embed,
         concurrency: args.concurrency,
         reconcile: args.reconcile,
+        resolve_identity: args.resolve_identity,
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);

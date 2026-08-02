@@ -12,6 +12,7 @@
 
 mod ask;
 mod digest;
+mod identity;
 mod openai;
 mod preset;
 mod provider;
@@ -22,6 +23,7 @@ pub use digest::{
     CandidateSource, DigestEdge, DigestNode, DigestOptions, DigestReport, DigestResult,
     ExistingEntity, PlaneCandidates, digest,
 };
+pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};

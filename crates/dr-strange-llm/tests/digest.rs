@@ -27,6 +27,7 @@ fn opts(embed: bool) -> DigestOptions {
         // The mock provider serves one canned reply; the reconciliation pass
         // would consume replies these tests do not provide.
         reconcile: false,
+        resolve_identity: false,
     }
 }
 
@@ -333,5 +334,157 @@ fn renaming_collapses_relations_that_became_the_same_triple() -> Result<()> {
     let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
     assert_eq!(res.edges.len(), 1, "the duplicate triple collapsed");
     assert_eq!(res.report.merged_relations, 1);
+    Ok(())
+}
+
+// ---- identity resolution (ROADMAP §8 stage 2) -----------------------------
+
+/// One chunk naming an entity two ways, the other naming an abbreviation and a
+/// variant — the three shapes stage 2 has to tell apart.
+const ID_A: &str = r#"{
+  "entities": [
+    {"key":"Softmax","label":"Function","description":"The softmax function."},
+    {"key":"K","label":"Matrix","description":"The key matrix."},
+    {"key":"Transformer","label":"Model","description":"The Transformer."}
+  ],
+  "relations": [{"src":"Transformer","dst":"Softmax","type":"USES"}]
+}"#;
+const ID_B: &str = r#"{
+  "entities": [
+    {"key":"softmax","label":"Function","description":"Softmax again."},
+    {"key":"Key","label":"Matrix","description":"The key vectors."},
+    {"key":"Transformer (big)","label":"Model","description":"The large variant."}
+  ],
+  "relations": [{"src":"Transformer (big)","dst":"softmax","type":"USES"}]
+}"#;
+/// `K|Key` is one entity written twice; `Transformer|Transformer (big)` is a
+/// model and its variant, so the model leaves that pair out.
+const SAME_REPLY: &str = r#"{"same":["K|Key"]}"#;
+
+fn id_opts() -> DigestOptions {
+    let mut o = opts(false);
+    o.chunk_chars = 200;
+    o.concurrency = 1;
+    o.resolve_identity = true;
+    o
+}
+
+#[test]
+fn identity_folds_spellings_merges_aliases_and_keeps_variants() -> Result<()> {
+    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
+
+    let keys: Vec<&str> = res.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert!(
+        !keys.contains(&"softmax"),
+        "the spelling variant folded: {keys:?}"
+    );
+    assert!(keys.contains(&"Softmax"));
+    assert!(
+        !keys.contains(&"K"),
+        "the abbreviation merged into Key: {keys:?}"
+    );
+    assert!(keys.contains(&"Key"));
+    // A variant is its own entity — merging it would lose the distinction the
+    // document drew, and the INSTANCE_OF-style edges that hang off it.
+    assert!(keys.contains(&"Transformer"), "{keys:?}");
+    assert!(keys.contains(&"Transformer (big)"), "{keys:?}");
+
+    assert_eq!(res.report.identity.folded, 1, "softmax");
+    assert_eq!(res.report.identity.merged, 1, "K→Key");
+    assert_eq!(res.report.identity.before - res.report.identity.after, 2);
+    Ok(())
+}
+
+#[test]
+fn merging_rewires_edges_onto_the_survivor() -> Result<()> {
+    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
+
+    // Both USES edges pointed at a spelling of softmax; both must now point at
+    // the survivor, and the pair collapses to one edge per distinct source.
+    for e in &res.edges {
+        assert_ne!(e.dst, "softmax", "an edge still points at a folded key");
+    }
+    let to_softmax: Vec<&str> = res
+        .edges
+        .iter()
+        .filter(|e| e.dst == "Softmax")
+        .map(|e| e.src.as_str())
+        .collect();
+    assert_eq!(to_softmax.len(), 2, "one from each model: {to_softmax:?}");
+    Ok(())
+}
+
+#[test]
+fn an_absorbed_key_survives_as_an_alias() -> Result<()> {
+    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &id_opts())?;
+
+    let key_node = res.nodes.iter().find(|n| n.key == "Key").unwrap();
+    assert_eq!(
+        key_node.props.get("_key_as_written").map(|p| &p.value),
+        Some(&PropValue::Str("K".into())),
+        "the document's other name for this entity is recoverable"
+    );
+    // The absorbed entity's own account is kept where the survivor had none.
+    assert!(key_node.props.contains_key("description"));
+    Ok(())
+}
+
+/// A plane that holds `Softmax` already but has no usable embeddings — the
+/// state that produced two `ByteNet` nodes under one key (ROADMAP §8).
+struct KeyedPlaneNoVectors;
+impl CandidateSource for KeyedPlaneNoVectors {
+    fn similar(&self, _query: &[f32], _k: usize) -> Result<Vec<ExistingEntity>> {
+        Ok(Vec::new()) // every vector empty ⇒ every search empty
+    }
+    fn existing_keys(&self, keys: &[String]) -> Result<Vec<ExistingEntity>> {
+        Ok(keys
+            .iter()
+            .filter(|k| *k == "Softmax")
+            .map(|k| ExistingEntity {
+                key: k.clone(),
+                label: "Function".into(),
+                description: String::new(),
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn an_exact_key_check_prevents_a_duplicate_when_vectors_cannot() -> Result<()> {
+    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let res = digest(
+        &two_chunk_doc(),
+        &chat,
+        &chat,
+        Some(&KeyedPlaneNoVectors),
+        &id_opts(),
+    )?;
+
+    // Similarity found nothing, as it must with empty vectors — yet the entity
+    // the plane already holds is linked rather than written a second time.
+    assert!(
+        !res.nodes.iter().any(|n| n.key == "Softmax"),
+        "Softmax was re-created under a key the plane already holds"
+    );
+    assert_eq!(res.report.linked, 1);
+    // And its edges survive for the bulk loader to resolve against the plane.
+    assert!(res.edges.iter().any(|e| e.dst == "Softmax"));
+    Ok(())
+}
+
+#[test]
+fn identity_resolution_is_off_by_request() -> Result<()> {
+    let chat = MockProvider::new(vec![ID_A.into(), ID_B.into(), SAME_REPLY.into()], 4);
+    let mut o = id_opts();
+    o.resolve_identity = false;
+    let res = digest(&two_chunk_doc(), &chat, &chat, None, &o)?;
+
+    let keys: Vec<&str> = res.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert!(keys.contains(&"softmax") && keys.contains(&"Softmax"));
+    assert!(keys.contains(&"K") && keys.contains(&"Key"));
+    assert_eq!(res.report.identity, Default::default());
     Ok(())
 }

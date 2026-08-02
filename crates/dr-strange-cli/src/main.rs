@@ -222,6 +222,11 @@ enum Command {
         /// variants and all. Saves two chat calls per run.
         #[arg(long)]
         no_reconcile: bool,
+        /// Skip identity resolution (ROADMAP §8 stage 2): keep every extracted
+        /// entity separate even where two names denote one thing, and rely on
+        /// vector linking alone to avoid duplicating existing nodes.
+        #[arg(long)]
+        no_resolve_identity: bool,
     },
 }
 
@@ -570,6 +575,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             no_embed,
             no_link,
             no_reconcile,
+            no_resolve_identity,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -581,6 +587,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 embed: !no_embed,
                 link: !no_link,
                 reconcile: !no_reconcile,
+                resolve_identity: !no_resolve_identity,
                 chat_provider: &chat,
                 embed_provider: &embed,
                 model: model.as_deref(),

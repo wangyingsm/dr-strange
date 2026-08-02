@@ -198,6 +198,10 @@ struct Digest {
     /// the spelling variants independent chunks produce (default true).
     #[serde(default)]
     reconcile: Option<bool>,
+    /// Merge extracted entities that name the same thing, and check keys
+    /// against the graph exactly so a re-digest links (default true).
+    #[serde(default)]
+    resolve_identity: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -783,6 +787,7 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         embed,
         concurrency: 8,
         reconcile: req.reconcile.unwrap_or(true),
+        resolve_identity: req.resolve_identity.unwrap_or(true),
     };
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);
