@@ -221,7 +221,8 @@ enum Command {
         /// cost for precision: `coarse` reconciles the label and edge-type
         /// vocabularies; `fine` also merges entities that name the same thing;
         /// `super` also re-reads every entity against all the passages
-        /// mentioning it — the most accurate, and by far the most expensive.
+        /// mentioning it — the most accurate, and by far the most expensive
+        /// (~15× input token usage).
         #[arg(long, default_value = "fine")]
         mode: String,
     },
