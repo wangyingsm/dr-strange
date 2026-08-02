@@ -27,6 +27,33 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 /// error the caller can retry rather than an indefinite stall.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Total tries for one request, the first included. Reaching a provider over
+/// the open internet fails occasionally for reasons that have nothing to do
+/// with the request — a dropped handshake, a moment of congestion — and a
+/// digest run makes hundreds of them. Without this, one such moment costs a
+/// whole run: extraction aborts on the first chunk that errors, and the
+/// reconciliation, identity and `ask` passes all propagate.
+const MAX_ATTEMPTS: u32 = 4;
+/// Wait before the second try; doubles each time, to [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// Whether an HTTP status is worth trying again. `429` and `5xx` say "not now";
+/// every other 4xx is a statement about the request itself — a bad key, a
+/// malformed body, a model that does not exist — and repeating it only spends
+/// time and money to be told the same thing.
+fn worth_retrying(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// How long to wait before try number `attempt` (2 for the first retry).
+fn backoff(attempt: u32) -> Duration {
+    let steps = attempt.saturating_sub(2);
+    INITIAL_BACKOFF
+        .saturating_mul(1u32 << steps.min(6))
+        .min(MAX_BACKOFF)
+}
+
 /// Build an [`OpenAiProvider`] from a provider name (a [`preset`] or a raw base
 /// URL) plus optional overrides, reading the API key from the environment. The
 /// one place CLI and MCP resolve provider config the same way. `embed` selects
@@ -97,27 +124,62 @@ impl OpenAiProvider {
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}/{path}", self.base_url);
-        // Bounded: ureq applies no timeout of its own, so a provider that
-        // accepts the connection and then stops responding would wedge the
-        // caller forever — an `ask` loop or a digest run with no way out but
-        // Ctrl-C. A generous cap still ends the wait.
-        let mut req = ureq::post(&url)
-            .timeout(REQUEST_TIMEOUT)
-            .set("Content-Type", "application/json");
-        if !self.api_key.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
-        }
-        match req.send_json(body) {
-            Ok(resp) => resp
-                .into_json::<Value>()
-                .context("decoding provider response"),
-            // Surface the provider's error body — the useful part.
-            Err(ureq::Error::Status(code, resp)) => {
-                let detail = resp.into_string().unwrap_or_default();
-                bail!("{path} → HTTP {code}: {}", detail.trim())
+        for attempt in 1..=MAX_ATTEMPTS {
+            // Bounded: ureq applies no timeout of its own, so a provider that
+            // accepts the connection and then stops responding would wedge the
+            // caller forever — an `ask` loop or a digest run with no way out
+            // but Ctrl-C. A generous cap still ends the wait.
+            let mut req = ureq::post(&url)
+                .timeout(REQUEST_TIMEOUT)
+                .set("Content-Type", "application/json");
+            if !self.api_key.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {}", self.api_key));
             }
-            Err(e) => Err(anyhow::anyhow!("{path}: {e}")),
+            // Cloned per attempt: sending consumes the body.
+            let (reason, wait) = match req.send_json(body.clone()) {
+                Ok(resp) => {
+                    return resp
+                        .into_json::<Value>()
+                        .context("decoding provider response");
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    if !worth_retrying(code) || attempt == MAX_ATTEMPTS {
+                        // Surface the provider's error body — the useful part.
+                        let detail = resp.into_string().unwrap_or_default();
+                        bail!("{path} → HTTP {code}: {}", detail.trim())
+                    }
+                    // A provider that says how long to wait knows better than
+                    // the schedule does.
+                    let asked = resp
+                        .header("retry-after")
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs);
+                    (
+                        format!("HTTP {code}"),
+                        asked
+                            .unwrap_or_else(|| backoff(attempt + 1))
+                            .min(MAX_BACKOFF),
+                    )
+                }
+                // Transport: no connection, a dropped one, or the timeout above.
+                Err(e) => {
+                    if attempt == MAX_ATTEMPTS {
+                        return Err(anyhow!("{path}: {e}"));
+                    }
+                    (e.to_string(), backoff(attempt + 1))
+                }
+            };
+            tracing::warn!(
+                path,
+                attempt,
+                of = MAX_ATTEMPTS,
+                retry_in_ms = wait.as_millis() as u64,
+                reason,
+                "provider request failed; retrying",
+            );
+            std::thread::sleep(wait);
         }
+        unreachable!("the final attempt either returns or bails")
     }
 
     fn embed_once(&self, texts: &[String]) -> Result<EmbedReply> {
@@ -194,5 +256,120 @@ impl Embedder for OpenAiProvider {
             tokens += reply.tokens;
         }
         Ok(EmbedReply { vectors, tokens })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_transient_statuses_are_retried() {
+        // "Not now" — worth asking again.
+        for s in [429, 500, 502, 503, 504] {
+            assert!(worth_retrying(s), "{s} should be retried");
+        }
+        // Statements about the request itself: repeating it changes nothing,
+        // and a wrong key would be retried four times over.
+        for s in [400, 401, 403, 404, 422] {
+            assert!(!worth_retrying(s), "{s} must not be retried");
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_and_then_stops_growing() {
+        assert_eq!(backoff(2), INITIAL_BACKOFF);
+        assert_eq!(backoff(3), INITIAL_BACKOFF * 2);
+        assert_eq!(backoff(4), INITIAL_BACKOFF * 4);
+        // However many attempts a future change allows, the wait stays bounded.
+        assert_eq!(backoff(50), MAX_BACKOFF);
+        assert!(backoff(4) <= MAX_BACKOFF);
+    }
+
+    /// A one-connection-at-a-time HTTP server that answers with each of
+    /// `replies` in turn: `(status, body)`. Returns its base URL and a counter
+    /// of the requests it actually received.
+    fn server(replies: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (i, (status, body)) in replies.into_iter().enumerate() {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                let mut reader = BufReader::new(&stream);
+                // Drain the request head, then the body if one was announced.
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if len > 0 {
+                    std::io::Read::read_exact(&mut reader, &mut vec![0u8; len]).ok();
+                }
+                let mut stream = &stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.flush();
+                let _ = i;
+            }
+        });
+        (url, seen)
+    }
+
+    fn provider(base_url: String) -> OpenAiProvider {
+        OpenAiProvider::new(base_url, String::new(), "m")
+    }
+
+    #[test]
+    fn a_transient_failure_is_survived() {
+        // Two 503s, then the answer — exactly the shape of the connection
+        // trouble that killed a live digest run.
+        let (url, seen) = server(vec![
+            (503, "{\"error\":\"busy\"}"),
+            (503, "{\"error\":\"busy\"}"),
+            (200, "{\"ok\":true}"),
+        ]);
+        let got = provider(url).post("x", json!({"a":1})).unwrap();
+        assert_eq!(got["ok"], json!(true));
+        assert_eq!(seen.load(Ordering::Relaxed), 3, "it tried until it worked");
+    }
+
+    #[test]
+    fn a_rejected_request_is_not_repeated() {
+        // A bad key is a bad key: asking again wastes time and says the same.
+        let (url, seen) = server(vec![(401, "{\"error\":\"bad key\"}"); 4]);
+        let err = provider(url).post("x", json!({})).unwrap_err().to_string();
+        assert!(err.contains("401") && err.contains("bad key"), "{err}");
+        assert_eq!(seen.load(Ordering::Relaxed), 1, "asked exactly once");
+    }
+
+    #[test]
+    fn the_provider_error_survives_exhausted_retries() {
+        let (url, seen) = server(vec![
+            (500, "{\"error\":\"still down\"}");
+            MAX_ATTEMPTS as usize
+        ]);
+        let err = provider(url).post("x", json!({})).unwrap_err().to_string();
+        assert!(
+            err.contains("still down"),
+            "the last body is reported: {err}"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
     }
 }
