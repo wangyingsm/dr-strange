@@ -20,7 +20,12 @@ use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
 
 /// Where a plan's rows originate.
+///
+/// `#[non_exhaustive]`: the engine grows new ways to seed a query (keyword,
+/// hybrid, algorithms — ROADMAP §7), so a downstream match must carry a
+/// wildcard arm and each addition stays a minor release.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Source {
     /// Every node in the plane.
     ScanAll,
@@ -96,7 +101,10 @@ pub enum NodeRef {
 }
 
 /// One pipeline stage, applied to the stream of rows.
+///
+/// `#[non_exhaustive]` for the same reason as [`Source`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Step {
     /// Replace each row's current node with each 1-hop neighbor (one row per
     /// neighbor); records the traversed edge in the row's trail.

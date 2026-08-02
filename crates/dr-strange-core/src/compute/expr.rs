@@ -18,7 +18,13 @@ use serde::{Deserialize, Serialize};
 use crate::storage::vector::Metric;
 use crate::types::{NodeRecord, PropValue};
 
+/// A predicate or scalar over the row's current node.
+///
+/// `#[non_exhaustive]`: the language keeps gaining terms (`key(n)`, the scoring
+/// functions), so a downstream match must carry a wildcard arm and each
+/// addition stays a minor release.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Expr {
     /// The current node's value for a property key (`Null` if absent).
     Property(String),

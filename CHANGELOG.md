@@ -4,7 +4,7 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-08-02
 
 ### Added
 - **Query-language parity (ROADMAP §7).** The openCypher subset now reaches
@@ -53,6 +53,19 @@ All notable changes to Dr Strange are documented here. The format is based on
   installation.
 - Release binaries for **Intel macOS** (`x86_64-apple-darwin`), so the macOS
   installer covers both architectures.
+
+### Changed
+- **The embedded Rust API changed; every other surface did not.** The CLI,
+  JSON-RPC, the five SDKs, MCP, plan JSON on the wire, and every query already
+  written all keep working. For code embedding the Rust crates:
+  `dr_strange_parser::parse` (and `parse_with_embedder`) now return a
+  `ReadQuery { plan, as_of }` rather than a bare `LogicalPlan`, and
+  `Statement::Read` carries it — `AS OF` addresses the plane handle, not the
+  plan, so it cannot ride inside one. `Source` gained three variants and `Expr`
+  one, which a total match must now handle.
+- `Source`, `Step` and `Expr` are `#[non_exhaustive]`. A downstream match needs
+  a wildcard arm from here on, so the operators and expression terms the engine
+  keeps growing land as minor releases rather than major ones.
 
 ## [1.1.0] - 2026-08-02
 
@@ -130,6 +143,7 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.2.0
 [1.1.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.1.0
 [1.0.2]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.0.2
