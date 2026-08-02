@@ -113,7 +113,9 @@ jobs:
         run: |
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
-      - uses: astral-sh/setup-uv@v9
+      # Pinned exactly: setup-uv stopped publishing a floating major tag after
+      # v7, so `@v9` does not resolve even though v9.0.0 is the latest release.
+      - uses: astral-sh/setup-uv@v9.0.0
       - name: Test (drift + e2e)
         run: uv run --with pytest pytest -q
         working-directory: sdk/python
