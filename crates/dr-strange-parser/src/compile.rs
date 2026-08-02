@@ -332,22 +332,30 @@ fn compile_hybrid(
         }
         None => None,
     };
-    let keyword = h.keyword.as_ref().map(|k| {
-        if let Some(w) = k.weight {
-            weights.keyword = w;
+    let keyword = match &h.keyword {
+        Some(k) => {
+            if let Some(w) = k.weight {
+                weights.keyword = w;
+            }
+            Some(KeywordChannel {
+                property: k.property.clone().ok_or_else(|| {
+                    "the HYBRID KEYWORD channel needs ON <property> — keyword \
+                     properties follow no convention, so there is nothing to \
+                     default to. (Only NEAR defaults, to `embedding`.)"
+                        .to_string()
+                })?,
+                query: k.query.clone(),
+            })
         }
-        KeywordChannel {
-            property: k.property.clone(),
-            query: k.query.clone(),
-        }
-    });
+        None => None,
+    };
     let graph = h.graph.as_ref().map(|g| {
         if let Some(w) = g.weight {
             weights.graph = w;
         }
         GraphChannel {
             hops: g.hops,
-            decay: g.decay,
+            decay: g.decay.unwrap_or(DEFAULT_GRAPH_DECAY),
             seeds: g.seeds.unwrap_or(DEFAULT_GRAPH_SEEDS) as usize,
         }
     });
@@ -365,6 +373,9 @@ fn compile_hybrid(
 /// Seeds per primary channel for `GRAPH` when `SEEDS` is omitted; matches the
 /// builder API's default.
 const DEFAULT_GRAPH_SEEDS: u64 = 10;
+/// Per-hop decay for `GRAPH` when `DECAY` is omitted — the same default the
+/// RPC (`graph_decay`), MCP and CLI (`--graph-decay`) surfaces already apply.
+const DEFAULT_GRAPH_DECAY: f32 = 0.5;
 /// Per-channel candidate pool when `CANDIDATES` is omitted.
 const DEFAULT_CANDIDATES: u64 = 100;
 /// Fused hits returned when `TOPK` is omitted.

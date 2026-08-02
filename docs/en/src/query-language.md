@@ -170,9 +170,10 @@ search returns nothing when no index is declared.
 
 `HYBRID` fuses up to three ranked channels into a single ordering. Each channel
 is optional (at least one of `VECTOR` or `KEYWORD` is required), may carry a
-`WEIGHT`, and they may appear in any order. The `VECTOR` channel defaults its
-property exactly as `SEARCH … NEAR` does, so `VECTOR NEAR "…"` is the short
-form:
+`WEIGHT`, and they may appear in any order. Only the channel's defining part is
+required — `HOPS` for `GRAPH`, a query for the other two — so `VECTOR NEAR "…"`
+and `GRAPH HOPS 2` are the short forms; the vector property defaults to
+`embedding` and the per-hop decay to `0.5`, matching the RPC, MCP and CLI:
 
 ```text
 HYBRID (d:Doc)

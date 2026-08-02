@@ -157,8 +157,10 @@ RETURN d ORDER BY score() DESC
 ## 查询中的混合检索
 
 `HYBRID` 将至多三路排序通道融合为单一次序。各通道均为可选（`VECTOR` 与 `KEYWORD`
-至少需其一），可携带 `WEIGHT`，且书写次序任意。`VECTOR` 通道对属性的默认处理与
-`SEARCH … NEAR` 完全一致，故 `VECTOR NEAR "…"` 即为其简写形式：
+至少需其一），可携带 `WEIGHT`，且书写次序任意。每个通道只有其定义性的部分是必需的
+——`GRAPH` 需要 `HOPS`，另两者需要一个查询——因此 `VECTOR NEAR "…"` 与
+`GRAPH HOPS 2` 即为简写形式：向量属性默认取 `embedding`，逐跳衰减默认取 `0.5`，与
+RPC、MCP 和命令行保持一致：
 
 ```text
 HYBRID (d:Doc)

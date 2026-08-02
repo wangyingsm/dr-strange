@@ -23,6 +23,17 @@ All notable changes to Dr Strange are documented here. The format is based on
     snapshot (native backend).
   - Every source may carry a relationship tail, so a typed hop follows a
     retrieval or algorithm seed; and `x IN [a, b]` works over any expression.
+  - Only what a clause actually needs is required: `ON <property>` defaults to
+    `embedding` wherever `NEAR` appears (`SEARCH`, `HYBRID VECTOR`, `BEAM`) and
+    `HYBRID`'s `GRAPH DECAY` defaults to `0.5`, matching the RPC/MCP/CLI
+    surfaces. `MATCHING` still requires `ON` — keyword properties follow no
+    convention to default to, and it now says so.
+
+### Fixed
+- A malformed clause reports its own position instead of blaming the query's
+  first token: once a clause's leading keyword matches, the parser commits, so
+  `HYBRID (n) VECTOR "model" …` points at `"model"` and a missing `RETURN`
+  points at the end of the query.
 - Matching plan sources — `Source::KeywordTopK`, `Source::Hybrid`,
   `Source::Algo` — and `Expr::ExternalKey`, so `plane.query` and the SDKs reach
   the same capabilities through serialized plans. `plane.hybrid()` and

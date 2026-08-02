@@ -939,7 +939,7 @@ impl DrStrange {
         top-k, where ON defaults to the `embedding` property; \
         SEARCH (v:L) ON prop MATCHING \"text\" [TOPK k] — BM25 keyword \
         search (label and ON both required); HYBRID (v:L) [VECTOR [ON p] NEAR q [WEIGHT w]] \
-        [KEYWORD ON p MATCHING \"text\" [WEIGHT w]] [GRAPH HOPS h DECAY d \
+        [KEYWORD ON p MATCHING \"text\" [WEIGHT w]] [GRAPH HOPS h [DECAY d] \
         [WEIGHT w]] [CANDIDATES n] [TOPK k] — fused retrieval; \
         CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \
         algorithms. Then BEAM similarity traversal, WHERE (property/label \

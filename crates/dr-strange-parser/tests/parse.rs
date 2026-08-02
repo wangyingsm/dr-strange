@@ -1278,3 +1278,84 @@ fn matching_still_requires_an_explicit_property() {
         ParseError::Syntax(_) | ParseError::Compile(_)
     ));
 }
+
+// ---- GRAPH decay default -------------------------------------------------
+
+#[test]
+fn hybrid_graph_channel_defaults_decay() {
+    // The RPC, MCP and CLI surfaces all default graph decay to 0.5; the
+    // language now agrees, so HOPS alone is enough to enable the channel.
+    assert_eq!(
+        plan(r#"HYBRID (d:Doc) VECTOR NEAR [1.0] GRAPH HOPS 2 RETURN d"#),
+        plan(r#"HYBRID (d:Doc) VECTOR NEAR [1.0] GRAPH HOPS 2 DECAY 0.5 RETURN d"#)
+    );
+    let Source::Hybrid(spec) =
+        plan(r#"HYBRID (d:Doc) VECTOR NEAR [1.0] GRAPH HOPS 3 RETURN d"#).source
+    else {
+        panic!("expected a hybrid source")
+    };
+    assert_eq!(
+        spec.graph,
+        Some(GraphChannel {
+            hops: 3,
+            decay: 0.5,
+            seeds: 10,
+        })
+    );
+}
+
+// ---- error positions -----------------------------------------------------
+//
+// A clause that has started — its leading keyword matched — must report its
+// own failure, not unwind to the top and blame the query's first token.
+
+/// The `near \`…\`` fragment of a syntax error.
+fn err_at(q: &str) -> String {
+    match err(q) {
+        ParseError::Syntax(m) => m,
+        other => panic!("expected a syntax error for `{q}`, got {other}"),
+    }
+}
+
+#[test]
+fn a_malformed_channel_reports_at_the_channel() {
+    // VECTOR without NEAR: the error points at what follows VECTOR.
+    let m = err_at(r#"HYBRID (n) VECTOR "model" GRAPH HOPS 2 RETURN n"#);
+    assert!(m.contains(r#""model""#), "{m}");
+    assert!(
+        !m.contains("HYBRID (n) VECTOR"),
+        "blamed the whole query: {m}"
+    );
+
+    // GRAPH without HOPS.
+    let m = err_at("HYBRID (n:Doc) GRAPH DECAY 0.5 RETURN n");
+    assert!(m.starts_with("near `DECAY"), "{m}");
+}
+
+#[test]
+fn a_missing_return_reports_at_the_end() {
+    for q in [
+        "MATCH (n)",
+        "MATCH (n:Doc) WHERE n.year > 2000",
+        r#"SEARCH (d:Doc) ON body MATCHING "rust" TOPK 10"#,
+    ] {
+        assert_eq!(err_at(q), "unexpected end of query", "for `{q}`");
+    }
+}
+
+#[test]
+fn committing_a_read_clause_does_not_break_writes() {
+    // `MATCH … SET/REMOVE/DELETE` is tried before the read grammar, so
+    // committing to RETURN inside a read must not capture a write.
+    for q in [
+        "MATCH (n:Doc) WHERE n.x = 1 SET n.y = 2",
+        "MATCH (n:Doc) REMOVE n.y",
+        "MATCH (n:Doc) DETACH DELETE n",
+        "MATCH (n:Doc) CREATE (n)-[:R]->(m:Other {key: \"k\"})",
+    ] {
+        assert!(
+            matches!(parse_statement(q), Ok(Statement::Write(_))),
+            "expected a write for `{q}`"
+        );
+    }
+}

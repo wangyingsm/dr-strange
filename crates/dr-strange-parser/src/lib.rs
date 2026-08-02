@@ -29,7 +29,7 @@
 //!   compares words.
 //! - **`HYBRID (v:Label) [VECTOR [ON p] NEAR q [METRIC m] [WEIGHT w]]
 //!   [KEYWORD ON p MATCHING "text" [WEIGHT w]]
-//!   [GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]] [CANDIDATES n] [TOPK k]`** —
+//!   [GRAPH HOPS h [DECAY d] [SEEDS n] [WEIGHT w]] [CANDIDATES n] [TOPK k]`** —
 //!   fused retrieval (`Source::Hybrid`); channels in any order, at least one of
 //!   VECTOR/KEYWORD.
 //! - **`CALL <pagerank|components|shortest_path|louvain>(arg: v, …) ON (v[:Label])`**

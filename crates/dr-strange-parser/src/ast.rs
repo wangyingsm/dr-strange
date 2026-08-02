@@ -116,7 +116,9 @@ pub struct HybridVector {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HybridKeyword {
-    pub property: String,
+    /// Required in practice — the compiler rejects `None` with a clear error,
+    /// since keyword properties follow no convention to default to.
+    pub property: Option<String>,
     pub query: String,
     pub weight: Option<f32>,
 }
@@ -124,7 +126,9 @@ pub struct HybridKeyword {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HybridGraph {
     pub hops: u32,
-    pub decay: f32,
+    /// `None` ⇒ the same default the RPC/MCP/CLI surfaces use (see
+    /// [`crate::compile`]).
+    pub decay: Option<f32>,
     pub seeds: Option<u64>,
     pub weight: Option<f32>,
 }

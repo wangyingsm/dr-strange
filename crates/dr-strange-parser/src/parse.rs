@@ -6,7 +6,7 @@ use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
-use nom::combinator::{map, map_res, not, opt, recognize, value};
+use nom::combinator::{cut, map, map_res, not, opt, recognize, value};
 use nom::multi::{many0, many1, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
 
@@ -516,7 +516,10 @@ type Tail = (
 
 fn query_tail(i: &str) -> IResult<&str, Tail> {
     let (i, where_clause) = opt(preceded(kw("where"), expr))(i)?;
-    let (i, _) = kw("return")(i)?;
+    // Every read ends in RETURN, so a miss here is the query's actual fault —
+    // committing reports it at this position rather than unwinding to the top
+    // and blaming the first token.
+    let (i, _) = cut(kw("return"))(i)?;
     let (i, distinct) = opt(kw("distinct"))(i)?;
     let (i, item) = return_item(i)?;
     let (i, order_by) = opt(preceded(
@@ -579,6 +582,20 @@ fn assemble(
         skip,
         limit,
         as_of,
+    }
+}
+
+/// Sort an optional part's result into "didn't start" (`None` — try something
+/// else) and "started but is malformed" (`Err::Failure` — report it here). A
+/// plain `Err::Error` means the part's leading keyword didn't match at all.
+#[allow(clippy::type_complexity)]
+fn committed<T>(
+    r: IResult<&str, T>,
+) -> Result<Option<(&str, T)>, nom::Err<nom::error::Error<&str>>> {
+    match r {
+        Ok((rest, v)) => Ok(Some((rest, v))),
+        Err(e @ nom::Err::Failure(_)) => Err(e),
+        Err(_) => Ok(None),
     }
 }
 
@@ -662,19 +679,28 @@ fn hybrid_query(i: &str) -> IResult<&str, Query> {
             k: None,
         },
     );
-    // Each part is optional and order-free; stop at the first token that
-    // starts none of them (WHERE/RETURN/a relationship tail).
+    // Each part is optional and order-free; stop at the first token that starts
+    // none of them (WHERE/RETURN/a relationship tail). A channel that *did*
+    // start — its leading keyword matched — but is malformed fails hard
+    // (`Err::Failure`, via `cut` inside the channel), so the error points at the
+    // broken channel instead of unwinding to the top of the query.
     loop {
-        if let Ok((rest, v)) = hybrid_vector(i) {
+        if let Some((rest, v)) = committed(hybrid_vector(i))? {
             clause.vector = Some(v);
             i = rest;
-        } else if let Ok((rest, k)) = hybrid_keyword(i) {
+            continue;
+        }
+        if let Some((rest, k)) = committed(hybrid_keyword(i))? {
             clause.keyword = Some(k);
             i = rest;
-        } else if let Ok((rest, g)) = hybrid_graph(i) {
+            continue;
+        }
+        if let Some((rest, g)) = committed(hybrid_graph(i))? {
             clause.graph = Some(g);
             i = rest;
-        } else if let Ok((rest, n)) = preceded(kw("candidates"), uint)(i) {
+            continue;
+        }
+        if let Ok((rest, n)) = preceded(kw("candidates"), uint)(i) {
             clause.candidates = Some(n);
             i = rest;
         } else if let Ok((rest, n)) = preceded(kw("topk"), uint)(i) {
@@ -698,9 +724,11 @@ fn hybrid_query(i: &str) -> IResult<&str, Query> {
 /// `VECTOR [ON prop] NEAR "text"|[..] [METRIC m] [WEIGHT w]`
 fn hybrid_vector(i: &str) -> IResult<&str, HybridVector> {
     let (i, _) = kw("vector")(i)?;
+    // Past the keyword this channel is committed: `NEAR <query>` is what makes
+    // it a vector channel, so a miss here is an error to report, not a retry.
     let (i, property) = opt(preceded(kw("on"), ident))(i)?;
-    let (i, _) = kw("near")(i)?;
-    let (i, query) = vec_arg(i)?;
+    let (i, _) = cut(kw("near"))(i)?;
+    let (i, query) = cut(vec_arg)(i)?;
     let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
     let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
     Ok((
@@ -717,10 +745,9 @@ fn hybrid_vector(i: &str) -> IResult<&str, HybridVector> {
 /// `KEYWORD ON prop MATCHING "text" [WEIGHT w]`
 fn hybrid_keyword(i: &str) -> IResult<&str, HybridKeyword> {
     let (i, _) = kw("keyword")(i)?;
-    let (i, _) = kw("on")(i)?;
-    let (i, property) = ident(i)?;
-    let (i, _) = kw("matching")(i)?;
-    let (i, query) = alt((quoted_str('\''), quoted_str('"')))(i)?;
+    let (i, property) = opt(preceded(kw("on"), ident))(i)?;
+    let (i, _) = cut(kw("matching"))(i)?;
+    let (i, query) = cut(alt((quoted_str('\''), quoted_str('"'))))(i)?;
     let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
     Ok((
         i,
@@ -732,13 +759,13 @@ fn hybrid_keyword(i: &str) -> IResult<&str, HybridKeyword> {
     ))
 }
 
-/// `GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]`
+/// `GRAPH HOPS h [DECAY d] [SEEDS n] [WEIGHT w]`
 fn hybrid_graph(i: &str) -> IResult<&str, HybridGraph> {
     let (i, _) = kw("graph")(i)?;
-    let (i, _) = kw("hops")(i)?;
-    let (i, hops) = map_res(preceded(multispace0, digit1), str::parse::<u32>)(i)?;
-    let (i, _) = kw("decay")(i)?;
-    let (i, decay) = f32_num(i)?;
+    // `HOPS <n>` is what makes it a graph channel; everything after is tuning.
+    let (i, _) = cut(kw("hops"))(i)?;
+    let (i, hops) = cut(map_res(preceded(multispace0, digit1), str::parse::<u32>))(i)?;
+    let (i, decay) = opt(preceded(kw("decay"), f32_num))(i)?;
     let (i, seeds) = opt(preceded(kw("seeds"), uint))(i)?;
     let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
     Ok((
