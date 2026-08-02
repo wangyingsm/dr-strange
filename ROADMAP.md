@@ -309,10 +309,33 @@ entity (recorded during round 1 — not tracked today, and cheap to add) widened
 by BM25 over the chunk text, reusing the in-tree `text::Analyzer` so it needs no
 embedder.
 
+**Settled — stage 3 cost.** Gate on *possibility*, rank on *value*; they are
+different questions. Refinement can only add information when an entity has
+occurrences **outside the chunk(s) that produced it**, which the occurrence pass
+computes for free, model-free — so entities with nothing new to read are skipped
+without a call and without loss. Survivors are ranked by degree plus property
+sparsity, because the measured graph shows importance and thinness coincide: the
+hubs are the thinnest (`Scaled Dot-Product Attention`, degree 11, one property;
+`Multi-Head Attention`, degree 6, one property; 61% of nodes are degree ≤1 and
+58% carry only a description). Degree alone is rejected as the *gate* — it
+measures importance, not whether anything remains to be learned.
+
+Two budgets, not one, since the larger cost is input rather than calls: a hub
+mentioned throughout a document would otherwise carry nearly the whole text as
+context. Cap **entities refined** and **occurrences per entity** (top-*m* by
+BM25, always including the producing chunks). Both default to **unlimited** —
+correctness first, with the cost visible in `DigestReport` — and both are
+`DigestOptions` knobs beside `concurrency` / `chunk_chars`.
+
+Batching several entities per call is rejected: it would cut call count but
+multiply prompt size and let entities contaminate each other's refinement.
+**Per-entity isolation is what makes the pass trustworthy.**
+
+The pass must report refined / skipped / why plus the mention-spread histogram,
+so the thresholds are tuned from real runs rather than guessed — that
+distribution is unknown today because chunk provenance is not recorded.
+
 **Forks to settle.**
-- *Cost control on stage 3* — it is O(entities) chat calls where round 1 is
-  O(chunks), roughly 10× on a paper-sized document. Refine every entity, or
-  triage to those mentioned in ≥2 chunks / above a degree threshold?
 - *Edges are visited twice* in stage 3, once from each endpoint, yielding two
   refinements of one edge. Resolve by endpoint order, by confidence, or refine
   edges in their own pass?
