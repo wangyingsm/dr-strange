@@ -442,7 +442,11 @@ pub fn digest(
                 },
             )
             .collect();
-        let (renames, r) = identity::resolve(chat, &key_counts, &descriptions)?;
+        let labels: BTreeMap<String, String> = entities
+            .iter()
+            .map(|(k, n)| (k.clone(), n.label.clone()))
+            .collect();
+        let (renames, r) = identity::resolve(chat, &key_counts, &descriptions, &labels)?;
         report.identity = r;
 
         if !renames.is_empty() {

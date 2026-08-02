@@ -88,10 +88,26 @@ fn fold_keys(counts: &BTreeMap<String, usize>) -> Renames {
 }
 
 /// Pairs where one key is contained in another — an alias, or a more specific
-/// thing. Deterministic order, and capped per key so a document full of
-/// prefixes cannot explode the prompt.
-fn containment_pairs(keys: &[String]) -> Vec<Pair> {
+/// thing. Deterministic order, capped per key and in total so no document can
+/// explode the prompt.
+///
+/// Pairs whose entities carry **different labels** are never proposed. Stage 1
+/// has just canonicalized the label vocabulary, so by now a disagreement is
+/// real, and it is decisive: a live run merged `dropout` into `Dropout: a
+/// simple way to prevent neural networks from overfitting` and
+/// `machine translation` into `Google's neural machine translation system: …`
+/// — a technique and a task swallowed by the *papers about them*. The prompt
+/// forbids exactly that and the model did it anyway; the labels (`Technique`
+/// vs `Paper`) rule it out for free, before anything is asked.
+fn containment_pairs(keys: &[String], labels: &BTreeMap<String, String>) -> Vec<Pair> {
     const MAX_PER_KEY: usize = 4;
+    const MAX_PAIRS: usize = 200;
+    let comparable = |a: &str, b: &str| match (labels.get(a), labels.get(b)) {
+        // An unlabelled entity carries no evidence either way, so it is judged
+        // on its name like before.
+        (Some(x), Some(y)) if !x.is_empty() && !y.is_empty() => x.eq_ignore_ascii_case(y),
+        _ => true,
+    };
     let mut pairs = BTreeSet::new();
     for inner in keys {
         let folded_inner = fold_key(inner);
@@ -100,7 +116,7 @@ fn containment_pairs(keys: &[String]) -> Vec<Pair> {
         }
         let mut taken = 0;
         for outer in keys {
-            if inner == outer || taken >= MAX_PER_KEY {
+            if inner == outer || taken >= MAX_PER_KEY || !comparable(inner, outer) {
                 continue;
             }
             let folded_outer = fold_key(outer);
@@ -114,7 +130,8 @@ fn containment_pairs(keys: &[String]) -> Vec<Pair> {
             }
         }
     }
-    pairs.into_iter().collect()
+    // Bounded overall: the set is ordered, so the cut is reproducible.
+    pairs.into_iter().take(MAX_PAIRS).collect()
 }
 
 /// Ask the model which containment pairs name one entity. Anything it does not
@@ -124,6 +141,7 @@ fn adjudicate(
     chat: &dyn Chat,
     pairs: &[Pair],
     descriptions: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
     report: &mut IdentityReport,
 ) -> Result<Renames> {
     if pairs.is_empty() {
@@ -160,8 +178,9 @@ fn adjudicate(
         for key in described {
             if seen.insert(key) {
                 let d = &descriptions[key];
+                let label = labels.get(key).map(String::as_str).unwrap_or("");
                 user.push_str(&format!(
-                    "{key}: {}\n",
+                    "{key} [{label}]: {}\n",
                     d.chars().take(160).collect::<String>()
                 ));
             }
@@ -201,6 +220,7 @@ pub(crate) fn resolve(
     chat: &dyn Chat,
     counts: &BTreeMap<String, usize>,
     descriptions: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
 ) -> Result<(Renames, IdentityReport)> {
     let mut report = IdentityReport {
         before: counts.len(),
@@ -220,8 +240,8 @@ pub(crate) fn resolve(
         .filter(|k| !folded.contains_key(*k))
         .cloned()
         .collect();
-    let pairs = containment_pairs(&survivors);
-    let merged = adjudicate(chat, &pairs, descriptions, &mut report)?;
+    let pairs = containment_pairs(&survivors, labels);
+    let merged = adjudicate(chat, &pairs, descriptions, labels, &mut report)?;
     report.merged = merged.len();
 
     let mut renames = folded;
@@ -264,7 +284,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let pairs = containment_pairs(&keys);
+        let pairs = containment_pairs(&keys, &BTreeMap::new());
         assert!(pairs.iter().any(|p| p.inner == "K" && p.outer == "Key"));
         assert!(
             pairs
@@ -284,7 +304,7 @@ mod tests {
             ("Transformer", 9),
             ("Transformer (big)", 4),
         ]);
-        let (renames, report) = resolve(&chat, &c, &BTreeMap::new()).unwrap();
+        let (renames, report) = resolve(&chat, &c, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(renames.get("K"), Some(&"Key".to_string()));
         assert!(
             !renames.contains_key("Transformer"),
@@ -305,7 +325,7 @@ mod tests {
         ] {
             let chat = MockProvider::new(vec![reply.into()], 4);
             let c = counts(&[("Trans", 1), ("Transformer", 1)]);
-            let (renames, _) = resolve(&chat, &c, &BTreeMap::new()).unwrap();
+            let (renames, _) = resolve(&chat, &c, &BTreeMap::new(), &BTreeMap::new()).unwrap();
             assert!(renames.is_empty(), "reply {reply:?} should merge nothing");
         }
     }
@@ -322,7 +342,13 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (renames, report) = resolve(&chat, &counts(&[("K", 1), ("Key", 1)]), &d).unwrap();
+        let (renames, report) = resolve(
+            &chat,
+            &counts(&[("K", 1), ("Key", 1)]),
+            &d,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(renames["K"], "Key");
         assert_eq!(report.adjudicated, 1);
     }
@@ -335,9 +361,64 @@ mod tests {
             &chat,
             &counts(&[("alpha", 1), ("beta", 1)]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(renames.is_empty());
         assert_eq!(report.chat_requests, 0, "no candidate pairs, no call");
+    }
+
+    #[test]
+    fn a_label_disagreement_blocks_the_pair_before_it_is_asked() {
+        // The live failure: a technique swallowed by the paper about it. The
+        // model was told not to and did it anyway; the labels settle it for
+        // free, so the pair is never put.
+        let labels: BTreeMap<String, String> = [
+            ("dropout".to_string(), "Technique".to_string()),
+            (
+                "Dropout: a simple way to prevent overfitting".to_string(),
+                "Paper".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let keys: Vec<String> = labels.keys().cloned().collect();
+        assert!(
+            containment_pairs(&keys, &labels).is_empty(),
+            "a Technique and a Paper are not two names for one thing"
+        );
+        // The same names with one label agree ⇒ still asked.
+        let agreeing: BTreeMap<String, String> = keys
+            .iter()
+            .map(|k| (k.clone(), "Technique".to_string()))
+            .collect();
+        assert_eq!(containment_pairs(&keys, &agreeing).len(), 1);
+    }
+
+    #[test]
+    fn an_unlabelled_entity_is_still_judged_on_its_name() {
+        let labels: BTreeMap<String, String> = [("Key".to_string(), "Matrix".to_string())]
+            .into_iter()
+            .collect();
+        let keys = vec!["K".to_string(), "Key".to_string()];
+        assert_eq!(
+            containment_pairs(&keys, &labels).len(),
+            1,
+            "no label on one side is no evidence, not a veto"
+        );
+    }
+
+    #[test]
+    fn the_model_never_sees_an_unbounded_pair_list() {
+        // Every key contains "a", so without a cap this would be quadratic.
+        let keys: Vec<String> = (0..400).map(|i| format!("a{i}")).collect();
+        let pairs = containment_pairs(&keys, &BTreeMap::new());
+        assert!(
+            pairs.len() <= 200,
+            "pair list must stay bounded: {}",
+            pairs.len()
+        );
+        // And the cut is reproducible.
+        assert_eq!(pairs, containment_pairs(&keys, &BTreeMap::new()));
     }
 }

@@ -217,7 +217,7 @@ const CHUNK_B: &str = r#"{
 /// The label vocabulary needs no model at all here — folding collapses the two
 /// spellings to one name, and one name is canonical by definition — so only the
 /// edge types, which no string rule can equate, reach the model.
-const TYPE_MERGE: &str = r#"{"merge":{"CONTRASTS_WITH":"COMPARED_WITH"}}"#;
+const TYPE_MERGE: &str = r#"{"groups":[["COMPARED_WITH","CONTRASTS_WITH"]]}"#;
 
 /// Two paragraphs that cannot share a chunk: `chunk` floors the target size at
 /// 200 characters, so each paragraph is 150 and the pair overruns it.

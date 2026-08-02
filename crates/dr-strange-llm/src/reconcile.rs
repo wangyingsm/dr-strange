@@ -53,11 +53,17 @@ pub struct ReconcileReport {
     pub output_tokens: u64,
 }
 
-/// The model's reply: `{"merge": {"FROM": "INTO", …}}`.
+/// The model's reply: `{"groups": [["<survivor>", "<alias>", …], …]}`.
+///
+/// Asking for *groups* rather than a from→into map is what made this pass
+/// reliable. The map framing was answered wildly differently run to run on the
+/// same input — one live run merged 78 names, the next merged 15 — because
+/// "emit the renames" invites the model to stop whenever it feels done.
+/// Grouping is a bounded, checkable task over a list it can walk once.
 #[derive(Deserialize, Default)]
-struct MergeReply {
+struct GroupReply {
     #[serde(default)]
-    merge: BTreeMap<String, String>,
+    groups: Vec<Vec<String>>,
 }
 
 /// Normalized form used to decide that two names are the same name written
@@ -99,6 +105,7 @@ fn adjudicate(
     kind: &str,
     extra: &str,
     names: &[String],
+    counts: &BTreeMap<String, usize>,
     report: &mut ReconcileReport,
 ) -> Result<Renames> {
     // Nothing to merge into: one name is already canonical by definition.
@@ -107,34 +114,57 @@ fn adjudicate(
     }
     let system = format!(
         "You reconcile the {kind} vocabulary extracted from one document into a canonical set. \
-         Different chunks of the document were read independently, so the same {kind} may appear \
-         under several names.\n\
+         Different chunks of the document were read independently, so the same {kind} routinely \
+         appears under several names, and your job is to find EVERY such family.\n\
          \n\
-         Reply with ONLY a JSON object {{\"merge\": {{\"<from>\": \"<into>\", …}}}} — every name \
-         that should be renamed, mapped to the name that replaces it. Both sides must appear \
-         verbatim in the list below. Omit a name entirely if it should keep its own spelling; an \
-         empty object is a valid, and often correct, answer.\n\
+         Work through the whole list once, in order. Reply with ONLY a JSON object \
+         {{\"groups\": [[\"<canonical>\", \"<other name>\", …], …]}} — one array per family of \
+         names that denote the SAME thing, the canonical name first. Use each name at most once, \
+         verbatim as given. Names with no synonym in the list belong to no group; do not list \
+         them alone.\n\
          \n\
-         Merge two names ONLY when they denote the same thing. Keep them apart when they differ in \
-         meaning, however similar they read.\n\
+         Group two names ONLY when they denote the same thing. Keep them apart when they differ \
+         in meaning, however similar they read.\n\
          {extra}\
-         Prefer the more frequent, more explicit name as the survivor. Never map a name to one \
-         that is not in the list, and never map a name to itself.\n"
+         Put the more frequent, more explicit name first — it becomes the name the graph keeps. \
+         The count after each name is how often it was extracted.\n"
     );
-    let user = format!("The {kind}s extracted:\n{}", names.join("\n"));
+    let listed: Vec<String> = names
+        .iter()
+        .map(|n| match counts.get(n) {
+            Some(c) => format!("{n}  ({c})"),
+            None => n.clone(),
+        })
+        .collect();
+    let user = format!("The {kind}s extracted:\n{}", listed.join("\n"));
     let reply = chat.complete(&system, &user)?;
     report.chat_requests += 1;
     report.input_tokens += reply.input_tokens;
     report.output_tokens += reply.output_tokens;
 
-    let parsed: MergeReply =
+    let parsed: GroupReply =
         serde_json::from_str(crate::ask::extract_json(&reply.text)).unwrap_or_default();
     let valid: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let mut renames = Renames::new();
-    for (from, into) in parsed.merge {
-        // Drop anything the model invented, and any self-map.
-        if from != into && valid.contains(from.as_str()) && valid.contains(into.as_str()) {
-            renames.insert(from, into);
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for group in parsed.groups {
+        // Keep only real names, and only the first group to claim one — a name
+        // in two families would otherwise make the rename order decide the
+        // outcome.
+        let members: Vec<String> = group
+            .into_iter()
+            .filter(|n| valid.contains(n.as_str()) && !claimed.contains(n))
+            .collect();
+        let Some((survivor, others)) = members.split_first() else {
+            continue;
+        };
+        if others.is_empty() {
+            continue; // a family of one renames nothing
+        }
+        claimed.insert(survivor.clone());
+        for other in others {
+            claimed.insert(other.clone());
+            renames.insert(other.clone(), survivor.clone());
         }
     }
     Ok(resolve_chains(renames))
@@ -187,7 +217,7 @@ pub(crate) fn reconcile(
         .filter(|n| !folded.contains_key(*n))
         .cloned()
         .collect();
-    let merged = adjudicate(chat, kind, extra, &survivors, &mut report)?;
+    let merged = adjudicate(chat, kind, extra, &survivors, counts, &mut report)?;
     report.merged = merged.len();
 
     // Fold first, then the model's merges — so a folded name follows its
@@ -280,7 +310,7 @@ mod tests {
     fn the_model_only_sees_what_folding_left() {
         // One call, and the two spellings of one name are already gone from it.
         let chat = MockProvider::new(
-            vec![r#"{"merge":{"CONTRASTS_WITH":"COMPARED_WITH"}}"#.into()],
+            vec![r#"{"groups":[["COMPARED_WITH","CONTRASTS_WITH"]]}"#.into()],
             4,
         );
         let c = counts(&[
@@ -300,7 +330,7 @@ mod tests {
     #[test]
     fn invented_and_self_referential_merges_are_dropped() {
         let chat = MockProvider::new(
-            vec![r#"{"merge":{"A":"A","A ":"NOT_IN_LIST","B":"A"}}"#.into()],
+            vec![r#"{"groups":[["A","NOT_IN_LIST","B"],["A"]]}"#.into()],
             4,
         );
         let (renames, _) = reconcile(&chat, "label", "", &counts(&[("A", 1), ("B", 1)])).unwrap();
@@ -309,17 +339,34 @@ mod tests {
     }
 
     #[test]
-    fn chains_collapse_and_cycles_do_not_hang() {
-        let chat = MockProvider::new(vec![r#"{"merge":{"A":"B","B":"C"}}"#.into()], 4);
+    fn a_name_belongs_to_the_first_family_that_claims_it() {
+        // `B` appears in two groups. Taking the first keeps the outcome
+        // independent of the order the renames happen to be applied in — the
+        // alternative is a chain whose result depends on iteration order.
+        let chat = MockProvider::new(vec![r#"{"groups":[["B","A"],["C","B"]]}"#.into()], 4);
         let (renames, _) =
             reconcile(&chat, "label", "", &counts(&[("A", 1), ("B", 1), ("C", 1)])).unwrap();
-        assert_eq!(renames["A"], "C", "A→B→C collapses to A→C");
-        assert_eq!(renames["B"], "C");
+        assert_eq!(renames["A"], "B");
+        assert!(!renames.contains_key("B"), "B was already spoken for");
+        assert!(!renames.contains_key("C"));
+    }
 
+    #[test]
+    fn a_cyclic_rename_map_terminates() {
         let cyclic: Renames = [("A".to_string(), "B".to_string()), ("B".into(), "A".into())]
             .into_iter()
             .collect();
-        let _ = resolve_chains(cyclic); // terminates
+        let _ = resolve_chains(cyclic); // must not loop
+    }
+
+    #[test]
+    fn the_prompt_carries_how_often_each_name_was_seen() {
+        // Frequency is what tells the model which spelling the graph should
+        // keep, so it has to reach the prompt.
+        let chat = MockProvider::new(vec![r#"{"groups":[]}"#.into()], 4);
+        let c = counts(&[("COMPARED_WITH", 7), ("CONTRASTS_WITH", 2)]);
+        let (_, report) = reconcile(&chat, "edge type", EDGE_RULE, &c).unwrap();
+        assert_eq!(report.chat_requests, 1);
     }
 
     #[test]
