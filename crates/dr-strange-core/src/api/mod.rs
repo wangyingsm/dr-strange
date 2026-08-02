@@ -22,8 +22,10 @@ use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOp
 use crate::compute::catalog::{self, CatalogSnapshot};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
-use crate::compute::hybrid::{self, Channel, HybridHit, HybridWeights};
-use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
+use crate::compute::hybrid::{
+    self, GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, VectorChannel,
+};
+use crate::compute::plan::{Algo, LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
@@ -676,6 +678,9 @@ impl<'db> PlaneHandle<'db> {
     /// this snapshot's commit seq). The query/algorithm/hybrid terminals use it.
     fn with_reader<T>(&self, f: impl FnOnce(&CachedReader) -> Result<T>) -> Result<T> {
         let registry = self.db.indexes();
+        // The BM25 registry rides along too, so a plan's keyword/hybrid source
+        // can search it through the same reader (no second lock inside exec).
+        let keywords = self.db.keywords();
         let cache = &self.db.cache;
         // A time-travelling read drops the live vector index (built from the
         // latest commit, so it can't answer a past snapshot); its vector
@@ -693,7 +698,8 @@ impl<'db> PlaneHandle<'db> {
                 CachedReader::with_cache_no_index(txn, self.id, cache, seq)
             } else {
                 CachedReader::with_cache(txn, self.id, &registry, cache, seq)
-            };
+            }
+            .with_keywords(&keywords);
             f(&reader)
         })
     }
@@ -818,13 +824,15 @@ impl<'db> PlaneHandle<'db> {
     pub fn hybrid(&self) -> HybridBuilder<'db> {
         HybridBuilder {
             plane: *self,
-            label: None,
-            vector: None,
-            keyword: None,
-            graph: None,
-            weights: HybridWeights::default(),
-            candidates: 100,
-            k: 10,
+            spec: HybridSpec {
+                label: None,
+                vector: None,
+                keyword: None,
+                graph: None,
+                weights: HybridWeights::default(),
+                candidates: 100,
+                k: 10,
+            },
         }
     }
 
@@ -1711,6 +1719,38 @@ impl<'db> QueryBuilder<'db> {
         self
     }
 
+    /// BM25 keyword search (ROADMAP §2): the `k` nodes whose `property` best
+    /// matches `query`, seeded with their relevance score. Needs a keyword
+    /// index declared on `(label, property)`; empty without one.
+    pub fn keyword_top_k(mut self, label: &str, property: &str, query: &str, k: u64) -> Self {
+        self.plan.source = Source::KeywordTopK {
+            label: label.to_string(),
+            property: property.to_string(),
+            query: query.to_string(),
+            k,
+        };
+        self
+    }
+
+    /// Fused vector + keyword + graph-proximity retrieval as the source, so
+    /// the pipeline can traverse and filter onward from the fused hits. Build
+    /// `spec` with [`PlaneHandle::hybrid`] and [`HybridBuilder::spec`].
+    pub fn hybrid(mut self, spec: HybridSpec) -> Self {
+        self.plan.source = Source::Hybrid(Box::new(spec));
+        self
+    }
+
+    /// A graph algorithm as the source (ROADMAP §1): its nodes become the
+    /// rows, carrying the per-node result in the score channel. `label`
+    /// scopes the algorithm's universe.
+    pub fn algo(mut self, label: Option<&str>, algo: Algo) -> Self {
+        self.plan.source = Source::Algo {
+            label: label.map(str::to_string),
+            algo,
+        };
+        self
+    }
+
     // ---- steps -----------------------------------------------------------
 
     /// 1-hop expansion in `dir`; `edge_type = None` means any type.
@@ -2026,23 +2066,6 @@ impl<'db> AlgoBuilder<'db> {
 
 // ---- hybrid retrieval (ROADMAP §2) ---------------------------------------
 
-struct VectorChannelCfg {
-    property: String,
-    query: Vec<f32>,
-    metric: Metric,
-}
-
-struct KeywordChannelCfg {
-    property: String,
-    query: String,
-}
-
-struct GraphChannelCfg {
-    hops: u32,
-    decay: f32,
-    seeds: usize,
-}
-
 /// Number of top hits per primary channel used to seed the graph-proximity
 /// channel, when `.graph(..)` is enabled without an explicit seed count.
 const DEFAULT_GRAPH_SEEDS: usize = 10;
@@ -2054,27 +2077,21 @@ const DEFAULT_GRAPH_SEEDS: usize = 10;
 /// the query text server-side first.
 pub struct HybridBuilder<'db> {
     plane: PlaneHandle<'db>,
-    label: Option<String>,
-    vector: Option<VectorChannelCfg>,
-    keyword: Option<KeywordChannelCfg>,
-    graph: Option<GraphChannelCfg>,
-    weights: HybridWeights,
-    candidates: usize,
-    k: usize,
+    spec: HybridSpec,
 }
 
 impl<'db> HybridBuilder<'db> {
     /// Scope every channel to nodes carrying this label. Required when the
     /// keyword channel is used (its index is keyed on the label).
     pub fn label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(label.into());
+        self.spec.label = Some(label.into());
         self
     }
 
     /// Add the vector channel over `property`, ranking by distance to the
     /// (already embedded) `query` vector under `metric`.
     pub fn vector(mut self, property: impl Into<String>, query: Vec<f32>, metric: Metric) -> Self {
-        self.vector = Some(VectorChannelCfg {
+        self.spec.vector = Some(VectorChannel {
             property: property.into(),
             query,
             metric,
@@ -2084,7 +2101,7 @@ impl<'db> HybridBuilder<'db> {
 
     /// Add the BM25 keyword channel over `property` for the text `query`.
     pub fn keyword(mut self, property: impl Into<String>, query: impl Into<String>) -> Self {
-        self.keyword = Some(KeywordChannelCfg {
+        self.spec.keyword = Some(KeywordChannel {
             property: property.into(),
             query: query.into(),
         });
@@ -2094,7 +2111,7 @@ impl<'db> HybridBuilder<'db> {
     /// Add the graph-proximity channel: seed from the strongest vector/keyword
     /// hits, expand `hops` outward, decaying the boost by `decay` per hop.
     pub fn graph(mut self, hops: u32, decay: f32) -> Self {
-        self.graph = Some(GraphChannelCfg {
+        self.spec.graph = Some(GraphChannel {
             hops,
             decay,
             seeds: DEFAULT_GRAPH_SEEDS,
@@ -2105,96 +2122,37 @@ impl<'db> HybridBuilder<'db> {
     /// Override the per-channel fusion weights (defaults: vector 1, keyword 1,
     /// graph 0.5).
     pub fn weights(mut self, weights: HybridWeights) -> Self {
-        self.weights = weights;
+        self.spec.weights = weights;
         self
     }
 
     /// Per-channel candidate pool size fetched before fusion (default 100).
     pub fn candidates(mut self, candidates: usize) -> Self {
-        self.candidates = candidates.max(1);
+        self.spec.candidates = candidates.max(1);
         self
     }
 
     /// Number of fused results to return (default 10).
     pub fn k(mut self, k: usize) -> Self {
-        self.k = k;
+        self.spec.k = k;
         self
+    }
+
+    /// The assembled query, ready to run — or to carry in a `Source::Hybrid`
+    /// plan node so the same search can ride over the wire.
+    pub fn spec(&self) -> &HybridSpec {
+        &self.spec
     }
 
     /// Run the query: gather each enabled channel over one read snapshot and
     /// fuse them. Errors if the keyword channel is used without a label.
+    ///
+    /// The reader honours this handle's AS OF snapshot, so a hybrid search can
+    /// run over historical state (its vector channel then scans rather than
+    /// using the live index, which only answers the latest commit).
     pub fn run(&self) -> Result<Vec<HybridHit>> {
-        let plane_id = self.plane.id;
-        let label = self.label.as_deref();
-        let registry = self.plane.db.indexes();
-        let cache = &self.plane.db.cache;
-        // `with_read` honours the plane handle's AS OF snapshot, so a hybrid
-        // search can run over historical state too.
-        self.plane.with_read(|txn| {
-            let seq = graph::read_commit_seq(txn)?;
-            let reader = CachedReader::with_cache(txn, plane_id, &registry, cache, seq);
-
-            let vector_ch = match &self.vector {
-                Some(v) => {
-                    let hits = reader.vector_search(
-                        label,
-                        &v.property,
-                        &v.query,
-                        v.metric,
-                        self.candidates,
-                    )?;
-                    Some(Channel {
-                        hits: hits
-                            .into_iter()
-                            .map(|h| (NodeId(h.id), h.distance))
-                            .collect(),
-                        higher_better: false,
-                    })
-                }
-                None => None,
-            };
-
-            let keyword_ch = match &self.keyword {
-                Some(kw) => {
-                    let label = label.ok_or_else(|| {
-                        Error::InvalidArgument(
-                            "hybrid keyword channel requires a label (.label(..))".into(),
-                        )
-                    })?;
-                    let hits = self
-                        .plane
-                        .db
-                        .keywords()
-                        .search(plane_id, label, &kw.property, &kw.query, self.candidates)
-                        .unwrap_or_default();
-                    Some(Channel {
-                        hits,
-                        higher_better: true,
-                    })
-                }
-                None => None,
-            };
-
-            let graph_ch = match &self.graph {
-                Some(g) => {
-                    let seeds = hybrid::top_seeds(&vector_ch, &keyword_ch, g.seeds);
-                    let prox = hybrid::graph_proximity(&reader, &seeds, g.hops, g.decay)?;
-                    Some(Channel {
-                        hits: prox,
-                        higher_better: true,
-                    })
-                }
-                None => None,
-            };
-
-            Ok(hybrid::fuse(
-                vector_ch,
-                keyword_ch,
-                graph_ch,
-                self.weights,
-                self.k,
-            ))
-        })
+        self.plane
+            .with_reader(|reader| hybrid::run(reader, &self.spec))
     }
 }
 

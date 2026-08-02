@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Result as AnyResult;
 use dr_strange_core::{
     Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions,
-    Properties, ShortestPathOptions, json,
+    PlaneHandle, Properties, ShortestPathOptions, json,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -630,6 +630,27 @@ impl dr_strange_parser::Embedder for LlmEmbedder {
     }
 }
 
+/// Pin a plane handle to the snapshot a query's `AS OF` clause names
+/// (ROADMAP §4); the native backend is the only one that keeps history.
+#[cfg(feature = "native-backend")]
+fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> AnyResult<PlaneHandle<'_>> {
+    use dr_strange_core::AsOf;
+    use dr_strange_parser::AsOfSpec;
+    Ok(match at {
+        None => p,
+        Some(AsOfSpec::Seq(seq)) => p.as_of(AsOf::Seq(seq))?,
+        Some(AsOfSpec::Time(ms)) => p.as_of(AsOf::Time(ms))?,
+    })
+}
+
+#[cfg(not(feature = "native-backend"))]
+fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> AnyResult<PlaneHandle<'_>> {
+    if at.is_some() {
+        anyhow::bail!("AS OF (time-travel) requires the native backend");
+    }
+    Ok(p)
+}
+
 fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     let provider = req.embed.as_deref().unwrap_or("openai");
     let embedder = dr_strange_llm::build_provider(provider, None, None, None, true)
@@ -650,9 +671,11 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let plane = db.plane(&req.plane)?;
     match stmt {
-        dr_strange_parser::Statement::Read(plan) => {
-            Ok(scored_rows(&plane.query_from_plan(plan).scored_nodes()?))
-        }
+        dr_strange_parser::Statement::Read(read) => Ok(scored_rows(
+            &pin(plane, read.as_of)?
+                .query_from_plan(read.plan)
+                .scored_nodes()?,
+        )),
         dr_strange_parser::Statement::Write(w) => {
             let s = w.apply(&plane).map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(jval!({
@@ -906,12 +929,28 @@ impl DrStrange {
     }
 
     #[tool(description = "Run a statement in the openCypher-subset query \
-        language. Reads (MATCH one linear path with labels/->/<-/- and bounded \
-        *m..n, SEARCH vector top-k, BEAM similarity traversal, WHERE, RETURN \
-        [DISTINCT]/ORDER BY/SKIP/LIMIT) return the matching node records. \
-        Writes (CREATE) mutate the plane and return change-counts. Prefer this \
-        over the raw `query` plan for readability. Examples: \
+        language — the whole engine through one surface, and the preferred \
+        alternative to the raw `query` plan. Reads return the matching node \
+        records; score() carries the seed's relevance or an algorithm's \
+        per-node result. Every source binds one node pattern and may continue \
+        with a typed hop (put hops in the pattern, before WHERE): \
+        MATCH one linear path (labels, ->/<-/-, bounded *m..n); \
+        SEARCH (v:L) ON prop NEAR \"text\"|[..] [METRIC m] [TOPK k] — vector \
+        top-k; SEARCH (v:L) ON prop MATCHING \"text\" [TOPK k] — BM25 keyword \
+        search (label required); HYBRID (v:L) [VECTOR ON p NEAR q [WEIGHT w]] \
+        [KEYWORD ON p MATCHING \"text\" [WEIGHT w]] [GRAPH HOPS h DECAY d \
+        [WEIGHT w]] [CANDIDATES n] [TOPK k] — fused retrieval; \
+        CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \
+        algorithms. Then BEAM similarity traversal, WHERE (property/label \
+        tests, key(n) for a node's external key, x IN [a,b]), \
+        RETURN [DISTINCT], ORDER BY/SKIP/LIMIT, and a trailing \
+        AS OF <seq|\"RFC-3339\"|TIME ms> to read a past snapshot. \
+        Writes (CREATE/MERGE/SET/REMOVE/DELETE) mutate the plane and return \
+        change-counts. Examples: \
         `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`; \
+        `MATCH (n)-[:KNOWS]->(m) WHERE key(n) = \"alice\" RETURN m`; \
+        `SEARCH (d:Doc) ON body MATCHING \"graph database\" TOPK 5 RETURN d`; \
+        `CALL pagerank() ON (n:Paper) RETURN n ORDER BY score() DESC LIMIT 10`; \
         `CREATE (a:Person {key:\"alice\", age:30})-[:KNOWS]->(b:Person {key:\"bob\"})`.")]
     async fn cypher(
         &self,

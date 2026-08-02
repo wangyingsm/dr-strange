@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::index::VectorRegistry;
+use crate::keyword::KeywordRegistry;
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
 use crate::storage::vector::{Hit, Metric, top_k};
@@ -70,6 +71,21 @@ pub trait GraphReader {
         k: usize,
     ) -> Result<Vec<Hit>> {
         brute_force_search(self, label, property, query, metric, k)
+    }
+
+    /// BM25 keyword search for `KeywordTopK` and the hybrid keyword channel:
+    /// the `k` best-matching nodes on `(label, property)`, as `(id, score)`,
+    /// most-relevant first. Unlike vector search there is no brute-force
+    /// fallback — BM25 needs the inverted index — so a reader with no keyword
+    /// registry (or a pair with no declared index) yields nothing.
+    fn keyword_search(
+        &self,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        Ok(Vec::new())
     }
 }
 
@@ -229,6 +245,9 @@ pub struct CachedReader<'a> {
     txn: &'a dyn ReadTransaction,
     plane: PlaneId,
     registry: Option<&'a VectorRegistry>,
+    /// Declared BM25 indexes (a read-locked view for the query's lifetime).
+    /// `None` ⇒ `keyword_search` yields nothing — there is no unindexed path.
+    keywords: Option<&'a KeywordRegistry>,
     /// Optional shared cross-query L2 (arch/02 §3). `None` ⇒ pure per-query
     /// (L1 only) — used by tests and the differential oracle.
     l2: Option<(&'a GraphCache, u64)>,
@@ -278,6 +297,14 @@ impl<'a> CachedReader<'a> {
         Self::build(txn, plane, None, Some((cache, seq)))
     }
 
+    /// Attach the declared keyword indexes, enabling `keyword_search`. Chained
+    /// onto a constructor rather than threaded through each one — only the
+    /// query path needs it, and the two registries are locked separately.
+    pub(crate) fn with_keywords(mut self, keywords: &'a KeywordRegistry) -> Self {
+        self.keywords = Some(keywords);
+        self
+    }
+
     fn build(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
@@ -288,6 +315,7 @@ impl<'a> CachedReader<'a> {
             txn,
             plane,
             registry,
+            keywords: None,
             l2,
             nodes: RefCell::new(HashMap::new()),
             edges: RefCell::new(HashMap::new()),
@@ -386,6 +414,19 @@ impl GraphReader for CachedReader<'_> {
             metric,
             k,
         )
+    }
+
+    fn keyword_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        Ok(self
+            .keywords
+            .and_then(|reg| reg.search(self.plane, label, property, query, k))
+            .unwrap_or_default())
     }
 }
 

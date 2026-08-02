@@ -167,6 +167,21 @@ fn comparison(i: &str) -> IResult<&str, PExpr> {
         return Ok((rest, out));
     }
 
+    // `x IN [a, b, …]` — sugar the compiler expands into equalities (and, on
+    // `key(n)` at the source, into a multi-key seek).
+    if let Ok((rest, _)) = kw("in")(i) {
+        let (rest, _) = symbol("[")(rest)?;
+        let (rest, list) = separated_list0(symbol(","), expr)(rest)?;
+        let (rest, _) = symbol("]")(rest)?;
+        return Ok((
+            rest,
+            PExpr::In {
+                lhs: Box::new(lhs),
+                list,
+            },
+        ));
+    }
+
     // an optional binary comparison
     match cmp_op(i) {
         Ok((rest, op)) => {
@@ -285,6 +300,12 @@ fn func_call<'a>(name: &str, i: &'a str) -> IResult<&'a str, PExpr> {
         "hops" => {
             let (i, _) = symbol(")")(i)?;
             Ok((i, PExpr::Hops))
+        }
+        // `key(v)` — the node's external key.
+        "key" => {
+            let (i, var) = ident(i)?;
+            let (i, _) = symbol(")")(i)?;
+            Ok((i, PExpr::ExternalKey { var }))
         }
         "similarity" | "distance" => {
             let (i, (var, key)) = prop_ref(i)?;
@@ -483,13 +504,14 @@ fn order_key(i: &str) -> IResult<&str, OrderKey> {
 }
 
 /// The clauses shared by every query, after its source: an optional WHERE, a
-/// RETURN, then optional ORDER BY / SKIP / LIMIT.
+/// RETURN, then optional ORDER BY / SKIP / LIMIT / AS OF.
 type Tail = (
     Option<PExpr>,
     Return,
     Vec<OrderKey>,
     Option<u64>,
     Option<u64>,
+    Option<AsOfSpec>,
 );
 
 fn query_tail(i: &str) -> IResult<&str, Tail> {
@@ -503,6 +525,7 @@ fn query_tail(i: &str) -> IResult<&str, Tail> {
     ))(i)?;
     let (i, skip) = opt(preceded(kw("skip"), uint))(i)?;
     let (i, limit) = opt(preceded(kw("limit"), uint))(i)?;
+    let (i, as_of) = opt(as_of_clause)(i)?;
     Ok((
         i,
         (
@@ -514,14 +537,38 @@ fn query_tail(i: &str) -> IResult<&str, Tail> {
             order_by.unwrap_or_default(),
             skip,
             limit,
+            as_of,
         ),
     ))
+}
+
+/// `AS OF <seq>` (a commit sequence), `AS OF "2026-07-01T00:00:00Z"` (an
+/// RFC-3339 instant) or `AS OF TIME <ms>` (unix-epoch milliseconds). Last
+/// clause in a query, so it reads as a modifier over the whole thing.
+fn as_of_clause(i: &str) -> IResult<&str, AsOfSpec> {
+    let (i, _) = kw("as")(i)?;
+    let (i, _) = kw("of")(i)?;
+    alt((
+        // `TIME <ms>` — a raw epoch, the same address the RPC `as_of_ms` takes.
+        map(preceded(kw("time"), int), AsOfSpec::Time),
+        map_res(alt((quoted_str('\''), quoted_str('"'))), |s: String| {
+            rfc3339_to_epoch_ms(&s).map(AsOfSpec::Time).ok_or(())
+        }),
+        map(uint, AsOfSpec::Seq),
+    ))(i)
+}
+
+/// A signed integer (epoch milliseconds may predate 1970).
+fn int(i: &str) -> IResult<&str, i64> {
+    let (i, neg) = opt(symbol("-"))(i)?;
+    let (i, n) = map_res(preceded(multispace0, digit1), str::parse::<i64>)(i)?;
+    Ok((i, if neg.is_some() { -n } else { n }))
 }
 
 fn assemble(
     source: QuerySource,
     beams: Vec<BeamClause>,
-    (where_clause, ret, order_by, skip, limit): Tail,
+    (where_clause, ret, order_by, skip, limit, as_of): Tail,
 ) -> Query {
     Query {
         source,
@@ -531,7 +578,14 @@ fn assemble(
         order_by,
         skip,
         limit,
+        as_of,
     }
+}
+
+/// A source's relationship tail — the typed hops that may follow *any* seed,
+/// not just a `MATCH` node.
+fn source_tail(i: &str) -> IResult<&str, Vec<(RelPat, NodePat)>> {
+    many0(pair(rel_pat, node_pat))(i)
 }
 
 fn match_query(i: &str) -> IResult<&str, Query> {
@@ -539,30 +593,262 @@ fn match_query(i: &str) -> IResult<&str, Query> {
     let (i, pattern) = pattern(i)?;
     let (i, beams) = many0(beam_clause)(i)?;
     let (i, tail) = query_tail(i)?;
-    Ok((i, assemble(QuerySource::Match(pattern), beams, tail)))
+    let source = QuerySource {
+        kind: SourceKind::Match,
+        first: pattern.first,
+        rest: pattern.rest,
+    };
+    Ok((i, assemble(source, beams, tail)))
 }
 
-/// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` — the
-/// indexed vector seed (`Source::VectorTopK`).
+/// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` (the vector
+/// seed, `Source::VectorTopK`) or `SEARCH (v:Label) ON prop MATCHING "text"
+/// [TOPK k]` (the BM25 seed, `Source::KeywordTopK`). One verb, two operators:
+/// `NEAR` compares meaning, `MATCHING` compares words.
 fn search_query(i: &str) -> IResult<&str, Query> {
     let (i, _) = kw("search")(i)?;
-    let (i, node) = node_pat(i)?;
+    let (i, first) = node_pat(i)?;
+    let (i, _) = kw("on")(i)?;
+    let (i, property) = ident(i)?;
+    let (i, kind) = alt((
+        |i| {
+            let (i, _) = kw("near")(i)?;
+            let (i, query) = vec_arg(i)?;
+            let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
+            let (i, k) = opt(preceded(kw("topk"), uint))(i)?;
+            Ok((
+                i,
+                SourceKind::Search {
+                    property: property.clone(),
+                    query,
+                    metric: metric.unwrap_or(Metric::Cosine),
+                    k: k.unwrap_or(DEFAULT_TOPK),
+                },
+            ))
+        },
+        |i| {
+            let (i, _) = kw("matching")(i)?;
+            let (i, query) = alt((quoted_str('\''), quoted_str('"')))(i)?;
+            let (i, k) = opt(preceded(kw("topk"), uint))(i)?;
+            Ok((
+                i,
+                SourceKind::Keyword {
+                    property: property.clone(),
+                    query,
+                    k: k.unwrap_or(DEFAULT_TOPK),
+                },
+            ))
+        },
+    ))(i)?;
+    let (i, rest) = source_tail(i)?;
+    let (i, beams) = many0(beam_clause)(i)?;
+    let (i, tail) = query_tail(i)?;
+    Ok((i, assemble(QuerySource { kind, first, rest }, beams, tail)))
+}
+
+/// `HYBRID (v:Label) [VECTOR …] [KEYWORD …] [GRAPH …] [CANDIDATES n] [TOPK k]`
+/// — fused retrieval (`Source::Hybrid`). Channels may appear in any order.
+fn hybrid_query(i: &str) -> IResult<&str, Query> {
+    let (i, _) = kw("hybrid")(i)?;
+    let (i, first) = node_pat(i)?;
+    let (mut i, mut clause) = (
+        i,
+        HybridClause {
+            vector: None,
+            keyword: None,
+            graph: None,
+            candidates: None,
+            k: None,
+        },
+    );
+    // Each part is optional and order-free; stop at the first token that
+    // starts none of them (WHERE/RETURN/a relationship tail).
+    loop {
+        if let Ok((rest, v)) = hybrid_vector(i) {
+            clause.vector = Some(v);
+            i = rest;
+        } else if let Ok((rest, k)) = hybrid_keyword(i) {
+            clause.keyword = Some(k);
+            i = rest;
+        } else if let Ok((rest, g)) = hybrid_graph(i) {
+            clause.graph = Some(g);
+            i = rest;
+        } else if let Ok((rest, n)) = preceded(kw("candidates"), uint)(i) {
+            clause.candidates = Some(n);
+            i = rest;
+        } else if let Ok((rest, n)) = preceded(kw("topk"), uint)(i) {
+            clause.k = Some(n);
+            i = rest;
+        } else {
+            break;
+        }
+    }
+    let (i, rest) = source_tail(i)?;
+    let (i, beams) = many0(beam_clause)(i)?;
+    let (i, tail) = query_tail(i)?;
+    let source = QuerySource {
+        kind: SourceKind::Hybrid(clause),
+        first,
+        rest,
+    };
+    Ok((i, assemble(source, beams, tail)))
+}
+
+/// `VECTOR ON prop NEAR "text"|[..] [METRIC m] [WEIGHT w]`
+fn hybrid_vector(i: &str) -> IResult<&str, HybridVector> {
+    let (i, _) = kw("vector")(i)?;
     let (i, _) = kw("on")(i)?;
     let (i, property) = ident(i)?;
     let (i, _) = kw("near")(i)?;
     let (i, query) = vec_arg(i)?;
     let (i, metric) = opt(preceded(kw("metric"), metric_ident))(i)?;
-    let (i, k) = opt(preceded(kw("topk"), uint))(i)?;
+    let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
+    Ok((
+        i,
+        HybridVector {
+            property,
+            query,
+            metric: metric.unwrap_or(Metric::Cosine),
+            weight,
+        },
+    ))
+}
+
+/// `KEYWORD ON prop MATCHING "text" [WEIGHT w]`
+fn hybrid_keyword(i: &str) -> IResult<&str, HybridKeyword> {
+    let (i, _) = kw("keyword")(i)?;
+    let (i, _) = kw("on")(i)?;
+    let (i, property) = ident(i)?;
+    let (i, _) = kw("matching")(i)?;
+    let (i, query) = alt((quoted_str('\''), quoted_str('"')))(i)?;
+    let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
+    Ok((
+        i,
+        HybridKeyword {
+            property,
+            query,
+            weight,
+        },
+    ))
+}
+
+/// `GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]`
+fn hybrid_graph(i: &str) -> IResult<&str, HybridGraph> {
+    let (i, _) = kw("graph")(i)?;
+    let (i, _) = kw("hops")(i)?;
+    let (i, hops) = map_res(preceded(multispace0, digit1), str::parse::<u32>)(i)?;
+    let (i, _) = kw("decay")(i)?;
+    let (i, decay) = f32_num(i)?;
+    let (i, seeds) = opt(preceded(kw("seeds"), uint))(i)?;
+    let (i, weight) = opt(preceded(kw("weight"), f32_num))(i)?;
+    Ok((
+        i,
+        HybridGraph {
+            hops,
+            decay,
+            seeds,
+            weight,
+        },
+    ))
+}
+
+/// `CALL name(arg: value, …) ON (v[:Label])` — a graph algorithm as a source
+/// (`Source::Algo`). The `ON` node pattern both scopes the algorithm to a
+/// label and binds the variable the rest of the query names.
+fn call_query(i: &str) -> IResult<&str, Query> {
+    let (i, _) = kw("call")(i)?;
+    let (i, name) = ident(i)?;
+    let (i, _) = symbol("(")(i)?;
+    let (i, args) = separated_list0(symbol(","), call_arg)(i)?;
+    let (i, _) = symbol(")")(i)?;
+    let (i, _) = kw("on")(i)?;
+    let (i, first) = node_pat(i)?;
+    let (i, rest) = source_tail(i)?;
     let (i, beams) = many0(beam_clause)(i)?;
     let (i, tail) = query_tail(i)?;
-    let clause = SearchClause {
-        node,
-        property,
-        query,
-        metric: metric.unwrap_or(Metric::Cosine),
-        k: k.unwrap_or(DEFAULT_TOPK),
+    let source = QuerySource {
+        kind: SourceKind::Call(CallClause { name, args }),
+        first,
+        rest,
     };
-    Ok((i, assemble(QuerySource::Search(clause), beams, tail)))
+    Ok((i, assemble(source, beams, tail)))
+}
+
+/// One `name: value` algorithm argument.
+fn call_arg(i: &str) -> IResult<&str, (String, Val)> {
+    let (i, name) = ident(i)?;
+    let (i, _) = symbol(":")(i)?;
+    let (i, value) = prop_value(i)?;
+    Ok((i, (name, value)))
+}
+
+/// Convert an RFC-3339 instant to unix-epoch milliseconds, or `None` if it
+/// isn't one. Hand-rolled (`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`) so the
+/// parser keeps no date-time dependency; the date part uses Howard Hinnant's
+/// days-from-civil algorithm, which is exact for the proleptic Gregorian
+/// calendar.
+fn rfc3339_to_epoch_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || (b[10] != b'T' && b[10] != b't' && b[10] != b' ') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if s.as_bytes()[4] != b'-'
+        || s.as_bytes()[7] != b'-'
+        || s.as_bytes()[13] != b':'
+        || s.as_bytes()[16] != b':'
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
+
+    // Optional fractional seconds, then a mandatory zone.
+    let mut rest = &s[19..];
+    let mut millis = 0i64;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits: String = frac.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        // Truncate/pad to milliseconds.
+        let ms: String = digits.chars().chain("000".chars()).take(3).collect();
+        millis = ms.parse::<i64>().ok()?;
+        rest = &rest[1 + digits.len()..];
+    }
+    let offset_min = match rest.as_bytes().first() {
+        Some(b'Z') | Some(b'z') if rest.len() == 1 => 0,
+        Some(sign @ (b'+' | b'-')) if rest.len() == 6 && rest.as_bytes()[3] == b':' => {
+            let h = rest.get(1..3)?.parse::<i64>().ok()?;
+            let m = rest.get(4..6)?.parse::<i64>().ok()?;
+            if h > 23 || m > 59 {
+                return None;
+            }
+            if *sign == b'-' {
+                -(h * 60 + m)
+            } else {
+                h * 60 + m
+            }
+        }
+        _ => return None,
+    };
+
+    // days_from_civil: days since 1970-01-01, shifting the year to start in
+    // March so the leap day lands at the end of the era.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12; // March = 0
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(((days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60) * 1000) + millis)
 }
 
 /// A traversal direction keyword for `BEAM`.
@@ -611,7 +897,7 @@ const DEFAULT_TOPK: u64 = 10;
 /// Parse a whole read query. The public [`crate::parse`] wraps this and
 /// enforces that all input was consumed.
 pub fn query(i: &str) -> IResult<&str, Query> {
-    alt((match_query, search_query))(i)
+    alt((match_query, search_query, hybrid_query, call_query))(i)
 }
 
 // ---- write statements -----------------------------------------------------

@@ -24,6 +24,28 @@ fn plane<'db>(db: &'db Database, name: &str) -> Result<PlaneHandle<'db>> {
         .with_context(|| format!("no such plane '{name}'"))
 }
 
+/// Pin a plane handle to the snapshot a query's `AS OF` names (ROADMAP §4).
+#[cfg(feature = "native-backend")]
+fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> Result<PlaneHandle<'_>> {
+    use dr_strange_core::AsOf;
+    use dr_strange_parser::AsOfSpec;
+    Ok(match at {
+        None => p,
+        Some(AsOfSpec::Seq(seq)) => p.as_of(AsOf::Seq(seq))?,
+        Some(AsOfSpec::Time(ms)) => p.as_of(AsOf::Time(ms))?,
+    })
+}
+
+/// Other backends keep no history, so an `AS OF` query is refused outright
+/// rather than silently reading the present.
+#[cfg(not(feature = "native-backend"))]
+fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> Result<PlaneHandle<'_>> {
+    if at.is_some() {
+        bail!("AS OF (time-travel) requires the native backend");
+    }
+    Ok(p)
+}
+
 pub fn init(path: &Path, out: &mut dyn Write) -> Result<()> {
     open(path)?;
     writeln!(out, "initialized dr-strange database at {}", path.display())?;
@@ -103,7 +125,7 @@ pub fn get(db: &Database, plane_name: &str, reference: &str, out: &mut dyn Write
 pub fn query(db: &Database, plane_name: &str, plan_json: &str, out: &mut dyn Write) -> Result<()> {
     let plan: LogicalPlan =
         serde_json::from_str(plan_json).context("parsing the query plan JSON")?;
-    run_plan(db, plane_name, plan, out)
+    run_plan(plane(db, plane_name)?, plan, out)
 }
 
 /// Run a statement written in the query language (arch/00 §5): a read compiles
@@ -120,7 +142,9 @@ pub fn cypher(
 ) -> Result<()> {
     let params = parse_params(param)?;
     match parse_stmt(query, embed, &params)? {
-        dr_strange_parser::Statement::Read(plan) => run_plan(db, plane_name, plan, out),
+        dr_strange_parser::Statement::Read(read) => {
+            run_plan(pin(plane(db, plane_name)?, read.as_of)?, read.plan, out)
+        }
         dr_strange_parser::Statement::Write(w) => {
             let p = plane(db, plane_name)?;
             let summary = w.apply(&p).map_err(|e| anyhow!("{e}"))?;
@@ -225,8 +249,7 @@ fn parse_stmt(
 
 /// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
 /// the similarity score when the plan produced one.
-fn run_plan(db: &Database, plane_name: &str, plan: LogicalPlan, out: &mut dyn Write) -> Result<()> {
-    let p = plane(db, plane_name)?;
+fn run_plan(p: PlaneHandle<'_>, plan: LogicalPlan, out: &mut dyn Write) -> Result<()> {
     for (node, score) in p.query_from_plan(plan).scored_nodes()? {
         let mut obj = jsonio::node_to_json(&node);
         if let (Some(s), Value::Object(map)) = (score, &mut obj) {

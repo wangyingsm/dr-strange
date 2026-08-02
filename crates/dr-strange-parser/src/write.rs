@@ -117,7 +117,11 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
             }
             // Compile the MATCH to a read plan returning the terminal node.
             let query = Query {
-                source: QuerySource::Match(m.pattern),
+                source: QuerySource {
+                    kind: SourceKind::Match,
+                    first: m.pattern.first,
+                    rest: m.pattern.rest,
+                },
                 beams: Vec::new(),
                 where_clause: m.where_clause,
                 ret: Return {
@@ -127,6 +131,8 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
                 order_by: Vec::new(),
                 skip: None,
                 limit: None,
+                // A write never time-travels: it targets the current state.
+                as_of: None,
             };
             let plan = crate::compile::compile(query, None, &params)?;
             Some((var, plan))

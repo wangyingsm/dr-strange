@@ -7,6 +7,26 @@ All notable changes to Dr Strange are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Query-language parity (ROADMAP §7).** The openCypher subset now reaches
+  every capability the engine has, so it is a complete alternative to
+  hand-writing plan JSON:
+  - `key(n)` reads a node's external key anywhere an expression is allowed; an
+    equality or `IN` on the source variable compiles to a `SeekKeys` seek
+    instead of a scan-and-filter.
+  - `SEARCH (d:Doc) ON body MATCHING "…" [TOPK k]` — BM25 keyword search, the
+    word-matching twin of the existing `NEAR` vector seed.
+  - `HYBRID (d:Doc) [VECTOR …] [KEYWORD …] [GRAPH …] [CANDIDATES n] [TOPK k]` —
+    fused retrieval with per-channel `WEIGHT`.
+  - `CALL <pagerank|components|shortest_path|louvain>(args) ON (n[:Label])` —
+    graph algorithms as a query source; the per-node result rides `score()`.
+  - A trailing `AS OF <seq|"RFC-3339"|TIME ms>` clause pins any read to a past
+    snapshot (native backend).
+  - Every source may carry a relationship tail, so a typed hop follows a
+    retrieval or algorithm seed; and `x IN [a, b]` works over any expression.
+- Matching plan sources — `Source::KeywordTopK`, `Source::Hybrid`,
+  `Source::Algo` — and `Expr::ExternalKey`, so `plane.query` and the SDKs reach
+  the same capabilities through serialized plans. `plane.hybrid()` and
+  `Source::Hybrid` now share one fusion implementation.
 - **One-line installers** for the released binaries — `scripts/install.sh`
   (Linux and macOS) and `scripts/install.ps1` (Windows). Each picks the archive
   for the host platform, verifies its published SHA-256, and installs `drsg`,

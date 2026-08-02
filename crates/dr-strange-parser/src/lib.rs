@@ -12,20 +12,43 @@
 //! LIMIT 10
 //! ```
 //!
-//! # Supported (this cut)
+//! # Supported
+//! Every source below binds one node pattern and may continue with a
+//! relationship tail, so a typed hop chains off a retrieval seed exactly as it
+//! does off a `MATCH` node (ROADMAP §7).
 //! - `MATCH` one linear path: `(a:Label)`, `-[:TYPE]->` / `<-[:TYPE]-` / `-[:T]-`
 //!   (in/out/both), bare `-->`/`--`, and bounded variable-length `-[:T*1..3]->`.
 //! - **`SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]`** — an
 //!   indexed vector seed (`Source::VectorTopK`). `"text"` is embedded server-side
 //!   via [`parse_with_embedder`]; `[..]` is a literal escape hatch.
+//! - **`SEARCH (v:Label) ON prop MATCHING "text" [TOPK k]`** — a BM25 keyword
+//!   seed (`Source::KeywordTopK`) over a declared keyword index. Same verb as
+//!   the vector seed, different operator: `NEAR` compares meaning, `MATCHING`
+//!   compares words.
+//! - **`HYBRID (v:Label) [VECTOR ON p NEAR q [METRIC m] [WEIGHT w]]
+//!   [KEYWORD ON p MATCHING "text" [WEIGHT w]]
+//!   [GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]] [CANDIDATES n] [TOPK k]`** —
+//!   fused retrieval (`Source::Hybrid`); channels in any order, at least one of
+//!   VECTOR/KEYWORD.
+//! - **`CALL <pagerank|components|shortest_path|louvain>(arg: v, …) ON (v[:Label])`**
+//!   — a graph algorithm as a source (`Source::Algo`). `ON` both scopes the
+//!   algorithm and binds the variable; the per-node result rides `score()`.
 //! - **`BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR "text"|[..]
 //!   [METRIC m] WIDTH w DEPTH d`** — similarity-guided beam traversal
-//!   (`Step::ExpandBeam`) from the current frontier; chains after MATCH/SEARCH.
+//!   (`Step::ExpandBeam`) from the current frontier; chains after any source.
 //! - `WHERE` over `=,<>,!=,<,<=,>,>=`, `AND`/`OR`/`NOT`, `+ - * /`, `IS [NOT] NULL`,
-//!   property access `a.key`, the label predicate `a:Label`, and the scoring
-//!   terms `score()`, `hops()`, `similarity(a.prop, "text"|[..][, metric])`,
-//!   `distance(...)` (usable in `ORDER BY` too — a brute-force rank).
+//!   `x IN [a, b]`, property access `a.key`, the label predicate `a:Label`, the
+//!   external key `key(a)`, and the scoring terms `score()`, `hops()`,
+//!   `similarity(a.prop, "text"|[..][, metric])`, `distance(...)` (usable in
+//!   `ORDER BY` too — a brute-force rank).
 //! - `RETURN [DISTINCT] <var|*>`, `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n`.
+//! - **`AS OF <seq|"RFC-3339"|TIME <ms>>`** — last clause; reads a past
+//!   snapshot (native backend). Not a plan node: it rides on [`ReadQuery`] for
+//!   the surface to apply with `PlaneHandle::as_of`.
+//!
+//! `key(n) = "…"` (or `key(n) IN […]`) on a scanned source compiles to a
+//! `SeekKeys` seek rather than a scan-and-filter — an index lookup, so an LLM
+//! can anchor on an entity it knows by key.
 //!
 //! # Writes (via [`parse_statement`], applied with [`WriteStatement::apply`])
 //! - `CREATE (n:L {k: v, …}), (a)-[:T {…}]->(b), …` — a string `key:` sets the
@@ -60,6 +83,7 @@ use std::collections::HashMap;
 
 use dr_strange_core::{LogicalPlan, PropValue};
 
+pub use ast::AsOfSpec;
 pub use write::{WriteStatement, WriteSummary};
 
 /// Values for `$name` placeholders in a query, supplied by the caller and
@@ -75,12 +99,23 @@ pub(crate) fn resolve_param(params: &Params, name: &str) -> Result<PropValue, St
         .ok_or_else(|| format!("unbound parameter `${name}`"))
 }
 
-/// A parsed statement: a read (a runnable [`LogicalPlan`]) or a write (applied
-/// with [`WriteStatement::apply`]). Surfaces branch on this to run a query.
+/// A parsed statement: a read (a runnable plan) or a write (applied with
+/// [`WriteStatement::apply`]). Surfaces branch on this to run a query.
 #[derive(Debug)]
 pub enum Statement {
-    Read(LogicalPlan),
+    Read(ReadQuery),
     Write(WriteStatement),
+}
+
+/// A compiled read: the plan to run, and the snapshot to run it against.
+///
+/// `AS OF` is not a plan node — it addresses the *plane handle* — so it rides
+/// alongside. A surface applies it with `PlaneHandle::as_of` before running
+/// the plan; `None` reads the latest commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadQuery {
+    pub plan: LogicalPlan,
+    pub as_of: Option<AsOfSpec>,
 }
 
 /// Resolves the text in a `SEARCH … NEAR "text"` (or `similarity(p, "text")`)
@@ -114,19 +149,17 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parse a *read* query into a [`LogicalPlan`]. A write statement (`CREATE`, …)
-/// is an error here — use [`parse_statement`]. A text `SEARCH … NEAR "…"` also
-/// errors (no embedder); use [`parse_with_embedder`] or a literal vector.
-pub fn parse(input: &str) -> Result<LogicalPlan, ParseError> {
+/// Parse a *read* query into a runnable [`ReadQuery`]. A write statement
+/// (`CREATE`, …) is an error here — use [`parse_statement`]. A text
+/// `SEARCH … NEAR "…"` also errors (no embedder); use [`parse_with_embedder`]
+/// or a literal vector.
+pub fn parse(input: &str) -> Result<ReadQuery, ParseError> {
     read_only(parse_statement_inner(input, None, &Params::new())?)
 }
 
 /// Like [`parse`], but resolves text `NEAR "…"` terms into query vectors via
 /// `embedder` — the semantic-search entry point the surfaces use for reads.
-pub fn parse_with_embedder(
-    input: &str,
-    embedder: &dyn Embedder,
-) -> Result<LogicalPlan, ParseError> {
+pub fn parse_with_embedder(input: &str, embedder: &dyn Embedder) -> Result<ReadQuery, ParseError> {
     read_only(parse_statement_inner(
         input,
         Some(embedder),
@@ -159,9 +192,9 @@ pub fn parse_statement_full(
     parse_statement_inner(input, embedder, params)
 }
 
-fn read_only(stmt: Statement) -> Result<LogicalPlan, ParseError> {
+fn read_only(stmt: Statement) -> Result<ReadQuery, ParseError> {
     match stmt {
-        Statement::Read(plan) => Ok(plan),
+        Statement::Read(read) => Ok(read),
         Statement::Write(_) => Err(ParseError::Compile(
             "this is a write statement; run it with parse_statement, not a read query".to_string(),
         )),
@@ -183,9 +216,11 @@ fn parse_statement_inner(
         )));
     }
     Ok(match stmt {
-        ast::StmtAst::Read(query) => Statement::Read(
-            compile::compile(*query, embedder, params).map_err(ParseError::Compile)?,
-        ),
+        ast::StmtAst::Read(query) => {
+            let as_of = query.as_of;
+            let plan = compile::compile(*query, embedder, params).map_err(ParseError::Compile)?;
+            Statement::Read(ReadQuery { plan, as_of })
+        }
         ast::StmtAst::Write(w) => {
             Statement::Write(write::compile(w, params.clone()).map_err(ParseError::Compile)?)
         }

@@ -11,12 +11,13 @@
 //! node plus the trail of `(edge, node)` hops taken to reach it. `Filter`
 //! and `Sort` address the current node.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::cache::GraphReader;
 use crate::compute::expr::{self, Expr};
-use crate::compute::plan::{LogicalPlan, SortKey, Source, Step};
+use crate::compute::plan::{Algo, LogicalPlan, NodeRef, SortKey, Source, Step};
+use crate::compute::{algo, hybrid};
 use crate::error::Result;
 use crate::storage::vector::{Metric, top_k};
 use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
@@ -178,8 +179,121 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
                 })
                 .collect());
         }
+        Source::KeywordTopK {
+            label,
+            property,
+            query,
+            k,
+        } => {
+            // BM25 over the declared keyword index; the relevance score seeds
+            // the row's score channel, as a vector seed's similarity does.
+            let hits = reader.keyword_search(label, property, query, *k as usize)?;
+            return Ok(hits
+                .into_iter()
+                .map(|(id, score)| Row::scored(id, score))
+                .collect());
+        }
+        Source::Hybrid(spec) => {
+            return Ok(hybrid::run(reader, spec)?
+                .into_iter()
+                .map(|hit| Row::scored(hit.node, hit.score))
+                .collect());
+        }
+        Source::Algo { label, algo } => {
+            return algo_rows(reader, label.as_deref(), algo);
+        }
     };
     Ok(ids.into_iter().map(Row::start).collect())
+}
+
+/// Run a graph algorithm and turn its result into source rows. Each algorithm
+/// puts its per-node result in the score channel; the row *order* is the
+/// algorithm's natural one (rank order, community order, path order), which a
+/// query can still override with `ORDER BY`.
+fn algo_rows(reader: &dyn GraphReader, label: Option<&str>, spec: &Algo) -> Result<Vec<Row>> {
+    Ok(match spec {
+        Algo::PageRank {
+            damping,
+            max_iters,
+            tolerance,
+        } => algo::pagerank(
+            reader,
+            label,
+            algo::PageRankOptions {
+                damping: *damping,
+                max_iters: *max_iters,
+                tolerance: *tolerance,
+            },
+        )?
+        .into_iter()
+        .map(|(id, rank)| Row::scored(id, rank as f32))
+        .collect(),
+        Algo::ConnectedComponents => grouped_rows(algo::connected_components(reader, label)?.0),
+        Algo::Louvain {
+            max_levels,
+            min_gain,
+        } => grouped_rows(
+            algo::louvain(
+                reader,
+                label,
+                algo::LouvainOptions {
+                    max_levels: *max_levels,
+                    min_gain: *min_gain,
+                },
+            )?
+            .0,
+        ),
+        Algo::ShortestPath {
+            from,
+            to,
+            dir,
+            weight,
+        } => {
+            let (Some(src), Some(dst)) = (resolve_ref(reader, from)?, resolve_ref(reader, to)?)
+            else {
+                return Ok(Vec::new()); // an unknown endpoint yields no path
+            };
+            let opts = algo::ShortestPathOptions {
+                dir: *dir,
+                weight: weight.clone(),
+            };
+            match algo::shortest_path(reader, label, src, dst, &opts)? {
+                Some(path) => path
+                    .nodes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| Row::scored(id, i as f32))
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
+    })
+}
+
+/// Turn `(node, community representative)` pairs into rows grouped by
+/// community, scoring each node with a dense 0-based community index assigned
+/// in order of first appearance.
+fn grouped_rows(assignments: Vec<(NodeId, NodeId)>) -> Vec<Row> {
+    let mut index: HashMap<NodeId, usize> = HashMap::new();
+    let mut rows: Vec<(usize, NodeId)> = Vec::with_capacity(assignments.len());
+    for (node, community) in assignments {
+        let next = index.len();
+        let idx = *index.entry(community).or_insert(next);
+        rows.push((idx, node));
+    }
+    rows.sort_unstable();
+    rows.into_iter()
+        .map(|(idx, node)| Row::scored(node, idx as f32))
+        .collect()
+}
+
+/// Resolve a plan's node reference to an id in this plane; `None` when the key
+/// (or id) doesn't exist here.
+fn resolve_ref(reader: &dyn GraphReader, r: &NodeRef) -> Result<Option<NodeId>> {
+    match r {
+        NodeRef::Id(id) => Ok(reader.node(*id)?.map(|_| *id)),
+        NodeRef::Key(key) => reader.node_id_by_key(key),
+    }
 }
 
 /// Score `candidates` (a graph frontier) by similarity of their `property`

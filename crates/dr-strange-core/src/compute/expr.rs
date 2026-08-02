@@ -26,6 +26,10 @@ pub enum Expr {
     Literal(PropValue),
     /// True iff the current node carries `label`.
     HasLabel(String),
+    /// The current node's caller-supplied external key as a `Str` (`Null` if
+    /// the node was created without one). The query language's `key(n)`; an
+    /// equality on it at the source compiles to a `SeekKeys` seek instead.
+    ExternalKey,
     /// The row's similarity score channel as a `Float` (`Null` if the row
     /// carries no score — arch/03 §4.5 `score()`).
     Score,
@@ -196,6 +200,11 @@ pub fn has_label(label: impl Into<String>) -> Expr {
     Expr::HasLabel(label.into())
 }
 
+/// The current node's external key — the query language's `key(n)`.
+pub fn external_key() -> Expr {
+    Expr::ExternalKey
+}
+
 /// The row's similarity score channel (arch/03 §4.5).
 pub fn score() -> Expr {
     Expr::Score
@@ -270,6 +279,11 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
             ctx.node
                 .is_some_and(|n| n.labels.iter().any(|l| l == label)),
         ),
+        Expr::ExternalKey => ctx
+            .node
+            .and_then(|n| n.external_key.clone())
+            .map(PropValue::Str)
+            .unwrap_or(PropValue::Null),
         Expr::Score => ctx
             .score
             .map(|s| PropValue::Float(s as f64))

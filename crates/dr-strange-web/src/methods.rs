@@ -89,6 +89,34 @@ fn plane_at<'a>(
     app(ctx.db.plane(plane))
 }
 
+/// Pin a plane handle to the snapshot a query's `AS OF` clause names — the
+/// in-language counterpart of the `as_of` / `as_of_ms` request params.
+#[cfg(feature = "native-backend")]
+fn pin(
+    p: PlaneHandle<'_>,
+    at: Option<dr_strange_parser::AsOfSpec>,
+) -> Result<PlaneHandle<'_>, RpcError> {
+    use dr_strange_parser::AsOfSpec;
+    match at {
+        None => Ok(p),
+        Some(AsOfSpec::Seq(seq)) => app(p.as_of(AsOf::Seq(seq))),
+        Some(AsOfSpec::Time(ms)) => app(p.as_of(AsOf::Time(ms))),
+    }
+}
+
+#[cfg(not(feature = "native-backend"))]
+fn pin(
+    p: PlaneHandle<'_>,
+    at: Option<dr_strange_parser::AsOfSpec>,
+) -> Result<PlaneHandle<'_>, RpcError> {
+    if at.is_some() {
+        return Err(RpcError::invalid_params(
+            "AS OF (time-travel) requires the native backend",
+        ));
+    }
+    Ok(p)
+}
+
 fn parse_metric(s: Option<&str>) -> Metric {
     match s {
         Some("dot") | Some("Dot") => Metric::Dot,
@@ -484,8 +512,8 @@ pub fn cypher_subgraph(
 
     // A write statement mutates the plane and returns its change-counts; the UI
     // shows a status rather than a subgraph.
-    let plan = match stmt {
-        dr_strange_parser::Statement::Read(plan) => plan,
+    let (plane, plan) = match stmt {
+        dr_strange_parser::Statement::Read(read) => (pin(plane, read.as_of)?, read.plan),
         dr_strange_parser::Statement::Write(w) => {
             let s = w.apply(&plane).map_err(RpcError::server)?;
             return Ok(jval!({

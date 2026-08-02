@@ -10,9 +10,9 @@ use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
 use dr_strange_core::types::Dir;
 
-/// A whole parsed query: a source (`MATCH` pattern or a `SEARCH` vector seed),
-/// zero or more `BEAM` hops, then `[WHERE …] RETURN … [ORDER BY …] [SKIP n]
-/// [LIMIT n]`.
+/// A whole parsed query: a source (a `MATCH` pattern or one of the retrieval
+/// seeds), zero or more `BEAM` hops, then `[WHERE …] RETURN … [ORDER BY …]
+/// [SKIP n] [LIMIT n] [AS OF …]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub source: QuerySource,
@@ -22,6 +22,18 @@ pub struct Query {
     pub order_by: Vec<OrderKey>,
     pub skip: Option<u64>,
     pub limit: Option<u64>,
+    /// `AS OF <seq|"timestamp">` — read a past snapshot. Not part of the
+    /// compiled plan: it addresses the *plane handle*, so it rides beside it.
+    pub as_of: Option<AsOfSpec>,
+}
+
+/// The point `AS OF` pins reads to. A bare integer is a commit sequence; a
+/// quoted RFC-3339 instant and `TIME <ms>` are both wall-clock addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsOfSpec {
+    Seq(u64),
+    /// Unix-epoch milliseconds.
+    Time(i64),
 }
 
 /// `BEAM (result[:Label]) <OUT|IN|BOTH> [:TYPE] ON prop NEAR <query>
@@ -40,13 +52,86 @@ pub struct BeamClause {
     pub depth: u32,
 }
 
-/// Where the query's rows originate: a graph pattern (`MATCH`) or an indexed
-/// vector search (`SEARCH`). Both bind their node variables the same way, so
-/// the rest of the query (WHERE/RETURN/ORDER BY/…) is shared.
+/// Where the query's rows originate. Every form binds exactly one node pattern
+/// (`first`) and may continue with a relationship tail (`rest`) — so a typed
+/// hop can follow a retrieval seed just as it follows a `MATCH` node, and the
+/// rest of the query (WHERE/RETURN/ORDER BY/…) is shared by all of them.
 #[derive(Debug, Clone, PartialEq)]
-pub enum QuerySource {
-    Match(Pattern),
-    Search(SearchClause),
+pub struct QuerySource {
+    pub kind: SourceKind,
+    pub first: NodePat,
+    pub rest: Vec<(RelPat, NodePat)>,
+}
+
+/// What seeds a query's rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceKind {
+    /// `MATCH (a:Label)…` — a scan of the first node's label.
+    Match,
+    /// `SEARCH (v:Label) ON prop NEAR "text"|[..] [METRIC m] [TOPK k]` — the
+    /// indexed vector seed (`Source::VectorTopK`).
+    Search {
+        property: String,
+        query: VecArg,
+        metric: Metric,
+        k: u64,
+    },
+    /// `SEARCH (v:Label) ON prop MATCHING "text" [TOPK k]` — the BM25 keyword
+    /// seed (`Source::KeywordTopK`).
+    Keyword {
+        property: String,
+        query: String,
+        k: u64,
+    },
+    /// `HYBRID (v:Label) …` — fused retrieval (`Source::Hybrid`).
+    Hybrid(HybridClause),
+    /// `CALL name(args) ON (v:Label)` — a graph algorithm (`Source::Algo`).
+    Call(CallClause),
+}
+
+/// `HYBRID (v:Label) [VECTOR ON p NEAR q [METRIC m] [WEIGHT w]]
+/// [KEYWORD ON p MATCHING "text" [WEIGHT w]]
+/// [GRAPH HOPS h DECAY d [SEEDS n] [WEIGHT w]] [CANDIDATES n] [TOPK k]` —
+/// every channel optional, but at least one required.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridClause {
+    pub vector: Option<HybridVector>,
+    pub keyword: Option<HybridKeyword>,
+    pub graph: Option<HybridGraph>,
+    pub candidates: Option<u64>,
+    pub k: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridVector {
+    pub property: String,
+    pub query: VecArg,
+    pub metric: Metric,
+    pub weight: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridKeyword {
+    pub property: String,
+    pub query: String,
+    pub weight: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridGraph {
+    pub hops: u32,
+    pub decay: f32,
+    pub seeds: Option<u64>,
+    pub weight: Option<f32>,
+}
+
+/// `CALL name(arg: value, …)` — an algorithm invocation. The compiler checks
+/// the name and its arguments; the grammar accepts any named-argument list so
+/// a typo reports as an unknown algorithm/argument rather than a parse error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallClause {
+    pub name: String,
+    pub args: Vec<(String, Val)>,
 }
 
 /// A query-vector argument: either a literal vector (programmatic) or text to
@@ -55,18 +140,6 @@ pub enum QuerySource {
 pub enum VecArg {
     Vector(Vec<f32>),
     Text(String),
-}
-
-/// `SEARCH (v:Label) ON prop NEAR <query> [METRIC m] [TOPK k]` — the indexed
-/// similarity seed (compiles to `Source::VectorTopK`). One node, no traversal
-/// tail in this cut. `<query>` is `"text"` (embedded) or `[..]` (literal).
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchClause {
-    pub node: NodePat,
-    pub property: String,
-    pub query: VecArg,
-    pub metric: Metric,
-    pub k: u64,
 }
 
 /// A single linear path: one node, then zero or more `(relationship, node)`
@@ -133,6 +206,16 @@ pub enum PExpr {
     HasLabel {
         var: String,
         label: String,
+    },
+    /// `key(v)` — the node's external key. An equality (or `IN`) on the
+    /// source variable compiles to a `SeekKeys` seek rather than a filter.
+    ExternalKey {
+        var: String,
+    },
+    /// `x IN [a, b, …]` — sugar for a chain of equalities.
+    In {
+        lhs: Box<PExpr>,
+        list: Vec<PExpr>,
     },
     IsNull(Box<PExpr>),
     Not(Box<PExpr>),

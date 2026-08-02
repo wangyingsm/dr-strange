@@ -3,8 +3,9 @@
 //! Cypher construct maps onto the pipeline.
 
 use dr_strange_core::{
-    Dir, LogicalPlan, Metric, PropValue, SortKey, Source, Step, distance, has_label, hops, lit, p,
-    score, similarity,
+    Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan, Metric,
+    NodeId, NodeRef, PropValue, SortKey, Source, Step, VectorChannel, distance, external_key,
+    has_label, hops, lit, p, score, similarity,
 };
 use dr_strange_parser::{
     Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
@@ -22,7 +23,9 @@ impl Embedder for MockEmbedder {
 }
 
 fn plan(q: &str) -> LogicalPlan {
-    parse(q).unwrap_or_else(|e| panic!("parse failed for `{q}`: {e}"))
+    parse(q)
+        .unwrap_or_else(|e| panic!("parse failed for `{q}`: {e}"))
+        .plan
 }
 
 #[test]
@@ -547,7 +550,7 @@ fn search_by_text_embeds_via_the_embedder() {
     )
     .unwrap();
     assert_eq!(
-        pl.source,
+        pl.plan.source,
         Source::VectorTopK {
             label: Some("Paper".into()),
             property: "embedding".into(),
@@ -577,7 +580,7 @@ fn similarity_by_text_embeds_too() {
     )
     .unwrap();
     assert_eq!(
-        pl.steps,
+        pl.plan.steps,
         vec![
             Step::Sort(vec![SortKey {
                 expr: similarity("embedding", vec![3.0, 'c' as u32 as f32], Metric::Cosine),
@@ -643,7 +646,7 @@ fn beam_embeds_text_and_composes_after_search() {
     )
     .unwrap();
     assert_eq!(
-        pl.source,
+        pl.plan.source,
         Source::VectorTopK {
             label: Some("Paper".into()),
             property: "embedding".into(),
@@ -653,7 +656,7 @@ fn beam_embeds_text_and_composes_after_search() {
         }
     );
     assert_eq!(
-        pl.steps,
+        pl.plan.steps,
         vec![
             Step::ExpandBeam {
                 dir: Dir::Out,
@@ -704,7 +707,7 @@ fn where_param_resolves_at_parse_time() {
     )
     .unwrap();
     let plan = match stmt {
-        Statement::Read(p) => p,
+        Statement::Read(r) => r.plan,
         Statement::Write(_) => panic!("expected read"),
     };
     assert_eq!(
@@ -739,4 +742,486 @@ fn error_display_distinguishes_syntax_from_compile() {
             .to_string()
             .starts_with("unsupported query:")
     );
+}
+
+// ---- key-seek (ROADMAP §7) -----------------------------------------------
+
+#[test]
+fn key_equality_on_the_source_becomes_a_seek() {
+    // The seek replaces the scan; the label survives as a filter, because
+    // SeekKeys resolves by key alone.
+    assert_eq!(
+        plan(r#"MATCH (n:Doc) WHERE key(n) = "paper-42" RETURN n"#),
+        LogicalPlan {
+            source: Source::SeekKeys(vec!["paper-42".into()]),
+            steps: vec![Step::Filter(has_label("Doc"))],
+        }
+    );
+}
+
+#[test]
+fn unlabelled_key_seek_has_no_residual_filter() {
+    assert_eq!(
+        plan(r#"MATCH (n) WHERE key(n) = "paper-42" RETURN n"#),
+        LogicalPlan {
+            source: Source::SeekKeys(vec!["paper-42".into()]),
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn key_in_list_seeks_every_key() {
+    assert_eq!(
+        plan(r#"MATCH (n) WHERE key(n) IN ["a", "b", "c"] RETURN n"#),
+        LogicalPlan {
+            source: Source::SeekKeys(vec!["a".into(), "b".into(), "c".into()]),
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn key_seek_keeps_the_other_conjuncts_as_filters() {
+    assert_eq!(
+        plan(r#"MATCH (n:Doc) WHERE key(n) = "k" AND n.year >= 2020 RETURN n"#),
+        LogicalPlan {
+            source: Source::SeekKeys(vec!["k".into()]),
+            steps: vec![
+                Step::Filter(has_label("Doc")),
+                Step::Filter(p("year").ge(2020)),
+            ],
+        }
+    );
+}
+
+#[test]
+fn key_seek_anchors_a_traversal() {
+    assert_eq!(
+        plan(r#"MATCH (n)-[:KNOWS]->(m:Person) WHERE key(n) = "ada" RETURN m"#),
+        LogicalPlan {
+            source: Source::SeekKeys(vec!["ada".into()]),
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Out,
+                    edge_type: Some("KNOWS".into()),
+                },
+                Step::Filter(has_label("Person")),
+            ],
+        }
+    );
+}
+
+#[test]
+fn key_on_a_later_variable_stays_a_filter() {
+    // Only the *source* variable can become a seek; elsewhere `key()` is an
+    // ordinary expression over the current node.
+    assert_eq!(
+        plan(r#"MATCH (a:Person)-[:KNOWS]->(b) WHERE key(b) = "alan" RETURN b"#),
+        LogicalPlan {
+            source: Source::ScanLabel("Person".into()),
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Out,
+                    edge_type: Some("KNOWS".into()),
+                },
+                Step::Filter(external_key().eq("alan")),
+            ],
+        }
+    );
+}
+
+#[test]
+fn key_seek_resolves_a_parameter() {
+    let mut params = Params::new();
+    params.insert("k".into(), PropValue::Str("paper-7".into()));
+    let stmt =
+        parse_statement_full(r#"MATCH (n) WHERE key(n) = $k RETURN n"#, None, &params).unwrap();
+    let Statement::Read(read) = stmt else {
+        panic!("expected a read")
+    };
+    assert_eq!(read.plan.source, Source::SeekKeys(vec!["paper-7".into()]));
+}
+
+#[test]
+fn key_is_usable_as_an_ordinary_term() {
+    // Not an equality, so no seek — just a predicate over the key.
+    assert_eq!(
+        plan("MATCH (n) WHERE key(n) IS NOT NULL RETURN n"),
+        LogicalPlan {
+            source: Source::ScanAll,
+            steps: vec![Step::Filter(external_key().is_null().not())],
+        }
+    );
+}
+
+#[test]
+fn in_over_a_property_expands_to_equalities() {
+    assert_eq!(
+        plan("MATCH (n) WHERE n.year IN [2020, 2021] RETURN n"),
+        LogicalPlan {
+            source: Source::ScanAll,
+            steps: vec![Step::Filter(p("year").eq(2020).or(p("year").eq(2021)))],
+        }
+    );
+}
+
+// ---- keyword search (ROADMAP §7) -----------------------------------------
+
+#[test]
+fn keyword_search_compiles_to_a_bm25_source() {
+    assert_eq!(
+        plan(r#"SEARCH (d:Doc) ON body MATCHING "graph databases" TOPK 5 RETURN d"#),
+        LogicalPlan {
+            source: Source::KeywordTopK {
+                label: "Doc".into(),
+                property: "body".into(),
+                query: "graph databases".into(),
+                k: 5,
+            },
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn keyword_search_defaults_topk_and_chains_a_typed_hop() {
+    assert_eq!(
+        plan(r#"SEARCH (d:Doc) ON body MATCHING "rust" -[:CITES]->(p:Paper) RETURN p"#),
+        LogicalPlan {
+            source: Source::KeywordTopK {
+                label: "Doc".into(),
+                property: "body".into(),
+                query: "rust".into(),
+                k: 10,
+            },
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Out,
+                    edge_type: Some("CITES".into()),
+                },
+                Step::Filter(has_label("Paper")),
+            ],
+        }
+    );
+}
+
+#[test]
+fn keyword_search_needs_a_label() {
+    assert!(matches!(
+        err(r#"SEARCH (d) ON body MATCHING "rust" RETURN d"#),
+        ParseError::Compile(_)
+    ));
+}
+
+#[test]
+fn vector_search_chains_a_typed_hop_too() {
+    assert_eq!(
+        plan("SEARCH (d:Doc) ON emb NEAR [1.0, 2.0] TOPK 3 -[:CITES]->(p) RETURN p"),
+        LogicalPlan {
+            source: Source::VectorTopK {
+                label: Some("Doc".into()),
+                property: "emb".into(),
+                query: vec![1.0, 2.0],
+                metric: Metric::Cosine,
+                k: 3,
+            },
+            steps: vec![Step::Expand {
+                dir: Dir::Out,
+                edge_type: Some("CITES".into()),
+            }],
+        }
+    );
+}
+
+// ---- hybrid retrieval (ROADMAP §7) ---------------------------------------
+
+#[test]
+fn hybrid_all_three_channels() {
+    assert_eq!(
+        plan(
+            r#"HYBRID (d:Doc)
+                 VECTOR ON embedding NEAR [1.0, 2.0] METRIC dot WEIGHT 2.0
+                 KEYWORD ON body MATCHING "graph databases" WEIGHT 1.5
+                 GRAPH HOPS 2 DECAY 0.5 SEEDS 5 WEIGHT 0.25
+                 CANDIDATES 50 TOPK 7
+               RETURN d"#
+        ),
+        LogicalPlan {
+            source: Source::Hybrid(Box::new(HybridSpec {
+                label: Some("Doc".into()),
+                vector: Some(VectorChannel {
+                    property: "embedding".into(),
+                    query: vec![1.0, 2.0],
+                    metric: Metric::Dot,
+                }),
+                keyword: Some(KeywordChannel {
+                    property: "body".into(),
+                    query: "graph databases".into(),
+                }),
+                graph: Some(GraphChannel {
+                    hops: 2,
+                    decay: 0.5,
+                    seeds: 5,
+                }),
+                weights: HybridWeights {
+                    vector: 2.0,
+                    keyword: 1.5,
+                    graph: 0.25,
+                },
+                candidates: 50,
+                k: 7,
+            })),
+            steps: vec![],
+        }
+    );
+}
+
+#[test]
+fn hybrid_defaults_and_channel_subset() {
+    let LogicalPlan { source, steps } =
+        plan(r#"HYBRID (d:Doc) KEYWORD ON body MATCHING "rust" RETURN d"#);
+    assert!(steps.is_empty());
+    let Source::Hybrid(spec) = source else {
+        panic!("expected a hybrid source")
+    };
+    assert!(spec.vector.is_none() && spec.graph.is_none());
+    assert_eq!(spec.weights, HybridWeights::default());
+    assert_eq!((spec.candidates, spec.k), (100, 10));
+}
+
+#[test]
+fn hybrid_composes_with_the_rest_of_the_query() {
+    let steps = plan(
+        r#"HYBRID (d:Doc) KEYWORD ON body MATCHING "rust" TOPK 20
+             -[:CITES]->(p:Paper)
+           WHERE p.year >= 2020
+           RETURN p ORDER BY score() DESC LIMIT 5"#,
+    )
+    .steps;
+    assert_eq!(
+        steps,
+        vec![
+            Step::Expand {
+                dir: Dir::Out,
+                edge_type: Some("CITES".into()),
+            },
+            Step::Filter(has_label("Paper")),
+            Step::Filter(p("year").ge(2020)),
+            Step::Sort(vec![SortKey {
+                expr: score(),
+                descending: true,
+            }]),
+            Step::Limit(5),
+        ]
+    );
+}
+
+#[test]
+fn hybrid_needs_a_retrieval_channel() {
+    assert!(matches!(
+        err("HYBRID (d:Doc) GRAPH HOPS 2 DECAY 0.5 RETURN d"),
+        ParseError::Compile(_)
+    ));
+}
+
+#[test]
+fn hybrid_keyword_channel_needs_a_label() {
+    assert!(matches!(
+        err(r#"HYBRID (d) KEYWORD ON body MATCHING "rust" RETURN d"#),
+        ParseError::Compile(_)
+    ));
+}
+
+// ---- algorithms (ROADMAP §7) ---------------------------------------------
+
+#[test]
+fn call_pagerank_with_arguments() {
+    assert_eq!(
+        plan(
+            "CALL pagerank(damping: 0.5, iterations: 3, tolerance: 0.01) ON (n:Paper) \
+             RETURN n ORDER BY score() DESC LIMIT 10"
+        ),
+        LogicalPlan {
+            source: Source::Algo {
+                label: Some("Paper".into()),
+                algo: Algo::PageRank {
+                    damping: 0.5,
+                    max_iters: 3,
+                    tolerance: 0.01,
+                },
+            },
+            steps: vec![
+                Step::Sort(vec![SortKey {
+                    expr: score(),
+                    descending: true,
+                }]),
+                Step::Limit(10),
+            ],
+        }
+    );
+}
+
+#[test]
+fn call_defaults_match_the_builder_api() {
+    assert_eq!(
+        plan("CALL pagerank() ON (n) RETURN n").source,
+        Source::Algo {
+            label: None,
+            algo: Algo::PageRank {
+                damping: 0.85,
+                max_iters: 20,
+                tolerance: 1e-6,
+            },
+        }
+    );
+}
+
+#[test]
+fn call_components_and_louvain() {
+    assert_eq!(
+        plan("CALL components() ON (n:Doc) RETURN n").source,
+        Source::Algo {
+            label: Some("Doc".into()),
+            algo: Algo::ConnectedComponents,
+        }
+    );
+    assert_eq!(
+        plan("CALL louvain(max_levels: 3) ON (n) RETURN n").source,
+        Source::Algo {
+            label: None,
+            algo: Algo::Louvain {
+                max_levels: 3,
+                min_gain: 1e-9,
+            },
+        }
+    );
+}
+
+#[test]
+fn call_shortest_path_by_key_and_by_id() {
+    assert_eq!(
+        plan(r#"CALL shortest_path(from: "ada", to: 7, dir: "both") ON (n) RETURN n"#).source,
+        Source::Algo {
+            label: None,
+            algo: Algo::ShortestPath {
+                from: NodeRef::Key("ada".into()),
+                to: NodeRef::Id(NodeId(7)),
+                dir: Dir::Both,
+                weight: None,
+            },
+        }
+    );
+}
+
+#[test]
+fn call_result_composes_with_a_typed_hop() {
+    assert_eq!(
+        plan("CALL pagerank() ON (n:Paper) -[:CITES]->(q:Paper) RETURN q").steps,
+        vec![
+            Step::Expand {
+                dir: Dir::Out,
+                edge_type: Some("CITES".into()),
+            },
+            Step::Filter(has_label("Paper")),
+        ]
+    );
+}
+
+#[test]
+fn call_rejects_unknown_algorithms_and_arguments() {
+    assert!(matches!(
+        err("CALL betweenness() ON (n) RETURN n"),
+        ParseError::Compile(_)
+    ));
+    assert!(matches!(
+        err("CALL pagerank(dampening: 0.85) ON (n) RETURN n"),
+        ParseError::Compile(_)
+    ));
+    // shortest_path needs both endpoints.
+    assert!(matches!(
+        err(r#"CALL shortest_path(from: "ada") ON (n) RETURN n"#),
+        ParseError::Compile(_)
+    ));
+    // and a direction it understands.
+    assert!(matches!(
+        err(r#"CALL shortest_path(from: "a", to: "b", dir: "sideways") ON (n) RETURN n"#),
+        ParseError::Compile(_)
+    ));
+}
+
+// ---- AS OF (ROADMAP §7) ---------------------------------------------------
+
+fn as_of(q: &str) -> Option<dr_strange_parser::AsOfSpec> {
+    parse(q)
+        .unwrap_or_else(|e| panic!("parse failed for `{q}`: {e}"))
+        .as_of
+}
+
+#[test]
+fn as_of_reads_a_commit_sequence() {
+    assert_eq!(
+        as_of("MATCH (n:Doc) RETURN n LIMIT 5 AS OF 41337"),
+        Some(dr_strange_parser::AsOfSpec::Seq(41337))
+    );
+}
+
+#[test]
+fn as_of_reads_an_rfc3339_instant() {
+    // 2026-07-01T00:00:00Z
+    assert_eq!(
+        as_of(r#"MATCH (n) RETURN n AS OF "2026-07-01T00:00:00Z""#),
+        Some(dr_strange_parser::AsOfSpec::Time(1_782_864_000_000))
+    );
+    // The unix epoch itself, and a fractional-second offset form.
+    assert_eq!(
+        as_of(r#"MATCH (n) RETURN n AS OF "1970-01-01T00:00:00Z""#),
+        Some(dr_strange_parser::AsOfSpec::Time(0))
+    );
+    assert_eq!(
+        as_of(r#"MATCH (n) RETURN n AS OF "1970-01-01T01:30:00.250+01:30""#),
+        Some(dr_strange_parser::AsOfSpec::Time(250))
+    );
+}
+
+#[test]
+fn as_of_time_takes_epoch_milliseconds() {
+    assert_eq!(
+        as_of("MATCH (n) RETURN n AS OF TIME 1782864000000"),
+        Some(dr_strange_parser::AsOfSpec::Time(1_782_864_000_000))
+    );
+    assert_eq!(
+        as_of("MATCH (n) RETURN n AS OF TIME -1000"),
+        Some(dr_strange_parser::AsOfSpec::Time(-1000))
+    );
+}
+
+#[test]
+fn as_of_is_absent_by_default_and_applies_to_every_source() {
+    assert_eq!(as_of("MATCH (n) RETURN n"), None);
+    assert_eq!(
+        as_of("CALL pagerank() ON (n) RETURN n AS OF 12"),
+        Some(dr_strange_parser::AsOfSpec::Seq(12))
+    );
+    assert_eq!(
+        as_of(r#"SEARCH (d:Doc) ON body MATCHING "rust" RETURN d AS OF 12"#),
+        Some(dr_strange_parser::AsOfSpec::Seq(12))
+    );
+}
+
+#[test]
+fn as_of_rejects_a_malformed_timestamp() {
+    assert!(matches!(
+        err(r#"MATCH (n) RETURN n AS OF "yesterday""#),
+        ParseError::Syntax(_)
+    ));
+    assert!(matches!(
+        err(r#"MATCH (n) RETURN n AS OF "2026-07-01""#),
+        ParseError::Syntax(_)
+    ));
+    // No zone designator.
+    assert!(matches!(
+        err(r#"MATCH (n) RETURN n AS OF "2026-07-01T00:00:00""#),
+        ParseError::Syntax(_)
+    ));
 }

@@ -191,50 +191,50 @@ plane-level restore/merge, and a web "download snapshot" action.
 
 ---
 
-## 7. Query-language parity — Cypher subset ⇒ full engine
+## 7. Query-language parity — Cypher subset ⇒ full engine  *(shipped)*
 
-**Goal.** Grow the openCypher subset until it can express **everything the engine
-already does**, so the query language is a complete alternative to hand-writing
-`LogicalPlan` JSON — and a first-class LLM target. Missing today:
+**Status.** ✅ Shipped (2026-08-02). The openCypher subset now reaches
+everything the engine does, so the language is a complete alternative to
+hand-writing `LogicalPlan` JSON — and a first-class LLM target:
 
-- **Key-seek** — pin a node by its `external_key` (the plan IR's `SeekKeys`).
-  Without it a query can't anchor on a specific entity when identity lives in the
-  key rather than a property (`name`/`title`) — the common shape for
-  LLM-digested graphs.
-- **Keyword / BM25 search** — a text-search source over the keyword index
-  (`keyword::KeywordRegistry`), the parallel of the vector `SEARCH … NEAR`.
-- **Hybrid search** — a fusion form combining vector + keyword + graph-proximity
-  with weights (the `plane.hybrid` channels), each channel optional.
-- **Graph algorithms** — invoke PageRank / connected components / shortest path /
-  Louvain (`plane.algo`) from a query.
-- **Time-travel** — an `AS OF <seq|timestamp>` clause pinning a historical
-  snapshot (native backend), so any query can read the past.
-- **Typed expansion from a seed** — a `SEARCH` / keyword seed today chains only
-  `BEAM`; allow a normal typed hop (`-[:TYPE]->`) after it.
+- **Key-seek** — `key(n)` is an ordinary expression term (`Expr::ExternalKey`);
+  an equality or `IN` on the *source* variable compiles to a `SeekKeys` seek
+  rather than a scan-and-filter, so a query can anchor on an entity whose
+  identity lives in the key — the common shape for LLM-digested graphs.
+- **Keyword / BM25 search** — `SEARCH (d:Doc) ON body MATCHING "…" [TOPK k]`.
+  Same verb as the vector seed, different operator: `NEAR` compares meaning,
+  `MATCHING` compares words.
+- **Hybrid search** — `HYBRID (d:Doc) [VECTOR …] [KEYWORD …] [GRAPH …]
+  [CANDIDATES n] [TOPK k]`, each channel optional with its own `WEIGHT`.
+- **Graph algorithms** — `CALL <pagerank|components|shortest_path|louvain>(args)
+  ON (n[:Label])`, where `ON` both scopes the algorithm and binds the variable.
+- **Time-travel** — a trailing `AS OF <seq|"RFC-3339"|TIME ms>` clause.
+- **Typed expansion from a seed** — every source may carry a relationship tail,
+  so a normal typed hop follows a retrieval or algorithm seed.
+- Plus `x IN [a, b]` over any expression, desugared to equalities.
 
 **Why AI-native.** Cypher is a surface LLMs write fluently and *tersely* — a far
 better NL→query target than the bespoke, verbose `LogicalPlan` JSON, which is
-prone to blowing the model's output-token budget on broad questions. Bringing the
-subset to parity lets the Cypher route (item 3) match the plan route's
-*capability*, and hands humans/SDKs the full engine through a single language. Today the subset
-can't pin a node by key, nor reach the keyword / hybrid / algorithm / temporal
-power the engine already ships.
+prone to blowing the model's output-token budget on broad questions. The Cypher
+route (item 3) now matches the plan route's *capability*, and humans/SDKs reach
+the full engine through a single language.
 
-**Scope sketch.** Extend `dr-strange-parser` (grammar + plan/operator compile)
-with: a key-seek source (→ `SeekKeys`); a keyword search source (→ BM25 top-k); a
-`HYBRID` fusion form (→ the `plane.hybrid` channels + weights); algorithm
-invocation (→ `plane.algo`); an `AS OF` clause (→ `PlaneHandle::as_of`); and a
-typed hop after a vector/keyword seed. Every unsupported construct stays a clear
-parse error, never a silent mis-compile. Flows through CLI `drsg cypher` and RPC
-`plane.cypher`, and re-enables an NL→Cypher route (`ask_cypher`) once at parity.
+**Forks settled.** The plan IR grew (`Source::KeywordTopK` / `Hybrid` / `Algo`,
+executed through `GraphReader`, which gained `keyword_search`) rather than the
+parser routing around it — so `plane.query` and the SDKs gain the same power,
+and every new source composes with the existing steps. `key(n)` in `WHERE` over
+a dedicated `SEEK` clause; `CALL name(args) ON (v:Label)` over a bespoke clause;
+per-channel `WEIGHT` on `HYBRID`; `AS OF` last, so every existing query keeps
+its exact prefix. Algorithm results ride the score channel — rank for PageRank,
+path position for shortest path, a dense community index for components/Louvain
+(aggregation & projection stay deferred, see Low priority). One hybrid engine
+now backs both `plane.hybrid()` and `Source::Hybrid`. `AS OF` is not a plan
+node — it addresses the plane handle — so it rides on `ReadQuery` beside the
+plan for a surface to apply. The keyword / hybrid / algorithm / temporal forms
+are read-only.
 
-**Forks to settle.** Surface syntax for each — a `SEEK "<key>"` source vs an
-anchor map vs `key(n)` in `WHERE`; `CALL algo()` procedure-style vs dedicated
-clauses; how `HYBRID` weights/channels are spelled; where `AS OF` sits. How
-algorithm results (node→score) fit the single-current-node row model — an ordered
-result vs a transient score binding (note: aggregation & projection stay
-deferred, see Low priority). Reuse existing operators vs parser-only sugar. The
-keyword / hybrid / algorithm / temporal forms are read-only.
+**Follow-ups.** Re-enable an NL→Cypher route (`ask_cypher`) now that the subset
+is at parity, and expose the new sources in the dashboard's query surface.
 
 ---
 

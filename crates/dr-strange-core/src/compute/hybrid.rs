@@ -16,13 +16,16 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
+
 use crate::cache::GraphReader;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
 
 /// Per-channel weights for the fused score. Graph proximity defaults to a
 /// softer boost than the two primary retrieval channels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HybridWeights {
     pub vector: f32,
     pub keyword: f32,
@@ -50,6 +53,102 @@ pub struct HybridHit {
     pub vector: Option<f32>,
     pub keyword: Option<f32>,
     pub graph: Option<f32>,
+}
+
+/// A complete hybrid query: which channels are enabled, how they are weighted,
+/// and how deep to look. Serializable, so it is both what [`HybridBuilder`]
+/// assembles and what a `Source::Hybrid` plan node carries over the wire.
+///
+/// [`HybridBuilder`]: crate::HybridBuilder
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HybridSpec {
+    /// Scope every channel to this label. Required by the keyword channel (its
+    /// index is keyed on the label); optional for the others.
+    pub label: Option<String>,
+    pub vector: Option<VectorChannel>,
+    pub keyword: Option<KeywordChannel>,
+    pub graph: Option<GraphChannel>,
+    pub weights: HybridWeights,
+    /// Per-channel candidate pool fetched before fusion.
+    pub candidates: usize,
+    /// How many fused hits to return.
+    pub k: usize,
+}
+
+/// The vector channel: rank by distance from `query` under `metric`. The query
+/// is already embedded — the core never calls a model.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorChannel {
+    pub property: String,
+    pub query: Vec<f32>,
+    pub metric: Metric,
+}
+
+/// The BM25 channel: rank by relevance of `property` to the text `query`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeywordChannel {
+    pub property: String,
+    pub query: String,
+}
+
+/// The graph-proximity channel: seed from the strongest primary-channel hits,
+/// expand `hops` outward, decaying the boost by `decay` per hop.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphChannel {
+    pub hops: u32,
+    pub decay: f32,
+    /// Top hits taken from each primary channel as seeds.
+    pub seeds: usize,
+}
+
+/// Run a hybrid query over one reader: gather each enabled channel and fuse
+/// them. The single implementation behind both `plane.hybrid()` and a
+/// `Source::Hybrid` plan node, so the two can never drift.
+pub fn run<R: GraphReader + ?Sized>(reader: &R, spec: &HybridSpec) -> Result<Vec<HybridHit>> {
+    let label = spec.label.as_deref();
+
+    let vector = match &spec.vector {
+        Some(v) => {
+            let hits =
+                reader.vector_search(label, &v.property, &v.query, v.metric, spec.candidates)?;
+            Some(Channel {
+                hits: hits
+                    .into_iter()
+                    .map(|h| (NodeId(h.id), h.distance))
+                    .collect(),
+                higher_better: false,
+            })
+        }
+        None => None,
+    };
+
+    let keyword = match &spec.keyword {
+        Some(kw) => {
+            let label = label.ok_or_else(|| {
+                Error::InvalidArgument("the hybrid keyword channel requires a label".into())
+            })?;
+            Some(Channel {
+                hits: reader.keyword_search(label, &kw.property, &kw.query, spec.candidates)?,
+                higher_better: true,
+            })
+        }
+        None => None,
+    };
+
+    let graph = match &spec.graph {
+        Some(g) => Some(Channel {
+            hits: graph_proximity(
+                reader,
+                &top_seeds(&vector, &keyword, g.seeds),
+                g.hops,
+                g.decay,
+            )?,
+            higher_better: true,
+        }),
+        None => None,
+    };
+
+    Ok(fuse(vector, keyword, graph, spec.weights, spec.k))
 }
 
 /// One channel's raw ranked hits. `higher_better` flags the score direction:
