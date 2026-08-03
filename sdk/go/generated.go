@@ -201,6 +201,7 @@ type GraphSeedParams struct {
 	Plane  string  `json:"plane"`
 	Label  *string `json:"label,omitempty"`
 	Limit  *int64  `json:"limit,omitempty"`
+	Order  *string `json:"order,omitempty"`
 	AsOf   *int64  `json:"as_of,omitempty"`
 	AsOfMs *int64  `json:"as_of_ms,omitempty"`
 }
@@ -422,7 +423,7 @@ func (c *Client) IndexEnsure(ctx context.Context, p IndexEnsureParams) (map[stri
 	return out, err
 }
 
-// GraphSeed An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read)
+// GraphSeed An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call. (access: read)
 func (c *Client) GraphSeed(ctx context.Context, p GraphSeedParams) (*Subgraph, error) {
 	var out *Subgraph
 	err := c.call(ctx, "graph.seed", p, &out)

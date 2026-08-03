@@ -259,8 +259,8 @@ class Drsg(_Client):
             _p["language"] = language
         return self._call("index.ensure", _p)
 
-    def graph_seed(self, plane, label=None, limit=None, as_of=None, as_of_ms=None) -> Any:
-        """An initial canvas: up to `limit` nodes plus the edges induced among them.
+    def graph_seed(self, plane, label=None, limit=None, order=None, as_of=None, as_of_ms=None) -> Any:
+        """An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call.
 
         Access: read."""
         _p: dict = {}
@@ -269,6 +269,8 @@ class Drsg(_Client):
             _p["label"] = label
         if limit is not None:
             _p["limit"] = limit
+        if order is not None:
+            _p["order"] = order
         if as_of is not None:
             _p["as_of"] = as_of
         if as_of_ms is not None:

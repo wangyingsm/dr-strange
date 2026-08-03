@@ -8,6 +8,15 @@ import Sigma from 'sigma'
 import forceAtlas2 from 'graphology-layout-forceatlas2'
 import { EdgeCurvedArrowProgram, indexParallelEdgesIndex } from '@sigma/edge-curve'
 
+import {
+  alphaFor,
+  dim,
+  focusDistances,
+  hubsToFold,
+  sectorLeaves,
+  weightByImportance,
+} from './layout.js'
+
 const DEFAULT_CURVATURE = 0.25 // gentle arc for a solitary edge
 
 // Curvature for the nth of a set of parallel edges (sigma's own formula), so a
@@ -42,6 +51,10 @@ const MUTED_EDGE = '#c7ccd4'
 // under the cursor (target) get loud, distinct solid colours while dragging.
 const CONNECT_SRC = '#16a34a' // green
 const CONNECT_DST = '#2563eb' // blue
+
+const BEAD_COLOR = '#8b93a1'
+const BEAD_PREFIX = '~bead:'
+const BEAD_EDGE_PREFIX = '~beadedge:'
 
 // A theme-aware replacement for sigma's default node-hover drawer. Two jobs:
 //  - the SELECTED node (sigma routes `highlighted` nodes here) draws as a
@@ -119,6 +132,15 @@ export class Plot {
     this.hoveredEdge = null
     this.selectedEdge = null // persists (unlike hover) while an edge is selected
     this.selectedNode = null // the selected node, shown focused in the graph
+    // Nodes drawn as focused. Usually the one selected node — but selecting an
+    // edge focuses BOTH its endpoints, because an edge is a statement about two
+    // things and looking at it means looking at them.
+    this.focusNodes = new Set()
+    this.focusDist = null // node -> hops from the focus, or absent when far
+    this.collapsed = new Map() // bead key -> { hub, nodes, edges } folded away
+    this.expandedHubs = new Set() // hubs the reader opened; never re-folded
+    this.scores = new Map() // node id -> importance, when the seed was ranked
+    this.hiddenLabels = new Set() // categories switched off from the legend
 
     // Labels are canvas-drawn, so CSS variables don't reach them — read the
     // OS theme directly and keep them legible on both backgrounds.
@@ -151,10 +173,28 @@ export class Plot {
       // Highlight the hovered OR selected edge — thicker, amber, with its type
       // label forced visible. Hover makes the clickable region obvious; the
       // selected edge stays lit so a click/search focus is visible.
-      edgeReducer: (edge, data) =>
-        edge === this.hoveredEdge || edge === this.selectedEdge
-          ? { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
-          : data,
+      edgeReducer: (edge, data) => {
+        if (edge === this.hoveredEdge || edge === this.selectedEdge) {
+          return { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
+        }
+        if (this.hiddenLabels.size) {
+          const src = this.graph.source(edge)
+          const dst = this.graph.target(edge)
+          const gone = (n) =>
+            !this.graph.getNodeAttribute(n, 'bead') && this.hiddenLabels.has(this._categoryOf(n))
+          if (gone(src) || gone(dst)) return { ...data, hidden: true }
+        }
+        // An edge is only as near as its further end.
+        const alpha = this.focusDist
+          ? Math.min(
+              this._alphaOf(this.graph.source(edge)),
+              this._alphaOf(this.graph.target(edge)),
+            )
+          : 1
+        return alpha >= 1
+          ? data
+          : { ...data, color: dim(data.color ?? MUTED_EDGE, alpha), label: '' }
+      },
       // The selected node renders as a hollow ring. Sigma draws a highlighted
       // node's solid WebGL disc *over* anything the hover drawer paints, so we
       // make that disc transparent here and let drawNodeHover paint the ring
@@ -170,35 +210,51 @@ export class Plot {
             return { ...data, color: CONNECT_DST, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
           }
         }
-        return node === this.selectedNode
-          ? {
-              ...data,
-              highlighted: true,
-              forceLabel: true,
-              size: (data.size ?? 5) * 1.35,
-              color: 'rgba(0,0,0,0)',
-              zIndex: 1,
-            }
-          : data
+        if (this.focusNodes.has(node)) {
+          return {
+            ...data,
+            highlighted: true,
+            forceLabel: true,
+            size: (data.size ?? 5) * 1.35,
+            color: 'rgba(0,0,0,0)',
+            zIndex: 1,
+          }
+        }
+        if (!data.bead && this.hiddenLabels.size && this.hiddenLabels.has(this._categoryOf(node))) {
+          return { ...data, hidden: true }
+        }
+        // A folded bead always says how much it is hiding.
+        if (data.bead) {
+          return { ...data, forceLabel: true, color: dim(BEAD_COLOR, this._alphaOf(node)) }
+        }
+        const alpha = this._alphaOf(node)
+        // Labels are dropped rather than faded past the focus ring: unreadable
+        // text still costs the space it occupies.
+        return alpha >= 1 ? data : { ...data, color: dim(data.color, alpha), label: alpha > 0.2 ? data.label : '' }
       },
     })
 
     this.sigma.on('clickNode', ({ node }) => {
+      // A bead is not a thing in the graph — clicking it opens what it folded.
+      if (this.graph.getNodeAttribute(node, 'bead')) {
+        this.expandBead(node)
+        return
+      }
       this.selectedNode = node
       this.selectedEdge = null // a node click supersedes any edge selection
-      this.sigma.refresh()
+      this._setFocus([node])
       handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record'))
     })
     this.sigma.on('clickEdge', ({ edge }) => {
       this.selectedEdge = edge
       this.selectedNode = null
-      this.sigma.refresh()
+      this._setFocus([this.graph.source(edge), this.graph.target(edge)])
       handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record'))
     })
     this.sigma.on('clickStage', () => {
       this.selectedEdge = null
       this.selectedNode = null
-      this.sigma.refresh()
+      this._setFocus([])
       handlers.onClearSelection?.()
     })
 
@@ -292,7 +348,9 @@ export class Plot {
       if (!this.rightPan && this.connectFrom && this.hoveredNode && this.hoveredNode !== this.connectFrom) {
         const src = this.graph.getNodeAttribute(this.connectFrom, 'record')
         const dst = this.graph.getNodeAttribute(this.hoveredNode, 'record')
-        handlers.onConnect?.(src, dst)
+        // A bead stands for many nodes and is none of them; there is no edge to
+        // draw to it.
+        if (src && dst) handlers.onConnect?.(src, dst)
       }
       this.connectFrom = null
       this.leftDown = false
@@ -322,6 +380,7 @@ export class Plot {
         record: e,
       })
       this._curveEdges() // re-fan in case this created a parallel bundle
+      this._sizeByDegree() // both endpoints just gained a degree
       this.sigma.refresh()
     }
   }
@@ -335,20 +394,51 @@ export class Plot {
     this.legend.clear()
     this.selectedEdge = null
     this.selectedNode = null
+    this.focusNodes = new Set()
+    this.focusDist = null
+    this.collapsed.clear()
+    this.expandedHubs.clear()
+    this.scores.clear()
   }
 
-  /** Highlight an edge by its record id (search focus uses this). */
+  /**
+   * Highlight an edge by its record id (search focus uses this), focusing both
+   * of its endpoints with it.
+   */
   selectEdge(id) {
-    this.selectedEdge = 'e' + id
+    const key = 'e' + id
+    this.selectedEdge = key
     this.selectedNode = null
-    this.sigma.refresh()
+    this._setFocus(this.graph.hasEdge(key) ? [this.graph.source(key), this.graph.target(key)] : [])
   }
 
   /** Highlight a node by its id (click-expand and search focus use this). */
   selectNode(id) {
     this.selectedNode = String(id)
     this.selectedEdge = null
+    this._setFocus([String(id)])
+  }
+
+  /**
+   * Set which nodes read as focused, and measure the graph outward from them so
+   * everything else can recede. Distance is what makes a dense canvas legible:
+   * a selection with its neighbourhood at full strength and the rest faded is
+   * the same picture with the noise turned down.
+   */
+  _setFocus(nodes) {
+    this.focusNodes = new Set(nodes.filter((n) => this.graph.hasNode(n)))
+    if (!this.focusNodes.size) {
+      this.focusDist = null
+      this.sigma.refresh()
+      return
+    }
+    this.focusDist = focusDistances(this.graph, this.focusNodes)
     this.sigma.refresh()
+  }
+
+  /** Opacity for a node at its hop distance from the focus. 1 when unfocused. */
+  _alphaOf(node) {
+    return this.focusDist ? alphaFor(this.focusDist.get(node)) : 1
   }
 
   /**
@@ -357,7 +447,8 @@ export class Plot {
    * existing nodes keep their positions. Returns nothing — call sites read
    * `legendEntries()` afterward.
    */
-  addSubgraph({ nodes = [], edges = [] }, anchorId = null) {
+  addSubgraph({ nodes = [], edges = [], scores = null }, anchorId = null) {
+    for (const { id, score } of scores ?? []) this.scores.set(String(id), score)
     const anchor =
       anchorId != null && this.graph.hasNode(String(anchorId))
         ? {
@@ -366,6 +457,22 @@ export class Plot {
           }
         : { x: 0, y: 0 }
 
+    // Unfold every bead before merging. A newly-arrived edge may well point at
+    // a node that is currently folded away, and an edge whose endpoint is not
+    // on the canvas is silently dropped — so the graph is made whole first and
+    // re-folded afterwards, rather than reasoning about what each bead hides.
+    this._restoreAllBeads()
+
+    this._addNodes(nodes, anchor)
+    this._addEdges(edges)
+
+    this._curveEdges()
+    this._collapseLeaves()
+    this._sizeByDegree()
+    this._layout()
+  }
+
+  _addNodes(nodes, anchor) {
     for (const n of nodes) {
       const id = String(n.id)
       if (this.graph.hasNode(id)) continue
@@ -379,7 +486,9 @@ export class Plot {
         record: n,
       })
     }
+  }
 
+  _addEdges(edges) {
     for (const e of edges) {
       const key = 'e' + e.id
       if (this.graph.hasEdge(key)) continue
@@ -391,7 +500,69 @@ export class Plot {
         })
       }
     }
+  }
 
+  /**
+   * Fold each hub's leaves into a single bead once there are too many to read.
+   * Nothing is lost: the records ride on the bead and come back when it is
+   * opened, or whenever the canvas next changes.
+   */
+  _collapseLeaves() {
+    const work = hubsToFold(this.graph, {
+      skipHubs: this.expandedHubs,
+      keep: this.focusNodes,
+    })
+
+    for (const [hub, leaves] of work) {
+      const nodes = []
+      const edges = []
+      for (const leaf of leaves) {
+        nodes.push(this.graph.getNodeAttribute(leaf, 'record'))
+        this.graph.forEachEdge(leaf, (_e, attrs) => edges.push(attrs.record))
+        this.graph.dropNode(leaf) // takes its edges with it
+      }
+      const key = BEAD_PREFIX + hub
+      this.collapsed.set(key, { hub, nodes, edges })
+      this.graph.addNode(key, {
+        label: `+${leaves.length}`,
+        x: this.graph.getNodeAttribute(hub, 'x') + 1,
+        y: this.graph.getNodeAttribute(hub, 'y') + 1,
+        size: 6,
+        color: BEAD_COLOR,
+        bead: true,
+        count: leaves.length,
+      })
+      this.graph.addEdgeWithKey(BEAD_EDGE_PREFIX + hub, hub, key, {
+        label: `${leaves.length} more`,
+        size: 4,
+      })
+    }
+  }
+
+  /** Put every folded leaf back, dropping the beads. */
+  _restoreAllBeads() {
+    if (!this.collapsed.size) return
+    for (const [key, { nodes, edges }] of this.collapsed) {
+      const anchor = this.graph.hasNode(key)
+        ? { x: this.graph.getNodeAttribute(key, 'x'), y: this.graph.getNodeAttribute(key, 'y') }
+        : { x: 0, y: 0 }
+      if (this.graph.hasNode(key)) this.graph.dropNode(key)
+      this._addNodes(nodes, anchor)
+      this._addEdges(edges)
+    }
+    this.collapsed.clear()
+  }
+
+  /** Open one bead, and remember not to fold that hub again. */
+  expandBead(key) {
+    const folded = this.collapsed.get(key)
+    if (!folded) return
+    this.expandedHubs.add(folded.hub)
+    const anchor = { x: this.graph.getNodeAttribute(key, 'x'), y: this.graph.getNodeAttribute(key, 'y') }
+    this.graph.dropNode(key)
+    this.collapsed.delete(key)
+    this._addNodes(folded.nodes, anchor)
+    this._addEdges(folded.edges)
     this._curveEdges()
     this._sizeByDegree()
     this._layout()
@@ -417,9 +588,25 @@ export class Plot {
     })
   }
 
+  /**
+   * Radius by degree, so the core node in a fan reads as the core node without
+   * an overlay switched on. A hub counts the leaves folded into its bead — its
+   * importance did not shrink when they were tidied away — and a bead counts
+   * what it hides.
+   */
   _sizeByDegree() {
-    this.graph.forEachNode((node) => {
-      const d = this.graph.degree(node)
+    const folded = new Map() // hub -> leaves hidden beneath it
+    for (const { hub, nodes } of this.collapsed.values()) {
+      folded.set(hub, (folded.get(hub) ?? 0) + nodes.length)
+    }
+    this.graph.forEachNode((node, attrs) => {
+      if (attrs.bead) {
+        this.graph.setNodeAttribute(node, 'size', 6 + Math.min(16, Math.sqrt(attrs.count) * 2.2))
+        return
+      }
+      const hidden = folded.get(node) ?? 0
+      // The bead edge stands in for the leaves it replaced; don't count both.
+      const d = this.graph.degree(node) + (hidden ? hidden - 1 : 0)
       this.graph.setNodeAttribute(node, 'size', 4 + Math.min(14, Math.sqrt(d) * 2.5))
     })
   }
@@ -429,6 +616,7 @@ export class Plot {
       this.sigma.refresh()
       return
     }
+    if (this.scores.size) weightByImportance(this.graph, this.scores)
     // Low gravity so ForceAtlas2 doesn't pile every disconnected group onto
     // the center (there's no attraction *between* components, only repulsion,
     // so weak gravity lets them drift apart); outbound-attraction spreads hubs.
@@ -442,9 +630,14 @@ export class Plot {
         barnesHutOptimize: this.graph.order > 400,
       },
     })
-    // Then hard-separate: pack each connected component's bounding box into a
-    // grid so unrelated groups never overlap, regardless of how FA2 settled.
+    // Then arrange each hub's leaves into label sectors, and only then pack:
+    // sectoring moves nodes, and packing measures bounding boxes, so doing it
+    // the other way round would let a re-arranged fan spill into its neighbour.
+    sectorLeaves(this.graph)
     this._packComponents()
+    // Distances were measured on the graph as it was; folding, unfolding and
+    // expanding all change what is a hop away.
+    this._setFocus([...this.focusNodes])
     this.sigma.refresh()
   }
 
@@ -519,6 +712,21 @@ export class Plot {
       cursorX += b.w + gap
       rowH = Math.max(rowH, b.h)
     }
+  }
+
+  /**
+   * Switch whole categories off. Hiding rather than fading, because a reader
+   * turning off a label has said it is not part of the question — leaving a
+   * ghost of it behind would be answering a question they did not ask.
+   */
+  setHiddenLabels(labels) {
+    this.hiddenLabels = new Set(labels)
+    this.sigma.refresh()
+  }
+
+  /** The category a node belongs to, as the legend names it. */
+  _categoryOf(node) {
+    return this.graph.getNodeAttribute(node, 'record')?.labels?.[0] ?? '(none)'
   }
 
   legendEntries() {
@@ -597,9 +805,14 @@ export class Plot {
 
   /** Undo any overlay: restore category colours + degree sizing. */
   resetStyle() {
-    this.graph.forEachNode((n) => {
-      const rec = this.graph.getNodeAttribute(n, 'record')
-      const label = rec?.labels?.[0] ?? ''
+    this.graph.forEachNode((n, attrs) => {
+      // Beads are not entities: giving one a category colour would also invent
+      // a legend entry for the label it does not have.
+      if (attrs.bead) {
+        this.graph.setNodeAttribute(n, 'color', BEAD_COLOR)
+        return
+      }
+      const label = attrs.record?.labels?.[0] ?? ''
       this.graph.setNodeAttribute(n, 'color', colorFor(label, this.legend))
     })
     this.graph.forEachEdge((e) => {

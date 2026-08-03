@@ -471,27 +471,32 @@ public class Drsg extends Client {
             String plane,
             String label,
             Long limit,
+            String order,
             Long asOf,
             Long asOfMs) {
 
         public static GraphSeedParams of(String plane) {
-            return new GraphSeedParams(plane, null, null, null, null);
+            return new GraphSeedParams(plane, null, null, null, null, null);
         }
 
         public GraphSeedParams withLabel(String label) {
-            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+            return new GraphSeedParams(plane, label, limit, order, asOf, asOfMs);
         }
 
         public GraphSeedParams withLimit(Long limit) {
-            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+            return new GraphSeedParams(plane, label, limit, order, asOf, asOfMs);
+        }
+
+        public GraphSeedParams withOrder(String order) {
+            return new GraphSeedParams(plane, label, limit, order, asOf, asOfMs);
         }
 
         public GraphSeedParams withAsOf(Long asOf) {
-            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+            return new GraphSeedParams(plane, label, limit, order, asOf, asOfMs);
         }
 
         public GraphSeedParams withAsOfMs(Long asOfMs) {
-            return new GraphSeedParams(plane, label, limit, asOf, asOfMs);
+            return new GraphSeedParams(plane, label, limit, order, asOf, asOfMs);
         }
     }
 
@@ -854,7 +859,7 @@ public class Drsg extends Client {
         return call("index.ensure", params, new TypeReference<Map<String, Object>>() {});
     }
 
-    /** An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
+    /** An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call. (access: read) */
     public Subgraph graphSeed(GraphSeedParams params) throws DrsgException {
         return call("graph.seed", params, new TypeReference<Subgraph>() {});
     }

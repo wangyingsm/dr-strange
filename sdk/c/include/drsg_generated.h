@@ -141,11 +141,12 @@ struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const c
 typedef struct {
     const char *label;
     const int64_t *limit;
+    const char *order;
     const int64_t *as_of;
     const int64_t *as_of_ms;
 } drsg_graph_seed_opts;
 
-/* An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
+/* An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call. (access: read) */
 struct json_object *drsg_graph_seed(drsg_client *c, const char *plane, const drsg_graph_seed_opts *opts, drsg_error *err);
 
 typedef struct {

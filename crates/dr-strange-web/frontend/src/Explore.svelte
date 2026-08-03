@@ -39,6 +39,12 @@
   let labels = $state([]) // catalog label names for the filter
   let catLabels = $state({}) // full catalog: label -> { properties: { name -> { types } } }
   let labelFilter = $state('') // '' = all labels
+  // Seeding is ranked, not arbitrary: start with the plane's skeleton and widen
+  // deliberately. 200 arbitrary nodes is a hairball whatever the layout does.
+  const SEED_STEPS = [40, 100, 200, 500]
+  let seedLimit = $state(SEED_STEPS[0])
+  let seedTotal = $state(0)
+  let hiddenLabels = $state(new Set()) // categories switched off from the legend
   let cypher = $state('') // query-language text; '' = use the label seed
   let embedProvider = $state(loadPref('embedProvider', 'openai')) // text SEARCH … NEAR provider
   let selected = $state(null) // { kind: 'node'|'edge', data }
@@ -299,18 +305,39 @@
     }
   }
 
+  /** Widen the ranked seed by one step. */
+  async function seedMore() {
+    const next = SEED_STEPS.find((n) => n > seedLimit)
+    if (!next) return
+    seedLimit = next
+    await seed()
+  }
+
+  /**
+   * Switch a category off, or back on. A reader who hides a label has said it
+   * is not part of the question, so it goes rather than fading.
+   */
+  function toggleLabel(label) {
+    const next = new Set(hiddenLabels)
+    if (!next.delete(label)) next.add(label)
+    hiddenLabels = next
+    plot.setHiddenLabels(next)
+  }
+
   async function seed() {
     error = null
     try {
       plot.clear()
-      const params = { plane, ...atParams() }
+      hiddenLabels = new Set()
+      const params = { plane, limit: seedLimit, order: 'degree', ...atParams() }
       if (labelFilter) params.label = labelFilter
       const sg = await rpc('graph.seed', params)
       plot.addSubgraph(sg)
       legend = plot.legendEntries()
       selected = null
+      seedTotal = sg.total
       status = `${sg.nodes.length} nodes · ${sg.edges.length} edges${
-        sg.truncated ? ` (of ${sg.total}, capped)` : ''
+        sg.truncated ? ` — the ${sg.nodes.length} most connected of ${sg.total}` : ''
       }`
     } catch (e) {
       error = e.message
@@ -1431,10 +1458,29 @@
        nothing is selected; selecting a node/edge swaps it for the props layer. -->
   {#if !selected && (algoLegend.length || legend.length)}
     <div class="legend">
-      <p class="legend-title">Legend</p>
+      <p class="legend-title">
+        Legend
+        {#if !algoLegend.length}<span class="legend-hint">click to hide</span>{/if}
+      </p>
       {#each (algoLegend.length ? algoLegend : legend) as e (e.label)}
-        <span class="swatch" style="--c:{e.color}">{e.label || '(no label)'}</span>
+        {#if algoLegend.length}
+          <span class="swatch" style="--c:{e.color}">{e.label || '(no label)'}</span>
+        {:else}
+          <button
+            type="button"
+            class="swatch"
+            class:off={hiddenLabels.has(e.label || '(none)')}
+            style="--c:{e.color}"
+            aria-pressed={hiddenLabels.has(e.label || '(none)')}
+            onclick={() => toggleLabel(e.label || '(none)')}
+          >{e.label || '(no label)'}</button>
+        {/if}
       {/each}
+      {#if seedTotal > 0 && SEED_STEPS.some((n) => n > seedLimit)}
+        <button type="button" class="more" onclick={seedMore}>
+          Show more ({seedLimit} of {seedTotal})
+        </button>
+      {/if}
     </div>
   {/if}
 

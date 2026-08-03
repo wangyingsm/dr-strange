@@ -50,7 +50,7 @@ jobs:
           retention-days: 1
 
   frontend:
-    name: Frontend — build
+    name: Frontend — lint + build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -61,8 +61,18 @@ jobs:
         # let it resolve fresh instead of failing to read the lock.
         run: bun install
         working-directory: crates/dr-strange-web/frontend
+      # `no-undef` specifically: neither vite nor bun errors on a reference to
+      # an identifier that does not exist, so a function lost in a refactor
+      # builds green and throws at runtime — which is how the graph plot once
+      # shipped an empty canvas.
+      - name: Lint
+        run: bun run lint
+        working-directory: crates/dr-strange-web/frontend
       - name: Build
         run: bun run build
+        working-directory: crates/dr-strange-web/frontend
+      - name: Test
+        run: bun test
         working-directory: crates/dr-strange-web/frontend
 
   docs:

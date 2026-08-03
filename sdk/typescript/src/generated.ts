@@ -160,8 +160,8 @@ export class Drsg extends Client {
     return this._call("index.ensure", params) as Promise<Record<string, unknown>>;
   }
 
-  /** An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
-  graphSeed(params: { plane: string; label?: string; limit?: number; as_of?: number; as_of_ms?: number }): Promise<Subgraph> {
+  /** An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call. (access: read) */
+  graphSeed(params: { plane: string; label?: string; limit?: number; order?: "scan" | "degree" | "pagerank"; as_of?: number; as_of_ms?: number }): Promise<Subgraph> {
     return this._call("graph.seed", params) as Promise<Subgraph>;
   }
 

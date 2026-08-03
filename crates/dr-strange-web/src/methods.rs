@@ -580,6 +580,12 @@ pub struct Seed {
     label: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    /// `"degree"` or `"pagerank"` seed the plane's important nodes rather than
+    /// the first ones the scan happens to reach. Anything else (and the
+    /// default) keeps scan order, which is cheaper and is what a re-seed of a
+    /// small plane wants.
+    #[serde(default)]
+    order: Option<String>,
     #[serde(flatten)]
     at: AsOfParams,
 }
@@ -597,7 +603,47 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         None => app(plane.query().scan_all().ids())?,
     };
     let total = all_ids.len();
-    let ids: Vec<NodeId> = all_ids.into_iter().take(limit as usize).collect();
+
+    // Ranked seeding: take the *important* nodes, not the first ones the scan
+    // reached. A canvas of two hundred arbitrary nodes is a hairball whatever
+    // the layout does with it; the same budget spent on the highest-PageRank
+    // nodes is the plane's skeleton, and the caller widens it deliberately.
+    let ranked: Option<Vec<(NodeId, f64)>> = match req.order.as_deref() {
+        // Degree, not PageRank, is what "the skeleton" means. PageRank on a
+        // directed graph flows rank *along* the edges and pools it in sinks, so
+        // a hub that points at forty things ranks below the forty — measured on
+        // a test plane, a twelve-leaf hub came out under its own leaves. Degree
+        // asks the question actually being asked: what is connected to a lot.
+        Some("degree") => {
+            let mut rows = Vec::with_capacity(all_ids.len());
+            for id in &all_ids {
+                let d = app(plane.neighbors(*id, Dir::Both, None))?.len();
+                rows.push((*id, d as f64));
+            }
+            // Descending by degree, ties by id so a re-seed is reproducible.
+            rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
+            Some(rows)
+        }
+        Some("pagerank") => {
+            let mut builder = plane.algo();
+            if let Some(label) = &req.label {
+                builder = builder.label(label.clone());
+            }
+            Some(app(builder.pagerank(PageRankOptions::default()))?)
+        }
+        _ => None,
+    };
+
+    let (ids, scores): (Vec<NodeId>, Option<Vec<(u64, f64)>>) = match ranked {
+        Some(rows) => {
+            let top: Vec<(NodeId, f64)> = rows.into_iter().take(limit as usize).collect();
+            (
+                top.iter().map(|(id, _)| *id).collect(),
+                Some(top.into_iter().map(|(id, s)| (id.0, s)).collect()),
+            )
+        }
+        None => (all_ids.into_iter().take(limit as usize).collect(), None),
+    };
     let set: std::collections::BTreeSet<u64> = ids.iter().map(|n| n.0).collect();
 
     let mut nodes = Vec::with_capacity(ids.len());
@@ -628,6 +674,14 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "edges": edges,
         "total": total,
         "truncated": total > ids.len(),
+        // Present only for a ranked seed. The caller gets the scores it just
+        // paid for, so sizing a node or weighting an edge by importance costs
+        // no second call.
+        "scores": scores.map(|rows| {
+            rows.into_iter()
+                .map(|(id, score)| jval!({ "id": id, "score": score }))
+                .collect::<Vec<_>>()
+        }),
     }))
 }
 

@@ -250,13 +250,14 @@ struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const c
     return rc == 0 ? result : NULL;
 }
 
-/* An initial canvas: up to `limit` nodes plus the edges induced among them. (access: read) */
+/* An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches — a legible skeleton instead of an arbitrary sample — and returns the scores alongside, so a caller can size or weight by importance without a second call. (access: read) */
 struct json_object *drsg_graph_seed(drsg_client *c, const char *plane, const drsg_graph_seed_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
     if (opts) {
         if (opts->label) json_object_object_add(p, "label", json_object_new_string(opts->label));
         if (opts->limit) json_object_object_add(p, "limit", json_object_new_int64(*opts->limit));
+        if (opts->order) json_object_object_add(p, "order", json_object_new_string(opts->order));
         if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
         if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
     }

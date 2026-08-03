@@ -9,15 +9,15 @@
       "-32600": "invalid request",
       "-32601": "method not found",
       "-32602": "invalid params",
-      "-32000": "application error (bad plane, dangling edge endpoint, conflict, …)",
+      "-32000": "application error (bad plane, dangling edge endpoint, conflict, \u2026)",
       "-32001": "unauthorized (missing or invalid credential)"
     },
     "x-websocket": {
-      "description": "The `/ws` endpoint answers these request/response methods AND a change-feed subscription (ROADMAP §5). Send `plane.watch` to start receiving `plane.change` notifications for a plane; `plane.unwatch` to stop. Best-effort: a subscriber that falls too far behind drops events. These are WebSocket-only (not in the HTTP dispatch table).",
+      "description": "The `/ws` endpoint answers these request/response methods AND a change-feed subscription (ROADMAP \u00a75). Send `plane.watch` to start receiving `plane.change` notifications for a plane; `plane.unwatch` to stop. Best-effort: a subscriber that falls too far behind drops events. These are WebSocket-only (not in the HTTP dispatch table).",
       "plane.watch": {
         "params": {
           "plane": "string (required)",
-          "label": "string (optional) — only node changes carrying this label; edges pass only when omitted"
+          "label": "string (optional) \u2014 only node changes carrying this label; edges pass only when omitted"
         },
         "result": {
           "watching": "plane name",
@@ -31,12 +31,12 @@
         }
       },
       "plane.change": {
-        "note": "server → client notification (no id)",
+        "note": "server \u2192 client notification (no id)",
         "params": {
           "plane": "string",
           "seq": "commit sequence",
           "truncated": "bool",
-          "changes": "[{ kind: node|edge, op: created|updated|deleted, id, labels?, record? }] — record is the sanitized node/edge (no embeddings, no _-prefixed props); a delete carries id only"
+          "changes": "[{ kind: node|edge, op: created|updated|deleted, id, labels?, record? }] \u2014 record is the sanitized node/edge (no embeddings, no _-prefixed props); a delete carries id only"
         }
       }
     }
@@ -810,7 +810,7 @@
         "name": "result",
         "schema": {
           "type": "object",
-          "description": "{plans:[plan…], ran, attempts, results:[node…], edges:[edge…], count} — the generated plan(s) and their unioned matched subgraph (nodes + connecting edges)."
+          "description": "{plans:[plan\u2026], ran, attempts, results:[node\u2026], edges:[edge\u2026], count} \u2014 the generated plan(s) and their unioned matched subgraph (nodes + connecting edges)."
         }
       }
     },
@@ -905,7 +905,7 @@
     },
     {
       "name": "graph.seed",
-      "summary": "An initial canvas: up to `limit` nodes plus the edges induced among them.",
+      "summary": "An initial canvas of nodes plus induced edges. `order` seeds the highest-ranked nodes rather than the first the scan reaches \u2014 a legible skeleton instead of an arbitrary sample \u2014 and returns the scores alongside, so a caller can size or weight by importance without a second call.",
       "x-access": "read",
       "params": [
         {
@@ -929,6 +929,19 @@
             "type": "integer",
             "default": 200
           }
+        },
+        {
+          "name": "order",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "scan",
+              "degree",
+              "pagerank"
+            ],
+            "default": "scan"
+          },
+          "summary": "`degree` or `pagerank` seed the plane's important nodes instead of the first ones the scan reaches, and return their scores. Prefer `degree` for a skeleton: PageRank pools rank in sinks, so a hub can rank below its own neighbours."
         },
         {
           "name": "as_of",
@@ -1027,7 +1040,7 @@
     },
     {
       "name": "digest.run",
-      "summary": "Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it — most accurate, and ~15x the input token usage.",
+      "summary": "Extract a node/edge proposal from text via the LLM (dry-run; spends provider credits). `mode` sets how much clean-up follows the extraction: `coarse` reconciles the label and edge-type vocabularies, `fine` (the default) also merges entities that name the same thing, `super` also re-reads every entity against all the passages mentioning it \u2014 most accurate, and ~15x the input token usage.",
       "x-access": "write",
       "params": [
         {
@@ -1113,7 +1126,7 @@
         },
         {
           "name": "mode",
-          "summary": "How thoroughly to clean up the extraction, trading cost for precision. `coarse` reconciles the label and edge-type vocabularies, which chunks read independently never converge on. `fine` (the default) also merges entities that name the same thing and checks every key against the graph exactly, so a re-digest links rather than duplicating. `super` also re-reads every entity against all the passages mentioning it, repairing properties that one-round extraction fixed from whichever chunk mentioned it first — the most accurate, and by far the most expensive (~15x input token usage), since every eligible entity carries its passages into a call of its own.",
+          "summary": "How thoroughly to clean up the extraction, trading cost for precision. `coarse` reconciles the label and edge-type vocabularies, which chunks read independently never converge on. `fine` (the default) also merges entities that name the same thing and checks every key against the graph exactly, so a re-digest links rather than duplicating. `super` also re-reads every entity against all the passages mentioning it, repairing properties that one-round extraction fixed from whichever chunk mentioned it first \u2014 the most accurate, and by far the most expensive (~15x input token usage), since every eligible entity carries its passages into a call of its own.",
           "required": false,
           "schema": {
             "type": "string",
@@ -1552,7 +1565,7 @@
     "schemas": {
       "Properties": {
         "type": "object",
-        "description": "Property map in the core JSON dialect: scalars map directly; {\"$vector\":[…]} is an embedding; {\"$desc\":…,\"$value\":…} is a described value."
+        "description": "Property map in the core JSON dialect: scalars map directly; {\"$vector\":[\u2026]} is an embedding; {\"$desc\":\u2026,\"$value\":\u2026} is a described value."
       },
       "NodeRef": {
         "description": "A node reference: a numeric id or an external key.",

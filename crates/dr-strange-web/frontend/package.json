@@ -6,10 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "test": "bun test",
+    "preview": "vite preview",
+    "lint": "oxlint -A all -D no-undef --config .oxlintrc.json src/"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.1.0",
+    "oxlint": "^1.77.0",
     "svelte": "^5.19.0",
     "vite": "^6.0.0"
   },

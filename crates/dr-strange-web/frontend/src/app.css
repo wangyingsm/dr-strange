@@ -1097,6 +1097,56 @@ nav button.active {
   background: var(--c);
   flex: none;
 }
+/* The category legend doubles as a filter, so its entries are buttons — reset
+   the button chrome and keep the swatch reading as a label, not a control. */
+button.swatch {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0.1rem 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+  border-radius: 4px;
+}
+button.swatch:hover {
+  color: var(--accent);
+}
+/* A switched-off category: struck through and dimmed, so it is plainly absent
+   from the canvas by choice rather than missing. */
+button.swatch.off {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+button.swatch.off::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--c);
+}
+.legend-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: 0.4rem;
+  opacity: 0.75;
+}
+.legend .more {
+  margin-top: auto;
+  font: 12px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+}
+.legend .more:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 
 .inspector {
   position: absolute;
