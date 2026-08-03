@@ -276,7 +276,7 @@ impl KeywordRegistry {
             entries: self
                 .entries
                 .iter()
-                .map(|((plane, label, property), e)| (*plane, label.clone(), property.clone(), e))
+                .map(|((plane, label, property), e)| (*plane, label.as_str(), property.as_str(), e))
                 .collect(),
         };
         let mut bytes = Vec::from(*SIDECAR_MAGIC);
@@ -316,7 +316,7 @@ impl KeywordRegistry {
 struct Sidecar<'a> {
     version: u32,
     seq: u64,
-    entries: Vec<(PlaneId, String, String, &'a Entry)>,
+    entries: Vec<(PlaneId, &'a str, &'a str, &'a Entry)>,
 }
 
 #[derive(Deserialize)]

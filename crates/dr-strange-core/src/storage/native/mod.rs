@@ -717,16 +717,16 @@ impl WriteTransaction for NativeWriteTxn<'_> {
             return Ok(());
         }
         let seq = self.snapshot + 1;
-        let batch = WalBatch {
+        let batch = WalBatchRef {
             seq,
             ops: self
                 .buf
                 .iter()
-                .map(|((t, k), op)| WalOp {
+                .map(|((t, k), op)| WalOpRef {
                     table: *t,
-                    key: k.clone(),
+                    key: k,
                     value: match op {
-                        Op::Put(v) => Some(v.clone()),
+                        Op::Put(v) => Some(v.as_slice()),
                         Op::Del => None,
                     },
                 })
@@ -761,13 +761,17 @@ impl WriteTransaction for NativeWriteTxn<'_> {
 // A record is `[u32 len][u32 crc32][postcard(WalBatch)]`, all little-endian.
 // One record per committed transaction, so replay is all-or-nothing per commit.
 
-#[derive(Serialize, Deserialize)]
+// Borrowing (append) vs owning (replay) structs, agreeing on field order and
+// wire types (`&[u8]`/`Vec<u8>` serialize identically), so a commit serializes
+// its staged ops without copying every key and value.
+
+#[derive(Deserialize)]
 struct WalBatch {
     seq: u64,
     ops: Vec<WalOp>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct WalOp {
     table: u8,
     key: Vec<u8>,
@@ -775,7 +779,23 @@ struct WalOp {
     value: Option<Vec<u8>>,
 }
 
-fn append_batch(w: &mut impl Write, batch: &WalBatch) -> Result<()> {
+/// ⚠ Borrowed append twin of [`WalBatch`] — field order must match it.
+#[derive(Serialize)]
+struct WalBatchRef<'a> {
+    seq: u64,
+    ops: Vec<WalOpRef<'a>>,
+}
+
+/// ⚠ Borrowed append twin of [`WalOp`] — field order must match it.
+#[derive(Serialize)]
+struct WalOpRef<'a> {
+    table: u8,
+    key: &'a [u8],
+    /// `None` is a tombstone (delete).
+    value: Option<&'a [u8]>,
+}
+
+fn append_batch(w: &mut impl Write, batch: &WalBatchRef<'_>) -> Result<()> {
     let body = postcard::to_stdvec(batch).map_err(backend)?;
     w.write_all(&(body.len() as u32).to_le_bytes())?;
     w.write_all(&crc32(&body).to_le_bytes())?;
