@@ -111,6 +111,49 @@ struct Store {
     next_sst: u64,
 }
 
+/// Take the directory's exclusive advisory lock, or say who already has it.
+///
+/// `sst::list` only matches `sst-<n>`, so the lock file is inert to the rest of
+/// the directory.
+///
+/// A filesystem that cannot lock at all (some network mounts) is warned about
+/// and allowed through. Refusing there would make the database unusable on
+/// those mounts, and an unenforceable guarantee is not worth a working
+/// installation. A lock that is *held* is always refused.
+fn lock_directory(dir: &Path) -> Result<File> {
+    let path = dir.join("LOCK");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    // Fully qualified, and via `fs4` rather than std: `File::try_lock` is
+    // inherent from Rust 1.89 and would shadow the trait, but this crate
+    // promises 1.85. Drop the dependency and call std's directly whenever the
+    // MSRV moves past 1.89.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(file),
+        Err(fs4::TryLockError::WouldBlock) => Err(Error::Conflict(format!(
+            concat!(
+                "the database at {} is already open by another process. ",
+                "One process at a time may open it directly; ",
+                "run `drsg serve` and share that instance instead."
+            ),
+            dir.display()
+        ))),
+        Err(fs4::TryLockError::Error(e)) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "cannot take the database lock on this filesystem; \
+                 a concurrent open will not be detected"
+            );
+            Ok(file)
+        }
+    }
+}
+
 /// The native LSM engine. `Send + Sync`: reads take a shared lock on `store`,
 /// the single writer is serialized by `write_gate`, and the WAL has its own
 /// lock so an in-flight `fsync` doesn't block readers.
@@ -118,6 +161,17 @@ pub struct NativeEngine {
     store: RwLock<Store>,
     wal: Mutex<BufWriter<File>>,
     write_gate: Mutex<()>,
+    /// Exclusive advisory lock on `<dir>/LOCK`, held for the engine's lifetime
+    /// and released when this handle drops.
+    ///
+    /// `write_gate` serializes the writer *within* one process; this is what
+    /// stops a second process opening the same directory. Without it each
+    /// process gets its own WAL offset and its own `next_sst` counter and they
+    /// quietly overwrite each other — measured before this existed: two
+    /// concurrent imports of 200 nodes each left a database holding 200, with
+    /// `check` reporting it healthy. Silent loss that survives the integrity
+    /// scan is the worst kind, so the second open is refused instead.
+    _lock: File,
     dir: PathBuf,
     flush_threshold: usize,
     /// Live read snapshots (snapshot → reader count), so compaction never
@@ -157,6 +211,8 @@ impl NativeEngine {
     ) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+        // Before anything else touches the directory.
+        let lock = lock_directory(&dir)?;
 
         let mut store = Store {
             next_sst: sst::next_number(&dir),
@@ -188,6 +244,7 @@ impl NativeEngine {
             store: RwLock::new(store),
             wal: Mutex::new(BufWriter::new(file)),
             write_gate: Mutex::new(()),
+            _lock: lock,
             dir,
             flush_threshold,
             readers: Mutex::new(BTreeMap::new()),

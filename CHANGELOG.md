@@ -4,6 +4,25 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Two processes could open one database and silently destroy each other's
+  writes** ([#1](https://github.com/wangyingsm/dr-strange/issues/1)). The native
+  backend took no cross-process lock, so a second `Database::open` on the same
+  directory succeeded and got its own WAL offset and `next_sst` counter.
+  Measured: two concurrent 200-node imports left a database holding 200 nodes,
+  with `drsg check` reporting it healthy — silent loss that survives the
+  integrity scan. The engine now takes an exclusive advisory lock on
+  `<dir>/LOCK` for its lifetime, so the second open fails with an error naming
+  the database and pointing at `drsg serve`. Closing releases it, so
+  close-then-reopen is unaffected. A filesystem that cannot lock (some network
+  mounts) is warned about and allowed through rather than made unusable. The
+  `redb` backend was never affected — redb locks internally.
+
+  This matters most for MCP: every agent host spawns its own `drsg-mcp`
+  subprocess, so two editors on one project were two writers on one database.
+
 ## [1.4.1] - 2026-08-04
 
 ### Added

@@ -6,9 +6,11 @@ scripting, bulk ingestion, inspection, backup, and operations. Every invocation
 takes a global `--db <path>` (default `graph.drsg`); most commands also take a
 `--plane` (default `startup`).
 
-Because it opens the database in-process, `drsg` should not operate on a database
-that a `drsg serve` currently holds open; use the SDKs or the RPC API against the
-server for concurrent access, and the CLI for offline operations.
+Because it opens the database in-process, `drsg` cannot operate on a database
+that a `drsg serve` — or another `drsg` — currently holds open: the database
+takes an exclusive lock, and a second open fails with a clear error rather than
+corrupting it. Use the SDKs or the RPC API against the server for concurrent
+access, and the CLI for offline operations.
 
 ## Command reference
 
