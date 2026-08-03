@@ -406,6 +406,125 @@ second scheme.
 
 ---
 
+## 9. URL ingestion — AIgest reads the web
+
+**Goal.** A URL becomes a third input to AIgest beside upload and paste. The
+server fetches the page, converts it to Markdown, follows its hyperlinks as far
+as a budget allows, keeps only what is relevant to the target, and assembles one
+LLM-ready document that the existing digest pipeline consumes unchanged.
+
+**Why AI-native.** Most material worth digesting lives behind a URL rather than
+on a disk, and a page's outbound links are a *curated bibliography* — the author
+already decided what is related, which is a signal no amount of retrieval
+recreates. It also plays directly into §8: a crawl is the case where one entity
+is mentioned across several documents, which is exactly what first-chunk-wins
+handles worst and what `super` mode repairs.
+
+**The problem.** Following links naively is how a knowledge graph fills with
+cookie banners, "Privacy Policy", and navigation chrome. Relevance has to be
+decided, and **hop count does not decide it** — depth measures how far the crawl
+walked, not whether the page is about anything. A footer link is one hop away
+and pure noise; a linked appendix three hops out can be the substance.
+
+**Scope sketch.**
+
+- A **server-side fetcher**. A browser `fetch()` is blocked by CORS for
+  essentially every third-party site, so this cannot live in the dashboard. It
+  is also a new production HTTP dependency: `reqwest` is currently a
+  *dev*-dependency of `dr-strange-web`, used only by the tests, with no TLS
+  backend enabled.
+- **HTML → Markdown** with main-content extraction, not the tag-stripping
+  `strip_tags` in `extract.rs` (which exists for DOCX XML and would drag nav and
+  footer text in as prose). Markdown because the chunker already handles it and
+  because headings and lists survive the conversion.
+- **Two-gate relevance** (below), model-free, over `text::Analyzer` — the same
+  tokenizer, stemmer and stopword set the BM25 index uses, so the whole system
+  keeps one notion of what a word is.
+- **Budgets**: max pages, max depth, max total bytes, per-host concurrency and
+  rate, total wall-clock. Whatever a budget drops is reported rather than
+  silently truncated.
+- **Assembly** into one document, each page preceded by its URL and title, with
+  a page boundary forcing a chunk boundary so no chunk straddles two pages.
+- **Surfaces**: a streaming endpoint following the `/digest/extract` precedent
+  (a crawl needs progress for the same reason PDF extraction does), a selection
+  list in the dashboard, and a URL in place of a path on the CLI.
+
+**Settled — relevance is decided twice, and hops are only a tiebreak.** The two
+gates answer different questions, in the shape §8 established (*gate on
+possibility, rank on value*):
+
+*Before fetching*, score each candidate link on what is already in hand for
+free — its anchor text, `title`, and the words in its URL path — by BM25 against
+the target terms. No network, no model. Only the top candidates are fetched.
+
+*After fetching*, re-score the extracted text and **drop** pages that do not hold
+up. A link promising "Transformer architecture" that delivers a login page dies
+here, having cost exactly one request.
+
+Hop decay (`score × decay^hops`) rides along as a tiebreak toward the root, the
+same idiom `plane.hybrid`'s graph channel already uses. It does not decide
+relevance. Depth defaults to 1; the budget is the real control, since depth 2 is
+50 links × 50 links.
+
+**Settled — the target comes from both.** The relevance target defaults to the
+root page's own top terms, and an optional topic the user types sharpens it —
+much the better signal when the user knows what they are after. Offering only
+the root page makes a broad landing page unusable as a seed; offering only a
+typed topic makes the common case (paste a URL, press go) require homework.
+
+**Settled — one blob into the text input.** Fetched pages are concatenated and
+land in the same textarea that upload and paste fill, so they stay editable and
+nothing downstream changes: `digest.run` gains no parameter, and the mode /
+preview / write flow is untouched. Page URLs travel as header lines rather than
+as structured provenance. Carrying pages structurally so each node records the
+page it came from is better provenance and real new plumbing through the digest
+API — a second stage, not this one.
+
+**Settled — fetching is on by default; reaching the private network is not.**
+The feature ships enabled, because a database that has to be reconfigured before
+it can read a URL will mostly not be used to read URLs. The security posture is
+carried by guards that are *not* part of that default:
+
+- `http`/`https` only;
+- DNS resolved and the **resolved address** checked against loopback, private,
+  link-local (`169.254.0.0/16` — cloud metadata) and multicast ranges, at every
+  redirect hop rather than once, since checking the hostname alone leaves DNS
+  rebinding open;
+- response size, redirect count and total time capped;
+- `robots.txt` respected, an identifying User-Agent sent, and per-host rate
+  limiting applied — the bandwidth being spent belongs to someone else.
+
+Reaching a private address is therefore not a setting to relax casually but an
+explicit allowlist for an operator who means it. The posture change — a database
+server that makes outbound connections to addresses its clients choose — is
+stated where an operator will see it: the configuration reference, the book's
+server chapter, and the CLI help.
+
+**Settled — the CLI takes a URL too.** `drsg digest <url>` costs little once the
+fetcher exists. It has nowhere to show a selection list, so it selects by
+threshold and reports what it kept and dropped; the interactive list is a
+dashboard affordance, not a requirement of the feature.
+
+**Forks to settle.**
+- *How the cut is made.* BM25 scores are not comparable across corpora, so an
+  absolute floor is close to meaningless. Rank-based (top-*k*), a floor relative
+  to the best candidate on the page, or both?
+- *Cross-origin.* Follow only same-origin links by default — safer and usually
+  on-topic — or follow anywhere the score justifies, which is where citations
+  actually live?
+- *Linked documents.* A link to a PDF could go straight into the existing
+  `extract.rs` PDF path. Free reach, or an unbounded appetite for 200-page
+  files?
+- *Re-fetching.* A user who previews, changes mode, and previews again should
+  not re-crawl a stranger's site. Cache the fetch per URL for the session, and
+  for how long?
+- *JavaScript-rendered pages* return a shell with no prose. A documented
+  limitation, or eventually a headless renderer?
+- *Topic and root terms* when both are present — does the typed topic replace
+  the root page's terms or merge with them, and at what weight?
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.
