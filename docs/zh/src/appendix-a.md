@@ -46,7 +46,7 @@
 - **`plane.hybrid`** · read —— 融合的向量 + 关键词 + 图邻近度检索。参数：`plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string。
 - **`plane.algo`** · read —— 作用于一个平面或某个标签子集的图算法。参数：`plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number。
 - **`plane.ask`** · read —— 自然语言查询 → 计划 → 执行。参数：`plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string。
-- **`graph.seed`** · read —— 一块由若干节点及其诱导边构成的初始画布。参数：`plane` string!, `label` string, `limit` integer, `as_of` integer, `as_of_ms` integer。
+- **`graph.seed`** · read —— 一块由若干节点及其诱导边构成的初始画布。参数：`plane` string!, `label` string, `limit` integer, `order` string（`scan` \| `degree` \| `pagerank`，默认 `scan`）, `as_of` integer, `as_of_ms` integer。指定排序时返回得分最高的节点，而非扫描最先遇到的那些，并附带其 `scores`——若要取骨架，宜用 `degree`，因为 PageRank 会把权重汇聚到汇点上。
 - **`graph.expand`** · read —— 围绕某个节点的、防枢纽的一跳邻域。参数：`plane` string!, `id` integer!, `direction` string, `type` string, `limit` integer, `as_of` integer, `as_of_ms` integer。
 
 ## 索引与导入

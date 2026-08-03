@@ -36,7 +36,36 @@ Explore is an interactive graph canvas driven by a tabbed toolbar. Selecting a
 node or edge opens an inspector showing its labels/type and properties (vectors
 are collapsed behind a control rather than printed); double-clicking a node
 expands its neighborhood; dragging from one node to another opens the
-new-edge dialog with the endpoints prefilled. A legend maps colors to labels.
+new-edge dialog with the endpoints prefilled.
+
+### Reading a dense graph
+
+A plane of any size is more than a canvas can show at once, so Explore draws
+the **skeleton** and lets you ask for the rest.
+
+- **Ranked seeding.** The opening view is the 40 most connected nodes and the
+  edges among them, not the first 40 the scan reaches — a legible shape rather
+  than an arbitrary sample. *Show more* widens it to 100, 200, 500. Ranking is
+  by degree; `graph.seed` also offers PageRank, but PageRank pools rank in
+  sinks, so a hub can score below its own neighbours.
+- **The legend is a filter.** Click a label to hide that category, click again
+  to bring it back. Hidden, not faded: a category you switched off is not part
+  of the question.
+- **Crowded hubs fold.** When a node has more than twenty *leaves* — neighbours
+  attached to it and to nothing else — they collapse into one bead labelled
+  with the count. Click the bead to open it. Nothing is discarded, and a leaf
+  you have selected is never folded away.
+- **Fans are grouped.** Below that threshold, a hub's leaves are arranged
+  around it in arcs by label, so a ring reads as regions rather than a smear.
+- **Importance opens the layout.** Edges touching a well-connected node are
+  laid out longer, so a busy neighbourhood has room to be read.
+- **Selection focuses.** The selection and its immediate neighbours stay at
+  full strength, the next ring dims, and everything beyond recedes and drops
+  its label. Selecting an **edge** focuses both of its endpoints, since an edge
+  is a statement about two things.
+
+Node size tracks how connected a node is (counting anything folded beneath
+it), and the legend maps colors to labels.
 
 The toolbar tabs:
 

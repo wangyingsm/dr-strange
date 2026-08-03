@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "criterion",
  "moka",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-llm"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "dr-strange-core",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-log"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "tracing",
  "tracing-appender",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-mcp"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "dr-strange-core",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-parser"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "dr-strange-core",
  "nom 7.1.3",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-web"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "drsg-bench"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "clap",

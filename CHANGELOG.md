@@ -4,6 +4,33 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-08-04
+
+### Added
+- **A legible Explore canvas.** The plot drew 200 arbitrary nodes and no layout
+  makes 200 interlinked nodes readable, so it now draws the skeleton and lets
+  the reader ask for more.
+  - `graph.seed` gains `order` (`scan` \| `degree` \| `pagerank`) and returns
+    the scores it ranked by. Explore opens on the 40 most connected nodes with
+    a *show more*. Prefer `degree`: PageRank pools rank in sinks, so a hub can
+    score below its own neighbours.
+  - The legend is a filter — click a label to hide that category.
+  - A hub's leaves fold into one counted bead past twenty and open on a click;
+    below that they are arranged into arcs by label.
+  - Edges touching a well-connected node lay out longer, so a busy
+    neighbourhood has room.
+  - A selection fades the graph by hop distance, and selecting an **edge**
+    focuses both of its endpoints.
+
+### Fixed
+- **The dashboard could serve a previous build.** `index.html` went out with no
+  `Cache-Control`, `ETag` or `Last-Modified` — and it is the only unhashed file
+  and the only thing naming the hashed bundles — so a browser could reuse a
+  stale copy pointing at assets the rebuild had replaced. The SPA fallback then
+  answered the missing bundle with `index.html`, handing back HTML where the
+  browser asked for JavaScript, so the page failed silently. The entry point is
+  now `no-cache`, hashed assets are `immutable`, and a missing asset is a 404.
+
 ## [1.4.0] - 2026-08-03
 
 ### Added
