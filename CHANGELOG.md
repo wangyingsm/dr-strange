@@ -4,43 +4,33 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-08-03
 
 ### Added
-- **URL ingestion — AIgest reads the web (ROADMAP §9).** A document may be named
-  by address instead of uploaded. The server fetches the page, converts it to
-  Markdown, follows its links under a budget, and assembles one document that
-  digests exactly as a pasted one does.
-  - `drsg digest <url>` (with `--topic`, `--pages`, `--depth`), a streaming
-    `POST /digest/fetch`, and a URL row in the dashboard's AIgest view that
-    returns a *list* of what was found — each page with its relevance score,
-    ticked if it cleared the floor — so nothing becomes tokens unseen.
-  - **Relevance is decided twice**, and hop count decides nothing. Anchor text,
-    `title` and URL *path* words choose what is worth a request; the fetched
-    text decides what is worth keeping. Both use the analyzer the BM25 index
-    uses. A typed topic sharpens the page's own subject rather than replacing
-    it. Hop decay survives only as a tiebreak toward the root.
-  - The keep/drop floor is **relative to the best page in the batch**, because
-    BM25 scores are not comparable across corpora and an absolute threshold
-    would mean something different on every document.
-  - Each page carries its address in the text as `<!-- drsg:source … -->`, and a
-    page boundary now forces a chunk boundary, so no chunk mixes two documents.
-  - Linked PDFs go through the existing extractor. Pages, depth, response size,
-    total download and time are all bounded, and whatever a budget drops is
-    reported rather than silently truncated.
-- **`[fetch]` configuration section** — `enabled`, `max_pages`, `max_depth`,
+- **URL ingestion (ROADMAP §9).** A document may be named by address instead of
+  uploaded: the server fetches the page, converts it to Markdown, follows its
+  links under a budget, and assembles one document that digests as a pasted one
+  does. `drsg digest <url>` (`--topic` / `--pages` / `--depth`), a streaming
+  `POST /digest/fetch`, and a source row in the dashboard that returns the pages
+  it found — each scored, most relevant first — to tick before they cost tokens.
+  - **Relevance is decided twice**: anchor text, `title` and URL *path* words
+    choose what is worth a request; the fetched text decides what is worth
+    keeping. Hop count is only a tiebreak. The keep floor is relative to the
+    best page in the batch, since BM25 scores are not comparable across corpora.
+  - Each page carries `<!-- drsg:source … -->`, and a page boundary now forces a
+    chunk boundary, so no chunk mixes two documents.
+  - Linked PDFs reuse the existing extractor. Pages, depth, response size, total
+    download and time are bounded, and what a budget drops is reported.
+- **`[fetch]` configuration** — `enabled`, `max_pages`, `max_depth`,
   `concurrency`, `allow_private`. Fetching ships enabled; reaching the private
-  network does not. The server refuses loopback, RFC-1918, link-local
-  (`169.254.0.0/16`, where cloud metadata answers credentials) and other
-  non-routable addresses, checks the **resolved address** rather than the
-  hostname, and re-checks at every redirect hop. `allow_private` re-permits
-  specific CIDR blocks for an operator who means it; it does not disable the
-  guard. `robots.txt` is respected, the crawler identifies itself, and requests
-  to one host are spaced.
+  network does not. Loopback, RFC-1918, link-local (`169.254.0.0/16`, where
+  cloud metadata answers credentials) and other non-routable addresses are
+  refused on the **resolved address**, re-checked at every redirect hop.
+  `allow_private` re-permits specific CIDR blocks; it does not disable the
+  guard. `robots.txt` is respected and per-host requests are spaced.
 
 ### Known limitations
-- A page whose text is assembled by JavaScript returns a shell with no prose;
-  there is no headless renderer.
+- JavaScript-rendered pages return a shell with no prose; no headless renderer.
 - Relevance is scored in one analyzer language per crawl.
 
 ## [1.3.0] - 2026-08-03
