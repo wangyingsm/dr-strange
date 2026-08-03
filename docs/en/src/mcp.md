@@ -63,8 +63,16 @@ A ready-to-edit copy of this configuration is provided at
 an absolute path to the binary, point `args` at your database, and supply only
 the provider keys you use.
 
-Because it opens the database in-process, `drsg-mcp` should not run against a
-database a `drsg serve` currently holds open.
+Because it opens the database in-process, **one process at a time** may open a
+given database directly — a `drsg-mcp`, a `drsg` command, or a `drsg serve`, but
+not two at once. This is enforced, not advisory: the second open fails with a
+clear error rather than corrupting the database.
+
+That matters for agent hosts, because each one spawns its own MCP server
+subprocess. Two editors open on the same project means two `drsg-mcp` processes,
+and the second will refuse to start. Until `drsg-mcp` can attach to a running
+server, point each host at its own database, or drive one `drsg serve` through
+the SDKs or the RPC API for anything that must be shared.
 
 ## The tools
 
