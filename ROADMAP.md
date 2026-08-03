@@ -525,6 +525,134 @@ dashboard affordance, not a requirement of the feature.
 
 ---
 
+## 10. Preprocessor plugins — domain structure before the model
+
+**Goal.** Every source of truth carries structure of its own, and that structure
+is knowledge the model should not have to rediscover from prose. A plugin turns
+a format-specific input into **facts** (nodes and edges it is certain about) and
+**prose** (the residue that needs understanding), and a router dispatches to the
+right one before the digest pipeline runs. Source code is the first and best
+case; the point is that stock series, building models and everything else stay
+*out* of this repository and arrive as plugins.
+
+**Why AI-native.** Three wins, and only the first is the obvious one.
+
+*Tokens.* An interface-level view of a source file — signatures, types, doc
+comments, call edges — is a small fraction of the file, and none of the body
+text ever reaches the model.
+
+*Precision.* An AST does not infer that `parse()` calls `lex()`; it **knows**.
+Handing that to a model as prose so it can re-derive a `CALLS` edge spends
+tokens to get a worse answer than the one already in hand.
+
+*Vocabulary.* Plugin facts carry a schema fixed by the plugin — `Function`,
+`Trait`, `IMPLEMENTS` are constants, not inventions — so §8's fragmentation
+problem does not arise for that portion of the graph and stage 1 has nothing to
+reconcile there. A facts-only plugin is a digest with **no model call at all**,
+which puts a whole class of ingestion on the LLM-free side of Appendix C.
+
+**The problem.** `extract.rs`'s `extract_text_with_progress` is already this
+router — it just has the table compiled in (`.pdf` → pdf-extract, `.docx` →
+zip + XML, `.txt`/`.md` → passthrough) and only ever produces text. This item
+generalizes the table and widens the return type. It is also the seam §9 lands
+on: a fetched URL arrives as bytes plus a content type, which is the same
+routing question a file's extension asks, and there should be one dispatch point
+rather than two.
+
+**Scope sketch.**
+
+- A **transport-independent protocol**: `describe` → manifest (name, version,
+  what it handles, what it wants access to), optional `detect(sample)` →
+  confidence, and `preprocess` → `{ facts, prose, report }`. `facts` uses
+  exactly the node/edge shape `digest.write` already accepts, so plugin output
+  is writable through a path that exists.
+- Input by **pull, not push**: the plugin calls back into the host to list and
+  read the files it needs. A whole repository pushed into wasm32 linear memory
+  is both a needless copy and a 4 GiB ceiling; pulling also lets a code plugin
+  follow imports across files, which is where the call graph lives — and *what
+  the host will answer* is the capability grant, rather than a policy document
+  beside it.
+- A **router** over built-in handlers and plugins, resolving on declared
+  extensions and content types first, with an explicit user override always
+  winning. `detect` is for genuine ambiguity only: a router that guesses is
+  worse than one that asks.
+- **Grounding.** The facts are handed to the LLM pass as known entity keys, so
+  the model attaches to them instead of inventing parallel nodes — which §8
+  stage 2's exact-key check already handles.
+- **Two example plugins**, Rust and Go, in-tree as the proof that the interface
+  is real and as the template a third party copies.
+
+**Settled — facts and prose, not prose alone.** A plugin returns both. This is
+the whole reason the item is worth building: preprocessing that only condenses
+text saves tokens, while preprocessing that emits facts also removes an entire
+class of extraction error.
+
+**Settled — the built-in extractors stay built in.** PDF, DOCX and plain text
+remain compiled into the server rather than being rewritten as plugins, so a
+default install keeps working with nothing configured and no wasm runtime
+present. They sit behind the same router, so the interface is uniform even where
+the implementation is not.
+
+**Settled — interface level only.** A code plugin emits signatures, types,
+trait/interface implementations, doc comments and call edges. Statement-level
+ASTs would produce a graph no human can read and no model can afford, for
+material that belongs in a compiler rather than a knowledge graph.
+
+**Settled — provenance is a property.** Every node and edge a plugin produces
+carries `_generated_by: <plugin-name>`, so a later reader can always separate a
+parsed fact from a model's guess. Underscore-prefixed properties are already
+hidden from the schema summary the model reads, so this costs the read paths
+nothing — the mechanism §8 established for `_label_as_written`.
+
+**Settled — WASM, behind a cargo feature that is on by default.** Plugins are
+WebAssembly modules run in-process by an embedded runtime, gated behind a
+`plugins` feature — compile-time gated rather than runtime-erroring, per the
+existing convention — and that feature ships **on**, following `digest`'s
+precedent in the CLI: the capability is there for anyone who wants it, and
+`--no-default-features` drops the whole dependency chain for anyone who does
+not. A plugin system that requires rebuilding the database before it can load a
+plugin is not one.
+
+The default flip costs binary size and build time, and it changes no security
+posture: **the runtime being compiled in is not a plugin running.** No module is
+loaded that the configuration did not name, so a default install executes
+exactly as much third-party code as it does today, which is none.
+
+The sandbox is the reason rather than a bonus. It is what makes a **third-party**
+plugin viable at all, and it hands the trust decision to the operator instead of
+asking them to take one on faith: a plugin starts with no filesystem, no
+network, no environment and no clock, and receives exactly the capabilities the
+configuration grants it. Two properties fall out that a subprocess cannot offer —
+CPU is bounded by fuel metering or epoch interruption, so a runaway plugin is
+*interrupted* rather than killed; and a plugin denied the clock and randomness is
+deterministic, so re-ingesting a repository yields the same graph.
+
+The protocol above is deliberately transport-independent, so a subprocess host
+(for a plugin in a language that will not compile to wasm, or one that genuinely
+needs the network) can be added later without the plugin contract changing.
+
+**Forks to settle.**
+- *Which wasm flavour.* The **component model / WIT** gives a typed contract and
+  generated bindings — the right shape for a third-party interface — but its
+  language support outside Rust is still uneven. Core wasm + WASI preview 1 with
+  hand-rolled marshalling works in more toolchains today and ages worse.
+- *What the example plugins are written in.* Both in Rust is the low-risk answer
+  (`syn` for Rust, a tree-sitter grammar for Go, both compiling to wasm32
+  cleanly) and it proves the interface is language-neutral less convincingly
+  than writing the Go plugin in Go — which depends on TinyGo's stdlib coverage
+  holding up under `go/parser`.
+- *Plugin identity.* Pin a plugin by SHA-256 in the configuration, the way the
+  installers already verify release binaries, or trust the path?
+- *Version in provenance.* `_generated_by` carries the name; a plugin's version
+  belongs somewhere too, in that value or a sibling property.
+- *Enforced determinism.* Deny the clock and randomness outright, or grant them
+  on request and lose reproducible ingestion for plugins that ask?
+- *Facts that conflict with the model's extraction.* A plugin says a symbol is a
+  `Function` and the LLM pass calls it a `Concept`. Plugin wins by rule, or does
+  this go to stage 2 as an identity question?
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.
