@@ -556,7 +556,69 @@ dashboard affordance, not a requirement of the feature.
 
 ---
 
-## 10. Preprocessor plugins — domain structure before the model
+## 10. MCP over the network — one database, many agents
+
+**Goal.** Let several agent hosts share one memory. Today each host spawns its
+own `drsg-mcp`, which embeds the core and opens the database directly, so two
+editors on one project are two writers on one file. As of v1.4.2 the second is
+refused with a clear error instead of silently destroying the first one's
+writes — that is a floor, not an answer.
+
+**Why AI-native.** This is the use case the README leads with. A memory layer
+only one agent can hold open is a memory layer for one agent, and the
+interesting behaviour — one agent reading what another wrote — is exactly what
+the current deployment model forbids.
+
+**The problem.** `drsg-mcp` embeds by design, the same way `drsg` does: point a
+host at a path and it works, with nothing to run and nothing to configure.
+`drsg serve` is the networked surface, for the SDKs, the dashboard and the
+JSON-RPC API — one process, one `Database`, `write_gate` serializing writers and
+MVCC giving genuinely concurrent readers. Both models are complete; neither
+serves several agents sharing one memory, because the protocol agent hosts
+actually speak reaches only the embedded one.
+
+**Settled — the transport belongs on `serve`, not a proxy in `drsg-mcp`.** The
+cheaper-looking option is a `drsg-mcp --connect <url>` forwarding each tool call
+to a running server over `/rpc`. It is rejected on the reporter's own evidence
+in issue #1: the tools do not map cleanly onto the RPC surface. `traverse` has
+no method and would have to be rebuilt as a `LogicalPlan`; `write_nodes` /
+`write_edges` become N round-trips and **lose batch atomicity**; `digest` has to
+be composed from `digest.run` + `digest.write`. Proxying would quietly change
+what the tools mean, and an agent's memory is the last place to accept "almost
+the same semantics".
+
+An MCP transport hosted by `drsg serve` avoids all of it — the tools run in the
+same process against the same `Database`, with the batch atomicity and the
+traversal code they already have. More work up front, less work forever.
+
+**Scope sketch.** An HTTP/SSE MCP endpoint on `drsg serve` (rmcp is already a
+dependency; only `transport-io` is compiled in today). The 15 tools move behind
+a transport-independent handler, so the stdio binary and the served endpoint
+drive the same code. `drsg-mcp` keeps its embedded stdio mode — it is the right
+answer for a single agent and needs no infrastructure.
+
+**Forks to settle.**
+- *Authentication.* `auth.rs`'s `Access::{Read, Write, Admin}` is the natural
+  base for per-agent scoping, but the v1 model is one shared token that
+  authorizes everything. Scoped keys, or one token and per-agent planes?
+- *The token posture is a trap for newcomers.* With no `DRSG_TOKEN` set only the
+  same-origin browser UI is trusted, and every programmatic client is denied
+  **even for reads** — deliberate, so a zero-config desktop install does not
+  quietly expose an open API on localhost. Any remote mode must state this where
+  someone configuring it will read it.
+- *Isolation.* Do agents share a plane, or does each get its own beside a shared
+  one? Sharing is the point, but two agents writing the same entity concurrently
+  is a merge problem this project already has opinions about (§8).
+- *Transport.* Streamable HTTP versus SSE, and what each costs in host support.
+- *Whether the embedded binary gains a client mode at all* once the served
+  endpoint exists — a host can point straight at the URL.
+
+**Credit.** Raised by @maidol in issue #1, alongside the multi-process bug fixed
+in v1.4.2.
+
+---
+
+## 11. Preprocessor plugins — domain structure before the model
 
 **Goal.** Every source of truth carries structure of its own, and that structure
 is knowledge the model should not have to rediscover from prose. A plugin turns
