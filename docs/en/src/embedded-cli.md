@@ -26,7 +26,7 @@ server for concurrent access, and the CLI for offline operations.
 | `hybrid <query> --plane` | fused vector + keyword + graph-proximity search |
 | `index ensure \| keyword` | declare a vector or keyword index |
 | `ask <question> --plane` | natural-language query |
-| `digest <file> --plane [--mode]` | ingest a document via an LLM |
+| `digest <file\|url> --plane [--mode]` | ingest a document (or a page and its links) via an LLM |
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |
 | `stats` / `check` | summary counts / integrity scan |
 | `serve [--addr]` | run the web dashboard + JSON-RPC API |
@@ -97,7 +97,18 @@ $ drsg --db graph.drsg ask "which companies does Ada work for?" \
 $ drsg --db graph.drsg digest notes.md --plane social --apply
 
 $ drsg --db graph.drsg digest paper.md --plane papers --mode super --apply
+
+$ drsg --db graph.drsg digest https://example.com/paper --plane papers \
+    --topic "attention mechanism" --pages 6 --apply
 ```
+
+An `http(s)://` argument is fetched rather than read from disk: the page is
+converted to Markdown and its links followed under `--pages` / `--depth`, keeping
+what is relevant to the page's own subject and to `--topic` if given ([Chapter
+3](./ai-native.md#reading-from-a-url)). The scheme is required — a bare
+`example.com` is a valid filename, and guessing which was meant would be worse
+than asking. The command prints what it kept and what it dropped; there is no
+selection prompt, which is what the dashboard's page list is for.
 
 `--mode` selects how thoroughly the extraction is cleaned up: `coarse`
 reconciles the label and edge-type vocabularies, `fine` (the default) also

@@ -22,7 +22,7 @@ mod refine;
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
     CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport, DigestResult,
-    ExistingEntity, PlaneCandidates, digest,
+    ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest,
 };
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};

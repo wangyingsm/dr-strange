@@ -93,6 +93,14 @@ entities and relations and proposes them. **Write to graph** commits the
 previewed proposal with no further model call. Options include linking to
 existing nodes (to avoid duplicates) and skipping embeddings.
 
+A **URL** row sits beside the upload control: paste an address, optionally a
+topic, and **Fetch**. What comes back is not text in the box but a *list* — the
+page and the pages it links to, each with its relevance score, title and size,
+ticked if it cleared the floor. Unticking one removes it from the document with
+no further request, and a fold-out shows what was not kept and why. Nothing
+becomes tokens until the list looks right ([Chapter
+3](./ai-native.md#reading-from-a-url)).
+
 **Mode** selects how thoroughly the extraction is cleaned up — `coarse`, `fine`
 (the default), or `super` — and is remembered like the provider choices, since
 it is a standing preference rather than a per-run decision. Choosing `super`

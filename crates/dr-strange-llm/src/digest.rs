@@ -950,11 +950,24 @@ fn extract_chunk(
     }
 }
 
+/// Opens a paragraph that names where the text after it came from, e.g.
+/// `<!-- drsg:source https://example.com/a -->`. A document assembled from
+/// several sources (ROADMAP §9's URL fetch, or a reader pasting two papers)
+/// carries one before each, and [`chunk`] breaks there — so no chunk ever
+/// straddles two documents and every chunk that opens one names it.
+pub const SOURCE_MARKER: &str = "<!-- drsg:source";
+
 fn chunk(doc: &str, size: usize) -> Vec<String> {
     let size = size.max(200);
     let mut chunks = Vec::new();
     let mut cur = String::new();
     for para in doc.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+        // A source marker is a hard boundary: flush whatever the previous
+        // document left open rather than gluing half a privacy policy to half
+        // a paper and asking the model to make sense of the pair.
+        if para.starts_with(SOURCE_MARKER) && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+        }
         // A paragraph longer than `size` must itself be split — otherwise a doc
         // with few blank lines becomes one giant chunk whose extraction JSON
         // overruns the model's output limit and comes back truncated.
@@ -1146,6 +1159,30 @@ mod tests {
         let joined: Vec<&str> = chunks.iter().flat_map(|c| c.split_whitespace()).collect();
         assert_eq!(joined.len(), 500);
         assert!(joined.iter().all(|w| *w == "word"));
+    }
+
+    #[test]
+    fn no_chunk_straddles_two_sources() {
+        // Two short documents that would comfortably fit in one chunk together.
+        let doc = format!(
+            "{SOURCE_MARKER} https://a.test -->\n\nAlpha text.\n\n\
+             {SOURCE_MARKER} https://b.test -->\n\nBeta text."
+        );
+        let chunks = chunk(&doc, 4000);
+        assert_eq!(chunks.len(), 2, "the marker must force a break: {chunks:?}");
+        assert!(chunks[0].contains("a.test") && chunks[0].contains("Alpha"));
+        assert!(chunks[1].contains("b.test") && chunks[1].contains("Beta"));
+        // Each chunk still names where its text came from.
+        assert!(chunks.iter().all(|c| c.starts_with(SOURCE_MARKER)));
+        // And neither carries the other's document.
+        assert!(!chunks[0].contains("Beta"));
+        assert!(!chunks[1].contains("Alpha"));
+    }
+
+    #[test]
+    fn a_document_with_no_markers_chunks_exactly_as_before() {
+        let doc = "One paragraph.\n\nAnother paragraph.\n\nA third.";
+        assert_eq!(chunk(doc, 4000).len(), 1, "markers are the only new break");
     }
 
     #[test]

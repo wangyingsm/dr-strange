@@ -157,6 +157,59 @@ The command-line tool ingests text and Markdown; the dashboard's **AIgest** page
 additionally extracts PDF and DOCX, and previews the proposed entities and
 relations before writing. Committing a preview performs no further model calls.
 
+### Reading from a URL
+
+A document may be named by address instead of uploaded. The server fetches the
+page, converts it to Markdown, follows its links under a budget, and assembles
+one document — which then digests exactly as a pasted one does.
+
+```console
+$ drsg --db graph.drsg digest https://example.com/paper \
+    --plane papers --topic "attention mechanism" --pages 6 --apply
+```
+
+A page's outbound links are a curated bibliography: the author already decided
+what is related. The difficulty is that they also point at cookie policies and
+navigation. So **relevance is decided twice**, and hop count decides nothing —
+depth measures how far the crawl walked, not whether a page is about anything.
+
+- *Before fetching*, each link is scored on what is already in hand: its anchor
+  text, its `title`, and the words in its URL path. No network, no model. Only
+  the best candidates cost a request.
+- *After fetching*, the page is scored again on its actual text, and one that
+  does not hold up is dropped having cost exactly one request.
+
+Both use the same analyzer as the BM25 index, so a link saying "transformers"
+matches a target term of "Transformer". A typed `--topic` sharpens the target;
+left empty, the page's own subject is what the crawl looks for. Hop decay
+survives only as a tiebreak toward the root.
+
+Each page arrives with its address recorded in the text, and a page boundary
+always begins a new chunk, so no chunk ever mixes two documents:
+
+```markdown
+<!-- drsg:source https://example.com/paper -->
+
+# Attention Is All You Need
+…
+```
+
+Budgets — pages, depth, response size, total download, time — are the real
+control, and **whatever a budget drops is reported**. The CLI prints what it
+kept and what it discarded; the dashboard shows the same list with checkboxes.
+
+Fetching is enabled by default. What is not a default is reaching the private
+network: the server refuses to connect to loopback, private, link-local (where
+cloud metadata services live) or otherwise non-routable addresses, checks the
+*resolved address* rather than the hostname, and re-checks it at every redirect
+hop. An operator who needs an intranet source re-permits exactly that block, and
+this is the one exception; see [Chapter 2](./getting-started.md#configuration-file).
+`robots.txt` is respected, the crawler identifies itself, and requests to one
+host are spaced.
+
+Known limitation: a page whose text is assembled by JavaScript in the browser
+returns a shell with no prose. There is no headless renderer.
+
 ## Providers and keys
 
 The LLM features — semantic search embedding, `ask`, and ingestion — call an

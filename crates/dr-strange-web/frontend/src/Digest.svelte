@@ -32,12 +32,112 @@
   ]
   let noEmbed = $state(false)
   let link = $state(true)
+  // URL ingestion (ROADMAP §9). `pages` is what the crawl found, each with its
+  // own Markdown block and relevance score; ticking one puts it in the text.
+  let url = $state('')
+  let topic = $state('')
+  // 0 reads only the page named. Remembered like the provider choices: how far
+  // a reader wants to follow links is a habit, not a per-page decision.
+  let depth = $state(Number(loadPref('digestDepth', '0')))
+  let pages = $state([])
+  let dropped = $state([])
   let proposal = $state(null) // { report, nodes, edges }
   let status = $state('')
   let error = $state(null)
   let busy = $state(false)
   let pct = $state(null) // extraction progress 0..100, null = no/indeterminate
   let thinking = $state(false) // waiting on the (slow, indeterminate) LLM call
+
+  /// Both streaming endpoints answer newline-delimited JSON: zero or more
+  /// progress lines, then a final result or `{error}`. Read it line by line so
+  /// the progress bar moves during a slow extraction or crawl.
+  async function stream(res, onMsg) {
+    // A non-2xx here is a pre-stream failure (e.g. a 413 when the upload is too
+    // large, or a 403 when fetching is disabled) with a non-streamed body.
+    if (!res.ok) {
+      const raw = await res.text()
+      let msg = raw
+      try {
+        msg = JSON.parse(raw).error || raw
+      } catch {
+        /* keep raw */
+      }
+      throw new Error(msg || `request failed (${res.status})`)
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let done = null
+    for (;;) {
+      const { value, done: streamDone } = await reader.read()
+      if (streamDone) break
+      buffer += decoder.decode(value, { stream: true })
+      let nl
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim()
+        buffer = buffer.slice(nl + 1)
+        if (!line) continue
+        const msg = JSON.parse(line)
+        if (msg.error) throw new Error(msg.error)
+        const result = onMsg(msg)
+        if (result !== undefined) done = result
+      }
+    }
+    return done
+  }
+
+  // Joining the ticked pages *here* rather than server-side is what makes the
+  // selection interactive: unticking a page costs no request.
+  function assemble() {
+    text = pages
+      .filter((p) => p.kept)
+      .map((p) => p.block)
+      .join('\n\n')
+    proposal = null
+  }
+
+  async function fetchUrl() {
+    if (!url.trim()) return
+    error = null
+    busy = true
+    pct = null
+    pages = []
+    dropped = []
+    status = `fetching ${url}…`
+    try {
+      const params = new URLSearchParams({ url: url.trim(), depth: String(depth) })
+      if (topic.trim()) params.set('topic', topic.trim())
+      const res = await fetch(`/digest/fetch?${params}`, {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      const done = await stream(res, (msg) => {
+        if (msg.progress) {
+          const { done: n, total, url: at } = msg.progress
+          pct = total ? Math.round((n / total) * 100) : null
+          status = `fetching ${n}/${total} — ${at}`
+        } else if (msg.pages !== undefined) {
+          return msg
+        }
+      })
+      if (!done) throw new Error('the fetch ended without a result')
+      pages = done.pages
+      dropped = done.dropped
+      assemble()
+      const kept = pages.filter((p) => p.kept).length
+      status = `fetched ${pages.length} page(s), ${kept} selected — ${text.length} chars`
+    } catch (err) {
+      error = err.message
+    } finally {
+      busy = false
+      pct = null
+    }
+  }
+
+  function togglePage(i) {
+    pages[i].kept = !pages[i].kept
+    assemble()
+  }
 
   async function onFile(e) {
     const file = e.target.files?.[0]
@@ -53,48 +153,20 @@
         headers: authHeaders(),
         body: buf,
       })
-      // A non-2xx here is a pre-stream failure (e.g. a 413 when the upload is
-      // too large) with a non-streamed body — read it defensively.
-      if (!res.ok) {
-        const raw = await res.text()
-        let msg = raw
-        try {
-          msg = JSON.parse(raw).error || raw
-        } catch {
-          /* keep raw */
+      const done = await stream(res, (msg) => {
+        if (msg.progress) {
+          const { page, total } = msg.progress
+          pct = total ? Math.round((page / total) * 100) : null
+          status = `extracting ${file.name}… page ${page}/${total}`
+        } else if (msg.text !== undefined) {
+          return msg
         }
-        throw new Error(msg || `extraction failed (${res.status})`)
-      }
-
-      // Success is a stream of newline-delimited JSON: progress lines then a
-      // final {chars,text} (or {error}). Parse it line by line to drive the bar.
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      let done = null
-      for (;;) {
-        const { value, done: streamDone } = await reader.read()
-        if (streamDone) break
-        buffer += decoder.decode(value, { stream: true })
-        let nl
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, nl).trim()
-          buffer = buffer.slice(nl + 1)
-          if (!line) continue
-          const msg = JSON.parse(line)
-          if (msg.progress) {
-            const { page, total } = msg.progress
-            pct = total ? Math.round((page / total) * 100) : null
-            status = `extracting ${file.name}… page ${page}/${total}`
-          } else if (msg.error) {
-            throw new Error(msg.error)
-          } else if (msg.text !== undefined) {
-            done = msg
-          }
-        }
-      }
+      })
       if (!done) throw new Error('extraction ended without a result')
       text = done.text
+      // An uploaded file replaces whatever a crawl had put in the box.
+      pages = []
+      dropped = []
       proposal = null
       status = `extracted ${done.chars} chars from ${file.name}`
     } catch (err) {
@@ -177,11 +249,40 @@
   <label class="check" title="Retrieve similar entities already in the plane and let the LLM reuse their keys / add edges to them, instead of creating duplicates">
     <input type="checkbox" bind:checked={link} /> link to existing nodes
   </label>
-  <label class="file-btn">
-    Upload file
+  <button class="new-plane-btn ml-auto" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
+</div>
+
+<!-- Row two: where the document comes from. Kept apart from the parse
+     settings above because these are two different questions — what to read,
+     and how to read it. -->
+<div class="sources">
+  <label class="file-btn" title="Markdown, plain text, PDF or DOCX">
+    Local file: upload
     <input type="file" accept=".md,.markdown,.txt,.pdf,.docx" onchange={onFile} />
   </label>
-  <button class="new-plane-btn ml-auto" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
+  <span class="ext">.md .txt .pdf .docx</span>
+  <span class="or">or from URL</span>
+  <input
+    class="url"
+    type="url"
+    bind:value={url}
+    placeholder="https://example.com/article"
+    onkeydown={(e) => e.key === 'Enter' && !busy && fetchUrl()}
+  />
+  <label title="How far to follow the page's links. 0 reads only the page you named; each further hop costs requests and tokens.">
+    follow links
+    <select bind:value={depth} onchange={() => savePref('digestDepth', String(depth))}>
+      {#each [0, 1, 2, 3] as d (d)}<option value={d}>{d}</option>{/each}
+    </select>
+  </label>
+  <input
+    class="topic"
+    type="text"
+    bind:value={topic}
+    placeholder="topic (optional)"
+    title="Sharpens which links are worth following, beyond what the page itself is about. Left empty, the page's own subject is the target."
+  />
+  <button onclick={fetchUrl} disabled={busy || !url.trim()}>Fetch</button>
 </div>
 
 <CreatePlane bind:open={newPlaneOpen} onCreated={onPlaneCreated} />
@@ -205,11 +306,44 @@
   </div>
 {/if}
 
+{#if pages.length}
+  <section class="pages">
+    <h3>
+      Fetched {pages.length} page(s) — {pages.filter((p) => p.kept).length} selected
+      <span class="hint">most relevant first; untick anything not worth the tokens</span>
+    </h3>
+    <ul>
+      {#each pages as p, i (p.url)}
+        <li class:off={!p.kept}>
+          <label>
+            <input type="checkbox" checked={p.kept} onchange={() => togglePage(i)} />
+            <span class="score" title="Relevance to the target, 0–1">{p.score.toFixed(2)}</span>
+            <span class="ptitle">{p.title || p.url}</span>
+            {#if p.depth === 0}<span class="badge">the page you named</span>{/if}
+            <span class="chars">{p.chars.toLocaleString()} chars</span>
+          </label>
+          <a class="purl" href={p.url} target="_blank" rel="noreferrer noopener">{p.url}</a>
+        </li>
+      {/each}
+    </ul>
+    {#if dropped.length}
+      <details class="dropped">
+        <summary>{dropped.length} not kept</summary>
+        <ul>
+          {#each dropped as d (d.url)}
+            <li><span class="purl">{d.url}</span> — {d.reason}</li>
+          {/each}
+        </ul>
+      </details>
+    {/if}
+  </section>
+{/if}
+
 <textarea
   class="doc"
   bind:value={text}
   rows="12"
-  placeholder="Upload a markdown / txt / pdf / docx file, or paste text here…"
+  placeholder="Upload a markdown / txt / pdf / docx file, paste a URL above, or paste text here…"
 ></textarea>
 
 <div class="actions">

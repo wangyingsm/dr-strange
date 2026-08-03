@@ -47,6 +47,19 @@ tracing.workspace = true
 # or those per-glyph warns will flood the logs again. See extract.rs.
 pdf-extract = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# URL ingestion for the digest page (ROADMAP §9). `scraper` (html5ever) parses
+# real-world HTML — the tag-stripping in extract.rs exists for docx XML and
+# would render a navigation bar as prose; `ego-tree` is scraper's own tree type,
+# needed to name node handles in the walker and pinned to the version scraper
+# resolves so both see one crate.
+scraper = "0.27"
+ego-tree = "0.11"
+url = "2"
+# ureq rather than reqwest (which is only a dev-dependency here, for tests)
+# because of `AgentBuilder::resolver`: the SSRF guard must be the thing that
+# hands ureq the addresses to connect to, not a check made beforehand that the
+# client is then free to re-resolve. See fetch/guard.rs.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -509,7 +509,16 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
 /// `--chat deepseek --embed qwen`, since DeepSeek has no embeddings endpoint).
 #[cfg(feature = "digest")]
 pub struct DigestArgs<'a> {
-    pub file: &'a Path,
+    /// A filesystem path, or an `http(s)://` URL to fetch (ROADMAP §9). The
+    /// scheme is required for a URL: a bare `example.com` is a valid filename,
+    /// and guessing which one a reader meant is worse than asking.
+    pub source: &'a str,
+    /// URL only: sharpens what the crawl counts as relevant.
+    pub topic: Option<&'a str>,
+    /// URL only: ceiling on pages kept, the root included.
+    pub pages: usize,
+    /// URL only: link-following depth.
+    pub depth: usize,
     pub plane: &'a str,
     pub apply: bool,
     pub chunk_chars: usize,
@@ -595,6 +604,79 @@ pub fn ask(
     Ok(())
 }
 
+/// Read what is to be digested: a file, or — when the argument carries an
+/// `http(s)` scheme — a page and the pages it links to (ROADMAP §9).
+///
+/// The CLI has nowhere to show a selection list, so it keeps what cleared the
+/// relevance floor and *says* what it kept and what it dropped. A crawl that
+/// quietly read less than the reader expected would be worse than one that
+/// read nothing.
+#[cfg(feature = "digest")]
+fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String)> {
+    let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
+    if !is_url {
+        let path = Path::new(args.source);
+        let doc =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        return Ok((doc, name));
+    }
+
+    let opts = dr_strange_web::fetch::FetchOptions {
+        topic: args.topic.map(str::to_string),
+        max_pages: args.pages.max(1),
+        max_depth: args.depth,
+        ..Default::default()
+    };
+    // Progress goes to stderr so a piped `--dry-run` still yields clean stdout.
+    let fetched = dr_strange_web::fetch::fetch_with_progress(args.source, &opts, &mut |p| {
+        eprintln!("fetching {}/{} {}", p.done, p.total, p.url);
+    })?;
+
+    let kept = fetched.pages.iter().filter(|p| p.kept).count();
+    writeln!(
+        out,
+        "fetched {} page(s) from {} — {kept} kept, {} dropped",
+        fetched.pages.len(),
+        args.source,
+        fetched.pages.len() - kept + fetched.dropped.len()
+    )?;
+    for page in fetched.pages.iter().filter(|p| p.kept) {
+        writeln!(
+            out,
+            "  {:.2}  {}  ({} chars){}",
+            page.score,
+            page.url,
+            page.chars,
+            if page.depth == 0 {
+                "  [the page you named]"
+            } else {
+                ""
+            }
+        )?;
+    }
+    for d in &fetched.dropped {
+        writeln!(out, "  ----  {}  — {}", d.url, d.reason)?;
+    }
+    for page in fetched.pages.iter().filter(|p| !p.kept) {
+        writeln!(
+            out,
+            "  {:.2}  {}  — below the relevance floor",
+            page.score, page.url
+        )?;
+    }
+    writeln!(out)?;
+
+    let doc = fetched.document();
+    if doc.trim().is_empty() {
+        bail!("{} yielded no readable text", args.source);
+    }
+    Ok((doc, args.source.to_string()))
+}
+
 /// Digests a document into the plane: an LLM extracts entities/relations
 /// (labels chosen purely from the document), they're embedded and stamped with
 /// provenance, and — only with `apply` — written through the bulk path.
@@ -603,13 +685,7 @@ pub fn ask(
 pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let doc = std::fs::read_to_string(args.file)
-        .with_context(|| format!("reading {}", args.file.display()))?;
-    let source = args
-        .file
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| args.file.display().to_string());
+    let (doc, source) = read_source(args, out)?;
 
     let chat = dr_strange_llm::build_provider(
         args.chat_provider,

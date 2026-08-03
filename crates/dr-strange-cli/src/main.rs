@@ -173,8 +173,10 @@ enum Command {
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
-        /// Document to digest (text / markdown).
-        file: PathBuf,
+        /// Document to digest: a file (text / markdown) or an `http(s)://` URL.
+        /// A URL is fetched, converted to Markdown, and its links followed
+        /// under `--pages`/`--depth` (ROADMAP §9).
+        source: String,
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Write the result (default is a dry-run preview).
@@ -225,6 +227,16 @@ enum Command {
         /// (~15× input token usage).
         #[arg(long, default_value = "fine")]
         mode: String,
+        /// URL only: what the crawl should count as relevant, beyond what the
+        /// page itself is about. Sharpens which links are worth following.
+        #[arg(long)]
+        topic: Option<String>,
+        /// URL only: ceiling on pages kept, the root included.
+        #[arg(long, default_value_t = 10)]
+        pages: usize,
+        /// URL only: how far to follow links. 0 reads just the page named.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
     },
 }
 
@@ -557,7 +569,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         }
         #[cfg(feature = "digest")]
         Command::Digest {
-            file,
+            source,
             plane,
             apply,
             chat,
@@ -573,10 +585,16 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             no_embed,
             no_link,
             mode,
+            topic,
+            pages,
+            depth,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
-                file: &file,
+                source: &source,
+                topic: topic.as_deref(),
+                pages,
+                depth,
                 plane: &plane,
                 apply,
                 chunk_chars,

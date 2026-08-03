@@ -23,7 +23,7 @@
 | `hybrid <查询> --plane` | 融合的向量 + 关键词 + 图邻近度检索 |
 | `index ensure \| keyword` | 声明一个向量或关键词索引 |
 | `ask <问题> --plane` | 自然语言查询 |
-| `digest <文件> --plane [--mode]` | 经由 LLM 导入一篇文档 |
+| `digest <文件\|url> --plane [--mode]` | 经由 LLM 导入一篇文档（或一个页面及其链接） |
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |
 | `stats` / `check` | 汇总计数 / 完整性扫描 |
 | `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 |
@@ -92,7 +92,16 @@ $ drsg --db graph.drsg ask "which companies does Ada work for?" \
 $ drsg --db graph.drsg digest notes.md --plane social --apply
 
 $ drsg --db graph.drsg digest paper.md --plane papers --mode super --apply
+
+$ drsg --db graph.drsg digest https://example.com/paper --plane papers \\
+    --topic "attention mechanism" --pages 6 --apply
 ```
+
+以 `http(s)://` 开头的参数会被抓取，而非从磁盘读取：该页面被转换为 Markdown，并在
+`--pages` / `--depth` 的范围内沿其链接继续抓取，保留与页面自身主题（以及 `--topic`，
+若给出）相关的内容（[第 3 章](./ai-native.md#从-url-读取)）。协议头是必需的——裸的
+`example.com` 也可以是一个合法的文件名，与其去猜使用者的本意，不如要求写明。该命令会
+打印保留了什么、丢弃了什么；它不提供交互式的挑选，那是仪表盘页面列表的用武之地。
 
 `--mode` 决定抽取结果被清理到何种程度：`coarse` 归一标签与边类型的词表，`fine`
 （默认）在此之上合并指称同一事物的实体，`super` 再将每个实体与其全部段落一并重读

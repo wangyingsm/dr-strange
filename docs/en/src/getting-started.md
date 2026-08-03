@@ -214,7 +214,32 @@ dir = "/var/log/drsg"                       # directory for the rolling log file
 OPENAI_API_KEY = "sk-…"
 DEEPSEEK_API_KEY = "…"
 DASHSCOPE_API_KEY = "…"
+
+[digest]                                    # server-side AIgest tuning
+concurrency = 8                             # per-chunk extraction calls in flight
+chunk_chars = 4000                          # target chunk size
+
+[fetch]                                     # URL ingestion (Chapter 3)
+enabled = true                              # false refuses URL fetching outright
+max_pages = 10                              # ceiling on pages kept per crawl
+max_depth = 3                               # ceiling on link-following depth a request may ask for
+concurrency = 4                             # requests in flight
+allow_private = []                          # see below — normally left empty
 ```
+
+**`[fetch]` changes the server's network posture**, and is worth reading before
+enabling anything in it. With URL ingestion on — the default — a client can name
+an address that *the server* then connects to. The server's position on the
+network is usually the more privileged one, so every non-routable address is
+refused: loopback, RFC-1918 private space, link-local (`169.254.0.0/16`, where
+cloud instance metadata services answer credentials), and the rest. The check is
+made on the **resolved address**, not the hostname, and repeated at every
+redirect hop.
+
+`allow_private` re-permits specific CIDR blocks — `["10.0.0.0/8"]` to read an
+intranet wiki — and is the one deliberate exception to that. It is not a switch
+that turns the guard off, and a server reachable by untrusted clients should
+leave it empty. To refuse URL fetching entirely, set `enabled = false`.
 
 Precedence is fixed: an environment variable already set in the process always
 takes precedence over the corresponding file value, and the `--addr` flag

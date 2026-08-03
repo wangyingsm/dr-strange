@@ -406,7 +406,28 @@ second scheme.
 
 ---
 
-## 9. URL ingestion — AIgest reads the web
+## 9. URL ingestion — AIgest reads the web  *(shipped)*
+
+**Status.** ✅ Shipped (2026-08-03). A URL is a third input beside upload and
+paste, on all three surfaces: `drsg digest <url>`, a streaming `/digest/fetch`
+endpoint, and a URL row in the dashboard's AIgest view that returns a *list* of
+what was found — each page with its relevance score, ticked if it cleared the
+floor — so nothing becomes tokens before the reader has seen it.
+
+Live against the Wikipedia article on Transformers: 1062 candidate links, 5
+pages read, the rest reported in one line rather than a thousand. The crawl
+found two failure modes no unit test would have:
+
+- **A site's own machinery outranked its content.** `/w/index.php?title=
+  Transformer_(deep_learning)&action=edit` scored above the article on attention,
+  because the query string repeated every word the target was looking for. URL
+  *paths* are now read and queries are not: a query parameterizes a view of a
+  document rather than naming one.
+- **`robots.txt` matching was too loose.** Wikipedia publishes a
+  `User-agent: Fetch` group (an offline-download tool) with `Disallow: /`, and a
+  substring test made `drsg-fetch` obey it and refuse the entire site. Group
+  selection now matches the longest token that is a **prefix of our product
+  token**, as the convention intends.
 
 **Goal.** A URL becomes a third input to AIgest beside upload and paste. The
 server fetches the page, converts it to Markdown, follows its hyperlinks as far
@@ -505,23 +526,33 @@ fetcher exists. It has nowhere to show a selection list, so it selects by
 threshold and reports what it kept and dropped; the interactive list is a
 dashboard affordance, not a requirement of the feature.
 
-**Forks to settle.**
-- *How the cut is made.* BM25 scores are not comparable across corpora, so an
-  absolute floor is close to meaningless. Rank-based (top-*k*), a floor relative
-  to the best candidate on the page, or both?
-- *Cross-origin.* Follow only same-origin links by default — safer and usually
-  on-topic — or follow anywhere the score justifies, which is where citations
-  actually live?
-- *Linked documents.* A link to a PDF could go straight into the existing
-  `extract.rs` PDF path. Free reach, or an unbounded appetite for 200-page
-  files?
-- *Re-fetching.* A user who previews, changes mode, and previews again should
-  not re-crawl a stranger's site. Cache the fetch per URL for the session, and
-  for how long?
-- *JavaScript-rendered pages* return a shell with no prose. A documented
-  limitation, or eventually a headless renderer?
-- *Topic and root terms* when both are present — does the typed topic replace
-  the root page's terms or merge with them, and at what weight?
+**Forks settled.**
+- *How the cut is made* — both, because they bound different things. The page
+  budget is a rank cap; the floor is **relative to the best page in the batch**
+  (a quarter of it, by default), so it adapts to a corpus instead of asserting
+  an absolute meaning for a BM25 score.
+- *Cross-origin* — follow anywhere and let relevance decide, since citations are
+  exactly what lives off-origin. Placement is a nudge rather than a rule: a link
+  in the prose scores 1.25×, one on the same host 1.15×. A documentation table
+  of contents lives in a `<nav>` and must still be able to win.
+- *Linked documents* — a linked PDF goes through the existing `extract.rs` path,
+  under the same per-response size cap that bounds everything else. Free reach,
+  bounded appetite.
+- *Re-fetching* — dissolved. A fetch happens once, on an explicit press, and its
+  result lands in the text box; changing the mode and previewing again re-reads
+  the box, not the network. No cache is needed because nothing re-crawls.
+- *JavaScript-rendered pages* — a documented limitation. A headless renderer is
+  a browser, and shipping one inside a database is not a small decision.
+- *Topic and root terms* — merged, with a typed term weighted 3× against the
+  page's own most frequent terms. It sharpens rather than replaces.
+
+**Follow-ups.**
+- Relevance is scored in one language per crawl (the analyzer's), so a
+  multilingual site is read through one stemmer.
+- Coverage is not length-normalized, so a very long URL — an archive.org wrapper
+  embedding another URL — can out-match a short one on the pre-fetch gate.
+- The dashboard offers no per-crawl budget controls; the CLI has `--pages` /
+  `--depth` and the server caps both.
 
 ---
 

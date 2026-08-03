@@ -1418,6 +1418,171 @@ nav button.active {
   transition: width 0.2s ease;
 }
 
+/* Where the document comes from (ROADMAP §9) — its own row, below the parse
+   settings, because "what to read" and "how to read it" are two questions. */
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.sources label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font: 13px system-ui;
+  color: var(--muted);
+}
+.sources select,
+.sources input {
+  font: 13px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.55rem;
+}
+.sources .ext {
+  font: 11px ui-monospace, monospace;
+  color: var(--muted);
+}
+.sources .or {
+  font: 13px system-ui;
+  color: var(--muted);
+  margin-left: 0.4rem;
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--border);
+}
+.sources input.url {
+  flex: 3 1 14rem;
+  min-width: 0;
+}
+.sources input.topic {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+.sources button {
+  font: 14px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sources button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.sources .file-btn {
+  position: relative;
+  overflow: hidden;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+.sources .file-btn input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* What a crawl found. This list is the point of the feature's UX: pages are
+   shown with their relevance, most relevant first, before they become tokens. */
+
+.pages {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.75rem;
+  background: var(--panel);
+}
+.pages h3 {
+  font: 600 13px system-ui;
+  margin: 0 0 0.5rem;
+}
+.pages h3 .hint {
+  font: 12px system-ui;
+  color: var(--muted);
+  margin-left: 0.5rem;
+}
+.pages ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.pages > ul > li {
+  padding: 0.3rem 0;
+  border-top: 1px solid var(--border);
+}
+.pages > ul > li:first-child {
+  border-top: none;
+}
+.pages li.off {
+  opacity: 0.45;
+}
+.pages label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font: 13px system-ui;
+  cursor: pointer;
+}
+.pages .score {
+  font: 12px ui-monospace, monospace;
+  color: var(--accent);
+  min-width: 2.6em;
+}
+.pages .ptitle {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pages .badge {
+  font: 11px system-ui;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.45rem;
+  white-space: nowrap;
+}
+.pages .chars {
+  font: 12px system-ui;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pages .purl {
+  display: block;
+  font: 11px ui-monospace, monospace;
+  color: var(--muted);
+  text-decoration: none;
+  margin-left: 3.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pages a.purl:hover {
+  text-decoration: underline;
+}
+.pages .dropped {
+  margin-top: 0.5rem;
+  font: 12px system-ui;
+  color: var(--muted);
+}
+.pages .dropped summary {
+  cursor: pointer;
+}
+.pages .dropped li {
+  padding: 0.15rem 0;
+}
+
 textarea.doc {
   width: 100%;
   box-sizing: border-box;

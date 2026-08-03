@@ -67,6 +67,8 @@ pub struct AppState {
     pub changes: broadcast::Sender<Arc<ChangeSet>>,
     /// Server-side `digest.run` defaults (from `[digest]` config / built-ins).
     pub digest: crate::DigestDefaults,
+    /// URL-fetch policy and budgets (from `[fetch]` config / built-ins).
+    pub fetch: crate::FetchDefaults,
 }
 
 impl AppState {
@@ -147,6 +149,9 @@ fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
+        // POST for the same reason as /export below: the Origin header the
+        // local-UI check needs is omitted on same-origin GETs.
+        .route("/digest/fetch", post(fetch_http))
         // POST (not GET): browsers omit the Origin header on same-origin GETs,
         // so the local-UI Origin check can't see it and a tokenless server
         // would 401 its own UI. POST always carries Origin.
@@ -230,6 +235,119 @@ async fn extract_http(
         .header("content-type", "application/x-ndjson")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap()
+}
+
+#[derive(serde::Deserialize)]
+struct FetchQuery {
+    /// The address to read. A bare `example.com/x` is read as https.
+    #[serde(default)]
+    url: String,
+    /// Sharpens what the crawl counts as relevant, beyond what the root page
+    /// says about itself.
+    topic: Option<String>,
+    /// Per-request budgets, each bounded by the server's configured ceiling —
+    /// a client may ask for less, never for more.
+    pages: Option<usize>,
+    depth: Option<usize>,
+}
+
+/// `POST /digest/fetch?url=…` — read a page and, under a budget, the pages it
+/// links to (ROADMAP §9). No DB access; the crawl runs on a blocking task.
+///
+/// Newline-delimited JSON so the digest page can show progress through what is
+/// a genuinely slow operation:
+///   `{"progress":{"done":2,"total":8,"url":"…"}}` — zero or more
+///   `{"pages":[…],"dropped":[…]}`                 — the final result, or
+///   `{"error":"…"}`                               — a terminal failure
+///
+/// Every page is returned with its own Markdown block and relevance score; the
+/// caller chooses which to keep and joins their blocks. Nothing here decides
+/// what the model reads — it decides what the reader is offered.
+async fn fetch_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<FetchQuery>,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    // Read level: fetching touches no graph state. It does spend the server's
+    // network, which is why it is authenticated at all.
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    if !state.fetch.enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            "URL fetching is disabled on this server ([fetch] enabled = false)",
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let cfg = state.fetch.clone();
+    tokio::task::spawn_blocking(move || {
+        let send = |v: serde_json::Value| {
+            let mut line = serde_json::to_vec(&v).unwrap_or_default();
+            line.push(b'\n');
+            tx.blocking_send(Ok(Bytes::from(line))).is_ok()
+        };
+        let opts = match fetch_options(&cfg, &q) {
+            Ok(o) => o,
+            Err(e) => {
+                send(json!({ "error": e.to_string() }));
+                return;
+            }
+        };
+        let result = {
+            let mut on_page = |p: crate::fetch::Progress| {
+                send(json!({ "progress": p }));
+            };
+            crate::fetch::fetch_with_progress(&q.url, &opts, &mut on_page)
+        };
+        match result {
+            Ok(got) => send(json!({ "pages": got.pages, "dropped": got.dropped })),
+            Err(e) => send(json!({ "error": format!("{e:#}") })),
+        };
+    });
+
+    Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
+}
+
+/// How far a crawl follows links when the request does not say. One hop: the
+/// material a page points at is almost always one step away, and further hops
+/// multiply requests for a rapidly thinning return.
+const DEFAULT_FETCH_DEPTH: usize = 1;
+
+/// Merge the request's budgets with the server's, clamping rather than
+/// trusting: a client may ask for a smaller crawl, never a larger one.
+fn fetch_options(
+    cfg: &crate::FetchDefaults,
+    q: &FetchQuery,
+) -> anyhow::Result<crate::fetch::FetchOptions> {
+    let allow_private = cfg
+        .allow_private
+        .iter()
+        .map(|s| crate::fetch::Prefix::parse(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let topic = q
+        .topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    Ok(crate::fetch::FetchOptions {
+        topic,
+        max_pages: q.pages.unwrap_or(cfg.max_pages).clamp(1, cfg.max_pages),
+        max_depth: q.depth.unwrap_or(DEFAULT_FETCH_DEPTH).min(cfg.max_depth),
+        concurrency: cfg.concurrency,
+        allow_private,
+        ..Default::default()
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -436,6 +554,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         bootstrap_token: token,
         changes,
         digest: opts.digest,
+        fetch: opts.fetch,
     });
     let app = router(state, opts.max_concurrent);
     // Bind a std listener up front so we can report the actual port (handy when

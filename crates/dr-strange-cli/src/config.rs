@@ -38,6 +38,9 @@ pub struct Config {
     /// param overrides these, which override the built-ins (8 / 4000).
     #[serde(default)]
     pub digest: DigestCfg,
+    /// URL-fetch policy for the web AIgest (ROADMAP §9).
+    #[serde(default)]
+    pub fetch: FetchCfg,
 }
 
 /// The `[digest]` section — server-side ingestion tuning.
@@ -48,6 +51,30 @@ pub struct DigestCfg {
     pub concurrency: Option<usize>,
     /// Target chunk size in characters (default 4000).
     pub chunk_chars: Option<usize>,
+}
+
+/// The `[fetch]` section — URL ingestion policy.
+///
+/// Fetching is enabled by default. What is *not* a default is reaching the
+/// private network: the address guard refuses loopback, RFC-1918, link-local
+/// (where cloud metadata lives) and the rest of the non-routable space, and
+/// `allow_private` is the one deliberate exception an operator can make —
+/// e.g. `allow_private = ["10.0.0.0/8"]` to read an intranet wiki. It is not a
+/// switch that turns the guard off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchCfg {
+    /// Set false to refuse URL fetching outright.
+    pub enabled: Option<bool>,
+    /// Ceiling on pages kept in one crawl (default 10). A request may ask for
+    /// fewer, never more.
+    pub max_pages: Option<usize>,
+    /// Link-following depth (default 1).
+    pub max_depth: Option<usize>,
+    /// Requests in flight at once (default 4).
+    pub concurrency: Option<usize>,
+    /// CIDR blocks to re-permit despite not being publicly routable.
+    pub allow_private: Option<Vec<String>>,
 }
 
 /// The `[server]` section.
@@ -156,6 +183,21 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     if let Some(c) = cfg.digest.chunk_chars {
         opts.digest.chunk_chars = c;
     }
+    if let Some(e) = cfg.fetch.enabled {
+        opts.fetch.enabled = e;
+    }
+    if let Some(p) = cfg.fetch.max_pages {
+        opts.fetch.max_pages = p;
+    }
+    if let Some(d) = cfg.fetch.max_depth {
+        opts.fetch.max_depth = d;
+    }
+    if let Some(c) = cfg.fetch.concurrency {
+        opts.fetch.concurrency = c;
+    }
+    if let Some(a) = &cfg.fetch.allow_private {
+        opts.fetch.allow_private = a.clone();
+    }
     opts
 }
 
@@ -187,6 +229,10 @@ mod tests {
             [digest]
             concurrency = 16
             chunk_chars = 6000
+
+            [fetch]
+            max_pages = 4
+            allow_private = ["10.0.0.0/8"]
             "#,
         );
         assert_eq!(cfg.server.addr.unwrap().to_string(), "0.0.0.0:9000");
@@ -200,6 +246,13 @@ mod tests {
         );
         assert_eq!(cfg.digest.concurrency, Some(16));
         assert_eq!(cfg.digest.chunk_chars, Some(6000));
+        assert_eq!(cfg.fetch.max_pages, Some(4));
+        assert_eq!(
+            cfg.fetch.allow_private.as_deref(),
+            Some(&["10.0.0.0/8".to_string()][..])
+        );
+        // Absent means "the built-in default", not "off".
+        assert_eq!(cfg.fetch.enabled, None);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 mod assets;
 mod auth;
 mod extract;
+pub mod fetch;
 mod methods;
 mod rpc;
 mod server;
@@ -41,6 +42,8 @@ pub struct ServeOptions {
     pub tls: Option<TlsOptions>,
     /// Server-side defaults for `digest.run` when the request omits them.
     pub digest: DigestDefaults,
+    /// Policy and budgets for the URL fetcher (ROADMAP §9).
+    pub fetch: FetchDefaults,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -72,6 +75,43 @@ impl Default for DigestDefaults {
 pub const DEFAULT_DIGEST_CONCURRENCY: usize = 8;
 pub const DEFAULT_DIGEST_CHUNK_CHARS: usize = 4000;
 
+/// Policy for the URL fetcher (ROADMAP §9), from the `[fetch]` config section.
+///
+/// Fetching ships **enabled**: a database that must be reconfigured before it
+/// can read a URL will not be used to read URLs. That default carries none of
+/// the security — the address guard in [`fetch::guard`] is not a setting, and
+/// `allow_private` is the one deliberate exception an operator can make.
+#[derive(Debug, Clone)]
+pub struct FetchDefaults {
+    /// Whether `/digest/fetch` will fetch anything at all.
+    pub enabled: bool,
+    /// Ceiling on pages kept in one crawl, the root included.
+    pub max_pages: usize,
+    /// Ceiling on link-following depth — the most a request may ask for, not
+    /// what it gets by default. A request that names no depth follows one hop.
+    /// The page budget bounds the crawl regardless of how deep it is allowed
+    /// to go.
+    pub max_depth: usize,
+    /// Requests in flight at once.
+    pub concurrency: usize,
+    /// CIDR blocks the operator has deliberately re-permitted, e.g. to read an
+    /// intranet wiki. Everything not listed here that is not publicly routable
+    /// stays refused.
+    pub allow_private: Vec<String>,
+}
+
+impl Default for FetchDefaults {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_pages: 10,
+            max_depth: 3,
+            concurrency: 4,
+            allow_private: Vec::new(),
+        }
+    }
+}
+
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
@@ -79,6 +119,7 @@ impl Default for ServeOptions {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             tls: None,
             digest: DigestDefaults::default(),
+            fetch: FetchDefaults::default(),
         }
     }
 }
