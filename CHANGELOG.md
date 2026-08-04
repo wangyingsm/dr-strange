@@ -4,6 +4,23 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`drsg serve` now hosts the MCP tool set at `POST /mcp`** (ROADMAP §10),
+  so several agent hosts (e.g. Claude Code and Codex, each spawning its own
+  MCP server subprocess) can share one database instead of each embedding
+  its own — the other half of
+  [#1](https://github.com/wangyingsm/dr-strange/issues/1), alongside the
+  cross-process lock in 1.4.2. The endpoint runs the identical tool code
+  `drsg-mcp` runs over stdio (extracted into a shared library so the two
+  transports drive one implementation), over MCP's Streamable HTTP
+  transport, gated by the same `DRSG_TOKEN` bearer auth as `/rpc` — with no
+  token set, `/mcp` refuses every request, reads included, same as the rest
+  of the authenticated surface. `drsg-mcp` itself is unchanged: it keeps its
+  embedded stdio-only mode, since a host that wants the shared server can
+  point its MCP client straight at the URL.
+
 ## [1.4.2] - 2026-08-04
 
 ### Fixed
