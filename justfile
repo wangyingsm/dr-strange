@@ -52,7 +52,7 @@ bench-gen nodes="100000" edges="500000" dim="128":
 
 bench-drsg:
     cargo build --release -p drsg-bench
-    ./target/release/drsg-bench run --data benchmarks/data --db benchmarks/data/drsg.redb --out benchmarks/results/dr-strange.json
+    ./target/release/drsg-bench run --data benchmarks/data --db benchmarks/data/drsg.db --out benchmarks/results/dr-strange.json
 
 bench-sqlite:
     uv run --no-project benchmarks/compare.py --engine sqlite
@@ -76,6 +76,14 @@ bench-neo4j:
 # Aggregate whatever results exist into BENCHMARKS.md.
 bench-report:
     uv run --no-project benchmarks/aggregate.py
+
+# dr-strange alone, no competitor engines: generate the shared dataset only if
+# it is missing (bench-gen regenerates deterministically — delete
+# benchmarks/data to force), run the drsg benchmark, refresh BENCHMARKS.md.
+benchmark:
+    @test -f benchmarks/data/meta.json || just bench-gen
+    just bench-drsg
+    just bench-report
 
 # Embedded engines end-to-end (Neo4j is opt-in: bench-neo4j-up → bench-neo4j).
 bench-compare: bench-gen bench-drsg bench-sqlite bench-kuzu bench-report
