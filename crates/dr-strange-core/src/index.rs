@@ -158,6 +158,11 @@ impl VectorRegistry {
         let mut entries = HashMap::with_capacity(sidecar.entries.len());
         for entry in sidecar.entries {
             let mut index = entry.index;
+            // Decoded bytes are untrusted: a graph with dangling adjacency
+            // would panic at first search. Stale-sidecar posture: rebuild.
+            if !index.is_wellformed() {
+                return None;
+            }
             // id_to_idx is #[serde(skip)] — rebuild it before the index is used.
             index.reindex();
             entries.insert(
