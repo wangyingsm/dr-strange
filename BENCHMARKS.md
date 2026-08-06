@@ -6,18 +6,18 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 | Operation | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
-| Graph load — nodes + edges (↑ better) | 286 K/s | 951 K/s | 660 K/s | 31 K/s |
-| Point lookup by key — median (↓ better) | 12.0 µs | 306.8 µs | 3.8 µs | 783.0 µs |
-| 1-hop expansion — median (↓ better) | 17.7 µs | 2.03 ms | 9.0 µs | 504.5 µs |
-| 2-hop reachable set — median (↓ better) | 53.2 µs | 8.94 ms | 69.5 µs | 1.08 ms |
-| Vector index build (↑ better) | 22 K/s | 3 K/s | — | 4 K/s |
-| Vector top-k query — median (↓ better) | 320.5 µs | 9.28 ms | — | 3.51 ms |
+| Graph load — nodes + edges (↑ better) | 296 K/s | 1.0 M/s | 662 K/s | 35 K/s |
+| Point lookup by key — median (↓ better) | 12.6 µs | 266.2 µs | 3.6 µs | 299.7 µs |
+| 1-hop expansion — median (↓ better) | 18.1 µs | 1.71 ms | 9.0 µs | 381.9 µs |
+| 2-hop reachable set — median (↓ better) | 55.3 µs | 7.19 ms | 67.4 µs | 931.9 µs |
+| Vector index build (↑ better) | 16 K/s | 2 K/s | — | 4 K/s |
+| Vector top-k query — median (↓ better) | 318.3 µs | 7.75 ms | — | 2.66 ms |
 
 ## Reading this
 
 - **↑ better** rows are throughput (bigger is faster); **↓ better** rows are median latency per operation (smaller is faster).
 - SQLite has no native vectors, so it sits out the two vector rows.
-- Numbers are single-run, warm, on one machine — **indicative, not a leaderboard**. Re-run with `just bench-compare`.
+- Every figure is the **median of repeated measurement passes** (3 by default; the min→max spread per op is recorded in `benchmarks/results/*.json`), with every engine pinned to the same P-cores — one machine, **indicative, not a leaderboard**. Re-run with `just bench-compare`.
 
 ## Methodology
 
@@ -25,7 +25,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 - **Identity**: the string key `n{i}` is the primary key in every engine, so point lookups and edge loads use each engine's PK index (Kùzu only indexes the PK, so a non-PK lookup would be an unfair scan).
 - **Graph load** is nodes + edges through each engine's bulk path (drsg `bulk_load` / Kùzu `COPY` / SQLite `executemany` / Neo4j `UNWIND`) and includes building the adjacency/indexes that make expansion fast — insert + index, not insert alone. It's one combined throughput number (total rows / total load time).
 - **expand/traverse** resolve the start node by key first (as any client must), then expand; `traverse_2hop` is the distinct set reachable in 1–2 hops.
-- Each engine runs **alone** (no CPU contention). drsg is a `--release` build.
+- Each engine runs **alone** (no CPU contention), **pinned to the same P-core set** (`bench_pin` in the justfile; the Neo4j container gets the same `--cpuset-cpus`), for `bench_repeat` passes with a fresh database each pass — pinning removes the hybrid-CPU scheduling lottery, repeats make the residual noise visible as a recorded spread. Note the pin gives parallel index builds fewer threads than the unpinned machine has; the spread on a pinned run is the trustworthy part. drsg is a `--release` build.
 
 ## Caveats (why cross-engine numbers lie if you squint)
 

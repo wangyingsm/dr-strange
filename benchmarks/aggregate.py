@@ -119,8 +119,11 @@ def main():
         "- **↑ better** rows are throughput (bigger is faster); **↓ better** rows "
         "are median latency per operation (smaller is faster).\n"
         "- SQLite has no native vectors, so it sits out the two vector rows.\n"
-        "- Numbers are single-run, warm, on one machine — **indicative, not a "
-        "leaderboard**. Re-run with `just bench-compare`.\n"
+        "- Every figure is the **median of repeated measurement passes** (3 by "
+        "default; the min→max spread per op is recorded in "
+        "`benchmarks/results/*.json`), with every engine pinned to the same "
+        "P-cores — one machine, **indicative, not a leaderboard**. Re-run with "
+        "`just bench-compare`.\n"
     )
 
     lines.append("## Methodology\n")
@@ -139,8 +142,14 @@ def main():
         "- **expand/traverse** resolve the start node by key first (as any "
         "client must), then expand; `traverse_2hop` is the distinct set "
         "reachable in 1–2 hops.\n"
-        "- Each engine runs **alone** (no CPU contention). drsg is a `--release` "
-        "build.\n"
+        "- Each engine runs **alone** (no CPU contention), **pinned to the same "
+        "P-core set** (`bench_pin` in the justfile; the Neo4j container gets the "
+        "same `--cpuset-cpus`), for `bench_repeat` passes with a fresh database "
+        "each pass — pinning removes the hybrid-CPU scheduling lottery, repeats "
+        "make the residual noise visible as a recorded spread. Note the pin "
+        "gives parallel index builds fewer threads than the unpinned machine "
+        "has; the spread on a pinned run is the trustworthy part. drsg is a "
+        "`--release` build.\n"
     )
 
     lines.append("## Caveats (why cross-engine numbers lie if you squint)\n")
