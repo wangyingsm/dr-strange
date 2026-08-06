@@ -78,17 +78,21 @@ enum Op {
     Del,
 }
 
-fn op_value(op: Op) -> Option<Vec<u8>> {
-    match op {
-        Op::Put(v) => Some(v),
-        Op::Del => None,
+impl Op {
+    /// The put value, or `None` for a tombstone — how a read reports "deleted".
+    fn into_value(self) -> Option<Vec<u8>> {
+        match self {
+            Op::Put(v) => Some(v),
+            Op::Del => None,
+        }
     }
-}
 
-fn op_bytes(op: &Op) -> usize {
-    match op {
-        Op::Put(v) => v.len(),
-        Op::Del => 0,
+    /// Heap bytes this op's value pins (memtable size accounting).
+    fn value_len(&self) -> usize {
+        match self {
+            Op::Put(v) => v.len(),
+            Op::Del => 0,
+        }
     }
 }
 
@@ -567,11 +571,11 @@ fn mem_range_ops(
 /// means "deleted", shadowing older runs.
 fn committed_get(store: &Store, table: u8, key: &[u8], snapshot: u64) -> Result<Option<Vec<u8>>> {
     if let Some(op) = mem_op(&store.mem, table, key, snapshot) {
-        return Ok(op_value(op));
+        return Ok(op.into_value());
     }
     for s in store.ssts.iter().rev() {
         if let Some(op) = s.get(table, key, snapshot)? {
-            return Ok(op_value(op));
+            return Ok(op.into_value());
         }
     }
     Ok(None)
@@ -595,7 +599,7 @@ fn committed_values(
     mem_range_ops(&store.mem, table, start, end, snapshot, &mut ops);
     Ok(ops
         .into_iter()
-        .filter_map(|(k, op)| op_value(op).map(|v| (k, v)))
+        .filter_map(|(k, op)| op.into_value().map(|v| (k, v)))
         .collect())
 }
 
@@ -649,7 +653,7 @@ pub struct NativeWriteTxn<'a> {
 impl ReadTransaction for NativeWriteTxn<'_> {
     fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(op) = self.buf.get(&(table as u8, key.to_vec())) {
-            return Ok(op_value(op.clone()));
+            return Ok(op.clone().into_value());
         }
         let store = self.engine.store.read().unwrap_or_else(|e| e.into_inner());
         committed_get(&store, table as u8, key, self.snapshot)
@@ -745,7 +749,7 @@ impl WriteTransaction for NativeWriteTxn<'_> {
         {
             let mut store = self.engine.store.write().unwrap_or_else(|e| e.into_inner());
             for ((t, k), op) in self.buf {
-                store.mem_bytes += 1 + k.len() + 8 + op_bytes(&op);
+                store.mem_bytes += 1 + k.len() + 8 + op.value_len();
                 store.mem.insert((t, k, Reverse(seq)), op);
             }
             store.committed_seq = seq;
@@ -831,7 +835,7 @@ fn replay(file: &mut File, store: &mut Store) -> Result<u64> {
         };
         for op in batch.ops {
             let entry = op.value.map_or(Op::Del, Op::Put);
-            store.mem_bytes += 1 + op.key.len() + 8 + op_bytes(&entry);
+            store.mem_bytes += 1 + op.key.len() + 8 + entry.value_len();
             store
                 .mem
                 .insert((op.table, op.key, Reverse(batch.seq)), entry);
