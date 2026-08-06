@@ -7,11 +7,11 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 | Operation | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
 | Graph load — nodes + edges (↑ better) | 296 K/s | 1.0 M/s | 662 K/s | 35 K/s |
-| Point lookup by key — median (↓ better) | 12.6 µs | 266.2 µs | 3.6 µs | 299.7 µs |
-| 1-hop expansion — median (↓ better) | 18.1 µs | 1.71 ms | 9.0 µs | 381.9 µs |
-| 2-hop reachable set — median (↓ better) | 55.3 µs | 7.19 ms | 67.4 µs | 931.9 µs |
+| Point lookup by key — median (↓ better) | 3.8 µs | 266.2 µs | 3.6 µs | 299.7 µs |
+| 1-hop expansion — median (↓ better) | 6.8 µs | 1.71 ms | 9.0 µs | 381.9 µs |
+| 2-hop reachable set — median (↓ better) | 30.7 µs | 7.19 ms | 67.4 µs | 931.9 µs |
 | Vector index build (↑ better) | 16 K/s | 2 K/s | — | 4 K/s |
-| Vector top-k query — median (↓ better) | 318.3 µs | 7.75 ms | — | 2.66 ms |
+| Vector top-k query — median (↓ better) | 306.2 µs | 7.75 ms | — | 2.66 ms |
 
 ## Reading this
 

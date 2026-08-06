@@ -156,11 +156,19 @@ fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
-fn encode_entry(buf: &mut Vec<u8>, table: u8, key: &[u8], seq: u64, op: &Op) {
+/// The `table · key-len · key · seq` prefix shared by data-block entries and
+/// index entries — one writer, so the two layouts cannot drift apart (the
+/// index's first-key must compare consistently with entry order; see
+/// [`KeyPos::cmp`]). Borrowed fields, so neither caller clones to encode.
+fn encode_key_parts(buf: &mut Vec<u8>, table: u8, key: &[u8], seq: u64) {
     buf.push(table);
     put_u32(buf, key.len() as u32);
     buf.extend_from_slice(key);
     put_u64(buf, seq);
+}
+
+fn encode_entry(buf: &mut Vec<u8>, table: u8, key: &[u8], seq: u64, op: &Op) {
+    encode_key_parts(buf, table, key, seq);
     match op {
         Op::Put(v) => {
             buf.push(1);
@@ -175,10 +183,7 @@ fn encode_entry(buf: &mut Vec<u8>, table: u8, key: &[u8], seq: u64, op: &Op) {
 }
 
 fn encode_index_key(buf: &mut Vec<u8>, k: &KeyPos) {
-    buf.push(k.table);
-    put_u32(buf, k.key.len() as u32);
-    buf.extend_from_slice(&k.key);
-    put_u64(buf, k.seq);
+    encode_key_parts(buf, k.table, &k.key, k.seq);
 }
 
 /// Write `entries` (already sorted, as a memtable `BTreeMap` is) to an SST at
@@ -193,57 +198,46 @@ pub(super) fn write(
     let mut file = File::create(&tmp)?;
 
     let mut index: Vec<(KeyPos, u64, u32)> = Vec::new();
-    let mut block = Vec::new();
-    let mut block_first: Option<KeyPos> = None;
+    // The in-progress data block: its first key (fixed at creation) bundled
+    // with the encoded bytes, so a block-without-first-key is unrepresentable
+    // — flushing needs no unwrap and no error path for an unreachable state.
+    let mut cur: Option<(KeyPos, Vec<u8>)> = None;
     let mut offset = 0u64;
     let mut count = 0u64;
     let mut bloom = Bloom::new(entries.len());
 
-    let flush_block = |block: &mut Vec<u8>,
-                       first: &mut Option<KeyPos>,
+    let flush_block = |cur: &mut Option<(KeyPos, Vec<u8>)>,
                        offset: &mut u64,
                        file: &mut File,
                        index: &mut Vec<(KeyPos, u64, u32)>|
      -> Result<()> {
-        if block.is_empty() {
-            return Ok(());
+        if let Some((first, block)) = cur.take() {
+            file.write_all(&block)?;
+            let len = block.len() as u32;
+            index.push((first, *offset, len));
+            *offset += len as u64;
         }
-        file.write_all(block)?;
-        let len = block.len() as u32;
-        index.push((first.take().expect("block has a first key"), *offset, len));
-        *offset += len as u64;
-        block.clear();
         Ok(())
     };
 
     for ((table, key, std::cmp::Reverse(seq)), op) in entries {
-        if block_first.is_none() {
-            block_first = Some(KeyPos {
+        let (_, block) = cur.get_or_insert_with(|| {
+            let first = KeyPos {
                 table: *table,
                 key: key.clone(),
                 seq: *seq,
-            });
-        }
-        encode_entry(&mut block, *table, key, *seq, op);
+            };
+            (first, Vec::with_capacity(BLOCK_TARGET + BLOCK_TARGET / 4))
+        });
+        encode_entry(block, *table, key, *seq, op);
         bloom.add(*table, key);
         count += 1;
-        if block.len() >= BLOCK_TARGET {
-            flush_block(
-                &mut block,
-                &mut block_first,
-                &mut offset,
-                &mut file,
-                &mut index,
-            )?;
+        let full = block.len() >= BLOCK_TARGET;
+        if full {
+            flush_block(&mut cur, &mut offset, &mut file, &mut index)?;
         }
     }
-    flush_block(
-        &mut block,
-        &mut block_first,
-        &mut offset,
-        &mut file,
-        &mut index,
-    )?;
+    flush_block(&mut cur, &mut offset, &mut file, &mut index)?;
 
     // Index block.
     let index_offset = offset;
@@ -314,32 +308,40 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// A decoded data-block entry.
-struct Entry {
+/// A decoded data-block entry, borrowing from its block. Scans decode entries
+/// by the dozen and keep almost none (wrong table, out of range, shadowed,
+/// too-new seq), so decoding is allocation-free; the caller materializes via
+/// [`EntryRef::op`] only for the entry it keeps.
+struct EntryRef<'a> {
     table: u8,
-    key: Vec<u8>,
+    key: &'a [u8],
     seq: u64,
-    op: Op,
+    /// `Some(value)` for a put, `None` for a tombstone.
+    put: Option<&'a [u8]>,
 }
 
-fn decode_entry(c: &mut Cursor<'_>) -> Option<Entry> {
+impl EntryRef<'_> {
+    fn op(&self) -> Op {
+        match self.put {
+            Some(v) => Op::Put(v.to_vec()),
+            None => Op::Del,
+        }
+    }
+}
+
+fn decode_entry<'a>(c: &mut Cursor<'a>) -> Option<EntryRef<'a>> {
     let table = c.u8()?;
     let key_len = c.u32()? as usize;
-    let key = c.bytes(key_len)?.to_vec();
+    let key = c.bytes(key_len)?;
     let seq = c.u64()?;
     let flag = c.u8()?;
     let val_len = c.u32()? as usize;
     let val = c.bytes(val_len)?;
-    let op = if flag == 1 {
-        Op::Put(val.to_vec())
-    } else {
-        Op::Del
-    };
-    Some(Entry {
+    Some(EntryRef {
         table,
         key,
         seq,
-        op,
+        put: (flag == 1).then_some(val),
     })
 }
 
@@ -427,7 +429,7 @@ impl Sst {
             let buf = self.read_block(block)?;
             let mut c = Cursor::new(&buf);
             while let Some(e) = decode_entry(&mut c) {
-                out.insert((e.table, e.key, std::cmp::Reverse(e.seq)), e.op);
+                out.insert((e.table, e.key.to_vec(), std::cmp::Reverse(e.seq)), e.op());
             }
         }
         Ok(())
@@ -478,12 +480,12 @@ impl Sst {
             let buf = self.read_block(block)?;
             let mut c = Cursor::new(&buf);
             while let Some(e) = decode_entry(&mut c) {
-                match (e.table, e.key.as_slice()).cmp(&(table, key)) {
+                match (e.table, e.key).cmp(&(table, key)) {
                     std::cmp::Ordering::Less => continue,
                     std::cmp::Ordering::Greater => return Ok(None), // passed the key
                     std::cmp::Ordering::Equal => {
                         if e.seq <= snapshot {
-                            return Ok(Some(e.op)); // newest visible version
+                            return Ok(Some(e.op())); // newest visible version
                         }
                     }
                 }
@@ -518,20 +520,20 @@ impl Sst {
                     }
                     continue;
                 }
-                if e.key.as_slice() < start {
+                if e.key < start {
                     continue;
                 }
-                if end.is_some_and(|end| e.key.as_slice() >= end) {
+                if end.is_some_and(|end| e.key >= end) {
                     return Ok(());
                 }
-                if cur_key.as_deref() == Some(e.key.as_slice()) {
+                if cur_key.as_deref() == Some(e.key) {
                     continue; // already took this key's newest-visible
                 }
                 if e.seq > snapshot {
                     continue; // too new; older versions of this key may follow
                 }
-                cur_key = Some(e.key.clone());
-                out.insert(e.key, e.op);
+                cur_key = Some(e.key.to_vec());
+                out.insert(e.key.to_vec(), e.op());
             }
         }
         Ok(())
