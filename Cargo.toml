@@ -26,5 +26,8 @@ homepage = "https://github.com/wangyingsm/dr-strange"
 dr-strange-core = { path = "crates/dr-strange-core", default-features = false }
 dr-strange-log = { path = "crates/dr-strange-log" }
 dr-strange-parser = { path = "crates/dr-strange-parser" }
+# Process allocator for the BINARY crates only (never the libraries — the
+# allocator is a process-global choice the embedding application makes).
+mimalloc = "0.1"
 thiserror = "2"
 tracing = "0.1"

@@ -12,6 +12,11 @@
 //! The dataset is the single source of truth: `gen` produces the files, and
 //! both `run` and the Python engines read them — no engine regenerates data.
 
+/// Same process allocator as the shipped binaries (drsg / drsg-mcp), so the
+/// benchmark measures what production runs.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -253,8 +258,10 @@ fn run(data: &Path, db_path: &Path, out: &Path, k: u64) -> Result<()> {
     let engine = "dr-strange".to_string();
     let mut results: Vec<OpResult> = Vec::new();
 
-    // Fresh database each run.
+    // Fresh database each run. The native backend's db is a directory
+    // (WAL + SSTs), legacy redb's a single file — clear either shape.
     let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(db_path);
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -8,6 +8,11 @@
 //! (LLM ingestion, arch/07) reads provider API keys from the server's
 //! environment, never from params.
 
+/// mimalloc as the process allocator (see the drsg binary for the rationale;
+/// binaries choose the allocator, the core library never does).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

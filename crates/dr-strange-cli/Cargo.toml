@@ -25,6 +25,7 @@ redb-backend = ["dr-strange-core/redb-backend", "dr-strange-web/redb-backend"]
 native-backend = ["dr-strange-core/native-backend", "dr-strange-web/native-backend"]
 
 [dependencies]
+mimalloc = { workspace = true }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 dr-strange-core = { workspace = true, features = ["json"] }

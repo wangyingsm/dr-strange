@@ -21,6 +21,7 @@ redb-backend = ["dr-strange-core/redb-backend"]
 native-backend = ["dr-strange-core/native-backend"]
 
 [dependencies]
+mimalloc = { workspace = true }
 dr-strange-core = { workspace = true, features = ["json"] }
 # Non-optional: the rmcp #[tool_router] macro doesn't compose with #[cfg] on
 # individual tool methods, and the MCP server exists to be driven by LLM

@@ -182,16 +182,20 @@ engine loads the **same** deterministic dataset — 100 K nodes, 500 K edges,
 
 | Operation (median latency, ↓ better) | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
-| Point lookup by key | **3.4 µs** | 397.6 µs | 5.5 µs | 978.6 µs |
-| 1-hop expansion | **6.7 µs** | 2.37 ms | 13.7 µs | 799.5 µs |
-| 2-hop reachable set | **37.0 µs** | 9.84 ms | 94.7 µs | 1.56 ms |
-| Vector top-k query | **387.7 µs** | 10.39 ms | — | 3.57 ms |
+| Point lookup by key | 12.0 µs | 306.8 µs | **3.8 µs** | 783.0 µs |
+| 1-hop expansion | 17.7 µs | 2.03 ms | **9.0 µs** | 504.5 µs |
+| 2-hop reachable set | **53.2 µs** | 8.94 ms | 69.5 µs | 1.08 ms |
+| Vector top-k query | **320.5 µs** | 9.28 ms | — | 3.51 ms |
 
-The embedded KV design delivers microsecond point and graph queries and a vector
-top-k below both Kùzu and Neo4j; bulk load still trails the mature columnar
-engines. Numbers are single-run, warm, on one machine — **indicative, not a
-leaderboard**. Methodology, caveats, the load-throughput figures, and how to
-re-run (`just bench-compare`) are in **[BENCHMARKS.md](BENCHMARKS.md)**.
+The embedded KV design keeps point and graph queries in microseconds — fastest
+of the field on multi-hop traversal — and vector search is where it pulls away:
+top-k an order of magnitude below Neo4j and ~30× below Kùzu, with index build
+several times faster than both (full table in BENCHMARKS.md). Bulk load still
+trails the mature columnar engines. Numbers are single-run, warm, on one
+machine, all engines measured back-to-back — **indicative, not a leaderboard**.
+Methodology, caveats, the load-throughput figures, and how to re-run
+(`just bench-compare`, or `just benchmark` for dr-strange alone) are in
+**[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## License
 

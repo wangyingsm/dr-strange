@@ -3,6 +3,15 @@
 //! (LLM-powered ingestion) is intentionally absent pending its own design
 //! session (arch/05 §3, arch/07).
 
+/// mimalloc as the process allocator: the storage paths are allocation-heavy
+/// (owned values per read, per-key buffers, record encode scratch), where it
+/// measurably beats the platform malloc — see the drsg-bench comparison in
+/// the commit that introduced it. Chosen in each BINARY, never in the core
+/// library: the allocator is a process-global decision that belongs to the
+/// embedding application.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 mod config;
 
