@@ -250,3 +250,96 @@ async fn auth_gate_over_http() {
     let forbidden_read = post(read, Some("https://evil.example.com")).await.unwrap();
     assert_eq!(forbidden_read.status(), reqwest::StatusCode::FORBIDDEN);
 }
+
+/// `digest.write` must never take a key that is already bound in the plane.
+///
+/// It writes through the bulk path, which stamps the external-key index
+/// unconditionally — so before this was gated, a proposal naming an existing
+/// entity overwrote that index entry and left the original node reachable only
+/// by id. Every `key(...)` read against it then came back empty while the data
+/// sat there untouched — observed in practice, on nodes an application
+/// addressed by key, with no error and no log line to notice it by.
+///
+/// Skipping is the contract, not failing: a distillation proposes every entity
+/// as new, so naming something already known is the normal case. The edge is
+/// still written and must land on the *original* node.
+#[tokio::test]
+async fn digest_write_never_shadows_an_existing_key() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let created = rpc(
+        &client,
+        &base,
+        "node.create",
+        json!({ "plane": "startup", "key": "proj", "labels": ["Project"],
+                "properties": { "path": "/keep/me" } }),
+    )
+    .await;
+    let original = created["result"]["id"].as_u64().unwrap();
+
+    // A proposal that re-proposes `proj`, names it twice, and hangs a new node
+    // off it — exactly the shape digest.run emits with `link: false`.
+    let w = rpc(
+        &client,
+        &base,
+        "digest.write",
+        json!({
+            "plane": "startup",
+            "nodes": [
+                { "key": "proj",  "label": "Project", "properties": { "path": "/overwritten" } },
+                { "key": "proj",  "label": "Project", "properties": {} },
+                { "key": "fresh", "label": "Note",    "properties": {} }
+            ],
+            "edges": [ { "src": "fresh", "dst": "proj", "type": "ABOUT" } ],
+        }),
+    )
+    .await["result"]
+        .clone();
+
+    assert_eq!(
+        w["nodes_written"], 1,
+        "only the genuinely new node is written"
+    );
+    assert_eq!(w["nodes_skipped"], 2, "the taken key, twice over");
+    assert_eq!(
+        w["skipped_keys"],
+        json!(["proj", "proj"]),
+        "skips are reported, not silent"
+    );
+    assert_eq!(w["edges_written"], 1, "the edge still lands");
+
+    // The key still resolves to the node that owned it, properties intact.
+    let got = rpc(
+        &client,
+        &base,
+        "node.get",
+        json!({ "plane": "startup", "key": "proj" }),
+    )
+    .await;
+    assert_eq!(got["result"]["id"], original, "key must not have moved");
+    assert_eq!(
+        got["result"]["properties"]["path"], "/keep/me",
+        "not overwritten"
+    );
+
+    // …and the edge attached to that original node, not to a second one.
+    let n = rpc(
+        &client,
+        &base,
+        "plane.cypher",
+        json!({
+            "plane": "startup",
+            "query": "MATCH (p:Project)<-[:ABOUT]-(x) WHERE key(p) = $k RETURN x",
+            "params": { "k": "proj" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        n["result"]["nodes"].as_array().unwrap().len(),
+        1,
+        "edge onto a skipped key must resolve to the node already there"
+    );
+}

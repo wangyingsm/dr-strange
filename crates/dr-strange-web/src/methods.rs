@@ -5,6 +5,7 @@
 //! wire shape. Most methods are reads; `digest.run`/`digest.write` power the
 //! digest page (arch/07), the latter writing through the bulk path.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use dr_strange_core::{
@@ -1519,12 +1520,41 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestWrite = params(p)?;
     let plane = app(ctx.db.plane(&req.plane))?;
 
-    let mut node_props = Vec::with_capacity(req.nodes.len());
+    // Only nodes whose key is genuinely free get written.
+    //
+    // `bulk_load` writes the external-key index unconditionally: a proposed key
+    // that already exists overwrites the index entry, leaving the original node
+    // in place but reachable only by id. Every `key(...)` read against it then
+    // returns empty while the data sits there untouched. Observed, not
+    // theorised: one run shadowed two nodes an application addressed by key,
+    // and every key-filtered read for them went empty at the same moment —
+    // no error, no log line. `node.create` has always rejected a taken key;
+    // this path was the way around it.
+    //
+    // Skipping rather than failing the batch: a distillation proposes every
+    // entity as new (`link: false`), so naming something already known is the
+    // normal case, not an error — rejecting the batch would drop the run
+    // exactly when it had learned something. Edges are kept either way:
+    // `resolve` falls back to the plane's existing keys, so an edge onto a
+    // skipped key attaches to the node that was already there, which is what
+    // "this distillation mentions something we know" ought to mean.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut fresh: Vec<&WriteNode> = Vec::with_capacity(req.nodes.len());
+    let mut skipped: Vec<&str> = Vec::new();
     for n in &req.nodes {
+        // Intra-batch duplicates would make bulk_load reject the whole call.
+        if !seen.insert(n.key.as_str()) || app(plane.node_by_key(&n.key))?.is_some() {
+            skipped.push(n.key.as_str());
+            continue;
+        }
+        fresh.push(n);
+    }
+
+    let mut node_props = Vec::with_capacity(fresh.len());
+    for n in &fresh {
         node_props.push(props_of(&n.properties)?);
     }
-    let label_slots: Vec<[&str; 1]> = req
-        .nodes
+    let label_slots: Vec<[&str; 1]> = fresh
         .iter()
         .map(|n| {
             [if n.label.is_empty() {
@@ -1534,8 +1564,7 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             }]
         })
         .collect();
-    let bnodes: Vec<BulkNode> = req
-        .nodes
+    let bnodes: Vec<BulkNode> = fresh
         .iter()
         .zip(&label_slots)
         .zip(node_props)
@@ -1565,7 +1594,14 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let mut txn = app(plane.write())?;
     let stats = app(txn.bulk_load(bnodes, bedges))?;
     app(txn.commit())?;
-    Ok(jval!({ "nodes_written": stats.nodes, "edges_written": stats.edges }))
+    // `skipped_keys` is reported, not just counted: a silent skip is how the
+    // client-side guard managed to do nothing for weeks without anyone noticing.
+    Ok(jval!({
+        "nodes_written": stats.nodes,
+        "edges_written": stats.edges,
+        "nodes_skipped": skipped.len(),
+        "skipped_keys": skipped,
+    }))
 }
 
 // ---- granular mutations (arch/09 §3) --------------------------------------
