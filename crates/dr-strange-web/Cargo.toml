@@ -11,16 +11,31 @@ homepage.workspace = true
 
 [features]
 default = ["native-backend"]
-# Storage backend, forwarded to core. The hand-rolled LSM engine is the default;
-# `redb-backend` selects the legacy v1 engine.
-redb-backend = ["dr-strange-core/redb-backend"]
-native-backend = ["dr-strange-core/native-backend"]
+# Storage backend, forwarded to core + the embedded MCP tool set. The
+# hand-rolled LSM engine is the default; `redb-backend` selects the legacy v1
+# engine.
+redb-backend = ["dr-strange-core/redb-backend", "dr-strange-mcp/redb-backend"]
+native-backend = ["dr-strange-core/native-backend", "dr-strange-mcp/native-backend"]
 
 [dependencies]
 dr-strange-core = { workspace = true, features = ["json"] }
 dr-strange-llm = { path = "../dr-strange-llm" }
+# The MCP tool set (arch/06), reused (not reimplemented) to host it at `/mcp`
+# (ROADMAP §10) — the served endpoint and the `drsg-mcp` stdio binary drive
+# the identical tool code, just over different transports.
+# `default-features = false` for the same reason `[workspace.dependencies]`
+# gives for core: the backend is this crate's choice to forward, and the
+# binary's default (`native-backend`) would otherwise reach core through here
+# even in a `--no-default-features --features redb-backend` build — where
+# core's `cfg(all(redb-backend, not(native-backend)))` would then silently
+# select the native engine anyway.
+dr-strange-mcp = { path = "../dr-strange-mcp", default-features = false }
 dr-strange-parser.workspace = true
 axum = { version = "0.8", features = ["ws"] }
+# Streamable HTTP MCP transport for `/mcp` (ROADMAP §10). `server` pulls in
+# the tool macros dr-strange-mcp's `DrStrange` needs; `transport-io` (stdio)
+# stays out — that's `drsg-mcp`'s transport, not this one's.
+rmcp = { version = "2.2.0", features = ["server", "transport-streamable-http-server"] }
 # Native TLS for `drsg serve` (arch/08). axum-server drives the accept loop with
 # a rustls acceptor; `no-provider` + an explicit `ring` provider keeps the build
 # off the aws-lc-rs C toolchain.
@@ -64,3 +79,6 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+# A real MCP client, to drive /mcp end-to-end in tests/mcp.rs the way an
+# agent host actually would, not just over raw HTTP.
+rmcp = { version = "2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }

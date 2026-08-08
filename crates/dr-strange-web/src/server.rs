@@ -13,11 +13,17 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::{ChangeSet, Database, PlaneId};
+use dr_strange_mcp::DrStrange;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -123,6 +129,43 @@ fn resolve_credentials(
     })
 }
 
+/// Gates `/mcp` the same way `cypher_http` gates `/cypher`: **write** level,
+/// since several tools mutate (`write_nodes`, `digest` with `apply`, …) and
+/// the v1 single-token model doesn't distinguish finer than that (ROADMAP
+/// §10 "Authentication" — a per-tool split is future work). Runs as an axum
+/// middleware, not a handler check, because the `/mcp` route is a raw tower
+/// service ([`StreamableHttpService`]) with no handler body of its own to put
+/// the check in.
+async fn mcp_auth(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let creds = match resolve_credentials(&state, request.headers(), None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Write, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    next.run(request).await
+}
+
+/// The MCP endpoint (ROADMAP §10): the same [`DrStrange`] tool set
+/// `drsg-mcp` serves over stdio, mounted here over Streamable HTTP so several
+/// agent hosts can share this process's `Database` instead of each opening
+/// the file directly. One [`DrStrange`] instance per MCP session — cheap,
+/// since all real state lives in the shared `Arc<Database>` each clone
+/// points at; `write_gate` inside it, not anything here, is what serializes
+/// concurrent writers.
+fn mcp_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    let db = state.db.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(DrStrange::new(db.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    Router::new()
+        .route_service("/mcp", service)
+        .route_layer(middleware::from_fn_with_state(state, mcp_auth))
+}
+
 fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -146,6 +189,7 @@ fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
+        .merge(mcp_router(state.clone()))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
