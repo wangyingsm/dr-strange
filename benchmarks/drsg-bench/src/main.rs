@@ -12,6 +12,11 @@
 //! The dataset is the single source of truth: `gen` produces the files, and
 //! both `run` and the Python engines read them — no engine regenerates data.
 
+/// Same process allocator as the shipped binaries (drsg / drsg-mcp), so the
+/// benchmark measures what production runs.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -70,6 +75,12 @@ enum Command {
         /// k for vector top-k.
         #[arg(long, default_value_t = 10)]
         k: u64,
+        /// Measurement passes: the whole load + query workload runs this many
+        /// times (fresh database each pass) and every reported figure is the
+        /// median across passes, with the min→max spread printed alongside.
+        /// One pass is a machine-state lottery; three make the noise visible.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
 }
 
@@ -106,6 +117,13 @@ struct OpResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     p95_us: Option<f64>,
     throughput_per_s: f64,
+    /// Measurement passes aggregated into this row (absent = single pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runs: Option<u32>,
+    /// (max − min) / median of the primary metric across passes, in percent —
+    /// the honest error bar on the numbers above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spread_pct: Option<f64>,
 }
 
 fn stat(mut micros: Vec<f64>) -> (f64, f64) {
@@ -249,12 +267,15 @@ fn parse_vector(s: &str) -> Vec<f32> {
     s.split_whitespace().map(|t| t.parse().unwrap()).collect()
 }
 
-fn run(data: &Path, db_path: &Path, out: &Path, k: u64) -> Result<()> {
+/// One full measurement pass: fresh database, load, then every query set.
+fn run_pass(data: &Path, db_path: &Path, k: u64) -> Result<Vec<OpResult>> {
     let engine = "dr-strange".to_string();
     let mut results: Vec<OpResult> = Vec::new();
 
-    // Fresh database each run.
+    // Fresh database each run. The native backend's db is a directory
+    // (WAL + SSTs), legacy redb's a single file — clear either shape.
     let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(db_path);
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -439,20 +460,83 @@ fn run(data: &Path, db_path: &Path, out: &Path, k: u64) -> Result<()> {
         results.push(latency_result(&engine, "vector_topk", &micros, t.elapsed()));
     }
 
-    // ---- write results ----------------------------------------------------
+    Ok(results)
+}
+
+/// Median of a small sample (by value; passes are few, cloning is fine).
+fn median_of(mut vals: Vec<f64>) -> f64 {
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals[vals.len() / 2]
+}
+
+/// (max − min) / median, as a percentage — the printed error bar.
+fn spread_of(vals: &[f64]) -> f64 {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &v in vals {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let med = median_of(vals.to_vec());
+    if med > 0.0 {
+        (hi - lo) / med * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Run `repeat` measurement passes and aggregate: every reported metric is the
+/// median across passes; `spread_pct` records the min→max spread of each op's
+/// primary metric (latency median, else throughput) so noise stays visible
+/// instead of silently baked into a single-shot number.
+fn run(data: &Path, db_path: &Path, out: &Path, k: u64, repeat: u32) -> Result<()> {
+    let repeat = repeat.max(1);
+    let mut passes: Vec<Vec<OpResult>> = Vec::with_capacity(repeat as usize);
+    for i in 0..repeat {
+        if repeat > 1 {
+            println!("pass {}/{repeat}…", i + 1);
+        }
+        passes.push(run_pass(data, db_path, k)?);
+    }
+
+    let per_op = |f: &dyn Fn(&OpResult) -> f64, op_idx: usize| -> Vec<f64> {
+        passes.iter().map(|p| f(&p[op_idx])).collect()
+    };
+    let results: Vec<OpResult> = (0..passes[0].len())
+        .map(|i| {
+            let first = &passes[0][i];
+            let latency = first.median_us.is_some();
+            let primary = per_op(&|r| r.median_us.unwrap_or(r.throughput_per_s), i);
+            OpResult {
+                engine: first.engine.clone(),
+                op: first.op.clone(),
+                n: first.n,
+                total_ms: median_of(per_op(&|r| r.total_ms, i)),
+                median_us: latency.then(|| median_of(per_op(&|r| r.median_us.unwrap(), i))),
+                p95_us: latency.then(|| median_of(per_op(&|r| r.p95_us.unwrap(), i))),
+                throughput_per_s: median_of(per_op(&|r| r.throughput_per_s, i)),
+                runs: (repeat > 1).then_some(repeat),
+                spread_pct: (repeat > 1).then(|| spread_of(&primary)),
+            }
+        })
+        .collect();
+
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(out, serde_json::to_vec_pretty(&results)?)?;
     println!("wrote {} results → {}", results.len(), out.display());
     for r in &results {
+        let spread = r
+            .spread_pct
+            .map(|s| format!("  ±{s:.1}%"))
+            .unwrap_or_default();
         match r.median_us {
             Some(m) => println!(
-                "  {:<14} n={:<7} {:>9.2} ms total  median {:>8.2} µs  {:>12.0}/s",
+                "  {:<14} n={:<7} {:>9.2} ms total  median {:>8.2} µs  {:>12.0}/s{spread}",
                 r.op, r.n, r.total_ms, m, r.throughput_per_s
             ),
             None => println!(
-                "  {:<14} n={:<7} {:>9.2} ms total  {:>12.0}/s",
+                "  {:<14} n={:<7} {:>9.2} ms total  {:>12.0}/s{spread}",
                 r.op, r.n, r.total_ms, r.throughput_per_s
             ),
         }
@@ -473,6 +557,8 @@ fn throughput_result(engine: &str, op: &str, n: u64, total_ms: f64) -> OpResult 
         } else {
             0.0
         },
+        runs: None,
+        spread_pct: None,
     }
 }
 
@@ -487,6 +573,8 @@ fn latency_result(engine: &str, op: &str, micros: &[f64], total: std::time::Dura
         median_us: Some(median),
         p95_us: Some(p95),
         throughput_per_s: micros.len() as f64 / total.as_secs_f64(),
+        runs: None,
+        spread_pct: None,
     }
 }
 
@@ -500,6 +588,12 @@ fn main() -> Result<()> {
             queries,
             vec_queries,
         } => generate(&out, nodes, edges, dim, queries, vec_queries),
-        Command::Run { data, db, out, k } => run(&data, &db, &out, k),
+        Command::Run {
+            data,
+            db,
+            out,
+            k,
+            repeat,
+        } => run(&data, &db, &out, k, repeat),
     }
 }

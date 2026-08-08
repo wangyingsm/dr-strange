@@ -17,6 +17,7 @@ redb-backend = ["dr-strange-core/redb-backend"]
 native-backend = ["dr-strange-core/native-backend"]
 
 [dependencies]
+ahash = { workspace = true }
 dr-strange-core = { workspace = true, features = ["json"] }
 dr-strange-llm = { path = "../dr-strange-llm" }
 dr-strange-parser.workspace = true

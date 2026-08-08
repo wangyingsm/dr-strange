@@ -11,7 +11,7 @@
 //! node plus the trail of `(edge, node)` hops taken to reach it. `Filter`
 //! and `Sort` address the current node.
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap, AHashSet};
 use std::rc::Rc;
 
 use crate::cache::GraphReader;
@@ -274,7 +274,7 @@ fn algo_rows(reader: &dyn GraphReader, label: Option<&str>, spec: &Algo) -> Resu
 /// community, scoring each node with a dense 0-based community index assigned
 /// in order of first appearance.
 fn grouped_rows(assignments: Vec<(NodeId, NodeId)>) -> Vec<Row> {
-    let mut index: HashMap<NodeId, usize> = HashMap::new();
+    let mut index: AHashMap<NodeId, usize> = AHashMap::new();
     let mut rows: Vec<(usize, NodeId)> = Vec::with_capacity(assignments.len());
     for (node, community) in assignments {
         let next = index.len();
@@ -362,7 +362,7 @@ fn apply_step<'r>(
         Step::Skip(n) => Box::new(iter.skip(*n as usize)),
         Step::Limit(n) => Box::new(iter.take(*n as usize)),
         Step::Distinct => {
-            let mut seen: HashSet<NodeId> = HashSet::new();
+            let mut seen: AHashSet<NodeId> = AHashSet::new();
             Box::new(iter.filter_map(move |rr| match rr {
                 Err(e) => Some(Err(e)),
                 Ok(row) => seen.insert(row.head).then_some(Ok(row)),
@@ -382,7 +382,7 @@ fn apply_step<'r>(
             let ranked = vector_top_k_rows(reader, &ids, property, query, *metric, *k as usize)?;
             // vector_top_k_rows makes fresh scored rows (no trail); re-attach
             // each winner's original trail so path info survives the rerank.
-            let mut by_head: std::collections::HashMap<NodeId, Row> =
+            let mut by_head: ahash::AHashMap<NodeId, Row> =
                 frontier.into_iter().map(|r| (r.head, r)).collect();
             let out: Vec<Result<Row>> = ranked
                 .into_iter()
@@ -580,9 +580,11 @@ fn node_vector(reader: &dyn GraphReader, head: NodeId, property: &str) -> Result
 fn cmp_keys(a: &[PropValue], b: &[PropValue], keys: &[SortKey]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for (i, key) in keys.iter().enumerate() {
-        // Incomparable pairs (mismatched types, Null, NaN) sort as Equal,
-        // keeping the sort total and stable rather than panicking.
-        let ord = expr::partial_cmp(&a[i], &b[i]).unwrap_or(Ordering::Equal);
+        // The canonical total order: NaN and mismatched types get a real,
+        // consistent position. (`partial_cmp(..).unwrap_or(Equal)` was NOT
+        // total — NaN "equal" to floats that order among themselves — and
+        // std's sort panics when it detects such a comparator.)
+        let ord = expr::total_cmp(&a[i], &b[i]);
         let ord = if key.descending { ord.reverse() } else { ord };
         if ord != Ordering::Equal {
             return ord;
@@ -788,6 +790,49 @@ mod tests {
             descending: true,
         }]));
         assert_eq!(years(&desc), vec![2020, 2010, 1999]);
+    }
+
+    /// Soft-schema sort keys: NaN and mixed types must sort deterministically,
+    /// not panic. (`partial_cmp(..).unwrap_or(Equal)` was a non-total
+    /// comparator — NaN "equal" to floats that order among themselves — which
+    /// std's sort detects and panics on.)
+    #[test]
+    fn sort_with_nan_and_mixed_types_is_total_not_a_panic() {
+        let values = [
+            PropValue::Float(f64::NAN),
+            PropValue::Float(2.0),
+            PropValue::Str("s".into()),
+            PropValue::Float(1.0),
+            PropValue::Null,
+            PropValue::Float(f64::NAN),
+            PropValue::Int(3),
+        ];
+        let mut plan = LogicalPlan::new(Source::ScanLabel("X".into()));
+        plan.push(Step::Sort(vec![SortKey {
+            expr: p("v"),
+            descending: false,
+        }]));
+        let ids = run(
+            |txn| {
+                for v in &values {
+                    graph::create_node(txn, PlaneId::STARTUP, &["X"], &props(&[("v", v.clone())]))
+                        .unwrap();
+                }
+            },
+            &plan,
+        );
+        // All rows survive, in the canonical order: Null, then numbers
+        // ascending with NaN past everything, then strings.
+        assert_eq!(ids.len(), values.len());
+        let rank_of = |id: NodeId| values[(id.0 - 1) as usize].clone();
+        let sorted: Vec<PropValue> = ids.into_iter().map(rank_of).collect();
+        assert!(matches!(sorted[0], PropValue::Null));
+        assert!(matches!(sorted[1], PropValue::Float(f) if f == 1.0));
+        assert!(matches!(sorted[2], PropValue::Float(f) if f == 2.0));
+        assert!(matches!(sorted[3], PropValue::Int(3)));
+        assert!(matches!(sorted[4], PropValue::Float(f) if f.is_nan()));
+        assert!(matches!(sorted[5], PropValue::Float(f) if f.is_nan()));
+        assert!(matches!(sorted[6], PropValue::Str(_)));
     }
 
     #[test]

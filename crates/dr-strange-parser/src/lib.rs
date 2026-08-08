@@ -81,7 +81,7 @@ mod compile;
 mod parse;
 mod write;
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 use dr_strange_core::{LogicalPlan, PropValue};
 
@@ -91,7 +91,7 @@ pub use write::{WriteStatement, WriteSummary};
 /// Values for `$name` placeholders in a query, supplied by the caller and
 /// resolved at parse time (so no string interpolation — the SDK-safe way to
 /// pass values). Keyed by the bare name (no `$`).
-pub type Params = HashMap<String, PropValue>;
+pub type Params = AHashMap<String, PropValue>;
 
 /// Resolve a `$name` placeholder against the caller's params.
 pub(crate) fn resolve_param(params: &Params, name: &str) -> Result<PropValue, String> {

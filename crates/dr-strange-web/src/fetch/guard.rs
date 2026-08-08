@@ -327,16 +327,85 @@ mod tests {
 
     #[test]
     fn a_mixed_record_keeps_only_the_public_addresses() {
-        let r = PublicOnly { allow: vec![] };
-        let addrs = vec![
-            SocketAddr::new(ip("127.0.0.1"), 80),
-            SocketAddr::new(ip("1.1.1.1"), 80),
-        ];
-        let kept: Vec<_> = addrs
-            .into_iter()
-            .filter(|a| classify(a.ip()).is_none() || r.allow.iter().any(|p| p.contains(a.ip())))
-            .collect();
+        // Through `filter` itself. An earlier version of this test re-created
+        // the filtering inline and asserted on the copy, which proved the test
+        // right and said nothing about the code — coverage caught it.
+        let kept = filter(
+            vec![
+                SocketAddr::new(ip("127.0.0.1"), 80),
+                SocketAddr::new(ip("1.1.1.1"), 80),
+            ],
+            &[],
+        )
+        .expect("a public address survives");
         assert_eq!(kept.len(), 1, "the loopback answer must be dropped");
         assert_eq!(kept[0].ip(), ip("1.1.1.1"));
+    }
+
+    #[test]
+    fn a_record_with_nothing_public_is_refused_and_says_why() {
+        let err = filter(
+            vec![
+                SocketAddr::new(ip("10.0.0.1"), 80),
+                SocketAddr::new(ip("169.254.169.254"), 80),
+            ],
+            &[],
+        )
+        .expect_err("nothing here may be connected to");
+        // The first refusal is the one reported, and it names the address.
+        assert!(err.contains("10.0.0.1"), "{err}");
+        assert!(err.contains("private"), "{err}");
+
+        let empty = filter(vec![], &[]).expect_err("a name that resolved to nothing");
+        assert!(empty.contains("resolved to nothing"), "{empty}");
+    }
+
+    #[test]
+    fn an_operator_grant_survives_the_filter() {
+        let allow = vec![Prefix::parse("10.0.0.0/8").unwrap()];
+        let kept = filter(vec![SocketAddr::new(ip("10.1.2.3"), 80)], &allow)
+            .expect("the granted block is reachable");
+        assert_eq!(kept.len(), 1);
+        // …and the grant is not a blanket over the rest of private space.
+        assert!(filter(vec![SocketAddr::new(ip("192.168.1.1"), 80)], &allow).is_err());
+    }
+
+    #[test]
+    fn precheck_refuses_before_a_packet_moves() {
+        // Literal addresses, so this resolves locally and needs no network.
+        let url = |s: &str| Url::parse(s).unwrap();
+
+        let err = guard_err(&url("http://127.0.0.1:8080/x"), &[]);
+        assert!(err.contains("refusing to connect"), "{err}");
+        assert!(err.contains("loopback"), "{err}");
+
+        let meta = guard_err(&url("http://169.254.169.254/latest/meta-data/"), &[]);
+        assert!(meta.contains("link-local"), "the metadata endpoint: {meta}");
+
+        // A public address passes, and a granted private one passes too.
+        assert!(precheck(&url("http://1.1.1.1/"), &[]).is_ok());
+        let allow = vec![Prefix::parse("10.0.0.0/8").unwrap()];
+        assert!(precheck(&url("http://10.0.0.5/wiki"), &allow).is_ok());
+        // The scheme check runs first, so a `file:` URL never reaches resolution.
+        assert!(precheck(&url("file:///etc/passwd"), &[]).is_err());
+    }
+
+    fn guard_err(u: &Url, allow: &[Prefix]) -> String {
+        precheck(u, allow).expect_err("must be refused").to_string()
+    }
+
+    #[test]
+    fn a_prefix_matches_v6_and_non_byte_aligned_blocks() {
+        // /12 is not byte-aligned, so it exercises the mask path.
+        let twelve = Prefix::parse("172.16.0.0/12").unwrap();
+        assert!(twelve.contains(ip("172.31.255.254")));
+        assert!(!twelve.contains(ip("172.32.0.1")));
+
+        // A v6 prefix against v6 addresses.
+        let v6 = Prefix::parse("fd00::/8").unwrap();
+        assert!(v6.contains(ip("fd00::1")));
+        assert!(!v6.contains(ip("2606:4700::1111")));
+        // A v6 prefix never matches a bare v4 address.
+        assert!(!v6.contains(ip("10.0.0.1")));
     }
 }

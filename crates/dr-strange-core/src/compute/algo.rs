@@ -17,7 +17,9 @@
 //! materialization are follow-ups (see ROADMAP §1 forks).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+
+use ahash::AHashMap;
 
 use crate::cache::GraphReader;
 use crate::error::Result;
@@ -43,7 +45,7 @@ impl Frame {
             Some(l) => reader.scan_label(l)?,
             None => reader.scan_all()?,
         };
-        let index: HashMap<NodeId, usize> =
+        let index: AHashMap<NodeId, usize> =
             nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
         let mut out: Vec<Vec<(usize, EdgeId)>> = vec![Vec::new(); nodes.len()];
         for (i, &nid) in nodes.iter().enumerate() {
@@ -117,8 +119,7 @@ pub fn pagerank<R: GraphReader + ?Sized>(
     for _ in 0..opts.max_iters {
         // Dangling mass is spread uniformly so total rank is conserved.
         let dangling: f64 = (0..n)
-            .filter(|&i| frame.out[i].is_empty())
-            .map(|i| rank[i])
+            .filter_map(|i| frame.out[i].is_empty().then_some(rank[i]))
             .sum();
         let base = teleport + opts.damping * dangling / nf;
         for v in next.iter_mut() {
@@ -268,7 +269,7 @@ pub fn shortest_path<R: GraphReader + ?Sized>(
     opts: &ShortestPathOptions,
 ) -> Result<Option<Path>> {
     let frame = Frame::build(reader, label)?;
-    let index: HashMap<NodeId, usize> = frame
+    let index: AHashMap<NodeId, usize> = frame
         .nodes
         .iter()
         .enumerate()
@@ -427,7 +428,7 @@ pub fn louvain<R: GraphReader + ?Sized>(
     // Build an undirected weighted graph: each directed edge contributes weight
     // 1 to the undirected pair (self-loops kept separately). `adj[i]` maps a
     // neighbor to the summed weight; `self_w[i]` is the node's self-loop weight.
-    let mut adj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+    let mut adj: Vec<AHashMap<usize, f64>> = vec![AHashMap::new(); n];
     let mut self_w = vec![0.0f64; n];
     for i in 0..n {
         for &(j, _) in &frame.out[i] {
@@ -461,7 +462,7 @@ pub fn louvain<R: GraphReader + ?Sized>(
     }
 
     // Translate community indices to representative NodeIds (smallest id).
-    let mut rep: HashMap<usize, NodeId> = HashMap::new();
+    let mut rep: AHashMap<usize, NodeId> = AHashMap::new();
     for (&id, &c) in frame.nodes.iter().zip(&community) {
         rep.entry(c)
             .and_modify(|e| {
@@ -484,7 +485,7 @@ pub fn louvain<R: GraphReader + ?Sized>(
 
 /// Undirected weighted graph used by Louvain, with self-loop weights split out.
 struct WGraph {
-    adj: Vec<HashMap<usize, f64>>,
+    adj: Vec<AHashMap<usize, f64>>,
     self_w: Vec<f64>,
 }
 
@@ -532,7 +533,7 @@ impl WGraph {
             for i in 0..n {
                 let ci = comm[i];
                 // Weight from i into each neighboring community.
-                let mut w_to: HashMap<usize, f64> = HashMap::new();
+                let mut w_to: AHashMap<usize, f64> = AHashMap::new();
                 for (&j, &w) in &self.adj[i] {
                     *w_to.entry(comm[j]).or_insert(0.0) += w;
                 }
@@ -569,7 +570,7 @@ impl WGraph {
     /// nodes.
     fn condense(&self, membership: &[usize]) -> WGraph {
         let k = membership.iter().copied().max().map_or(0, |m| m + 1);
-        let mut adj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); k];
+        let mut adj: Vec<AHashMap<usize, f64>> = vec![AHashMap::new(); k];
         let mut self_w = vec![0.0f64; k];
         for i in 0..self.len() {
             let ci = membership[i];
@@ -592,7 +593,7 @@ impl WGraph {
 /// Compress arbitrary label values into a dense `0..k` numbering, preserving
 /// first-seen order so the mapping is deterministic.
 fn renumber(labels: &[usize]) -> Vec<usize> {
-    let mut map: HashMap<usize, usize> = HashMap::new();
+    let mut map: AHashMap<usize, usize> = AHashMap::new();
     let mut out = Vec::with_capacity(labels.len());
     for &l in labels {
         let next = map.len();

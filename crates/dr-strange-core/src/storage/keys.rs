@@ -7,6 +7,18 @@
 use crate::error::{Error, Result};
 use crate::types::{EdgeId, NodeId, PlaneId};
 
+/// Big-endian decode of an exactly-4-byte slice. Every parser below
+/// length-checks the whole key before slicing, so the width is already
+/// proven — hence `expect`, not an error path.
+fn u32be(b: &[u8]) -> u32 {
+    u32::from_be_bytes(b.try_into().expect("checked length"))
+}
+
+/// Big-endian decode of an exactly-8-byte slice (see [`u32be`]).
+fn u64be(b: &[u8]) -> u64 {
+    u64::from_be_bytes(b.try_into().expect("checked length"))
+}
+
 // ---- meta table -----------------------------------------------------------
 
 /// Magic value stored under `META_MAGIC`; identifies a dr-strange database.
@@ -75,9 +87,7 @@ fn parse_index_decl_key(prefix: &[u8], key: &[u8]) -> Result<(PlaneId, String, S
     if rest.len() < 4 {
         return Err(Error::Corrupt("index key too short".into()));
     }
-    let plane = PlaneId(u32::from_be_bytes(
-        rest[..4].try_into().expect("checked length"),
-    ));
+    let plane = PlaneId(u32be(&rest[..4]));
     let tail = &rest[4..];
     let sep = tail
         .iter()
@@ -132,13 +142,7 @@ pub fn parse_node_key(key: &[u8]) -> Result<(PlaneId, NodeId)> {
             key.len()
         )));
     }
-    let plane = PlaneId(u32::from_be_bytes(
-        key[..4].try_into().expect("checked length"),
-    ));
-    let node = NodeId(u64::from_be_bytes(
-        key[4..].try_into().expect("checked length"),
-    ));
-    Ok((plane, node))
+    Ok((PlaneId(u32be(&key[..4])), NodeId(u64be(&key[4..]))))
 }
 
 pub fn edge_key(plane: PlaneId, edge: EdgeId) -> [u8; 12] {
@@ -182,9 +186,7 @@ pub fn label_idx_node(key: &[u8]) -> Result<NodeId> {
             key.len()
         )));
     }
-    Ok(NodeId(u64::from_be_bytes(
-        key[8..].try_into().expect("checked length"),
-    )))
+    Ok(NodeId(u64be(&key[8..])))
 }
 
 // ---- adjacency ------------------------------------------------------------
@@ -246,8 +248,6 @@ pub fn parse_adj_key(key: &[u8]) -> Result<AdjEntry> {
             key.len()
         )));
     }
-    let u32be = |b: &[u8]| u32::from_be_bytes(b.try_into().expect("checked length"));
-    let u64be = |b: &[u8]| u64::from_be_bytes(b.try_into().expect("checked length"));
     Ok(AdjEntry {
         plane: PlaneId(u32be(&key[..4])),
         from: NodeId(u64be(&key[4..12])),

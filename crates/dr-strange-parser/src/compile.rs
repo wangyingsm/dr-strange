@@ -9,7 +9,9 @@
 //! spanning two variables can't be evaluated in this model, so it's rejected
 //! with a clear message rather than silently mis-scoped.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use ahash::AHashMap;
 
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
 use dr_strange_core::types::Dir;
@@ -69,7 +71,7 @@ pub fn compile(
 
     // Variable → slot index. Reusing a variable would mean a graph constraint
     // (same node reached two ways), which the linear model can't express.
-    let mut var_slot: HashMap<&str, usize> = HashMap::new();
+    let mut var_slot: AHashMap<&str, usize> = AHashMap::new();
     for (idx, n) in nodes.iter().enumerate() {
         if let Some(v) = &n.var
             && var_slot.insert(v.as_str(), idx).is_some()

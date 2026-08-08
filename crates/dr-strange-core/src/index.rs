@@ -21,7 +21,7 @@
 //! an exclusive lock to apply the coherence events buffered during the write
 //! (see `api::WriteTxn`).
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ struct Entry {
 /// [`Database`](crate::Database) wraps it in an `RwLock`.
 #[derive(Default)]
 pub struct VectorRegistry {
-    entries: HashMap<IndexKey, Entry>,
+    entries: AHashMap<IndexKey, Entry>,
 }
 
 impl VectorRegistry {
@@ -155,9 +155,14 @@ impl VectorRegistry {
         if sidecar.version != SIDECAR_VERSION || sidecar.seq != expected_seq {
             return None;
         }
-        let mut entries = HashMap::with_capacity(sidecar.entries.len());
+        let mut entries = AHashMap::with_capacity(sidecar.entries.len());
         for entry in sidecar.entries {
             let mut index = entry.index;
+            // Decoded bytes are untrusted: a graph with dangling adjacency
+            // would panic at first search. Stale-sidecar posture: rebuild.
+            if !index.is_wellformed() {
+                return None;
+            }
             // id_to_idx is #[serde(skip)] — rebuild it before the index is used.
             index.reindex();
             entries.insert(

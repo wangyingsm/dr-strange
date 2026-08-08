@@ -86,7 +86,7 @@ def query_vectors(data):
 
 # ---- SQLite ---------------------------------------------------------------
 
-def run_sqlite(data, out_path, k):
+def run_sqlite(data, k):
     import sqlite3
 
     engine = "sqlite"
@@ -156,12 +156,12 @@ def run_sqlite(data, out_path, k):
     results.append(op_latency(engine, "traverse_2hop", micros, time.perf_counter() - t0))
 
     con.close()
-    write_results(out_path, results)
+    return results
 
 
 # ---- Kùzu -----------------------------------------------------------------
 
-def run_kuzu(data, out_path, k):
+def run_kuzu(data, k):
     import shutil
 
     import kuzu
@@ -238,7 +238,7 @@ def run_kuzu(data, out_path, k):
     except Exception as e:  # noqa: BLE001
         print(f"kuzu: vector benchmark skipped ({e})", file=sys.stderr)
 
-    write_results(out_path, results)
+    return results
 
 
 def run_kuzu_vectors(con, data, k, results, engine):
@@ -276,7 +276,7 @@ def run_kuzu_vectors(con, data, k, results, engine):
 
 # ---- Neo4j ----------------------------------------------------------------
 
-def run_neo4j(data, out_path, k, uri, user, password):
+def run_neo4j(data, k, uri, user, password):
     from neo4j import GraphDatabase
 
     engine = "neo4j"
@@ -285,7 +285,14 @@ def run_neo4j(data, out_path, k, uri, user, password):
     driver.verify_connectivity()
 
     with driver.session() as ses:
-        ses.run("MATCH (n) DETACH DELETE n")  # clean slate
+        # Clean slate, batched: one giant DETACH DELETE of a previous pass's
+        # 600k+ records exceeds the server's per-transaction memory cap.
+        while True:
+            deleted = ses.run(
+                "MATCH (n) WITH n LIMIT 50000 DETACH DELETE n RETURN count(*) AS c"
+            ).single()["c"]
+            if deleted == 0:
+                break
         for idx in ses.run("SHOW INDEXES YIELD name RETURN name"):
             try:
                 ses.run(f"DROP INDEX {idx['name']}")
@@ -344,7 +351,7 @@ def run_neo4j(data, out_path, k, uri, user, password):
             print(f"neo4j: vector benchmark skipped ({e})", file=sys.stderr)
 
     driver.close()
-    write_results(out_path, results)
+    return results
 
 
 def run_neo4j_vectors(ses, data, k, results, engine):
@@ -384,17 +391,46 @@ def chunks(seq, n):
 
 # ---- main -----------------------------------------------------------------
 
+def aggregate_passes(passes):
+    """Median across measurement passes, per op. `spread_pct` records
+    (max − min) / median of each op's primary metric (latency median, else
+    throughput) — the honest error bar, visible instead of silently baked
+    into a single-shot number. Mirrors drsg-bench's aggregation exactly."""
+    if len(passes) == 1:
+        return passes[0]
+
+    def med(vals):
+        return sorted(vals)[len(vals) // 2]
+
+    out = []
+    for i, first in enumerate(passes[0]):
+        rows = [p[i] for p in passes]
+        r = {"engine": first["engine"], "op": first["op"], "n": first["n"],
+             "total_ms": med([x["total_ms"] for x in rows])}
+        if "median_us" in first:
+            r["median_us"] = med([x["median_us"] for x in rows])
+            r["p95_us"] = med([x["p95_us"] for x in rows])
+        r["throughput_per_s"] = med([x["throughput_per_s"] for x in rows])
+        primary = [x.get("median_us", x["throughput_per_s"]) for x in rows]
+        m = med(primary)
+        r["runs"] = len(passes)
+        r["spread_pct"] = (max(primary) - min(primary)) / m * 100 if m else 0.0
+        out.append(r)
+    return out
+
+
 def write_results(out_path, results):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
     print(f"wrote {len(results)} results → {out_path}")
     for r in results:
+        spread = f"  ±{r['spread_pct']:.1f}%" if "spread_pct" in r else ""
         if "median_us" in r:
             print(f"  {r['op']:<14} n={r['n']:<7} {r['total_ms']:>9.2f} ms  "
-                  f"median {r['median_us']:>8.2f} µs  {r['throughput_per_s']:>12.0f}/s")
+                  f"median {r['median_us']:>8.2f} µs  {r['throughput_per_s']:>12.0f}/s{spread}")
         else:
             print(f"  {r['op']:<14} n={r['n']:<7} {r['total_ms']:>9.2f} ms  "
-                  f"{r['throughput_per_s']:>12.0f}/s")
+                  f"{r['throughput_per_s']:>12.0f}/s{spread}")
 
 
 def main():
@@ -403,6 +439,9 @@ def main():
     ap.add_argument("--data", type=Path, default=Path("benchmarks/data"))
     ap.add_argument("--out", type=Path)
     ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="measurement passes; every figure reported is the median "
+                         "across passes, with the min→max spread recorded")
     ap.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     ap.add_argument("--neo4j-user", default="neo4j")
     ap.add_argument("--neo4j-password", default="benchpass")
@@ -410,11 +449,19 @@ def main():
 
     out = args.out or Path(f"benchmarks/results/{args.engine}.json")
     if args.engine == "sqlite":
-        run_sqlite(args.data, out, args.k)
+        one_pass = lambda: run_sqlite(args.data, args.k)  # noqa: E731
     elif args.engine == "kuzu":
-        run_kuzu(args.data, out, args.k)
-    elif args.engine == "neo4j":
-        run_neo4j(args.data, out, args.k, args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+        one_pass = lambda: run_kuzu(args.data, args.k)  # noqa: E731
+    else:
+        one_pass = lambda: run_neo4j(  # noqa: E731
+            args.data, args.k, args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+
+    passes = []
+    for i in range(max(1, args.repeat)):
+        if args.repeat > 1:
+            print(f"pass {i + 1}/{args.repeat}…")
+        passes.append(one_pass())
+    write_results(out, aggregate_passes(passes))
 
 
 if __name__ == "__main__":

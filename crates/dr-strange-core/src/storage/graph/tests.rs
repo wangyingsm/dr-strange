@@ -44,6 +44,32 @@ fn init_rejects_bad_magic() {
     assert!(matches!(init(&mut txn), Err(Error::Corrupt(_))));
 }
 
+/// The version policy at open: reject newer-than-this-build (with an
+/// "upgrade drsg" message), reject older-than-supported, accept current.
+/// The migration ladder itself is empty while MIN == FORMAT_VERSION; its
+/// first real arm gets tested when a v3 exists.
+#[test]
+fn init_version_policy() {
+    let reopen_with_version = |v: u32| {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        txn.put(TableId::Meta, keys::META_FORMAT_VERSION, &v.to_be_bytes())
+            .unwrap();
+        init(&mut txn)
+    };
+
+    match reopen_with_version(FORMAT_VERSION + 1) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("upgrade drsg"), "{msg}"),
+        other => panic!("newer format must be refused, got {other:?}"),
+    }
+    match reopen_with_version(MIN_SUPPORTED_VERSION - 1) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("no upgrade path"), "{msg}"),
+        other => panic!("ancient format must be refused, got {other:?}"),
+    }
+    assert!(reopen_with_version(FORMAT_VERSION).is_ok());
+}
+
 /// A corrupted database must surface `Corrupt` errors, never panic.
 #[test]
 fn corrupted_meta_errors_cleanly() {

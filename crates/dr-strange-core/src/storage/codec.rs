@@ -1,11 +1,7 @@
 //! Record/property codec, v1 (arch/01 §4): postcard.
 //!
-//! Chosen for M0 because it is actively maintained, compact (varint), and —
-//! crucial for durable storage — has a formal wire-format specification
-//! independent of the crate version. bincode was rejected (unmaintained,
-//! RUSTSEC-2025-0141). The M1 benchmark may still swap the format; that is
-//! why everything goes through these functions and nothing else in the
-//! crate touches postcard directly. `META_FORMAT_VERSION` gates the format.
+//! `bincode` was chosen at the beginning, but replaced by `postcard`
+//! since `bincode` is not maintained and has a security vulnerability.
 //!
 //! Postcard is not self-describing: struct field order and enum variant
 //! order in `types.rs` (and the raw record structs below) ARE the format.
@@ -36,25 +32,49 @@ fn decode<'a, T: Deserialize<'a>>(buf: &'a [u8]) -> Result<T> {
     }
 }
 
+// Each record has a borrowing (encode) and an owning (decode) struct. postcard
+// is not self-describing, so the pair need only agree on field ORDER and wire
+// types — `&str`/`String`, `&[u32]`/`Vec<u32>`, `&Properties`/`Properties`
+// serialize identically. Keeping them separate lets encoding borrow the
+// caller's data instead of cloning a potentially large property map (the same
+// pattern as the index sidecars in `index.rs`/`keyword.rs`).
+
 /// ⚠ On-disk format — field order is the encoding (see module docs).
 ///
 /// `external_key` is carried inline (rather than requiring a reverse lookup
 /// through `ext_keys`) so `delete_node` can clean up its `ext_keys` entry
 /// without an extra index (arch/01 §2).
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct NodeRecordRaw {
     external_key: Option<String>,
     labels: Vec<u32>,
     props: Properties,
 }
 
+/// ⚠ Borrowed encode twin of [`NodeRecordRaw`] — field order must match it.
+#[derive(Serialize)]
+struct NodeRecordRef<'a> {
+    external_key: Option<&'a str>,
+    labels: &'a [u32],
+    props: &'a Properties,
+}
+
 /// ⚠ On-disk format — field order is the encoding (see module docs).
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct EdgeRecordRaw {
     src: u64,
     dst: u64,
     ty: u32,
     props: Properties,
+}
+
+/// ⚠ Borrowed encode twin of [`EdgeRecordRaw`] — field order must match it.
+#[derive(Serialize)]
+struct EdgeRecordRef<'a> {
+    src: u64,
+    dst: u64,
+    ty: u32,
+    props: &'a Properties,
 }
 
 pub fn encode_props(props: &Properties) -> Vec<u8> {
@@ -70,10 +90,10 @@ pub fn encode_node_record(
     labels: &[u32],
     props: &Properties,
 ) -> Vec<u8> {
-    encode(&NodeRecordRaw {
-        external_key: external_key.map(str::to_string),
-        labels: labels.to_vec(),
-        props: props.clone(),
+    encode(&NodeRecordRef {
+        external_key,
+        labels,
+        props,
     })
 }
 
@@ -83,11 +103,11 @@ pub fn decode_node_record(buf: &[u8]) -> Result<(Option<String>, Vec<u32>, Prope
 }
 
 pub fn encode_edge_record(src: NodeId, dst: NodeId, ty: u32, props: &Properties) -> Vec<u8> {
-    encode(&EdgeRecordRaw {
+    encode(&EdgeRecordRef {
         src: src.0,
         dst: dst.0,
         ty,
-        props: props.clone(),
+        props,
     })
 }
 

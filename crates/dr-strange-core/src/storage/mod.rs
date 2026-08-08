@@ -1,11 +1,14 @@
 //! Storage layer (arch/01): graph encoding over a swappable KV backend.
 //!
+//! - [`codec`] — the graph encoding and decoding layer
 //! - [`engine`] — the `StorageEngine` / transaction traits (the swap seam)
+//! - [`graph`] — the graph data structure and its operations
+//! - [`hnsw`] — the HNSW vector index implementation
+//! - [`keys`] — the keys in graph storage implementation
 //! - [`memory`] — in-memory backend for tests and property-based testing
-//! - [`vector`] — the `VectorIndex` trait (HNSW sidecar lands at M3)
+//! - [`native`] — native backend of the graph storage implementation
+//! - [`vector`] — the `VectorIndex` trait
 //!
-//! Planned for M0/M1 (not yet present): `redb` backend, key encoding
-//! (plane-prefixed tables), property codec, graph-level record store.
 
 pub mod codec;
 pub mod engine;
@@ -17,6 +20,8 @@ pub mod memory;
 pub mod native;
 pub mod vector;
 
+/// Since v0.2.0, the `redb` backend is obsolete replaced by `native` backend
+/// as default.
 #[cfg(feature = "redb-backend")]
 pub mod redb_backend;
 

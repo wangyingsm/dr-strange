@@ -18,7 +18,11 @@
 //! assumed fresh (uniqueness is checked within the batch, not against the KV —
 //! that's the per-record path's job).
 
-use std::collections::HashMap;
+// aHash, not std's SipHash: `key_to_id` sees one insert per node and two
+// lookups per edge, all short string keys — the hot path of a bulk load. The
+// keyed random seed keeps crafted-collision (hash-DoS) resistance, which Fx
+// would give up; import files are user-supplied data.
+use ahash::AHashMap;
 
 use crate::error::{Error, Result};
 use crate::storage::engine::{ReadTransaction, TableId, WriteTransaction};
@@ -65,8 +69,165 @@ pub struct BulkStats {
 
 type Batch = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Sort a batch by key — the endpoint-/label-keyed tables aren't naturally
+/// ordered, and a sorted batch gives the backend near-sequential inserts.
+fn sort_batch(b: &mut Batch) {
+    b.sort_unstable_by(|a, c| a.0.cmp(&c.0));
+}
+
+/// Batch-local dictionary cache: intern each distinct name once per batch
+/// (`intern` is [`intern_label`] or [`intern_edge_type`]).
+fn intern_cached<'a>(
+    cache: &mut AHashMap<&'a str, u32>,
+    txn: &mut dyn WriteTransaction,
+    name: &'a str,
+    intern: fn(&mut dyn WriteTransaction, &str) -> Result<u32>,
+) -> Result<u32> {
+    match cache.get(name) {
+        Some(&id) => Ok(id),
+        None => {
+            let id = intern(txn, name)?;
+            cache.insert(name, id);
+            Ok(id)
+        }
+    }
+}
+
+/// The node phase's output: the four node-table batches plus the key→id map
+/// the edge phase resolves endpoints against.
+struct StagedNodes<'a> {
+    node_start: u64,
+    key_to_id: AHashMap<&'a str, NodeId>,
+    nodes: Batch,
+    node_plane: Batch,
+    label_idx: Batch,
+    ext_keys: Batch,
+}
+
+/// Encode every node's record, plane entry, label-index entries, and external
+/// key, assigning contiguous ids from a single reservation.
+fn stage_nodes<'a>(
+    txn: &mut dyn WriteTransaction,
+    plane: PlaneId,
+    nodes: &'a [BulkNode],
+) -> Result<StagedNodes<'a>> {
+    let node_start = reserve_id_batch(txn, keys::META_NEXT_NODE_ID, nodes.len() as u64)?;
+    let mut label_ids: AHashMap<&str, u32> = AHashMap::new();
+    let mut staged = StagedNodes {
+        node_start,
+        key_to_id: AHashMap::with_capacity(nodes.len()),
+        nodes: Vec::with_capacity(nodes.len()),
+        node_plane: Vec::with_capacity(nodes.len()),
+        label_idx: Vec::new(),
+        ext_keys: Vec::new(),
+    };
+
+    for (i, node) in nodes.iter().enumerate() {
+        let id = NodeId(node_start + i as u64);
+
+        let mut lids = Vec::with_capacity(node.labels.len());
+        for &l in node.labels {
+            lids.push(intern_cached(&mut label_ids, txn, l, intern_label)?);
+        }
+
+        if let Some(key) = node.external_key {
+            if staged.key_to_id.insert(key, id).is_some() {
+                return Err(Error::Conflict(format!(
+                    "duplicate external key '{key}' in bulk batch"
+                )));
+            }
+            staged.ext_keys.push((
+                keys::ext_key_key(plane, key).to_vec(),
+                id.0.to_be_bytes().to_vec(),
+            ));
+        }
+
+        staged.nodes.push((
+            keys::node_key(plane, id).to_vec(),
+            codec::encode_node_record(node.external_key, &lids, &node.props),
+        ));
+        staged.node_plane.push((
+            keys::node_plane_key(id).to_vec(),
+            plane.0.to_be_bytes().to_vec(),
+        ));
+        for &lid in &lids {
+            staged
+                .label_idx
+                .push((keys::label_idx_key(plane, lid, id).to_vec(), Vec::new()));
+        }
+    }
+    Ok(staged)
+}
+
+impl StagedNodes<'_> {
+    /// Write the four node tables, each as one sorted `put_batch`. The record
+    /// and plane tables are already key-sorted (contiguous ids); the label
+    /// index and external keys are not, so they get sorted here.
+    fn write(mut self, txn: &mut dyn WriteTransaction) -> Result<()> {
+        sort_batch(&mut self.label_idx);
+        sort_batch(&mut self.ext_keys);
+        txn.put_batch(TableId::Nodes, &self.nodes)?;
+        txn.put_batch(TableId::NodePlane, &self.node_plane)?;
+        txn.put_batch(TableId::LabelIdx, &self.label_idx)?;
+        txn.put_batch(TableId::ExtKeys, &self.ext_keys)
+    }
+}
+
+/// The three per-edge KV batches (record + both adjacency directions) —
+/// the staging half both [`bulk_load`] and [`bulk_load_edges`] share.
+struct EdgeBatches {
+    edges: Batch,
+    adj_fwd: Batch,
+    adj_rev: Batch,
+}
+
+impl EdgeBatches {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            edges: Vec::with_capacity(n),
+            adj_fwd: Vec::with_capacity(n),
+            adj_rev: Vec::with_capacity(n),
+        }
+    }
+
+    /// Stage one edge: its record plus both adjacency entries.
+    fn push(
+        &mut self,
+        plane: PlaneId,
+        id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        ty_id: u32,
+        props: &Properties,
+    ) {
+        self.edges.push((
+            keys::edge_key(plane, id).to_vec(),
+            codec::encode_edge_record(src, dst, ty_id, props),
+        ));
+        self.adj_fwd.push((
+            keys::adj_key(plane, src, ty_id, dst, id).to_vec(),
+            Vec::new(),
+        ));
+        self.adj_rev.push((
+            keys::adj_key(plane, dst, ty_id, src, id).to_vec(),
+            Vec::new(),
+        ));
+    }
+
+    /// Write the three edge tables, each as one sorted `put_batch`. Records
+    /// are already key-sorted (contiguous ids); adjacency is endpoint-keyed,
+    /// so both directions get sorted here.
+    fn write(mut self, txn: &mut dyn WriteTransaction) -> Result<()> {
+        sort_batch(&mut self.adj_fwd);
+        sort_batch(&mut self.adj_rev);
+        txn.put_batch(TableId::Edges, &self.edges)?;
+        txn.put_batch(TableId::AdjFwd, &self.adj_fwd)?;
+        txn.put_batch(TableId::AdjRev, &self.adj_rev)
+    }
+}
+
 /// Loads `nodes` then `edges` into `plane` (see module docs). Returns counts +
-/// the first node id. Nodes are written before edges so intra-batch endpoint
+/// the first node id. Nodes are staged before edges so intra-batch endpoint
 /// resolution works purely in memory.
 pub fn bulk_load(
     txn: &mut dyn WriteTransaction,
@@ -74,114 +235,22 @@ pub fn bulk_load(
     nodes: &[BulkNode],
     edges: &[BulkEdge],
 ) -> Result<BulkStats> {
-    // ---- nodes -----------------------------------------------------------
-    let node_start = reserve_id_batch(txn, keys::META_NEXT_NODE_ID, nodes.len() as u64)?;
+    let staged = stage_nodes(txn, plane, nodes)?;
 
-    let mut label_ids: HashMap<&str, u32> = HashMap::new();
-    let mut key_to_id: HashMap<&str, NodeId> = HashMap::new();
-
-    let mut nodes_b: Batch = Vec::with_capacity(nodes.len());
-    let mut node_plane_b: Batch = Vec::with_capacity(nodes.len());
-    let mut label_idx_b: Batch = Vec::new();
-    let mut ext_keys_b: Batch = Vec::new();
-
-    for (i, node) in nodes.iter().enumerate() {
-        let id = NodeId(node_start + i as u64);
-
-        let mut lids = Vec::with_capacity(node.labels.len());
-        for &l in node.labels {
-            let lid = match label_ids.get(l) {
-                Some(&x) => x,
-                None => {
-                    let x = intern_label(txn, l)?;
-                    label_ids.insert(l, x);
-                    x
-                }
-            };
-            lids.push(lid);
-        }
-
-        if let Some(key) = node.external_key {
-            if key_to_id.insert(key, id).is_some() {
-                return Err(Error::Conflict(format!(
-                    "duplicate external key '{key}' in bulk batch"
-                )));
-            }
-            ext_keys_b.push((
-                keys::ext_key_key(plane, key).to_vec(),
-                id.0.to_be_bytes().to_vec(),
-            ));
-        }
-
-        nodes_b.push((
-            keys::node_key(plane, id).to_vec(),
-            codec::encode_node_record(node.external_key, &lids, &node.props),
-        ));
-        node_plane_b.push((
-            keys::node_plane_key(id).to_vec(),
-            plane.0.to_be_bytes().to_vec(),
-        ));
-        for &lid in &lids {
-            label_idx_b.push((keys::label_idx_key(plane, lid, id).to_vec(), Vec::new()));
-        }
-    }
-
-    // ---- edges -----------------------------------------------------------
     let edge_start = reserve_id_batch(txn, keys::META_NEXT_EDGE_ID, edges.len() as u64)?;
-
-    let mut type_ids: HashMap<&str, u32> = HashMap::new();
-    let mut edges_b: Batch = Vec::with_capacity(edges.len());
-    let mut adj_fwd_b: Batch = Vec::with_capacity(edges.len());
-    let mut adj_rev_b: Batch = Vec::with_capacity(edges.len());
-
+    let mut type_ids: AHashMap<&str, u32> = AHashMap::new();
+    let mut batches = EdgeBatches::with_capacity(edges.len());
     for (i, e) in edges.iter().enumerate() {
         let id = EdgeId(edge_start + i as u64);
-        let src = resolve(&key_to_id, txn, plane, e.src_key)?;
-        let dst = resolve(&key_to_id, txn, plane, e.dst_key)?;
-
-        let ty_id = match type_ids.get(e.ty) {
-            Some(&x) => x,
-            None => {
-                let x = intern_edge_type(txn, e.ty)?;
-                type_ids.insert(e.ty, x);
-                x
-            }
-        };
-
-        edges_b.push((
-            keys::edge_key(plane, id).to_vec(),
-            codec::encode_edge_record(src, dst, ty_id, &e.props),
-        ));
-        adj_fwd_b.push((
-            keys::adj_key(plane, src, ty_id, dst, id).to_vec(),
-            Vec::new(),
-        ));
-        adj_rev_b.push((
-            keys::adj_key(plane, dst, ty_id, src, id).to_vec(),
-            Vec::new(),
-        ));
+        let src = resolve(&staged.key_to_id, txn, plane, e.src_key)?;
+        let dst = resolve(&staged.key_to_id, txn, plane, e.dst_key)?;
+        let ty_id = intern_cached(&mut type_ids, txn, e.ty, intern_edge_type)?;
+        batches.push(plane, id, src, dst, ty_id, &e.props);
     }
 
-    // ---- sorted batched writes ------------------------------------------
-    // nodes/node_plane/edges are already key-sorted (contiguous ids); the
-    // index and adjacency tables are keyed by label/endpoint, so sort them for
-    // the near-sequential-insert win.
-    for b in [
-        &mut ext_keys_b,
-        &mut label_idx_b,
-        &mut adj_fwd_b,
-        &mut adj_rev_b,
-    ] {
-        b.sort_unstable_by(|a, c| a.0.cmp(&c.0));
-    }
-
-    txn.put_batch(TableId::Nodes, &nodes_b)?;
-    txn.put_batch(TableId::NodePlane, &node_plane_b)?;
-    txn.put_batch(TableId::LabelIdx, &label_idx_b)?;
-    txn.put_batch(TableId::ExtKeys, &ext_keys_b)?;
-    txn.put_batch(TableId::Edges, &edges_b)?;
-    txn.put_batch(TableId::AdjFwd, &adj_fwd_b)?;
-    txn.put_batch(TableId::AdjRev, &adj_rev_b)?;
+    let node_start = staged.node_start;
+    staged.write(txn)?;
+    batches.write(txn)?;
 
     Ok(BulkStats {
         nodes: nodes.len() as u64,
@@ -201,43 +270,14 @@ pub fn bulk_load_edges(
     edges: &[BulkEdgeById],
 ) -> Result<u64> {
     let edge_start = reserve_id_batch(txn, keys::META_NEXT_EDGE_ID, edges.len() as u64)?;
-
-    let mut type_ids: HashMap<&str, u32> = HashMap::new();
-    let mut edges_b: Batch = Vec::with_capacity(edges.len());
-    let mut adj_fwd_b: Batch = Vec::with_capacity(edges.len());
-    let mut adj_rev_b: Batch = Vec::with_capacity(edges.len());
-
+    let mut type_ids: AHashMap<&str, u32> = AHashMap::new();
+    let mut batches = EdgeBatches::with_capacity(edges.len());
     for (i, e) in edges.iter().enumerate() {
         let id = EdgeId(edge_start + i as u64);
-        let ty_id = match type_ids.get(e.ty) {
-            Some(&x) => x,
-            None => {
-                let x = intern_edge_type(txn, e.ty)?;
-                type_ids.insert(e.ty, x);
-                x
-            }
-        };
-        edges_b.push((
-            keys::edge_key(plane, id).to_vec(),
-            codec::encode_edge_record(e.src, e.dst, ty_id, &e.props),
-        ));
-        adj_fwd_b.push((
-            keys::adj_key(plane, e.src, ty_id, e.dst, id).to_vec(),
-            Vec::new(),
-        ));
-        adj_rev_b.push((
-            keys::adj_key(plane, e.dst, ty_id, e.src, id).to_vec(),
-            Vec::new(),
-        ));
+        let ty_id = intern_cached(&mut type_ids, txn, e.ty, intern_edge_type)?;
+        batches.push(plane, id, e.src, e.dst, ty_id, &e.props);
     }
-
-    for b in [&mut adj_fwd_b, &mut adj_rev_b] {
-        b.sort_unstable_by(|a, c| a.0.cmp(&c.0));
-    }
-    txn.put_batch(TableId::Edges, &edges_b)?;
-    txn.put_batch(TableId::AdjFwd, &adj_fwd_b)?;
-    txn.put_batch(TableId::AdjRev, &adj_rev_b)?;
-
+    batches.write(txn)?;
     Ok(edges.len() as u64)
 }
 
@@ -245,7 +285,7 @@ pub fn bulk_load_edges(
 /// plane's existing external keys. Absent in both ⇒ a rejected edge, so no
 /// dangling adjacency is ever written.
 fn resolve(
-    batch: &HashMap<&str, NodeId>,
+    batch: &AHashMap<&str, NodeId>,
     txn: &dyn ReadTransaction,
     plane: PlaneId,
     key: &str,

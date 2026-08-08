@@ -9,6 +9,11 @@
 //! one place that knows concrete engine types) and owns transaction and
 //! reader lifecycles.
 
+/// Decoded-object cache between storage and computation (arch/02) — owned by
+/// this layer since the API's reader lifecycle is what scopes it; re-exported
+/// at the crate root so the public `dr_strange_core::cache` path is unchanged.
+pub mod cache;
+
 // `Path` is only referenced by the backend-gated `open`; `PathBuf` is used
 // unconditionally (sidecar fields), so import them separately to avoid an
 // unused-import warning in a no-backend build (e.g. dr-strange-llm's).

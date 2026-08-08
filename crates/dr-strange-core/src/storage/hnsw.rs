@@ -11,16 +11,23 @@
 //! connectivity but is never returned. The KV remains the source of truth
 //! (arch/01 §5), so a compacting rebuild-from-KV is always available; this
 //! index never needs to reclaim tombstones itself.
+//!
+//! Soft-schema totality (the [`super::vector`] posture): vectors of the wrong
+//! dimension can arrive via node properties, and every distance involving one
+//! is `+∞` ([`guarded_dist`]) — mismatched pairs rank at the far edge rather
+//! than panicking or feeding the unchecked SIMD kernel mismatched slices.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+
+use ahash::AHashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, backend};
+use crate::error::{Error, Result, backend};
 use crate::storage::vector::{Hit, IdFilter, Metric, VectorIndex, dot, top_k};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -81,7 +88,7 @@ pub struct HnswIndex {
     rng: u64,
     // Rebuilt on load, so skipped in the on-disk form.
     #[serde(skip)]
-    id_to_idx: HashMap<u64, usize>,
+    id_to_idx: AHashMap<u64, usize>,
     // Reusable search buffers (see [`Scratch`]); never serialized. Owned by
     // the index so a whole build reuses one allocation instead of allocating
     // a visited-set + heaps per `search_layer` call.
@@ -111,7 +118,7 @@ impl Scratch {
         }
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            self.visited.iter_mut().for_each(|v| *v = 0);
+            self.visited.fill(0);
             self.epoch = 1;
         }
         self.cand.clear();
@@ -146,18 +153,30 @@ struct Query<'a> {
     norm: f32,
 }
 
+/// The distance every kernel below routes through. Mismatched dimensions are
+/// `+∞` — [`super::vector`]'s soft-schema totality posture (such pairs never
+/// rank close, never an error) — which also keeps the unchecked SIMD `dot`
+/// away from slices of different lengths (out-of-bounds reads in release).
+fn guarded_dist(metric: Metric, a: &[f32], na: f32, b: &[f32], nb: f32) -> f32 {
+    if a.len() != b.len() {
+        return f32::INFINITY;
+    }
+    metric_dist(metric, dot(a, b), na, nb)
+}
+
 /// Distance from a prepared query to node `idx` — one dot.
 fn dist_q(nodes: &[Node], metric: Metric, q: Query<'_>, idx: usize) -> f32 {
     let n = &nodes[idx];
-    metric_dist(metric, dot(q.vec, &n.vector), q.norm, n.norm)
+    guarded_dist(metric, q.vec, q.norm, &n.vector, n.norm)
 }
 
 /// Distance between two stored nodes — one dot (used by pruning).
 fn dist_nn(nodes: &[Node], metric: Metric, a: usize, b: usize) -> f32 {
-    metric_dist(
+    guarded_dist(
         metric,
-        dot(&nodes[a].vector, &nodes[b].vector),
+        &nodes[a].vector,
         nodes[a].norm,
+        &nodes[b].vector,
         nodes[b].norm,
     )
 }
@@ -190,7 +209,7 @@ impl HnswIndex {
             entry: None,
             top_layer: 0,
             rng: params.seed,
-            id_to_idx: HashMap::new(),
+            id_to_idx: AHashMap::new(),
             scratch: Scratch::default(),
         }
     }
@@ -198,8 +217,37 @@ impl HnswIndex {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         let mut idx: HnswIndex = postcard::from_bytes(&bytes).map_err(backend)?;
+        if !idx.is_wellformed() {
+            return Err(Error::Corrupt(
+                "hnsw sidecar violates graph invariants".into(),
+            ));
+        }
         idx.reindex();
         Ok(idx)
+    }
+
+    /// Whether the graph upholds the invariants search/insert index by without
+    /// bounds checks: every adjacency entry points to an existing node that is
+    /// present on that layer, and `entry`/`top_layer` agree with the entry
+    /// node. Live indexes hold these by construction; deserialized bytes are
+    /// untrusted (a corrupt or foreign sidecar decodes into arbitrary
+    /// indices, and searching such a graph panics), so loaders reject a
+    /// malformed graph and let the caller rebuild from KV.
+    pub(crate) fn is_wellformed(&self) -> bool {
+        if let Some(e) = self.entry
+            && self
+                .nodes
+                .get(e)
+                .is_none_or(|n| n.layers.len() <= self.top_layer)
+        {
+            return false;
+        }
+        self.nodes.iter().all(|n| {
+            n.layers.iter().enumerate().all(|(l, list)| {
+                list.iter()
+                    .all(|&e| self.nodes.get(e).is_some_and(|t| t.layers.len() > l))
+            })
+        })
     }
 
     /// Rebuild the live-id lookup (`id_to_idx`) from `nodes`. Needed after any
@@ -304,6 +352,51 @@ impl HnswIndex {
         self.top_layer = top;
         self.reindex();
         Ok(())
+    }
+
+    /// [`search`](VectorIndex::search) with the layer-0 beam width chosen by
+    /// the caller: `search` applies the `ef_search`/`k` clamp and delegates
+    /// here. Separate so the `measure_ef_*` sweep tests can measure raw beam
+    /// widths the clamp would otherwise floor away.
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&dyn IdFilter>,
+        ef: usize,
+    ) -> Result<Vec<Hit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(entry) = self.entry else {
+            return Ok(Vec::new());
+        };
+
+        let q = Query {
+            vec: query,
+            norm: dot(query, query).sqrt(),
+        };
+        let mut scratch = Scratch::default();
+
+        let mut ep = entry;
+        let mut lc = self.top_layer;
+        while lc > 0 {
+            let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], 1, lc, &mut scratch);
+            if let Some(&(_, nearest)) = w.first() {
+                ep = nearest;
+            }
+            lc -= 1;
+        }
+
+        let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
+
+        let hits = top_k(
+            w.into_iter()
+                .map(|(d, i)| (self.nodes[i].id, d))
+                .filter(|(id, _)| filter.is_none_or(|f| f.contains(*id))),
+            k,
+        );
+        Ok(hits)
     }
 
     pub fn len(&self) -> usize {
@@ -448,15 +541,16 @@ struct BuildMeta {
 /// Query→node distance during the parallel build (reads immutable `meta`).
 fn dist_bm_q(meta: &[BuildMeta], metric: Metric, q: Query<'_>, idx: usize) -> f32 {
     let n = &meta[idx];
-    metric_dist(metric, dot(q.vec, &n.vector), q.norm, n.norm)
+    guarded_dist(metric, q.vec, q.norm, &n.vector, n.norm)
 }
 
 /// Node→node distance during the parallel build (reads immutable `meta`).
 fn dist_bm(meta: &[BuildMeta], metric: Metric, a: usize, b: usize) -> f32 {
-    metric_dist(
+    guarded_dist(
         metric,
-        dot(&meta[a].vector, &meta[b].vector),
+        &meta[a].vector,
         meta[a].norm,
+        &meta[b].vector,
         meta[b].norm,
     )
 }
@@ -720,45 +814,21 @@ impl VectorIndex for HnswIndex {
     }
 
     fn search(&self, query: &[f32], k: usize, filter: Option<&dyn IdFilter>) -> Result<Vec<Hit>> {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(entry) = self.entry else {
-            return Ok(Vec::new());
-        };
-
-        let q = Query {
-            vec: query,
-            norm: dot(query, query).sqrt(),
-        };
-        let mut scratch = Scratch::default();
-
-        let mut ep = entry;
-        let mut lc = self.top_layer;
-        while lc > 0 {
-            let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], 1, lc, &mut scratch);
-            if let Some(&(_, nearest)) = w.first() {
-                ep = nearest;
-            }
-            lc -= 1;
-        }
-
         // A restrictive filter needs a wider beam to surface k matches; the
         // KV-backed brute-force path (small frontiers) is the exact fallback.
+        //
+        // Unfiltered, the beam still needs headroom over k: at ef = k the deep
+        // ranks sit at the beam's edge and their recall drops. The 2× floor is
+        // the knee of the recall-vs-latency curve measured by the tests'
+        // `measure_ef_multiplier_sweep` (weak-graph fixture, k=100: tail
+        // recall 0.74 at ef=k vs 0.92 at ef=2k; past 2× each +50% ef buys
+        // ≲0.03 recall).
         let ef = if filter.is_some() {
             self.params.ef_search.max(k * 8)
         } else {
-            self.params.ef_search.max(k)
+            self.params.ef_search.max(k * 2)
         };
-        let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
-
-        let hits = top_k(
-            w.into_iter()
-                .map(|(d, i)| (self.nodes[i].id, d))
-                .filter(|(id, _)| filter.is_none_or(|f| f.contains(*id))),
-            k,
-        );
-        Ok(hits)
+        self.search_with_ef(query, k, filter, ef)
     }
 
     fn persist(&self, path: &Path) -> Result<()> {
@@ -966,6 +1036,54 @@ mod tests {
         assert!(hits.iter().all(|h| allow.contains(&h.id)));
     }
 
+    /// Soft-schema totality: vectors of the wrong dimension insert and search
+    /// without panicking (debug) or out-of-bounds SIMD reads (release), and
+    /// rank at `+∞` so they never displace well-formed matches.
+    #[test]
+    fn mismatched_dimensions_rank_at_infinity_not_ub() {
+        let dim = 8;
+        let mut g = Gen(77);
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        for id in 0..50u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        // Strays from "the wrong model" — wider and narrower both.
+        idx.insert(100, &g.vec(dim * 2)).unwrap();
+        idx.insert(101, &g.vec(dim / 2)).unwrap();
+
+        for _ in 0..10 {
+            let hits = idx.search(&g.vec(dim), 10, None).unwrap();
+            assert_eq!(hits.len(), 10);
+            assert!(
+                hits.iter().all(|h| h.id < 50 && h.distance.is_finite()),
+                "mismatched-dimension nodes must never outrank well-formed ones"
+            );
+        }
+
+        // A wrong-dimension query is equally total: no panic, and everything
+        // it returns is ranked at +∞ (callers filter by score).
+        let hits = idx.search(&g.vec(dim * 4), 5, None).unwrap();
+        assert!(hits.iter().all(|h| h.distance == f32::INFINITY));
+    }
+
+    /// The parallel build goes through its own distance kernels (`dist_bm*`);
+    /// a mismatched vector in the batch must be as harmless there as in the
+    /// sequential path.
+    #[test]
+    fn parallel_build_tolerates_mismatched_dimensions() {
+        let dim = 8;
+        let count = 2500u64; // above PARALLEL_MIN → actually threads
+        let mut g = Gen(88);
+        let mut items: Vec<(u64, Vec<f32>)> = (0..count).map(|id| (id, g.vec(dim))).collect();
+        items[1234].1 = g.vec(dim * 2);
+
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        idx.build_parallel(&items).unwrap();
+        let hits = idx.search(&g.vec(dim), 10, None).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| h.id != 1234 && h.distance.is_finite()));
+    }
+
     #[test]
     fn empty_and_upsert() {
         let mut idx = HnswIndex::new(Metric::L2);
@@ -976,6 +1094,247 @@ mod tests {
         assert_eq!(idx.len(), 2);
         let hits = idx.search(&[9.0, 9.0], 2, None).unwrap();
         assert_eq!(hits.len(), 2); // both near the query now
+    }
+
+    /// Mean recall of one ground-truth rank slice (`lo..hi`, 0-based) within
+    /// the ids `search` returned, averaged over the query set.
+    fn slice_recall(
+        hnsw: &HnswIndex,
+        exact: &BruteForceIndex,
+        queries: &[Vec<f32>],
+        k: usize,
+        lo: usize,
+        hi: usize,
+    ) -> f64 {
+        let mut total = 0.0;
+        for q in queries {
+            let got: Vec<u64> = hnsw
+                .search(q, k, None)
+                .unwrap()
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            let truth: Vec<u64> = exact.search(q, k, None).unwrap()[lo..hi]
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            assert_eq!(got.len(), k, "clamp must still yield k results");
+            total += recall_at_k(&got, &truth);
+        }
+        total / queries.len() as f64
+    }
+
+    /// Guards `search`'s `ef = ef_search.max(2k)` clamp — the 2× headroom the
+    /// `measure_ef_multiplier_sweep` measurement picked. At `ef = k` the deep
+    /// ranks sit at the beam's edge and their recall collapses (tail 0.74,
+    /// trailing the head by 0.145 on this fixture); with the 2× floor the tail
+    /// holds 0.92, within 0.06 of the head. If the multiplier regresses to 1×,
+    /// both assertions fail.
+    ///
+    /// A weaker-than-default graph (`m=8`, `ef_construction=80`) and a
+    /// selective `k/N` (100 of 6000) keep the beam edge visible at a runtime a
+    /// unit test can afford — with default build params and small N, recall
+    /// saturates at ~1.0 regardless of the clamp.
+    #[test]
+    fn ef_clamp_headroom_keeps_tail_recall() {
+        let dim = 48;
+        let count = 6000u64;
+        let k = 100; // > ef_search (64) → the 2× clamp runs the beam at ef = 200
+        let mut params = HnswParams::new(8);
+        params.ef_construction = 80;
+        let mut vg = Gen(0x5EED_BEA3_0000_0001);
+        let mut hnsw = HnswIndex::with_params(Metric::Cosine, params);
+        let mut exact = BruteForceIndex::new(Metric::Cosine);
+        for id in 0..count {
+            let v = vg.vec(dim);
+            hnsw.insert(id, &v).unwrap();
+            exact.insert(id, &v).unwrap();
+        }
+        let queries: Vec<Vec<f32>> = (0..40).map(|_| vg.vec(dim)).collect();
+
+        let head = slice_recall(&hnsw, &exact, &queries, k, 0, 20);
+        let tail = slice_recall(&hnsw, &exact, &queries, k, 80, 100);
+        eprintln!("clamped ef=2k: head(1-20) {head:.3}, tail(81-100) {tail:.3}");
+
+        assert!(
+            tail >= 0.88,
+            "tail(81-100) recall {tail:.3} below 0.88 — did the ef clamp lose its 2x headroom?"
+        );
+        assert!(
+            head - tail <= 0.10,
+            "tail(81-100) recall {tail:.3} trails head(1-20) {head:.3} by more than 0.10"
+        );
+    }
+
+    /// Print overall/tail recall@`k` and mean query latency for each raw
+    /// layer-0 beam width in `efs` — the measurement loop behind the
+    /// `measure_ef_*` sweeps. Calls `search_with_ef` directly so the sweep can
+    /// observe beams narrower than the `search` clamp's `2k` floor.
+    fn sweep_ef(
+        hnsw: &HnswIndex,
+        exact: &BruteForceIndex,
+        queries: &[Vec<f32>],
+        k: usize,
+        efs: &[usize],
+    ) {
+        use std::time::Instant;
+        let truths: Vec<Vec<u64>> = queries
+            .iter()
+            .map(|q| {
+                exact
+                    .search(q, k, None)
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.id)
+                    .collect()
+            })
+            .collect();
+        eprintln!("ef      overall@{k}  tail       mean query");
+        for &ef in efs {
+            let t = Instant::now();
+            let got: Vec<Vec<u64>> = queries
+                .iter()
+                .map(|q| {
+                    hnsw.search_with_ef(q, k, None, ef)
+                        .unwrap()
+                        .iter()
+                        .map(|h| h.id)
+                        .collect()
+                })
+                .collect();
+            let per_query = t.elapsed() / queries.len() as u32;
+            let mean = |lo: usize| {
+                truths
+                    .iter()
+                    .zip(&got)
+                    .map(|(truth, ids)| recall_at_k(ids, &truth[lo..]))
+                    .sum::<f64>()
+                    / queries.len() as f64
+            };
+            let (overall, tail) = (mean(0), mean(k * 8 / 10));
+            eprintln!("{ef:<7} {overall:<12.3} {tail:<10.3} {per_query:?}");
+        }
+    }
+
+    /// Sweep the layer-0 beam width to pick the clamp's `ef`-vs-`k` multiplier:
+    /// the weak-graph fixture of [`ef_clamp_headroom_keeps_tail_recall`].
+    /// Re-run with `--run-ignored all --no-capture` when re-tuning the magic
+    /// number.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_ef_multiplier_sweep() {
+        let dim = 48;
+        let count = 6000u64;
+        let k = 100;
+        let mut params = HnswParams::new(8);
+        params.ef_construction = 80;
+        let mut vg = Gen(0x5EED_BEA3_0000_0001);
+        let mut hnsw = HnswIndex::with_params(Metric::Cosine, params);
+        let mut exact = BruteForceIndex::new(Metric::Cosine);
+        for id in 0..count {
+            let v = vg.vec(dim);
+            hnsw.insert(id, &v).unwrap();
+            exact.insert(id, &v).unwrap();
+        }
+        let queries: Vec<Vec<f32>> = (0..40).map(|_| vg.vec(dim)).collect();
+
+        sweep_ef(
+            &hnsw,
+            &exact,
+            &queries,
+            k,
+            &[100, 125, 150, 200, 250, 300, 400, 600],
+        );
+    }
+
+    /// The same sweep at production shape: 1024-dim vectors with the geometry
+    /// real embeddings have — points on a low-dimensional manifold (intrinsic
+    /// dim 32, mapped through a fixed random basis into 1024 dims, plus small
+    /// off-manifold noise), NOT uniform random 1024-dim data (which suffers
+    /// distance concentration and misrepresents recall). Default build params
+    /// (`m=16`, `ef_construction=200`) and the parallel builder, i.e. what
+    /// production runs; queries are drawn from the same manifold.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_ef_sweep_production_dim() {
+        let ambient = 1024;
+        let intrinsic = 32;
+        let noise = 0.05;
+        let count = 20_000u64;
+        let k = 100;
+
+        let mut vg = Gen(0x5EED_BEA3_0000_0002);
+        let basis: Vec<Vec<f32>> = (0..intrinsic).map(|_| vg.vec(ambient)).collect();
+        let embed = |g: &mut Gen| {
+            let mut v = vec![0.0f32; ambient];
+            for b in &basis {
+                let z = g.f32();
+                for (vi, bi) in v.iter_mut().zip(b) {
+                    *vi += z * bi;
+                }
+            }
+            for vi in v.iter_mut() {
+                *vi += noise * g.f32();
+            }
+            v
+        };
+
+        let items: Vec<(u64, Vec<f32>)> = (0..count).map(|id| (id, embed(&mut vg))).collect();
+        let queries: Vec<Vec<f32>> = (0..40).map(|_| embed(&mut vg)).collect();
+
+        let mut hnsw = HnswIndex::new(Metric::Cosine);
+        hnsw.build_parallel(&items).unwrap();
+        let mut exact = BruteForceIndex::new(Metric::Cosine);
+        for (id, v) in &items {
+            exact.insert(*id, v).unwrap();
+        }
+
+        sweep_ef(
+            &hnsw,
+            &exact,
+            &queries,
+            k,
+            &[100, 125, 150, 200, 250, 300, 400, 600],
+        );
+    }
+
+    /// A sidecar can decode structurally while its graph is nonsense —
+    /// dangling adjacency, a neighbor absent from the claimed layer, or a
+    /// bogus entry point would all panic at the first search if trusted.
+    /// `is_wellformed` gates both load paths (`HnswIndex::load` and the
+    /// registry sidecar), so a bad file means rebuild-from-KV, not a crash.
+    #[test]
+    fn malformed_graphs_are_rejected_on_load() {
+        let dim = 8;
+        let mut g = Gen(21);
+        let mut idx = HnswIndex::new(Metric::L2);
+        for id in 0..30u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        assert!(idx.is_wellformed());
+
+        let mut dangling = idx.clone();
+        dangling.nodes[3].layers[0].push(9999);
+        assert!(!dangling.is_wellformed());
+
+        let mut wrong_layer = idx.clone();
+        wrong_layer.nodes[0].layers.resize(50, Vec::new());
+        wrong_layer.nodes[0].layers[49] = vec![1]; // node 1 has no layer 49
+        assert!(!wrong_layer.is_wellformed());
+
+        let mut bad_entry = idx.clone();
+        bad_entry.entry = Some(1000);
+        assert!(!bad_entry.is_wellformed());
+
+        let mut tall_top = idx.clone();
+        tall_top.top_layer = 40; // the entry node has no layer 40
+        assert!(!tall_top.is_wellformed());
+
+        // The file boundary: a corrupted persisted index must fail load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.idx");
+        dangling.persist(&path).unwrap();
+        assert!(matches!(HnswIndex::load(&path), Err(Error::Corrupt(_))));
     }
 
     #[test]

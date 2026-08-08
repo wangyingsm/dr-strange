@@ -89,7 +89,8 @@ impl Metric {
 /// Dot product — the one hot numeric kernel. Every metric reduces to it (see
 /// `l2`/`cosine` below and [`super::hnsw`]'s cached-norm distances), so this is
 /// where SIMD pays off across build, search, and brute force alike. Dispatches
-/// to an AVX2+FMA path when the CPU supports it, else a scalar fallback.
+/// to an AVX2+FMA path when the CPU supports it (x86-64), to NEON on aarch64
+/// (baseline there — no runtime detection needed), else a scalar fallback.
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
@@ -99,6 +100,11 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { dot_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return dot_neon(a, b);
+    }
+    #[allow(unreachable_code)]
     dot_scalar(a, b)
 }
 
@@ -106,6 +112,17 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Four independent accumulators, not one: a single `acc = fmadd(…, acc)`
+/// chain serializes on FMA latency (~4 cycles) while the core can *issue* two
+/// FMAs per cycle, capping the loop at a fraction of peak. Four chains keep
+/// the FMA units fed; measured on 1024-dim vectors this is ~2.3× faster with
+/// the operand in L1 and ~1.5× on cache-cold graph traversal (i9-14900HX).
+/// Wider ISA is not the lever here — AVX-512 is absent on consumer Intel
+/// (fused off since 12th gen) — the dependency chain is.
+///
+/// Reassociating the sum changes rounding order vs. a single chain; that is
+/// fine because every caller (all metrics, HNSW and brute force alike) goes
+/// through this same kernel, so distances stay mutually consistent.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -113,12 +130,38 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let n = a.len();
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
-        let mut acc = _mm256_setzero_ps();
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
         let mut i = 0;
+        // Main loop: 32 floats per iteration, one FMA per accumulator.
+        while i + 32 <= n {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), a0);
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 8)),
+                _mm256_loadu_ps(pb.add(i + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 16)),
+                _mm256_loadu_ps(pb.add(i + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 24)),
+                _mm256_loadu_ps(pb.add(i + 24)),
+                a3,
+            );
+            i += 32;
+        }
+        // Fold the four chains, then mop up any full 8-lane blocks (dims not
+        // divisible by 32, e.g. 24 or 40).
+        let mut acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         while i + 8 <= n {
-            let va = _mm256_loadu_ps(pa.add(i));
-            let vb = _mm256_loadu_ps(pb.add(i));
-            acc = _mm256_fmadd_ps(va, vb, acc);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc);
             i += 8;
         }
         // Horizontal sum of the 8 lanes.
@@ -134,12 +177,175 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// NEON twin of [`dot_avx2`] for aarch64 (Apple Silicon, Graviton, …), where
+/// the scalar fallback would otherwise run one serial FMA per element. NEON is
+/// baseline on aarch64, so no runtime detection — the `cfg` alone gates it.
+///
+/// Same dependency-chain reasoning as the AVX2 kernel, scaled to the ISA:
+/// NEON registers are 128-bit (4×f32), and Apple M-series cores execute four
+/// FMA pipes at ~3–4 cycle latency, so it takes MORE independent chains to
+/// keep them fed, not fewer. Eight accumulators (32 floats/iteration, the same
+/// stride as the AVX2 path) is a reasonable static choice; final tuning wants
+/// a measurement on real hardware (the `simd_kernels_match_scalar_reference`
+/// test guards correctness on any aarch64 machine that runs the suite).
+#[cfg(target_arch = "aarch64")]
+fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline; the pointer arithmetic
+    // stays within `min(a.len(), b.len())` == n (caller guarantees equal
+    // lengths; `debug_assert` in `dot`).
+    unsafe {
+        let n = a.len();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        let mut i = 0;
+        // Main loop: 32 floats per iteration, one FMA per accumulator chain.
+        while i + 32 <= n {
+            for (j, chain) in acc.iter_mut().enumerate() {
+                let o = i + j * 4;
+                *chain = vfmaq_f32(*chain, vld1q_f32(pa.add(o)), vld1q_f32(pb.add(o)));
+            }
+            i += 32;
+        }
+        // Fold the chains, then mop up any full 4-lane blocks.
+        let mut folded = vaddq_f32(
+            vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])),
+            vaddq_f32(vaddq_f32(acc[4], acc[5]), vaddq_f32(acc[6], acc[7])),
+        );
+        while i + 4 <= n {
+            folded = vfmaq_f32(folded, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+            i += 4;
+        }
+        // Horizontal sum of the 4 lanes, then the scalar tail.
+        let mut sum = vaddvq_f32(folded);
+        while i < n {
+            sum += *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// L2 distance — like [`dot`], a hot kernel on the brute-force paths, so it
+/// gets the same SIMD treatment. Kept as a dedicated sum-of-squared-differences
+/// pass (subtract feeding FMA) rather than the `√(‖a‖²+‖b‖²−2·a·b)` identity:
+/// that would take three passes over memory instead of one and loses precision
+/// to cancellation exactly when vectors are close — the case that decides
+/// nearest-neighbor ranking.
 fn l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f32>()
-        .sqrt()
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: gated on runtime detection of avx2+fma just above.
+            return unsafe { l2sq_avx2(a, b) }.sqrt();
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return l2sq_neon(a, b).sqrt();
+    }
+    #[allow(unreachable_code)]
+    l2sq_scalar(a, b).sqrt()
+}
+
+fn l2sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+/// Sum of squared differences, AVX2+FMA — the same four-chain structure as
+/// [`dot_avx2`] (see there for the dependency-chain rationale), with a
+/// subtract feeding each FMA: `acc += d·d` where `d = a−b`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2sq_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = a.len();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
+        let mut i = 0;
+        while i + 32 <= n {
+            let d0 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+            let d1 = _mm256_sub_ps(
+                _mm256_loadu_ps(pa.add(i + 8)),
+                _mm256_loadu_ps(pb.add(i + 8)),
+            );
+            let d2 = _mm256_sub_ps(
+                _mm256_loadu_ps(pa.add(i + 16)),
+                _mm256_loadu_ps(pb.add(i + 16)),
+            );
+            let d3 = _mm256_sub_ps(
+                _mm256_loadu_ps(pa.add(i + 24)),
+                _mm256_loadu_ps(pb.add(i + 24)),
+            );
+            a0 = _mm256_fmadd_ps(d0, d0, a0);
+            a1 = _mm256_fmadd_ps(d1, d1, a1);
+            a2 = _mm256_fmadd_ps(d2, d2, a2);
+            a3 = _mm256_fmadd_ps(d3, d3, a3);
+            i += 32;
+        }
+        let mut acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        while i + 8 <= n {
+            let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+            acc = _mm256_fmadd_ps(d, d, acc);
+            i += 8;
+        }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let mut sum: f32 = lanes.iter().sum();
+        while i < n {
+            let d = *pa.add(i) - *pb.add(i);
+            sum += d * d;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// Sum of squared differences, NEON — the eight-chain structure of
+/// [`dot_neon`] (see there for the pipe/latency rationale) with a subtract
+/// feeding each FMA.
+#[cfg(target_arch = "aarch64")]
+fn l2sq_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline; pointer arithmetic stays
+    // within `n` (caller guarantees equal lengths; `debug_assert` in `l2`).
+    unsafe {
+        let n = a.len();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, chain) in acc.iter_mut().enumerate() {
+                let o = i + j * 4;
+                let d = vsubq_f32(vld1q_f32(pa.add(o)), vld1q_f32(pb.add(o)));
+                *chain = vfmaq_f32(*chain, d, d);
+            }
+            i += 32;
+        }
+        let mut folded = vaddq_f32(
+            vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])),
+            vaddq_f32(vaddq_f32(acc[4], acc[5]), vaddq_f32(acc[6], acc[7])),
+        );
+        while i + 4 <= n {
+            let d = vsubq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+            folded = vfmaq_f32(folded, d, d);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(folded);
+        while i < n {
+            let d = *pa.add(i) - *pb.add(i);
+            sum += d * d;
+            i += 1;
+        }
+        sum
+    }
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -312,6 +518,41 @@ mod tests {
         assert_eq!(Metric::L2.distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), 0.0);
         // dot distance is negated dot
         assert_eq!(Metric::Dot.distance(&[1.0, 2.0], &[3.0, 4.0]), -(3.0 + 8.0));
+    }
+
+    /// Pins the SIMD kernels (`dot`, `l2`) against their scalar references
+    /// across dimensions that exercise every phase: the 32-wide main loop, the
+    /// narrower mop-up, the scalar tail, and sub-SIMD inputs. Tolerance, not
+    /// equality: the multi-accumulator reassociation legitimately rounds
+    /// differently from the scalar left-fold. On aarch64 the same assertions
+    /// exercise the NEON kernels instead.
+    #[test]
+    fn simd_kernels_match_scalar_reference() {
+        let mut seed = 0xD07_0D07_0D07u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        for n in [0, 1, 3, 7, 8, 9, 24, 31, 32, 33, 40, 100, 1024, 1536] {
+            let a: Vec<f32> = (0..n).map(|_| rnd()).collect();
+            let b: Vec<f32> = (0..n).map(|_| rnd()).collect();
+            // Relative-ish bound: n float ops each rounding at ~1e-7.
+            let tol = 1e-5 * (n.max(1) as f32);
+
+            let (simd, scalar) = (dot(&a, &b), dot_scalar(&a, &b));
+            assert!(
+                (simd - scalar).abs() <= tol,
+                "dot dim {n}: simd {simd} vs scalar {scalar}"
+            );
+
+            let (simd, scalar) = (l2(&a, &b), l2sq_scalar(&a, &b).sqrt());
+            assert!(
+                (simd - scalar).abs() <= tol,
+                "l2 dim {n}: simd {simd} vs scalar {scalar}"
+            );
+        }
     }
 
     #[test]

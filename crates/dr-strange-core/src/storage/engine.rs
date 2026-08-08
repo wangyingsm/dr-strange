@@ -57,7 +57,8 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Stable MVCC snapshot; concurrent with other readers and the writer.
     fn begin_read(&self) -> Result<Self::ReadTxn<'_>>;
 
-    /// Single writer at a time is acceptable in v1 (arch/01 §6).
+    /// Single writer at a time now since we don't need distributed storage yet.
+    /// If we do in the future, maybe try raft + TiKV.
     fn begin_write(&self) -> Result<Self::WriteTxn<'_>>;
 }
 

@@ -14,8 +14,8 @@
 //! [`upsert`]: KeywordRegistry::upsert
 //! [`remove_node`]: KeywordRegistry::remove_node
 
+use ahash::AHashMap;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -51,9 +51,9 @@ struct DocEntry {
 struct Entry {
     language: Language,
     /// term → `[(node, term-frequency), …]`.
-    postings: HashMap<String, Vec<(u64, u32)>>,
+    postings: AHashMap<String, Vec<(u64, u32)>>,
     /// node → its length + terms.
-    docs: HashMap<u64, DocEntry>,
+    docs: AHashMap<u64, DocEntry>,
     /// Σ of every doc's token length (for `avgdl`).
     total_len: u64,
 }
@@ -62,8 +62,8 @@ impl Entry {
     fn new(language: Language) -> Self {
         Self {
             language,
-            postings: HashMap::new(),
-            docs: HashMap::new(),
+            postings: AHashMap::new(),
+            docs: AHashMap::new(),
             total_len: 0,
         }
     }
@@ -76,7 +76,7 @@ impl Entry {
             return;
         }
         let len = tokens.len() as u32;
-        let mut tf: HashMap<String, u32> = HashMap::new();
+        let mut tf: AHashMap<String, u32> = AHashMap::new();
         for t in tokens {
             *tf.entry(t).or_insert(0) += 1;
         }
@@ -118,7 +118,7 @@ impl Entry {
         qterms.dedup();
 
         let avgdl = self.total_len as f32 / n as f32;
-        let mut scores: HashMap<u64, f32> = HashMap::new();
+        let mut scores: AHashMap<u64, f32> = AHashMap::new();
         for term in &qterms {
             let Some(list) = self.postings.get(term) else {
                 continue;
@@ -151,7 +151,7 @@ impl Entry {
 /// [`Database`](crate::Database) wraps it in an `RwLock`.
 #[derive(Default)]
 pub struct KeywordRegistry {
-    entries: HashMap<IndexKey, Entry>,
+    entries: AHashMap<IndexKey, Entry>,
 }
 
 impl KeywordRegistry {
@@ -276,7 +276,7 @@ impl KeywordRegistry {
             entries: self
                 .entries
                 .iter()
-                .map(|((plane, label, property), e)| (*plane, label.clone(), property.clone(), e))
+                .map(|((plane, label, property), e)| (*plane, label.as_str(), property.as_str(), e))
                 .collect(),
         };
         let mut bytes = Vec::from(*SIDECAR_MAGIC);
@@ -316,7 +316,7 @@ impl KeywordRegistry {
 struct Sidecar<'a> {
     version: u32,
     seq: u64,
-    entries: Vec<(PlaneId, String, String, &'a Entry)>,
+    entries: Vec<(PlaneId, &'a str, &'a str, &'a Entry)>,
 }
 
 #[derive(Deserialize)]
