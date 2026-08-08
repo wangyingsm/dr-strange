@@ -4,21 +4,34 @@
 //! cost?). Run with `cargo bench`.
 //!
 //! Covered: insert throughput, point lookup, 1-hop and 2-hop expansion
-//! (memory vs redb), and vector search brute-force vs the declared HNSW index.
-//! External-DB comparison (Kùzu/Neo4j) is a separate, later effort.
+//! (in-memory vs on-disk), and vector search brute-force vs the declared HNSW
+//! index. External-DB comparison (Kùzu/Neo4j) is a separate, later effort.
 //!
-//! **Backend comparison.** The `redb`-labelled `Database` benches run against
-//! whichever on-disk backend the features select, so the native LSM engine is
-//! measured against redb by running the suite twice:
+//! **Backend comparison.** The `Database::open` benches run against whichever
+//! on-disk backend the features select, so their label is derived from that
+//! selection ([`DISK`]) rather than hard-coded — a hard-coded `"redb"` label
+//! silently reported native LSM numbers as redb ones once `native-backend`
+//! became the default. Run the suite twice to compare engines:
 //! ```text
-//!   cargo bench --bench graph                          # redb (baseline)
-//!   cargo bench --bench graph --features native-backend  # native (reports Δ)
+//!   cargo bench --bench graph                                               # native (default)
+//!   cargo bench --bench graph --no-default-features --features redb-backend # redb (legacy)
 //! ```
-//! Indicative (1 machine, data resident in the memtable): the native engine is
-//! ~3.5× faster on insert (40.4ms → 11.6ms / 1k nodes) and ~2.7× on point
-//! lookup (1.42µs → 518ns), and on par for 2-hop expansion. The SST read path
-//! (bloom/block-cache) only engages past the flush threshold and isn't measured
-//! by this small-data suite.
+//! Because each backend labels its groups differently, criterion keeps a
+//! separate history per engine and its change percentages compare like with
+//! like, instead of straddling a backend switch.
+//!
+//! Indicative (1 machine, pinned to P-cores, data resident in the memtable):
+//! native beats redb ~3.4× on insert (38.3ms → 11.2ms / 1k nodes) and ~2.6× on
+//! point lookup (1.10µs → 427ns), and is on par for 1-hop and 2-hop expansion.
+//! The SST read path (bloom/block-cache) only engages past the flush threshold
+//! and isn't measured by this small-data suite.
+//!
+//! The `memory` groups and both vector groups use [`Database::in_memory`] and
+//! are therefore backend-independent — they run identically in both builds,
+//! which makes them a free noise gauge. Back-to-back runs of that identical
+//! code move by ±5–10% here, and criterion reports some of that drift as a
+//! significant "improved"/"regressed" verdict, so treat single-digit-percent
+//! changes in this suite as noise unless they reproduce across runs.
 
 use std::hint::black_box;
 
@@ -38,8 +51,19 @@ fn emb_props(v: Vec<f32>) -> Properties {
         .collect()
 }
 
-/// A fresh redb database in a temp dir (kept alive alongside the handle).
-fn open_redb() -> (Database, TempDir) {
+/// Name of the on-disk backend compiled into this build, used to label every
+/// `Database::open` bench. Mirrors `Database::open`'s own cfg precedence:
+/// `native-backend` wins when both features are on. Enabling neither backend
+/// already fails to compile in `Database::open`, so no fallback arm is needed
+/// here either.
+#[cfg(feature = "native-backend")]
+const DISK: &str = "native";
+#[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+const DISK: &str = "redb";
+
+/// A fresh on-disk database in a temp dir (kept alive alongside the handle),
+/// on whichever backend the features selected — see [`DISK`].
+fn open_disk() -> (Database, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("bench.drsg")).unwrap();
     (db, dir)
@@ -108,9 +132,9 @@ fn bench_insert(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
-    g.bench_function("redb", |b| {
+    g.bench_function(DISK, |b| {
         b.iter_batched(
-            open_redb,
+            open_disk,
             |(db, _dir)| insert_nodes(&db, 1000),
             BatchSize::SmallInput,
         )
@@ -122,10 +146,10 @@ fn bench_lookup(c: &mut Criterion) {
     let mut g = c.benchmark_group("point_lookup");
     let mem = Database::in_memory().unwrap();
     insert_nodes(&mem, 10_000);
-    let (redb, _dir) = open_redb();
-    insert_nodes(&redb, 10_000);
+    let (disk, _dir) = open_disk();
+    insert_nodes(&disk, 10_000);
 
-    for (name, db) in [("memory", &mem), ("redb", &redb)] {
+    for (name, db) in [("memory", &mem), (DISK, &disk)] {
         let plane = db.plane("startup").unwrap();
         g.bench_function(name, |b| {
             b.iter(|| black_box(plane.node(NodeId(5000)).unwrap()))
@@ -138,11 +162,11 @@ fn bench_expand(c: &mut Criterion) {
     // fanout 32 → 32 one-hop, 1024 two-hop neighbours.
     let mem = Database::in_memory().unwrap();
     let mem_root = build_expand_graph(&mem, 32);
-    let (redb, _dir) = open_redb();
-    let redb_root = build_expand_graph(&redb, 32);
+    let (disk, _dir) = open_disk();
+    let disk_root = build_expand_graph(&disk, 32);
 
     let mut one = c.benchmark_group("expand_1hop");
-    for (name, db, root) in [("memory", &mem, mem_root), ("redb", &redb, redb_root)] {
+    for (name, db, root) in [("memory", &mem, mem_root), (DISK, &disk, disk_root)] {
         let plane = db.plane("startup").unwrap();
         one.bench_function(name, |b| {
             b.iter(|| black_box(plane.neighbors(root, Dir::Out, None).unwrap().len()))
@@ -151,7 +175,7 @@ fn bench_expand(c: &mut Criterion) {
     one.finish();
 
     let mut two = c.benchmark_group("expand_2hop");
-    for (name, db, root) in [("memory", &mem, mem_root), ("redb", &redb, redb_root)] {
+    for (name, db, root) in [("memory", &mem, mem_root), (DISK, &disk, disk_root)] {
         let plane = db.plane("startup").unwrap();
         two.bench_function(name, |b| {
             b.iter(|| {
