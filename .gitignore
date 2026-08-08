@@ -10,3 +10,6 @@
 # Runtime logs from dr-strange-log (DRSG_LOG_DIR, default ./logs) — the server
 # writes ./logs relative to its cwd, so ignore the dir anywhere.
 logs/
+
+# CodeGraph's local symbol index — a machine-local cache rebuilt from source.
+.codegraph/
