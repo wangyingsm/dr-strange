@@ -335,8 +335,10 @@ pub fn is_true(v: &PropValue) -> bool {
     matches!(v, PropValue::Bool(true))
 }
 
-/// Total ordering used by comparisons and `Sort`. `None` for incomparable
-/// pairs (mismatched types, `Null`, `NaN`).
+/// Ordering used by filter comparisons (`<`, `<=`, …). `None` for
+/// incomparable pairs (mismatched types, `Null`, `NaN`) — a comparison
+/// against those is simply false, the SQL-flavored posture. `Sort` must NOT
+/// use this: see [`total_cmp`].
 pub fn partial_cmp(a: &PropValue, b: &PropValue) -> Option<std::cmp::Ordering> {
     use PropValue::*;
     match (a, b) {
@@ -347,6 +349,98 @@ pub fn partial_cmp(a: &PropValue, b: &PropValue) -> Option<std::cmp::Ordering> {
         (Bool(x), Bool(y)) => Some(x.cmp(y)),
         (Str(x), Str(y)) => Some(x.cmp(y)),
         _ => None,
+    }
+}
+
+/// A value's rank in the canonical sort order — mismatched types sort by
+/// type, in a fixed order (cf. SQLite), never "equal".
+fn type_rank(v: &PropValue) -> u8 {
+    use PropValue::*;
+    match v {
+        Null => 0,
+        Bool(_) => 1,
+        Int(_) | Float(_) => 2, // one numeric line, compared cross-type
+        Str(_) => 3,
+        Bytes(_) => 4,
+        Vector(_) => 5,
+        List(_) => 6,
+        Map(_) => 7,
+    }
+}
+
+/// Exact `i64` vs `f64` comparison on the IEEE total-order line. The naive
+/// `(x as f64).total_cmp(&y)` alone is not total: distinct ints beyond 2⁵³
+/// round to the same f64 and would all compare Equal to it while ordering
+/// among themselves — the intransitivity [`total_cmp`] exists to rule out.
+fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let rounded = (x as f64).total_cmp(&y);
+    if rounded != Ordering::Equal {
+        // Rounding moves x by less than one ulp, which cannot carry it across
+        // a *different* f64 — a strict f64 verdict is the true verdict. NaN
+        // lands here too (never Equal to the non-NaN rounded x).
+        return rounded;
+    }
+    // Rounded-equal ⇒ y is integer-valued; settle exactly in i64. The one
+    // value that saturates the cast is 2⁶³ itself, above every i64.
+    if y >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    x.cmp(&(y as i64))
+}
+
+/// The canonical **total** order over property values — what `Sort` uses.
+/// Unlike [`partial_cmp`] it never gives up: mismatched types order by
+/// [`type_rank`], `Null` first; Int/Float share one exactly-compared numeric
+/// line; floats follow IEEE `totalOrder` (NaN sorts past the infinities);
+/// sequences and maps compare lexicographically. A sort comparator must be
+/// genuinely total — `unwrap_or(Equal)` on the partial order is not (NaN
+/// "equal" to 1.0 and 2.0 while 1.0 < 2.0), and std's sort detects such
+/// inconsistency and panics.
+pub fn total_cmp(a: &PropValue, b: &PropValue) -> std::cmp::Ordering {
+    use PropValue::*;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Int(x), Int(y)) => x.cmp(y),
+        (Float(x), Float(y)) => x.total_cmp(y),
+        (Int(x), Float(y)) => cmp_int_float(*x, *y),
+        (Float(x), Int(y)) => cmp_int_float(*y, *x).reverse(),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Str(x), Str(y)) => x.cmp(y),
+        (Bytes(x), Bytes(y)) => x.cmp(y),
+        (Vector(x), Vector(y)) => {
+            for (p, q) in x.iter().zip(y) {
+                let ord = p.total_cmp(q);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (List(x), List(y)) => {
+            for (p, q) in x.iter().zip(y) {
+                let ord = total_cmp(p, q);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Map(x), Map(y)) => {
+            // BTreeMap iterates key-sorted: lexicographic over (key, value,
+            // description) is deterministic and total.
+            for ((ka, pa), (kb, pb)) in x.iter().zip(y) {
+                let ord = ka
+                    .cmp(kb)
+                    .then_with(|| total_cmp(&pa.value, &pb.value))
+                    .then_with(|| pa.description.cmp(&pb.description));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        _ => type_rank(a).cmp(&type_rank(b)),
     }
 }
 
@@ -432,6 +526,73 @@ mod tests {
 
     fn b(expr: &Expr, n: &NodeRecord) -> bool {
         is_true(&ev(expr, Some(n)))
+    }
+
+    /// `total_cmp` must be a genuine total order — std's sort panics on a
+    /// comparator that isn't. Verified the brute-force way: antisymmetry and
+    /// transitivity over every pair/triple of a value set chosen to hit the
+    /// past failure modes (NaN, mixed types, ints past 2⁵³ that round to the
+    /// same f64, negative NaN, nested values).
+    #[test]
+    fn total_cmp_is_a_total_order() {
+        use std::cmp::Ordering;
+        let vals = [
+            PropValue::Null,
+            PropValue::Bool(false),
+            PropValue::Bool(true),
+            PropValue::Int(i64::MIN),
+            PropValue::Int(-1),
+            PropValue::Int(0),
+            PropValue::Int(9_007_199_254_740_992), // 2^53
+            PropValue::Int(9_007_199_254_740_993), // 2^53+1: rounds to 2^53
+            PropValue::Int(i64::MAX),
+            PropValue::Float(f64::NEG_INFINITY),
+            PropValue::Float(-f64::NAN),
+            PropValue::Float(-0.0),
+            PropValue::Float(0.0),
+            PropValue::Float(1.5),
+            PropValue::Float(9_007_199_254_740_992.0), // == 2^53
+            PropValue::Float(9.3e18),                  // > i64::MAX, saturating-cast territory
+            PropValue::Float(f64::INFINITY),
+            PropValue::Float(f64::NAN),
+            PropValue::Str("a".into()),
+            PropValue::Str("b".into()),
+            PropValue::Bytes(vec![1]),
+            PropValue::Vector(vec![f32::NAN, 1.0]),
+            PropValue::List(vec![PropValue::Int(1)]),
+            PropValue::List(vec![PropValue::Int(1), PropValue::Null]),
+        ];
+        for a in &vals {
+            assert_eq!(total_cmp(a, a), Ordering::Equal);
+            for b in &vals {
+                assert_eq!(total_cmp(a, b), total_cmp(b, a).reverse());
+                for c in &vals {
+                    // transitivity: a<=b and b<=c ⇒ a<=c
+                    if total_cmp(a, b) != Ordering::Greater && total_cmp(b, c) != Ordering::Greater
+                    {
+                        assert_ne!(
+                            total_cmp(a, c),
+                            Ordering::Greater,
+                            "intransitive: {a:?} <= {b:?} <= {c:?} but {a:?} > {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 2⁵³ trap concretely: both big ints round to the same f64, so a
+    /// rounded comparison would call each Equal to it — while the ints order
+    /// among themselves. The exact comparison keeps all three consistent.
+    #[test]
+    fn total_cmp_is_exact_past_f64_precision() {
+        use std::cmp::Ordering;
+        let f = PropValue::Float(9_007_199_254_740_992.0);
+        let lo = PropValue::Int(9_007_199_254_740_992);
+        let hi = PropValue::Int(9_007_199_254_740_993);
+        assert_eq!(total_cmp(&lo, &f), Ordering::Equal);
+        assert_eq!(total_cmp(&hi, &f), Ordering::Greater);
+        assert_eq!(total_cmp(&lo, &hi), Ordering::Less);
     }
 
     #[test]
