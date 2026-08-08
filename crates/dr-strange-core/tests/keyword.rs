@@ -106,6 +106,53 @@ fn writes_after_declaration_stay_coherent() {
     );
 }
 
+/// Chinese end-to-end: jieba segmentation at index AND query time, through
+/// declaration, search, relevance ranking, and sidecar reopen. Chinese text
+/// has no spaces — without segmentation the split-based analyzer indexes a
+/// whole clause as one term and every sub-phrase query misses.
+#[test]
+fn chinese_index_segments_and_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("graph.drsg");
+    let (dense, other);
+    {
+        let db = Database::open(&path).unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        dense = txn
+            .create_node(&["Doc"], body("图数据库存储节点与边，图查询遍历图结构"))
+            .unwrap();
+        other = txn
+            .create_node(&["Doc"], body("向量检索按相似度排序结果"))
+            .unwrap();
+        txn.commit().unwrap();
+        plane
+            .ensure_keyword_index("Doc", "body", Language::Chinese)
+            .unwrap();
+
+        let hits = plane.keyword_search("Doc", "body", "图数据库", 5);
+        assert_eq!(hits[0].0, dense, "the graph-dense doc ranks first");
+        // A sub-word of the compound must also hit (search-mode granularity).
+        assert!(
+            plane
+                .keyword_search("Doc", "body", "数据库", 5)
+                .iter()
+                .any(|(id, _)| *id == dense)
+        );
+        assert!(
+            plane
+                .keyword_search("Doc", "body", "向量", 5)
+                .iter()
+                .any(|(id, _)| *id == other)
+        );
+        // drop → sidecar written
+    }
+    let db = Database::open(&path).unwrap();
+    let plane = db.plane("startup").unwrap();
+    let hits = plane.keyword_search("Doc", "body", "图查询", 5);
+    assert_eq!(hits[0].0, dense, "segmentation intact after sidecar reload");
+}
+
 #[test]
 fn index_survives_reopen() {
     let dir = TempDir::new().unwrap();

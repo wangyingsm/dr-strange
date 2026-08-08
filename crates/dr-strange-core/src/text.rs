@@ -1,24 +1,32 @@
 //! Text analysis for the BM25 keyword index (ROADMAP §2).
 //!
 //! One [`Analyzer`] turns a property string into a token stream the inverted
-//! index and query both agree on: Unicode-aware lowercasing, split on
-//! non-alphanumerics, English stopword removal, then Snowball stemming so
-//! "databases" and "database" collapse to one term. The stemmer language is a
-//! per-index choice ([`Language`]), stored durably with the declaration.
+//! index and query both agree on. For the Snowball languages: Unicode-aware
+//! lowercasing, split on non-alphanumerics, English stopword removal, then
+//! stemming so "databases" and "database" collapse to one term. For
+//! [`Language::Chinese`]: jieba word segmentation in search mode (there are
+//! no spaces to split on, and `char::is_alphanumeric` is true for Han
+//! ideographs — the split-based pipeline would index whole clauses as single
+//! terms), a compact stopword list, no stemming. The language is a per-index
+//! choice, stored durably with the declaration.
 //!
 //! The [`Language`] tag byte is stable on disk — append new variants, never
-//! renumber — so a declaration written by an older build still decodes.
+//! renumber — so a declaration written by an older build still decodes. The
+//! serde variant order is wire format for the same reason (postcard encodes
+//! the variant index).
 
 use ahash::AHashSet;
 use std::sync::OnceLock;
 
+use jieba_rs::Jieba;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Snowball stemmer language for a keyword index. English is the default; the
-/// set mirrors what `rust-stemmers` ships.
+/// Analysis language for a keyword index. English is the default; the
+/// Snowball set mirrors what `rust-stemmers` ships, and Chinese analyzes by
+/// jieba segmentation instead of stemming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Language {
     #[default]
@@ -40,12 +48,15 @@ pub enum Language {
     Swedish,
     Tamil,
     Turkish,
+    // ⚠ Append-only (tag byte + serde variant index are both on-disk).
+    Chinese,
 }
 
 impl Language {
-    /// The Snowball algorithm backing this language.
-    pub fn algorithm(self) -> Algorithm {
-        match self {
+    /// The Snowball algorithm backing this language — `None` for Chinese,
+    /// which segments instead of stemming.
+    pub fn algorithm(self) -> Option<Algorithm> {
+        Some(match self {
             Language::Arabic => Algorithm::Arabic,
             Language::Danish => Algorithm::Danish,
             Language::Dutch => Algorithm::Dutch,
@@ -64,7 +75,8 @@ impl Language {
             Language::Swedish => Algorithm::Swedish,
             Language::Tamil => Algorithm::Tamil,
             Language::Turkish => Algorithm::Turkish,
-        }
+            Language::Chinese => return None,
+        })
     }
 
     /// Stable on-disk tag. **Append-only** — never renumber existing variants.
@@ -88,6 +100,7 @@ impl Language {
             Language::Swedish => 15,
             Language::Tamil => 16,
             Language::Turkish => 17,
+            Language::Chinese => 18,
         }
     }
 
@@ -111,6 +124,7 @@ impl Language {
             15 => Language::Swedish,
             16 => Language::Tamil,
             17 => Language::Turkish,
+            18 => Language::Chinese,
             _ => return None,
         })
     }
@@ -139,6 +153,7 @@ impl std::str::FromStr for Language {
             "swedish" | "sv" => Language::Swedish,
             "tamil" | "ta" => Language::Tamil,
             "turkish" | "tr" => Language::Turkish,
+            "chinese" | "zh" | "zh-cn" | "zh-tw" => Language::Chinese,
             other => {
                 return Err(Error::InvalidArgument(format!(
                     "unknown language '{other}'"
@@ -148,18 +163,27 @@ impl std::str::FromStr for Language {
     }
 }
 
+/// The process-wide jieba segmenter. Built on first Chinese analysis — the
+/// embedded dictionary takes real time and memory to load, so it is shared,
+/// never per-analyzer.
+fn jieba() -> &'static Jieba {
+    static JIEBA: OnceLock<Jieba> = OnceLock::new();
+    JIEBA.get_or_init(Jieba::new)
+}
+
 /// Turns text into index/query terms for one language. Cheap to build; hold one
 /// per (build or search) call rather than per token.
 pub struct Analyzer {
     language: Language,
-    stemmer: Stemmer,
+    /// `None` for Chinese, which segments instead of stemming.
+    stemmer: Option<Stemmer>,
 }
 
 impl Analyzer {
     pub fn new(language: Language) -> Self {
         Self {
             language,
-            stemmer: Stemmer::create(language.algorithm()),
+            stemmer: language.algorithm().map(Stemmer::create),
         }
     }
 
@@ -167,10 +191,19 @@ impl Analyzer {
         self.language
     }
 
-    /// Lowercase → split on non-alphanumerics → drop stopwords (English only)
-    /// → stem. Returns the ordered term list (duplicates kept, so callers can
-    /// count term frequencies).
+    /// Returns the ordered term list (duplicates kept, so callers can count
+    /// term frequencies). Snowball languages: lowercase → split on
+    /// non-alphanumerics → drop stopwords (English only) → stem. Chinese:
+    /// jieba search-mode segmentation → lowercase (for embedded Latin) →
+    /// drop punctuation/whitespace tokens and Chinese stopwords, unstemmed.
     pub fn analyze(&self, text: &str) -> Vec<String> {
+        match &self.stemmer {
+            Some(stemmer) => self.analyze_stemmed(text, stemmer),
+            None => analyze_chinese(text),
+        }
+    }
+
+    fn analyze_stemmed(&self, text: &str, stemmer: &Stemmer) -> Vec<String> {
         let mut out = Vec::new();
         for raw in text.split(|c: char| !c.is_alphanumeric()) {
             if raw.is_empty() {
@@ -180,7 +213,7 @@ impl Analyzer {
             if self.is_stopword(&lower) {
                 continue;
             }
-            let term = self.stemmer.stem(&lower);
+            let term = stemmer.stem(&lower);
             if !term.is_empty() {
                 out.push(term.into_owned());
             }
@@ -191,6 +224,20 @@ impl Analyzer {
     fn is_stopword(&self, token: &str) -> bool {
         matches!(self.language, Language::English) && english_stopwords().contains(token)
     }
+}
+
+/// Chinese analysis: jieba's search mode cuts words AND their sub-words
+/// (`数据库` also yields `数据`), the same granularity trade query engines
+/// index with — a query for the sub-word still hits the document. Mixed-in
+/// Latin/digit runs survive as lowercased whole tokens, unstemmed.
+fn analyze_chinese(text: &str) -> Vec<String> {
+    jieba()
+        .cut_for_search(text, true)
+        .into_iter()
+        .filter(|tok| tok.word.chars().any(char::is_alphanumeric))
+        .map(|tok| tok.word.to_lowercase())
+        .filter(|tok| !chinese_stopwords().contains(tok.as_str()))
+        .collect()
 }
 
 /// Common English stopwords, built once. BM25's IDF already downweights
@@ -329,6 +376,24 @@ fn english_stopwords() -> &'static AHashSet<&'static str> {
     })
 }
 
+/// Compact Chinese stopword list (function words and particles). As with the
+/// English list, BM25's IDF already downweights ubiquitous terms; this keeps
+/// the most common ones out of the postings entirely.
+fn chinese_stopwords() -> &'static AHashSet<&'static str> {
+    static SET: OnceLock<AHashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        [
+            "的", "了", "着", "是", "在", "和", "与", "或", "及", "就", "都", "而", "也", "又",
+            "但", "并", "被", "把", "让", "向", "从", "对", "为", "以", "于", "之", "这", "那",
+            "些", "个", "我", "你", "他", "她", "它", "我们", "你们", "他们", "什么", "怎么",
+            "这样", "那样", "一个", "没有", "不", "很", "会", "能", "要", "去", "来", "到", "吗",
+            "呢", "吧", "啊", "嘛",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +434,7 @@ mod tests {
             Language::French,
             Language::Turkish,
             Language::Russian,
+            Language::Chinese,
         ] {
             assert_eq!(Language::from_tag(lang.tag()), Some(lang));
         }
@@ -379,6 +445,54 @@ mod tests {
     fn language_parses_names_and_codes() {
         assert_eq!("en".parse::<Language>().unwrap(), Language::English);
         assert_eq!("French".parse::<Language>().unwrap(), Language::French);
+        assert_eq!("zh".parse::<Language>().unwrap(), Language::Chinese);
+        assert_eq!("Chinese".parse::<Language>().unwrap(), Language::Chinese);
         assert!("klingon".parse::<Language>().is_err());
+    }
+
+    /// Chinese is appended, never inserted: its tag byte AND its postcard
+    /// variant index are both on-disk formats. If either changes, existing
+    /// declarations and sidecars misdecode.
+    #[test]
+    fn chinese_wire_positions_are_pinned() {
+        assert_eq!(Language::Chinese.tag(), 18);
+        assert_eq!(
+            postcard::to_stdvec(&Language::Chinese).unwrap(),
+            vec![18],
+            "postcard variant index moved — Language variants were reordered"
+        );
+        assert_eq!(postcard::to_stdvec(&Language::Turkish).unwrap(), vec![17]);
+    }
+
+    #[test]
+    fn chinese_segments_words_not_clauses() {
+        let a = Analyzer::new(Language::Chinese);
+        // Without segmentation the whole clause is one is_alphanumeric run —
+        // a single useless token. jieba must cut real words.
+        let terms = a.analyze("我爱北京天安门");
+        assert!(terms.contains(&"北京".to_string()), "{terms:?}");
+        assert!(terms.contains(&"天安门".to_string()), "{terms:?}");
+        assert!(!terms.contains(&"我爱北京天安门".to_string()));
+        // "我" is a stopword; punctuation never becomes a token.
+        assert!(!terms.contains(&"我".to_string()));
+
+        // Mixed Latin survives lowercased, unstemmed.
+        let mixed = a.analyze("用 Rust 写的图数据库");
+        assert!(mixed.contains(&"rust".to_string()), "{mixed:?}");
+        assert!(mixed.contains(&"数据库".to_string()), "{mixed:?}");
+    }
+
+    /// Query and document must agree on terms — the invariant BM25 relies on.
+    #[test]
+    fn chinese_query_and_doc_share_terms() {
+        let a = Analyzer::new(Language::Chinese);
+        let doc = a.analyze("向量检索与关键词检索的混合排序");
+        for q in ["向量", "检索", "关键词"] {
+            let query = a.analyze(q);
+            assert!(
+                query.iter().any(|t| doc.contains(t)),
+                "query {q:?} → {query:?} shares no term with doc {doc:?}"
+            );
+        }
     }
 }
