@@ -9,7 +9,7 @@
 //! Planes (arch/09) are a data-model primitive and appear at every layer.
 
 pub mod api;
-pub mod cache;
+pub use api::cache;
 pub mod compute;
 pub mod error;
 pub mod index;
