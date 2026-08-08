@@ -158,11 +158,12 @@ pub fn node_vector(
     id: NodeId,
     property: &str,
 ) -> Result<Option<Vec<f32>>> {
-    let Some(node) = get_node(txn, plane, id)? else {
+    let Some(mut node) = get_node(txn, plane, id)? else {
         return Ok(None);
     };
-    Ok(match node.properties.get(property).map(|p| &p.value) {
-        Some(PropValue::Vector(v)) => Some(v.clone()),
+    // The record is owned and about to drop — move the value out, no clone.
+    Ok(match node.properties.remove(property).map(|p| p.value) {
+        Some(PropValue::Vector(v)) => Some(v),
         _ => None,
     })
 }
@@ -175,11 +176,12 @@ pub fn node_text(
     id: NodeId,
     property: &str,
 ) -> Result<Option<String>> {
-    let Some(node) = get_node(txn, plane, id)? else {
+    let Some(mut node) = get_node(txn, plane, id)? else {
         return Ok(None);
     };
-    Ok(match node.properties.get(property).map(|p| &p.value) {
-        Some(PropValue::Str(s)) => Some(s.clone()),
+    // As in [`node_vector`]: owned record, move the value out.
+    Ok(match node.properties.remove(property).map(|p| p.value) {
+        Some(PropValue::Str(s)) => Some(s),
         _ => None,
     })
 }
@@ -266,15 +268,20 @@ pub fn delete_node(txn: &mut dyn WriteTransaction, plane: PlaneId, id: NodeId) -
 
     // Cascade: collect every incident edge id from both adjacency tables
     // before deleting anything (delete_edge itself scans/mutates adjacency).
-    let mut incident = std::collections::BTreeSet::new();
+    let mut incident = Vec::new();
     for table in [TableId::AdjFwd, TableId::AdjRev] {
         let prefix = keys::adj_prefix(plane, id).to_vec();
         let end = prefix_successor(&prefix);
         for item in txn.range(table, &prefix, end.as_deref())? {
             let (key, _) = item?;
-            incident.insert(keys::parse_adj_key(&key)?.edge);
+            incident.push(keys::parse_adj_key(&key)?.edge);
         }
     }
+    // Only a self-loop yields a duplicate (its edge sits in both adjacency
+    // tables under this node), and `delete_edge` is idempotent anyway — the
+    // dedup just skips redundant work, so sort + dedup beats a per-insert set.
+    incident.sort_unstable();
+    incident.dedup();
     for edge in incident {
         delete_edge(txn, plane, edge)?;
     }

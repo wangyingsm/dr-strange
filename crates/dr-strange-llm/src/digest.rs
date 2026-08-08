@@ -95,11 +95,12 @@ impl CandidateSource for PlaneCandidates<'_> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(hits
             .into_iter()
-            .filter_map(|(n, _)| {
+            .filter_map(|(mut n, _)| {
                 let key = n.external_key?; // only keyed nodes are linkable
                 let label = n.labels.into_iter().next().unwrap_or_default();
-                let description = match n.properties.get("description").map(|p| &p.value) {
-                    Some(PropValue::Str(s)) => s.clone(),
+                // Owned record, about to drop — move the description out.
+                let description = match n.properties.remove("description").map(|p| p.value) {
+                    Some(PropValue::Str(s)) => s,
                     _ => String::new(),
                 };
                 Some(ExistingEntity {
@@ -118,14 +119,16 @@ impl CandidateSource for PlaneCandidates<'_> {
                 .plane
                 .node_by_key(key)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if let Some(n) = node {
+            if let Some(mut n) = node {
+                // Owned record, about to drop — move the description out.
+                let description = match n.properties.remove("description").map(|p| p.value) {
+                    Some(PropValue::Str(s)) => s,
+                    _ => String::new(),
+                };
                 found.push(ExistingEntity {
                     key: key.clone(),
                     label: n.labels.into_iter().next().unwrap_or_default(),
-                    description: match n.properties.get("description").map(|p| &p.value) {
-                        Some(PropValue::Str(s)) => s.clone(),
-                        _ => String::new(),
-                    },
+                    description,
                 });
             }
         }
