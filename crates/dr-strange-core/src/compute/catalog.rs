@@ -89,32 +89,34 @@ pub struct EdgeTypeStats {
 }
 
 impl EdgeTypeStats {
+    /// Where `(src, dst)` lives in the sorted `connections`, by key alone —
+    /// `(src, dst)` is unique in the list, so `count` never has to tie-break.
+    fn probe(&self, src: &str, dst: &str) -> std::result::Result<usize, usize> {
+        self.connections
+            .binary_search_by(|c| (c.src_label.as_str(), c.dst_label.as_str()).cmp(&(src, dst)))
+    }
+
     /// Increments the `src → dst` connection count by `by`, inserting it if
-    /// new. Keeps `connections` sorted for deterministic output.
+    /// new. `connections` stays sorted by construction — the canonical order
+    /// that makes two logically identical schemas serialize identically.
     fn add_connection(&mut self, src: &str, dst: &str, by: u64) {
-        match self
-            .connections
-            .iter_mut()
-            .find(|c| c.src_label == src && c.dst_label == dst)
-        {
-            Some(c) => c.count += by,
-            None => {
-                self.connections.push(Connection {
+        match self.probe(src, dst) {
+            Ok(i) => self.connections[i].count += by,
+            Err(i) => self.connections.insert(
+                i,
+                Connection {
                     src_label: src.to_string(),
                     dst_label: dst.to_string(),
                     count: by,
-                });
-                self.connections.sort();
-            }
+                },
+            ),
         }
     }
 
     /// The observed count of `src → dst` links (0 if never seen).
     pub fn connection(&self, src: &str, dst: &str) -> u64 {
-        self.connections
-            .iter()
-            .find(|c| c.src_label == src && c.dst_label == dst)
-            .map(|c| c.count)
+        self.probe(src, dst)
+            .map(|i| self.connections[i].count)
             .unwrap_or(0)
     }
 }
@@ -258,5 +260,57 @@ mod tests {
         // distinct keys accumulate independently
         a.merge(&one("U", "C", "D"));
         assert_eq!(a.edge_types.len(), 2);
+    }
+
+    /// `add_connection`'s binary-search insertion must keep `connections`
+    /// canonically sorted regardless of discovery order — the property the
+    /// old sort-after-push maintained — and increments must land on the
+    /// existing entry, never mint a duplicate.
+    #[test]
+    fn connections_stay_sorted_and_deduped_under_any_insert_order() {
+        let mut ets = EdgeTypeStats::default();
+        // Deliberately anti-sorted discovery order, with same-src ties.
+        for (s, d) in [("z", "a"), ("a", "z"), ("m", "m"), ("a", "a"), ("z", "z")] {
+            ets.add_connection(s, d, 1);
+        }
+        let order: Vec<(&str, &str)> = ets
+            .connections
+            .iter()
+            .map(|c| (c.src_label.as_str(), c.dst_label.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [("a", "a"), ("a", "z"), ("m", "m"), ("z", "a"), ("z", "z")]
+        );
+
+        // Re-adding every pair increments in place: same order, same length.
+        for (s, d) in [("a", "a"), ("z", "z"), ("m", "m"), ("a", "z"), ("z", "a")] {
+            ets.add_connection(s, d, 2);
+        }
+        assert_eq!(ets.connections.len(), 5);
+        assert!(ets.connections.iter().all(|c| c.count == 3));
+
+        // Lookups: every present pair via the same probe, absent pairs are 0 —
+        // including probes that would land before, between, and past the ends.
+        assert_eq!(ets.connection("a", "z"), 3);
+        assert_eq!(ets.connection("a", "0"), 0);
+        assert_eq!(ets.connection("m", "z"), 0);
+        assert_eq!(ets.connection("zz", "a"), 0);
+    }
+
+    /// The catalog's determinism contract: two logically identical schemas
+    /// built in different orders serialize identically.
+    #[test]
+    fn connection_order_is_canonical_across_build_orders() {
+        let pairs = [("b", "c"), ("a", "a"), ("c", "b"), ("b", "b")];
+        let mut fwd = EdgeTypeStats::default();
+        for (s, d) in pairs {
+            fwd.add_connection(s, d, 1);
+        }
+        let mut rev = EdgeTypeStats::default();
+        for (s, d) in pairs.iter().rev() {
+            rev.add_connection(s, d, 1);
+        }
+        assert_eq!(fwd.connections, rev.connections);
     }
 }
