@@ -119,8 +119,7 @@ pub fn pagerank<R: GraphReader + ?Sized>(
     for _ in 0..opts.max_iters {
         // Dangling mass is spread uniformly so total rank is conserved.
         let dangling: f64 = (0..n)
-            .filter(|&i| frame.out[i].is_empty())
-            .map(|i| rank[i])
+            .filter_map(|i| frame.out[i].is_empty().then_some(rank[i]))
             .sum();
         let base = teleport + opts.damping * dangling / nf;
         for v in next.iter_mut() {
