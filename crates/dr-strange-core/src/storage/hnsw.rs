@@ -18,7 +18,9 @@
 //! than panicking or feeding the unchecked SIMD kernel mismatched slices.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+
+use ahash::AHashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,7 +88,7 @@ pub struct HnswIndex {
     rng: u64,
     // Rebuilt on load, so skipped in the on-disk form.
     #[serde(skip)]
-    id_to_idx: HashMap<u64, usize>,
+    id_to_idx: AHashMap<u64, usize>,
     // Reusable search buffers (see [`Scratch`]); never serialized. Owned by
     // the index so a whole build reuses one allocation instead of allocating
     // a visited-set + heaps per `search_layer` call.
@@ -207,7 +209,7 @@ impl HnswIndex {
             entry: None,
             top_layer: 0,
             rng: params.seed,
-            id_to_idx: HashMap::new(),
+            id_to_idx: AHashMap::new(),
             scratch: Scratch::default(),
         }
     }

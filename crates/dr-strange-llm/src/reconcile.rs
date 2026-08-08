@@ -25,7 +25,9 @@
 //! settled): provenance properties are hidden from the schema the model reads,
 //! so the alias costs the read paths nothing and the original stays recoverable.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+
+use ahash::AHashMap;
 
 use anyhow::Result;
 use dr_strange_core::{PropDesc, PropValue, Properties};
@@ -245,7 +247,7 @@ pub(crate) fn note_original(props: &mut Properties, key: &str, what: &str, origi
 
 /// Count how often each name occurs, for the frequency tie-break.
 pub(crate) fn tally<'a>(names: impl Iterator<Item = &'a str>) -> BTreeMap<String, usize> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: AHashMap<&str, usize> = AHashMap::new();
     for n in names {
         *counts.entry(n).or_default() += 1;
     }

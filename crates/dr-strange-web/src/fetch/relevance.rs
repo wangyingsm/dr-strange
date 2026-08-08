@@ -19,7 +19,9 @@
 //! "Transformer" in a heading and the whole system keeps one notion of what a
 //! word is.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use ahash::AHashMap;
 
 use dr_strange_core::Analyzer;
 
@@ -55,7 +57,7 @@ impl Target {
     /// seed, and topic-only makes the common case — paste a URL, press go —
     /// require homework.
     pub fn new(analyzer: &Analyzer, root_text: &str, topic: Option<&str>) -> Self {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut counts: AHashMap<String, usize> = AHashMap::new();
         for t in analyzer.analyze(root_text) {
             *counts.entry(t).or_default() += 1;
         }
@@ -90,7 +92,7 @@ impl Target {
     pub fn score(&self, analyzer: &Analyzer, text: &str, avg_len: f32) -> f32 {
         let tokens = analyzer.analyze(text);
         let len = tokens.len() as f32;
-        let mut tf: HashMap<&str, f32> = HashMap::new();
+        let mut tf: AHashMap<&str, f32> = AHashMap::new();
         for t in &tokens {
             *tf.entry(t.as_str()).or_default() += 1.0;
         }

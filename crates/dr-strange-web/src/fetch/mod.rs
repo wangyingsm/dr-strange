@@ -17,7 +17,7 @@ mod html;
 mod relevance;
 mod robots;
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap, AHashSet};
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -170,13 +170,13 @@ pub fn fetch_with_progress(
     let ctx = Crawl {
         agent,
         opts,
-        robots: Mutex::new(HashMap::new()),
-        last_hit: Mutex::new(HashMap::new()),
+        robots: Mutex::new(AHashMap::new()),
+        last_hit: Mutex::new(AHashMap::new()),
         spent: AtomicUsize::new(0),
     };
 
     let mut out = Fetched::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: AHashSet<String> = AHashSet::new();
     seen.insert(normalize(&root_url));
 
     // The root is not a candidate — it is what the reader asked for, so it is
@@ -357,7 +357,7 @@ fn candidates(
     base: &Url,
     links: &[html::Link],
     depth: usize,
-    seen: &mut HashSet<String>,
+    seen: &mut AHashSet<String>,
 ) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
     for link in links {
@@ -453,8 +453,8 @@ struct Loaded {
 struct Crawl<'a> {
     agent: ureq::Agent,
     opts: &'a FetchOptions,
-    robots: Mutex<HashMap<String, Robots>>,
-    last_hit: Mutex<HashMap<String, Instant>>,
+    robots: Mutex<AHashMap<String, Robots>>,
+    last_hit: Mutex<AHashMap<String, Instant>>,
     spent: AtomicUsize,
 }
 
@@ -690,7 +690,7 @@ mod tests {
                 in_main: true,
             },
         ];
-        let mut seen = HashSet::new();
+        let mut seen = AHashSet::new();
         seen.insert(normalize(&base));
         let got = candidates(&base, &links, 1, &mut seen);
         let urls: Vec<&str> = got.iter().map(|c| c.url.as_str()).collect();

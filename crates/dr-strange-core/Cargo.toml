@@ -23,6 +23,7 @@ redb-backend = ["dep:redb"]
 native-backend = []
 
 [dependencies]
+ahash = { workspace = true, features = ["serde"] }
 # Cross-platform advisory file locking (flock / LockFileEx) for the native
 # backend's directory lock. `sync` only: the async wrappers pull in a runtime,
 # and the lock is taken once, on open.

@@ -869,8 +869,8 @@ pub fn import(
     let stats = txn.bulk_load(bnodes, Vec::new())?;
 
     // Maps from this batch's identifiers to the freshly-assigned node ids.
-    let mut old_to_new = std::collections::HashMap::new();
-    let mut key_to_new = std::collections::HashMap::new();
+    let mut old_to_new = ahash::AHashMap::new();
+    let mut key_to_new = ahash::AHashMap::new();
     for i in 0..n_nodes as usize {
         let id = NodeId(stats.node_start + i as u64);
         if let Some(o) = old_ids[i] {
@@ -927,8 +927,8 @@ fn parse_ref(obj: &serde_json::Map<String, Value>, prefix: &str) -> Result<Ref> 
 /// plane (a committed key, or a live node id).
 fn resolve(
     r: &Ref,
-    key_to_new: &std::collections::HashMap<String, NodeId>,
-    old_to_new: &std::collections::HashMap<u64, NodeId>,
+    key_to_new: &ahash::AHashMap<String, NodeId>,
+    old_to_new: &ahash::AHashMap<u64, NodeId>,
     p: &PlaneHandle,
 ) -> Result<NodeId> {
     match r {

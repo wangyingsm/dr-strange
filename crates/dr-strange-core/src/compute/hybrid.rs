@@ -14,7 +14,9 @@
 //! `decay^distance` — so a node near several strong hits gets boosted even if
 //! its own text/vector match is weak.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use ahash::AHashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -161,7 +163,7 @@ pub(crate) struct Channel {
 impl Channel {
     /// Normalize this channel's scores to `[0, 1]` with best = 1. When every
     /// score is equal (or there is a single hit) they are all equally best → 1.
-    fn normalized(&self) -> HashMap<NodeId, f32> {
+    fn normalized(&self) -> AHashMap<NodeId, f32> {
         let mut lo = f32::INFINITY;
         let mut hi = f32::NEG_INFINITY;
         for &(_, s) in &self.hits {
@@ -184,7 +186,7 @@ impl Channel {
             .collect()
     }
 
-    fn raw(&self) -> HashMap<NodeId, f32> {
+    fn raw(&self) -> AHashMap<NodeId, f32> {
         self.hits.iter().copied().collect()
     }
 }
@@ -211,14 +213,14 @@ pub(crate) fn fuse(
         nodes.extend(norm.keys().copied());
     }
 
-    let contrib = |norm: &Option<HashMap<NodeId, f32>>, w: f32, node: NodeId| -> f32 {
+    let contrib = |norm: &Option<AHashMap<NodeId, f32>>, w: f32, node: NodeId| -> f32 {
         norm.as_ref()
             .and_then(|m| m.get(&node))
             .copied()
             .unwrap_or(0.0)
             * w
     };
-    let raw = |m: &Option<HashMap<NodeId, f32>>, node: NodeId| -> Option<f32> {
+    let raw = |m: &Option<AHashMap<NodeId, f32>>, node: NodeId| -> Option<f32> {
         m.as_ref().and_then(|m| m.get(&node)).copied()
     };
 
@@ -270,7 +272,7 @@ pub(crate) fn graph_proximity<R: GraphReader + ?Sized>(
     hops: u32,
     decay: f32,
 ) -> Result<Vec<(NodeId, f32)>> {
-    let mut dist: HashMap<NodeId, u32> = HashMap::new();
+    let mut dist: AHashMap<NodeId, u32> = AHashMap::new();
     for &s in seeds {
         dist.entry(s).or_insert(0);
     }

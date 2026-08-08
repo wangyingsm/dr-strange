@@ -477,7 +477,11 @@ fn spread_of(vals: &[f64]) -> f64 {
         hi = hi.max(v);
     }
     let med = median_of(vals.to_vec());
-    if med > 0.0 { (hi - lo) / med * 100.0 } else { 0.0 }
+    if med > 0.0 {
+        (hi - lo) / med * 100.0
+    } else {
+        0.0
+    }
 }
 
 /// Run `repeat` measurement passes and aggregate: every reported metric is the

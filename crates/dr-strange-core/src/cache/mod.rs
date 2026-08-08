@@ -21,8 +21,8 @@
 mod store;
 pub(crate) use store::GraphCache;
 
+use ahash::AHashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -253,9 +253,9 @@ pub struct CachedReader<'a> {
     l2: Option<(&'a GraphCache, u64)>,
     // Per-query L1: fast intra-query hits and negative caching. Bound to this
     // reader's snapshot, dropped at query end.
-    nodes: RefCell<HashMap<NodeId, Option<Arc<NodeRecord>>>>,
-    edges: RefCell<HashMap<EdgeId, Option<Arc<EdgeRecord>>>>,
-    adjacency: RefCell<HashMap<AdjKey, Arc<[Neighbor]>>>,
+    nodes: RefCell<AHashMap<NodeId, Option<Arc<NodeRecord>>>>,
+    edges: RefCell<AHashMap<EdgeId, Option<Arc<EdgeRecord>>>>,
+    adjacency: RefCell<AHashMap<AdjKey, Arc<[Neighbor]>>>,
 }
 
 impl<'a> CachedReader<'a> {
@@ -317,9 +317,9 @@ impl<'a> CachedReader<'a> {
             registry,
             keywords: None,
             l2,
-            nodes: RefCell::new(HashMap::new()),
-            edges: RefCell::new(HashMap::new()),
-            adjacency: RefCell::new(HashMap::new()),
+            nodes: RefCell::new(AHashMap::new()),
+            edges: RefCell::new(AHashMap::new()),
+            adjacency: RefCell::new(AHashMap::new()),
         }
     }
 }

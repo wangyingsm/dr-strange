@@ -26,6 +26,10 @@ homepage = "https://github.com/wangyingsm/dr-strange"
 dr-strange-core = { path = "crates/dr-strange-core", default-features = false }
 dr-strange-log = { path = "crates/dr-strange-log" }
 dr-strange-parser = { path = "crates/dr-strange-parser" }
+# The workspace-standard hash map/set (fast keyed hashing, DoS-resistant via
+# per-process random seed): use ahash::{AHashMap, AHashSet} instead of std's
+# SipHash-backed collections everywhere.
+ahash = "0.8"
 # Process allocator for the BINARY crates only (never the libraries — the
 # allocator is a process-global choice the embedding application makes).
 mimalloc = "0.1"

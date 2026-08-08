@@ -18,7 +18,9 @@
 //! linked (not re-created) and relations to them are kept — the bulk loader
 //! resolves those keys against the plane.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+
+use ahash::{AHashMap, AHashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -346,7 +348,7 @@ pub fn digest(
     // Existing graph entities surfaced across all chunks (key → entity). Used
     // to (a) skip re-creating them as nodes and (b) treat them as valid
     // relation endpoints so new→existing edges survive.
-    let mut existing: HashMap<String, ExistingEntity> = HashMap::new();
+    let mut existing: AHashMap<String, ExistingEntity> = AHashMap::new();
     let mut report = DigestReport {
         chunks: chunks.len(),
         ..Default::default()
@@ -384,7 +386,7 @@ pub fn digest(
     // parallel extraction above.
     let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
     let mut edges: Vec<DigestEdge> = Vec::new();
-    let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
+    let mut seen_rel: AHashSet<(String, String, String)> = AHashSet::new();
     // Which chunk(s) produced each entity — stage 3 needs it to tell an entity
     // that has more to say elsewhere in the document from one that does not
     // (ROADMAP §8), and nothing else records it.
@@ -475,7 +477,7 @@ pub fn digest(
         }
         // Renaming can make two edges the same `(src, dst, ty)` triple; keep the
         // first in the existing deterministic order.
-        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        let mut seen: AHashSet<(String, String, String)> = AHashSet::new();
         let before = edges.len();
         edges.retain(|e| seen.insert((e.src.clone(), e.dst.clone(), e.ty.clone())));
         report.merged_relations = before - edges.len();
@@ -554,7 +556,7 @@ pub fn digest(
                     edge.dst = into.clone();
                 }
             }
-            let mut seen: HashSet<(String, String, String)> = HashSet::new();
+            let mut seen: AHashSet<(String, String, String)> = AHashSet::new();
             let before = edges.len();
             edges.retain(|e| {
                 e.src != e.dst && seen.insert((e.src.clone(), e.dst.clone(), e.ty.clone()))
@@ -724,7 +726,7 @@ pub fn digest(
     // an existing graph node (model hallucination) — otherwise the bulk load
     // would reject the batch. Edges to existing nodes are kept: the bulk
     // loader resolves those keys against the plane.
-    let mut valid: HashSet<&str> = nodes.iter().map(|n| n.key.as_str()).collect();
+    let mut valid: AHashSet<&str> = nodes.iter().map(|n| n.key.as_str()).collect();
     valid.extend(existing.keys().map(String::as_str));
     let before = edges.len();
     edges.retain(|e| valid.contains(e.src.as_str()) && valid.contains(e.dst.as_str()));
@@ -845,7 +847,7 @@ fn embed_text(n: &DigestNode) -> String {
 
 fn dedup(texts: &[String]) -> (Vec<String>, Vec<usize>) {
     let mut unique = Vec::new();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut seen: AHashMap<&str, usize> = AHashMap::new();
     let mut index = Vec::with_capacity(texts.len());
     for t in texts {
         let i = *seen.entry(t.as_str()).or_insert_with(|| {

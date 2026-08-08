@@ -11,7 +11,7 @@
 //! node plus the trail of `(edge, node)` hops taken to reach it. `Filter`
 //! and `Sort` address the current node.
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap, AHashSet};
 use std::rc::Rc;
 
 use crate::cache::GraphReader;
@@ -274,7 +274,7 @@ fn algo_rows(reader: &dyn GraphReader, label: Option<&str>, spec: &Algo) -> Resu
 /// community, scoring each node with a dense 0-based community index assigned
 /// in order of first appearance.
 fn grouped_rows(assignments: Vec<(NodeId, NodeId)>) -> Vec<Row> {
-    let mut index: HashMap<NodeId, usize> = HashMap::new();
+    let mut index: AHashMap<NodeId, usize> = AHashMap::new();
     let mut rows: Vec<(usize, NodeId)> = Vec::with_capacity(assignments.len());
     for (node, community) in assignments {
         let next = index.len();
@@ -362,7 +362,7 @@ fn apply_step<'r>(
         Step::Skip(n) => Box::new(iter.skip(*n as usize)),
         Step::Limit(n) => Box::new(iter.take(*n as usize)),
         Step::Distinct => {
-            let mut seen: HashSet<NodeId> = HashSet::new();
+            let mut seen: AHashSet<NodeId> = AHashSet::new();
             Box::new(iter.filter_map(move |rr| match rr {
                 Err(e) => Some(Err(e)),
                 Ok(row) => seen.insert(row.head).then_some(Ok(row)),
@@ -382,7 +382,7 @@ fn apply_step<'r>(
             let ranked = vector_top_k_rows(reader, &ids, property, query, *metric, *k as usize)?;
             // vector_top_k_rows makes fresh scored rows (no trail); re-attach
             // each winner's original trail so path info survives the rerank.
-            let mut by_head: std::collections::HashMap<NodeId, Row> =
+            let mut by_head: ahash::AHashMap<NodeId, Row> =
                 frontier.into_iter().map(|r| (r.head, r)).collect();
             let out: Vec<Result<Row>> = ranked
                 .into_iter()

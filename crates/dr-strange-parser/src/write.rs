@@ -8,7 +8,7 @@
 //! the ids, then apply the ops to each. A standalone `CREATE` just builds nodes
 //! and edges.
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 use dr_strange_core::{
     Dir, LogicalPlan, NodeId, PlaneHandle, PropDesc, PropValue, Properties, WriteTxn,
@@ -244,7 +244,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
 
     // Preload current labels for the targets (label SET/REMOVE is
     // read-modify-write; core `set_labels` replaces the whole set).
-    let mut labels: HashMap<u64, Vec<String>> = HashMap::new();
+    let mut labels: AHashMap<u64, Vec<String>> = AHashMap::new();
     if stmt.has_label_ops {
         for id in &ids {
             if let Some(n) = plane.node(*id).map_err(|e| e.to_string())? {
@@ -257,14 +257,14 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
     // Statement-scoped: keyed nodes upserted by MERGE, so a shared target across
     // matched rows resolves to one node (node_by_key can't see the uncommitted
     // create). Persists across ops and per-row loops.
-    let mut merged: HashMap<&str, NodeId> = HashMap::new();
+    let mut merged: AHashMap<&str, NodeId> = AHashMap::new();
 
     for op in &stmt.ops {
         match op {
             WriteOp::Create(paths) => match &stmt.binding {
                 // Standalone CREATE: build once; vars are scoped to it.
                 None => {
-                    let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                    let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                     for path in paths {
                         create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
                     }
@@ -273,7 +273,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 // variable pre-bound so `(a)` anchors to that node.
                 Some((bound, _)) => {
                     for id in &ids {
-                        let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                        let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                         vars.insert(bound.as_str(), *id);
                         for path in paths {
                             create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
@@ -284,7 +284,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
             WriteOp::Merge(m) => match &stmt.binding {
                 // Standalone MERGE: run once.
                 None => {
-                    let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                    let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                     merge_path(
                         plane,
                         &mut txn,
@@ -299,7 +299,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 // MERGE after MATCH: once per matched row, anchored to that node.
                 Some((bound, _)) => {
                     for id in &ids {
-                        let mut vars: HashMap<&str, NodeId> = HashMap::new();
+                        let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                         vars.insert(bound.as_str(), *id);
                         merge_path(
                             plane,
@@ -360,7 +360,7 @@ fn apply_set(
     txn: &mut WriteTxn<'_>,
     id: NodeId,
     it: &SetItem,
-    labels: &mut HashMap<u64, Vec<String>>,
+    labels: &mut AHashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(), String> {
@@ -394,7 +394,7 @@ fn apply_remove(
     txn: &mut WriteTxn<'_>,
     id: NodeId,
     it: &RemoveItem,
-    labels: &mut HashMap<u64, Vec<String>>,
+    labels: &mut AHashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
 ) -> Result<(), String> {
     match it {
@@ -425,9 +425,9 @@ fn merge_path<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     m: &'a MergeClause,
-    vars: &mut HashMap<&'a str, NodeId>,
-    merged: &mut HashMap<&'a str, NodeId>,
-    labels: &mut HashMap<u64, Vec<String>>,
+    vars: &mut AHashMap<&'a str, NodeId>,
+    merged: &mut AHashMap<&'a str, NodeId>,
+    labels: &mut AHashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(), String> {
@@ -466,9 +466,9 @@ fn upsert_merge_node<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
-    vars: &mut HashMap<&'a str, NodeId>,
-    merged: &mut HashMap<&'a str, NodeId>,
-    labels: &mut HashMap<u64, Vec<String>>,
+    vars: &mut AHashMap<&'a str, NodeId>,
+    merged: &mut AHashMap<&'a str, NodeId>,
+    labels: &mut AHashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(NodeId, bool), String> {
@@ -547,7 +547,7 @@ fn ensure_edge(
 fn get_or_create<'a>(
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
-    vars: &mut HashMap<&'a str, NodeId>,
+    vars: &mut AHashMap<&'a str, NodeId>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<NodeId, String> {
@@ -574,7 +574,7 @@ fn get_or_create<'a>(
 fn create_path<'a>(
     txn: &mut WriteTxn<'_>,
     path: &'a CreatePath,
-    vars: &mut HashMap<&'a str, NodeId>,
+    vars: &mut AHashMap<&'a str, NodeId>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(), String> {

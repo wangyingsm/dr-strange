@@ -9,7 +9,7 @@
 //! The [`Language`] tag byte is stable on disk — append new variants, never
 //! renumber — so a declaration written by an older build still decodes.
 
-use std::collections::HashSet;
+use ahash::AHashSet;
 use std::sync::OnceLock;
 
 use rust_stemmers::{Algorithm, Stemmer};
@@ -195,8 +195,8 @@ impl Analyzer {
 
 /// Common English stopwords, built once. BM25's IDF already downweights
 /// ubiquitous terms; this just keeps them out of the postings entirely.
-fn english_stopwords() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+fn english_stopwords() -> &'static AHashSet<&'static str> {
+    static SET: OnceLock<AHashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {
         [
             "a",
