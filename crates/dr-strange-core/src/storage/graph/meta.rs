@@ -13,20 +13,48 @@ use crate::types::{EdgeId, NodeId, PlaneId, Properties};
 /// v2 (M1): node records gained an inline `external_key` field
 /// (arch/01 §2 — `codec::NodeRecordRaw`).
 pub const FORMAT_VERSION: u32 = 2;
+
+/// Oldest on-disk format this build can open — versions in
+/// `MIN_SUPPORTED_VERSION..FORMAT_VERSION` are upgraded in place by the
+/// migration ladder in [`init`]. v1 never appeared in a public release
+/// (M0-internal only), so it has no upgrade path.
+pub const MIN_SUPPORTED_VERSION: u32 = 2;
+
 pub const DEFAULT_PLANE_NAME: &str = "startup";
 
 // ---- meta / init ----------------------------------------------------------
 
 /// First-open initialization; verifies magic/version on an existing database.
+///
+/// Version policy: a database *newer* than this build is refused (only a
+/// newer drsg knows that format); one older than [`MIN_SUPPORTED_VERSION`] is
+/// refused (no upgrade path); anything in between is migrated forward one
+/// version step at a time and re-stamped — atomically, since `init` runs
+/// inside the caller's write transaction, so a crash mid-migration leaves the
+/// old version intact.
 pub fn init(txn: &mut dyn WriteTransaction) -> Result<()> {
     match txn.get(TableId::Meta, keys::META_MAGIC)? {
         Some(magic) if magic == keys::MAGIC => {
             let version = get_u32(txn, keys::META_FORMAT_VERSION)?
                 .ok_or_else(|| Error::Corrupt("missing format version".into()))?;
-            if version != FORMAT_VERSION {
+            if version > FORMAT_VERSION {
                 return Err(Error::Corrupt(format!(
-                    "format version {version} not supported (expected {FORMAT_VERSION})"
+                    "database format v{version} is newer than this build supports \
+                     (v{FORMAT_VERSION}) — upgrade drsg to open it"
                 )));
+            }
+            if version < MIN_SUPPORTED_VERSION {
+                return Err(Error::Corrupt(format!(
+                    "database format v{version} predates the oldest supported \
+                     (v{MIN_SUPPORTED_VERSION}) and has no upgrade path"
+                )));
+            }
+            // The migration ladder: one step per historical version bump.
+            for from in version..FORMAT_VERSION {
+                migrate_step(txn, from)?;
+            }
+            if version != FORMAT_VERSION {
+                put_u32(txn, keys::META_FORMAT_VERSION, FORMAT_VERSION)?;
             }
             Ok(())
         }
@@ -52,6 +80,18 @@ pub fn init(txn: &mut dyn WriteTransaction) -> Result<()> {
             )
         }
     }
+}
+
+/// One rung of the migration ladder: bring the on-disk data from format
+/// `from` up to `from + 1`, inside the caller's write transaction.
+///
+/// No migrations exist yet (`MIN_SUPPORTED_VERSION == FORMAT_VERSION`); when
+/// `FORMAT_VERSION` bumps, turn the body into a `match from` with one arm per
+/// historical step, keeping this error as the wildcard for ladder gaps.
+fn migrate_step(_txn: &mut dyn WriteTransaction, from: u32) -> Result<()> {
+    Err(Error::Corrupt(format!(
+        "no migration step from format v{from} — gap in the migration ladder (bug)"
+    )))
 }
 
 pub(super) fn decode_u32(bytes: &[u8], what: &str) -> Result<u32> {
@@ -204,22 +244,7 @@ impl IdBatch {
     }
 }
 
-/// Batched node/edge id allocator (arch/01 §2 TODO): amortizes the
-/// meta-counter write across up to [`ID_BATCH_SIZE`] allocations instead of
-/// paying one write per node/edge, which matters for bulk ingest. Owned by
-/// `api::WriteTxn` — one instance per write transaction, never persisted.
-///
-/// Correctness under abort/commit:
-/// - **Abort**: reserving a batch bumps the counter via `txn.put`, which is
-///   itself part of the write transaction. If the transaction aborts, that
-///   put rolls back with everything else, so an aborted transaction's
-///   reserved-but-unused ids are simply available again — no waste, no gap.
-/// - **Commit**: if a transaction reserves a batch of `ID_BATCH_SIZE` and
-///   commits having used only some of it, the counter has already advanced
-///   past the rest — that tail is lost forever (ids are never reused once
-///   the counter passes them). This is the standard cache-sequence
-///   tradeoff (cf. `SERIAL` with `CACHE` in Postgres); ids stay unique and
-///   monotonic, just no longer perfectly dense.
+/// A batch ID allocator to reserve default `ID_BATCH_SIZE` IDs in one IO operation.
 #[derive(Default)]
 pub(crate) struct IdAllocator {
     node: IdBatch,
