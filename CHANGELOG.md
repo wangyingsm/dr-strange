@@ -4,6 +4,50 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-09
+
+### Added
+- **Chinese full-text search.** Chinese text was silently unsearchable: Han
+  ideographs pass `char::is_alphanumeric`, so the split-based analyzer indexed
+  whole clauses as single tokens and no sub-phrase query could ever hit.
+  `Language::Chinese` segments with jieba in `cut_for_search` mode — the
+  search-engine granularity where a compound also yields its sub-words, so a
+  query for 数据库 still matches a document saying 图数据库. The embedded
+  dictionary loads lazily behind a `OnceLock`, so databases that never index
+  Chinese don't pay for it. The new language variant is appended last and its
+  on-disk encoding is pinned by tests, so existing databases are unaffected.
+- **Version policy with a migration ladder at open.** A database records the
+  version that wrote it, and opening walks a ladder of migrations to bring an
+  older one forward rather than failing or silently misreading it.
+
+### Changed
+- **Faster across the storage, vector, and graph paths.** Records and WAL
+  batches are encoded by borrowing instead of cloning; SST blocks are scanned
+  without allocating; node properties moved out of owned records, which also
+  makes delete-node dedup cheaper; the catalog binary-searches its sorted
+  connections list; hash collections standardized on ahash; and `bulk_load`
+  was decomposed. Vector search gained multi-accumulator SIMD kernels for dot
+  and L2 on x86-64 and aarch64, and the HNSW search beam got 2x headroom with
+  hardened kernels and sidecar loads. The shipped binaries now use mimalloc.
+  In the in-process benchmarks the graph query paths improved by more than an
+  order of magnitude: 1-hop expansion ~270µs → 846ns, 2-hop ~364µs → 38µs, and
+  HNSW top-k ~890µs → 13.3µs.
+
+### Fixed
+- **`Sort` did not define a total order over property values.** Keys were
+  compared with `partial_cmp(..).unwrap_or(Equal)`, so a NaN compared equal to
+  floats that still ordered among themselves — an inconsistent comparator that
+  can produce an arbitrary permutation rather than merely misplacing the NaN.
+  Sorting is now a genuine total order.
+- **The on-disk micro-benchmarks reported the wrong backend.** They hard-coded
+  the group label `"redb"` while `Database::open` selects its engine by cfg, so
+  once `native-backend` became the default a plain `cargo bench` measured the
+  native LSM engine and filed the result under `"redb"` — and redb stopped
+  being measured at all. Because criterion keys its history by group name, this
+  also made a post-change run compare native against a redb baseline and report
+  the backend switch as an engine improvement. The label now derives from the
+  same cfg. This affects benchmark reporting only, not shipped behavior.
+
 ## [1.4.2] - 2026-08-04
 
 ### Fixed
@@ -265,7 +309,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.5.0
 [1.2.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.2.0
 [1.1.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.1.0
 [1.0.2]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.0.2
