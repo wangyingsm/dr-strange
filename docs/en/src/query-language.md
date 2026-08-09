@@ -76,10 +76,44 @@ LIMIT 50
 
 A `MATCH` is a node pattern, optionally chained through relationship patterns
 (`-[:TYPE]->`, `<-[:TYPE]-`, or undirected). `WHERE` predicates combine property
-comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`), label tests (`n:Label`), set
-membership (`x IN [a, b]`), and the boolean operators `AND`, `OR`, `NOT`. A read
-returns the matched subgraph — the nodes and edges on every matching path, not
-merely the final nodes.
+comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`), label tests (`n:Label`), string
+predicates (`CONTAINS`, `STARTS WITH`, `ENDS WITH`), membership (`IN`), and the
+boolean operators `AND`, `OR`, `NOT`. A read returns the matched subgraph — the
+nodes and edges on every matching path, not merely the final nodes.
+
+### Text and membership predicates
+
+```text
+MATCH (d:Doc) WHERE d.title CONTAINS "graph"    RETURN d
+MATCH (p:Person) WHERE p.name STARTS WITH "Al"  RETURN p
+MATCH (f:File) WHERE f.path ENDS WITH ".pdf"    RETURN f
+```
+
+Matching is byte-wise: no case folding, the same posture `=` takes. Non-string
+scalars promote to their text form, so `d.year STARTS WITH "20"` works whether
+`year` was stored as `2026` or `"2026"` — which matters on soft-schema data,
+where the same field may differ in type from node to node. Values with no
+canonical text form (`Null`, byte strings, vectors, lists, maps) simply do not
+match.
+
+`IN` is membership, and is deliberately *not* spelled `CONTAINS`: for a list of
+strings, "contains" could mean either "has this element" or "some element has
+this substring", and nothing in the syntax would pick one.
+
+```text
+MATCH (d:Doc) WHERE "graph" IN d.tags  RETURN d   -- element of a list property
+MATCH (d:Doc) WHERE "author" IN d.meta RETURN d   -- key of a map property
+MATCH (n) WHERE n.year IN [2020, 2021] RETURN n   -- literal list
+```
+
+A list is tested by element, using the same equality `=` uses, so `7` matches a
+stored `7.0`. A map is tested by **key**, not value. A literal list on the right
+is expanded into equalities at compile time; any other right-hand side is
+evaluated per row.
+
+> A predicate that does not match and a property that is absent are
+> indistinguishable, so `NOT (d.title CONTAINS "x")` is true for a document with
+> no `title` at all. Use `d.title IS NULL` when the difference matters.
 
 ### Anchoring on a known entity
 

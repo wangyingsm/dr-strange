@@ -866,6 +866,69 @@ fn in_over_a_property_expands_to_equalities() {
     );
 }
 
+#[test]
+fn string_predicates_parse_at_comparison_precedence() {
+    for (query, expected) in [
+        (
+            r#"MATCH (n) WHERE n.title CONTAINS "graph" RETURN n"#,
+            p("title").contains("graph"),
+        ),
+        (
+            r#"MATCH (n) WHERE n.name STARTS WITH "Al" RETURN n"#,
+            p("name").starts_with("Al"),
+        ),
+        (
+            r#"MATCH (n) WHERE n.file ENDS WITH ".pdf" RETURN n"#,
+            p("file").ends_with(".pdf"),
+        ),
+    ] {
+        assert_eq!(
+            plan(query).steps,
+            vec![Step::Filter(expected)],
+            "for `{query}`"
+        );
+    }
+}
+
+#[test]
+fn string_predicates_are_case_insensitive_and_compose() {
+    // Keywords lex case-insensitively like the rest of the language, and sit
+    // at comparison precedence so AND binds looser — which the compiler then
+    // splits into one pushable Filter per conjunct.
+    assert_eq!(
+        plan(r#"MATCH (n) WHERE n.a starts with "x" AND n.b contains "y" RETURN n"#).steps,
+        vec![
+            Step::Filter(p("a").starts_with("x")),
+            Step::Filter(p("b").contains("y")),
+        ]
+    );
+}
+
+/// `contains` is only an operator on a word boundary — a property called
+/// `contains_pii` must still parse as a property.
+#[test]
+fn a_property_named_like_an_operator_is_not_an_operator() {
+    assert_eq!(
+        plan("MATCH (n) WHERE n.contains_pii = true RETURN n").steps,
+        vec![Step::Filter(p("contains_pii").eq(true))]
+    );
+}
+
+/// `IN` over a literal list stays sugar for equalities; `IN` over anything
+/// else is membership evaluated per row, which cannot be expanded that way.
+#[test]
+fn in_over_a_non_literal_is_membership_not_sugar() {
+    assert_eq!(
+        plan(r#"MATCH (n) WHERE "graph" IN n.tags RETURN n"#).steps,
+        vec![Step::Filter(lit("graph").is_in(p("tags")))]
+    );
+    // The literal-list form is untouched.
+    assert_eq!(
+        plan("MATCH (n) WHERE n.year IN [2020] RETURN n").steps,
+        vec![Step::Filter(p("year").eq(2020))]
+    );
+}
+
 // ---- keyword search (ROADMAP §7) -----------------------------------------
 
 #[test]

@@ -12,7 +12,7 @@ use nom::sequence::{delimited, pair, preceded, tuple};
 
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
-use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
+use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
 use dr_strange_core::types::Dir;
 
 use crate::ast::*;
@@ -75,6 +75,17 @@ fn cmp_op(i: &str) -> IResult<&str, CmpOp> {
             value(CmpOp::Gt, tag(">")),
         )),
     )(i)
+}
+
+/// `CONTAINS` / `STARTS WITH` / `ENDS WITH`. Two-word forms are a keyword
+/// pair, so `STARTS  WITH` and `starts with` both lex; `kw` supplies the word
+/// boundary, so a property named `contains_x` is not mistaken for the operator.
+fn str_op(i: &str) -> IResult<&str, StrOp> {
+    alt((
+        value(StrOp::Contains, kw("contains")),
+        value(StrOp::StartsWith, pair(kw("starts"), kw("with"))),
+        value(StrOp::EndsWith, pair(kw("ends"), kw("with"))),
+    ))(i)
 }
 
 // ---- literals -------------------------------------------------------------
@@ -167,17 +178,43 @@ fn comparison(i: &str) -> IResult<&str, PExpr> {
         return Ok((rest, out));
     }
 
-    // `x IN [a, b, …]` — sugar the compiler expands into equalities (and, on
-    // `key(n)` at the source, into a multi-key seek).
     if let Ok((rest, _)) = kw("in")(i) {
-        let (rest, _) = symbol("[")(rest)?;
-        let (rest, list) = separated_list0(symbol(","), expr)(rest)?;
-        let (rest, _) = symbol("]")(rest)?;
+        // `x IN [a, b, …]` — sugar the compiler expands into equalities (and,
+        // on `key(n)` at the source, into a multi-key seek).
+        if let Ok((rest, _)) = symbol("[")(rest) {
+            let (rest, list) = separated_list0(symbol(","), expr)(rest)?;
+            let (rest, _) = symbol("]")(rest)?;
+            return Ok((
+                rest,
+                PExpr::In {
+                    lhs: Box::new(lhs),
+                    list,
+                },
+            ));
+        }
+        // `x IN <expr>` — membership in a value the row supplies (a `List`
+        // property, or a `Map`'s keys). Not expandable into equalities: the
+        // haystack isn't known until the row is.
+        let (rest, haystack) = additive(rest)?;
         return Ok((
             rest,
-            PExpr::In {
+            PExpr::InValue {
                 lhs: Box::new(lhs),
-                list,
+                haystack: Box::new(haystack),
+            },
+        ));
+    }
+
+    // `a CONTAINS b` / `STARTS WITH` / `ENDS WITH`, at comparison precedence
+    // like openCypher.
+    if let Ok((rest, op)) = str_op(i) {
+        let (rest, rhs) = additive(rest)?;
+        return Ok((
+            rest,
+            PExpr::StringMatch {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
             },
         ));
     }

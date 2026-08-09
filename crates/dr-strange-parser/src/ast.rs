@@ -7,7 +7,7 @@
 
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
-use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
+use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
 use dr_strange_core::types::Dir;
 
 /// A whole parsed query: a source (a `MATCH` pattern or one of the retrieval
@@ -224,6 +224,21 @@ pub enum PExpr {
     In {
         lhs: Box<PExpr>,
         list: Vec<PExpr>,
+    },
+    /// `x IN <expr>` where the right side is not a literal list — membership
+    /// in a value only known per row (a `List` property, or a `Map`'s keys).
+    /// Kept apart from [`PExpr::In`] because that one is sugar the compiler
+    /// expands into equalities (and, on `key(n)`, into a seek); this one
+    /// cannot be, since the haystack isn't known until the row is.
+    InValue {
+        lhs: Box<PExpr>,
+        haystack: Box<PExpr>,
+    },
+    /// `a CONTAINS b`, `a STARTS WITH b`, `a ENDS WITH b`.
+    StringMatch {
+        op: StrOp,
+        lhs: Box<PExpr>,
+        rhs: Box<PExpr>,
     },
     IsNull(Box<PExpr>),
     Not(Box<PExpr>),

@@ -73,8 +73,38 @@ LIMIT 50
 
 一个 `MATCH` 是一个节点模式，可选地通过关系模式（`-[:TYPE]->`、`<-[:TYPE]-`，或
 无向）串接。`WHERE` 谓词组合了属性比较（`=`、`<>`、`<`、`<=`、`>`、`>=`）、标签测试
-（`n:Label`）、集合成员判断（`x IN [a, b]`）以及布尔运算符 `AND`、`OR`、`NOT`。读操作
-返回所匹配的子图——每条匹配路径上的节点与边，而不仅是末端节点。
+（`n:Label`）、字符串谓词（`CONTAINS`、`STARTS WITH`、`ENDS WITH`）、成员判断
+（`IN`）以及布尔运算符 `AND`、`OR`、`NOT`。读操作返回所匹配的子图——每条匹配路径上
+的节点与边，而不仅是末端节点。
+
+### 文本谓词与成员判断
+
+```text
+MATCH (d:Doc) WHERE d.title CONTAINS "graph"    RETURN d
+MATCH (p:Person) WHERE p.name STARTS WITH "Al"  RETURN p
+MATCH (f:File) WHERE f.path ENDS WITH ".pdf"    RETURN f
+```
+
+匹配按字节进行：不做大小写折叠，与 `=` 的立场一致。非字符串标量会提升为其文本形式，
+因此无论 `year` 存为 `2026` 还是 `"2026"`，`d.year STARTS WITH "20"` 都成立——这对
+软模式数据很重要，因为同一字段在不同节点上的类型可能并不一致。没有规范文本形式的值
+（`Null`、字节串、向量、列表、映射）则一律不匹配。
+
+`IN` 表示成员判断，并且刻意不写作 `CONTAINS`：对于一个字符串列表，「contains」既可
+理解为「含有该元素」，也可理解为「某个元素含有该子串」，而语法本身无法在二者之间做出
+选择。
+
+```text
+MATCH (d:Doc) WHERE "graph" IN d.tags  RETURN d   -- 列表属性中的元素
+MATCH (d:Doc) WHERE "author" IN d.meta RETURN d   -- 映射属性中的键
+MATCH (n) WHERE n.year IN [2020, 2021] RETURN n   -- 字面量列表
+```
+
+列表按元素判断，所用相等语义与 `=` 相同，因此 `7` 可匹配存储的 `7.0`。映射按**键**
+判断，而非按值。右侧为字面量列表时会在编译期展开为若干等值判断；其余形式则逐行求值。
+
+> 谓词不匹配与属性缺失这两种情形无法区分，因此对于一份根本没有 `title` 的文档，
+> `NOT (d.title CONTAINS "x")` 同样成立。若需要区分，请使用 `d.title IS NULL`。
 
 ### 锚定到某个已知实体
 

@@ -206,9 +206,16 @@ plan/executor decisions don't preclude it.
 1. **`Expr` surface** — the M2 set (property access, literals, `HasLabel`,
    `IsNull`, comparisons with numeric coercion, boolean logic, arithmetic;
    total evaluation — incomparable/missing ⇒ predicate false) shipped and is
-   enough for filter/sort. Still deferred: string operators (`contains`,
-   prefix), list membership, and edge-property access (needs the richer
-   binding model).
+   enough for filter/sort. **String operators and membership have since
+   landed**: `StringMatch` (`CONTAINS` / `STARTS WITH` / `ENDS WITH`, byte-wise
+   like `=`, with scalars promoted to their text form so soft-schema data
+   whose type varies per node still matches) and `In` (`List` by element under
+   `=` equality, `Map` by key). Membership is deliberately a separate operator
+   rather than an overload of `CONTAINS`: for a list of strings, "contains"
+   reads as either element-equality or existential substring, nothing in the
+   syntax picks one, and openCypher splits them the same way — so a query
+   written against it means the same thing here. Still deferred:
+   **edge-property access**, which needs the richer binding model.
 2. **`ExpandVar`/`ExpandBeam` path semantics** — **v0 chose walk semantics**
    for `ExpandVar`: bounded by depth `min..=max`, nodes/edges may repeat, one
    row per distinct walk; callers add `Distinct` for uniqueness. Trail /

@@ -593,6 +593,14 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
                     go(e, out);
                 }
             }
+            PExpr::InValue { lhs, haystack } => {
+                go(lhs, out);
+                go(haystack, out);
+            }
+            PExpr::StringMatch { lhs, rhs, .. } => {
+                go(lhs, out);
+                go(rhs, out);
+            }
             PExpr::IsNull(x) | PExpr::Not(x) | PExpr::Neg(x) => go(x, out),
             PExpr::Compare { lhs, rhs, .. }
             | PExpr::Logic { lhs, rhs, .. }
@@ -645,6 +653,17 @@ fn compile_expr(
             }
             out.unwrap_or(Expr::Literal(PropValue::Bool(false)))
         }
+        // Not sugar, unlike `PExpr::In`: the haystack is a per-row value, so
+        // it stays an operator the executor evaluates.
+        PExpr::InValue { lhs, haystack } => Expr::In {
+            needle: sub(lhs)?,
+            haystack: sub(haystack)?,
+        },
+        PExpr::StringMatch { op, lhs, rhs } => Expr::StringMatch {
+            op: *op,
+            lhs: sub(lhs)?,
+            rhs: sub(rhs)?,
+        },
         PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
         PExpr::Not(x) => Expr::Not(sub(x)?),
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).

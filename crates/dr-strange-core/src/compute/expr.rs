@@ -13,6 +13,8 @@
 //! model, arch/03 §2); edge-property and multi-variable access arrive with
 //! the richer binding model later.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::storage::vector::Metric;
@@ -75,6 +77,35 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// Substring predicate over two strings — the query language's
+    /// `CONTAINS` / `STARTS WITH` / `ENDS WITH`.
+    ///
+    /// Total, like [`Expr::Compare`]: an operand that is missing or not a
+    /// string makes the predicate *false* rather than an error, so a filter
+    /// over a heterogeneous plane simply doesn't match instead of failing the
+    /// whole query.
+    StringMatch {
+        op: StrOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Membership — the query language's `needle IN haystack`.
+    ///
+    /// Deliberately *not* folded into [`StrOp::Contains`]. For a list of
+    /// strings, "contains" could mean either "has this element" or "some
+    /// element has this substring", and nothing in the syntax picks one; a
+    /// silently-wrong row set is worse than two operators. openCypher splits
+    /// them the same way, so a query written against it means the same thing
+    /// here.
+    ///
+    /// A `List` haystack tests elements by the same equality `=` uses, so
+    /// `1 IN [1.0]` holds. A `Map` haystack tests **keys** — the values side
+    /// is what `IN` would be ambiguous about, which is why `HashMap` has
+    /// `contains_key` and no bare `contains`. Anything else is false.
+    In {
+        needle: Box<Expr>,
+        haystack: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +122,16 @@ pub enum CmpOp {
 pub enum LogicOp {
     And,
     Or,
+}
+
+/// Which substring relation [`Expr::StringMatch`] tests. Byte-wise, so
+/// matching is exact rather than Unicode-normalised or case-folded — the same
+/// posture as equality, which does not case-fold either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StrOp {
+    Contains,
+    StartsWith,
+    EndsWith,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +239,35 @@ impl Expr {
     }
     pub fn div(self, rhs: impl Into<Expr>) -> Expr {
         self.arith(ArithOp::Div, rhs)
+    }
+
+    fn string_match(self, op: StrOp, rhs: impl Into<Expr>) -> Expr {
+        Expr::StringMatch {
+            op,
+            lhs: Box::new(self),
+            rhs: Box::new(rhs.into()),
+        }
+    }
+    /// `p("title").contains("graph")`.
+    pub fn contains(self, rhs: impl Into<Expr>) -> Expr {
+        self.string_match(StrOp::Contains, rhs)
+    }
+    /// `p("name").starts_with("Al")`.
+    pub fn starts_with(self, rhs: impl Into<Expr>) -> Expr {
+        self.string_match(StrOp::StartsWith, rhs)
+    }
+    /// `p("file").ends_with(".pdf")`.
+    pub fn ends_with(self, rhs: impl Into<Expr>) -> Expr {
+        self.string_match(StrOp::EndsWith, rhs)
+    }
+
+    /// `p("tag").is_in(lit(PropValue::List(vec![...])))` — the language's
+    /// `IN`. Named `is_in` because `in` is a keyword.
+    pub fn is_in(self, haystack: impl Into<Expr>) -> Expr {
+        Expr::In {
+            needle: Box::new(self),
+            haystack: Box::new(haystack.into()),
+        }
     }
 }
 
@@ -326,6 +396,72 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
             PropValue::Bool(v)
         }
         Expr::Arith { op, lhs, rhs } => arith(*op, &eval(lhs, ctx), &eval(rhs, ctx)),
+        Expr::StringMatch { op, lhs, rhs } => {
+            PropValue::Bool(string_match(*op, &eval(lhs, ctx), &eval(rhs, ctx)))
+        }
+        Expr::In { needle, haystack } => {
+            PropValue::Bool(member_of(&eval(needle, ctx), &eval(haystack, ctx)))
+        }
+    }
+}
+
+/// The value as text, for the string predicates. `None` when there is no
+/// canonical text form, which makes the predicate false rather than an error.
+///
+/// Scalars promote, so `p("year") STARTS WITH "20"` works on an `Int` without
+/// the caller casting — soft-schema data stores the same field as `Int` on one
+/// node and `Str` on the next, and a predicate that silently missed half of
+/// them would be worse than useless.
+///
+/// Deliberately excluded: `Null` is *absence*, and promoting it to `""` would
+/// make `CONTAINS ""` true for a missing property. `Bytes` is not text.
+/// `Vector`, `List` and `Map` have no canonical rendering — their `Debug` form
+/// is an implementation artifact, and matching against it would freeze that
+/// artifact into query semantics.
+fn as_text(v: &PropValue) -> Option<Cow<'_, str>> {
+    match v {
+        PropValue::Str(s) => Some(Cow::Borrowed(s)),
+        PropValue::Int(i) => Some(Cow::Owned(i.to_string())),
+        PropValue::Float(f) => Some(Cow::Owned(f.to_string())),
+        PropValue::Bool(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+        PropValue::Null
+        | PropValue::Bytes(_)
+        | PropValue::Vector(_)
+        | PropValue::List(_)
+        | PropValue::Map(_) => None,
+    }
+}
+
+/// `CONTAINS` / `STARTS WITH` / `ENDS WITH`, byte-wise over the text forms.
+///
+/// Byte-wise means exact: no case folding and no Unicode normalisation, the
+/// same posture `=` takes. Anything without a text form is false, not an
+/// error. One consequence worth knowing: a missing property and a present
+/// non-matching one are indistinguishable here, so `NOT (p CONTAINS "x")`
+/// holds for a node with no `p` at all — use `IS NULL` when that matters.
+fn string_match(op: StrOp, lhs: &PropValue, rhs: &PropValue) -> bool {
+    let (Some(hay), Some(needle)) = (as_text(lhs), as_text(rhs)) else {
+        return false;
+    };
+    match op {
+        StrOp::Contains => hay.contains(needle.as_ref()),
+        StrOp::StartsWith => hay.starts_with(needle.as_ref()),
+        StrOp::EndsWith => hay.ends_with(needle.as_ref()),
+    }
+}
+
+/// `needle IN haystack`: elements of a `List` by `=` equality, or keys of a
+/// `Map`. Everything else — including a `Str` haystack, which is what
+/// `CONTAINS` is for — is false.
+fn member_of(needle: &PropValue, haystack: &PropValue) -> bool {
+    match haystack {
+        PropValue::List(items) => items.iter().any(|item| compare(CmpOp::Eq, item, needle)),
+        // Keys, not values: see the note on `Expr::In`.
+        PropValue::Map(entries) => match as_text(needle) {
+            Some(key) => entries.contains_key(key.as_ref()),
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -526,6 +662,117 @@ mod tests {
 
     fn b(expr: &Expr, n: &NodeRecord) -> bool {
         is_true(&ev(expr, Some(n)))
+    }
+
+    /// Soft-schema data stores the same field as `Int` on one node and `Str`
+    /// on the next, so the string predicates promote any scalar with a
+    /// canonical text form rather than silently missing half the rows.
+    #[test]
+    fn string_predicates_promote_scalars() {
+        let n = node(
+            &["Doc"],
+            &[
+                ("title", PropValue::Str("graph database".into())),
+                ("year", PropValue::Int(2026)),
+                ("ratio", PropValue::Float(1.5)),
+                ("live", PropValue::Bool(true)),
+            ],
+        );
+        assert!(b(&p("title").contains("data"), &n));
+        assert!(b(&p("title").starts_with("graph"), &n));
+        assert!(b(&p("title").ends_with("base"), &n));
+        assert!(!b(&p("title").contains("sql"), &n));
+
+        // Promoted scalars, no cast at the call site.
+        assert!(b(&p("year").starts_with("20"), &n));
+        assert!(b(&p("year").contains("02"), &n));
+        assert!(b(&p("ratio").contains("."), &n));
+        assert!(b(&p("live").eq(true), &n));
+        assert!(b(&p("live").starts_with("tru"), &n));
+
+        // The needle promotes too, so both sides are symmetric.
+        assert!(b(&p("year").contains(lit(2026)), &n));
+    }
+
+    /// Values with no canonical text form make the predicate false rather
+    /// than matching some `Debug` rendering — that rendering is an
+    /// implementation detail and must not leak into query semantics.
+    #[test]
+    fn string_predicates_reject_values_without_text() {
+        let n = node(
+            &["Doc"],
+            &[
+                ("raw", PropValue::Bytes(vec![1, 2, 3])),
+                ("emb", PropValue::Vector(vec![0.5, 0.5])),
+                ("tags", PropValue::List(vec![PropValue::Str("a".into())])),
+                ("nil", PropValue::Null),
+            ],
+        );
+        for key in ["raw", "emb", "tags", "nil", "absent"] {
+            assert!(
+                !b(&p(key).contains("1"), &n),
+                "{key} has no text form, so CONTAINS must be false"
+            );
+        }
+        // Null must not promote to "": otherwise every missing property would
+        // match `CONTAINS ""`.
+        assert!(!b(&p("absent").contains(""), &n));
+        assert!(b(&p("absent").is_null(), &n));
+        // The sharp edge this implies, pinned deliberately: a missing property
+        // is indistinguishable from a non-matching one under negation.
+        assert!(b(&p("absent").contains("x").not(), &n));
+    }
+
+    /// `IN` is membership, kept separate from `CONTAINS` because "list
+    /// contains x" has two defensible readings and nothing picks one.
+    #[test]
+    fn in_tests_list_elements_by_equality() {
+        let n = node(
+            &["Doc"],
+            &[
+                (
+                    "tags",
+                    PropValue::List(vec![PropValue::Str("graph".into()), PropValue::Int(7)]),
+                ),
+                ("title", PropValue::Str("graph database".into())),
+            ],
+        );
+        assert!(b(&lit("graph").is_in(p("tags")), &n));
+        assert!(!b(&lit("graphs").is_in(p("tags")), &n));
+        // Element equality, not substring — that is what CONTAINS is for.
+        assert!(!b(&lit("gra").is_in(p("tags")), &n));
+        // Same numeric coercion `=` uses, so 7 and 7.0 are the same member.
+        assert!(b(&lit(7).is_in(p("tags")), &n));
+        assert!(b(&lit(7.0).is_in(p("tags")), &n));
+
+        // A string haystack is false: substring matching has its own operator,
+        // and overloading IN onto it would make the two indistinguishable.
+        assert!(!b(&lit("graph").is_in(p("title")), &n));
+        assert!(b(&p("title").contains("graph"), &n));
+        // Absent or non-collection haystacks are false, not errors.
+        assert!(!b(&lit("x").is_in(p("absent")), &n));
+    }
+
+    /// A map's *keys*, not its values — `HashMap` has `contains_key` and no
+    /// bare `contains` for exactly this reason.
+    #[test]
+    fn in_tests_map_keys_not_values() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "colour".to_string(),
+            PropDesc::new(PropValue::Str("red".into())),
+        );
+        m.insert("2026".to_string(), PropDesc::new(PropValue::Int(1)));
+        let n = node(&["Doc"], &[("meta", PropValue::Map(m))]);
+
+        assert!(b(&lit("colour").is_in(p("meta")), &n));
+        assert!(
+            !b(&lit("red").is_in(p("meta")), &n),
+            "values must not match"
+        );
+        // The needle promotes, so an int key can be tested without a cast.
+        assert!(b(&lit(2026).is_in(p("meta")), &n));
+        assert!(!b(&lit("missing").is_in(p("meta")), &n));
     }
 
     /// `total_cmp` must be a genuine total order — std's sort panics on a
