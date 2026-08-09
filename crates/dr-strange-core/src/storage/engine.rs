@@ -60,6 +60,18 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Single writer at a time now since we don't need distributed storage yet.
     /// If we do in the future, maybe try raft + TiKV.
     fn begin_write(&self) -> Result<Self::WriteTxn<'_>>;
+
+    /// Bound how long [`Self::begin_write`] waits for the writer slot before
+    /// failing with [`crate::error::Error::Timeout`]. `None` waits forever.
+    ///
+    /// Unbounded is right for an embedded single-user database — the caller is
+    /// the only writer, so waiting is just correctness. It stops being right
+    /// the moment several clients share one process (arch/08 §4.2): one long
+    /// `bulk_load` would then block every other writer indefinitely, with no
+    /// way to report why. Servers should set a bound; embedders need not.
+    ///
+    /// Engines that do not serialize writers ignore this.
+    fn set_write_timeout(&self, _timeout: Option<std::time::Duration>) {}
 }
 
 /// Reference receivers only, so the trait stays dyn-compatible: graph

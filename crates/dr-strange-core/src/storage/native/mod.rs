@@ -33,7 +33,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,87 @@ use crate::error::{Error, Result, backend};
 use crate::storage::engine::{
     KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction, prefix_successor,
 };
+
+/// Serializes writers within one process, with an optional deadline.
+///
+/// A plain `Mutex<()>` would be shorter, but `std`'s has no timed acquire and
+/// an unbounded one is a hazard as soon as several clients share a server
+/// (arch/08 §4.2): a long `bulk_load` blocks every other writer with no way to
+/// say why. A `Condvar` over a `held` flag gives the same mutual exclusion plus
+/// a bound. Poisoning is ignored throughout — the flag is a plain `bool` that
+/// no panic can leave torn, and refusing every future write because one writer
+/// panicked would turn a transient bug into a dead database.
+struct WriteGate {
+    held: Mutex<bool>,
+    free: Condvar,
+}
+
+impl WriteGate {
+    fn new() -> Self {
+        Self {
+            held: Mutex::new(false),
+            free: Condvar::new(),
+        }
+    }
+
+    /// Take the writer slot, waiting at most `timeout` (`None` = forever).
+    fn acquire(&self, timeout: Option<Duration>) -> Result<WriteGuard<'_>> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        match timeout {
+            None => {
+                while *held {
+                    held = self.free.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            Some(limit) => {
+                // Deadline, not a per-wait budget: a spurious wake-up must not
+                // silently restart the clock and turn a bounded wait into an
+                // unbounded one.
+                let deadline = Instant::now() + limit;
+                while *held {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out(limit));
+                    }
+                    let (guard, wait) = self
+                        .free
+                        .wait_timeout(held, left)
+                        .unwrap_or_else(|e| e.into_inner());
+                    held = guard;
+                    // Re-check the flag rather than trusting the timeout flag
+                    // alone: waking exactly as the slot frees is a success.
+                    if wait.timed_out() && *held {
+                        return Err(timed_out(limit));
+                    }
+                }
+            }
+        }
+        *held = true;
+        Ok(WriteGuard { gate: self })
+    }
+}
+
+fn timed_out(limit: Duration) -> Error {
+    Error::Timeout(format!(
+        "waited {limit:?} for the write transaction slot; another writer still holds it. \
+         Long-running writes (bulk_load, digest) hold it for their whole transaction."
+    ))
+}
+
+/// Releases the writer slot on drop and wakes one waiter.
+struct WriteGuard<'a> {
+    gate: &'a WriteGate,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut held = self.gate.held.lock().unwrap_or_else(|e| e.into_inner());
+        *held = false;
+        // One waiter: the slot is exclusive, so waking the rest only to have
+        // them re-sleep is wasted work.
+        self.gate.free.notify_one();
+    }
+}
 
 /// Shared cache of decoded-on-read SST data blocks, keyed by `(sst id, block
 /// offset)` and byte-weighted, so repeated reads of a hot block skip the
@@ -164,7 +246,12 @@ fn lock_directory(dir: &Path) -> Result<File> {
 pub struct NativeEngine {
     store: RwLock<Store>,
     wal: Mutex<BufWriter<File>>,
-    write_gate: Mutex<()>,
+    write_gate: WriteGate,
+    /// How long `begin_write` waits for the gate, in milliseconds; `0` means
+    /// wait forever (the default). Atomic so a server can set it through the
+    /// shared `Arc<Database>` after open, without an options struct threaded
+    /// through every constructor.
+    write_timeout_ms: AtomicU64,
     /// Exclusive advisory lock on `<dir>/LOCK`, held for the engine's lifetime
     /// and released when this handle drops.
     ///
@@ -247,7 +334,8 @@ impl NativeEngine {
         Ok(Self {
             store: RwLock::new(store),
             wal: Mutex::new(BufWriter::new(file)),
-            write_gate: Mutex::new(()),
+            write_gate: WriteGate::new(),
+            write_timeout_ms: AtomicU64::new(0),
             _lock: lock,
             dir,
             flush_threshold,
@@ -509,7 +597,10 @@ impl StorageEngine for NativeEngine {
     }
 
     fn begin_write(&self) -> Result<NativeWriteTxn<'_>> {
-        let gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let ms = self.write_timeout_ms.load(Ordering::Relaxed);
+        let gate = self
+            .write_gate
+            .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
         let snapshot = self
             .store
             .read()
@@ -521,6 +612,18 @@ impl StorageEngine for NativeEngine {
             snapshot,
             buf: BTreeMap::new(),
         })
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) {
+        // Saturating: a timeout longer than ~584 million years is the caller
+        // meaning "forever", and `0` already encodes that. Sub-millisecond
+        // values round up to 1ms rather than to 0, so a small timeout never
+        // silently becomes an unbounded wait.
+        let ms = match timeout {
+            None => 0,
+            Some(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1),
+        };
+        self.write_timeout_ms.store(ms, Ordering::Relaxed);
     }
 }
 
@@ -644,7 +747,7 @@ impl ReadTransaction for NativeReadTxn<'_> {
 
 pub struct NativeWriteTxn<'a> {
     engine: &'a NativeEngine,
-    _gate: MutexGuard<'a, ()>,
+    _gate: WriteGuard<'a>,
     snapshot: u64,
     /// Staged mutations, last-write-wins per key (seq assigned at commit).
     buf: BTreeMap<(u8, Vec<u8>), Op>,

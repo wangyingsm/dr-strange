@@ -151,7 +151,20 @@ releases; the on-disk format version (`meta`) is independent of API version.
    call sites that a macro would only have hidden the types.
 2. **Streaming rows vs `collect()` defaults** — iterators are right for the
    core, but wrappers keep collecting; provide `rows()` + `all()` both?
-3. **Blocking writer acquire** — timeout default? Fail-fast for MCP callers?
+3. ~~**Blocking writer acquire** — timeout default? Fail-fast for MCP
+   callers?~~ **Resolved: bounded on request, unbounded by default.**
+   `Database::set_write_timeout` bounds the wait for the single writer slot and
+   raises `Error::Timeout` when it expires. The default stays unbounded because
+   for an embedded caller — the only writer — waiting *is* the correct
+   behaviour, and failing a write that would have succeeded a moment later
+   would be a regression. A process serving several clients sets a bound
+   instead: there, one long `bulk_load` or `digest` otherwise blocks every
+   other writer for its whole transaction with nothing to say why (08 §4.2).
+   It takes `&self`, so a server can set it through the `Arc<Database>` it
+   already holds. Still to do once `/mcp` lands: give the timeout its own
+   JSON-RPC code, since `app()` currently flattens every core error onto one
+   and a caller should be able to tell "retry this" from "your request was
+   wrong".
 4. ~~**Wire-protocol readiness** — decide the serialization format when the
    server wrapper lands.~~ **Resolved: JSON-RPC 2.0 over the wire, postcard on
    disk.** The two codecs are deliberately different: postcard's versioned

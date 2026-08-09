@@ -71,6 +71,16 @@ impl Engine {
         }
     }
 
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) {
+        match self {
+            Engine::Memory(e) => e.set_write_timeout(timeout),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => e.set_write_timeout(timeout),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => e.set_write_timeout(timeout),
+        }
+    }
+
     /// Runs `f` in a write transaction and commits iff it succeeded. Every
     /// committed write bumps the commit sequence (arch/02 §3) so the cache's
     /// version stamp advances — coarse invalidation: any write logically
@@ -349,6 +359,23 @@ impl Database {
         )?;
         tracing::info!(path = %path.display(), "opened database");
         Ok(db)
+    }
+
+    /// Bound how long a write transaction waits for the single writer slot
+    /// before failing with [`Error::Timeout`]. `None` (the default) waits
+    /// forever.
+    ///
+    /// Takes `&self` so a server can set it through the shared
+    /// `Arc<Database>` it already holds. Applies to transactions started
+    /// after the call; one already waiting keeps the bound it began with.
+    ///
+    /// Unbounded is right for an embedded database, where the caller is the
+    /// only writer and waiting is simply correctness. Anything serving
+    /// several clients from one process should set a bound — otherwise one
+    /// long `bulk_load` or `digest` blocks every other writer for as long as
+    /// it runs, with nothing to tell them why (arch/08 §4.2).
+    pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) {
+        self.engine.set_write_timeout(timeout);
     }
 
     /// A fresh, empty in-memory database (tests, scratch work).

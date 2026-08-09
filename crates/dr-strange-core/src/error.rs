@@ -21,6 +21,13 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// A bounded wait expired — currently only `begin_write` giving up on the
+    /// writer slot (arch/01 §3, arch/04 §8.3). Distinct from [`Error::Conflict`]
+    /// because nothing was attempted and nothing was lost: the caller simply
+    /// never got the writer, so retrying is the correct response.
+    #[error("timed out: {0}")]
+    Timeout(String),
+
     #[error("database is corrupt: {0}")]
     Corrupt(String),
 
