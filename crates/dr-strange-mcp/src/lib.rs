@@ -35,13 +35,43 @@ use serde_json::{Value, json as jval};
 pub struct DrStrange {
     db: Arc<Database>,
     tool_router: ToolRouter<Self>,
+    digest: DigestTuning,
+}
+
+/// Digest knobs the host resolved, applied to the `digest` tool.
+///
+/// The stdio binary embeds its own database and has no config file, so it
+/// keeps [`DigestTuning::default`]. A host that does have one — `drsg serve`,
+/// whose `[digest]` section already steers `digest.run` over `/rpc` — passes
+/// it through [`DrStrange::with_digest`], so the same server does not honour
+/// an operator's `concurrency` on one surface and ignore it on the other.
+#[derive(Debug, Clone, Copy)]
+pub struct DigestTuning {
+    /// Target chunk size in characters (paragraph-aware).
+    pub chunk_chars: usize,
+    /// Per-chunk extraction chat calls to run concurrently.
+    pub concurrency: usize,
+}
+
+impl Default for DigestTuning {
+    fn default() -> Self {
+        Self {
+            chunk_chars: 4000,
+            concurrency: 8,
+        }
+    }
 }
 
 impl DrStrange {
     pub fn new(db: Arc<Database>) -> Self {
+        Self::with_digest(db, DigestTuning::default())
+    }
+
+    pub fn with_digest(db: Arc<Database>, digest: DigestTuning) -> Self {
         Self {
             db,
             tool_router: Self::tool_router(),
+            digest,
         }
     }
 }
@@ -765,7 +795,7 @@ fn drop_plane_logic(db: &Database, req: DropPlane) -> AnyResult<Value> {
     Ok(jval!({ "dropped": req.name }))
 }
 
-fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
+fn digest_logic(db: &Database, req: Digest, tuning: DigestTuning) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let chat_provider = req.chat.as_deref().unwrap_or("openai");
@@ -797,9 +827,9 @@ fn digest_logic(db: &Database, req: Digest) -> AnyResult<Value> {
         source: req.source.unwrap_or_else(|| "mcp-digest".into()),
         model: chat_model,
         run_id,
-        chunk_chars: 4000,
+        chunk_chars: tuning.chunk_chars,
         embed,
-        concurrency: 8,
+        concurrency: tuning.concurrency,
         mode: match req.mode.as_deref() {
             None => dr_strange_llm::DigestMode::default(),
             Some(m) => dr_strange_llm::DigestMode::parse(m)
@@ -1049,7 +1079,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Digest>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking("digest", move |db| digest_logic(db, req))
+        let tuning = self.digest;
+        self.blocking("digest", move |db| digest_logic(db, req, tuning))
             .await
     }
 }

@@ -45,7 +45,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Production hardening middleware (arch/08): a global in-flight concurrency cap
 # (tower) plus panic→500 and static security headers (tower-http).
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["catch-panic", "set-header"] }
+tower-http = { version = "0.6", features = ["catch-panic", "set-header", "limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }

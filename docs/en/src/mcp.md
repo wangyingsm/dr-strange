@@ -127,7 +127,25 @@ concurrent writers so this is safe, not just convenient.
 tool parameter, remote or local); `write_nodes`/`write_edges` keep their
 per-call batch atomicity, since the tool code runs in the same process
 against the same `Database` either way — nothing here proxies to `/rpc` or
-reshapes what a tool does.
+reshapes what a tool does. The `[digest]` config section steers the `digest`
+tool exactly as it steers `digest.run` over `/rpc`: lowering `concurrency` to
+stay under a provider's rate limit applies to both surfaces, not one of them.
+(The embedded `drsg-mcp` binary has no config file and keeps the built-in
+defaults.)
+
+### Session lifetime
+
+A host that exits cleanly sends `DELETE /mcp` and its session goes away at
+once. A host that is `SIGKILL`ed — an editor restarting its MCP child, say —
+sends nothing, so the server reclaims that session on a timer instead: **5
+minutes idle**, or **60 seconds** with no `initialize` after the session is
+created. The session's worker task, its `DrStrange`, and its buffered
+messages all go with it.
+
+What survives is one map entry per dead session — a session id and a closed
+handle, tens of bytes, never reused. On a server running for months with
+hosts crashing daily that is noise, not a leak worth restarting for; but if
+you are scripting sessions in a loop, close them and it stays exactly zero.
 
 ## The tools
 

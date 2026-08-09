@@ -17,6 +17,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOKEN: &str = "test-mcp-token";
 
@@ -27,13 +28,35 @@ fn free_addr() -> SocketAddr {
         .unwrap()
 }
 
+/// Sets `DRSG_TOKEN` exactly once, before this binary starts any thread that
+/// might read it.
+///
+/// The tests in this file are separate `#[tokio::test]`s but share one
+/// process, and each spawns a server thread that calls `SharedToken::from_env`
+/// / `AllowedOrigins::from_env`. A per-test `set_var` would therefore run
+/// concurrently with another test's server thread calling `getenv` — under
+/// glibc `setenv` may reallocate `environ`, so that is a real data race, and
+/// the reason edition 2024 marks the function `unsafe`. It would surface as
+/// an occasional segfault or as a server that reads no token and 401s
+/// everything.
+///
+/// `Once` removes the race rather than documenting it: the first caller sets
+/// the variable and every later caller blocks until that is finished, so the
+/// single write happens-before every server thread this file creates.
+///
+/// SAFETY: no other thread exists that could be reading the environment —
+/// `call_once` serialises the writers, and the only readers are the server
+/// threads spawned below, after it returns.
+fn set_token_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { std::env::set_var("DRSG_TOKEN", TOKEN) });
+}
+
 /// Spins up a real server with a seeded node, gated by `DRSG_TOKEN` — the
 /// realistic configuration for a programmatic client (ROADMAP §10's "token
 /// posture" fork: with no token, `/mcp` refuses even reads, same as `/rpc`).
-/// SAFETY: this file is its own test binary (`cargo test` gives every
-/// `tests/*.rs` file its own process), so no other test observes this env var.
 fn spawn_server() -> SocketAddr {
-    unsafe { std::env::set_var("DRSG_TOKEN", TOKEN) };
+    set_token_once();
     let addr = free_addr();
     let db = Database::in_memory().unwrap();
     let plane = db.plane("startup").unwrap();
@@ -131,6 +154,48 @@ async fn mcp_endpoint_refuses_requests_with_no_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+/// An oversized body is refused on `/mcp`, the same as on `/rpc`.
+///
+/// Regression: `DefaultBodyLimit` guards the rest of the server, but axum
+/// implements it as a request extension that only extractors consult, and
+/// `/mcp` is a raw tower service that buffers the body itself — so an
+/// authenticated caller could POST unbounded bytes into the process holding
+/// the database.
+#[tokio::test]
+async fn mcp_endpoint_refuses_an_oversized_body() {
+    let addr = spawn_server();
+    wait_ready(addr).await;
+
+    // Only the request head is written. The limit is enforced from the
+    // declared `Content-Length`, so the server answers before a single byte
+    // of the body is buffered — which is the property worth pinning, and the
+    // reason this is raw TCP rather than `reqwest`: uploading the bytes for
+    // real proves the same thing, but the server's early close then reaches
+    // the client as a broken pipe instead of the 413 it already wrote.
+    let too_big = 64 * 1024 * 1024 + 1;
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Authorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: {too_big}\r\n\r\n"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = sock.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    })
+    .await
+    .expect("no response in 30s — the body was awaited, not refused");
+    assert!(
+        status.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {status}"
+    );
 }
 
 /// Two independent MCP sessions sharing one `/mcp` endpoint see one
