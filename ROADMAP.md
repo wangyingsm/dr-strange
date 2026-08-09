@@ -746,6 +746,67 @@ needs the network) can be added later without the plugin contract changing.
 
 ---
 
+## 12. Scoped identity — shared memory a team can actually run
+
+**Goal.** Make one database safely reachable by an ops team *and* a fleet of
+agents spread across machines, without the operational weight that usually comes
+with multi-tenant auth. Concretely: LAN-reachable UI and RPC for maintenance,
+`/mcp` reachable by agents on several hosts, per-agent identity that can be
+revoked and attributed — and nothing that needs a separate server to run.
+
+**Why AI-native.** §10 makes one memory reachable by many agents; this decides
+*which* agent may read or write *what*. Shared memory without attribution is
+shared memory nobody can trust: when two agent groups write the same plane, the
+first question is always "which one wrote this, and was it allowed to?" A
+memory layer that cannot answer that can be shared but not relied upon.
+
+**The problem.** The v1 model is one shared bearer token that authorizes
+everything (08 §4.1), plus an Origin guard that trusts loopback. That is right
+for a desktop install and wrong the moment the listener leaves localhost. Worse,
+the two interact: the zero-config fallback grants full write access when no
+token is set and keys off *allowed origin* rather than *loopback*, so an
+operator who adds a LAN UI origin — which a LAN deployment forces — and forgets
+`DRSG_TOKEN` has published an unauthenticated writable database.
+
+**Settled — scoped tokens, not signatures or an OAuth server.** The design is in
+08 §4.2. `drsg_<keyid>_<secret>`, stored as `SHA-256(secret)` (high-entropy
+random needs no password stretching), revoked by deleting a row, and carrying a
+plane scope plus an `Access` tier. Per-agent request signing and OAuth 2.1 were
+both considered and rejected: signing costs key distribution, rotation, clock
+skew and a nonce cache while no off-the-shelf MCP client speaks a bespoke
+scheme, and OAuth needs an authorization server. Behind TLS on a trusted LAN
+neither pays for its operational weight. Revisit signing (via RFC 9421, not a
+hand-rolled canonicalization) if `/mcp` ever faces the internet.
+
+**Settled — planes are the isolation unit.** This answers §10's open isolation
+fork. A team's agents get `Write` on their own plane, `Read` on a shared one,
+nothing elsewhere. No new concept is invented: planes (09) already partition the
+database and plane administration is already `Access::Admin`.
+
+**Scope sketch.** Replace `SharedToken` with a `TokenStore` behind the existing
+`Authorizer` seam — the trait was written for this and dispatch needn't change.
+`Authorizer` starts returning a `Principal` instead of a `bool`, so writes can
+be attributed in an audit log. `drsg serve` grows a second listener
+(`--mcp-addr`) so the agent surface and the human surface can differ in network
+exposure and credential type while sharing one `Arc<Database>`. Token issuance
+and revocation are `Access::Admin` RPC methods plus a dashboard view.
+
+**Forks to settle.**
+- *Human credentials.* Do ops humans get the same tokens (paste into the UI), or
+  a real login issuing an `HttpOnly` session cookie? The cookie is stronger
+  against XSS; the token is less to build and less to run.
+- *Bootstrap.* Issuing the first admin token on a fresh database, without a
+  window where the server is open.
+- *Scope granularity.* Plane-level is the obvious unit, but is label- or
+  property-level scoping ever needed, or does that belong to a query-rewrite
+  layer instead?
+- *Audit storage.* A plane in the database itself (queryable, but writable by
+  the thing being audited) or an append-only file beside it?
+- *TLS posture.* Refuse a non-loopback bind without TLS outright, or warn? A
+  refusal is safe and will annoy someone's internal test rig.
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.
