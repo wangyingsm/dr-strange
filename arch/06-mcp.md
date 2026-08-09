@@ -70,13 +70,18 @@ writing descriptions back; future sessions inherit them.
 
 ## 5. Open questions
 
-1. **`search` tool scope** — one polymorphic tool (fewer tools, kinder to
-   small tool budgets) vs split `vector_search`/`find_nodes` (simpler
-   schemas)? Prototype both against real agent transcripts.
+1. ~~**`search` tool scope** — one polymorphic tool vs split
+   `vector_search`/`find_nodes`?~~ **Resolved: split.** Each tool carries a
+   schema an agent can read without branching — `vector_search`, `get_node`,
+   `expand`, `cypher` and the rest — and the tool budget never became the
+   binding constraint the polymorphic option was hedging against.
 2. **Embedding generation on write** — should `write_nodes` auto-embed text
    properties via `dr-strange-llm`, or must callers supply vectors? (Leaning: opt-in
    auto-embed configured per plane, provider set at server start.)
 3. **Multi-database serving** — one MCP server per DB file vs a `db`
    argument on every tool.
-4. **Transport** — stdio first; streamable HTTP when the server wrapper
-   story lands.
+4. **Transport** — stdio shipped and remains the right answer for a single
+   agent: point a host at a path, nothing to run. Streamable HTTP is landing as
+   an endpoint on `drsg serve` rather than a client mode here (ROADMAP §10),
+   because the tools must run in-process against the same `Database` to keep
+   batch atomicity. Its security model is 08 §4.2.

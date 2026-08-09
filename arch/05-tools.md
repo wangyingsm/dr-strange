@@ -69,10 +69,13 @@ document (the plane model's intended usage, [09-planes.md](09-planes.md)).
 
 ## 4. Open questions
 
-1. Should `drsg query` also accept a tiny convenience syntax pre-v2 (e.g.
-   `--label Person --expand-out KNOWS`) for shell one-liners, or stay
-   plan-JSON-only until the real QL?
+1. ~~Should `drsg query` accept a convenience syntax pre-v2, or stay
+   plan-JSON-only until the real QL?~~ **Moot — the QL landed.** `drsg cypher`
+   runs an openCypher-subset statement compiled to a plan (ROADMAP §7), which
+   is the shell one-liner the stopgap syntax was for. `drsg query` keeps taking
+   plan JSON, for generated plans and for debugging the compiler's output.
 2. Watch/REPL mode (`drsg shell`) — worth it in v1, or wait for the QL?
 3. Import dedup policy flag (`--on-conflict skip|update|error` by external
    key) — decide with the first real ingest corpus.
-4. `digest` detailed design — deferred (see §3).
+4. ~~`digest` detailed design — deferred (see §3).~~ **Resolved: shipped** as
+   AIgest's three passes (ROADMAP §8), extended to read URLs in §9.

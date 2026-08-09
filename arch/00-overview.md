@@ -139,15 +139,22 @@ Each milestone ends with a working vertical slice, not a finished layer.
 - **M6 — web UI v1**: `drsg serve` (JSON-RPC 2.0 backend) with dashboard and
   visual graph plots ([08-web-ui.md](08-web-ui.md)).
 
-## 6. Cross-cutting open questions
+## 6. Cross-cutting decisions
 
-Layer-specific open questions live at the bottom of each layer doc.
+All four cross-cutting questions this doc opened with are settled; the answers
+are recorded here so the reasoning isn't lost. Layer-specific questions live at
+the bottom of each layer doc.
 
-1. **Versioning of on-disk format** — format version in `meta` from day one;
-   migration story TBD before first external user.
-2. **Error taxonomy** — one `dr_strange_core::Error` enum vs per-layer errors; decide
-   at M0.
-3. **Async or sync core** — leaning sync core (embedded DBs are CPU/IO-bound,
-   redb is sync) with async only in wrapper processes; confirm at M0.
-4. **Name/branding** — on-disk file extension `.dr`? Magic bytes? Bikeshed
-   later, but magic bytes must land in M0.
+1. **On-disk format versioning** — settled. The format version lives in `meta`
+   from day one, and `storage/graph/meta.rs` walks a migration ladder at open
+   (`migrate_step`), so an older database is carried forward rather than refused
+   or, worse, silently misread. Shipped v1.5.0.
+2. **Error taxonomy** — settled: one `dr_strange_core::Error` enum
+   (`core/src/error.rs`), not per-layer error types.
+3. **Async or sync core** — settled: the core is **sync**, as the original
+   leaning had it. Async lives only in the wrapper processes (`drsg serve`,
+   `drsg-mcp`), which is why every engine entry point is a synchronous closure
+   (`with_read` / `with_write`).
+4. **Name/branding** — settled: the project is `drsg`, databases carry the
+   `.drsg` extension, and the index sidecars carry their own magic bytes
+   (`DRSH` for the HNSW graph, `DRSK` for the BM25 index).

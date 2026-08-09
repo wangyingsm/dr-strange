@@ -33,13 +33,18 @@ and `dr-strange-mcp` depend on it optionally.
   output; embedding cache keyed by content hash to avoid re-embedding
   unchanged text.
 
-## 3. Open questions
+## 3. Decisions
 
-1. **Digest pipeline** (chunking, extraction schemas/prompting, incremental
-   re-digest, dedup-during-ingest, cost model) — deferred to its own design
-   session; this doc holds only its boundary: documents + API key in, plane
-   of nodes/edges/vectors + report out.
-2. **Local model support** — llama.cpp/ollama-compatible endpoints for
-   embeddings: needed in v1?
-3. **NL → plan safety** — generated plans are read-only by construction in
-   v1.5? (Leaning yes: the NL interface never mutates.)
+All three questions this doc opened with are settled.
+
+1. **Digest pipeline** — designed and shipped as AIgest's three passes
+   (ROADMAP §8), later extended to read URLs (§9). This doc still holds only
+   the boundary: documents + API key in, a plane of nodes/edges/vectors +
+   report out.
+2. **Local model support** — settled: yes, and it needed no dedicated code
+   path. `openai.rs` takes a configurable `base_url`, so any
+   OpenAI-compatible endpoint works — a gateway, `ollama`, or `llama.cpp`.
+3. **NL → plan safety** — settled: yes, and it is *enforced*, not merely
+   intended. `dr-strange-parser`'s `read_only()` rejects any statement that
+   would mutate before it can become a `ReadQuery`, so the NL interface
+   cannot write even if the model emits a mutation.

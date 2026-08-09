@@ -214,9 +214,11 @@ plan/executor decisions don't preclude it.
    row per distinct walk; callers add `Distinct` for uniqueness. Trail /
    simple-path modes and the `ExpandBeam` revisit-vs-dedup question are
    revisited when the richer binding model + `ExpandBeam` land (M3).
-3. **Score channel: one or many?** — a single `f32` keeps operators simple
-   but forces `Score` to fold multi-signal fusion eagerly; named score
-   columns are the alternative. Decide at M3 with real GraphRAG queries.
+3. ~~**Score channel: one or many?**~~ **Resolved (M3): a single channel.**
+   Real fusion queries fold their signals through `Expr` arithmetic over
+   `score()`, `hops()` and `distance()` rather than needing named columns, so
+   the simple operators won. Hybrid retrieval (ROADMAP §2) shipped on this
+   model.
 4. **`FrontierTopK` crossover threshold** — brute force vs filtered ANN;
    benchmark at M3.
 5. **Catalog write amplification** — per-write incremental updates vs

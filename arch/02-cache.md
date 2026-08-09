@@ -117,8 +117,12 @@ the trait boundary keeps it removable.
 
 ## 7. Open questions
 
-1. **`moka` vs hand-rolled** — measure overhead per hit at M2; moka's
-   concurrency machinery may be overkill for a single-process embedded core.
+1. ~~**`moka` vs hand-rolled** — measure overhead per hit at M2.~~ **Resolved:
+   moka.** Its overhead never showed up against the decode cost it saves, so
+   the concurrency machinery was not the overkill it looked like. The
+   `CachedReader` micro-benchmark that gated this decision lives on in
+   `core/benches/graph.rs`; the native engine uses the same crate for its SST
+   block cache.
 2. **Write-through vs invalidate-only on commit** — write-through warms the
    cache with the writer's decoded records but risks polluting it with bulk
    ingest; possibly ingest-mode toggles to invalidate-only.

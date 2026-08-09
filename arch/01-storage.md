@@ -227,14 +227,24 @@ Inherited from redb in v1:
    that chose redb over RocksDB); hand-rolling keeps the on-disk format ours
    (the bincode lesson). An exact `BruteForceIndex` is the small-plane impl
    *and* the recall oracle the HNSW is tested against (recall@10 ≥ 0.85).
-   The registry declares indexes durably in `meta` and rebuilds the HNSW
-   from the KV on open — so the KV stays the single source of truth and the
-   HNSW *graph* sidecar (open-time speedup only) is deferred, not required.
+   The registry declares indexes durably in `meta` and can always rebuild the
+   HNSW from the KV, so the KV stays the single source of truth. The graph
+   *sidecar* was deferred at M3 but has since shipped as a pure open-time
+   cache: one `<db>.hnsw` file stamped with the commit sequence it was written
+   at, accepted on open only when that stamp matches the data and rebuilt from
+   the KV otherwise — so a stale or hand-edited sidecar degrades to a slower
+   open, never to a wrong index.
 3. **Overflow storage for large blobs** — needed in v1 or defer?
 4. **Adjacency value payload** — should `adj_fwd` duplicate a few hot edge
    properties (e.g. weight) to avoid an `edges` lookup during weighted
    traversal? Measure first.
-5. **Single-writer ceiling** — acceptable through v1? Revisit at M5 benchmarks.
+5. ~~**Single-writer ceiling** — acceptable through v1?~~ **Resolved (M5):
+   accepted.** The benchmarks put point lookups and 1-hop expansion in the
+   microsecond range with MVCC keeping readers genuinely concurrent, so the
+   ceiling binds only write-heavy workloads, which is not the profile this
+   engine targets. `write_gate` serializes writers within the process, and the
+   `LOCK` file refuses a second one across processes — several writers share
+   one `drsg serve` instead (08 §4.2).
 6. **Description indexing** — should property descriptions themselves be
    embeddable/searchable (e.g. semantic search over what properties mean)?
    Natural M3+ extension; no storage change needed if they stay in the blob.
@@ -242,6 +252,7 @@ Inherited from redb in v1:
    `plane_id` into the high bits of `node_id` would kill the extra lookup but
    caps planes/IDs and complicates copy/move (ID changes on move). Current
    choice: separate table; revisit if the resolve hop shows up in profiles.
-8. **Vector-index sidecar proliferation** — thousands of tiny planes ⇒
-   thousands of files? Likely fine because small planes don't build indexes;
-   confirm, or pack sidecars into one directory-per-db container file.
+8. ~~**Vector-index sidecar proliferation** — thousands of tiny planes ⇒
+   thousands of files?~~ **Resolved: not a problem by construction.** The
+   sidecar is one file per *database*, not per plane or per index, so plane
+   count doesn't multiply files. No container format was needed.
