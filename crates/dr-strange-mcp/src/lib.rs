@@ -330,7 +330,33 @@ struct Cypher {
     embed: Option<String>,
     /// Values for `$name` placeholders in the query, e.g. `{"min": 18}`.
     #[serde(default)]
+    #[schemars(with = "crate::JsonObject")]
     params: serde_json::Map<String, Value>,
+}
+
+/// Free-form JSON object. Rendered as a full Schema object (`{"type":
+/// "object"}`) so Gemini's strict converter accepts it — schemars renders
+/// `serde_json::Map<String, Value>` as `additionalProperties: true`, a bare
+/// boolean schema that Gemini rejects with `400 … Schema, true`. `with` here
+/// changes only the *schema*; serde still deserializes `params` as a map.
+struct JsonObject;
+
+impl schemars::JsonSchema for JsonObject {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("JsonObject")
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::Schema::try_from(serde_json::json!({
+            "type": "object",
+            "description": "Free-form JSON object for `$name` placeholders, e.g. {\"min\": 18}",
+        }))
+        .expect("static JSON schema is valid")
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -355,6 +381,7 @@ struct EdgeInput {
     dst_key: String,
     #[serde(rename = "type")]
     ty: String,
+    /// Property map in the JSON dialect (`{"$vector":[…]}`, `{"$desc","$value"}`).
     properties: Option<Value>,
 }
 
@@ -1230,6 +1257,67 @@ mod tests {
         assert_eq!(planes[0]["edges"], jval!(1));
         let cat = describe_plane_logic(&db, from_value(jval!({})).unwrap()).unwrap();
         assert_eq!(cat["labels"]["Doc"]["count"], jval!(2));
+    }
+
+    /// Gemini's tool-schema converter rejects a *bare boolean* where a Schema
+    /// object is required — e.g. `"properties": true` rendered by schemars for
+    /// a doc-comment-less `Option<Value>` (the sub2api `400 Invalid value at
+    /// 'request.tools[...].parameters.properties[...].value' ... Schema, true`
+    /// failure). Walk a rendered schema and fail on any boolean in a
+    /// schema-bearing position.
+    fn assert_no_boolean_schema(v: &serde_json::Value, path: &str) {
+        if v.is_boolean() {
+            panic!("bare boolean schema at {path}: {v}");
+        }
+        let Some(map) = v.as_object() else {
+            return;
+        };
+        for (k, val) in map {
+            let p = format!("{path}.{k}");
+            match k.as_str() {
+                "properties" | "$defs" | "definitions" | "patternProperties" => {
+                    if let Some(objs) = val.as_object() {
+                        for (name, sub) in objs {
+                            assert_no_boolean_schema(sub, &format!("{p}.{name}"));
+                        }
+                    }
+                }
+                "items"
+                | "additionalProperties"
+                | "additionalItems"
+                | "contains"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "propertyNames" => assert_no_boolean_schema(val, &p),
+                "anyOf" | "allOf" | "oneOf" | "prefixItems" => {
+                    if let Some(arr) = val.as_array() {
+                        for (i, it) in arr.iter().enumerate() {
+                            assert_no_boolean_schema(it, &format!("{p}[{i}]"));
+                        }
+                    }
+                }
+                // keywords whose values are not schemas (type/description/
+                // default/required/enum/…): nothing to descend into
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn tool_schemas_have_no_bare_boolean_schema_values() {
+        // Regression: `EdgeInput.properties: Option<Value>` had no doc comment
+        // and schemars rendered it as a bare `true`, which Gemini's strict
+        // converter rejects. Every struct that carries a free-form
+        // `Value`/`Map` field is checked here so a future one cannot regress.
+        for v in [
+            schemars::schema_for!(WriteEdges),
+            schemars::schema_for!(WriteNodes),
+            schemars::schema_for!(Cypher),
+        ] {
+            assert_no_boolean_schema(&serde_json::to_value(v).unwrap(), "$");
+        }
     }
 
     #[test]
