@@ -155,7 +155,20 @@ async fn mcp_auth(State(state): State<Arc<AppState>>, request: Request, next: Ne
 /// process — and this endpoint exists precisely to be a long-running shared
 /// server. Pinned rather than inherited from `SessionConfig::default()` so
 /// the deployment shape stops depending on an upstream default.
-const MCP_SESSION_IDLE: Duration = Duration::from_secs(300);
+///
+/// Ten minutes rather than five, because rmcp 2.2.0's worker counts a *running*
+/// tool as idle: the keep-alive timer is only reset by an event, and a tool
+/// call emits none between dispatch and its result, so a long `digest` on an
+/// otherwise quiet session is torn down mid-flight. Ten minutes buys room for a
+/// slow digest without abandoning the reaping that stops a SIGKILLed host
+/// leaking its session. The real fix belongs upstream — the timer should not
+/// count in-flight work — and this constant drops back when that lands.
+///
+/// Reaping has a second upstream wart we accept for now: the worker exits but
+/// its map entry stays, so the next request sees `has_session` true, misses
+/// the spec's 404, and gets a 500 from `create_stream` instead — a client that
+/// would have re-initialized on 404 does not. A longer window makes it rarer.
+const MCP_SESSION_IDLE: Duration = Duration::from_secs(600);
 /// How long a session may exist before its `initialize` must arrive. Bounds
 /// the same leak for a connection that opens and then goes silent.
 const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
@@ -163,6 +176,16 @@ const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
 /// How long shutdown waits for in-flight connections before giving up. Both
 /// listeners use it, so Ctrl-C behaves the same with and without TLS.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How many MCP tool bodies may run at once, given the HTTP request ceiling.
+///
+/// Not `max_concurrent` itself: that counts requests, most of which are cheap,
+/// and defaults to 1024 — while every MCP tool is a `spawn_blocking` unit of
+/// real work. Clamped rather than fixed so an operator who deliberately runs a
+/// small server still gets a proportionally small tool ceiling.
+fn mcp_tool_concurrency(max_concurrent: usize) -> usize {
+    max_concurrent.clamp(1, dr_strange_mcp::DEFAULT_TOOL_CONCURRENCY)
+}
 
 /// The MCP endpoint (ROADMAP §10): the same [`DrStrange`] tool set
 /// `drsg-mcp` serves over stdio, mounted here over Streamable HTTP so several
@@ -176,17 +199,23 @@ const DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// the `digest` tool and `POST /rpc digest.run` obey the same `concurrency`
 /// and `chunk_chars` — an operator lowering `concurrency` to stay under a
 /// provider's rate limit should not find one of the two surfaces ignoring it.
-fn mcp_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+fn mcp_router(state: Arc<AppState>, max_concurrent: usize) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
         chunk_chars: state.digest.chunk_chars,
         concurrency: state.digest.concurrency,
     };
+    // One gate for the whole process, cloned into every session. Per-session
+    // would bound nothing: MCP puts no limit on how many sessions a client
+    // opens, so N sessions would multiply the ceiling by N.
+    let tools = Arc::new(tokio::sync::Semaphore::new(mcp_tool_concurrency(
+        max_concurrent,
+    )));
     let mut sessions = LocalSessionManager::default();
     sessions.session_config.keep_alive = Some(MCP_SESSION_IDLE);
     sessions.session_config.init_timeout = Some(MCP_SESSION_INIT);
     let service = StreamableHttpService::new(
-        move || Ok(DrStrange::with_digest(db.clone(), digest)),
+        move || Ok(DrStrange::with_digest(db.clone(), digest).with_tool_gate(tools.clone())),
         Arc::new(sessions),
         StreamableHttpServerConfig::default(),
     );
@@ -226,7 +255,7 @@ fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
-        .merge(mcp_router(state.clone()))
+        .merge(mcp_router(state.clone(), max_concurrent))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))

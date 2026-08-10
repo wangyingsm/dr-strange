@@ -137,15 +137,35 @@ defaults.)
 
 A host that exits cleanly sends `DELETE /mcp` and its session goes away at
 once. A host that is `SIGKILL`ed — an editor restarting its MCP child, say —
-sends nothing, so the server reclaims that session on a timer instead: **5
+sends nothing, so the server reclaims that session on a timer instead: **10
 minutes idle**, or **60 seconds** with no `initialize` after the session is
 created. The session's worker task, its `DrStrange`, and its buffered
 messages all go with it.
 
-What survives is one map entry per dead session — a session id and a closed
-handle, tens of bytes, never reused. On a server running for months with
-hosts crashing daily that is noise, not a leak worth restarting for; but if
-you are scripting sessions in a loop, close them and it stays exactly zero.
+The idle window is ten minutes rather than five for a specific reason: the
+transport counts a *running* tool as idle, because its keep-alive timer is only
+reset by traffic and a tool call sends nothing between dispatch and its result.
+On an otherwise quiet session, a tool that runs longer than the window is torn
+down mid-flight. Ten minutes clears any realistic `digest`; if you routinely run
+longer ones, keep the session busy or expect to retry.
+
+What survives a reclaim is one map entry per dead session. It is tens of bytes,
+but it is not inert: the next request on that session id is answered **500**
+rather than the **404** the spec calls for, so a client that would have
+re-initialized does not, and that session stays broken until the host restarts.
+Both of these are transport-level and fixed upstream rather than here. Closing
+sessions you script in a loop avoids the whole area.
+
+### Tool concurrency
+
+Tool calls are bounded separately from HTTP requests, at **16 at once** across
+the whole process (or `max_concurrent`, if that is lower). The two ceilings are
+not the same thing: `max_concurrent` counts requests, most of which are cheap,
+while every tool call is a full-graph scan, a bulk write, or an LLM-fanning
+digest. The transport also answers a tool call as soon as it is *queued*, so the
+request ceiling has already released the call before the work begins and cannot
+bound it. Excess calls queue rather than fail — a busy server makes an agent
+wait, it does not turn it away.
 
 ## The tools
 

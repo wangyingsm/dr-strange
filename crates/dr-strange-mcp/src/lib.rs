@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
 use anyhow::Result as AnyResult;
 use dr_strange_core::{
     Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions,
@@ -36,6 +38,8 @@ pub struct DrStrange {
     db: Arc<Database>,
     tool_router: ToolRouter<Self>,
     digest: DigestTuning,
+    /// Ceiling on tool bodies running at once — see [`DrStrange::with_tool_gate`].
+    tools: Arc<Semaphore>,
 }
 
 /// Digest knobs the host resolved, applied to the `digest` tool.
@@ -62,6 +66,13 @@ impl Default for DigestTuning {
     }
 }
 
+/// Tool bodies allowed to run at once when the host sets no explicit ceiling.
+///
+/// Every tool is a `spawn_blocking` unit of real work — a full-graph scan, a
+/// bulk write, an LLM-fanning digest — so the bound is deliberately far below
+/// the HTTP request ceiling, which counts cheap requests too.
+pub const DEFAULT_TOOL_CONCURRENCY: usize = 16;
+
 impl DrStrange {
     pub fn new(db: Arc<Database>) -> Self {
         Self::with_digest(db, DigestTuning::default())
@@ -72,7 +83,25 @@ impl DrStrange {
             db,
             tool_router: Self::tool_router(),
             digest,
+            tools: Arc::new(Semaphore::new(DEFAULT_TOOL_CONCURRENCY)),
         }
+    }
+
+    /// Share one tool-concurrency gate across every session.
+    ///
+    /// A host serving several sessions **must** pass the same `gate` to all of
+    /// them: the per-instance default bounds one session, and MCP puts no limit
+    /// on sessions, so an unshared gate bounds nothing in aggregate.
+    ///
+    /// Needed because the transport does not bound this. A tool call is
+    /// answered as soon as it is *queued* — `create_stream` returns after
+    /// `push_message`, so the HTTP response future resolves and tower's
+    /// concurrency permit is released before the tool body has run at all.
+    /// Without this gate an authenticated caller can pipeline unlimited
+    /// concurrent scans or digests and `max_concurrent` bounds none of them.
+    pub fn with_tool_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.tools = gate;
+        self
     }
 }
 
@@ -383,6 +412,15 @@ impl DrStrange {
     where
         F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
     {
+        // Held for the tool's whole body: this is the only thing bounding tool
+        // work, since the transport releases its own permit once the call is
+        // merely queued (see `with_tool_gate`). Queues rather than rejects — a
+        // busy server should make an agent wait, not fail it.
+        let _permit = self
+            .tools
+            .acquire()
+            .await
+            .map_err(|_| McpError::internal_error("tool gate closed", None))?;
         let db = self.db.clone();
         let joined = tokio::task::spawn_blocking(move || f(&db))
             .await
@@ -1108,8 +1146,58 @@ impl ServerHandler for DrStrange {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use serde_json::from_value;
+
+    /// Every tool body must pass the gate. Nothing else bounds them: the
+    /// transport answers a call as soon as it is queued, releasing its own
+    /// concurrency permit long before the work runs, so without this an
+    /// authenticated caller could pipeline unlimited scans and digests.
+    #[tokio::test]
+    async fn a_tool_cannot_run_while_the_gate_is_held() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let svc = DrStrange::new(db).with_tool_gate(gate.clone());
+
+        // Hold the only permit, as a tool already in flight would.
+        let held = gate.clone().acquire_owned().await.unwrap();
+        let blocked = tokio::time::timeout(Duration::from_millis(250), svc.list_planes()).await;
+        assert!(
+            blocked.is_err(),
+            "a tool ran while the gate was exhausted — nothing is bounding tool work"
+        );
+
+        // Releasing lets it through, so the gate queues rather than rejects:
+        // a busy server should make an agent wait, not fail it.
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), svc.list_planes())
+            .await
+            .expect("the tool should run once a permit frees")
+            .expect("list_planes");
+    }
+
+    /// The gate is only useful if every session shares one — MCP puts no limit
+    /// on how many sessions a client opens.
+    #[tokio::test]
+    async fn the_gate_is_shared_between_instances() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let a = DrStrange::new(db.clone()).with_tool_gate(gate.clone());
+        let b = DrStrange::new(db).with_tool_gate(gate.clone());
+
+        let held = gate.clone().acquire_owned().await.unwrap();
+        for (name, svc) in [("a", &a), ("b", &b)] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), svc.list_planes())
+                    .await
+                    .is_err(),
+                "session {name} ran a tool despite the shared gate being exhausted"
+            );
+        }
+        drop(held);
+    }
 
     /// A db with two keyed "Doc" nodes (embeddings on a line) and a CITES
     /// edge, plus a declared L2 index — mirrors the CLI/hybrid fixtures.
