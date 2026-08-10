@@ -52,6 +52,24 @@ $ drsg --db graph.drsg export --plane social > social.jsonl
 $ drsg --db graph.drsg get @ada --plane social
 ```
 
+节点的 `external_key` 是它在平面内的身份标识，因此 `--on-conflict` 决定了当导入的键
+已经存在时的处理方式：
+
+| 策略 | 效果 |
+|---|---|
+| `error`（默认） | 不导入任何内容，并列出发生冲突的键 |
+| `skip` | 保留已有节点，丢弃传入的那一行 |
+| `update` | 覆盖已有节点的属性；若该行带有 `labels`，一并覆盖标签 |
+
+```console
+$ drsg --db graph.drsg import nodes.jsonl --on-conflict update
+imported 0 nodes, 0 edges, 2 existing updated
+```
+
+在 `skip` 与 `update` 下，文件中的边仍会解析到平面中已存在的节点，因此关系可以挂载到
+既有数据上。边本身不带键，故总是追加写入——该策略约束的是节点身份，而非边的去重。
+没有 `external_key` 的行不可能发生冲突，始终会被插入。
+
 ## 查询
 
 一条语句既可以是 openCypher 子集，也可以是一个序列化的计划；两者均接受 `-` 以从标准

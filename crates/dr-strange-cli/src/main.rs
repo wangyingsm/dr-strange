@@ -52,6 +52,10 @@ enum Command {
         file: PathBuf,
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// What to do when a node's external key already exists in the plane:
+        /// `error` (default, writes nothing), `skip`, or `update`.
+        #[arg(long, value_enum, default_value = "error")]
+        on_conflict: commands::OnConflict,
     },
     /// Export a plane as JSONL.
     Export {
@@ -394,10 +398,14 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 PlaneCmd::Show { name } => commands::plane_show(&db, &name, out),
             }
         }
-        Command::Import { file, plane } => {
+        Command::Import {
+            file,
+            plane,
+            on_conflict,
+        } => {
             let db = commands::open(&cli.db)?;
             let reader = BufReader::new(std::fs::File::open(&file)?);
-            commands::import(&db, &plane, reader, out)
+            commands::import(&db, &plane, reader, on_conflict, out)
         }
         Command::Export { plane } => {
             let db = commands::open(&cli.db)?;

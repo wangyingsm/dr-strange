@@ -56,6 +56,26 @@ $ drsg --db graph.drsg export --plane social > social.jsonl
 $ drsg --db graph.drsg get @ada --plane social
 ```
 
+A node's `external_key` is its identity within a plane, so `--on-conflict`
+decides what happens when an imported key is already there:
+
+| Policy | Effect |
+|---|---|
+| `error` *(default)* | Import nothing and name the colliding keys |
+| `skip` | Keep the existing node; drop the incoming one |
+| `update` | Overwrite the existing node's properties, and its labels when the line carries them |
+
+```console
+$ drsg --db graph.drsg import nodes.jsonl --on-conflict update
+imported 0 nodes, 0 edges, 2 existing updated
+```
+
+Under `skip` and `update`, edges in the file still resolve to the node already
+in the plane, so relationships load against existing data. Edges themselves
+carry no key, so they are always appended — the policy governs node identity,
+not edge deduplication. Lines without an `external_key` cannot collide and are
+always inserted.
+
 ## Querying
 
 A statement may be the openCypher subset or a serialized plan; either accepts `-`

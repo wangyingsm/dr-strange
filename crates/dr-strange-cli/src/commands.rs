@@ -782,6 +782,28 @@ enum Ref {
     Id(u64),
 }
 
+/// What [`import`] does when an incoming node's external key already exists in
+/// the target plane.
+///
+/// This needs a policy at all because `bulk_load` is a trusting fast path: it
+/// rejects duplicates *within* a batch but does not check keys already in the
+/// plane. Unguarded, a re-import therefore wrote a second node under the same
+/// key — reachable by scan, invisible to `key(n) = …` (which resolves through
+/// the index to exactly one), and reported healthy by `drsg check`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnConflict {
+    /// Write nothing and report the offending keys. The default: a colliding
+    /// key usually means the same file was imported twice.
+    Error,
+    /// Keep the existing node as it is and drop the incoming one. Edges in the
+    /// file still resolve to the node already in the plane.
+    Skip,
+    /// Overwrite the existing node's properties from the incoming line, and
+    /// its labels when the line carries a non-empty `labels`. Properties the
+    /// line omits are left alone — soft schema, so absence is not a deletion.
+    Update,
+}
+
 /// Imports JSONL: each line is a node `{"id"?, "labels":[…], "external_key"?,
 /// "properties"?}` or an edge `{"src_key"|"src", "dst_key"|"dst", "type",
 /// "properties"?}` (an edge line is one carrying `type`).
@@ -795,6 +817,7 @@ pub fn import(
     db: &Database,
     plane_name: &str,
     reader: impl BufRead,
+    on_conflict: OnConflict,
     out: &mut dyn Write,
 ) -> Result<()> {
     let p = plane(db, plane_name)?;
@@ -850,34 +873,90 @@ pub fn import(
 
     let mut txn = p.write()?;
 
-    // Node phase (fast path): one batch, contiguous ids.
+    // Which incoming keys already exist. Done under the open write transaction
+    // so no other writer can land between the check and the load.
+    let mut conflicted: ahash::AHashMap<usize, NodeId> = ahash::AHashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        if let Some(key) = key
+            && let Some(node) = p.node_by_key(key)?
+        {
+            conflicted.insert(i, node.id);
+        }
+    }
+    if on_conflict == OnConflict::Error && !conflicted.is_empty() {
+        // Name a few rather than all: a doubled file collides on every line,
+        // and a thousand-key error message helps nobody.
+        let mut names: Vec<&str> = conflicted
+            .keys()
+            .filter_map(|&i| keys[i].as_deref())
+            .collect();
+        names.sort_unstable();
+        let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+        let more = names.len().saturating_sub(5);
+        let tail = if more > 0 {
+            format!(" (and {more} more)")
+        } else {
+            String::new()
+        };
+        bail!(
+            "{} external key(s) already exist in plane `{plane_name}`: {shown}{tail}. \
+             Nothing was imported — re-run with `--on-conflict skip` to keep the \
+             existing nodes, or `--on-conflict update` to overwrite them.",
+            names.len()
+        );
+    }
+
+    // Node phase (fast path): one batch, contiguous ids. Conflicting lines are
+    // held back so `bulk_load` keeps its fresh-keys precondition.
     let label_refs: Vec<Vec<&str>> = labels
         .iter()
         .map(|ls| ls.iter().map(String::as_str).collect())
         .collect();
-    let bnodes: Vec<BulkNode> = keys
+    let kept: Vec<usize> = (0..keys.len())
+        .filter(|i| !conflicted.contains_key(i))
+        .collect();
+    let bnodes: Vec<BulkNode> = kept
         .iter()
-        .zip(&label_refs)
-        .zip(node_props)
-        .map(|((k, lr), props)| BulkNode {
-            external_key: k.as_deref(),
-            labels: lr,
-            props,
+        .map(|&i| BulkNode {
+            external_key: keys[i].as_deref(),
+            labels: &label_refs[i],
+            props: std::mem::take(&mut node_props[i]),
         })
         .collect();
     let n_nodes = bnodes.len() as u64;
     let stats = txn.bulk_load(bnodes, Vec::new())?;
 
-    // Maps from this batch's identifiers to the freshly-assigned node ids.
+    // Maps from this batch's identifiers to the node ids edges must resolve to.
     let mut old_to_new = ahash::AHashMap::new();
     let mut key_to_new = ahash::AHashMap::new();
-    for i in 0..n_nodes as usize {
-        let id = NodeId(stats.node_start + i as u64);
+    for (n, &i) in kept.iter().enumerate() {
+        let id = NodeId(stats.node_start + n as u64);
         if let Some(o) = old_ids[i] {
             old_to_new.insert(o, id);
         }
         if let Some(k) = &keys[i] {
             key_to_new.insert(k.clone(), id);
+        }
+    }
+    // A skipped or updated line still names a real node, so edges in this file
+    // resolve to the one already in the plane rather than failing.
+    for (&i, &id) in &conflicted {
+        if let Some(o) = old_ids[i] {
+            old_to_new.insert(o, id);
+        }
+        if let Some(k) = &keys[i] {
+            key_to_new.insert(k.clone(), id);
+        }
+    }
+    if on_conflict == OnConflict::Update {
+        for (&i, &id) in &conflicted {
+            for (key, prop) in std::mem::take(&mut node_props[i]) {
+                txn.set_prop(id, &key, prop)?;
+            }
+            if !labels[i].is_empty() {
+                let ls: Vec<&str> = labels[i].iter().map(String::as_str).collect();
+                txn.set_labels(id, &ls)?;
+            }
         }
     }
 
@@ -894,13 +973,27 @@ pub fn import(
     let n_edges = txn.bulk_load_edges(bedges)?;
 
     txn.commit()?;
+    // Report the collisions rather than folding them into the node count: a
+    // silent "imported 2 nodes" after skipping both is how you end up trusting
+    // an import that did nothing.
+    let (verb, n_conflicted) = match on_conflict {
+        OnConflict::Skip => ("skipped", conflicted.len()),
+        OnConflict::Update => ("updated", conflicted.len()),
+        OnConflict::Error => ("skipped", 0),
+    };
     tracing::info!(
         plane = plane_name,
         nodes = n_nodes,
         edges = n_edges,
+        existing = n_conflicted,
         "imported JSONL into plane",
     );
-    writeln!(out, "imported {n_nodes} nodes, {n_edges} edges")?;
+    let tail = if n_conflicted > 0 {
+        format!(", {n_conflicted} existing {verb}")
+    } else {
+        String::new()
+    };
+    writeln!(out, "imported {n_nodes} nodes, {n_edges} edges{tail}")?;
     Ok(())
 }
 
@@ -1040,8 +1133,80 @@ mod tests {
 
     fn loaded() -> Database {
         let db = Database::in_memory().unwrap();
-        cap(|out| import(&db, "startup", SAMPLE.as_bytes(), out));
+        cap(|out| import(&db, "startup", SAMPLE.as_bytes(), OnConflict::Error, out));
         db
+    }
+
+    /// Re-importing used to write a second node under the same external key:
+    /// `bulk_load` rejects in-batch duplicates but does not check the plane, so
+    /// the copy was reachable by scan, invisible to `key(n) = …` (which
+    /// resolves through the index to exactly one node), and `drsg check` called
+    /// the database healthy. Failing loudly is the default.
+    #[test]
+    fn re_import_fails_instead_of_duplicating() {
+        let db = loaded();
+        let err = import(
+            &db,
+            "startup",
+            SAMPLE.as_bytes(),
+            OnConflict::Error,
+            &mut Vec::new(),
+        )
+        .expect_err("a colliding key must not be written");
+        let msg = err.to_string();
+        assert!(msg.contains("already exist"), "unhelpful: {msg}");
+        assert!(msg.contains("p1"), "should name the key: {msg}");
+        assert!(
+            msg.contains("--on-conflict"),
+            "should say how to proceed: {msg}"
+        );
+        // And nothing was written: the count is unchanged.
+        assert!(cap(|o| stats(&db, o)).contains("2 nodes"));
+    }
+
+    #[test]
+    fn skip_keeps_the_existing_node_and_still_resolves_edges() {
+        let db = loaded();
+        let changed = SAMPLE.replace("\"year\":2020", "\"year\":1999");
+        let out = cap(|o| import(&db, "startup", changed.as_bytes(), OnConflict::Skip, o));
+        assert!(out.contains("0 nodes"), "no node should be written: {out}");
+        assert!(out.contains("2 existing skipped"), "{out}");
+
+        // The existing node is untouched...
+        assert!(cap(|o| get(&db, "startup", "@p1", o)).contains("\"year\":2020"));
+        // ...and the file's edge line still resolved against it rather than
+        // failing to find its endpoints. Edges carry no external key, so there
+        // is no identity to skip on and the CITES edge is written again: the
+        // node conflict policy deliberately does not imply edge dedup.
+        assert!(cap(|o| stats(&db, o)).contains("1 planes, 2 nodes, 2 edges"));
+    }
+
+    #[test]
+    fn update_overwrites_properties_of_the_existing_node() {
+        let db = loaded();
+        let changed = SAMPLE
+            .replace("\"year\":2020", "\"year\":1999")
+            .replace(r#""labels":["Paper"]"#, r#""labels":["Paper","Retracted"]"#);
+        let out = cap(|o| import(&db, "startup", changed.as_bytes(), OnConflict::Update, o));
+        assert!(out.contains("2 existing updated"), "{out}");
+
+        let got = cap(|o| get(&db, "startup", "@p1", o));
+        assert!(got.contains("\"year\":1999"), "property not updated: {got}");
+        assert!(got.contains("Retracted"), "labels not updated: {got}");
+        // Still one node per key — an update must not fork the identity.
+        assert!(cap(|o| stats(&db, o)).contains("2 nodes"));
+    }
+
+    /// A line with no external key cannot collide, so it is always inserted —
+    /// including on a re-import under the default policy.
+    #[test]
+    fn keyless_lines_never_conflict() {
+        let db = Database::in_memory().unwrap();
+        let keyless = concat!(r#"{"labels":["Note"],"properties":{"n":1}}"#, "\n");
+        for _ in 0..2 {
+            cap(|o| import(&db, "startup", keyless.as_bytes(), OnConflict::Error, o));
+        }
+        assert!(cap(|o| stats(&db, o)).contains("2 nodes"));
     }
 
     #[test]
@@ -1143,7 +1308,7 @@ mod tests {
             "\n",
         );
         let db = Database::in_memory().unwrap();
-        cap(|o| import(&db, "startup", jsonl.as_bytes(), o));
+        cap(|o| import(&db, "startup", jsonl.as_bytes(), OnConflict::Error, o));
         let p = db.plane("startup").unwrap();
         let a = p.node_by_key("a").unwrap().unwrap();
         let b = p.node_by_key("b").unwrap().unwrap();
@@ -1290,7 +1455,7 @@ mod tests {
         let dumped = cap(|o| export(&db, "startup", o));
         // nodes carry keys; the re-import resolves the edge by src_key/dst_key
         let db2 = Database::in_memory().unwrap();
-        cap(|o| import(&db2, "startup", dumped.as_bytes(), o));
+        cap(|o| import(&db2, "startup", dumped.as_bytes(), OnConflict::Error, o));
         assert!(cap(|o| stats(&db2, o)).contains("2 nodes, 1 edges"));
     }
 

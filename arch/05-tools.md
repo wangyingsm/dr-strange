@@ -75,7 +75,23 @@ document (the plane model's intended usage, [09-planes.md](09-planes.md)).
    is the shell one-liner the stopgap syntax was for. `drsg query` keeps taking
    plan JSON, for generated plans and for debugging the compiler's output.
 2. Watch/REPL mode (`drsg shell`) — worth it in v1, or wait for the QL?
-3. Import dedup policy flag (`--on-conflict skip|update|error` by external
-   key) — decide with the first real ingest corpus.
+3. ~~Import dedup policy flag (`--on-conflict skip|update|error` by external
+   key) — decide with the first real ingest corpus.~~ **Resolved: shipped, and
+   it was a correctness fix rather than a convenience.** `bulk_load` is a
+   trusting fast path — it rejects duplicates *within* a batch but does not
+   check keys already in the plane — so an unguarded re-import wrote a second
+   node under the same external key. The copy was reachable by scan, invisible
+   to `key(n) = …` (which resolves through the index to exactly one node), and
+   `drsg check` reported the database healthy: the same silent-divergence
+   signature as the multi-process bug fixed in v1.4.2. `error` is the default
+   because a colliding key almost always means the same file was imported
+   twice. Under `skip`/`update` the file's edges still resolve to the node
+   already in the plane; edges carry no key, so the policy governs node
+   identity only and they are always appended.
+
+   Note the same hazard exists wherever else `bulk_load` takes untrusted
+   input — the `write_nodes` RPC and `digest`'s entity writes — which is a
+   separate decision: bounding it inside `bulk_load` would cost the fast path
+   a lookup per key, and that path is a headline benchmark.
 4. ~~`digest` detailed design — deferred (see §3).~~ **Resolved: shipped** as
    AIgest's three passes (ROADMAP §8), extended to read URLs in §9.
