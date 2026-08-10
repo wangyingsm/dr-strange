@@ -20,6 +20,11 @@ use crate::provider::{Chat, ChatReply, EmbedReply, Embedder, OutputTruncated};
 /// JSON is not cut off mid-object (which yields unparseable output). Chunks are
 /// size-bounded upstream, so this is rarely the binding limit; it also fits the
 /// preset models' output caps (deepseek-chat / qwen-plus are 8K).
+///
+/// Reasoning models (e.g. DeepSeek-v4-flash) are handled by `reasoning_effort:
+/// "none"` in [`Chat::complete`], not by shrinking this — their thinking tokens
+/// used to fill 8192 and truncate the JSON, but disabling reasoning keeps the
+/// output to clean structured JSON well under any of these caps.
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
 /// Ceiling on one provider round-trip. Long enough for a slow model writing a
@@ -95,6 +100,12 @@ pub struct OpenAiProvider {
     /// Max texts per embeddings request. OpenAI accepts large batches; some
     /// providers (DashScope/Qwen) cap it, so it's configurable.
     embed_batch: usize,
+    /// Optional `reasoning_effort` sent on chat completions. Reasoning models
+    /// (e.g. DeepSeek-v4-flash) emit long thinking tokens that fill the output
+    /// cap and truncate the structured JSON dr-strange needs; setting this to
+    /// "none" disables them. `None` (the default) sends nothing, keeping
+    /// behavior unchanged for providers that don't need it.
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -108,12 +119,20 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             model: model.into(),
             embed_batch: 256,
+            reasoning_effort: None,
         }
     }
 
     /// Cap embeddings requests at `n` texts each (default 256).
     pub fn with_embed_batch(mut self, n: usize) -> Self {
         self.embed_batch = n.max(1);
+        self
+    }
+
+    /// Set the `reasoning_effort` sent on chat completions ("none" disables
+    /// reasoning for models like DeepSeek-v4-flash). Default: not sent.
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
         self
     }
 
@@ -207,20 +226,34 @@ impl OpenAiProvider {
     }
 }
 
+impl OpenAiProvider {
+    /// The `chat/completions` request body. Split out from [`Chat::complete`]
+    /// so the optional-field logic is assertable without a provider on the
+    /// other end of a socket.
+    fn chat_body(&self, system: &str, user: &str) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        });
+        // Reasoning models (e.g. DeepSeek-v4-flash) emit long thinking tokens
+        // that fill the output cap and truncate the structured JSON dr-strange
+        // needs. `with_reasoning_effort("none")` opts into disabling them; when
+        // unset we send nothing and keep the provider's default behavior.
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = Value::String(effort.clone());
+        }
+        body
+    }
+}
+
 impl Chat for OpenAiProvider {
     fn complete(&self, system: &str, user: &str) -> Result<ChatReply> {
-        let v = self.post(
-            "chat/completions",
-            json!({
-                "model": self.model,
-                "temperature": 0,
-                "max_tokens": MAX_OUTPUT_TOKENS,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user },
-                ],
-            }),
-        )?;
+        let v = self.post("chat/completions", self.chat_body(system, user))?;
         let choice = &v["choices"][0];
         // A truncated reply (hit the output cap) is unparseable JSON — surface
         // the real cause instead of a confusing "not valid extraction JSON".
@@ -278,6 +311,24 @@ mod tests {
         for s in [400, 401, 403, 404, 422] {
             assert!(!worth_retrying(s), "{s} must not be retried");
         }
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_when_asked_for() {
+        let p = OpenAiProvider::new("http://example.invalid/v1", "k", "m");
+        // Unset is not the same as "none": a provider that has no such field
+        // must see no such field, or every non-reasoning model gets a request
+        // it did not have before.
+        assert!(p.chat_body("s", "u").get("reasoning_effort").is_none());
+
+        let p = p.with_reasoning_effort("none");
+        assert_eq!(p.chat_body("s", "u")["reasoning_effort"], json!("none"));
+        // The rest of the body is untouched by the option.
+        assert_eq!(
+            p.chat_body("s", "u")["max_tokens"],
+            json!(MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(p.chat_body("s", "u")["messages"][1]["content"], json!("u"));
     }
 
     #[test]
