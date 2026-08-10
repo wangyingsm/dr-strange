@@ -1363,6 +1363,26 @@ fn llm_err(e: anyhow::Error) -> RpcError {
     RpcError::server(e.to_string())
 }
 
+/// Build an LLM provider from a `chat`/`embed` spec: either a preset name
+/// (`openai`, `deepseek`, `qwen`, `ollama`) or a raw base URL to any
+/// OpenAI-compatible endpoint. `key_env` names the environment variable the
+/// server reads the key from — the key itself never travels in params; for a
+/// preset it defaults to that preset's own key env, as before.
+fn build_provider_flexible(
+    spec: &str,
+    model: Option<&str>,
+    key_env: Option<&str>,
+    embed: bool,
+) -> Result<dr_strange_llm::OpenAiProvider, RpcError> {
+    if spec.contains("://") {
+        // A raw base URL: empty preset name + explicit url. `build_provider`
+        // falls back to the url when the preset resolves to None.
+        dr_strange_llm::build_provider("", model, Some(spec), key_env, embed).map_err(llm_err)
+    } else {
+        dr_strange_llm::build_provider(spec, model, None, key_env, embed).map_err(llm_err)
+    }
+}
+
 #[derive(Deserialize)]
 pub struct DigestRun {
     /// Target plane — only read here, to retrieve existing entities as reuse
@@ -1370,14 +1390,26 @@ pub struct DigestRun {
     plane: String,
     /// The document text to digest.
     text: String,
+    /// Chat provider: a preset name (openai/deepseek/qwen/ollama) or a raw
+    /// base URL to any OpenAI-compatible endpoint (default `openai`).
     #[serde(default)]
     chat: Option<String>,
+    /// Embedding provider: preset name or base URL (defaults to `chat`).
     #[serde(default)]
     embed: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     embed_model: Option<String>,
+    /// Name of the environment variable holding the chat API key. For a preset
+    /// this defaults to that preset's own key env; for a raw base URL it is
+    /// required when the endpoint needs a key. The key itself never travels in
+    /// params — only the name of the variable the server reads it from.
+    #[serde(default)]
+    key_env: Option<String>,
+    /// The same, for the embedding provider.
+    #[serde(default)]
+    embed_key_env: Option<String>,
     #[serde(default)]
     source: Option<String>,
     #[serde(default)]
@@ -1412,18 +1444,19 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
-    let chat =
-        dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
-            .map_err(llm_err)?;
+    let chat = build_provider_flexible(
+        chat_provider,
+        req.model.as_deref(),
+        req.key_env.as_deref(),
+        false,
+    )?;
     let chat_model = chat.model().to_string();
-    let embedder = dr_strange_llm::build_provider(
+    let embedder = build_provider_flexible(
         embed_provider,
         req.embed_model.as_deref(),
-        None,
-        None,
+        req.embed_key_env.as_deref(),
         embed,
-    )
-    .map_err(llm_err)?;
+    )?;
 
     let opts = dr_strange_llm::DigestOptions {
         source: req.source.unwrap_or_else(|| "web-digest".into()),
