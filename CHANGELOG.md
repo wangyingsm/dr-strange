@@ -4,7 +4,7 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - 2026-08-10
 
 ### Added
 - **`drsg serve` now hosts the MCP tool set at `POST /mcp`** (ROADMAP §10),
@@ -20,6 +20,38 @@ All notable changes to Dr Strange are documented here. The format is based on
   of the authenticated surface. `drsg-mcp` itself is unchanged: it keeps its
   embedded stdio-only mode, since a host that wants the shared server can
   point its MCP client straight at the URL.
+- **String predicates and membership in the query language.** `CONTAINS`,
+  `STARTS WITH`, `ENDS WITH` — byte-wise like `=`, with non-string scalars
+  promoted to text, so `d.year STARTS WITH "20"` matches whether `year` was
+  stored as `2026` or `"2026"`. `IN` now also tests a value the row supplies:
+  `"graph" IN d.tags` for a list property, or a map by key. It stays separate
+  from `CONTAINS` because "list contains x" reads as either element-equality or
+  substring, and openCypher splits them the same way.
+- **A bound on how long a write waits for the writer slot.** `drsg serve` waits
+  30s by default (`[server] write_timeout_secs`, `0` for forever) and answers
+  JSON-RPC `-32002` — distinct from `-32000` because it is the one error worth
+  retrying unchanged. Embedded callers are unaffected:
+  `Database::set_write_timeout` is opt-in and still defaults to waiting.
+
+### Changed
+- **MCP tool calls are capped at 16 concurrent** (or `max_concurrent`, if
+  lower); the excess queues. The request ceiling could not bound them — the
+  transport answers a call as soon as it is *queued*, releasing its permit
+  before the work starts.
+- **MCP session idle window: 5 → 10 minutes.** The transport counts a *running*
+  tool as idle, so a long `digest` on a quiet session was torn down mid-flight.
+
+### Fixed
+- **`drsg import` silently duplicated nodes whose external key already
+  existed.** The bulk path rejects duplicates within a batch but never checked
+  the plane, so a 2-node file imported twice left 4 nodes under 2 keys — the
+  copy invisible to `key(n) = …`, with `drsg check` calling the database
+  healthy. Import now refuses by default and names the keys; `--on-conflict
+  skip` keeps the existing node, `update` overwrites its properties. This
+  changes behaviour for anyone re-importing.
+- **Ctrl-C could hang `drsg serve` while an agent host was attached.** The
+  plain-HTTP listener drained without a deadline while the TLS path capped it at
+  10s, and `/mcp`'s SSE stream never goes idle. Both now share one deadline.
 
 ## [1.5.0] - 2026-08-09
 
@@ -326,7 +358,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.6.0
 [1.5.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.5.0
 [1.2.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.2.0
 [1.1.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.1.0
