@@ -13,17 +13,24 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::{ChangeSet, Database, PlaneId};
+use dr_strange_mcp::DrStrange;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceBuilder;
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::ServeOptions;
@@ -123,6 +130,75 @@ fn resolve_credentials(
     })
 }
 
+/// Gates `/mcp` the same way `cypher_http` gates `/cypher`: **write** level,
+/// since several tools mutate (`write_nodes`, `digest` with `apply`, …) and
+/// the v1 single-token model doesn't distinguish finer than that (ROADMAP
+/// §10 "Authentication" — a per-tool split is future work). Runs as an axum
+/// middleware, not a handler check, because the `/mcp` route is a raw tower
+/// service ([`StreamableHttpService`]) with no handler body of its own to put
+/// the check in.
+async fn mcp_auth(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let creds = match resolve_credentials(&state, request.headers(), None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Write, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    next.run(request).await
+}
+
+/// How long an MCP session may sit idle before the server tears it down. A
+/// host that is SIGKILLed (an editor restarting its MCP child is routine)
+/// never sends `DELETE /mcp`, so without this its session worker, its
+/// [`DrStrange`], and its buffered SSE messages would live as long as the
+/// process — and this endpoint exists precisely to be a long-running shared
+/// server. Pinned rather than inherited from `SessionConfig::default()` so
+/// the deployment shape stops depending on an upstream default.
+const MCP_SESSION_IDLE: Duration = Duration::from_secs(300);
+/// How long a session may exist before its `initialize` must arrive. Bounds
+/// the same leak for a connection that opens and then goes silent.
+const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
+
+/// The MCP endpoint (ROADMAP §10): the same [`DrStrange`] tool set
+/// `drsg-mcp` serves over stdio, mounted here over Streamable HTTP so several
+/// agent hosts can share this process's `Database` instead of each opening
+/// the file directly. One [`DrStrange`] instance per MCP session — cheap,
+/// since all real state lives in the shared `Arc<Database>` each clone
+/// points at; `write_gate` inside it, not anything here, is what serializes
+/// concurrent writers.
+///
+/// The digest tuning resolved from `[digest]` is handed to every session, so
+/// the `digest` tool and `POST /rpc digest.run` obey the same `concurrency`
+/// and `chunk_chars` — an operator lowering `concurrency` to stay under a
+/// provider's rate limit should not find one of the two surfaces ignoring it.
+fn mcp_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    let db = state.db.clone();
+    let digest = dr_strange_mcp::DigestTuning {
+        chunk_chars: state.digest.chunk_chars,
+        concurrency: state.digest.concurrency,
+    };
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(MCP_SESSION_IDLE);
+    sessions.session_config.init_timeout = Some(MCP_SESSION_INIT);
+    let service = StreamableHttpService::new(
+        move || Ok(DrStrange::with_digest(db.clone(), digest)),
+        Arc::new(sessions),
+        StreamableHttpServerConfig::default(),
+    );
+    Router::new()
+        .route_service("/mcp", service)
+        // `DefaultBodyLimit` cannot cover this route: axum implements it as a
+        // request extension that only extractors calling `with_limited_body`
+        // consult, and `route_service` hands the raw `Request<Body>` to
+        // `StreamableHttpService`, which buffers it itself. Limiting the body
+        // rather than the extractor is what actually bounds it — otherwise an
+        // authenticated caller can POST gigabytes here that `/rpc` would have
+        // refused at 64 MiB, and OOM the process holding the database.
+        .route_layer(RequestBodyLimitLayer::new(MAX_BODY))
+        .route_layer(middleware::from_fn_with_state(state, mcp_auth))
+}
+
 fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -146,6 +222,7 @@ fn router(state: Arc<AppState>, max_concurrent: usize) -> Router {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
+        .merge(mcp_router(state.clone()))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
