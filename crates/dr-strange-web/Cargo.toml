@@ -34,9 +34,10 @@ dr-strange-mcp = { path = "../dr-strange-mcp", default-features = false }
 dr-strange-parser.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 # Streamable HTTP MCP transport for `/mcp` (ROADMAP §10). `server` pulls in
-# the tool macros dr-strange-mcp's `DrStrange` needs; `transport-io` (stdio)
-# stays out — that's `drsg-mcp`'s transport, not this one's.
-rmcp = { version = "2.2.0", features = ["server", "transport-streamable-http-server"] }
+# the tool macros dr-strange-mcp's `DrStrange` needs. Version comes from the
+# workspace: this crate and dr-strange-mcp exchange rmcp types, so the two must
+# resolve to one build of it.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 # Native TLS for `drsg serve` (arch/08). axum-server drives the accept loop with
 # a rustls acceptor; `no-provider` + an explicit `ring` provider keeps the build
 # off the aws-lc-rs C toolchain.
@@ -82,4 +83,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 # A real MCP client, to drive /mcp end-to-end in tests/mcp.rs the way an
 # agent host actually would, not just over raw HTTP.
-rmcp = { version = "2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }

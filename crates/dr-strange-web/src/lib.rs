@@ -19,6 +19,7 @@ mod server;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use dr_strange_core::Database;
 
@@ -44,6 +45,14 @@ pub struct ServeOptions {
     pub digest: DigestDefaults,
     /// Policy and budgets for the URL fetcher (ROADMAP §9).
     pub fetch: FetchDefaults,
+    /// How long a write transaction waits for the single writer slot before
+    /// failing with a retryable timeout; `None` waits forever.
+    ///
+    /// Bounded here, unlike an embedded `Database`, because a server has other
+    /// clients: one long `bulk_load` or `digest` holds the slot for its whole
+    /// transaction, and an unbounded wait would leave every other writer
+    /// blocked with nothing to report.
+    pub write_timeout: Option<Duration>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -120,15 +129,23 @@ impl Default for ServeOptions {
             tls: None,
             digest: DigestDefaults::default(),
             fetch: FetchDefaults::default(),
+            write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
         }
     }
 }
+
+/// Long enough that an ordinary import or digest is waited out, short enough
+/// that a client learns the writer is busy rather than hanging on it.
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serves `db` (whose file lives at `db_path`, if on disk) per `opts` until a
 /// shutdown signal (Ctrl-C / SIGTERM). Synchronous: it owns a multi-threaded
 /// tokio runtime internally so the sync `drsg` CLI can call it without being
 /// async itself.
 pub fn serve(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
+    // Applied before the first request: unlike an embedded caller, this process
+    // has several clients competing for the one writer slot.
+    db.set_write_timeout(opts.write_timeout);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

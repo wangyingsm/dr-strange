@@ -87,6 +87,10 @@ pub struct ServerCfg {
     pub token: Option<String>,
     /// Ceiling on requests in flight at once.
     pub max_concurrent: Option<usize>,
+    /// How long a write waits for the single writer slot before returning a
+    /// retryable timeout. `0` waits forever (the embedded default); omitted
+    /// means 30s.
+    pub write_timeout_secs: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
     /// TLS certificate/key; when present, `serve` speaks HTTPS.
@@ -170,6 +174,11 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     }
     if let Some(max_concurrent) = cfg.server.max_concurrent {
         opts.max_concurrent = max_concurrent;
+    }
+    if let Some(secs) = cfg.server.write_timeout_secs {
+        // 0 means "wait forever", matching the core's own encoding — an
+        // operator who wants the embedded behaviour back can ask for it.
+        opts.write_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {

@@ -15,6 +15,11 @@ addr = "0.0.0.0:7700"
 token = "change-me"
 # Maximum requests processed at once; excess requests queue. Default 1024.
 max_concurrent = 1024
+# How long a write waits for the single writer slot before failing with a
+# retryable timeout (JSON-RPC -32002). One process holds the database, so a long
+# bulk import or digest blocks every other writer while it runs; a bound turns
+# that into an answer instead of a hang. Default 30. Set 0 to wait forever.
+write_timeout_secs = 30
 # Extra browser origins allowed past the CSRF guard (→ DRSG_ALLOWED_ORIGINS).
 allowed_origins = ["https://app.example.com"]
 

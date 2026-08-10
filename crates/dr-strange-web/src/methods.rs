@@ -40,7 +40,12 @@ fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
 /// Core errors are the caller's fault far more often than ours (unknown plane,
 /// bad plan), so they ride the server-error code, not `-32603 internal`.
 fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
-    r.map_err(|e| RpcError::server(e.to_string()))
+    r.map_err(|e| match e {
+        // The one core error a client should retry unchanged rather than treat
+        // as its own fault: it never got the writer, so nothing was attempted.
+        dr_strange_core::Error::Timeout(_) => RpcError::timeout(e.to_string()),
+        _ => RpcError::server(e.to_string()),
+    })
 }
 
 /// Optional time-travel address on a read request (ROADMAP §4): pin the read to

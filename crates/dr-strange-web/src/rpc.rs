@@ -57,6 +57,15 @@ impl RpcError {
             "unauthorized: set DRSG_TOKEN and send it as `Authorization: Bearer <token>` (WebSocket: `?token=<token>`)",
         )
     }
+    /// A bounded wait expired — currently only the write-transaction slot, held
+    /// by another client's long write. Distinct from `-32000` because it is the
+    /// one server error that is *worth retrying unchanged*: nothing was
+    /// attempted and the request was not wrong. An agent that cannot tell the
+    /// two apart either retries what will never succeed or gives up on what
+    /// would have.
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::new(-32002, msg)
+    }
 
     fn to_value(&self) -> Value {
         let mut obj = json!({ "code": self.code, "message": self.message });

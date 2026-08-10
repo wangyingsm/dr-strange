@@ -3,14 +3,15 @@
   "info": {
     "title": "dr-strange JSON-RPC",
     "version": "0.1.0",
-    "description": "The wire protocol served by `drsg serve` (arch/08). Every method maps 1:1 to the core API. This document is the source of truth for the language SDKs and doubles as the RPC reference; the server returns it verbatim from `rpc.discover`.\n\nAuth: the whole surface is authenticated. Send the shared token as `Authorization: Bearer <DRSG_TOKEN>` over HTTP (or `?token=` on the WebSocket). With no token configured on the server, only the same-origin browser UI may call it. An unauthenticated call fails with error code -32001.\n\nEach method carries an `x-access` tag (read | write | admin): the tier a scoped key would need. Under the single shared token all three tiers require the same token.",
+    "description": "The wire protocol served by `drsg serve` (arch/08). Every method maps 1:1 to the core API. This document is the source of truth for the language SDKs and doubles as the RPC reference; the server returns it verbatim from `rpc.discover`.\n\nAuth: the whole surface is authenticated. Send the shared token as `Authorization: Bearer <DRSG_TOKEN>` over HTTP (or `?token=` on the WebSocket). With no token configured on the server, only the same-origin browser UI may call it. An unauthenticated call fails with error code -32001.\n\nEach method carries an `x-access` tag (read | write | admin): the tier a scoped key would need. Under the single shared token all three tiers require the same token.\n\nA write may fail with -32002 when it waited out `[server] write_timeout_secs` for the single writer slot, which one long import or digest can hold. It is the one error worth retrying unchanged: nothing was attempted and the request was not wrong.",
     "x-error-codes": {
       "-32700": "parse error",
       "-32600": "invalid request",
       "-32601": "method not found",
       "-32602": "invalid params",
       "-32000": "application error (bad plane, dangling edge endpoint, conflict, \u2026)",
-      "-32001": "unauthorized (missing or invalid credential)"
+      "-32001": "unauthorized (missing or invalid credential)",
+      "-32002": "write timed out waiting for the writer slot (retryable)"
     },
     "x-websocket": {
       "description": "The `/ws` endpoint answers these request/response methods AND a change-feed subscription (ROADMAP \u00a75). Send `plane.watch` to start receiving `plane.change` notifications for a plane; `plane.unwatch` to stop. Best-effort: a subscriber that falls too far behind drops events. These are WebSocket-only (not in the HTTP dispatch table).",

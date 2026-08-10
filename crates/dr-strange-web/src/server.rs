@@ -160,6 +160,10 @@ const MCP_SESSION_IDLE: Duration = Duration::from_secs(300);
 /// the same leak for a connection that opens and then goes silent.
 const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
 
+/// How long shutdown waits for in-flight connections before giving up. Both
+/// listeners use it, so Ctrl-C behaves the same with and without TLS.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
 /// The MCP endpoint (ROADMAP §10): the same [`DrStrange`] tool set
 /// `drsg-mcp` serves over stdio, mounted here over Streamable HTTP so several
 /// agent hosts can share this process's `Database` instead of each opening
@@ -651,9 +655,33 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         Some(tls) => serve_tls(app, std_listener, tls).await,
         None => {
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            // Bound the drain, as the TLS path already does. `axum::serve`
+            // waits for in-flight connections forever, and `/mcp` holds a
+            // standalone SSE stream for the life of an agent session with a
+            // 15s keep-alive, so it is never idle and its body never ends: an
+            // attached editor would leave Ctrl-C hanging indefinitely. Worse
+            // since 1.4.2, because the database lock is held for the process's
+            // lifetime, so no replacement can start until this one dies.
+            let (fired_tx, fired_rx) = tokio::sync::oneshot::channel();
+            let serve = std::future::IntoFuture::into_future(
+                axum::serve(listener, app).with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    let _ = fired_tx.send(());
+                }),
+            );
+            tokio::pin!(serve);
+            tokio::select! {
+                res = &mut serve => res?,
+                _ = async move {
+                    let _ = fired_rx.await;
+                    tokio::time::sleep(DRAIN_GRACE).await;
+                } => {
+                    tracing::warn!(
+                        grace = ?DRAIN_GRACE,
+                        "connections still open after the drain deadline; exiting anyway"
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -687,7 +715,7 @@ async fn serve_tls(
         let handle = handle.clone();
         async move {
             shutdown_signal().await;
-            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            handle.graceful_shutdown(Some(DRAIN_GRACE));
         }
     });
     axum_server::from_tcp_rustls(listener, config)?
