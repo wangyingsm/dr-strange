@@ -204,6 +204,11 @@ struct Hybrid {
     /// Embedding provider for the vector channel (key from the server env).
     #[serde(default)]
     provider: Option<String>,
+    /// Name of the environment variable the server reads the provider key
+    /// from. A preset defaults to its own; a base URL has none, so name it
+    /// here when the endpoint needs a key. The key never travels in params.
+    #[serde(default)]
+    key_env: Option<String>,
     #[serde(default)]
     embed_model: Option<String>,
 }
@@ -226,12 +231,20 @@ struct Ask {
     /// Chat provider (preset or base URL); key from the server env.
     #[serde(default)]
     provider: Option<String>,
+    /// Name of the environment variable the server reads the chat key from. A
+    /// preset defaults to its own; a base URL has none, so name it here when
+    /// the endpoint needs a key. The key never travels in params.
+    #[serde(default)]
+    key_env: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// Embedding provider for the find_edge/find_entity grounding tools (should
     /// match how the plane was embedded). Omit to disable them (schema only).
     #[serde(default)]
     embed_provider: Option<String>,
+    /// The same, for the embedding provider.
+    #[serde(default)]
+    embed_key_env: Option<String>,
     #[serde(default)]
     embed_model: Option<String>,
 }
@@ -253,6 +266,14 @@ struct Digest {
     /// Embedding provider preset or base URL (defaults to the chat provider).
     #[serde(default)]
     embed: Option<String>,
+    /// Name of the environment variable the server reads the chat key from. A
+    /// preset defaults to its own; a base URL has none, so name it here when
+    /// the endpoint needs a key. The key never travels in params.
+    #[serde(default)]
+    key_env: Option<String>,
+    /// The same, for the embedding provider.
+    #[serde(default)]
+    embed_key_env: Option<String>,
     /// Chat model override.
     #[serde(default)]
     model: Option<String>,
@@ -328,6 +349,15 @@ struct Cypher {
     /// the server environment supplies the key. Defaults to `openai`.
     #[serde(default)]
     embed: Option<String>,
+    /// Name of the environment variable the server reads the embedding key
+    /// from. A preset defaults to its own; a base URL has none, so name it
+    /// here when the endpoint needs a key. The key never travels in params.
+    #[serde(default)]
+    embed_key_env: Option<String>,
+    /// Embedding model. A preset supplies its own; a base URL has none, so it
+    /// is required there for a text `SEARCH … NEAR "…"`.
+    #[serde(default)]
+    embed_model: Option<String>,
     /// Values for `$name` placeholders in the query, e.g. `{"min": 18}`.
     #[serde(default)]
     params: serde_json::Map<String, Value>,
@@ -615,7 +645,7 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
             provider,
             req.embed_model.as_deref(),
             None,
-            None,
+            req.key_env.as_deref(),
             true,
         )?);
         let reply = embedder.embed(std::slice::from_ref(&req.query))?;
@@ -662,9 +692,22 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
 fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
     let provider = req.provider.as_deref().unwrap_or("openai");
-    let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)?;
+    let chat = dr_strange_llm::build_provider(
+        provider,
+        req.model.as_deref(),
+        None,
+        req.key_env.as_deref(),
+        false,
+    )?;
     let embedder = req.embed_provider.as_deref().and_then(|ep| {
-        dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
+        dr_strange_llm::build_provider(
+            ep,
+            req.embed_model.as_deref(),
+            None,
+            req.embed_key_env.as_deref(),
+            true,
+        )
+        .ok()
     });
     let opts = dr_strange_llm::AskOptions {
         max_attempts: req.max_attempts.unwrap_or(20),
@@ -743,9 +786,21 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> AnyResult
 
 fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     let provider = req.embed.as_deref().unwrap_or("openai");
-    let embedder = dr_strange_llm::build_provider(provider, None, None, None, true)
-        .ok()
-        .map(|p| LlmEmbedder(Box::new(p)));
+    // Built eagerly because the parser needs it up front, but tolerantly: most
+    // queries never embed anything, and a plain MATCH must not require a
+    // provider. The reason is kept rather than dropped — without it a query
+    // that *does* need an embedder reports only "needs an embedding provider
+    // (set the API key)", which misdirects when the real cause was the
+    // provider spec (an unusable base URL, or a model the endpoint requires).
+    let built = dr_strange_llm::build_provider(
+        provider,
+        req.embed_model.as_deref(),
+        None,
+        req.embed_key_env.as_deref(),
+        true,
+    );
+    let why_no_embedder = built.as_ref().err().map(|e| e.to_string());
+    let embedder = built.ok().map(|p| LlmEmbedder(Box::new(p)));
     // Resolve `$name` placeholders from the params object.
     let mut params = dr_strange_parser::Params::new();
     for (k, v) in &req.params {
@@ -758,7 +813,10 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
             .map(|e| e as &dyn dr_strange_parser::Embedder),
         &params,
     )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .map_err(|e| match &why_no_embedder {
+        Some(cause) => anyhow::anyhow!("{e} — embedding provider '{provider}': {cause}"),
+        None => anyhow::anyhow!("{e}"),
+    })?;
     let plane = db.plane(&req.plane)?;
     match stmt {
         dr_strange_parser::Statement::Read(read) => Ok(scored_rows(
@@ -841,15 +899,21 @@ fn digest_logic(db: &Database, req: Digest, tuning: DigestTuning) -> AnyResult<V
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
-    // Provider keys come from the server's environment (never tool params).
-    let chat =
-        dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)?;
+    // Provider keys come from the server's environment (never tool params) —
+    // `key_env` names the variable, it does not carry the key.
+    let chat = dr_strange_llm::build_provider(
+        chat_provider,
+        req.model.as_deref(),
+        None,
+        req.key_env.as_deref(),
+        false,
+    )?;
     let chat_model = chat.model().to_string();
     let embedder = dr_strange_llm::build_provider(
         embed_provider,
         req.embed_model.as_deref(),
         None,
-        None,
+        req.embed_key_env.as_deref(),
         embed,
     )?;
 

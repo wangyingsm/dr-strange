@@ -54,10 +54,21 @@ fn backoff(attempt: u32) -> Duration {
         .min(MAX_BACKOFF)
 }
 
+/// A provider name that is a base URL rather than a preset. Scheme-bearing is
+/// the whole test: preset names are bare words, and anything else was already
+/// an error, so this cannot reclassify a name that used to resolve.
+fn looks_like_url(provider: &str) -> bool {
+    provider.contains("://")
+}
+
 /// Build an [`OpenAiProvider`] from a provider name (a [`preset`] or a raw base
 /// URL) plus optional overrides, reading the API key from the environment. The
 /// one place CLI and MCP resolve provider config the same way. `embed` selects
 /// the embedding vs chat default model and, when true, requires a model.
+///
+/// A raw base URL has no preset behind it, so it carries no default key env and
+/// no default model: pass `key_env` when the endpoint needs a key, and `model`
+/// (always, for embeddings — an empty embedding model is rejected below).
 pub fn build_provider(
     provider: &str,
     model: Option<&str>,
@@ -69,6 +80,15 @@ pub fn build_provider(
     let base = url
         .map(str::to_string)
         .or_else(|| p.map(|p| p.base_url.to_string()))
+        // The name itself may be the base URL — what this function's own doc
+        // line and [`preset`]'s ("the caller then treats it as a raw base URL")
+        // have always said, and what the CLI help and the MCP tool schemas
+        // advertise. Only the explicit `url` override implemented it, so every
+        // caller that had no such override — `drsg ask`, query-time embedding,
+        // `digest.run` over RPC, and the MCP tools — answered a URL with
+        // "unknown provider ...; give a base URL instead", advice those
+        // surfaces gave no way to follow.
+        .or_else(|| looks_like_url(provider).then(|| provider.to_string()))
         .ok_or_else(|| anyhow!("unknown provider '{provider}'; give a base URL instead"))?;
     let key_env = key_env.or_else(|| p.map(|p| p.key_env)).unwrap_or("");
     let key = if key_env.is_empty() {
@@ -288,6 +308,56 @@ mod tests {
         // However many attempts a future change allows, the wait stays bounded.
         assert_eq!(backoff(50), MAX_BACKOFF);
         assert!(backoff(4) <= MAX_BACKOFF);
+    }
+
+    #[test]
+    fn a_provider_name_that_is_a_url_becomes_the_base_url() {
+        // The contract the doc line above has always stated. Every caller with
+        // no explicit `url` override depends on it: `drsg ask`, query-time
+        // embedding, `digest.run` over RPC, and the MCP tools.
+        let p = build_provider("http://127.0.0.1:1234/v1", Some("m"), None, None, false).unwrap();
+        assert_eq!(p.base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(p.model(), "m");
+        // No preset behind it, so no key env is invented and no key is read.
+        assert_eq!(p.api_key, "");
+    }
+
+    #[test]
+    fn presets_and_explicit_urls_keep_precedence() {
+        // A preset name resolves to the preset exactly as before.
+        let p = build_provider("openai", None, None, None, false).unwrap();
+        assert_eq!(p.base_url, "https://api.openai.com/v1");
+        assert_eq!(p.model(), "gpt-4o-mini");
+        // An explicit `url` still wins over a URL-shaped name.
+        let p = build_provider(
+            "http://name/v1",
+            Some("m"),
+            Some("http://override/v1"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.base_url, "http://override/v1");
+    }
+
+    #[test]
+    fn a_bare_unknown_name_is_still_an_error() {
+        // Carrying a scheme is the whole test, so a mistyped preset keeps its
+        // error instead of being taken for a hostname.
+        let Err(e) = build_provider("opanai", None, None, None, false) else {
+            panic!("a bare unknown name must not resolve to a provider");
+        };
+        assert!(e.to_string().contains("unknown provider"), "{e}");
+    }
+
+    #[test]
+    fn a_url_provider_still_needs_an_embedding_model() {
+        // A preset supplies a default embedding model; a bare URL cannot, so
+        // the existing guard has to fire rather than send an empty model.
+        let Err(e) = build_provider("http://127.0.0.1:1234/v1", None, None, None, true) else {
+            panic!("an embedding provider with no model must be rejected");
+        };
+        assert!(e.to_string().contains("no embedding model"), "{e}");
     }
 
     /// A one-connection-at-a-time HTTP server that answers with each of
