@@ -154,9 +154,10 @@ fn apply_writes_the_graph() {
     {
         let plane = db.plane("startup").unwrap();
         let mut txn = plane.write().unwrap();
-        let stats = result.apply(&mut txn).unwrap();
-        assert_eq!(stats.nodes, 2);
-        assert_eq!(stats.edges, 1);
+        let stats = result.apply(&plane, &mut txn).unwrap();
+        assert_eq!(stats.written.nodes, 2);
+        assert_eq!(stats.written.edges, 1);
+        assert!(stats.skipped.is_empty(), "a fresh plane skips nothing");
         txn.commit().unwrap();
     }
 
@@ -166,6 +167,48 @@ fn apply_writes_the_graph() {
     let hops = plane.neighbors(alice.id, Dir::Out, None).unwrap();
     assert_eq!(hops.len(), 1);
     assert_eq!(hops[0].node, acme.id);
+}
+
+/// Re-applying a digest must not shadow entities the plane already has.
+///
+/// `bulk_load` writes the external-key index unconditionally, so an unguarded
+/// re-apply overwrites the entry: the original node stays in place but becomes
+/// reachable only by id, and every `key(...)` read against it silently returns
+/// empty. Digesting the same source twice — or two sources naming one entity —
+/// is the ordinary case, not an edge case.
+#[test]
+fn re_applying_skips_entities_the_plane_already_has() {
+    let mock = MockProvider::new(vec![REPLY.to_string()], 8);
+    let result = digest("Alice at Acme.", &mock, &mock, None, &opts(false)).unwrap();
+    let db = Database::in_memory().unwrap();
+
+    for round in 0..2 {
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let stats = result.apply(&plane, &mut txn).unwrap();
+        if round == 0 {
+            assert_eq!(stats.written.nodes, 2);
+            assert!(stats.skipped.is_empty(), "a fresh plane skips nothing");
+        } else {
+            assert_eq!(stats.written.nodes, 0, "nothing new to write");
+            assert_eq!(
+                stats.skipped.len(),
+                2,
+                "both entities were already known: {:?}",
+                stats.skipped
+            );
+        }
+        txn.commit().unwrap();
+    }
+
+    // The originals are still addressable by key — the whole point.
+    let plane = db.plane("startup").unwrap();
+    for key in ["alice", "acme"] {
+        assert!(
+            plane.node_by_key(key).unwrap().is_some(),
+            "{key} must still resolve by key after a re-apply"
+        );
+    }
 }
 
 #[test]

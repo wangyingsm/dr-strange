@@ -748,13 +748,22 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
 
     if args.apply {
         let mut txn = p.write()?;
-        let stats = result.apply(&mut txn)?;
+        let stats = result.apply(&p, &mut txn)?;
         txn.commit()?;
         writeln!(
             out,
             "applied: wrote {} nodes, {} edges",
-            stats.nodes, stats.edges
+            stats.written.nodes, stats.written.edges
         )?;
+        if !stats.skipped.is_empty() {
+            writeln!(
+                out,
+                "  {} entit{} already in the plane, left untouched: {}",
+                stats.skipped.len(),
+                if stats.skipped.len() == 1 { "y" } else { "ies" },
+                stats.skipped.join(", ")
+            )?;
+        }
         if args.embed {
             writeln!(
                 out,

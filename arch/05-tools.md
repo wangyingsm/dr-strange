@@ -89,9 +89,24 @@ document (the plane model's intended usage, [09-planes.md](09-planes.md)).
    already in the plane; edges carry no key, so the policy governs node
    identity only and they are always appended.
 
-   Note the same hazard exists wherever else `bulk_load` takes untrusted
-   input — the `write_nodes` RPC and `digest`'s entity writes — which is a
-   separate decision: bounding it inside `bulk_load` would cost the fast path
-   a lookup per key, and that path is a headline benchmark.
+   Every other path that feeds `bulk_load` untrusted keys is now guarded the
+   same way — `digest.write` over `/rpc`, and `DigestResult::apply`, which
+   covers both `drsg digest` and the MCP `digest` tool. Those skip and report
+   the keys rather than refusing, because an extraction proposes every entity
+   as new: naming something already known is the normal case there, where a
+   colliding *import* key means the file went in twice. The MCP `write_nodes`
+   tool was never affected — it goes through `create_node_with_key`, which has
+   always rejected a taken key.
+
+   The check stays at the callers rather than inside `bulk_load`: only paths
+   taking untrusted input pay the lookup per key, and the fast path — a
+   headline benchmark — keeps its trusting contract for callers that have
+   already guaranteed fresh keys.
+
+   Worth knowing about the failure mode, since it is worse than "a duplicate
+   node": `bulk_load` writes the external-key index unconditionally, so a
+   colliding key *overwrites* that entry. The original node stays in place but
+   becomes reachable only by id, and every `key(…)` read against it silently
+   returns empty.
 4. ~~`digest` detailed design — deferred (see §3).~~ **Resolved: shipped** as
    AIgest's three passes (ROADMAP §8), extended to read URLs in §9.

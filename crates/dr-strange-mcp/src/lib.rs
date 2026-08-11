@@ -989,10 +989,14 @@ fn digest_logic(db: &Database, req: Digest, tuning: DigestTuning) -> AnyResult<V
 
     if req.apply {
         let mut txn = p.write()?;
-        let stats = result.apply(&mut txn)?;
+        let stats = result.apply(&p, &mut txn)?;
         txn.commit()?;
-        out["nodes_written"] = jval!(stats.nodes);
-        out["edges_written"] = jval!(stats.edges);
+        out["nodes_written"] = jval!(stats.written.nodes);
+        out["edges_written"] = jval!(stats.written.edges);
+        // Named, not just counted: an agent that proposed an entity the plane
+        // already knew should be told, or it will keep re-proposing it.
+        out["nodes_skipped"] = jval!(stats.skipped.len());
+        out["skipped_keys"] = jval!(stats.skipped);
     } else {
         // Dry-run: return the proposed graph (capped) so the agent can inspect
         // before a second call with apply=true.

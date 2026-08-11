@@ -298,10 +298,41 @@ impl DigestResult {
     /// Writes the digested nodes + edges into `txn` through the bulk-load fast
     /// path (arch/07 §2: writing is the separate, explicit step). Entity keys
     /// are the node external keys, so relations resolve within the batch.
-    pub fn apply(&self, txn: &mut WriteTxn) -> Result<BulkStats> {
-        let label_slots: Vec<[&str; 1]> = self.nodes.iter().map(|n| [n.label.as_str()]).collect();
-        let nodes: Vec<BulkNode> = self
-            .nodes
+    ///
+    /// Only entities whose key is genuinely free are written. `bulk_load`
+    /// writes the external-key index unconditionally, so a proposed key that
+    /// already exists would overwrite that entry — leaving the original node in
+    /// place but reachable only by id, with every `key(...)` read against it
+    /// silently returning empty. `plane` is read to find those first.
+    ///
+    /// Skipping rather than failing the batch: an extraction proposes every
+    /// entity as new, so naming something already known is the normal case, not
+    /// an error, and rejecting the batch would drop the run exactly when it had
+    /// learned something. Edges are kept either way — bulk-load resolution
+    /// falls back to the plane's existing keys, so a relation onto a skipped
+    /// entity attaches to the node already there, which is what "this digest
+    /// mentions something we know" ought to mean. Same semantics as
+    /// `digest.write` over `/rpc`, so the two surfaces cannot disagree.
+    pub fn apply(
+        &self,
+        plane: &dr_strange_core::PlaneHandle<'_>,
+        txn: &mut WriteTxn,
+    ) -> Result<ApplyStats> {
+        let mut seen: AHashSet<&str> = AHashSet::new();
+        let mut fresh: Vec<&DigestNode> = Vec::with_capacity(self.nodes.len());
+        let mut skipped: Vec<String> = Vec::new();
+        for n in &self.nodes {
+            // An intra-batch duplicate would make `bulk_load` reject the whole
+            // call, so it is filtered here too rather than left to fail.
+            if !seen.insert(n.key.as_str()) || plane.node_by_key(&n.key)?.is_some() {
+                skipped.push(n.key.clone());
+                continue;
+            }
+            fresh.push(n);
+        }
+
+        let label_slots: Vec<[&str; 1]> = fresh.iter().map(|n| [n.label.as_str()]).collect();
+        let nodes: Vec<BulkNode> = fresh
             .iter()
             .zip(&label_slots)
             .map(|(n, ls)| BulkNode {
@@ -320,8 +351,20 @@ impl DigestResult {
                 props: e.props.clone(),
             })
             .collect();
-        txn.bulk_load(nodes, edges).map_err(Into::into)
+        let written = txn.bulk_load(nodes, edges)?;
+        Ok(ApplyStats { written, skipped })
     }
+}
+
+/// What [`DigestResult::apply`] did.
+///
+/// `skipped` is reported rather than merely counted: a silent skip is exactly
+/// how a shadowed key goes unnoticed, and the caller usually wants to say which
+/// entities the plane already knew.
+pub struct ApplyStats {
+    pub written: BulkStats,
+    /// Entity keys left alone because the plane already had a node under them.
+    pub skipped: Vec<String>,
 }
 
 // ---- pipeline ------------------------------------------------------------
