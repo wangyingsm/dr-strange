@@ -1379,6 +1379,12 @@ pub struct DigestRun {
     model: Option<String>,
     #[serde(default)]
     embed_model: Option<String>,
+    /// `reasoning_effort` to send on the extraction chat calls (e.g. `"none"`
+    /// to disable reasoning on models that would otherwise spend the output
+    /// budget on thinking tokens and truncate the extraction JSON). Unset ⇒
+    /// not sent, so the provider's own default applies.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     #[serde(default)]
     source: Option<String>,
     #[serde(default)]
@@ -1416,6 +1422,13 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let chat =
         dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
             .map_err(llm_err)?;
+    // Opt-in only: unset leaves the request body byte-for-byte what it was, so
+    // providers with no such field are unaffected. Embedding calls never carry
+    // it — there is nothing to reason about.
+    let chat = match req.reasoning_effort.as_deref() {
+        Some(effort) => chat.with_reasoning_effort(effort),
+        None => chat,
+    };
     let chat_model = chat.model().to_string();
     let embedder = dr_strange_llm::build_provider(
         embed_provider,
