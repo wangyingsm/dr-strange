@@ -33,9 +33,12 @@ trait ReadTransaction {
 // WriteTransaction: ReadTransaction + put/delete/commit/abort.
 ```
 
-**v1 backend: [`redb`](https://github.com/cberner/redb)** — pure Rust,
-single-file, ACID with MVCC (concurrent readers + one writer), no C++ build
-chain, a good fit for the embedded-first shape.
+**v1 shipped on [`redb`](https://github.com/cberner/redb)** — pure Rust,
+single-file, ACID with MVCC, no C++ build chain, a good fit for the
+embedded-first shape. Since 1.5.0 the **hand-rolled LSM engine (`native`) is
+the default** and redb is the legacy backend, opt-in behind
+`--no-default-features --features redb-backend`. The trait below is what made
+that swap contained, exactly as intended.
 
 RocksDB remains a candidate second backend if write-heavy ingest becomes the
 bottleneck; the trait exists precisely so that is a contained change. An
@@ -208,8 +211,10 @@ Inherited from redb in v1:
   SIGKILL test was considered and deferred (CI-flaky) in favour of the
   deterministic approach.
 - **Benchmarks (M5 — `benches/graph.rs`, criterion):** insert / point-lookup /
-  1-&-2-hop expand (memory vs redb) and vector search (brute force vs HNSW) —
-  the numbers that gate the deferred moka cache and HNSW sidecar. External-DB
+  1-&-2-hop expand (in-memory vs whichever on-disk backend is compiled in) and
+  vector search (brute force vs HNSW) —
+  the numbers that gated the moka cache and the HNSW sidecar, both since
+  shipped. External-DB
   comparison (Kùzu/Neo4j) is a separate later effort.
 - The in-memory `StorageEngine` keeps the upper-layer suite fast. Its
   committed snapshot is `Arc`-shared (M5), so a read is an O(1) pointer clone

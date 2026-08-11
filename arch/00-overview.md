@@ -71,7 +71,7 @@ graph database with AI features bolted on:
 │  │ Storage layer — graph encoding over StorageEngine   │  │
 │  │ trait; VectorIndex trait; MVCC txns from backend    │  │
 │  ├──────────────────────────┬──────────────────────────┤  │
-│  │ KV backend (redb, v1)    │ Vector index (HNSW)      │  │
+│  │ KV backend (native LSM)  │ Vector index (HNSW)      │  │
 │  └──────────────────────────┴──────────────────────────┘  │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -88,9 +88,13 @@ dr-strange/
   crates/
     dr-strange-core/       # storage + computation + API layers (the database)
     dr-strange-cli/        # `drsg` binary
-    dr-strange-mcp/        # MCP server
-    dr-strange-llm/        # embedding/NL helpers (optional dep of mcp/cli)
+    dr-strange-mcp/        # MCP server (stdio; also mounted at /mcp by web)
+    dr-strange-llm/        # document reading, embeddings, digest, NL→plan
+    dr-strange-parser/     # the openCypher-subset query language
+    dr-strange-web/        # `drsg serve` — JSON-RPC API + dashboard
+    dr-strange-log/        # the binaries' tracing subscriber
   arch/            # these documents
+  docs/            # the tutorial book (en + zh)
 ```
 
 `dr-strange-core` may split (`dr-storage`, `dr-plan`) later if compile times or team
@@ -113,8 +117,8 @@ Each milestone ends with a working vertical slice, not a finished layer.
   `Expr` evaluator + pull-based executor over the `GraphReader` seam; builder
   API with `nodes`/`ids`/`count`/`select` terminals. Row model is the linear
   pipeline (current node + trail). The cache *seam* landed (`UncachedReader`);
-  the moka `CachedReader` is deferred to when traversal benchmarks can size it
-  (arch/02).
+  the moka caches the benchmarks were meant to size have since shipped too —
+  a per-query `CachedReader` over a persistent, commit-stamped store (arch/02).
 - **M3 — AI-native** ✅: `Metric` + exact brute-force + hand-rolled pure-Rust
   HNSW behind `VectorIndex`; native hybrid operators `VectorTopK` /
   `FrontierTopK` / `ExpandBeam` with a row score channel and
@@ -126,7 +130,8 @@ Each milestone ends with a working vertical slice, not a finished layer.
 - **M4 — first wrappers** ✅: `drsg` CLI (clap — init/plane/import/export/get/
   query/catalog/index/stats/check) and `drsg-mcp` MCP server (rmcp SDK, stdio,
   10 tools over the core API). Shared JSON dialect in the core's feature-gated
-  `json` module. `digest` deferred to its own design session (arch/07).
+  `json` module. `digest` had its own design session and shipped (arch/07,
+  ROADMAP §8).
 - **M5 — hardening** ✅: deterministic crash-recovery tests (fault-injecting
   engine — error propagation + commit atomicity; redb reopen restores every
   layer incl. the rebuilt HNSW index, with a reopen proptest); criterion

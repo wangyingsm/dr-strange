@@ -1,6 +1,8 @@
 # Cache Layer
 
-**Status**: draft · seam implemented, caching deferred (M2) · 2026-07-27
+**Status**: shipped — the seam, the per-query `CachedReader`, and the
+persistent cross-query `GraphCache` with commit-sequence stamping · last
+revised 2026-08-11
 
 **M2 landed the seam, not the cache.** The `GraphReader` trait (§2) and the
 pass-through `UncachedReader` are built; the executor reads only through them.

@@ -1,18 +1,26 @@
 # LLM Layer
 
-**Status**: draft for review · 2026-07-22 · **digest pipeline design deferred**
+**Status**: digest pipeline designed and shipped (ROADMAP §8, extended to URLs
+in §9) · last revised 2026-08-11
 
 Scope: the `dr-strange-llm` crate — everything that talks to a language or embedding
-model. Sits strictly **above** the core: `dr-strange-core` never calls a model, never
-sees an API key, and remains fully usable with this crate absent. `dr-strange-cli`
-and `dr-strange-mcp` depend on it optionally.
+model, **plus the ingestion front door that feeds it**. Sits strictly **above** the
+core: `dr-strange-core` never calls a model, never sees an API key, and remains fully
+usable with this crate absent. `dr-strange-cli` and `dr-strange-mcp` depend on it
+optionally.
+
+Document → Markdown conversion lives here despite talking to no model, because it
+is the digest pipeline's own input step and because every surface that ingests a
+document — the CLI, the MCP tools, the dashboard — must produce *identical* text
+from the same file. Two readers would mean two vector spaces for one corpus.
 
 ## 1. Responsibilities
 
 | Capability | Description |
 |---|---|
-| Embedding generation | text → vector at ingest/query time; pluggable providers (Anthropic-compatible / OpenAI-compatible / local HTTP), batching, retry; per-plane model configuration recorded as plane properties, so mixed-model vectors are detectable |
-| Document digestion | the engine behind `drsg digest` / MCP `digest`: LLM parses documents into entities, relations, `PropDesc` descriptions, and embeddings, written through the bulk API — **detailed design deferred; to be discussed separately** |
+| Embedding generation | text → vector at ingest/query time; pluggable providers (OpenAI-compatible, which covers gateways and a local `ollama`/`llama.cpp` through a configurable base URL), batched per call. Configured **per server** (`[digest] embed_provider`), not per plane: a per-plane model recorded as plane properties was considered and not built, since nothing yet needs to detect mixed-model vectors and the config an operator actually sets is process-wide |
+| Document reading | bytes → GitHub-Flavored Markdown for Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF (via `anydoc`), with Markdown and plain text passing through. Format is detected from the content, not the filename. Deterministic and model-free — the step before digestion, shared by every surface |
+| Document digestion | the engine behind `drsg digest` / MCP `digest`: an LLM parses that Markdown into entities, relations, `PropDesc` descriptions, and embeddings, written through the bulk API. Shipped as AIgest's three passes (ROADMAP §8) |
 | Entity resolution | propose cross-plane / intra-plane duplicate candidates by external key, name similarity, and embedding distance; output is a *proposal set* the caller (human or agent) confirms — feeds plane `merge` (09 §3) |
 | NL → plan translation | natural-language question → serialized logical plan, grounded on the per-plane catalog (labels + property descriptions); v1.5, once the plan format is stable |
 
