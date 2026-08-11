@@ -556,7 +556,7 @@ dashboard affordance, not a requirement of the feature.
 
 ---
 
-## 10. MCP over the network — one database, many agents
+## 10. MCP over the network — one database, many agents  *(shipped)*
 
 **Goal.** Let several agent hosts share one memory. Today each host spawns its
 own `drsg-mcp`, which embeds the core and opens the database directly, so two
