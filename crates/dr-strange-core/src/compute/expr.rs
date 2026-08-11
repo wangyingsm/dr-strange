@@ -405,31 +405,11 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
     }
 }
 
-/// The value as text, for the string predicates. `None` when there is no
-/// canonical text form, which makes the predicate false rather than an error.
-///
-/// Scalars promote, so `p("year") STARTS WITH "20"` works on an `Int` without
-/// the caller casting — soft-schema data stores the same field as `Int` on one
-/// node and `Str` on the next, and a predicate that silently missed half of
-/// them would be worse than useless.
-///
-/// Deliberately excluded: `Null` is *absence*, and promoting it to `""` would
-/// make `CONTAINS ""` true for a missing property. `Bytes` is not text.
-/// `Vector`, `List` and `Map` have no canonical rendering — their `Debug` form
-/// is an implementation artifact, and matching against it would freeze that
-/// artifact into query semantics.
+/// The value as text, for the string predicates — [`PropValue::as_text`],
+/// which is also what an entity's embedded text is built from, so a value a
+/// filter can match on is a value that reached the vector.
 fn as_text(v: &PropValue) -> Option<Cow<'_, str>> {
-    match v {
-        PropValue::Str(s) => Some(Cow::Borrowed(s)),
-        PropValue::Int(i) => Some(Cow::Owned(i.to_string())),
-        PropValue::Float(f) => Some(Cow::Owned(f.to_string())),
-        PropValue::Bool(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
-        PropValue::Null
-        | PropValue::Bytes(_)
-        | PropValue::Vector(_)
-        | PropValue::List(_)
-        | PropValue::Map(_) => None,
-    }
+    v.as_text()
 }
 
 /// `CONTAINS` / `STARTS WITH` / `ENDS WITH`, byte-wise over the text forms.

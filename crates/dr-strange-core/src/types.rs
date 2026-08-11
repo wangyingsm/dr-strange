@@ -73,6 +73,44 @@ pub enum PropValue {
     Map(BTreeMap<String, PropDesc>),
 }
 
+impl PropValue {
+    /// This value as text, when it has a canonical one.
+    ///
+    /// The single promotion rule shared by everything that treats a property
+    /// as text: the string predicates (`CONTAINS`, `STARTS WITH`, `ENDS WITH`)
+    /// and the text an entity is embedded from. One rule so the two cannot
+    /// drift — a value a filter can match on is a value that reached the
+    /// vector, and vice versa.
+    ///
+    /// Scalars promote, which is what makes soft-schema data usable: the same
+    /// field stored as `2026` on one node and `"2026"` on the next behaves
+    /// alike either way.
+    ///
+    /// `None` for the rest, and each for its own reason. [`PropValue::Null`]
+    /// is *absence*; rendering it as `""` would make `CONTAINS ""` true for
+    /// every missing property. [`PropValue::Bytes`] is not text.
+    /// [`PropValue::Vector`] is the embedding, not a description of one.
+    /// [`PropValue::List`] and [`PropValue::Map`] are composites with no
+    /// canonical rendering — their `Debug` form is an implementation detail,
+    /// and freezing it into query semantics or a vector space would make it
+    /// one we could never change. Callers that want them flattened should say
+    /// so explicitly, element by element.
+    pub fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match self {
+            PropValue::Str(s) => Some(Cow::Borrowed(s)),
+            PropValue::Int(i) => Some(Cow::Owned(i.to_string())),
+            PropValue::Float(f) => Some(Cow::Owned(f.to_string())),
+            PropValue::Bool(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+            PropValue::Null
+            | PropValue::Bytes(_)
+            | PropValue::Vector(_)
+            | PropValue::List(_)
+            | PropValue::Map(_) => None,
+        }
+    }
+}
+
 /// Direction of an adjacency scan / expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dir {

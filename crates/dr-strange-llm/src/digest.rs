@@ -876,13 +876,49 @@ fn add_provenance(props: &mut Properties, opts: &DigestOptions) {
 /// only extracted content feeds the vector. Property order is deterministic
 /// (`Properties` is a `BTreeMap`), keeping the run-scoped dedup reproducible.
 fn embed_text(n: &DigestNode) -> String {
-    let mut s = format!("{} ({})", n.key, n.label);
-    for (k, pd) in &n.props {
-        if let PropValue::Str(v) = &pd.value {
-            let v = v.trim();
-            if !v.is_empty() {
-                s.push_str(&format!("\n{k}: {v}"));
+    entity_text(&n.key, std::slice::from_ref(&n.label), &n.props)
+}
+
+/// The canonical text for an entity, shared by every path that embeds one.
+///
+/// Identity first (`key (Label)`), then each property that has text, as
+/// `key: value` in the map's stable order.
+///
+/// Public because more than one surface writes entities — a digest and an
+/// agent's `write_nodes` — and vectors built from different recipes do not
+/// share a space: a search would find one and miss the other. Sharing the
+/// function is what guarantees they match; two similar-looking implementations
+/// would not.
+///
+/// What counts as text is [`PropValue::as_text`], the same rule the `CONTAINS`
+/// family matches on, so anything a filter can find is something the vector
+/// saw. Scalars promote — a year stored as `2026` reads the same as `"2026"`.
+/// Lists are flattened element-wise (tags are worth embedding), which the rule
+/// leaves to callers precisely so it is a deliberate choice rather than a
+/// `Debug` rendering leaking in. `_`-prefixed properties are provenance and
+/// configuration, never content.
+pub fn entity_text(key: &str, labels: &[String], props: &Properties) -> String {
+    let mut s = match labels {
+        [] => key.to_string(),
+        _ => format!("{} ({})", key, labels.join(", ")),
+    };
+    for (k, pd) in props {
+        if k.starts_with('_') {
+            continue;
+        }
+        let text = match &pd.value {
+            PropValue::List(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|v| v.as_text().map(|t| t.trim().to_string()))
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
             }
+            other => other.as_text().map(|t| t.trim().to_string()),
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            s.push_str(&format!("\n{k}: {text}"));
         }
     }
     s
