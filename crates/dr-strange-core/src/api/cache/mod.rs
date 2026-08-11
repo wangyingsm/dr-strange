@@ -10,9 +10,13 @@
 //!   per visit (measured up to ~3.8× on hot property-rich traversals; a slight
 //!   loss on broad low-revisit scans — the benchmark-gated call of arch/02 §5).
 //!
-//! Deferred: the **persistent, cross-query** moka W-TinyLFU cache with
-//! commit-sequence version stamping (arch/02 §3–4), which needs a commit-seq
-//! subsystem built first. [`CommitSeq`] is its token, defined here already.
+//! Behind the per-query reader sits `GraphCache`, the **persistent,
+//! cross-query** moka W-TinyLFU cache (arch/02 §3–4) that `CachedReader` uses
+//! as its L2. Coherence there is **invalidate-only**: entries are stamped with
+//! the [`CommitSeq`] they were read at, and a reader pinned to a snapshot
+//! serves an entry only when the stamps match, so any write logically flushes
+//! everything older. Nothing is written *into* the cache at commit time — the
+//! populating `put_*` calls happen on a read miss, never on the write path.
 //!
 //! Cacheable reads return `Arc`s, so a cache serves shared clones and the
 //! trait signature never changes. Scans return owned `Vec`s — arch/02 §1 lists

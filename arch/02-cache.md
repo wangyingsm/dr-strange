@@ -123,9 +123,27 @@ the trait boundary keeps it removable.
    `CachedReader` micro-benchmark that gated this decision lives on in
    `core/benches/graph.rs`; the native engine uses the same crate for its SST
    block cache.
-2. **Write-through vs invalidate-only on commit** — write-through warms the
+2. ~~**Write-through vs invalidate-only on commit** — write-through warms the
    cache with the writer's decoded records but risks polluting it with bulk
-   ingest; possibly ingest-mode toggles to invalidate-only.
+   ingest.~~ **Resolved: invalidate-only**, and it shipped that way. Entries
+   carry the commit sequence they were read at; a reader serves one only when
+   the stamps match, so a write logically flushes everything older and moka
+   evicts it in due course. The `put_*` calls populate on a read *miss* — the
+   commit path never writes into the cache.
+
+   Write-through was not taken, and the ingest-mode toggle it would have needed
+   is why. The polluting case is not a corner: `bulk_load` is the fast path for
+   import and digest, so the writes most likely to warm the cache are exactly
+   the ones that should not — half a million records nobody asked to read,
+   evicting a working set that was serving queries. A toggle would make
+   correctness depend on a caller remembering which mode it was in, to save a
+   re-read of the records a query actually wants, which W-TinyLFU restores on
+   first demand anyway.
+
+   It also fits how writes are encoded. The write path deliberately borrows
+   rather than clones and never holds decoded records, so write-through would
+   mean decoding *for the cache's benefit* — paying on every write for a read
+   that may never come.
 3. **Adjacency segment granularity** — whole neighbor-list-per-(node, type) vs
    fixed-size chunks for hub nodes. Chunking interacts with the per-entry cap.
 4. **Negative caching** — cache "node X does not exist"? Useful for
