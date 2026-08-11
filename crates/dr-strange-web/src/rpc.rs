@@ -330,6 +330,7 @@ mod tests {
             db,
             db_path: None,
             digest: crate::DigestDefaults::default(),
+            deadline: None,
         };
         handle(&ctx, &Auth::allow_all(), body.as_bytes())
     }
@@ -341,6 +342,7 @@ mod tests {
             db,
             db_path: None,
             digest: crate::DigestDefaults::default(),
+            deadline: None,
         };
         handle(&ctx, auth, body.as_bytes())
     }

@@ -7,7 +7,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Router;
@@ -76,6 +76,9 @@ pub struct AppState {
     pub digest: crate::DigestDefaults,
     /// URL-fetch policy and budgets (from `[fetch]` config / built-ins).
     pub fetch: crate::FetchDefaults,
+    /// Per-request query budget (`[server] query_timeout_secs`); `None` runs
+    /// to completion.
+    pub query_timeout: Option<Duration>,
 }
 
 impl AppState {
@@ -84,6 +87,9 @@ impl AppState {
             db: self.db.as_ref(),
             db_path: self.db_path.as_deref(),
             digest: self.digest,
+            // Stamped per request, not per process: the budget is how long
+            // *this* call may run, so it starts when the call does.
+            deadline: self.query_timeout.map(|d| Instant::now() + d),
         }
     }
 }
@@ -665,6 +671,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         changes,
         digest: opts.digest,
         fetch: opts.fetch,
+        query_timeout: opts.query_timeout,
     });
     let app = router(state, opts.max_concurrent);
     // Bind a std listener up front so we can report the actual port (handy when

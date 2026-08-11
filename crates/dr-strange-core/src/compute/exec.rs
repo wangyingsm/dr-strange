@@ -13,11 +13,13 @@
 
 use ahash::{AHashMap, AHashSet};
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::cache::GraphReader;
 use crate::compute::expr::{self, Expr};
 use crate::compute::plan::{Algo, LogicalPlan, NodeRef, SortKey, Source, Step};
 use crate::compute::{algo, hybrid};
+use crate::error::Error;
 use crate::error::Result;
 use crate::storage::vector::{Metric, top_k};
 use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
@@ -123,14 +125,87 @@ impl Row {
 
 type RowIter<'r> = Box<dyn Iterator<Item = Result<Row>> + 'r>;
 
+/// Rows between deadline checks. A clock read per row is real overhead on a
+/// pipeline that moves millions, and the granularity buys nothing: at any
+/// plausible per-row cost 1024 rows is well under a millisecond.
+const DEADLINE_CHECK_EVERY: u32 = 1024;
+
+/// Stops a pipeline once `deadline` passes, yielding [`Error::Timeout`] and
+/// then ending.
+///
+/// Cooperative and row-paced, so it bounds work that *flows* — expansions,
+/// filters, the drain a `Sort` performs internally. It cannot interrupt a
+/// single call that is already running: a `scan_all` over a huge plane
+/// materializes inside the source (see the module note on barriers), and the
+/// graph algorithms in [`super::algo`] iterate without producing rows. Those
+/// need their own checks; this bounds the query pipeline, which is what an
+/// agent's runaway `MATCH` actually is.
+struct Deadlined<'r> {
+    inner: RowIter<'r>,
+    deadline: Instant,
+    since_check: u32,
+    tripped: bool,
+}
+
+impl Iterator for Deadlined<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Once tripped the stream is over: a caller that keeps polling must
+        // not get a fresh error every time, nor silently resume.
+        if self.tripped {
+            return None;
+        }
+        if self.since_check == 0 || self.since_check >= DEADLINE_CHECK_EVERY {
+            self.since_check = 0;
+            if Instant::now() >= self.deadline {
+                self.tripped = true;
+                return Some(Err(Error::Timeout(
+                    "query exceeded its time budget; narrow it (add a label, a filter, or LIMIT) \
+                     or raise `[server] query_timeout_secs`"
+                        .into(),
+                )));
+            }
+        }
+        self.since_check += 1;
+        self.inner.next()
+    }
+}
+
+fn deadlined<'r>(iter: RowIter<'r>, deadline: Option<Instant>) -> RowIter<'r> {
+    match deadline {
+        None => iter,
+        Some(deadline) => Box::new(Deadlined {
+            inner: iter,
+            deadline,
+            since_check: 0,
+            tripped: false,
+        }),
+    }
+}
+
 /// Builds the row stream for `plan` reading through `reader`. The returned
 /// iterator borrows `reader` for its whole lifetime.
 pub fn execute<'r>(plan: &LogicalPlan, reader: &'r dyn GraphReader) -> Result<RowIter<'r>> {
-    let mut iter: RowIter<'r> = Box::new(source_rows(reader, &plan.source)?.into_iter().map(Ok));
+    execute_with(plan, reader, None)
+}
+
+/// [`execute`], stopping with [`Error::Timeout`] once `deadline` passes.
+///
+/// The check wraps the source *and* the finished pipeline. Wrapping the source
+/// is what makes a barrier step bounded — a `Sort` drains its input before
+/// yielding anything, and that drain pulls through the source check.
+pub fn execute_with<'r>(
+    plan: &LogicalPlan,
+    reader: &'r dyn GraphReader,
+    deadline: Option<Instant>,
+) -> Result<RowIter<'r>> {
+    let source: RowIter<'r> = Box::new(source_rows(reader, &plan.source)?.into_iter().map(Ok));
+    let mut iter = deadlined(source, deadline);
     for step in &plan.steps {
         iter = apply_step(iter, step, reader)?;
     }
-    Ok(iter)
+    Ok(deadlined(iter, deadline))
 }
 
 fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {

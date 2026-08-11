@@ -91,6 +91,9 @@ pub struct ServerCfg {
     /// retryable timeout. `0` waits forever (the embedded default); omitted
     /// means 30s.
     pub write_timeout_secs: Option<u64>,
+    /// How long one request's queries may run before stopping with a retryable
+    /// timeout. `0` runs to completion; omitted means 60s.
+    pub query_timeout_secs: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
     /// TLS certificate/key; when present, `serve` speaks HTTPS.
@@ -179,6 +182,9 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
         // 0 means "wait forever", matching the core's own encoding — an
         // operator who wants the embedded behaviour back can ask for it.
         opts.write_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+    if let Some(secs) = cfg.server.query_timeout_secs {
+        opts.query_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {

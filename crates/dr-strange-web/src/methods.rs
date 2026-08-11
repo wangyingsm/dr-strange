@@ -30,6 +30,23 @@ pub struct Ctx<'a> {
     pub db_path: Option<&'a Path>,
     /// Server-side `digest.run` defaults (request params override these).
     pub digest: crate::DigestDefaults,
+    /// When this request's queries must stop. `None` ⇒ run to completion.
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl Ctx<'_> {
+    /// Resolve a plane, carrying this request's deadline onto the handle.
+    ///
+    /// Every method goes through here rather than `ctx.db.plane` so a new
+    /// method cannot ship unbounded by forgetting to apply it — the same
+    /// reason `Access` is named at every dispatch arm.
+    fn plane(&self, name: &str) -> Result<dr_strange_core::PlaneHandle<'_>, RpcError> {
+        let p = app(self.db.plane(name))?;
+        Ok(match self.deadline {
+            Some(d) => p.with_deadline(d),
+            None => p,
+        })
+    }
 }
 
 // ---- param decoding -------------------------------------------------------
@@ -68,7 +85,7 @@ fn plane_at<'a>(
     plane: &str,
     at: &AsOfParams,
 ) -> Result<PlaneHandle<'a>, RpcError> {
-    let handle = app(ctx.db.plane(plane))?;
+    let handle = ctx.plane(plane)?;
     match (at.as_of, at.as_of_ms) {
         (Some(_), Some(_)) => Err(RpcError::invalid_params(
             "specify only one of as_of / as_of_ms",
@@ -92,7 +109,7 @@ fn plane_at<'a>(
             "time-travel (as_of / as_of_ms) requires the native backend",
         ));
     }
-    app(ctx.db.plane(plane))
+    ctx.plane(plane)
 }
 
 /// Pin a plane handle to the snapshot a query's `AS OF` clause names — the
@@ -253,7 +270,7 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     // Declared vector + keyword indexes across every plane.
     let mut indexes = 0usize;
     for (_, name) in &planes {
-        let plane = app(ctx.db.plane(name))?;
+        let plane = ctx.plane(name)?;
         indexes += plane.vector_indexes().len() + plane.keyword_indexes().len();
     }
     let file_size = ctx
@@ -283,7 +300,7 @@ pub fn db_catalog(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let mut out = Vec::new();
     for (id, name) in app(ctx.db.planes())? {
-        let plane = app(ctx.db.plane(&name))?;
+        let plane = ctx.plane(&name)?;
         let cat = app(plane.catalog())?;
         let props = app(plane.properties())?;
         out.push(jval!({
@@ -306,7 +323,7 @@ pub struct PlaneOnly {
 /// edge-type connectivity, counts).
 pub fn plane_catalog(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneOnly = params(p)?;
-    let cat = app(app(ctx.db.plane(&req.plane))?.catalog())?;
+    let cat = app(ctx.plane(&req.plane)?.catalog())?;
     serde_json::to_value(cat).map_err(|e| RpcError::server(e.to_string()))
 }
 
@@ -322,7 +339,7 @@ pub struct GetNode {
 /// `node.get` — one node by id or external key; `null` if absent.
 pub fn node_get(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: GetNode = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let node = match (req.id, &req.key) {
         (Some(id), _) => app(plane.node(NodeId(id)))?,
         (None, Some(key)) => app(plane.node_by_key(key))?,
@@ -391,7 +408,7 @@ pub struct Search {
 /// `plane.search` — vector top-k, returning scored node records.
 pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let hits = app(plane
         .query()
         .vector_top_k(
@@ -514,7 +531,7 @@ pub fn cypher_subgraph(
     )
     .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let plane = app(ctx.db.plane(plane_name))?;
+    let plane = ctx.plane(plane_name)?;
 
     // A write statement mutates the plane and returns its change-counts; the UI
     // shows a status rather than a subgraph.
@@ -865,7 +882,7 @@ pub struct Algo {
 /// - `louvain` → `{ algo, results: [{id, community}], count }` (community count)
 pub fn plane_algo(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Algo = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let mut builder = plane.algo();
     if let Some(label) = &req.label {
         builder = builder.label(label.clone());
@@ -986,7 +1003,7 @@ pub struct Hybrid {
 /// contribution (`vector`/`keyword`/`graph`).
 pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Hybrid = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let mut builder = plane.hybrid();
     if let Some(label) = &req.label {
         builder = builder.label(label.clone());
@@ -1078,7 +1095,7 @@ pub struct Ask {
 /// transparency plus the result node records. Keys come from the server env.
 pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Ask = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let provider = req.provider.as_deref().unwrap_or("openai");
     let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)
         .map_err(|e| RpcError::server(format!("chat provider: {e}")))?;
@@ -1152,7 +1169,7 @@ pub struct EnsureIndex {
 /// different settings.
 pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: EnsureIndex = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     match req.kind.as_deref().unwrap_or("keyword") {
         "vector" => {
             app(plane.ensure_vector_index(
@@ -1184,7 +1201,7 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// search a `(label, property)` that appears under `keyword`.
 pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneIndexes = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let vector: Vec<Value> = plane
         .vector_indexes()
         .into_iter()
@@ -1457,7 +1474,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         refine_max_entities: None,
         refine_max_context: None,
     };
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let cands = dr_strange_llm::PlaneCandidates::new(&plane);
     let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
     let result =
@@ -1531,7 +1548,7 @@ fn props_of(v: &Value) -> Result<Properties, RpcError> {
 /// pass, not two.
 pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestWrite = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
 
     // Only nodes whose key is genuinely free get written.
     //
@@ -1678,7 +1695,7 @@ pub struct CreateNode {
 /// already bound in this plane.
 pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: CreateNode = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let props = props_of(&req.properties)?;
     let labels: Vec<&str> = req.labels.iter().map(String::as_str).collect();
 
@@ -1716,7 +1733,7 @@ pub struct UpdateNode {
 /// is present, replace its label set. Returns the updated record.
 pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: UpdateNode = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let id = resolve_node(&plane, req.id, req.key.as_deref())?;
     let set = props_of(&req.set)?;
 
@@ -1743,7 +1760,7 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// Export download. Not an RPC method (it returns a file, not JSON-RPC data);
 /// the `/export` HTTP endpoint calls it directly.
 pub fn export_plane(ctx: &Ctx<'_>, plane_name: &str) -> Result<String, RpcError> {
-    let plane = app(ctx.db.plane(plane_name))?;
+    let plane = ctx.plane(plane_name)?;
     let mut out = String::new();
     for node in app(plane.query().scan_all().nodes())? {
         out.push_str(&json::node_to_json(&node).to_string());
@@ -1775,7 +1792,7 @@ pub struct DeleteNode {
 /// clean no-op rather than an error.
 pub fn node_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DeleteNode = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let existing = match (req.id, &req.key) {
         (Some(id), _) => app(plane.node(NodeId(id)))?,
         (None, Some(k)) => app(plane.node_by_key(k))?,
@@ -1807,7 +1824,7 @@ pub struct CreateEdge {
 /// edge record.
 pub fn edge_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: CreateEdge = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let src = req.src.resolve(&plane)?;
     let dst = req.dst.resolve(&plane)?;
     let props = props_of(&req.properties)?;
@@ -1838,7 +1855,7 @@ pub struct UpdateEdge {
 /// is present, change its type. Returns the updated edge record.
 pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: UpdateEdge = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let id = EdgeId(req.edge);
     let set = props_of(&req.set)?;
 
@@ -1869,7 +1886,7 @@ pub struct DeleteEdge {
 /// redundant delete is a clean no-op.
 pub fn edge_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DeleteEdge = params(p)?;
-    let plane = app(ctx.db.plane(&req.plane))?;
+    let plane = ctx.plane(&req.plane)?;
     let id = EdgeId(req.edge);
     if app(plane.edge(id))?.is_none() {
         return Ok(jval!({ "deleted": false }));
@@ -1908,7 +1925,7 @@ pub struct RenamePlane {
 /// or the target is the always-present `startup` plane.
 pub fn plane_rename(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: RenamePlane = params(p)?;
-    let handle = app(ctx.db.plane(&req.plane))?;
+    let handle = ctx.plane(&req.plane)?;
     app(handle.rename(&req.to))?;
     Ok(jval!({ "id": handle.id().0, "name": req.to }))
 }
@@ -1925,7 +1942,7 @@ pub struct SetPlaneProps {
 pub fn plane_set_props(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: SetPlaneProps = params(p)?;
     let props = props_of(&req.properties)?;
-    let handle = app(ctx.db.plane(&req.plane))?;
+    let handle = ctx.plane(&req.plane)?;
     app(handle.set_properties(props))?;
     let now = app(handle.properties())?;
     Ok(jval!({

@@ -604,6 +604,7 @@ impl Database {
             id,
             #[cfg(feature = "native-backend")]
             as_of: None,
+            deadline: None,
         })
     }
 
@@ -619,6 +620,7 @@ impl Database {
             id,
             #[cfg(feature = "native-backend")]
             as_of: None,
+            deadline: None,
         })
     }
 
@@ -660,6 +662,11 @@ pub struct PlaneHandle<'db> {
     /// Gated to the native backend, the only one that can be time-travelled.
     #[cfg(feature = "native-backend")]
     as_of: Option<u64>,
+    /// When set, a query started from this handle stops with `Timeout` once
+    /// this instant passes. `None` ⇒ run to completion, which is right for an
+    /// embedded caller running its own query and wrong for a server running
+    /// someone else's.
+    deadline: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for PlaneHandle<'_> {
@@ -691,6 +698,22 @@ impl<'db> PlaneHandle<'db> {
     #[cfg(feature = "native-backend")]
     pub fn as_of_snapshot(&self) -> Option<u64> {
         self.as_of
+    }
+
+    /// Stop queries started from this handle once `deadline` passes, with
+    /// [`Error::Timeout`].
+    ///
+    /// Cooperative and row-paced: it bounds work that flows through the
+    /// pipeline. It does not interrupt a single storage call already in
+    /// progress, nor the graph algorithms, which do not produce rows as they
+    /// run — see [`crate::compute::exec`].
+    ///
+    /// Servers should set this per request. An embedded caller generally
+    /// should not: it is running its own query, and cutting it off part-way
+    /// would be a worse answer than a slow one.
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// Run `f` over a read txn — pinned to this handle's `as_of` snapshot when
@@ -1927,7 +1950,7 @@ impl<'db> QueryBuilder<'db> {
     /// Current-node ids of the matching rows, in pipeline order.
     pub fn ids(&self) -> Result<Vec<NodeId>> {
         self.with_reader(|reader| {
-            exec::execute(&self.plan, reader)?
+            exec::execute_with(&self.plan, reader, self.plane.deadline)?
                 .map(|r| r.map(|row| row.head))
                 .collect()
         })
@@ -1937,7 +1960,7 @@ impl<'db> QueryBuilder<'db> {
     pub fn nodes(&self) -> Result<Vec<NodeRecord>> {
         self.with_reader(|reader| {
             let mut out = Vec::new();
-            for r in exec::execute(&self.plan, reader)? {
+            for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
                 let row = r?;
                 if let Some(node) = reader.node(row.head)? {
                     out.push((*node).clone());
@@ -1967,7 +1990,7 @@ impl<'db> QueryBuilder<'db> {
                 }
                 Ok(())
             };
-            for r in exec::execute(&self.plan, reader)? {
+            for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
                 let row = r?;
                 add_node(row.head, reader)?;
                 // Each traversed edge carries its endpoints, so walking the
@@ -1989,7 +2012,7 @@ impl<'db> QueryBuilder<'db> {
     pub fn scored_nodes(&self) -> Result<Vec<(NodeRecord, Option<f32>)>> {
         self.with_reader(|reader| {
             let mut out = Vec::new();
-            for r in exec::execute(&self.plan, reader)? {
+            for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
                 let row = r?;
                 if let Some(node) = reader.node(row.head)? {
                     out.push(((*node).clone(), row.score));
@@ -2003,7 +2026,7 @@ impl<'db> QueryBuilder<'db> {
     pub fn count(&self) -> Result<usize> {
         self.with_reader(|reader| {
             let mut n = 0usize;
-            for r in exec::execute(&self.plan, reader)? {
+            for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
                 r?;
                 n += 1;
             }
@@ -2016,7 +2039,7 @@ impl<'db> QueryBuilder<'db> {
     pub fn select(&self, exprs: &[Expr]) -> Result<Vec<Vec<PropValue>>> {
         self.with_reader(|reader| {
             let mut out = Vec::new();
-            for r in exec::execute(&self.plan, reader)? {
+            for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
                 let row = r?;
                 let node = reader.node(row.head)?;
                 let ctx = expr::EvalCtx {

@@ -20,6 +20,11 @@ max_concurrent = 1024
 # bulk import or digest blocks every other writer while it runs; a bound turns
 # that into an answer instead of a hang. Default 30. Set 0 to wait forever.
 write_timeout_secs = 30
+# How long one request's queries may run before stopping with the same retryable
+# timeout. Bounds an agent's runaway MATCH so it cannot occupy the server
+# indefinitely. Cooperative and row-paced: it stops work that flows, not a graph
+# algorithm mid-iteration. Default 60. Set 0 to run to completion.
+query_timeout_secs = 60
 # Extra browser origins allowed past the CSRF guard (→ DRSG_ALLOWED_ORIGINS).
 allowed_origins = ["https://app.example.com"]
 

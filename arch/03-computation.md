@@ -230,5 +230,22 @@ plan/executor decisions don't preclude it.
    benchmark at M3.
 5. **Catalog write amplification** — per-write incremental updates vs
    periodic fold; measure at M3.
-6. **Timeout/cancellation** — cooperative check per iterator `next()`;
-   confirm granularity is enough for MCP request deadlines.
+6. ~~**Timeout/cancellation** — cooperative check per iterator `next()`;
+   confirm granularity is enough for MCP request deadlines.~~ **Resolved: yes,
+   for the pipeline — and only for the pipeline.** `execute_with` takes an
+   optional deadline and wraps both the source and the finished chain, checking
+   every 1024 rows (a clock read per row is real overhead and buys nothing at
+   that granularity). Wrapping the *source* is what makes a barrier bounded: a
+   `Sort` drains its input before yielding anything, so a check on the finished
+   chain alone would never fire for it.
+
+   Unbounded stays the default, since an embedded caller running its own query
+   is better served by a slow answer than a truncated one; `drsg serve` sets a
+   per-request deadline (`[server] query_timeout_secs`, 60s) and surfaces it as
+   the retryable `-32002`.
+
+   The granularity limit, stated plainly because it is easy to assume otherwise:
+   this bounds work that **flows**. It cannot interrupt a single call already
+   running — a `scan_all` materializing a huge plane inside the source — nor the
+   graph algorithms in `algo.rs`, which iterate without producing rows. Those
+   need their own checks and remain unbounded.
