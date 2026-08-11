@@ -21,8 +21,8 @@ mod refine;
 
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
-    CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport, DigestResult,
-    ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest,
+    ApplyStats, CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport,
+    DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, entity_text,
 };
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};

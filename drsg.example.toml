@@ -46,3 +46,21 @@ dir = "logs"
 # OPENAI_API_KEY = "sk-..."
 # DEEPSEEK_API_KEY = "..."
 # DASHSCOPE_API_KEY = "..."   # Qwen / DashScope
+
+# Server-side ingestion tuning. A digest.run request may override the first two.
+[digest]
+# Per-chunk extraction chat calls to run concurrently. Default 8.
+# concurrency = 8
+# Target chunk size in characters, paragraph-aware. Default 4000.
+# chunk_chars = 4000
+# Setting embed_provider turns on embed-on-write for /mcp's write_nodes: nodes
+# an agent writes get a vector built from the same recipe `digest` uses (key +
+# labels + text properties) and stored in the same `embedding` property, so both
+# land in one index and one search finds both. Off unless set — an agent then
+# has to supply its own vectors, and one that forgets writes nodes no vector
+# search will ever return. A node that already carries `embedding` is untouched.
+# Costs one provider round-trip per write_nodes call (the batch is embedded in
+# one request, not one per node).
+# embed_provider = "openai"
+# embed_model = "text-embedding-3-small"
+# embed_key_env = "OPENAI_API_KEY"

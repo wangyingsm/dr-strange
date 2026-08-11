@@ -60,6 +60,12 @@ pub struct ServeOptions {
     /// query is someone else's, and since `/mcp` shipped an agent's runaway
     /// `MATCH` had nothing bounding it at all.
     pub query_timeout: Option<Duration>,
+    /// When set, `/mcp`'s `write_nodes` embeds the nodes it writes —
+    /// `(preset-or-url, model, key-env)`. Configured by the operator rather
+    /// than asked for per call, so an agent cannot write silently unsearchable
+    /// nodes by forgetting a flag. The key is read from the environment at call
+    /// time, never carried here.
+    pub embed_provider: Option<(String, Option<String>, Option<String>)>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -138,6 +144,7 @@ impl Default for ServeOptions {
             fetch: FetchDefaults::default(),
             write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
             query_timeout: Some(DEFAULT_QUERY_TIMEOUT),
+            embed_provider: None,
         }
     }
 }
