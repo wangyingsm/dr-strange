@@ -33,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Database::open(PathBuf::from(&path))?);
     tracing::info!(db = %path, "drsg-mcp: database opened; serving MCP over stdio");
 
-    let server = DrStrange::new(db);
+    // Local files are allowed here and nowhere else: this process runs on the
+    // agent's own machine, as that agent's user, so `digest { path }` reads
+    // exactly what the agent could already read for itself. The served `/mcp`
+    // leaves the flag off, where the same param would be arbitrary file read.
+    let server = DrStrange::new(db).with_local_files(true);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

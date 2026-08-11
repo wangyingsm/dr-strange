@@ -1468,6 +1468,7 @@ button.swatch.off::before {
   transition: width 0.2s ease;
 }
 
+
 /* Where the document comes from (ROADMAP §9) — its own row, below the parse
    settings, because "what to read" and "how to read it" are two questions. */
 .sources {

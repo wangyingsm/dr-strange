@@ -29,6 +29,11 @@ access, and the CLI for offline operations.
 | `index ensure \| keyword` | declare a vector or keyword index |
 | `ask <question> --plane` | natural-language query |
 | `digest <file\|url> --plane [--mode]` | ingest a document (or a page and its links) via an LLM |
+
+A file may be Markdown or plain text, or any of Word, PowerPoint, Excel,
+OpenDocument, RTF, EPUB, CSV and PDF — those are converted to Markdown first, so
+the model reads headings, tables and lists rather than loose characters. The
+format is detected from the file's contents, so a wrong extension still works.
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |
 | `stats` / `check` | summary counts / integrity scan |
 | `serve [--addr]` | run the web dashboard + JSON-RPC API |

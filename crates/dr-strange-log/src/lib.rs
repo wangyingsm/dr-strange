@@ -10,10 +10,25 @@
 //! - **a daily-rolling file** under `DRSG_LOG_DIR` (default `./logs`), written
 //!   through a non-blocking worker so logging never stalls the hot path.
 //!
-//! Filtering honours `RUST_LOG`; absent that it defaults to `info`. Either way
-//! `pdf_extract` is pinned to `error`: its per-glyph font/unicode warnings come
-//! in as `log`-crate records (bridged by `tracing-log`) and flood on PDFs with
-//! broken unicode maps (see dr-strange-web's `extract.rs`).
+//! Filtering honours `RUST_LOG`; absent that it defaults to `info`.
+//!
+//! Document conversion (`anydoc`, via dr-strange-llm's `document`) reports
+//! through the `log` crate, bridged in by `tracing-log`, and is deliberately
+//! **not** filtered down. Its PDF warnings are per document and are exactly
+//! what explains a disappointing digest — "3 of 40 pages need OCR and were not
+//! extracted", "broken font encodings detected; extracted text may be garbled".
+//! Silencing those to keep the log tidy would hide the answer to the question
+//! an operator is about to ask.
+//!
+//! Volume is not a concern the way it was. `anydoc` warns per *document* —
+//! twice at most for a PDF. Its one per-record warning, for a CSV row the
+//! parser cannot read at all, is rarer than it looks: ragged rows are padded
+//! into a wider table rather than refused. Should a deployment ever meet a file
+//! that does flood, `RUST_LOG=info,anydoc=error` pins it.
+//!
+//! The predecessor, `pdf-extract`, was pinned to `error` here permanently
+//! because it warned per *glyph* on every broken font — a different order of
+//! noise, and gone with the crate.
 
 use std::path::PathBuf;
 
@@ -42,15 +57,8 @@ pub fn init(service: &str) -> LogGuard {
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
     // EnvFilter isn't Clone, so build a fresh one per layer.
-    let make_filter = || {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info"))
-            .add_directive(
-                "pdf_extract=error"
-                    .parse()
-                    .expect("static directive is valid"),
-            )
-    };
+    let make_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)

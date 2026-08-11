@@ -124,7 +124,8 @@ $ drsg --db graph.drsg digest notes.md --plane social --apply
 不出现在模型所读的 schema 摘要中，因此别名不为读路径带来任何代价，同时使文档自身的
 措辞始终可追回。
 
-命令行工具导入文本与 Markdown；仪表盘的 **AIgest** 页额外支持抽取 PDF 与 DOCX，并在
+各个入口都可导入文档：命令行、MCP 的 `digest` 工具，以及仪表盘的 **AIgest** 页。
+Word、PowerPoint、Excel、OpenDocument、RTF、EPUB、CSV 与 PDF 会先转换为 Markdown，并在
 写入前预览拟议的实体与关系。提交预览时不再产生任何额外的模型调用。
 
 ### 从 URL 读取

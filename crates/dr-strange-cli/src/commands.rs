@@ -616,12 +616,16 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
     let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
     if !is_url {
         let path = Path::new(args.source);
-        let doc =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
+        // Bytes, not `read_to_string`: a PDF or .docx is not UTF-8, and the old
+        // read failed on one before the user learned whether it was supported.
+        // Markdown and plain text pass straight through the converter.
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let doc = dr_strange_llm::to_markdown(&name, &bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
         return Ok((doc, name));
     }
 

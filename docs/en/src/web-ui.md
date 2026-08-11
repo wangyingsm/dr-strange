@@ -116,7 +116,10 @@ and narrowed to one label; selecting a node change focuses it in the canvas.
 ## AIgest
 
 The AIgest view ingests a document into the current plane (see [Chapter
-3](./ai-native.md)). Upload or paste text — Markdown, plain text, PDF, or DOCX —
+3](./ai-native.md)). Upload or paste text — Markdown and plain text, or any of
+Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF, which are
+converted to Markdown so the model sees headings, tables and lists rather than
+loose characters —
 choose the chat and embedding providers, and **Preview**: the model extracts the
 entities and relations and proposes them. **Write to graph** commits the
 previewed proposal with no further model call. Options include linking to

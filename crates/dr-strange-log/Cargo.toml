@@ -12,6 +12,7 @@ homepage.workspace = true
 [dependencies]
 tracing = { workspace = true }
 # `env-filter` isn't in the default set; keep the defaults (fmt, ansi, and the
-# `tracing-log` bridge that captures `log`-crate records, e.g. pdf-extract's).
+# `tracing-log` bridge that captures `log`-crate records — that is how the
+# document converter's warnings, e.g. "pages need OCR", reach these sinks).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

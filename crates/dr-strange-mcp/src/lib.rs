@@ -44,6 +44,9 @@ pub struct DrStrange {
     /// [`DrStrange::with_embed_provider`]. `None` leaves `write_nodes` writing
     /// exactly what it was given.
     embed: Option<EmbedProvider>,
+    /// Whether `digest` may read a `path` the caller names — see
+    /// [`DrStrange::with_local_files`]. Off unless the host says otherwise.
+    local_files: bool,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -102,7 +105,21 @@ impl DrStrange {
             digest,
             tools: Arc::new(Semaphore::new(DEFAULT_TOOL_CONCURRENCY)),
             embed: None,
+            local_files: false,
         }
+    }
+
+    /// Let `digest` read a document path the caller names.
+    ///
+    /// For the stdio server this is right: it runs on the agent's own machine,
+    /// as that agent's user, and "digest this file" is the obvious thing to ask.
+    /// For a shared `drsg serve` it would be an arbitrary-file-read primitive —
+    /// an authenticated remote agent could name any path the server process can
+    /// open, digest it into the graph, and read it back with a query. Off unless
+    /// the host opts in, so the network transport cannot acquire it by accident.
+    pub fn with_local_files(mut self, allowed: bool) -> Self {
+        self.local_files = allowed;
+        self
     }
 
     /// Embed nodes as they are written, using `provider`.
@@ -283,8 +300,19 @@ struct Ask {
 
 #[derive(Deserialize, JsonSchema)]
 struct Digest {
-    /// The document text to digest into a graph.
+    /// The document text to digest into a graph. Give this **or** `path`.
+    #[serde(default)]
     text: String,
+    /// Path to a document the *server* can read — Word, PowerPoint, Excel,
+    /// OpenDocument, RTF, EPUB, CSV, PDF, Markdown or plain text — converted to
+    /// Markdown before digesting.
+    ///
+    /// Only honoured by the stdio server, which runs on the same machine as the
+    /// agent that spawned it. A shared `drsg serve` refuses it: reading any path
+    /// the caller names would let an authenticated remote agent pull arbitrary
+    /// server files into the graph and query them back out.
+    #[serde(default)]
+    path: Option<String>,
     #[serde(default = "default_plane")]
     plane: String,
     /// Write the result. Default `false` — a dry-run that returns the proposed
@@ -1014,8 +1042,35 @@ fn drop_plane_logic(db: &Database, req: DropPlane) -> AnyResult<Value> {
     Ok(jval!({ "dropped": req.name }))
 }
 
-fn digest_logic(db: &Database, req: Digest, tuning: DigestTuning) -> AnyResult<Value> {
+fn digest_logic(
+    db: &Database,
+    req: Digest,
+    tuning: DigestTuning,
+    local_files: bool,
+) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Resolve the document before anything else: a refused `path` should cost
+    // no provider call.
+    let document = match &req.path {
+        None => req.text.clone(),
+        Some(_) if !local_files => anyhow::bail!(
+            "this server does not read local files — send the document as `text`. \
+             (`path` is honoured only by the stdio server, which runs on your own machine.)"
+        ),
+        Some(path) => {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+            dr_strange_llm::to_markdown(&name, &bytes)
+                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+        }
+    };
+    if document.trim().is_empty() {
+        anyhow::bail!("nothing to digest — give `text`, or `path` on a stdio server");
+    }
 
     let chat_provider = req.chat.as_deref().unwrap_or("openai");
     let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
@@ -1066,7 +1121,7 @@ fn digest_logic(db: &Database, req: Digest, tuning: DigestTuning) -> AnyResult<V
 
     let cands = dr_strange_llm::PlaneCandidates::new(&p);
     let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-    let result = dr_strange_llm::digest(&req.text, &chat, &embedder, candidates, &opts)?;
+    let result = dr_strange_llm::digest(&document, &chat, &embedder, candidates, &opts)?;
     let r = &result.report;
     let mut out = jval!({
         "applied": req.apply,
@@ -1332,8 +1387,11 @@ impl DrStrange {
         Parameters(req): Parameters<Digest>,
     ) -> Result<CallToolResult, McpError> {
         let tuning = self.digest;
-        self.blocking("digest", move |db| digest_logic(db, req, tuning))
-            .await
+        let local_files = self.local_files;
+        self.blocking("digest", move |db| {
+            digest_logic(db, req, tuning, local_files)
+        })
+        .await
     }
 }
 
@@ -1484,6 +1542,33 @@ mod tests {
         let p = db.plane("startup").unwrap();
         let node = p.node_by_key("a").unwrap().unwrap();
         assert!(!node.properties.contains_key(EMBED_PROP));
+    }
+
+    /// A served MCP endpoint must not read paths its caller names — that is an
+    /// arbitrary-file-read primitive dressed as an ingestion feature.
+    #[test]
+    fn digest_refuses_a_path_unless_the_host_allows_local_files() {
+        let db = Database::in_memory().unwrap();
+        let req: Digest = from_value(jval!({"path": "/etc/passwd"})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), false)
+            .expect_err("a networked server must refuse a caller-named path");
+        let msg = err.to_string();
+        assert!(msg.contains("does not read local files"), "got: {msg}");
+        // It must say what to do instead, or an agent just retries the same call.
+        assert!(
+            msg.contains("text"),
+            "should point at the alternative: {msg}"
+        );
+    }
+
+    /// Refused before any provider call — a rejected path should cost nothing.
+    #[test]
+    fn digest_with_neither_text_nor_path_is_refused() {
+        let db = Database::in_memory().unwrap();
+        let req: Digest = from_value(jval!({"text": "   "})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), true)
+            .expect_err("an empty document must not reach a provider");
+        assert!(err.to_string().contains("nothing to digest"), "{err}");
     }
 
     /// Every tool body must pass the gate. Nothing else bounds them: the

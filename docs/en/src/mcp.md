@@ -133,6 +133,15 @@ stay under a provider's rate limit applies to both surfaces, not one of them.
 (The embedded `drsg-mcp` binary has no config file and keeps the built-in
 defaults.)
 
+One capability differs by transport rather than by configuration. `digest`
+accepts a `path` to a document the server reads — Word, PowerPoint, Excel,
+OpenDocument, RTF, EPUB, CSV, PDF, Markdown or plain text — and **only the
+stdio server honours it**. That server runs on your own machine as your own
+user, so it reads exactly what the agent could already open for itself. A
+shared `drsg serve` refuses it: reading any path the caller names would let an
+authenticated remote agent pull arbitrary server files into the graph and query
+them back out. Over `/mcp`, send the document as `text` instead.
+
 ### Session lifetime
 
 A host that exits cleanly sends `DELETE /mcp` and its session goes away at

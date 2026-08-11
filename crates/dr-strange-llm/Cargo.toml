@@ -16,4 +16,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 ureq = { version = "2", features = ["json"] }
+# Server-side document → Markdown for the digest page (arch/07, arch/08).
+# Replaces a hand-rolled pdf-extract + unzip-the-docx pair: one crate covers
+# doc/docx/odt/rtf/epub/pdf/pptx/xlsx/csv, detects the format from the bytes
+# rather than the filename, and emits GitHub-Flavored Markdown — structure the
+# extraction pipeline previously threw away. Pure Rust, no C/C++ chain.
+# Pinned exactly, not a caret range: it is a young crate (10 releases in its
+# first fortnight) sitting in the ingestion path, so a bump should be a decision
+# rather than something that happens during someone else's `cargo update`.
+anydoc = "=0.1.8"
 tracing.workspace = true

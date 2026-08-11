@@ -351,15 +351,12 @@ async fn extract_http(
             // Err ⇒ the client hung up; nothing left to do but stop trying.
             tx.blocking_send(Ok(Bytes::from(line))).is_ok()
         };
-        // Scope the progress closure so its borrow of `send` ends before the
-        // final message is sent.
-        let result = {
-            let mut on_page = |page, total| {
-                send(json!({ "progress": { "page": page, "total": total } }));
-            };
-            crate::extract::extract_text_with_progress(&q.name, &body, &mut on_page)
-        };
-        match result {
+        // No progress messages: conversion is a single fast call now (anydoc
+        // is milliseconds where page-by-page PDF extraction was seconds), so
+        // the page shows an indeterminate loading state rather than a bar that
+        // would jump straight to 100. The stream stays NDJSON because the
+        // crawl endpoint shares this reader and does still report progress.
+        match dr_strange_llm::to_markdown(&q.name, &body) {
             Ok(text) => send(json!({ "chars": text.chars().count(), "text": text })),
             Err(e) => send(json!({ "error": e.to_string() })),
         };

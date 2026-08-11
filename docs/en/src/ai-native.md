@@ -154,7 +154,8 @@ hidden from the schema summary the model reads, so an alias costs the read paths
 nothing while keeping the document's own words recoverable.
 
 The command-line tool ingests text and Markdown; the dashboard's **AIgest** page
-additionally extracts PDF and DOCX, and previews the proposed entities and
+additionally converts Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV
+and PDF to Markdown, and previews the proposed entities and
 relations before writing. Committing a preview performs no further model calls.
 
 ### Reading from a URL

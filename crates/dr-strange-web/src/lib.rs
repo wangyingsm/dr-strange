@@ -11,7 +11,6 @@
 
 mod assets;
 mod auth;
-mod extract;
 pub mod fetch;
 mod methods;
 mod rpc;

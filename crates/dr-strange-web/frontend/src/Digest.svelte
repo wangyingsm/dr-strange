@@ -45,8 +45,13 @@
   let status = $state('')
   let error = $state(null)
   let busy = $state(false)
-  let pct = $state(null) // extraction progress 0..100, null = no/indeterminate
-  let thinking = $state(false) // waiting on the (slow, indeterminate) LLM call
+  // Crawl progress 0..100 — pages are countable, so that one gets a real bar.
+  // null means no bar; document conversion uses the overlay above instead.
+  let pct = $state(null)
+  // Work whose duration cannot be known: the LLM call, and converting an
+  // uploaded document. Both raise the same centred spinning-logo overlay —
+  // the message under it says which. A bar would have to invent a percentage.
+  let thinking = $state(false)
 
   /// Both streaming endpoints answer newline-delimited JSON: zero or more
   /// progress lines, then a final result or `{error}`. Read it line by line so
@@ -144,8 +149,9 @@
     if (!file) return
     error = null
     busy = true
+    thinking = true
     pct = null
-    status = `extracting ${file.name}…`
+    status = `reading ${file.name}…`
     try {
       const buf = await file.arrayBuffer()
       const res = await fetch(`/digest/extract?name=${encodeURIComponent(file.name)}`, {
@@ -153,14 +159,11 @@
         headers: authHeaders(),
         body: buf,
       })
+      // No per-page progress to report: conversion is one call, so the spinning
+      // overlay carries it and `pct` stays null. A crawl still reports pages —
+      // see the handler above.
       const done = await stream(res, (msg) => {
-        if (msg.progress) {
-          const { page, total } = msg.progress
-          pct = total ? Math.round((page / total) * 100) : null
-          status = `extracting ${file.name}… page ${page}/${total}`
-        } else if (msg.text !== undefined) {
-          return msg
-        }
+        if (msg.text !== undefined) return msg
       })
       if (!done) throw new Error('extraction ended without a result')
       text = done.text
@@ -173,6 +176,7 @@
       error = err.message
     } finally {
       busy = false
+      thinking = false
       pct = null
       e.target.value = '' // allow re-selecting the same file
     }
@@ -256,11 +260,14 @@
      settings above because these are two different questions — what to read,
      and how to read it. -->
 <div class="sources">
-  <label class="file-btn" title="Markdown, plain text, PDF or DOCX">
+  <label
+    class="file-btn"
+    title="Markdown and plain text, or Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF — converted to Markdown"
+  >
     Local file: upload
-    <input type="file" accept=".md,.markdown,.txt,.pdf,.docx" onchange={onFile} />
+    <input type="file" accept=".md,.markdown,.txt,.text,.doc,.docx,.odt,.rtf,.epub,.pdf,.ppt,.pptx,.xls,.xlsx,.ods,.odp,.csv" onchange={onFile} />
   </label>
-  <span class="ext">.md .txt .pdf .docx</span>
+  <span class="ext">.md .txt .pdf .docx .pptx .xlsx .csv &amp; more</span>
   <span class="or">or from URL</span>
   <input
     class="url"
@@ -343,7 +350,7 @@
   class="doc"
   bind:value={text}
   rows="12"
-  placeholder="Upload a markdown / txt / pdf / docx file, paste a URL above, or paste text here…"
+  placeholder="Upload a document — Markdown, text, PDF, Word, PowerPoint, Excel, OpenDocument, RTF, EPUB or CSV — paste a URL above, or paste text here…"
 ></textarea>
 
 <div class="actions">

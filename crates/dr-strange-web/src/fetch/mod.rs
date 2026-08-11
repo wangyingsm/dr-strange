@@ -555,9 +555,8 @@ impl Crawl<'_> {
             // already in the tree. It contributes no links, which is fine —
             // its prose is what was wanted.
             "application/pdf" => {
-                let text =
-                    crate::extract::extract_text_with_progress("x.pdf", &body, &mut |_, _| {})
-                        .map_err(|e| anyhow::anyhow!("reading the PDF: {e}"))?;
+                let text = dr_strange_llm::to_markdown("x.pdf", &body)
+                    .map_err(|e| anyhow::anyhow!("reading the PDF: {e}"))?;
                 Ok(Loaded {
                     title: String::new(),
                     text,

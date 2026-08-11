@@ -107,6 +107,13 @@ $ drsg-mcp /path/to/graph.drsg
 这正是关键所在：核心内部的 `write_gate` 会序列化并发写者，因此这是安全的，而不仅仅是
 方便。
 
+有一项能力的差别来自传输方式，而非配置。`digest` 接受一个 `path`，由服务端读取该文档
+（Word、PowerPoint、Excel、OpenDocument、RTF、EPUB、CSV、PDF、Markdown 或纯文本），
+但**只有 stdio 服务会接受它**：该进程运行在你自己的机器上、以你自己的身份运行，因此它
+读到的正是 agent 本就能打开的文件。共享的 `drsg serve` 则会拒绝——若允许调用方指定任意
+路径，一个已通过认证的远程 agent 就能把服务器上的任意文件读入图中，再用查询取回。在
+`/mcp` 上请改为以 `text` 传入文档。
+
 `digest` 的 LLM 调用仍然花费服务进程自身的提供方密钥（无论本地还是远程，都绝不来自
 工具参数）；`write_nodes`/`write_edges` 保留其逐次调用的批量原子性，因为无论哪种情况，
 工具代码都在同一进程内针对同一个 `Database` 运行——这里不会代理到 `/rpc`，也不会改变

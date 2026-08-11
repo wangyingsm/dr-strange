@@ -25,6 +25,10 @@
 | `index ensure \| keyword` | 声明一个向量或关键词索引 |
 | `ask <问题> --plane` | 自然语言查询 |
 | `digest <文件\|url> --plane [--mode]` | 经由 LLM 导入一篇文档（或一个页面及其链接） |
+
+文件可以是 Markdown 或纯文本，也可以是 Word、PowerPoint、Excel、OpenDocument、RTF、
+EPUB、CSV 与 PDF——后者会先转换为 Markdown，使模型读到的是标题、表格与列表，而非散乱
+的字符。格式依据文件内容判断，因此扩展名写错也不影响。
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |
 | `stats` / `check` | 汇总计数 / 完整性扫描 |
 | `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 |

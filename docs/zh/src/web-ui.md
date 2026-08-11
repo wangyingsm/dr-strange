@@ -95,7 +95,9 @@ Explore 的 **Live** 选项卡通过 WebSocket 打开一个 `plane.watch` 订阅
 ## AIgest
 
 AIgest 视图将一篇文档导入当前平面（见[第 3 章](./ai-native.md)）。上传或粘贴文本——
-Markdown、纯文本、PDF 或 DOCX——选择对话与嵌入提供方，然后 **Preview（预览）**：模型
+Markdown 与纯文本，或 Word、PowerPoint、Excel、OpenDocument、RTF、EPUB、CSV 与 PDF
+（它们会被转换为 Markdown，使模型看到的是标题、表格与列表，而非散乱的字符）——选择
+对话与嵌入提供方，然后 **Preview（预览）**：模型
 抽取实体与关系并提出方案。**Write to graph（写入图）** 会提交所预览的方案，不再产生
 任何额外的模型调用。可选项包括链接到既有节点（以避免重复）与跳过嵌入生成。
 
