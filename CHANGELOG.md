@@ -4,6 +4,51 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-08-11
+
+### Added
+- **Documents are read everywhere, and become Markdown.** `drsg digest`, the
+  `digest` MCP tool and the dashboard upload now share one reader covering
+  Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF, alongside
+  Markdown and plain text. Previously only the dashboard read documents, only
+  PDF and DOCX, and `drsg digest report.pdf` failed on the first non-UTF-8
+  byte. The output is Markdown rather than flat characters, so the model sees
+  headings, tables and lists — and the format is detected from the file's
+  contents, so a wrong extension still converts.
+- **Nodes can be embedded as an agent writes them.** Set `[digest]
+  embed_provider` and `/mcp`'s `write_nodes` gives each node a vector built
+  from the same recipe and stored in the same property `digest` uses, so an
+  agent's writes and a digest's land in one index and one search finds both.
+  Off unless configured; a node that already carries a vector is untouched;
+  the whole batch costs one provider round-trip.
+- **`digest` accepts a `path`** on the stdio MCP server, which runs on the
+  agent's own machine. A shared `drsg serve` refuses it — reading any path a
+  caller names would let a remote agent pull server files into the graph.
+
+### Changed
+- **A query now has a time budget.** `drsg serve` stops one after 60s
+  (`[server] query_timeout_secs`, `0` to disable) and answers with the
+  retryable `-32002`. Embedded callers are unaffected and still run to
+  completion. Cooperative and row-paced: it bounds work that flows, not a
+  graph algorithm mid-iteration.
+- **Slightly different vectors from `digest`.** Text and embedding now share
+  one promotion rule, so numbers, booleans and lists feed the vector where
+  only strings did before. Re-digesting a source produces a marginally
+  different vector than 1.6.0 — worth knowing because identity matching
+  compares against previously written embeddings.
+
+### Fixed
+- **`digest` could shadow entities the plane already had.** The bulk path
+  writes the external-key index unconditionally, so re-digesting a source, or
+  digesting two that name the same entity, overwrote the index entry: the
+  original node stayed but became reachable only by id, and every `key(…)`
+  read against it silently returned empty. Entities already present are now
+  skipped and reported by name. The same fix already landed for `digest.write`
+  over `/rpc`; `write_nodes` was never affected.
+- **The dashboard's upload filter hid files the server could read** — it
+  listed four extensions while the reader accepted twelve.
+- **An extensionless upload was refused** as a file type named after the file.
+
 ## [1.6.0] - 2026-08-10
 
 ### Added
@@ -358,7 +403,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.7.0
 [1.6.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.6.0
 [1.5.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.5.0
 [1.2.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.2.0
