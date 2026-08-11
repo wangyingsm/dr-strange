@@ -115,8 +115,13 @@ Chosen over *overlay* (shared nodes, plane-scoped edges) and *soft tags*
    node in plane B" needs to be queryable in-core (not just via shared
    external keys), add an explicit cross-plane correspondence table. Defer
    until a real workload demands traversing it.
-2. **Stack-read surface** — v1.5: is per-plane result tagging enough, or do
-   callers need cross-plane dedup by external key built in?
+2. ~~**Stack-read surface** — is per-plane result tagging enough, or do callers
+   need cross-plane dedup by external key built in?~~ **Closed: not a real
+   requirement.** Per-plane tagging is enough. A caller reading a stack knows
+   which plane each row came from and can drop what it does not want, and no
+   workload has asked for the built-in version. Deduplicating by external key
+   would also assume the same key means the same entity across planes — which
+   planes exist precisely not to assume.
 3. **Plane quotas/limits** — max planes, max per-plane size warnings for the
    embedded profile?
 4. **Copy-on-write plane forking** — `fork_plane` for cheap "try a hypothesis
