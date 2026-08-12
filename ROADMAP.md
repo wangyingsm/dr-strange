@@ -644,13 +644,12 @@ problem does not arise for that portion of the graph and stage 1 has nothing to
 reconcile there. A facts-only plugin is a digest with **no model call at all**,
 which puts a whole class of ingestion on the LLM-free side of Appendix C.
 
-**The problem.** `extract.rs`'s `extract_text_with_progress` is already this
-router — it just has the table compiled in (`.pdf` → pdf-extract, `.docx` →
-zip + XML, `.txt`/`.md` → passthrough) and only ever produces text. This item
-generalizes the table and widens the return type. It is also the seam §9 lands
-on: a fetched URL arrives as bytes plus a content type, which is the same
-routing question a file's extension asks, and there should be one dispatch point
-rather than two.
+**The problem.** `document::to_markdown(name, bytes) -> String` is already this
+router — it just has the table compiled in (anydoc by signature, then extension;
+`.txt`/`.md` passthrough) and only ever produces text. This item generalizes the
+table and widens the return type. It is also the seam §9 lands on: a fetched URL
+arrives as bytes plus a content type, which is the same routing question a
+file's extension asks, and there should be one dispatch point rather than two.
 
 **Scope sketch.**
 
@@ -724,25 +723,58 @@ The protocol above is deliberately transport-independent, so a subprocess host
 (for a plugin in a language that will not compile to wasm, or one that genuinely
 needs the network) can be added later without the plugin contract changing.
 
+**Settled — version travels inside `_generated_by`.** One property holding
+`rust@1`, not a name and a sibling version: they are never useful apart.
+
+**Settled — the plugin wins a conflict.** Where a parsed fact and a model entity
+claim one key, the fact is kept and the model's is dropped and counted. A parser
+knows where a model infers, and routing it to §8 stage 2 would spend a model
+call re-litigating what the AST already settled. Edges are *not* deduplicated
+this way: an edge carries no identity of its own, so dropping a relation the
+model found because a parser found something between the same nodes would lose
+real information.
+
+**Settled — preprocessing is local-only.** The CLI and the **stdio** MCP server
+route through it; `drsg serve` and the HTTP MCP server do not. What makes
+parsing worth its cost is a plugin pulling the files *around* the one it was
+handed, and that pull is exactly what a shared server must not offer — routing
+it there would hand every caller a handler whose only reachable input is the
+server's own filesystem. Text sent over the wire stays prose.
+
+**Shipped (v2, slice 1) — the contract, natively.** `dr_strange_llm::preprocess`
+holds `Preprocessed`/`Preprocessor`/`Host`/`Manifest`, the router
+(`route_document` for one input, `route_tree` for a polyglot tree), grounding
+(`FactsAndPlane`), the conflict rule (`fold`), and an in-tree Rust plugin built
+on `syn`. Keys are module paths (`dr_strange_core::compute::exec::execute`), a
+trait impl's methods are keyed by qualified path (`<T as From<i64>>::from`), and
+calls resolve by locality — the caller's own module first, then each enclosing
+one. What stays unresolved is counted in the report rather than guessed at.
+`drsg digest <dir>` on a code-only tree writes a graph with **zero provider
+calls**, which is the item's headline made real.
+
+The wasm host is slice 2. It implements a trait that has already run in anger,
+rather than one designed against a host that has never executed a module — and
+the dependency weight wasmtime brings (Cranelift, `libc`, `object`, `rustix`)
+deserves a deliberate re-look against the default-on decision above when it
+lands, not a silent arrival.
+
 **Forks to settle.**
 - *Which wasm flavour.* The **component model / WIT** gives a typed contract and
   generated bindings — the right shape for a third-party interface — but its
   language support outside Rust is still uneven. Core wasm + WASI preview 1 with
   hand-rolled marshalling works in more toolchains today and ages worse.
-- *What the example plugins are written in.* Both in Rust is the low-risk answer
-  (`syn` for Rust, a tree-sitter grammar for Go, both compiling to wasm32
-  cleanly) and it proves the interface is language-neutral less convincingly
-  than writing the Go plugin in Go — which depends on TinyGo's stdlib coverage
-  holding up under `go/parser`.
+- *What the example plugins are written in.* The Rust one is in Rust and in
+  tree. Writing the Go plugin in Go would prove the interface is
+  language-neutral far better than a second Rust plugin using a tree-sitter
+  grammar — and depends on TinyGo's stdlib coverage holding up under `go/parser`.
 - *Plugin identity.* Pin a plugin by SHA-256 in the configuration, the way the
-  installers already verify release binaries, or trust the path?
-- *Version in provenance.* `_generated_by` carries the name; a plugin's version
-  belongs somewhere too, in that value or a sibling property.
+  installers already verify release binaries, or trust the path? Meaningless
+  until a plugin can come from outside the binary.
 - *Enforced determinism.* Deny the clock and randomness outright, or grant them
-  on request and lose reproducible ingestion for plugins that ask?
-- *Facts that conflict with the model's extraction.* A plugin says a symbol is a
-  `Function` and the LLM pass calls it a `Concept`. Plugin wins by rule, or does
-  this go to stage 2 as an identity question?
+  on request and lose reproducible ingestion for plugins that ask? The native
+  slice is deterministic by construction — a sorted walk, and parallel results
+  collected in input order rather than as they complete — so this is a question
+  about the sandbox, not about the contract.
 
 ---
 

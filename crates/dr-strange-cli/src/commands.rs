@@ -538,6 +538,12 @@ pub struct DigestArgs<'a> {
     pub embed_url: Option<&'a str>,
     pub chat_key_env: Option<&'a str>,
     pub embed_key_env: Option<&'a str>,
+    /// Force a preprocessor by name instead of routing by extension
+    /// (ROADMAP §11). A router that guesses is worse than one that asks.
+    pub handler: Option<&'a str>,
+    /// Store each parsed function's own source on its node, for retrieval.
+    /// Off by default: it is roughly a copy of the codebase in the graph.
+    pub plugin_source: bool,
 }
 
 /// Natural-language query (ROADMAP §3): an LLM turns `question` into a
@@ -612,7 +618,11 @@ pub fn ask(
 /// quietly read less than the reader expected would be worse than one that
 /// read nothing.
 #[cfg(feature = "digest")]
-fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String)> {
+fn read_source(
+    args: &DigestArgs,
+    opts: &dr_strange_llm::PluginOptions,
+    out: &mut dyn Write,
+) -> Result<(dr_strange_llm::Preprocessed, String)> {
     let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
     if !is_url {
         let path = Path::new(args.source);
@@ -620,13 +630,28 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
+
+        // A directory is a legal source since ROADMAP §11: a preprocessor pulls
+        // the files it wants through the host, so "digest this project" needs
+        // no file list from the caller.
+        if path.is_dir() {
+            let host = dr_strange_llm::LocalFiles::new(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let facts = dr_strange_llm::route_tree(&host, args.handler, opts)?;
+            return Ok((facts, name));
+        }
+
         // Bytes, not `read_to_string`: a PDF or .docx is not UTF-8, and the old
         // read failed on one before the user learned whether it was supported.
         // Markdown and plain text pass straight through the converter.
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let doc = dr_strange_llm::to_markdown(&name, &bytes)
+        // The host is the file's own directory: a preprocessor handed one
+        // source file may still need to follow an import beside it.
+        let host = dr_strange_llm::LocalFiles::new(path.parent().unwrap_or(Path::new(".")))
             .with_context(|| format!("reading {}", path.display()))?;
-        return Ok((doc, name));
+        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, opts)
+            .with_context(|| format!("reading {}", path.display()))?;
+        return Ok((facts, name));
     }
 
     let opts = dr_strange_web::fetch::FetchOptions {
@@ -678,7 +703,10 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
     if doc.trim().is_empty() {
         bail!("{} yielded no readable text", args.source);
     }
-    Ok((doc, args.source.to_string()))
+    Ok((
+        dr_strange_llm::Preprocessed::prose_only("fetch", doc),
+        args.source.to_string(),
+    ))
 }
 
 /// Digests a document into the plane: an LLM extracts entities/relations
@@ -689,23 +717,18 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
 pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let (doc, source) = read_source(args, out)?;
+    // Mode is parsed before anything expensive: a typo should not cost a crawl.
+    let mode = dr_strange_llm::DigestMode::parse(args.mode).ok_or_else(|| {
+        anyhow!(
+            "unknown digest mode `{}` — expected coarse, fine or super",
+            args.mode
+        )
+    })?;
+    let plugins = dr_strange_llm::PluginOptions {
+        rust_include_source: args.plugin_source,
+    };
 
-    let chat = dr_strange_llm::build_provider(
-        args.chat_provider,
-        args.model,
-        args.chat_url,
-        args.chat_key_env,
-        false,
-    )?;
-    let chat_model = chat.model().to_string();
-    let embedder = dr_strange_llm::build_provider(
-        args.embed_provider,
-        args.embed_model,
-        args.embed_url,
-        args.embed_key_env,
-        args.embed,
-    )?;
+    let (mut facts, source) = read_source(args, &plugins, out)?;
 
     let p = plane(db, args.plane)?;
     let run_id = format!(
@@ -716,28 +739,65 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let opts = dr_strange_llm::DigestOptions {
-        source,
-        model: chat_model,
-        run_id,
-        chunk_chars: args.chunk_chars,
-        embed: args.embed,
-        concurrency: args.concurrency,
-        mode: dr_strange_llm::DigestMode::parse(args.mode).ok_or_else(|| {
-            anyhow!(
-                "unknown digest mode `{}` — expected coarse, fine or super",
-                args.mode
-            )
-        })?,
-        refine_max_entities: None,
-        refine_max_context: None,
+    dr_strange_llm::stamp_run(&mut facts, &source, &run_id);
+
+    if !facts.report.handlers.is_empty() {
+        let ran: Vec<String> = facts
+            .report
+            .handlers
+            .iter()
+            .map(|(n, c)| format!("{n} ({c} facts)"))
+            .collect();
+        writeln!(out, "preprocessed by {}", ran.join(", "))?;
+    }
+
+    // The §11 headline: an input that yields only facts is digested with **no
+    // model call at all** — no provider constructed, no key read, no request
+    // made. Building the chat client eagerly would defeat it, since that is
+    // where a missing API key turns into an error.
+    let result = if facts.needs_model() {
+        let chat = dr_strange_llm::build_provider(
+            args.chat_provider,
+            args.model,
+            args.chat_url,
+            args.chat_key_env,
+            false,
+        )?;
+        let embedder = dr_strange_llm::build_provider(
+            args.embed_provider,
+            args.embed_model,
+            args.embed_url,
+            args.embed_key_env,
+            args.embed,
+        )?;
+        let opts = dr_strange_llm::DigestOptions {
+            source,
+            model: chat.model().to_string(),
+            run_id,
+            chunk_chars: args.chunk_chars,
+            embed: args.embed,
+            concurrency: args.concurrency,
+            mode,
+            refine_max_entities: None,
+            refine_max_context: None,
+        };
+
+        let cands = dr_strange_llm::PlaneCandidates::new(&p);
+        let plane_source = args
+            .link
+            .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+        // Grounded whether or not `--link` is on: without this the model is
+        // told the facts this very run parsed are new, and proposes a second
+        // `parse` beside the one the AST just established.
+        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+        let extracted =
+            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+        dr_strange_llm::fold(facts, extracted)
+    } else {
+        writeln!(out, "no prose left to read — digested without a model call")?;
+        dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
     };
 
-    let cands = dr_strange_llm::PlaneCandidates::new(&p);
-    let candidates = args
-        .link
-        .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-    let result = dr_strange_llm::digest(&doc, &chat, &embedder, candidates, &opts)?;
     let r = &result.report;
     writeln!(
         out,
@@ -749,6 +809,9 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         "  {} chat request(s); tokens {} in / {} out / {} embed",
         r.chat_requests, r.input_tokens, r.output_tokens, r.embed_tokens
     )?;
+    for note in &r.notes {
+        writeln!(out, "  note: {note}")?;
+    }
 
     if args.apply {
         let mut txn = p.write()?;
@@ -768,7 +831,10 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
                 stats.skipped.join(", ")
             )?;
         }
-        if args.embed {
+        // Only when something was actually embedded: a facts-only digest calls
+        // no provider at all, and pointing at an `embedding` property nothing
+        // wrote would send a reader to build an index over empty vectors.
+        if args.embed && r.embed_tokens > 0 {
             writeln!(
                 out,
                 "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"

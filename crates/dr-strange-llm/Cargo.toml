@@ -25,4 +25,26 @@ ureq = { version = "2", features = ["json"] }
 # first fortnight) sitting in the ingestion path, so a bump should be a decision
 # rather than something that happens during someone else's `cargo update`.
 anydoc = "=0.1.8"
+# Rust source → facts, for the code preprocessor (ROADMAP §11). `visit` for the
+# body walkers that find calls and local bindings; `full` because these are
+# whole files, not macro fragments.
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+quote = "1"
+# Deterministic, ignore-aware directory walking. `.gitignore` is a project's own
+# statement of what is derived rather than source — better than a list this
+# crate could guess at — and hand-rolling its precedence, nesting and negation
+# rules is a well-known way to be subtly wrong.
+ignore = "0.4"
+# Preprocessing is CPU-bound, so files parse in parallel. Results are collected
+# in input order, never completion order: re-ingesting a repository has to yield
+# the same graph.
+rayon = "1"
 tracing.workspace = true
+
+[dev-dependencies]
+# Preprocessing throughput in MiB/s (ROADMAP §11) — see benches/preprocess.rs.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "preprocess"
+harness = false

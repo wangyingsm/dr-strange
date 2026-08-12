@@ -15,6 +15,7 @@ mod digest;
 pub mod document;
 mod identity;
 mod openai;
+pub mod preprocess;
 mod preset;
 mod provider;
 mod reconcile;
@@ -28,6 +29,10 @@ pub use digest::{
 pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
+pub use preprocess::{
+    FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginOptions, Preprocessed, Preprocessor, fold,
+    route_document, route_tree, stamp_run,
+};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;

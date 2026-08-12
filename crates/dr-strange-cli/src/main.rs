@@ -186,9 +186,11 @@ enum Command {
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
-        /// Document to digest: a file (text / markdown) or an `http(s)://` URL.
+        /// What to digest: a file, a **directory**, or an `http(s)://` URL.
         /// A URL is fetched, converted to Markdown, and its links followed
-        /// under `--pages`/`--depth` (ROADMAP §9).
+        /// under `--pages`/`--depth` (ROADMAP §9). A directory is walked and
+        /// routed per file, so a project's code becomes parsed facts and its
+        /// documents become prose (ROADMAP §11).
         source: String,
         #[arg(long, default_value = "startup")]
         plane: String,
@@ -247,6 +249,16 @@ enum Command {
         /// URL only: ceiling on pages kept, the root included.
         #[arg(long, default_value_t = 10)]
         pages: usize,
+        /// Force a preprocessor by name (e.g. `rust`) instead of routing by
+        /// file extension. A router that guesses is worse than one that asks.
+        #[arg(long)]
+        handler: Option<String>,
+        /// Store each parsed function's own source on its node, for retrieval.
+        /// Off by default: it is roughly a copy of the codebase in the graph,
+        /// and properties share one record, so every read of that node decodes
+        /// the body too.
+        #[arg(long)]
+        plugin_source: bool,
         /// URL only: how far to follow links. 0 reads just the page named.
         #[arg(long, default_value_t = 1)]
         depth: usize,
@@ -605,6 +617,8 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             topic,
             pages,
             depth,
+            handler,
+            plugin_source,
         } => {
             let db = commands::open(&cli.db)?;
             let args = commands::DigestArgs {
@@ -627,6 +641,8 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 embed_url: embed_url.as_deref(),
                 chat_key_env: chat_key_env.as_deref(),
                 embed_key_env: embed_key_env.as_deref(),
+                handler: handler.as_deref(),
+                plugin_source,
             };
             commands::digest(&db, &args, out)
         }

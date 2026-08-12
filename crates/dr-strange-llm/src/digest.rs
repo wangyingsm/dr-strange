@@ -173,12 +173,24 @@ struct ExRelation {
 
 // ---- the result ----------------------------------------------------------
 
+#[derive(Debug, Default)]
 pub struct DigestNode {
     pub key: String,
+    /// The label a model chose, and the one stage 1 reconciles: `Func`,
+    /// `function` and `Function` are folded to a single name across chunks.
     pub label: String,
+    /// Further labels **asserted rather than chosen** — constants a
+    /// preprocessor knows to be true, like `External` on a node standing in for
+    /// something outside the tree it read.
+    ///
+    /// Separate from `label` because they must not take part in vocabulary
+    /// reconciliation: there is no disagreement to settle, and nothing a model
+    /// should be able to rename them to. A node is written with all of them.
+    pub extra_labels: Vec<String>,
     pub props: Properties,
 }
 
+#[derive(Debug)]
 pub struct DigestEdge {
     pub src: String,
     pub dst: String,
@@ -210,8 +222,15 @@ pub struct DigestReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub embed_tokens: u64,
+    /// Anything a reader of this result would want said in words — what a
+    /// preprocessor skipped, what it could not resolve, what it dropped.
+    ///
+    /// A thin graph should be explained by its report rather than investigated
+    /// by re-running the ingest with different arguments.
+    pub notes: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct DigestResult {
     pub nodes: Vec<DigestNode>,
     pub edges: Vec<DigestEdge>,
@@ -331,7 +350,17 @@ impl DigestResult {
             fresh.push(n);
         }
 
-        let label_slots: Vec<[&str; 1]> = fresh.iter().map(|n| [n.label.as_str()]).collect();
+        // The reconciled label first, then whatever a preprocessor asserted —
+        // an external trait is written `["Trait", "External"]`, saying both what
+        // it is and that it is not ours.
+        let label_slots: Vec<Vec<&str>> = fresh
+            .iter()
+            .map(|n| {
+                std::iter::once(n.label.as_str())
+                    .chain(n.extra_labels.iter().map(String::as_str))
+                    .collect()
+            })
+            .collect();
         let nodes: Vec<BulkNode> = fresh
             .iter()
             .zip(&label_slots)
@@ -446,6 +475,7 @@ pub fn digest(
             let node = entities.entry(e.key.clone()).or_insert_with(|| DigestNode {
                 key: e.key.clone(),
                 label: String::new(),
+                extra_labels: Vec::new(),
                 props: Properties::new(),
             });
             if node.label.is_empty() && !e.label.is_empty() {
@@ -573,6 +603,7 @@ pub fn digest(
                 let survivor = entities.entry(into.clone()).or_insert_with(|| DigestNode {
                     key: into.clone(),
                     label: absorbed.label.clone(),
+                    extra_labels: Vec::new(),
                     props: Properties::new(),
                 });
                 if survivor.label.is_empty() {

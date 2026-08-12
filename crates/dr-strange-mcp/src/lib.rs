@@ -307,6 +307,11 @@ struct Digest {
     /// OpenDocument, RTF, EPUB, CSV, PDF, Markdown or plain text — converted to
     /// Markdown before digesting.
     ///
+    /// May also be a **directory**, walked and routed per file: source files
+    /// are parsed into facts and documents become prose (ROADMAP §11). Reading
+    /// a checkout this way is what makes it worth parsing — a plugin follows
+    /// imports across the tree — which is also why it stays stdio-only.
+    ///
     /// Only honoured by the stdio server, which runs on the same machine as the
     /// agent that spawned it. A shared `drsg serve` refuses it: reading any path
     /// the caller names would let an authenticated remote agent pull arbitrary
@@ -356,6 +361,15 @@ struct Digest {
     /// against all the passages mentioning it — most accurate, most costly.
     #[serde(default)]
     mode: Option<String>,
+    /// `path` only: force a preprocessor by name (e.g. `rust`) instead of
+    /// routing by file extension. A router that guesses is worse than one that
+    /// asks. Ignored for `text`, which is always read as prose.
+    #[serde(default)]
+    handler: Option<String>,
+    /// `path` only: store each parsed function's own source on its node, for
+    /// retrieval. Default false — it is roughly a copy of the code in the graph.
+    #[serde(default)]
+    plugin_source: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1050,25 +1064,50 @@ fn digest_logic(
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Resolve the document before anything else: a refused `path` should cost
+    let plugins = dr_strange_llm::PluginOptions {
+        rust_include_source: req.plugin_source.unwrap_or(false),
+    };
+    let handler = req.handler.as_deref();
+
+    // Resolve the input before anything else: a refused `path` should cost
     // no provider call.
-    let document = match &req.path {
-        None => req.text.clone(),
+    let mut facts = match &req.path {
+        // Text sent over the wire stays prose, deliberately. Preprocessing is
+        // for reading a checkout the agent already has — it is worth its cost
+        // when a plugin can pull the files around the one it was handed, and
+        // that pull is exactly what a shared server must not offer. Routing it
+        // here would hand every caller a handler whose only reachable input is
+        // the server's own filesystem.
+        None => dr_strange_llm::Preprocessed::prose_only("text", req.text.clone()),
         Some(_) if !local_files => anyhow::bail!(
             "this server does not read local files — send the document as `text`. \
              (`path` is honoured only by the stdio server, which runs on your own machine.)"
         ),
         Some(path) => {
-            let name = std::path::Path::new(path)
+            let p = std::path::Path::new(path);
+            let name = p
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.clone());
-            let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-            dr_strange_llm::to_markdown(&name, &bytes)
-                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            // A directory is a legal source since ROADMAP §11: the preprocessor
+            // pulls what it needs, so "digest this project" needs no file list.
+            if p.is_dir() {
+                let host = dr_strange_llm::LocalFiles::new(p)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                dr_strange_llm::route_tree(&host, handler, &plugins)?
+            } else {
+                let bytes =
+                    std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let host = dr_strange_llm::LocalFiles::new(
+                    p.parent().unwrap_or(std::path::Path::new(".")),
+                )
+                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                dr_strange_llm::route_document(&name, &bytes, handler, &host, &plugins)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            }
         }
     };
-    if document.trim().is_empty() {
+    if facts.nodes.is_empty() && !facts.needs_model() {
         anyhow::bail!("nothing to digest — give `text`, or `path` on a stdio server");
     }
 
@@ -1077,23 +1116,12 @@ fn digest_logic(
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
-    // Provider keys come from the server's environment (never tool params) —
-    // `key_env` names the variable, it does not carry the key.
-    let chat = dr_strange_llm::build_provider(
-        chat_provider,
-        req.model.as_deref(),
-        None,
-        req.key_env.as_deref(),
-        false,
-    )?;
-    let chat_model = chat.model().to_string();
-    let embedder = dr_strange_llm::build_provider(
-        embed_provider,
-        req.embed_model.as_deref(),
-        None,
-        req.embed_key_env.as_deref(),
-        embed,
-    )?;
+    // Parsed before anything expensive: a typo should not cost a provider call.
+    let mode = match req.mode.as_deref() {
+        None => dr_strange_llm::DigestMode::default(),
+        Some(m) => dr_strange_llm::DigestMode::parse(m)
+            .ok_or_else(|| anyhow::anyhow!("unknown digest mode `{m}`"))?,
+    };
 
     let p = db.plane(&req.plane)?;
     let run_id = format!(
@@ -1103,25 +1131,53 @@ fn digest_logic(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let opts = dr_strange_llm::DigestOptions {
-        source: req.source.unwrap_or_else(|| "mcp-digest".into()),
-        model: chat_model,
-        run_id,
-        chunk_chars: tuning.chunk_chars,
-        embed,
-        concurrency: tuning.concurrency,
-        mode: match req.mode.as_deref() {
-            None => dr_strange_llm::DigestMode::default(),
-            Some(m) => dr_strange_llm::DigestMode::parse(m)
-                .ok_or_else(|| anyhow::anyhow!("unknown digest mode `{m}`"))?,
-        },
-        refine_max_entities: None,
-        refine_max_context: None,
-    };
+    let source = req.source.unwrap_or_else(|| "mcp-digest".into());
+    dr_strange_llm::stamp_run(&mut facts, &source, &run_id);
 
-    let cands = dr_strange_llm::PlaneCandidates::new(&p);
-    let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-    let result = dr_strange_llm::digest(&document, &chat, &embedder, candidates, &opts)?;
+    // The §11 headline: an input that yields only facts is digested with **no
+    // model call at all** — no provider constructed, no key read from the
+    // environment, no request made.
+    let result = if facts.needs_model() {
+        // Provider keys come from the server's environment (never tool params) —
+        // `key_env` names the variable, it does not carry the key.
+        let chat = dr_strange_llm::build_provider(
+            chat_provider,
+            req.model.as_deref(),
+            None,
+            req.key_env.as_deref(),
+            false,
+        )?;
+        let embedder = dr_strange_llm::build_provider(
+            embed_provider,
+            req.embed_model.as_deref(),
+            None,
+            req.embed_key_env.as_deref(),
+            embed,
+        )?;
+        let opts = dr_strange_llm::DigestOptions {
+            source,
+            model: chat.model().to_string(),
+            run_id,
+            chunk_chars: tuning.chunk_chars,
+            embed,
+            concurrency: tuning.concurrency,
+            mode,
+            refine_max_entities: None,
+            refine_max_context: None,
+        };
+
+        let cands = dr_strange_llm::PlaneCandidates::new(&p);
+        let plane_source = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+        // Grounded whether or not `link` is on: without this the model is told
+        // the facts this very run parsed are new, and proposes a duplicate of
+        // what the parser just established.
+        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+        let extracted =
+            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+        dr_strange_llm::fold(facts, extracted)
+    } else {
+        dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
+    };
     let r = &result.report;
     let mut out = jval!({
         "applied": req.apply,
@@ -1135,6 +1191,10 @@ fn digest_logic(
             "input_tokens": r.input_tokens,
             "output_tokens": r.output_tokens,
             "embed_tokens": r.embed_tokens,
+            // What a preprocessor skipped or could not resolve. An agent
+            // reading a thinner graph than it expected should be able to see
+            // why here, rather than re-running the ingest to find out.
+            "notes": r.notes,
         },
     });
 

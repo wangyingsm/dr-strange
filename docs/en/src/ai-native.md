@@ -211,6 +211,68 @@ host are spaced.
 Known limitation: a page whose text is assembled by JavaScript in the browser
 returns a shell with no prose. There is no headless renderer.
 
+### Reading a codebase
+
+Point `digest` at a directory and it walks the tree, routing each file to
+whatever handles it. Source files are **parsed** rather than read: the result is
+facts a compiler-grade parser is certain of, not a model's reading of the text.
+
+```console
+$ drsg --db graph.drsg digest ./crates/dr-strange-core/src --plane code --apply
+preprocessed by rust@1 (3878 facts)
+no prose left to read — digested without a model call
+  0 chat request(s); tokens 0 in / 0 out / 0 embed
+applied: wrote 1139 nodes, 2739 edges
+```
+
+Read that third line again: **no API key was set and no request was made.** An
+AST does not infer that `parse()` calls `lex()` — it knows — so handing the file
+to a model as prose would spend tokens to get a worse answer than the one
+already in hand. Where a parser is certain, the model is not consulted.
+
+Each handler brings a vocabulary of its own, fixed by the handler rather than
+invented per document — which is why nothing needs reconciling afterwards, and
+why **the labels and properties a handler emits are documented by that handler**,
+not here. Ask the one you are using; `drsg digest --handler <name>` names it.
+
+Every fact carries `_generated_by` naming the handler and its version, so a
+parsed fact is always distinguishable from a model's guess. Where both claim one
+key, **the parser wins** and the model's version is dropped and counted.
+
+The example above points at `src/` rather than the crate root, and that is the
+difference between a run that calls no model and one that does: a crate root
+holds a `Cargo.toml` and usually a README, and those are prose that genuinely
+needs reading. Pointed at a `src/` directory, the crate is still named after the
+directory holding it, so two crates ingested into one plane stay two crates.
+
+A real repository is not one language, so a tree is routed per file: the Rust is
+parsed, the Markdown and the configuration become prose for the model, and
+anything unreadable is skipped and *counted*. What the parser could not resolve
+is reported rather than quietly omitted — a call into another crate is not an
+edge, and a name matching two functions equally is left alone rather than
+guessed at:
+
+```
+note: 553 call(s) named nothing defined here — calls into other crates and
+      the standard library are not edges
+```
+
+Two flags: `--handler rust` forces a handler instead of routing by extension,
+and `--plugin-source` stores each function's own source on its node for
+retrieval. The second is off by default — it is roughly a copy of the codebase
+in the graph, and properties share one record, so every read of that node would
+decode the body too.
+
+The walk honours `.gitignore` and `.dockerignore` (a project's own statement of
+what is derived rather than source, and better than a list this tool could
+guess at) and always skips `target/`, `node_modules/` and their kin. Running it
+twice on an unchanged tree yields the same graph, byte for byte.
+
+This is deliberately **local-only** — `drsg` on your own machine and the stdio
+MCP server, never a shared `drsg serve`. What makes parsing worth its cost is a
+handler pulling the files *around* the one it was handed, and the only
+filesystem a shared server could offer is its own.
+
 ## Providers and keys
 
 The LLM features — semantic search embedding, `ask`, and ingestion — call an
