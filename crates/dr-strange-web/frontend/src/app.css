@@ -1164,11 +1164,30 @@ button.swatch.off::before {
   margin: 0 0 0.2rem;
   font-size: 1rem;
 }
+/* Nothing in the inspector may scroll sideways.
+   `anywhere` rather than `break-word`: it breaks at the text's own
+   opportunities first — spaces in `Attention Is All You Need`, which is as
+   plausible a key as any path — and only splits a token when the token itself
+   cannot fit. A key is whatever produced it, so the rule has to hold for a
+   sentence, a URL and a module path alike, without knowing which it has. */
+.inspector,
+.inspector .key,
+.inspector dd,
+.inspector dt {
+  overflow-wrap: anywhere;
+}
 .inspector .key {
   margin: 0 0 0.2rem;
   color: var(--accent);
   font-family: ui-monospace, monospace;
   font-size: 0.85rem;
+  /* A key that runs on is capped rather than pushing the properties out of
+     sight; the whole thing stays one click away, as every long value is. */
+  display: block;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
 }
 .inspector .sub {
   margin: 0 0 0.6rem;
@@ -1208,6 +1227,212 @@ button.swatch.off::before {
 }
 .vec-btn:hover {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* A property value naming another node: the id leads, since that is what makes
+   it a link, and the key follows so the list still reads as what it is. */
+.key-link {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 0.15rem;
+  cursor: pointer;
+  text-align: left;
+}
+.key-link::before {
+  content: '';
+}
+.key-link-name {
+  margin-left: 0.3rem;
+  color: var(--fg);
+  opacity: 0.85;
+  text-decoration: underline dotted color-mix(in srgb, var(--accent) 60%, transparent);
+  text-underline-offset: 2px;
+}
+.key-link:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.key-link:hover .key-link-name {
+  opacity: 1;
+  text-decoration-style: solid;
+}
+/* An entry that names nothing in this plane — a glob, or a name the walk never
+   reached. Shown, not hidden: the list is what the source wrote. */
+.key-plain {
+  opacity: 0.75;
+}
+
+/* A long value shown as an excerpt. Styled as text rather than as a control,
+   because it *is* the value — the affordance is the trailing "more". */
+.text-more {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.text-more .more {
+  color: var(--accent);
+  white-space: nowrap;
+}
+/* ---- copy key / copy JSON ---- */
+/* The id and its copy button share a line: the button copies that identity, so
+   it belongs beside it rather than in a row of its own. */
+.inspector-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.inspector-head h3 {
+  margin: 0 0 0.2rem;
+}
+/* Pushed to the end of the action row, past Delete. */
+.json-btn {
+  margin-left: auto;
+}
+.copy-btn {
+  font: inherit;
+  font-size: 0.72rem;
+  color: var(--muted);
+  background: none;
+  border: 1px solid color-mix(in srgb, var(--fg) 16%, transparent);
+  border-radius: 5px;
+  padding: 0.1rem 0.4rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.copy-btn:hover {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+/* The key keeps its own colour when it is also an excerpt button. */
+.key.text-more {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.full-text.raw {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.text-more:hover .more {
+  text-decoration: underline;
+}
+.full-text {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  max-height: 60vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+/* ---- rendered markdown (doc comments) ---- */
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 0.7rem;
+}
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 1rem 0 0.4rem;
+  line-height: 1.3;
+}
+.md h3 {
+  font-size: 1rem;
+}
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 0.9rem;
+}
+.md ul,
+.md ol {
+  margin: 0 0 0.7rem;
+  padding-left: 1.3rem;
+}
+.md li {
+  margin: 0.15rem 0;
+}
+.md blockquote {
+  margin: 0 0 0.7rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  opacity: 0.9;
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--fg) 18%, transparent);
+  margin: 0.9rem 0;
+}
+.md a {
+  color: var(--accent);
+}
+.md-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  background: color-mix(in srgb, var(--fg) 9%, transparent);
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+}
+.md-code {
+  margin: 0 0 0.7rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  overflow-x: auto;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.md-code code {
+  background: none;
+  padding: 0;
+}
+
+/* ---- the floating hint on a #id link ---- */
+.key-hint {
+  position: fixed;
+  z-index: 60;
+  max-width: 420px;
+  padding: 0.3rem 0.55rem;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--fg) 20%, transparent);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 28%);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  pointer-events: none; /* a hint must never be in the way of the click */
+}
+.hint-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* The label is the other fact in the hint, so it is the other colour. */
+.hint-label {
+  margin-left: 0.4rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+.sep {
+  opacity: 0.5;
 }
 
 /* ---- inspector edit/delete (mutation UI) ---- */

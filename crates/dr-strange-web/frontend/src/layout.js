@@ -130,6 +130,36 @@ export function sectorLeaves(graph, min = SECTOR_MIN) {
  * absent from the map rather than carrying a large number — "further than we
  * measured" is the only thing the renderer needs to know about them.
  */
+/**
+ * The frontier: entities with at most one edge *on the canvas*, plus every
+ * entity currently folded into a bead.
+ *
+ * These are where the picture stops rather than where the graph does — a node
+ * drawn with one connection is almost always one whose other neighbours were
+ * never fetched.
+ *
+ * **The folded ones are the point.** `hubsToFold` drops a hub's leaves from the
+ * graph and leaves a bead behind, so after any seed most of the frontier is
+ * inside beads rather than in the graph. Reading only the graph reports an
+ * empty frontier on exactly the views that have the largest one, and an
+ * "expand" built on it appears to do nothing at all.
+ *
+ * @param graph the plotted graphology graph
+ * @param collapsed the plot's `bead key -> { hub, nodes, edges }` map
+ */
+export function frontierIds(graph, collapsed = new Map()) {
+  const out = new Set()
+  graph.forEachNode((node, attrs) => {
+    if (!attrs.bead && graph.degree(node) <= 1) out.add(node)
+  })
+  for (const { nodes } of collapsed.values()) {
+    for (const record of nodes ?? []) {
+      if (record?.id != null) out.add(String(record.id))
+    }
+  }
+  return [...out]
+}
+
 export function focusDistances(graph, focusNodes, hops = FOCUS_HOPS) {
   const dist = new Map()
   let frontier = [...focusNodes].filter((n) => graph.hasNode(n))
