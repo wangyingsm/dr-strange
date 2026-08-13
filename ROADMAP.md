@@ -705,7 +705,14 @@ precedent in the CLI: the capability is there for anyone who wants it, and
 not. A plugin system that requires rebuilding the database before it can load a
 plugin is not one.
 
-The default flip costs binary size and build time, and it changes no security
+The default flip costs binary size and build time — **measured, as promised,
+once the weight was real**: the release `drsg` went 37.0 MB → 57.6 MB with
+wasmtime trimmed to `runtime`, `component-model`, `cranelift`, `std`. Kept on
+against that number: a fifth of the binary buys the entire plugin system, and
+`--no-default-features` still drops it. Throughput through the sandbox, same
+corpus as the native baseline: 4.5 MiB/s end-to-end (native was 23 MiB/s) —
+this workspace in ~360 ms, still trivial beside one model call, so the
+optional split-phase escalation stays unbuilt. And the flip changes no security
 posture: **the runtime being compiled in is not a plugin running.** No module is
 loaded that the configuration did not name, so a default install executes
 exactly as much third-party code as it does today, which is none.
@@ -741,6 +748,27 @@ handed, and that pull is exactly what a shared server must not offer — routing
 it there would hand every caller a handler whose only reachable input is the
 server's own filesystem. Text sent over the wire stays prose.
 
+**Shipped (v2, slice 2) — the sandbox, and plugins you install.** Plugins are
+wasm **components** against a WIT contract with two phases: `parse` turns one
+chunk into an opaque partial (the host runs chunks in parallel — that is where
+the cores are, and the guest stays single-threaded), and `assemble` turns every
+partial into the result, once — cross-file resolution stays in the plugin
+because it is language semantics and the database holds none. `drsg plugin
+install <file.wasm | url>` validates the component, refuses one that imports
+`wasi:filesystem`/`wasi:sockets` by name, pins its SHA-256 (re-checked at every
+load — the *plugin identity* fork, settled), and records it in a per-user
+store. A plugin reaches exactly `list`/`read`/`label`, rooted and resolved-path
+checked; both wasi clocks are frozen; fuel and memory are bounded per call and
+operator-settable — each guarantee proven against a committed hostile fixture.
+The **Rust parser left this repository** for `dr-strange-extensions` (the
+official extension repo: the language-neutral WIT, per-language SDKs starting
+with `dr-strange-ext`, and the plugins), installed like anything else and
+verified to produce the identical graph — 1324 nodes, 4204 edges on
+`dr-strange-core/src` — to the native parser it replaced. Trees whose facts
+exceed wasm32's 4 GiB address space are ingested a subtree at a time with the
+plane as the accumulator: `apply()` is key-idempotent and keys are stable
+qualified paths, so cross-subtree edges bind by exact key.
+
 **Shipped (v2, slice 1) — the contract, natively.** `dr_strange_llm::preprocess`
 holds `Preprocessed`/`Preprocessor`/`Host`/`Manifest`, the router
 (`route_document` for one input, `route_tree` for a polyglot tree), grounding
@@ -758,23 +786,15 @@ the dependency weight wasmtime brings (Cranelift, `libc`, `object`, `rustix`)
 deserves a deliberate re-look against the default-on decision above when it
 lands, not a silent arrival.
 
-**Forks to settle.**
-- *Which wasm flavour.* The **component model / WIT** gives a typed contract and
-  generated bindings — the right shape for a third-party interface — but its
-  language support outside Rust is still uneven. Core wasm + WASI preview 1 with
-  hand-rolled marshalling works in more toolchains today and ages worse.
-- *What the example plugins are written in.* The Rust one is in Rust and in
-  tree. Writing the Go plugin in Go would prove the interface is
-  language-neutral far better than a second Rust plugin using a tree-sitter
-  grammar — and depends on TinyGo's stdlib coverage holding up under `go/parser`.
-- *Plugin identity.* Pin a plugin by SHA-256 in the configuration, the way the
-  installers already verify release binaries, or trust the path? Meaningless
-  until a plugin can come from outside the binary.
-- *Enforced determinism.* Deny the clock and randomness outright, or grant them
-  on request and lose reproducible ingestion for plugins that ask? The native
-  slice is deterministic by construction — a sorted walk, and parallel results
-  collected in input order rather than as they complete — so this is a question
-  about the sandbox, not about the contract.
+**Forks settled by slice 2.** The wasm flavour is the **component model /
+WIT**. Plugin identity is the SHA-256 pinned at install and re-checked at every
+load. Determinism is enforced rather than requested: frozen clocks, fixed-size
+chunking, partials assembled in chunk order.
+
+**Fork remaining.** *The Go plugin*, deferred to its own slice in the
+extensions repo: writing it in Go proves the interface is language-neutral far
+better than a second Rust plugin would, and depends on TinyGo's stdlib coverage
+holding up under `go/parser`.
 
 ---
 

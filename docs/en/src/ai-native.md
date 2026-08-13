@@ -217,9 +217,27 @@ Point `digest` at a directory and it walks the tree, routing each file to
 whatever handles it. Source files are **parsed** rather than read: the result is
 facts a compiler-grade parser is certain of, not a model's reading of the text.
 
+Parsers are **plugins** — sandboxed WebAssembly components you install once and
+use anywhere:
+
+```console
+$ drsg plugin install https://github.com/…/releases/download/rust-v2/rust.wasm
+installed rust@2  sha256:e3a586a150d0
+  handles: .rs
+```
+
+The artifact's SHA-256 is pinned at install and re-checked at every load, so a
+file that changes on disk is refused rather than silently run. Inside the
+sandbox a plugin can reach exactly three things — list files, read files,
+ask the tree's name — all rooted at the directory being ingested and checked
+on the resolved path. No filesystem, no network, no environment, frozen
+clocks, and hard instruction and memory budgets (`[plugins]` in `drsg.toml`).
+A component that so much as imports a filesystem interface is refused by name
+at install.
+
 ```console
 $ drsg --db graph.drsg digest ./crates/dr-strange-core/src --plane code --apply
-preprocessed by rust@1 (3878 facts)
+preprocessed by rust@2 (5528 facts)
 no prose left to read — digested without a model call
   0 chat request(s); tokens 0 in / 0 out / 0 embed
 applied: wrote 1139 nodes, 2739 edges
@@ -257,11 +275,11 @@ note: 553 call(s) named nothing defined here — calls into other crates and
       the standard library are not edges
 ```
 
-Two flags: `--handler rust` forces a handler instead of routing by extension,
-and `--plugin-source` stores each function's own source on its node for
-retrieval. The second is off by default — it is roughly a copy of the codebase
-in the graph, and properties share one record, so every read of that node would
-decode the body too.
+`--handler rust` forces a handler instead of routing by extension. A plugin's
+own settings live under `[plugins.<name>]` in `drsg.toml` and pass through
+uninterpreted — `[plugins.rust] include_source = true` stores each function's
+source on its node for retrieval, off by default because it is roughly a copy
+of the codebase in the graph.
 
 The walk honours `.gitignore` and `.dockerignore` (a project's own statement of
 what is derived rather than source, and better than a list this tool could

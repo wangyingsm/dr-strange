@@ -180,9 +180,23 @@ URL 抓取默认启用。默认*不*包含的，是触及私有网络的能力�
 文件是被**解析**的，而不是被阅读的：得到的是一个编译器级别的解析器所确知的事实，而
 非模型对文本的理解。
 
+解析器是**插件**——安装一次、随处可用的沙箱化 WebAssembly 组件：
+
+```console
+$ drsg plugin install https://github.com/…/releases/download/rust-v2/rust.wasm
+installed rust@2  sha256:e3a586a150d0
+  handles: .rs
+```
+
+制品的 SHA-256 在安装时被锁定，并在每次加载时重新校验，因此磁盘上被改动过的文件会
+被拒绝，而不是被悄悄运行。在沙箱内，插件能触及的只有三件事——列出文件、读取文件、
+询问这棵树的名字——全部以被导入的目录为根，并按解析后的路径检查。没有文件系统，没
+有网络，没有环境变量，时钟被冻结，指令数与内存都有硬性预算（`drsg.toml` 的
+`[plugins]` 节）。一个哪怕只是导入了文件系统接口的组件，都会在安装时被指名拒绝。
+
 ```console
 $ drsg --db graph.drsg digest ./crates/dr-strange-core/src --plane code --apply
-preprocessed by rust@1 (3878 facts)
+preprocessed by rust@2 (5528 facts)
 no prose left to read — digested without a model call
   0 chat request(s); tokens 0 in / 0 out / 0 embed
 applied: wrote 1139 nodes, 2739 edges
@@ -216,9 +230,10 @@ note: 553 call(s) named nothing defined here — calls into other crates and
       the standard library are not edges
 ```
 
-两个开关：`--handler rust` 强制指定处理器，而不按扩展名路由；`--plugin-source` 会把
-每个函数自身的源码存到它的节点上以供取回。后者默认关闭——那几乎等于把整个代码库复制
-进图里，而属性共用同一条记录，于是每次读取该节点都会连同函数体一起解码。
+`--handler rust` 强制指定处理器，而不按扩展名路由。插件自身的设置位于 `drsg.toml`
+的 `[plugins.<name>]` 节，原样透传——`[plugins.rust] include_source = true` 会把每个
+函数自身的源码存到它的节点上以供取回，默认关闭，因为那几乎等于把整个代码库复制进
+图里。
 
 遍历会遵守 `.gitignore` 与 `.dockerignore`（一个项目对「什么是衍生物、什么是源码」
 的自我声明，胜过本工具所能猜测的任何清单），并且总是跳过 `target/`、`node_modules/`
