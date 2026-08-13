@@ -710,9 +710,13 @@ once the weight was real**: the release `drsg` went 37.0 MB → 57.6 MB with
 wasmtime trimmed to `runtime`, `component-model`, `cranelift`, `std`. Kept on
 against that number: a fifth of the binary buys the entire plugin system, and
 `--no-default-features` still drops it. Throughput through the sandbox, same
-corpus as the native baseline: 4.5 MiB/s end-to-end (native was 23 MiB/s) —
-this workspace in ~360 ms, still trivial beside one model call, so the
-optional split-phase escalation stays unbuilt. And the flip changes no security
+corpus as the native baseline: 8.6 MiB/s end-to-end against native's 23 —
+this workspace in ~190 ms. The first measurement said 4.5 and was challenged
+as kernel-inadequate; pre-linking the component at load, per-file `parse`
+dispatch and a binary partial format closed it to ~2.7×, of which ~2.1× is
+the wasm instruction floor (the single-document bench) and the rest the
+serial `assemble` tail. The next lever, if a real tree ever demands it, is a
+tree-reduce `assemble` — a contract change, deliberately not taken now. And the flip changes no security
 posture: **the runtime being compiled in is not a plugin running.** No module is
 loaded that the configuration did not name, so a default install executes
 exactly as much third-party code as it does today, which is none.

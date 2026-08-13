@@ -68,10 +68,16 @@ fn wt(e: wasmtime::Error) -> anyhow::Error {
     anyhow!("{e:#}")
 }
 
-/// Paths per `parse` call. A constant, not a function of the core count: the
-/// same tree must chunk identically on every machine, or "re-ingesting yields
-/// the same graph" would hold only on identical hardware.
-const CHUNK_FILES: usize = 64;
+/// Paths per `parse` call: one, measured. The constant divides the tree into
+/// the units the host can run in parallel, so it bounds parallelism from
+/// above — at 64 this workspace made two chunks and ran two-wide on a machine
+/// with far more cores. One file per call is the same per-file discipline the
+/// native parser's rayon used, and it beat 8 and 64 on the bench; what it
+/// multiplies is only a store and a pre-linked instantiation, which is why
+/// pre-linking made it affordable. Kept a constant rather than derived from
+/// the core count so the same tree chunks identically on every machine —
+/// with one file a chunk, that guarantee is trivially true.
+const CHUNK_FILES: usize = 1;
 
 /// How much a plugin may spend, and how much it may hold.
 #[derive(Debug, Clone)]
@@ -88,7 +94,7 @@ pub struct Limits {
 /// before wasm overhead), this carries on the order of half a gigabyte of
 /// source through `assemble` — past `rust-lang/rust`. It is a net for the
 /// plugin that does not terminate, not a budget for honest work; per-`parse`
-/// calls see a 64-file chunk and sit far below it.
+/// calls see one small chunk and sit far below it.
 const DEFAULT_FUEL: u64 = 200_000_000_000;
 
 /// Three gigabytes — deliberately short of the 4 GiB ceiling wasm32 imposes
@@ -119,7 +125,11 @@ const FORBIDDEN: &[&str] = &["wasi:filesystem", "wasi:sockets"];
 /// made per call.
 pub struct WasmPlugin {
     engine: Engine,
-    component: Component,
+    /// The component, already linked: WASI and the host interface are wired
+    /// up **once here**, so a call pays for a store and an instantiation, not
+    /// for rebuilding the linker — measured, that rebuild was a large share
+    /// of the per-call cost.
+    instance_pre: PluginPre<State>,
     manifest: Manifest,
     limits: Limits,
     /// This plugin's own settings, from `[plugins.<name>]`. Passed through
@@ -161,9 +171,28 @@ impl WasmPlugin {
 
         refuse_forbidden_imports(&engine, &component)?;
 
+        // Link once. Instantiation from a pre-linked component is cheap; the
+        // linker construction it replaces registered every WASI function on
+        // every call.
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+            .map_err(wt)
+            .context("linking the wasi interfaces a guest needs to start")?;
+        Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)
+            .map_err(wt)
+            .context("linking the host interface")?;
+        let instance_pre = PluginPre::new(
+            linker
+                .instantiate_pre(&component)
+                .map_err(wt)
+                .context("pre-instantiating the plugin")?,
+        )
+        .map_err(wt)
+        .context("the component does not export the plugin world")?;
+
         let mut plugin = Self {
             engine,
-            component,
+            instance_pre,
             manifest: Manifest {
                 name: "<undescribed>".into(),
                 version: String::new(),
@@ -265,14 +294,9 @@ impl WasmPlugin {
             let _ = store.set_fuel(fuel);
         }
 
-        let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(wt)
-            .context("linking the wasi interfaces a guest needs to start")?;
-        Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)
-            .map_err(wt)
-            .context("linking the host interface")?;
-        let instance = Plugin::instantiate(&mut store, &self.component, &linker)
+        let instance = self
+            .instance_pre
+            .instantiate(&mut store)
             .map_err(wt)
             .context("instantiating the plugin")?;
 
@@ -301,6 +325,7 @@ impl Preprocessor for WasmPlugin {
     }
 
     fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed> {
+        let started = std::time::Instant::now();
         // Phase one: chunks in parallel, partials collected in chunk order —
         // par_iter's collect preserves order, which is the same discipline the
         // native parser used for exactly the same reason.
@@ -321,9 +346,20 @@ impl Preprocessor for WasmPlugin {
                 .map(|chunk| self.parse_chunk(wit_plugin::Input::Files(chunk.to_vec()), host))
                 .collect::<Result<Vec<_>>>()?,
         };
+        let parsed = std::time::Instant::now();
 
         // Phase two: once, with everything.
         let out = self.assemble(&partials, host)?;
+        // Where a slow run spends its time: the parse phase is as wide as the
+        // chunk count, the assemble phase is serial by design — knowing which
+        // one dominates decides where tuning is worth anything.
+        tracing::debug!(
+            plugin = %self.manifest.name,
+            chunks = partials.len(),
+            parse_ms = parsed.duration_since(started).as_millis() as u64,
+            assemble_ms = parsed.elapsed().as_millis() as u64,
+            "preprocess phases"
+        );
         into_preprocessed(out, &self.manifest.name)
     }
 }
