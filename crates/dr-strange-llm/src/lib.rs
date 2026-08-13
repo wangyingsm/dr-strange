@@ -30,8 +30,8 @@ pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
 pub use preprocess::{
-    FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginOptions, Preprocessed, Preprocessor, fold,
-    route_document, route_tree, stamp_run,
+    FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins, Preprocessed,
+    Preprocessor, fold, route_document, route_tree, stamp_run,
 };
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};

@@ -41,6 +41,8 @@
 //! sorted walk exists for: re-ingesting a repository yields the same graph.
 
 mod ground;
+#[cfg(feature = "plugins")]
+mod registry;
 mod rust_code;
 #[cfg(feature = "plugins")]
 mod wasm;
@@ -57,6 +59,8 @@ use rayon::prelude::*;
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
 pub use ground::{FactsAndPlane, fold, stamp_run};
+#[cfg(feature = "plugins")]
+pub use registry::{InstalledPlugin, PluginStore};
 pub use rust_code::RustCode;
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
@@ -348,26 +352,93 @@ pub trait Preprocessor: Sync {
     fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed>;
 }
 
-/// Per-handler settings an operator can turn on.
+/// How the caller wants plugins loaded and configured.
+///
+/// Every plugin's own settings pass through as key/value pairs — the host does
+/// not interpret them, because what a plugin can be configured to do is the
+/// plugin's business, not the database's.
 #[derive(Debug, Clone, Default)]
-pub struct PluginOptions {
-    /// Store each Rust function's source under `_code`, for retrieval.
-    ///
-    /// Off by default: every body stored is roughly a copy of the codebase in
-    /// the graph, and properties live in one blob per record, so it makes each
-    /// node read decode the body too.
-    pub rust_include_source: bool,
+pub struct PluginConfig {
+    /// `plugin name → its settings`, from `[plugins.<name>]` in the config.
+    pub options: BTreeMap<String, Vec<(String, String)>>,
+    /// An explicit store directory; `None` means the per-user default
+    /// (`$XDG_DATA_HOME/drsg/plugins`).
+    pub store_dir: Option<PathBuf>,
+    /// Instruction budget per sandbox call; `None` keeps the default, and
+    /// `Some(0)` disables the check for a trusted plugin on an input big
+    /// enough to make the ceiling a nuisance rather than a safeguard.
+    pub fuel: Option<u64>,
+    /// Linear-memory bound per sandbox call, in bytes; `None` keeps the
+    /// default. No value can lift the 4 GiB ceiling wasm32 itself imposes.
+    pub memory_bytes: Option<usize>,
 }
 
-/// The handlers available to the router.
+/// The handlers a routing call can dispatch to, resolved once by the caller.
+///
+/// A handle rather than a per-call lookup because loading a wasm plugin
+/// *compiles* it — work worth doing once per command, not once per routed
+/// input.
 ///
 /// The built-in document reader is not in here: it is the fallback every
 /// unclaimed input lands on, and giving it an entry would mean giving it
 /// extensions to claim.
-pub fn registry(opts: &PluginOptions) -> Vec<Box<dyn Preprocessor>> {
-    vec![Box::new(RustCode {
-        include_source: opts.rust_include_source,
-    })]
+pub struct Plugins {
+    handlers: Vec<Box<dyn Preprocessor>>,
+}
+
+impl Plugins {
+    /// The built-in handlers only — what a test or a tool that must not touch
+    /// the operator's plugin store uses.
+    pub fn builtin() -> Self {
+        Self::with_options(&BTreeMap::new())
+    }
+
+    /// Built-ins, configured. `[plugins.rust] include_source = "true"` is how
+    /// the native parser's one switch arrives now that it is a plugin setting
+    /// rather than a field on a host struct.
+    pub fn with_options(options: &BTreeMap<String, Vec<(String, String)>>) -> Self {
+        let rust_include_source = options
+            .get("rust")
+            .is_some_and(|kv| kv.iter().any(|(k, v)| k == "include_source" && v == "true"));
+        Plugins {
+            handlers: vec![Box::new(RustCode {
+                include_source: rust_include_source,
+            })],
+        }
+    }
+
+    /// Built-ins plus every installed plugin, each verified against the hash
+    /// pinned at install.
+    ///
+    /// A plugin that fails to load is an **error naming it**, never a silent
+    /// skip: the operator installed it, and a digest quietly running without
+    /// it would be the worst of the options.
+    #[cfg(feature = "plugins")]
+    pub fn load(config: &PluginConfig) -> Result<Self> {
+        let mut plugins = Self::with_options(&config.options);
+        let store = match &config.store_dir {
+            Some(dir) => PluginStore::open(dir.clone())?,
+            None => PluginStore::open_default()?,
+        };
+        let mut limits = Limits::default();
+        match config.fuel {
+            Some(0) => limits.fuel = None,
+            Some(n) => limits.fuel = Some(n),
+            None => {}
+        }
+        if let Some(bytes) = config.memory_bytes {
+            limits.memory_bytes = bytes;
+        }
+        for plugin in store.load_all(&config.options, &limits)? {
+            plugins.handlers.push(Box::new(plugin));
+        }
+        Ok(plugins)
+    }
+
+    /// What is available, for `--handler` errors and for `plugin list`.
+    pub fn manifests(&self) -> Vec<Manifest> {
+        self.handlers.iter().map(|p| p.manifest()).collect()
+    }
 }
 
 /// Stamp `_generated_by` onto everything a handler produced, so a later reader
@@ -429,12 +500,12 @@ pub fn route_document(
     bytes: &[u8],
     handler: Option<&str>,
     host: &dyn Host,
-    opts: &PluginOptions,
+    plugins: &Plugins,
 ) -> Result<Preprocessed> {
-    let registry = registry(opts);
-    let idx = index_for(&registry, &extension_of(name), handler);
+    let registry = &plugins.handlers;
+    let idx = index_for(registry, &extension_of(name), handler);
     if let (Some(want), None) = (handler, idx) {
-        return Err(no_such_handler(&registry, want));
+        return Err(no_such_handler(registry, want));
     }
     match idx {
         Some(i) => {
@@ -464,19 +535,19 @@ pub fn route_document(
 pub fn route_tree(
     host: &dyn Host,
     handler: Option<&str>,
-    opts: &PluginOptions,
+    plugins: &Plugins,
 ) -> Result<Preprocessed> {
-    let registry = registry(opts);
+    let registry = &plugins.handlers;
     if let Some(want) = handler
         && !registry.iter().any(|p| p.manifest().name == want)
     {
-        return Err(no_such_handler(&registry, want));
+        return Err(no_such_handler(registry, want));
     }
 
     // Bucket by handler index; `None` is the built-in reader's pile.
     let mut buckets: BTreeMap<Option<usize>, Vec<String>> = BTreeMap::new();
     for path in host.list("")? {
-        let idx = index_for(&registry, &extension_of(&path), handler);
+        let idx = index_for(registry, &extension_of(&path), handler);
         buckets.entry(idx).or_default().push(path);
     }
 

@@ -617,10 +617,27 @@ pub fn ask(
 /// relevance floor and *says* what it kept and what it dropped. A crawl that
 /// quietly read less than the reader expected would be worse than one that
 /// read nothing.
+/// The routing handlers for this invocation: built-ins plus every installed
+/// plugin, loaded once. Built only on the branches that route — a URL digest
+/// never needs them, and must not fail because an installed plugin is broken.
+#[cfg(feature = "digest")]
+fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
+    let mut options = std::collections::BTreeMap::new();
+    if args.plugin_source {
+        options.insert(
+            "rust".to_string(),
+            vec![("include_source".to_string(), "true".to_string())],
+        );
+    }
+    dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
+        options,
+        ..Default::default()
+    })
+}
+
 #[cfg(feature = "digest")]
 fn read_source(
     args: &DigestArgs,
-    opts: &dr_strange_llm::PluginOptions,
     out: &mut dyn Write,
 ) -> Result<(dr_strange_llm::Preprocessed, String)> {
     let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
@@ -637,7 +654,8 @@ fn read_source(
         if path.is_dir() {
             let host = dr_strange_llm::LocalFiles::new(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let facts = dr_strange_llm::route_tree(&host, args.handler, opts)?;
+            let plugins = load_plugins(args)?;
+            let facts = dr_strange_llm::route_tree(&host, args.handler, &plugins)?;
             return Ok((facts, name));
         }
 
@@ -649,7 +667,8 @@ fn read_source(
         // source file may still need to follow an import beside it.
         let host = dr_strange_llm::LocalFiles::new(path.parent().unwrap_or(Path::new(".")))
             .with_context(|| format!("reading {}", path.display()))?;
-        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, opts)
+        let plugins = load_plugins(args)?;
+        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, &plugins)
             .with_context(|| format!("reading {}", path.display()))?;
         return Ok((facts, name));
     }
@@ -724,11 +743,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             args.mode
         )
     })?;
-    let plugins = dr_strange_llm::PluginOptions {
-        rust_include_source: args.plugin_source,
-    };
-
-    let (mut facts, source) = read_source(args, &plugins, out)?;
+    let (mut facts, source) = read_source(args, out)?;
 
     let p = plane(db, args.plane)?;
     let run_id = format!(

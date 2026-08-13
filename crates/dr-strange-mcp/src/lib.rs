@@ -1064,8 +1064,20 @@ fn digest_logic(
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let plugins = dr_strange_llm::PluginOptions {
-        rust_include_source: req.plugin_source.unwrap_or(false),
+    // Built only on the branch that routes: a text digest never needs the
+    // plugin store, and must not fail because something in it is broken.
+    let load_plugins = || -> AnyResult<dr_strange_llm::Plugins> {
+        let mut options = std::collections::BTreeMap::new();
+        if req.plugin_source.unwrap_or(false) {
+            options.insert(
+                "rust".to_string(),
+                vec![("include_source".to_string(), "true".to_string())],
+            );
+        }
+        dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
+            options,
+            ..Default::default()
+        })
     };
     let handler = req.handler.as_deref();
 
@@ -1094,6 +1106,7 @@ fn digest_logic(
             if p.is_dir() {
                 let host = dr_strange_llm::LocalFiles::new(p)
                     .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
                 dr_strange_llm::route_tree(&host, handler, &plugins)?
             } else {
                 let bytes =
@@ -1102,6 +1115,7 @@ fn digest_logic(
                     p.parent().unwrap_or(std::path::Path::new(".")),
                 )
                 .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
                 dr_strange_llm::route_document(&name, &bytes, handler, &host, &plugins)
                     .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
             }

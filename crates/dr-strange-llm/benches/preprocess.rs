@@ -39,7 +39,7 @@
 use std::path::{Path, PathBuf};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use dr_strange_llm::preprocess::{Host, LocalFiles, PluginOptions, route_document, route_tree};
+use dr_strange_llm::preprocess::{Host, LocalFiles, Plugins, route_document, route_tree};
 
 /// The workspace's `crates/` directory, found by walking up from this package.
 fn corpus_root() -> Option<PathBuf> {
@@ -77,7 +77,7 @@ fn bench(c: &mut Criterion) {
         eprintln!("preprocess bench: corpus is empty — skipping");
         return;
     }
-    let opts = PluginOptions::default();
+    let opts = Plugins::builtin();
     eprintln!(
         "preprocess bench: {} files, {:.2} MiB of Rust",
         files.len(),

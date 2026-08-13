@@ -77,7 +77,7 @@ fn keys_are_module_paths_with_the_crate_name() {
         .write("src/lib.rs", LIB)
         .write("src/deep/thing.rs", "pub fn helper() {}");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let k = keys(&out);
 
     // `-` becomes `_`, as it does in code.
@@ -101,7 +101,7 @@ fn a_src_directory_is_named_after_the_crate_holding_it() {
         .write("my-crate/src/lib.rs", "pub fn only() {}");
 
     let host = LocalFiles::new(outer.0.join("my-crate/src")).unwrap();
-    let out = route_tree(&host, None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&host, None, &Plugins::builtin()).unwrap();
     assert!(keys(&out).contains(&"my_crate::only"), "{:?}", keys(&out));
 }
 
@@ -112,7 +112,7 @@ fn items_beyond_functions_and_types_are_emitted() {
     let t = Tree::new("items");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", LIB);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     for (key, label) in [
         ("k::LIMIT", "Const"),
@@ -139,7 +139,7 @@ fn a_foreign_trait_becomes_an_external_node() {
     let t = Tree::new("impls");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", LIB);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     let external = out
         .nodes
@@ -171,7 +171,7 @@ fn calls_resolve_by_name_and_locals_are_listed() {
     let t = Tree::new("calls");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", LIB);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert!(
         out.edges
@@ -205,7 +205,7 @@ fn a_function_records_what_it_returns() {
     let t = Tree::new("returns");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", SHAPES);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert_eq!(prop(&out, "k::T::open", "returns"), Some("T"));
     assert_eq!(prop(&out, "k::T::read", "returns"), Some("usize"));
@@ -227,7 +227,7 @@ fn a_method_is_labelled_apart_from_a_function() {
     let t = Tree::new("methods");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", SHAPES);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     let label = |key: &str| {
         out.nodes
@@ -259,7 +259,7 @@ fn methods_still_resolve_as_call_targets() {
         "src/lib.rs",
         "pub struct T;\nimpl T { pub fn go(&self) { self.inner(); }\n pub fn inner(&self) {} }",
     );
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         out.edges
             .iter()
@@ -275,7 +275,7 @@ fn an_async_function_says_so() {
     let t = Tree::new("asyncness");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", SHAPES);
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     let is_async = |key: &str| {
         out.nodes
@@ -302,7 +302,7 @@ fn a_call_into_another_crate_stops_at_a_node() {
         "use std::fs;\npub fn go() { std::mem::swap(); fs::read(); let v = x.trim(); }",
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let calls: Vec<&str> = out
         .edges
         .iter()
@@ -341,7 +341,7 @@ fn imports_become_edges_to_resolved_keys() {
             "use crate::thing::Thing;\nuse std::sync::Arc;\nuse std::io::*;",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let imported: Vec<&str> = out
         .edges
         .iter()
@@ -398,7 +398,7 @@ fn a_reexported_path_resolves_to_the_real_item() {
             "use crate::cache::{CachedReader, GraphCache};",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let list = prop(&out, "k::user", "imports").unwrap();
 
     assert!(list.contains("k::api::cache::CachedReader"), "{list}");
@@ -430,7 +430,7 @@ fn a_reexport_chain_resolves_through_its_own_facades() {
         .write("src/compute/expr.rs", "pub enum Expr { Lit }")
         .write("src/user.rs", "use crate::Expr;");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert_eq!(
         prop(&out, "k::user", "imports"),
         Some("k::compute::expr::Expr")
@@ -454,7 +454,7 @@ fn a_self_import_names_the_module_itself() {
         .write("src/algo.rs", "pub struct Options;")
         .write("src/user.rs", "use crate::algo::{self, Options};");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let list = prop(&out, "k::user", "imports").unwrap();
     assert!(list.contains("k::algo"), "{list}");
     assert!(!list.contains("::self"), "{list}");
@@ -486,7 +486,7 @@ pub enum Code { Ok = 0, Bad = 1 }
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let variants = |key: &str| match out
         .nodes
         .iter()
@@ -537,7 +537,7 @@ pub struct Marker;
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let fields = |key: &str| match out
         .nodes
         .iter()
@@ -596,7 +596,7 @@ pub struct Fixed;
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let flagged = |key: &str| {
         out.nodes
             .iter()
@@ -635,7 +635,7 @@ expr_from_literal!(bool, i64, String);
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     // The definition is an item and gets a node.
     assert!(
@@ -687,7 +687,7 @@ fn a_macro_inside_a_body_is_not_an_item() {
         "pub fn go() { macro_rules! run { () => { 1 } } run!(); }",
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         !keys(&out).iter().any(|k| k.contains("run")),
         "{:?}",
@@ -713,7 +713,7 @@ pub trait Reader {
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let node = |key: &str| out.nodes.iter().find(|n| n.key == key);
 
     // A `self` receiver makes it a method here exactly as in an impl block.
@@ -749,7 +749,7 @@ fn a_union_records_its_fields() {
         "pub union Word { pub bits: u64, pub halves: [u32; 2] }",
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let node = out.nodes.iter().find(|n| n.key == "k::Word").unwrap();
     assert_eq!(node.label, "Union");
     assert!(matches!(
@@ -771,7 +771,7 @@ fn renamed_and_extern_imports_are_recorded() {
             "extern crate alloc;\nuse crate::inner::Thing as Renamed;\nuse crate::{inner as nested};",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let list = prop(&out, "k::user", "imports").unwrap();
 
     // The rename names the *original*, which is what the node is keyed by.
@@ -802,7 +802,7 @@ pub fn go(p: P) {
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let bound = prop(&out, "k::go", "local_bindings").unwrap();
     for name in [
         "first", "second", "x", "y", "head", "tail", "borrowed", "typed", "inner",
@@ -818,17 +818,15 @@ fn source_is_stored_only_when_asked_for() {
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", LIB);
 
-    let off = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let off = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(prop(&off, "k::add", "_code").is_none());
 
-    let on = route_tree(
-        &t.host(),
-        None,
-        &PluginOptions {
-            rust_include_source: true,
-        },
-    )
-    .unwrap();
+    let mut options = std::collections::BTreeMap::new();
+    options.insert(
+        "rust".to_string(),
+        vec![("include_source".to_string(), "true".to_string())],
+    );
+    let on = route_tree(&t.host(), None, &Plugins::with_options(&options)).unwrap();
     assert!(
         prop(&on, "k::add", "_code").is_some_and(|c| c.contains("sum")),
         "the body should be retrievable when asked for"
@@ -847,7 +845,7 @@ fn a_polyglot_tree_fans_out_and_merges() {
         .write("notes.txt", "loose notes");
     std::fs::write(t.0.join("logo.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert!(keys(&out).contains(&"k::only"), "rust facts missing");
     assert!(out.prose.contains("Some prose"), "markdown prose missing");
@@ -881,8 +879,8 @@ fn the_same_tree_twice_gives_the_same_result() {
         .write("docs/one.md", "# One")
         .write("docs/two.md", "# Two");
 
-    let first = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
-    let second = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let first = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
+    let second = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert_eq!(keys(&first), keys(&second), "node order must be stable");
     assert_eq!(first.prose, second.prose, "prose order must be stable");
@@ -905,7 +903,7 @@ fn gitignore_is_honoured_and_can_be_turned_off() {
         .write("src/lib.rs", "pub fn kept() {}")
         .write("src/generated.rs", "pub fn generated() {}");
 
-    let honoured = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let honoured = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         !keys(&honoured).contains(&"k::generated::generated"),
         "{:?}",
@@ -920,7 +918,7 @@ fn gitignore_is_honoured_and_can_be_turned_off() {
         },
     )
     .unwrap();
-    let ignored = route_tree(&host, None, &PluginOptions::default()).unwrap();
+    let ignored = route_tree(&host, None, &Plugins::builtin()).unwrap();
     assert!(
         keys(&ignored).contains(&"k::generated::generated"),
         "turning gitignore off should surface it: {:?}",
@@ -937,7 +935,7 @@ fn build_directories_are_skipped_without_any_ignore_file() {
         .write("src/lib.rs", "pub fn kept() {}")
         .write("target/debug/thing.rs", "pub fn derived() {}");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         !keys(&out).iter().any(|k| k.contains("derived")),
         "{:?}",
@@ -970,7 +968,7 @@ fn routing_order_is_override_then_extension_then_builtin() {
     let t = Tree::new("routing");
     t.write("src/lib.rs", "pub fn a() {}");
     let host = t.host();
-    let opts = PluginOptions::default();
+    let opts = Plugins::builtin();
 
     // Extension picks the Rust handler.
     let by_ext = route_document("thing.rs", b"pub fn a() {}", None, &host, &opts).unwrap();
@@ -1004,7 +1002,7 @@ fn facts_carry_their_provenance() {
     let t = Tree::new("provenance");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n")
         .write("src/lib.rs", "pub fn a() {}");
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert_eq!(prop(&out, "k::a", "_generated_by"), Some("rust@1"));
     assert!(
@@ -1024,7 +1022,7 @@ fn an_unparsable_file_is_reported_rather_than_fatal() {
         .write("src/lib.rs", "pub fn fine() {}")
         .write("src/broken.rs", "pub fn ( ) ) {{{");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         keys(&out).contains(&"k::fine"),
         "the good file still parses"
@@ -1042,7 +1040,7 @@ fn an_unparsable_file_is_reported_rather_than_fatal() {
 fn a_code_only_tree_needs_no_model() {
     let t = Tree::new("nomodel");
     t.write("src/lib.rs", "pub fn a() {}");
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
 
     assert!(!out.nodes.is_empty(), "there should be facts");
     assert!(
@@ -1069,7 +1067,7 @@ fn config_files_become_fenced_prose_rather_than_being_dropped() {
         .write("deploy.yaml", "replicas: 3\n")
         .write("src/lib.rs", "pub fn a() {}");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(out.prose.contains("```toml"), "{}", out.prose);
     assert!(out.prose.contains("replicas: 3"), "{}", out.prose);
     // And the code in the same tree is still facts, not prose.
@@ -1088,7 +1086,7 @@ fn non_library_targets_are_keyed_under_their_package() {
         // A module *called* tests, inside the library — not an integration test.
         .write("src/tests/mod.rs", "pub fn inner() {}");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let k = keys(&out);
     assert!(k.contains(&"k::benches::graph::timed"), "{k:?}");
     assert!(k.contains(&"k::tests::api::checks"), "{k:?}");
@@ -1111,7 +1109,7 @@ impl V { pub fn new() -> Self { V::I(0) } }
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let k = keys(&out);
     assert!(k.contains(&"<k::V as From<i64>>::from"), "{k:?}");
     assert!(k.contains(&"<k::V as From<f64>>::from"), "{k:?}");
@@ -1156,7 +1154,7 @@ fn a_fully_qualified_impl_finds_the_trait_it_names() {
             "impl crate::one::Shared for crate::T {}\npub struct Other;",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     assert!(
         out.report.collisions.is_empty(),
         "{:?}",
@@ -1189,7 +1187,7 @@ fn an_impl_finds_a_type_declared_in_another_file() {
             "use super::Database;\nimpl Database { pub fn snapshot(&self) {} }",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let k = keys(&out);
     assert!(k.contains(&"k::api::Database::snapshot"), "{k:?}");
     assert!(
@@ -1222,7 +1220,7 @@ fn a_method_body_resolves_its_calls() {
             "pub struct T;\nimpl T { pub fn go(&self) { crate::helper(); self.inner(); }\n pub fn inner(&self) {} }",
         );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let calls: Vec<(&str, &str)> = out
         .edges
         .iter()
@@ -1258,7 +1256,7 @@ impl Filter for BTreeMap<u64, u64> {}
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let k = keys(&out);
 
     // Written out in full at the impl site.
@@ -1297,7 +1295,7 @@ pub fn go() { fs::read(); }
 "#,
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let node = |key: &str| out.nodes.iter().find(|n| n.key == key).unwrap();
 
     // Imported *and* used as an impl target: the impl knows more, and wins.
@@ -1321,7 +1319,7 @@ fn a_foreign_type_still_gets_an_endpoint() {
         "use std::fmt;\npub trait Mine {}\nimpl Mine for Vec<u8> {}\nimpl fmt::Display for String { fn fmt(&self) {} }",
     );
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     every_edge_has_endpoints(&out);
     // `Vec` is nobody's here, so it exists as an external stand-in rather than
     // as a key nothing owns.
@@ -1337,7 +1335,7 @@ fn calls_resolve_to_the_nearest_definition() {
         .write("src/a.rs", "pub fn helper() {}\npub fn go() { helper(); }")
         .write("src/b.rs", "pub fn helper() {}\npub fn go() { helper(); }");
 
-    let out = route_tree(&t.host(), None, &PluginOptions::default()).unwrap();
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
     let call = |src: &str| {
         out.edges
             .iter()
