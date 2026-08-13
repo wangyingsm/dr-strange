@@ -1,0 +1,17 @@
+[package]
+name = "drsg-fixture"
+description = "Hostile test fixture for the plugin sandbox — behaviour picked by options"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+# Not part of the drsg workspace: built by hand for wasm32-wasip2 and the
+# artifact committed — see ../README.md for the exact command.
+[workspace]
+members = []

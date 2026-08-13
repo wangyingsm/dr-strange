@@ -239,7 +239,15 @@ impl WasmPlugin {
         // Nothing is granted: no preopened directory, no network, no
         // environment, no arguments. File access exists only through the
         // `drsg:preprocess/host` interface below, which is rooted and checked.
-        let wasi = WasiCtxBuilder::new().build();
+        //
+        // The clocks are **frozen**, not merely untrusted: §11's determinism
+        // promise is that re-ingesting a tree yields the same graph, and a
+        // plugin that could read a real clock could fold time into its facts.
+        // A frozen clock makes that impossible rather than impolite.
+        let wasi = WasiCtxBuilder::new()
+            .monotonic_clock(FrozenInstant)
+            .wall_clock(FrozenWall)
+            .build();
         let mut store = Store::new(
             &self.engine,
             State {
@@ -317,6 +325,30 @@ impl Preprocessor for WasmPlugin {
         // Phase two: once, with everything.
         let out = self.assemble(&partials, host)?;
         into_preprocessed(out, &self.manifest.name)
+    }
+}
+
+/// Time, stopped. Both wasi clocks return a constant, so two reads agree and
+/// a run's output cannot depend on when it ran.
+struct FrozenInstant;
+
+impl wasmtime_wasi::HostMonotonicClock for FrozenInstant {
+    fn resolution(&self) -> u64 {
+        1
+    }
+    fn now(&self) -> u64 {
+        0
+    }
+}
+
+struct FrozenWall;
+
+impl wasmtime_wasi::HostWallClock for FrozenWall {
+    fn resolution(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(1)
+    }
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 }
 
