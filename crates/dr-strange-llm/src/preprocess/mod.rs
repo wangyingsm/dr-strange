@@ -43,7 +43,6 @@
 mod ground;
 #[cfg(feature = "plugins")]
 mod registry;
-mod rust_code;
 #[cfg(feature = "plugins")]
 mod wasm;
 
@@ -61,7 +60,6 @@ use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, PluginStore};
-pub use rust_code::RustCode;
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
 
@@ -403,18 +401,19 @@ impl Plugins {
         Self::with_options(&BTreeMap::new())
     }
 
-    /// Built-ins, configured. `[plugins.rust] include_source = "true"` is how
-    /// the native parser's one switch arrives now that it is a plugin setting
-    /// rather than a field on a host struct.
-    pub fn with_options(options: &BTreeMap<String, Vec<(String, String)>>) -> Self {
-        let rust_include_source = options
-            .get("rust")
-            .is_some_and(|kv| kv.iter().any(|(k, v)| k == "include_source" && v == "true"));
+    /// Built-ins, configured. Empty since the Rust parser moved out to the
+    /// extensions repository — every code parser is an installed plugin now,
+    /// and the built-in document reader was never in the registry.
+    pub fn with_options(_options: &BTreeMap<String, Vec<(String, String)>>) -> Self {
         Plugins {
-            handlers: vec![Box::new(RustCode {
-                include_source: rust_include_source,
-            })],
+            handlers: Vec::new(),
         }
+    }
+
+    /// A registry from explicit handlers — how an embedder brings its own, and
+    /// how the router's tests probe it without a wasm artifact.
+    pub fn from_handlers(handlers: Vec<Box<dyn Preprocessor>>) -> Self {
+        Plugins { handlers }
     }
 
     /// Built-ins plus every installed plugin, each verified against the hash
