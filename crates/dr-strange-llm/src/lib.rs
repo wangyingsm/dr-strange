@@ -33,6 +33,8 @@ pub use preprocess::{
     FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins, Preprocessed,
     Preprocessor, fold, route_document, route_tree, stamp_run,
 };
+#[cfg(feature = "plugins")]
+pub use preprocess::{InstalledPlugin, Limits, PluginStore, WasmPlugin};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;

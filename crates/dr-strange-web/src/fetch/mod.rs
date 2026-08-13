@@ -147,6 +147,46 @@ pub struct Progress {
 ///
 /// `progress` is called as each page completes; it may be invoked from several
 /// threads, so the caller's closure is serialized behind a lock.
+/// Fetch one URL's raw bytes under the same network policy as the crawler:
+/// scheme and resolved-address checks up front, every redirect hop re-resolved
+/// through the private-range guard, and a hard size cap.
+///
+/// For **artifacts** rather than pages — a plugin's `.wasm`, say — so there is
+/// no HTML, no links, no relevance scoring, and no robots dance: one request
+/// the operator asked for by exact URL.
+pub fn fetch_bytes(url: &str, max_bytes: usize, allow: &[Prefix]) -> Result<Vec<u8>> {
+    let url = parse_url(url)?;
+    guard::precheck(&url, allow)?;
+
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .resolver(guard::PublicOnly {
+            allow: allow.to_vec(),
+        })
+        .redirects(5)
+        .timeout(std::time::Duration::from_secs(60))
+        .build();
+
+    let response = agent
+        .request_url("GET", &url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse(&e)))?;
+
+    let mut bytes = Vec::new();
+    // One byte past the cap distinguishes "exactly at the limit" from "over
+    // it", so the error can say which.
+    std::io::Read::take(response.into_reader(), max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {url}"))?;
+    if bytes.len() > max_bytes {
+        bail!(
+            "{url} is larger than the {} MiB download cap",
+            max_bytes / (1024 * 1024)
+        );
+    }
+    Ok(bytes)
+}
+
 pub fn fetch_with_progress(
     root: &str,
     opts: &FetchOptions,

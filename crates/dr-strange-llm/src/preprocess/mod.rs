@@ -184,6 +184,16 @@ pub trait Host: Sync {
     }
 }
 
+/// What the built-in document reader owns outright — kept in step with
+/// `document::to_markdown`, which is the authority. Files with these
+/// extensions reaching the fallback are the system working as designed, not a
+/// missing plugin.
+const DOCUMENT_EXTS: &[&str] = &[
+    "md", "markdown", "txt", "text", // already the target format
+    "doc", "docx", "odt", "rtf", "epub", "pdf", // converted by anydoc
+    "ppt", "pptx", "xls", "xlsx", "ods", "odp", "csv",
+];
+
 /// Directories skipped even when a project declares no ignore rules of its own.
 ///
 /// A `target/` can outweigh the source it was built from by orders of
@@ -552,6 +562,32 @@ pub fn route_tree(
     }
 
     let mut merged = Preprocessed::default();
+
+    // Say when a whole class of source had no handler. Once a parser is a
+    // plugin rather than a built-in, a tree full of `.rs` with nothing
+    // installed would otherwise be read as plain text and quietly sent to the
+    // model — a behaviour change that deserves a sentence, not a guess. The
+    // formats the document reader genuinely owns are not worth a warning.
+    if let Some(unclaimed) = buckets.get(&None) {
+        let mut by_ext: BTreeMap<String, usize> = BTreeMap::new();
+        for path in unclaimed {
+            let ext = extension_of(path);
+            if !DOCUMENT_EXTS.contains(&ext.as_str()) && !ext.is_empty() {
+                *by_ext.entry(ext).or_default() += 1;
+            }
+        }
+        if !by_ext.is_empty() {
+            let listed: Vec<String> = by_ext
+                .iter()
+                .map(|(ext, n)| format!(".{ext} ({n})"))
+                .collect();
+            merged.report.notes.push(format!(
+                "no installed plugin claims {} — these files were read as plain \
+                 text; `drsg plugin list` shows what is installed",
+                listed.join(", ")
+            ));
+        }
+    }
     let mut owners: BTreeMap<String, String> = BTreeMap::new();
 
     for (idx, paths) in buckets {

@@ -183,6 +183,11 @@ enum Command {
         #[arg(long)]
         embed_model: Option<String>,
     },
+    /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
+    /// that turn source files into graph facts before any model reads them.
+    #[cfg(feature = "digest")]
+    #[command(subcommand)]
+    Plugin(PluginCmd),
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
@@ -263,6 +268,25 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         depth: usize,
     },
+}
+
+#[cfg(feature = "digest")]
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install a plugin from a local `.wasm` file or an `http(s)://` URL.
+    ///
+    /// The artifact is validated as a component, asked to describe itself, and
+    /// its SHA-256 pinned; every later load re-checks the hash, so a file that
+    /// changes on disk is refused rather than silently run. Installing a name
+    /// again is the upgrade path.
+    Install {
+        /// Path to a `.wasm` component, or a URL to download one from.
+        source: String,
+    },
+    /// List installed plugins: name, version, extensions, hash, source.
+    List,
+    /// Remove an installed plugin by name.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -597,6 +621,25 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             )
         }
         #[cfg(feature = "digest")]
+        #[cfg(feature = "digest")]
+        Command::Plugin(cmd) => {
+            let plugin_config = config::plugin_config(cfg)?;
+            let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
+                .fetch
+                .allow_private
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|s| dr_strange_web::fetch::Prefix::parse(s))
+                .collect::<Result<_>>()?;
+            match cmd {
+                PluginCmd::Install { source } => {
+                    commands::plugin_install(&plugin_config, &allow, &source, out)
+                }
+                PluginCmd::List => commands::plugin_list(&plugin_config, out),
+                PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
+            }
+        }
         Command::Digest {
             source,
             plane,
@@ -621,6 +664,15 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plugin_source,
         } => {
             let db = commands::open(&cli.db)?;
+            // The `[plugins]` section, with the legacy flag folded in on top.
+            let mut plugin_config = config::plugin_config(cfg)?;
+            if plugin_source {
+                plugin_config
+                    .options
+                    .entry("rust".to_string())
+                    .or_default()
+                    .push(("include_source".to_string(), "true".to_string()));
+            }
             let args = commands::DigestArgs {
                 source: &source,
                 topic: topic.as_deref(),
@@ -642,7 +694,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 chat_key_env: chat_key_env.as_deref(),
                 embed_key_env: embed_key_env.as_deref(),
                 handler: handler.as_deref(),
-                plugin_source,
+                plugin_config,
             };
             commands::digest(&db, &args, out)
         }

@@ -541,9 +541,9 @@ pub struct DigestArgs<'a> {
     /// Force a preprocessor by name instead of routing by extension
     /// (ROADMAP §11). A router that guesses is worse than one that asks.
     pub handler: Option<&'a str>,
-    /// Store each parsed function's own source on its node, for retrieval.
-    /// Off by default: it is roughly a copy of the codebase in the graph.
-    pub plugin_source: bool,
+    /// The `[plugins]` section, resolved: budgets, store, and each plugin's
+    /// own settings.
+    pub plugin_config: dr_strange_llm::PluginConfig,
 }
 
 /// Natural-language query (ROADMAP §3): an LLM turns `question` into a
@@ -622,17 +622,120 @@ pub fn ask(
 /// never needs them, and must not fail because an installed plugin is broken.
 #[cfg(feature = "digest")]
 fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
-    let mut options = std::collections::BTreeMap::new();
-    if args.plugin_source {
-        options.insert(
-            "rust".to_string(),
-            vec![("include_source".to_string(), "true".to_string())],
-        );
+    dr_strange_llm::Plugins::load(&args.plugin_config)
+}
+
+// ---- plugins (ROADMAP §11) -----------------------------------------------
+
+/// A plugin artifact is code this process will execute, so the download cap is
+/// not a courtesy: nothing legitimate is near it, and an endless body should
+/// stop mattering early.
+#[cfg(feature = "digest")]
+const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
+
+#[cfg(feature = "digest")]
+fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::PluginStore> {
+    match &cfg.store_dir {
+        Some(dir) => dr_strange_llm::PluginStore::open(dir.clone()),
+        None => dr_strange_llm::PluginStore::open_default(),
     }
-    dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
-        options,
-        ..Default::default()
-    })
+}
+
+/// Install a plugin from a local `.wasm` or a URL.
+///
+/// A URL goes through the same network policy as every other fetch (ROADMAP
+/// §9): resolved-address checks, the private-range guard at every redirect
+/// hop, a size cap. The artifact is then validated as a component, asked to
+/// describe itself, hashed, and only then stored — nothing unloadable enters
+/// the store to fail later at digest time.
+#[cfg(feature = "digest")]
+pub fn plugin_install(
+    cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    source: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let is_url = source.starts_with("http://") || source.starts_with("https://");
+    let bytes = if is_url {
+        writeln!(out, "downloading {source}")?;
+        dr_strange_web::fetch::fetch_bytes(source, PLUGIN_DOWNLOAD_CAP, allow_private)?
+    } else {
+        std::fs::read(source).with_context(|| format!("reading {source}"))?
+    };
+
+    let store = plugin_store(cfg)?;
+    let (entry, replaced) = store.install(&bytes, source)?;
+    match replaced {
+        Some(old) if old != entry.version => writeln!(
+            out,
+            "installed {}@{} (replacing {old})  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+        Some(_) => writeln!(
+            out,
+            "reinstalled {}@{}  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+        None => writeln!(
+            out,
+            "installed {}@{}  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+    }
+    writeln!(
+        out,
+        "  handles: {}",
+        entry
+            .extensions
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+pub fn plugin_list(cfg: &dr_strange_llm::PluginConfig, out: &mut dyn Write) -> Result<()> {
+    let store = plugin_store(cfg)?;
+    let plugins = store.list()?;
+    if plugins.is_empty() {
+        writeln!(
+            out,
+            "no plugins installed — `drsg plugin install <file.wasm | url>` adds one"
+        )?;
+        return Ok(());
+    }
+    for p in plugins {
+        writeln!(
+            out,
+            "{}@{}	.{}	sha256:{}	from {}",
+            p.name,
+            p.version,
+            p.extensions.join(", ."),
+            &p.sha256[..12],
+            p.source
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+pub fn plugin_remove(
+    cfg: &dr_strange_llm::PluginConfig,
+    name: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let store = plugin_store(cfg)?;
+    let entry = store.remove(name)?;
+    writeln!(out, "removed {}@{}", entry.name, entry.version)?;
+    Ok(())
 }
 
 #[cfg(feature = "digest")]
@@ -764,6 +867,13 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             .map(|(n, c)| format!("{n} ({c} facts)"))
             .collect();
         writeln!(out, "preprocessed by {}", ran.join(", "))?;
+    }
+    // The preprocess notes print here — before any provider is built — because
+    // the one that matters most ("no installed plugin claims `.rs`") must not
+    // be lost behind a model-call failure that happens later. Drained, so the
+    // folded report does not say everything twice.
+    for note in facts.report.notes.drain(..) {
+        writeln!(out, "  note: {note}")?;
     }
 
     // The §11 headline: an input that yields only facts is digested with **no
