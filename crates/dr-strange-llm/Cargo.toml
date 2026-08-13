@@ -9,6 +9,17 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Ships ON, per §11: "a plugin system that requires rebuilding the database
+# before it can load a plugin is not one." `--no-default-features` drops the
+# whole runtime for anyone who does not want it.
+#
+# The runtime being compiled in is not a plugin running: no module is loaded
+# that the configuration did not name, so a default install still executes
+# exactly as much third-party code as it did before, which is none.
+default = ["plugins"]
+plugins = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:toml"]
+
 [dependencies]
 ahash = { workspace = true }
 dr-strange-core = { workspace = true, features = ["json"] }
@@ -40,6 +51,22 @@ ignore = "0.4"
 # the same graph.
 rayon = "1"
 tracing.workspace = true
+# ---- the plugin host (ROADMAP §11 slice 2), behind `plugins` ----
+# Trimmed hard: the default feature set carries async, three GC strategies,
+# threads, stack-switching, profiling, coredump, caching and `wat`, none of
+# which a synchronous one-call-per-input host uses.
+wasmtime = { version = "47", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "cranelift",
+    "std",
+], optional = true }
+wasmtime-wasi = { version = "47", optional = true }
+# Plugin identity: hashed at install, re-checked at every load.
+sha2 = { version = "0.10", optional = true }
+# `registry.toml` — what is installed, and what it hashed to.
+toml = { version = "0.8", optional = true }
+
 
 [dev-dependencies]
 # Preprocessing throughput in MiB/s (ROADMAP §11) — see benches/preprocess.rs.

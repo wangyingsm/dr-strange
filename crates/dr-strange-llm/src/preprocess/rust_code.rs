@@ -53,9 +53,9 @@ pub struct RustCode {
 impl Preprocessor for RustCode {
     fn manifest(&self) -> Manifest {
         Manifest {
-            name: "rust",
-            version: "1",
-            extensions: &["rs"],
+            name: "rust".into(),
+            version: "1".into(),
+            extensions: vec!["rs".into()],
         }
     }
 

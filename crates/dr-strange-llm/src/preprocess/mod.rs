@@ -42,6 +42,8 @@
 
 mod ground;
 mod rust_code;
+#[cfg(feature = "plugins")]
+mod wasm;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,6 +58,8 @@ use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
 pub use ground::{FactsAndPlane, fold, stamp_run};
 pub use rust_code::RustCode;
+#[cfg(feature = "plugins")]
+pub use wasm::{Limits, WasmPlugin};
 
 /// What a preprocessor produces from one input.
 #[derive(Debug, Default)]
@@ -109,17 +113,27 @@ pub struct PreprocessReport {
 }
 
 /// What a preprocessor says it is and what it handles.
+///
+/// Owned rather than `&'static str`: a plugin loaded from a file at runtime
+/// learns its own name by asking the component, and there is no static string
+/// to borrow from.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    pub name: &'static str,
-    pub version: &'static str,
+    pub name: String,
+    pub version: String,
     /// Extensions this handles, lowercase and without the dot.
-    pub extensions: &'static [&'static str],
+    pub extensions: Vec<String>,
 }
 
 impl Manifest {
     /// The value stamped into `_generated_by`.
     fn stamp(&self) -> String {
         format!("{}@{}", self.name, self.version)
+    }
+
+    /// Whether this handler claims a file with the given extension.
+    fn claims(&self, ext: &str) -> bool {
+        self.extensions.iter().any(|e| e == ext)
     }
 }
 
@@ -397,14 +411,12 @@ fn index_for(
 ) -> Option<usize> {
     match handler {
         Some(want) => registry.iter().position(|p| p.manifest().name == want),
-        None => registry
-            .iter()
-            .position(|p| p.manifest().extensions.contains(&ext)),
+        None => registry.iter().position(|p| p.manifest().claims(ext)),
     }
 }
 
 fn no_such_handler(registry: &[Box<dyn Preprocessor>], want: &str) -> anyhow::Error {
-    let known: Vec<&str> = registry.iter().map(|p| p.manifest().name).collect();
+    let known: Vec<String> = registry.iter().map(|p| p.manifest().name).collect();
     anyhow::anyhow!(
         "no preprocessor named `{want}` (known: {})",
         known.join(", ")
