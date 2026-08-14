@@ -809,6 +809,24 @@ chain node (345 files, 6.2 MiB) it wrote 7.4k nodes and 13.8k edges in ~3.5 s
 end-to-end, ~325 ms of that in the sandbox — and TinyGo's stdlib coverage
 held: `go/parser`, `go/ast` and `encoding/json` all compile.
 
+**Shipped (v2, slice 4): the TypeScript/JavaScript plugin.** `ts@1` claims
+all of TS and JS (`ts, tsx, mts, cts, js, jsx, mjs, cjs`) — written in Rust
+on `swc_ecma_parser`, one parser with a per-extension syntax switch, on the
+proven wasip2 pipeline; the sdk/ts + componentize-js ecosystem proof is
+deliberately its own later slice, so SDK risk never touches a flagship
+parser. Keys are logical module identity (nearest `package.json` names the
+package, `/index` collapses, `pkg/src/api.Client.connect` is a class
+member); resolution covers named/default/namespace/aliased imports,
+re-export chains through barrel files, `this.m()` lexically, JSX components
+as calls — and **CommonJS**, because the first pure-JS corpus ingested had
+524 `require()` sites and a graph with no imports at all: `require` is an
+import wearing a call's syntax, `module.exports` is the export list, both
+written down and both now read. `implements`/`extends` are syntactic in TS,
+so those edges are certain where Go's had to be structural; `EXTENDS` joins
+the vocabulary. 30 native tests; wasm == native exactly on a real OSS corpus
+(zod: 3863 nodes / 6599 edges, notes identical); ~18 MiB/s through the
+sandbox — the fastest of the three, as swc should be.
+
 The sandbox had to *change shape* to hold it, in ways that were the slice's
 real findings. A Go runtime imports `wasi:filesystem` before the plugin's
 first line runs — as the Python and JS runtimes will too — so refusing that
