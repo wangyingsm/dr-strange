@@ -24,7 +24,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
-use crate::compute::catalog::{self, CatalogSnapshot};
+use std::collections::BTreeMap;
+
+use crate::compute::catalog::{self, CatalogSnapshot, PlaneCounters};
 use crate::compute::exec;
 use crate::compute::expr::{self, Expr, score};
 use crate::compute::hybrid::{
@@ -34,7 +36,7 @@ use crate::compute::plan::{Algo, LogicalPlan, SortKey, Source, Step};
 use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
-use crate::storage::engine::{ReadTransaction, StorageEngine, WriteTransaction};
+use crate::storage::engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
 use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 #[cfg(feature = "native-backend")]
@@ -395,6 +397,21 @@ impl Database {
         // yet (read errors) and no sidecar to match anyway → `None`.
         let prior_seq = engine.with_read(|txn| graph::read_commit_seq(txn)).ok();
         engine.with_write(|txn| graph::init(txn))?;
+        // Backfill: a database written before summary counters existed has
+        // no rows — count each such plane once, here, so every later
+        // dashboard read is a point lookup (arch/03 §5). A fresh database
+        // pays nothing (its planes are empty); an already-migrated one pays
+        // one row read per plane.
+        engine.with_write(|txn| {
+            for (plane, _name) in graph::list_planes(txn)? {
+                let key = crate::storage::keys::counters_key(plane);
+                if txn.get(TableId::Meta, &key)?.is_none() {
+                    let counted = catalog::count(txn, plane)?;
+                    txn.put(TableId::Meta, &key, &counted.encode())?;
+                }
+            }
+            Ok(())
+        })?;
         // Vector indexes (arch/01 §5): load the HNSW sidecar when it is fresh
         // (its stamped commit sequence equals the data's), else rebuild from
         // the KV — the KV is always the source of truth, the sidecar only a
@@ -628,7 +645,10 @@ impl Database {
     /// already-absent plane id. Errors with `InvalidArgument` for
     /// `PlaneId::STARTUP`, which always exists.
     pub fn drop_plane(&self, id: PlaneId) -> Result<()> {
-        self.engine.with_write(|txn| graph::drop_plane(txn, id))?;
+        self.engine.with_write(|txn| {
+            graph::drop_plane(txn, id)?;
+            txn.delete(TableId::Meta, &crate::storage::keys::counters_key(id))
+        })?;
         tracing::info!(id = id.0, "dropped plane");
         Ok(())
     }
@@ -636,6 +656,24 @@ impl Database {
     /// Every plane as `(id, name)`, ascending by id (arch/04 §1).
     pub fn planes(&self) -> Result<Vec<(PlaneId, String)>> {
         self.engine.with_read(|txn| graph::list_planes(txn))
+    }
+
+    /// Every plane's summary counters, rolled up (arch/03 §5): one row read
+    /// per plane, where [`Database::catalog`] scans everything — this is the
+    /// dashboard's call.
+    pub fn counters(&self) -> Result<PlaneCounters> {
+        self.engine.with_read(|txn| {
+            let mut rollup = PlaneCounters::default();
+            for (plane, _name) in graph::list_planes(txn)? {
+                let one =
+                    match txn.get(TableId::Meta, &crate::storage::keys::counters_key(plane))? {
+                        Some(bytes) => PlaneCounters::decode(&bytes)?,
+                        None => catalog::count(txn, plane)?,
+                    };
+                rollup.merge(&one);
+            }
+            Ok(rollup)
+        })
     }
 
     /// The soft-schema catalog rolled up across every plane (arch/03 §5).
@@ -820,6 +858,21 @@ impl<'db> PlaneHandle<'db> {
         self.with_read(|txn| catalog::compute(txn, self.id))
     }
 
+    /// The plane's summary counters (arch/03 §5): one row read, maintained
+    /// transactionally with every mutation — the dashboard's numbers in
+    /// constant time. A snapshot from before the row existed (an old
+    /// database, a deep `AS OF`) falls back to counting the plane at that
+    /// snapshot.
+    pub fn counters(&self) -> Result<PlaneCounters> {
+        let id = self.id;
+        self.with_read(|txn| {
+            match txn.get(TableId::Meta, &crate::storage::keys::counters_key(id))? {
+                Some(bytes) => PlaneCounters::decode(&bytes),
+                None => catalog::count(txn, id),
+            }
+        })
+    }
+
     /// Starts a query in this plane (arch/03, arch/04 §3). Defaults to
     /// scanning every node; call a source method (`scan_label`, `seek_ids`,
     /// …) to narrow it, then chain steps and a terminal:
@@ -980,6 +1033,7 @@ impl<'db> PlaneHandle<'db> {
             kw_decls,
             kw_events: Vec::new(),
             changes: Vec::new(),
+            counters: CounterDelta::default(),
         })
     }
 }
@@ -1030,6 +1084,72 @@ enum KwEvent {
 
 /// A plane-scoped write transaction. Dropped without [`commit`](Self::commit)
 /// ⇒ all changes discarded.
+/// Signed changes to a plane's [`PlaneCounters`], accumulated per write
+/// transaction and folded into the stored row exactly once at commit — so a
+/// thousand-node bulk load costs one row read and one row write, not a
+/// thousand.
+#[derive(Default)]
+struct CounterDelta {
+    nodes: i64,
+    edges: i64,
+    labels: BTreeMap<String, i64>,
+    edge_types: BTreeMap<String, i64>,
+}
+
+impl CounterDelta {
+    fn is_empty(&self) -> bool {
+        self.nodes == 0
+            && self.edges == 0
+            && self.labels.values().all(|v| *v == 0)
+            && self.edge_types.values().all(|v| *v == 0)
+    }
+
+    fn node_added(&mut self, labels: &[impl AsRef<str>]) {
+        self.nodes += 1;
+        for l in labels {
+            *self.labels.entry(l.as_ref().to_string()).or_default() += 1;
+        }
+    }
+
+    fn node_removed(&mut self, labels: &[String]) {
+        self.nodes -= 1;
+        for l in labels {
+            *self.labels.entry(l.clone()).or_default() -= 1;
+        }
+    }
+
+    fn edge_added(&mut self, ty: &str) {
+        self.edges += 1;
+        *self.edge_types.entry(ty.to_string()).or_default() += 1;
+    }
+
+    fn edge_removed(&mut self, ty: &str) {
+        self.edges -= 1;
+        *self.edge_types.entry(ty.to_string()).or_default() -= 1;
+    }
+
+    /// Folds this delta into `stored`, saturating at zero: a counter can
+    /// only go negative through corruption, and clamping beats poisoning
+    /// the row forever.
+    fn apply(self, stored: &mut PlaneCounters) {
+        fn shift(v: &mut u64, d: i64) {
+            *v = v.saturating_add_signed(d);
+        }
+        shift(&mut stored.nodes, self.nodes);
+        shift(&mut stored.edges, self.edges);
+        for (k, d) in self.labels {
+            let e = stored.labels.entry(k).or_default();
+            shift(e, d);
+        }
+        for (k, d) in self.edge_types {
+            let e = stored.edge_types.entry(k).or_default();
+            shift(e, d);
+        }
+        stored.labels.retain(|_, v| *v > 0);
+        stored.edge_types.retain(|_, v| *v > 0);
+    }
+}
+
 pub struct WriteTxn<'db> {
     db: &'db Database,
     plane: PlaneId,
@@ -1050,6 +1170,9 @@ pub struct WriteTxn<'db> {
     /// Collapsed per entity and resolved to full records at commit — only when
     /// a change observer is registered, so it's free otherwise.
     changes: Vec<(ChangeKind, u64, ChangeOp)>,
+    /// Running counter changes, folded into the plane's stored
+    /// [`PlaneCounters`] row at commit (arch/03 §5).
+    counters: CounterDelta,
 }
 
 impl WriteTxn<'_> {
@@ -1118,6 +1241,7 @@ impl WriteTxn<'_> {
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, None, labels, &props)?;
+        self.counters.node_added(labels);
         self.record_node_events(id, labels, &props);
         self.record_kw_node_events(id, labels, &props);
         self.record_change(ChangeKind::Node, id.0, ChangeOp::Created);
@@ -1137,6 +1261,7 @@ impl WriteTxn<'_> {
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
+        self.counters.node_added(labels);
         self.record_node_events(id, labels, &props);
         self.record_kw_node_events(id, labels, &props);
         self.record_change(ChangeKind::Node, id.0, ChangeOp::Created);
@@ -1156,6 +1281,7 @@ impl WriteTxn<'_> {
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_edge_id(txn)?;
         graph::insert_edge(txn, plane, id, src, dst, ty, &props)?;
+        self.counters.edge_added(ty);
         self.record_change(ChangeKind::Edge, id.0, ChangeOp::Created);
         Ok(id)
     }
@@ -1177,6 +1303,12 @@ impl WriteTxn<'_> {
     ) -> Result<BulkStats> {
         let plane = self.plane;
         let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges)?;
+        for n in &nodes {
+            self.counters.node_added(n.labels);
+        }
+        for e in &edges {
+            self.counters.edge_added(e.ty);
+        }
 
         // Change feed (ROADMAP §5): bulk-loaded nodes are creates over a known
         // contiguous id range. Edges are omitted (bulk assigns their ids
@@ -1239,13 +1371,34 @@ impl WriteTxn<'_> {
     /// writes dangling adjacency.
     pub fn bulk_load_edges(&mut self, edges: Vec<BulkEdgeById<'_>>) -> Result<u64> {
         let plane = self.plane;
-        graph::bulk_load_edges(self.txn(), plane, &edges)
+        let n = graph::bulk_load_edges(self.txn(), plane, &edges)?;
+        for e in &edges {
+            self.counters.edge_added(e.ty);
+        }
+        Ok(n)
     }
 
     /// Deletes a node, cascading to every incident edge in both directions
     /// (arch/01 §2). Idempotent: deleting an absent node is `Ok(())`.
     pub fn delete_node(&mut self, id: NodeId) -> Result<()> {
         let plane = self.plane;
+        // The counters need what is about to go: the node's labels, and —
+        // because deletion cascades — every incident edge's type.
+        if let Some(node) = graph::get_node(self.txn(), plane, id)? {
+            let mut incident: Vec<EdgeId> =
+                graph::neighbors(self.txn(), plane, id, Dir::Both, None)?
+                    .into_iter()
+                    .map(|n| n.edge)
+                    .collect();
+            incident.sort_unstable();
+            incident.dedup();
+            for eid in incident {
+                if let Some(edge) = graph::get_edge(self.txn(), plane, eid)? {
+                    self.counters.edge_removed(&edge.ty);
+                }
+            }
+            self.counters.node_removed(&node.labels);
+        }
         graph::delete_node(self.txn(), plane, id)?;
         self.events.push(IndexEvent::RemoveNode(id));
         self.kw_events.push(KwEvent::RemoveNode(id));
@@ -1256,6 +1409,9 @@ impl WriteTxn<'_> {
     /// Deletes an edge and both of its adjacency entries. Idempotent.
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<()> {
         let plane = self.plane;
+        if let Some(edge) = graph::get_edge(self.txn(), plane, id)? {
+            self.counters.edge_removed(&edge.ty);
+        }
         graph::delete_edge(self.txn(), plane, id)?;
         self.record_change(ChangeKind::Edge, id.0, ChangeOp::Deleted);
         Ok(())
@@ -1295,6 +1451,16 @@ impl WriteTxn<'_> {
         let node = graph::get_node(self.txn(), plane, id)?
             .ok_or_else(|| Error::NotFound(format!("node {}", id.0)))?;
         graph::set_node_labels(self.txn(), plane, id, labels)?;
+        for old_label in &node.labels {
+            *self.counters.labels.entry(old_label.clone()).or_default() -= 1;
+        }
+        for new_label in labels {
+            *self
+                .counters
+                .labels
+                .entry((*new_label).to_string())
+                .or_default() += 1;
+        }
         if !self.decls.is_empty() {
             self.record_labels_event(id, &node.labels, labels, &node.properties);
         }
@@ -1491,6 +1657,12 @@ impl WriteTxn<'_> {
     /// bookkeeping.)
     pub fn set_edge_type(&mut self, id: EdgeId, ty: &str) -> Result<()> {
         let plane = self.plane;
+        if let Some(edge) = graph::get_edge(self.txn(), plane, id)?
+            && edge.ty != ty
+        {
+            *self.counters.edge_types.entry(edge.ty).or_default() -= 1;
+            *self.counters.edge_types.entry(ty.to_string()).or_default() += 1;
+        }
         graph::set_edge_type(self.txn(), plane, id, ty)?;
         self.record_change(ChangeKind::Edge, id.0, ChangeOp::Updated);
         Ok(())
@@ -1506,6 +1678,21 @@ impl WriteTxn<'_> {
     }
 
     pub fn commit(mut self) -> Result<()> {
+        // Fold the counter delta into this plane's stored row — inside the
+        // txn, so the summary commits atomically with the data it counts
+        // (arch/03 §5).
+        if !self.counters.is_empty() {
+            let plane = self.plane;
+            let key = crate::storage::keys::counters_key(plane);
+            let delta = std::mem::take(&mut self.counters);
+            let txn = self.txn();
+            let mut stored = match txn.get(TableId::Meta, &key)? {
+                Some(bytes) => PlaneCounters::decode(&bytes)?,
+                None => PlaneCounters::default(),
+            };
+            delta.apply(&mut stored);
+            txn.put(TableId::Meta, &key, &stored.encode())?;
+        }
         // Bump the commit sequence inside the txn (arch/02 §3) so it commits
         // atomically with the data — advances the cache's version stamp — and
         // stamp the wall-clock time for time-addressed time-travel (ROADMAP §4).
@@ -2602,5 +2789,154 @@ mod change_feed_tests {
         let mut w = plane.write().unwrap();
         w.create_node(&["N"], Properties::new()).unwrap();
         w.commit().unwrap();
+    }
+
+    /// The maintained counters agree with a fresh count after every kind of
+    /// mutation — creates, bulk load, label rewrites, edge retyping,
+    /// deletion with its cascade (arch/03 §5).
+    #[test]
+    fn counters_track_every_mutation() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+
+        let (a, b, e1);
+        {
+            let mut w = plane.write().unwrap();
+            a = w
+                .create_node(&["Person", "Admin"], Properties::new())
+                .unwrap();
+            b = w
+                .create_node_with_key("b", &["Person"], Properties::new())
+                .unwrap();
+            e1 = w.create_edge(a, b, "KNOWS", Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+        let c = plane.counters().unwrap();
+        assert_eq!((c.nodes, c.edges), (2, 1));
+        assert_eq!(c.labels["Person"], 2);
+        assert_eq!(c.labels["Admin"], 1);
+        assert_eq!(c.edge_types["KNOWS"], 1);
+
+        // Bulk load folds in one row write, same numbers.
+        {
+            let mut w = plane.write().unwrap();
+            w.bulk_load(
+                vec![
+                    BulkNode {
+                        external_key: Some("c"),
+                        labels: &["Doc"],
+                        props: Properties::new(),
+                    },
+                    BulkNode {
+                        external_key: Some("d"),
+                        labels: &["Doc"],
+                        props: Properties::new(),
+                    },
+                ],
+                vec![BulkEdge {
+                    src_key: "c",
+                    dst_key: "d",
+                    ty: "CITES",
+                    props: Properties::new(),
+                }],
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        let c = plane.counters().unwrap();
+        assert_eq!((c.nodes, c.edges), (4, 2));
+        assert_eq!(c.labels["Doc"], 2);
+        assert_eq!(c.edge_types["CITES"], 1);
+
+        // Relabel and retype adjust both sides.
+        {
+            let mut w = plane.write().unwrap();
+            w.set_labels(a, &["Owner"]).unwrap();
+            w.set_edge_type(e1, "MANAGES").unwrap();
+            w.commit().unwrap();
+        }
+        let c = plane.counters().unwrap();
+        assert_eq!(c.labels["Person"], 1);
+        assert_eq!(c.labels.get("Admin"), None, "a zero count leaves the map");
+        assert_eq!(c.labels["Owner"], 1);
+        assert_eq!(c.edge_types.get("KNOWS"), None);
+        assert_eq!(c.edge_types["MANAGES"], 1);
+
+        // Deleting a node cascades to its incident edges — counted too.
+        {
+            let mut w = plane.write().unwrap();
+            w.delete_node(a).unwrap();
+            w.commit().unwrap();
+        }
+        let c = plane.counters().unwrap();
+        assert_eq!((c.nodes, c.edges), (3, 1));
+        assert_eq!(c.labels.get("Owner"), None);
+        assert_eq!(c.edge_types.get("MANAGES"), None);
+
+        // The maintained row and a fresh scan must always agree.
+        let cat = plane.catalog().unwrap();
+        assert_eq!((c.nodes, c.edges), (cat.node_count, cat.edge_count));
+    }
+
+    /// The database roll-up sums planes, and dropping a plane drops its row
+    /// with it.
+    #[test]
+    fn counters_roll_up_and_drop_with_the_plane() {
+        let db = Database::in_memory().unwrap();
+        let extra = db.create_plane("extra", Properties::new()).unwrap();
+        {
+            let mut w = db.plane("startup").unwrap().write().unwrap();
+            w.create_node(&["A"], Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+        {
+            let mut w = extra.write().unwrap();
+            w.create_node(&["B"], Properties::new()).unwrap();
+            w.create_node(&["B"], Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+        let all = db.counters().unwrap();
+        assert_eq!(all.nodes, 3);
+        assert_eq!(all.labels["B"], 2);
+
+        let id = extra.id();
+        db.drop_plane(id).unwrap();
+        let all = db.counters().unwrap();
+        assert_eq!(all.nodes, 1);
+        assert_eq!(all.labels.get("B"), None);
+    }
+
+    /// A database written before counters existed gets its rows backfilled
+    /// at open — proven by deleting the row out from under a live database
+    /// and reopening.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn counters_backfill_on_open() {
+        let dir = std::env::temp_dir().join(format!("drsg-counters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Database::open(&dir).unwrap();
+            let plane = db.plane("startup").unwrap();
+            {
+                let mut w = plane.write().unwrap();
+                w.create_node(&["X"], Properties::new()).unwrap();
+                w.create_node(&["X"], Properties::new()).unwrap();
+                w.commit().unwrap();
+            }
+            // Simulate the pre-migration on-disk state: no counters row.
+            db.engine
+                .with_write(|txn| {
+                    txn.delete(
+                        TableId::Meta,
+                        &crate::storage::keys::counters_key(plane.id()),
+                    )
+                })
+                .unwrap();
+        }
+        let db = Database::open(&dir).unwrap();
+        let c = db.plane("startup").unwrap().counters().unwrap();
+        assert_eq!(c.nodes, 2);
+        assert_eq!(c.labels["X"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

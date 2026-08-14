@@ -480,13 +480,15 @@ pub fn hybrid(
 
 pub fn stats(db: &Database, out: &mut dyn Write) -> Result<()> {
     let planes = db.planes()?;
-    let cat = db.catalog()?;
+    // The maintained summary row, not the catalog scan — same numbers,
+    // constant time (arch/03 §5).
+    let counters = db.counters()?;
     writeln!(
         out,
         "{} planes, {} nodes, {} edges",
         planes.len(),
-        cat.node_count,
-        cat.edge_count
+        counters.nodes,
+        counters.edges
     )?;
     Ok(())
 }

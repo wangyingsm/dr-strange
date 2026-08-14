@@ -265,7 +265,11 @@ pub fn rpc_discover(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 /// and the file size when the backend is on disk.
 pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let planes = app(ctx.db.planes())?;
-    let cat = app(ctx.db.catalog())?;
+    // Summary counters, maintained transactionally with every mutation —
+    // a point lookup per plane, where the catalog would scan everything
+    // (arch/03 §5). This is what keeps the dashboard at ms whatever the
+    // graph grows to.
+    let counters = app(ctx.db.counters())?;
     let commit_seq = app(ctx.db.commit_seq())?;
     // Declared vector + keyword indexes across every plane.
     let mut indexes = 0usize;
@@ -273,21 +277,45 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         let plane = ctx.plane(name)?;
         indexes += plane.vector_indexes().len() + plane.keyword_indexes().len();
     }
-    let file_size = ctx
-        .db_path
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len());
+    let file_size = ctx.db_path.map(on_disk_bytes);
     Ok(jval!({
         "planes": planes.len(),
-        "nodes": cat.node_count,
-        "edges": cat.edge_count,
-        "labels": cat.labels.len(),
-        "edge_types": cat.edge_types.len(),
+        "nodes": counters.nodes,
+        "edges": counters.edges,
+        "labels": counters.labels.len(),
+        "edge_types": counters.edge_types.len(),
         "indexes": indexes,
         "commit_seq": commit_seq,
         "persistent": ctx.db_path.is_some(),
         "file_size": file_size,
     }))
+}
+
+/// Bytes the database occupies on disk. The native backend's "path" is a
+/// directory — `fs::metadata` on one reports the inode (4 KB, famously
+/// wrong on the dashboard) — so a directory is walked and its files summed.
+/// The vector and keyword sidecars sit *beside* the path and count too.
+fn on_disk_bytes(path: &std::path::Path) -> u64 {
+    fn du(p: &std::path::Path) -> u64 {
+        let Ok(meta) = std::fs::metadata(p) else {
+            return 0;
+        };
+        if meta.is_file() {
+            return meta.len();
+        }
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return 0;
+        };
+        entries.flatten().map(|e| du(&e.path())).sum()
+    }
+    let mut total = du(path);
+    for sidecar in ["hnsw", "bm25"] {
+        let mut os = path.as_os_str().to_owned();
+        os.push(".");
+        os.push(sidecar);
+        total += du(std::path::Path::new(&os));
+    }
+    total
 }
 
 /// `db.catalog` — the soft schema across every plane.
@@ -301,13 +329,13 @@ pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let mut out = Vec::new();
     for (id, name) in app(ctx.db.planes())? {
         let plane = ctx.plane(&name)?;
-        let cat = app(plane.catalog())?;
+        let counters = app(plane.counters())?;
         let props = app(plane.properties())?;
         out.push(jval!({
             "id": id.0,
             "name": name,
-            "nodes": cat.node_count,
-            "edges": cat.edge_count,
+            "nodes": counters.nodes,
+            "edges": counters.edges,
             "properties": json::properties_to_json(&props),
         }));
     }
