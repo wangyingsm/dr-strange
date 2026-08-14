@@ -854,6 +854,21 @@ architecture. 18 native tests; wasm == native on gson (1032/2600) and on a
 1500-file Maven monorepo (7011/24599); deterministic; ~405 ms in the
 sandbox for 3.4 MiB.
 
+**Shipped (v2, slice 7): the C plugin.** `c@1` (.c, .h) on tree-sitter-c,
+through the wasi-sdk toolchain the Java slice bought. The design is the
+linker's model: external linkage is one flat namespace (a non-static
+function's key is its bare name), `static` is file-local
+(`filestem.name`), a header's declaration and its source's definition share
+one key and the definition wins the node; a static shadows a global in its
+own file, the compiler's rule. The preprocessor is recorded, not expanded —
+`#define` becomes Const or Macro as written, include guards stay out,
+`#ifdef` arms are walked so both platform variants are facts; `#include`
+resolves same-directory then unambiguous-tail against the parsed set, and
+ambiguity is counted because include paths are build configuration a parser
+does not have. libc is external by name. 16 native tests; wasm == native on
+redis/src (9633/34751, 2740 header declarations merged into definitions)
+and on a CMake-built SDK (1746/5953); deterministic; ~15.5 MiB/s.
+
 The sandbox had to *change shape* to hold it, in ways that were the slice's
 real findings. A Go runtime imports `wasi:filesystem` before the plugin's
 first line runs — as the Python and JS runtimes will too — so refusing that
