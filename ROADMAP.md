@@ -827,6 +827,20 @@ the vocabulary. 30 native tests; wasm == native exactly on a real OSS corpus
 (zod: 3863 nodes / 6599 edges, notes identical); ~18 MiB/s through the
 sandbox — the fastest of the three, as swc should be.
 
+**Shipped (v2, slice 5): the Python plugin.** `py@1` (py, pyi, pyw), written
+in Rust on ruff's parser — the same fork as TS, decided the same way. Module
+identity is the language's own rule (`__init__.py` marks a package, the
+first directory without one is the sys.path root, so `src/` layouts need no
+special case); relative imports are package geometry resolved where the
+module is known; dotted chains walk modules and stop the moment a step lands
+on a value; `self.m()` resolves lexically; decorators are the calls they
+are; class bases become EXTENDS; `__all__` is the written export list with
+PEP 8's underscore rule as fallback, and ALL_CAPS sorts Const from Var
+because PEP 8 says so. 21 native tests; wasm == native on psf/requests
+(1049/1966) and on a 759-file agent codebase (21148/54632); ~21 MiB/s.
+Four of five ecosystems now ship official parsers; Java remains, plus the
+sdk/ts and sdk/py ecosystem-proof slices.
+
 The sandbox had to *change shape* to hold it, in ways that were the slice's
 real findings. A Go runtime imports `wasi:filesystem` before the plugin's
 first line runs — as the Python and JS runtimes will too — so refusing that
