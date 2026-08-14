@@ -711,7 +711,9 @@ wasmtime trimmed to `runtime`, `component-model`, `cranelift`, `std`. Kept on
 against that number: a fifth of the binary buys the entire plugin system, and
 `--no-default-features` still drops it. Throughput through the sandbox, same
 corpus as the native baseline: 8.6 MiB/s end-to-end against native's 23 —
-this workspace in ~190 ms. The first measurement said 4.5 and was challenged
+this workspace in ~190 ms (7.5 after line provenance was added: span
+tracking costs ~13%, paid knowingly — a fact you cannot jump to is half a
+fact). The first measurement said 4.5 and was challenged
 as kernel-inadequate; pre-linking the component at load, per-file `parse`
 dispatch and a binary partial format closed it to ~2.7×, of which ~2.1× is
 the wasm instruction floor (the single-document bench) and the rest the

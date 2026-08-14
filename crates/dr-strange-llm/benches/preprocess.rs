@@ -24,10 +24,12 @@
 //!
 //! Slice 1's native baseline on this corpus: 23 MiB/s parallel (tree),
 //! 7.7 MiB/s sequential per-file. Measured through the plugin (1 machine,
-//! release, 2026-08-14): **8.6 MiB/s tree, 3.7 MiB/s per-document** — the
-//! sandbox costs ~2.7×, which is ~190 ms for this workspace and trivial
+//! release, 2026-08-14): **7.5 MiB/s tree, 3.7 MiB/s per-document** — the
+//! sandbox costs ~3×, which is ~220 ms for this workspace and trivial
 //! beside a single model call. The first measurement said 4.5; pre-linking
-//! the component, per-file chunks and MessagePack partials bought the rest.
+//! the component, per-file chunks and MessagePack partials bought it to 8.6,
+//! and line provenance (proc-macro2's span-locations) then cost ~13% of
+//! that back — paid knowingly: a fact you cannot jump to is half a fact.
 //! The per-document number is the wasm instruction floor (~2.1× native
 //! sequential); the remaining tree gap is the serial `assemble` tail, which
 //! `RUST_LOG=dr_strange_llm=debug` splits out per run.
