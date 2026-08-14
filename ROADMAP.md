@@ -795,10 +795,30 @@ WIT**. Plugin identity is the SHA-256 pinned at install and re-checked at every
 load. Determinism is enforced rather than requested: frozen clocks, fixed-size
 chunking, partials assembled in chunk order.
 
-**Fork remaining.** *The Go plugin*, deferred to its own slice in the
-extensions repo: writing it in Go proves the interface is language-neutral far
-better than a second Rust plugin would, and depends on TinyGo's stdlib coverage
-holding up under `go/parser`.
+**Shipped (v2, slice 3): the Go plugin — and what holding a second runtime
+taught the sandbox.** `go@1` lives in the extensions repo beside the Rust
+plugin: `go/parser` under TinyGo, the same parser/component split, 28 native
+tests, and Go's own qualified names as keys (the module path from the nearest
+`go.mod`, then `path.Ident`, then `path.Type.Method`). Interface satisfaction
+is decided structurally under certainty rules — textual signatures within a
+package, predeclared-only signatures across packages, an interface embedding
+anything the tree does not declare left unmatched and counted. On a real
+chain node (345 files, 6.2 MiB) it wrote 7.4k nodes and 13.8k edges in ~3.5 s
+end-to-end, ~325 ms of that in the sandbox — and TinyGo's stdlib coverage
+held: `go/parser`, `go/ast` and `encoding/json` all compile.
+
+The sandbox had to *change shape* to hold it, in ways that were the slice's
+real findings. A Go runtime imports `wasi:filesystem` before the plugin's
+first line runs — as the Python and JS runtimes will too — so refusing that
+import by name was refusing the toolchain, not the intent; the refusal moved
+to where it is real: an **empty preopen table** (nothing to read, probe, or
+enumerate), with `wasi:sockets` alone still refused at load because nothing
+needs sockets to start. `wasi:random` now deals a **fixed byte sequence**,
+because Go seeds map iteration order from it and real entropy would have
+broken re-ingest determinism. And a trapped guest's stderr is **captured and
+surfaced** in the error, because a Go panic prints there and a bare
+"trapped" hid the whole diagnosis. Each guarantee is pinned by a hostile
+fixture, as before.
 
 ---
 
