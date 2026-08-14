@@ -27,12 +27,13 @@
 //! to write anywhere**: whatever a plugin produces comes back as a return
 //! value, and the host is what writes to the database.
 //!
-//! The grant is enforced twice over. A component that imports
-//! `wasi:filesystem` or `wasi:sockets` is refused at load — a preprocessor has
-//! no business with either, and a loud refusal beats an empty implementation
-//! it can probe at. What is linked is then only what a guest needs to start
-//! (`wasi:cli`, `wasi:clocks`, `wasi:io`), with a context granting no
-//! preopens, no network, no environment and no arguments.
+//! The grant is what the context holds, and it holds nothing: no preopened
+//! directory, no network, no environment, no arguments. A guest runtime may
+//! *import* `wasi:filesystem` — TinyGo's does before the plugin's first line
+//! runs, and the Python and JS runtimes will too — but the preopen table is
+//! empty, so there is no directory handle to read, probe, or enumerate.
+//! `wasi:sockets` alone is refused at load by name: no runtime needs sockets
+//! to start, so that import is intent rather than a startup shim.
 //!
 //! ## Bounded, and deterministic
 //!
@@ -42,6 +43,12 @@
 //! store. Both are operator-settable; and no memory setting can lift the
 //! 4 GiB ceiling wasm32 itself imposes — a tree whose facts exceed that is
 //! ingested a subtree at a time, with the plane as the accumulator.
+//!
+//! Determinism is a matter of what the sandbox will answer: the clocks are
+//! frozen and `wasi:random` deals a fixed byte sequence, so a runtime that
+//! seeds hash or map order from entropy — Go seeds map iteration this way —
+//! orders identically on every run, and re-ingesting a tree yields the same
+//! graph.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
@@ -112,11 +119,20 @@ impl Default for Limits {
 
 /// Interfaces whose mere presence in a component is a refusal.
 ///
-/// Not "linked but empty": a preprocessor has no business reaching a
-/// filesystem or a socket, and a component asking for one is telling us what
-/// it is. The error names the interface, so the refusal is legible rather
-/// than an instantiation failure the operator has to decode.
-const FORBIDDEN: &[&str] = &["wasi:filesystem", "wasi:sockets"];
+/// Sockets only, and deliberately no longer `wasi:filesystem`. Refusing the
+/// filesystem *import* by name was the first policy, and the TinyGo runtime
+/// broke it honestly: a Go guest imports `wasi:filesystem/preopens` before
+/// its first line runs, as the Python and JS runtimes will too — the import
+/// is the toolchain's startup shim, not the plugin's intent. What holds
+/// instead is the grant itself: the context below preopens **nothing**, so
+/// there is no directory handle to read, probe, or enumerate — every open
+/// fails on an empty table. Sockets stay refused by name because no
+/// runtime needs them to start, so that import *is* intent.
+const FORBIDDEN: &[&str] = &["wasi:sockets"];
+
+/// The bytes `wasi:random` deals, forever. Any constant would do; this one
+/// spells the project, which makes it recognisable in a debugger.
+const FIXED_ENTROPY: [u8; 4] = *b"drsg";
 
 /// A plugin, compiled once and ready to run.
 ///
@@ -273,9 +289,23 @@ impl WasmPlugin {
         // promise is that re-ingesting a tree yields the same graph, and a
         // plugin that could read a real clock could fold time into its facts.
         // A frozen clock makes that impossible rather than impolite.
+        // Entropy is **fixed**, not merely untrusted, for the same reason the
+        // clocks are frozen: a Go runtime seeds its map iteration order from
+        // `wasi:random`, so real entropy would make the same tree emit facts
+        // in a different order on every run. Every store deals the same
+        // bytes, so every run is the same run.
+        // Stderr is captured, not discarded: a Go runtime prints its panic
+        // there and then traps, and the message is the whole diagnosis. The
+        // capacity is a guard, not a budget — a plugin writing a megabyte of
+        // stderr in one call has something wrong worth stopping over.
+        let stderr = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1 << 20);
         let wasi = WasiCtxBuilder::new()
+            .stderr(stderr.clone())
             .monotonic_clock(FrozenInstant)
             .wall_clock(FrozenWall)
+            .secure_random(wasmtime_wasi::Deterministic::new(FIXED_ENTROPY.to_vec()))
+            .insecure_random(wasmtime_wasi::Deterministic::new(FIXED_ENTROPY.to_vec()))
+            .insecure_random_seed(0)
             .build();
         let mut store = Store::new(
             &self.engine,
@@ -286,6 +316,7 @@ impl WasmPlugin {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(self.limits.memory_bytes)
                     .build(),
+                stderr,
             },
         );
         store.limiter(|s| &mut s.limits);
@@ -315,7 +346,15 @@ impl WasmPlugin {
                  or the input is larger than `[plugins] fuel` allows for"
             );
         }
-        anyhow!("plugin `{name}` trapped: {error}")
+        let said = store.data().stderr.contents();
+        if said.is_empty() {
+            return anyhow!("plugin `{name}` trapped: {error}");
+        }
+        // The tail, because a panic message comes last and the front of a
+        // long log is the least interesting part of it.
+        let tail = said.len().saturating_sub(2048);
+        let said = String::from_utf8_lossy(&said[tail..]).trim().to_string();
+        anyhow!("plugin `{name}` trapped: {error}\nits stderr said:\n{said}")
     }
 }
 
@@ -401,6 +440,10 @@ struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     limits: StoreLimits,
+    /// Where the guest's stderr lands. Discarding it kept a Go plugin's
+    /// panic message invisible behind a bare "trapped" — so it is captured
+    /// instead, and surfaced when a trap has to be explained.
+    stderr: wasmtime_wasi::p2::pipe::MemoryOutputPipe,
 }
 
 impl WasiView for State {

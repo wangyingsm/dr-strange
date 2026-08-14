@@ -96,6 +96,15 @@ impl Guest for Fixture {
                 let delta = a.elapsed().as_nanos();
                 Ok(delta.to_string().into_bytes())
             }
+            "rand" => {
+                // What entropy does the sandbox deal? A guest runtime seeds
+                // hash and map order from this, so the host must answer the
+                // same way every run.
+                let mut buf = [0u8; 16];
+                getrandom::fill(&mut buf).map_err(|e| e.to_string())?;
+                let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+                Ok(hex.into_bytes())
+            }
             other => Err(format!("fixture has no mode `{other}`")),
         }
     }

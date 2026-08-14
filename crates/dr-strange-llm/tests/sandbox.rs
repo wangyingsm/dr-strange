@@ -145,22 +145,77 @@ fn the_clock_is_frozen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A component that imports `wasi:filesystem` is refused **at load, by name**
-/// — before it can run at all. A preprocessor reads through the host
-/// interface, which is rooted; there is nothing an honest one needs a
-/// filesystem for.
+/// A component may *import* `wasi:filesystem` — a guest toolchain's runtime
+/// often does before the plugin's first line runs, which is why the import
+/// alone is not refused — but the grant behind it is an **empty preopen
+/// table**: there is no directory handle to read, probe, or enumerate, so
+/// the read itself fails and the failure reaches the caller naming the
+/// plugin.
 #[test]
-fn a_filesystem_import_is_refused_at_load() {
+fn a_filesystem_import_is_granted_nothing() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture-fs.wasm");
+    let plugin = WasmPlugin::load(&path, Vec::new(), Limits::default())
+        .expect("a filesystem import alone must not refuse the load");
+    let (dir, host) = scratch("fs");
+    let err = plugin
+        .preprocess(
+            &Input::Files {
+                paths: &["a.fix".to_string()],
+            },
+            &host,
+        )
+        .expect_err("a read through an empty preopen table must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("grabby"),
+        "the error must name the plugin: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A component that imports `wasi:sockets` is refused **at load, by name** —
+/// before it can run at all. Unlike the filesystem import, which a guest
+/// runtime plants before the plugin's first line runs, nothing needs sockets
+/// to start: that import is intent.
+#[test]
+fn a_sockets_import_is_refused_at_load() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture-net.wasm");
     let err = match WasmPlugin::load(&path, Vec::new(), Limits::default()) {
-        Ok(_) => panic!("a component importing wasi:filesystem must not load"),
+        Ok(_) => panic!("a component importing wasi:sockets must not load"),
         Err(e) => e,
     };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("wasi:filesystem"),
+        msg.contains("wasi:sockets"),
         "refusal must name the import: {msg}"
     );
+}
+
+/// `wasi:random` deals the **same bytes every run** — a guest runtime seeds
+/// hash and map iteration order from it (Go does), so real entropy would make
+/// the same tree emit facts in a different order on every ingest.
+#[test]
+fn entropy_is_dealt_from_a_fixed_deck() {
+    let (dir, host) = scratch("rand");
+    let plugin = fixture("rand", Limits::default());
+    let draw = |plugin: &WasmPlugin| {
+        let out = plugin
+            .preprocess(
+                &Input::Files {
+                    paths: &["a.fix".to_string()],
+                },
+                &host,
+            )
+            .unwrap();
+        format!("{:?}", out.nodes[0].props)
+    };
+    let first = draw(&plugin);
+    let second = draw(&plugin);
+    assert_eq!(
+        first, second,
+        "two draws in fresh stores must see identical entropy"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Determinism, end to end: the same tree through the same plugin twice gives

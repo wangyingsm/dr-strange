@@ -10,6 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.60"
+# The `rand` mode reads `wasi:random`, which the sandbox answers with a fixed
+# sequence — this is how that promise gets a test.
+getrandom = "0.3"
 
 # Not part of the drsg workspace: built by hand for wasm32-wasip2 and the
 # artifact committed — see ../README.md for the exact command.
