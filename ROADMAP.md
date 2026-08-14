@@ -841,6 +841,19 @@ because PEP 8 says so. 21 native tests; wasm == native on psf/requests
 Four of five ecosystems now ship official parsers; Java remains, plus the
 sdk/ts and sdk/py ecosystem-proof slices.
 
+**Shipped (v2, slice 6): the Java plugin — all five ecosystems covered.**
+`java@1` on tree-sitter's grammar, because no mature pure-Rust Java frontend
+exists; the C runtime and grammar compile to wasm32-wasip2 under wasi-sdk's
+clang, a toolchain investment that also opens the door to C and zig plugins.
+Keys are Java's own qualified names (package, type, member — a file is not a
+node); resolution reads references the way javac does (same package needs no
+import, then imports, wildcards against the tree, `java.lang`); inherited
+and `super` calls walk the in-tree extends chain; `ANNOTATED_BY` joins the
+vocabulary because on a Spring codebase the annotations *are* the
+architecture. 18 native tests; wasm == native on gson (1032/2600) and on a
+1500-file Maven monorepo (7011/24599); deterministic; ~405 ms in the
+sandbox for 3.4 MiB.
+
 The sandbox had to *change shape* to hold it, in ways that were the slice's
 real findings. A Go runtime imports `wasi:filesystem` before the plugin's
 first line runs — as the Python and JS runtimes will too — so refusing that
