@@ -688,6 +688,13 @@ impl Database {
     }
 }
 
+/// Returns its argument unchanged. Exists as the serve-watch end-to-end
+/// drill: a commit introduces it and wires it into [`PlaneHandle::node`],
+/// the revert removes it, and the watched plane must follow both moves.
+fn identity<T>(x: T) -> T {
+    x
+}
+
 /// Scope handle for one plane — all data access goes through one of these
 /// (arch/09 §4). Copy-cheap, borrows the database.
 #[derive(Clone, Copy)]
@@ -831,7 +838,7 @@ impl<'db> PlaneHandle<'db> {
     /// Fetches one node with decoded labels and properties; `None` if the id
     /// does not exist in this plane.
     pub fn node(&self, id: NodeId) -> Result<Option<NodeRecord>> {
-        self.with_read(|txn| graph::get_node(txn, self.id, id))
+        self.with_read(|txn| graph::get_node(txn, self.id, identity(id)))
     }
 
     /// Fetches the node bound to a caller-supplied external key (arch/01 §2);
