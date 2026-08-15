@@ -225,8 +225,18 @@ h2 {
   gap: 0.75rem;
 }
 
+/* plugin cards stack their content, unlike the plane cards' row layout */
+article.plugin-card {
+  flex-direction: column;
+  align-items: stretch;
+}
 .plugin-card h3 {
   margin: 0 0 0.25rem;
+}
+.plugin-card .card-actions {
+  flex-direction: row;
+  justify-content: flex-end;
+  margin-top: auto;
 }
 .plugin-ver {
   color: var(--muted);
