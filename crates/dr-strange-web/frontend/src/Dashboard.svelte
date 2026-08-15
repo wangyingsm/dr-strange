@@ -18,6 +18,8 @@
   let plugins = $state([]) // installed preprocessor plugins
   let catalog = $state([]) // the official catalog this build pins
   let busy = $state({}) // plugin name -> true while an install/upgrade runs
+  let vecBusy = $state({}) // plane name -> true while a vectorize runs
+  let vecMsg = $state({}) // plane name -> last vectorize summary
   let installing = $state(false)
   let installUrl = $state('')
 
@@ -140,6 +142,25 @@
     return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg)
   }
 
+  async function vectorizePlane(name) {
+    vecBusy = { ...vecBusy, [name]: true }
+    vecMsg = { ...vecMsg, [name]: '' }
+    try {
+      const st = await rpc('plane.vectorize', { plane: name })
+      vecMsg = {
+        ...vecMsg,
+        [name]:
+          st.embedded > 0
+            ? `embedded ${st.embedded} (${st.tokens} tokens), ${st.current} current`
+            : `up to date (${st.current} current)`,
+      }
+    } catch (e) {
+      vecMsg = { ...vecMsg, [name]: `failed: ${e.message}` }
+    } finally {
+      vecBusy = { ...vecBusy, [name]: false }
+    }
+  }
+
   async function installOfficial(c) {
     busy = { ...busy, [c.name]: true }
     try {
@@ -242,6 +263,20 @@
         </div>
       </button>
       <div class="card-actions">
+        <button
+          class="export"
+          onclick={() => vectorizePlane(p.name)}
+          disabled={vecBusy[p.name]}
+          title="Embed every node for similarity search (incremental) and build the vector indexes"
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="4" cy="12" r="1.6" />
+            <circle cx="8" cy="5" r="1.6" />
+            <circle cx="12.5" cy="10.5" r="1.6" />
+            <path d="M5.2 10.9 6.9 6.4M9.5 5.9l1.8 3.4" />
+          </svg>
+          {vecBusy[p.name] ? 'Vectorizing…' : 'Vectorize'}
+        </button>
         <button class="export" onclick={() => exportPlane(p.name)} title="Export this plane as JSONL">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M8 2.5v7" />
@@ -265,6 +300,9 @@
           Delete
         </button>
       </div>
+      {#if vecMsg[p.name]}
+        <p class="vec-msg" class:err={vecMsg[p.name].startsWith('failed')}>{vecMsg[p.name]}</p>
+      {/if}
     </article>
   {/each}
   <button class="card new-card" onclick={() => (creating = true)} title="Create a new plane" aria-label="Create a new plane">

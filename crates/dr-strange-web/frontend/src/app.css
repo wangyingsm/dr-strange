@@ -225,6 +225,18 @@ h2 {
   gap: 0.75rem;
 }
 
+.vec-msg {
+  position: absolute;
+  bottom: 0.35rem;
+  right: 1.1rem;
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.vec-msg.err {
+  color: #e5534b;
+}
+
 /* plugin cards stack their content, unlike the plane cards' row layout */
 article.plugin-card {
   flex-direction: column;
@@ -315,6 +327,8 @@ article.card {
   display: flex;
   gap: 0.6rem;
   align-items: flex-start;
+  /* anchors corner overlays: the plugin logo, the vectorize summary */
+  position: relative;
 }
 article.card:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));

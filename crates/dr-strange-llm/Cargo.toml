@@ -18,7 +18,7 @@ homepage.workspace = true
 # that the configuration did not name, so a default install still executes
 # exactly as much third-party code as it did before, which is none.
 default = ["plugins"]
-plugins = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:toml"]
+plugins = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:toml"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -63,7 +63,7 @@ wasmtime = { version = "47", default-features = false, features = [
 ], optional = true }
 wasmtime-wasi = { version = "47", optional = true }
 # Plugin identity: hashed at install, re-checked at every load.
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10" }
 # `registry.toml` — what is installed, and what it hashed to.
 toml = { version = "0.8", optional = true }
 

@@ -198,6 +198,7 @@ const METHODS: &[&str] = &[
     "plugin.install",
     "plugin.remove",
     "plane.list",
+    "plane.vectorize",
     "plane.catalog",
     "node.get",
     "plane.history",
@@ -255,6 +256,8 @@ fn dispatch_method(
         "plugin.catalog" => guarded!(Access::Read, methods::plugin_catalog(ctx)),
         "plugin.install" => guarded!(Access::Write, methods::plugin_install(ctx, params)),
         "plugin.remove" => guarded!(Access::Write, methods::plugin_remove(ctx, params)),
+        // Writes vectors and spends the server's provider budget.
+        "plane.vectorize" => guarded!(Access::Write, methods::plane_vectorize(ctx, params)),
         "plane.list" => guarded!(Access::Read, methods::plane_list(ctx)),
         "plane.catalog" => guarded!(Access::Read, methods::plane_catalog(ctx, params)),
         "node.get" => guarded!(Access::Read, methods::node_get(ctx, params)),

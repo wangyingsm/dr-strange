@@ -223,6 +223,73 @@
       }
     },
     {
+      "name": "plane.vectorize",
+      "summary": "Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment.",
+      "params": [
+        {
+          "name": "plane",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "embed",
+          "schema": {
+            "type": "string",
+            "description": "Provider preset or base URL (default openai)"
+          }
+        },
+        {
+          "name": "embed_model",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "metric",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "cosine",
+              "dot",
+              "l2"
+            ],
+            "description": "Index metric (default cosine)"
+          }
+        }
+      ],
+      "result": {
+        "name": "stats",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "embedded": {
+              "type": "integer"
+            },
+            "unique": {
+              "type": "integer"
+            },
+            "tokens": {
+              "type": "integer"
+            },
+            "current": {
+              "type": "integer"
+            },
+            "empty": {
+              "type": "integer"
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "plane.catalog",
       "summary": "One plane's soft schema (labels, property descriptions, edge types, counts).",
       "x-access": "read",

@@ -20,6 +20,7 @@ mod preset;
 mod provider;
 mod reconcile;
 mod refine;
+mod vectorize;
 
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
@@ -43,3 +44,4 @@ pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;
 pub use refine::RefineReport;
+pub use vectorize::{VectorizeStats, vectorize_plane};

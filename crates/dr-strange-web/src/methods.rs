@@ -338,6 +338,48 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+pub struct PlaneVectorize {
+    plane: String,
+    /// Embedding provider preset or base URL; the key comes from the
+    /// server's environment, mirroring `digest.run`.
+    #[serde(default)]
+    embed: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
+    /// `cosine` (default), `dot`, or `l2`.
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+/// `plane.vectorize` — embed every node in a plane and ensure its vector
+/// indexes: the dashboard's per-plane button, same engine as `drsg vec`.
+/// Incremental by meaning, so pressing it twice costs one pass.
+pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PlaneVectorize = params(p)?;
+    let metric = match req.metric.as_deref() {
+        None | Some("cosine") => dr_strange_core::Metric::Cosine,
+        Some("dot") => dr_strange_core::Metric::Dot,
+        Some("l2") => dr_strange_core::Metric::L2,
+        Some(other) => {
+            return Err(RpcError::invalid_params(format!(
+                "unknown metric `{other}` — cosine, dot or l2"
+            )));
+        }
+    };
+    let embedder = dr_strange_llm::build_provider(
+        req.embed.as_deref().unwrap_or("openai"),
+        req.embed_model.as_deref(),
+        None,
+        None,
+        true,
+    )
+    .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    let stats = dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric)
+        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    serde_json::to_value(stats).map_err(|e| RpcError::server(e.to_string()))
+}
+
+#[derive(Deserialize)]
 pub struct PluginInstall {
     /// A URL to download the component from. Server-local file paths are
     /// deliberately not accepted over RPC: a remote caller naming paths on

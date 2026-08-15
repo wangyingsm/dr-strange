@@ -792,14 +792,9 @@ fn fmt_channel(v: Option<f32>) -> String {
 }
 
 /// `drsg vectorize` — embed every node in a plane so it answers similarity
-/// search, incrementally.
-///
-/// Each node's text comes from [`dr_strange_llm::embeddable_text`]: parser
-/// facts get the stable projection (no positional properties), everything
-/// else the full text. `_embedded_from` records a hash of the text each
-/// vector was built from, so a re-run pays only for nodes whose *meaning*
-/// changed — a month of watching re-embeds a handful of symbols, not the
-/// plane.
+/// search, incrementally, then ensure the vector indexes. The engine lives
+/// in [`dr_strange_llm::vectorize_plane`], shared with `plane.vectorize`
+/// over RPC; this is its terminal voice.
 #[cfg(feature = "digest")]
 pub fn vectorize(
     db: &Database,
@@ -808,116 +803,29 @@ pub fn vectorize(
     metric: Metric,
     out: &mut dyn Write,
 ) -> Result<()> {
-    /// Inputs have provider token ceilings; a pathological `value` should
-    /// truncate, not fail the batch.
-    const TEXT_CAP: usize = 6000;
-
-    let p = plane(db, plane_name)?;
-    let mut work: Vec<(NodeId, String, String)> = Vec::new(); // id, text, hash
-    let (mut current, mut empty) = (0usize, 0usize);
-    for node in p.query().scan_all().nodes()? {
-        let key = node.external_key.as_deref().unwrap_or("");
-        let mut text = dr_strange_llm::embeddable_text(key, &node.labels, &node.properties);
-        if text.trim().is_empty() {
-            empty += 1;
-            continue;
-        }
-        if text.len() > TEXT_CAP {
-            let mut end = TEXT_CAP;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
-        let hash = text_hash(&text);
-        let up_to_date = matches!(
-            node.properties.get("_embedded_from").map(|d| &d.value),
-            Some(PropValue::Str(h)) if *h == hash
-        ) && matches!(
-            node.properties.get("embedding").map(|d| &d.value),
-            Some(PropValue::Vector(_))
-        );
-        if up_to_date {
-            current += 1;
-        } else {
-            work.push((node.id, text, hash));
-        }
-    }
-
-    if work.is_empty() {
+    let stats = dr_strange_llm::vectorize_plane(db, plane_name, embedder, metric)?;
+    if stats.embedded == 0 {
         writeln!(
             out,
-            "nothing to embed: {current} node(s) already current, {empty} with no text"
+            "nothing to embed: {} node(s) already current, {} with no text",
+            stats.current, stats.empty
         )?;
-        // Indexes are still ensured: embeddings may be current while a label
-        // gained since the last run has no index yet.
-        return index_ensure_all(db, plane_name, "embedding", metric, out);
-    }
-
-    // Identical texts embed once — external stand-ins and boilerplate repeat.
-    let mut unique: Vec<String> = Vec::new();
-    let mut index: Vec<usize> = Vec::with_capacity(work.len());
-    {
-        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for (_, text, _) in &work {
-            match seen.get(text.as_str()) {
-                Some(&i) => index.push(i),
-                None => {
-                    seen.insert(text.as_str(), unique.len());
-                    index.push(unique.len());
-                    unique.push(text.clone());
-                }
-            }
-        }
-    }
-    let reply = embedder.embed(&unique).context("embedding the plane")?;
-
-    let mut txn = p.write()?;
-    for (i, (id, _, hash)) in work.iter().enumerate() {
-        txn.set_prop(
-            *id,
-            "embedding",
-            PropDesc::described(
-                "embedding of this node's text",
-                PropValue::Vector(reply.vectors[index[i]].clone()),
-            ),
-        )?;
-        txn.set_prop(
-            *id,
-            "_embedded_from",
-            PropDesc::described(
-                "hash of the text the embedding was built from",
-                PropValue::Str(hash.clone()),
-            ),
+    } else {
+        writeln!(
+            out,
+            "embedded {} node(s) ({} unique texts, {} tokens); {} already current, {} with no text",
+            stats.embedded, stats.unique, stats.tokens, stats.current, stats.empty
         )?;
     }
-    txn.commit()?;
-
-    writeln!(
-        out,
-        "embedded {} node(s) ({} unique texts, {} tokens); {} already current, {} with no text",
-        work.len(),
-        unique.len(),
-        reply.tokens,
-        current,
-        empty
-    )?;
-    // Finish the job: the plane answers similarity queries the moment this
-    // returns, no follow-up command per label to remember.
-    index_ensure_all(db, plane_name, "embedding", metric, out)
-}
-
-/// A stable fingerprint of an embedded text — what `_embedded_from` stores
-/// so a re-run can tell "unchanged" without asking the provider. sha256
-/// rather than a std hasher because the value persists in the plane: a
-/// hasher whose algorithm may change across toolchains would quietly
-/// invalidate every skip on the next binary.
-#[cfg(feature = "digest")]
-fn text_hash(text: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    let d = Sha256::digest(text.as_bytes());
-    // 16 hex chars: 64 bits is plenty when a collision merely re-embeds one node.
-    d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    if !stats.labels.is_empty() {
+        writeln!(
+            out,
+            "  vector indexes ensured ({metric:?}) on `embedding` for {} label(s): {}",
+            stats.labels.len(),
+            stats.labels.join(", ")
+        )?;
+    }
+    Ok(())
 }
 
 /// Embed a query string for the vector channel. Needs the `digest` feature
@@ -2531,8 +2439,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("embedded 2 node(s)"), "{text}");
         // The plane is searchable when vectorize returns: both labels indexed.
-        assert!(text.contains("Function.embedding"), "{text}");
-        assert!(text.contains("Paper.embedding"), "{text}");
+        assert!(text.contains("Function, Paper"), "{text}");
         let node = p.node(fact_id).unwrap().unwrap();
         assert!(matches!(
             node.properties.get("embedding").map(|d| &d.value),
