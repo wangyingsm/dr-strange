@@ -107,74 +107,130 @@ fn candidates(name: &str, hits: &[NodeRecord]) -> String {
     out
 }
 
-/// `find_symbol` — fuzzy lookup by name; one candidate per line.
-pub fn find_symbol(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
-    Ok(match resolve(plane, name)? {
-        Resolved::One(n) => {
-            let mut s = one_line(&n);
-            if let Some(sig) = prop_str(&n.properties, "signature") {
-                s.push_str("\n  ");
-                s.push_str(sig);
-            }
-            s.push('\n');
-            s
-        }
-        Resolved::Many(hits) => candidates(name, &hits),
-        Resolved::None => format!("no symbol matches `{name}` in this plane\n"),
-    })
-}
-
 /// The honesty footer every call listing carries: what a recorded edge set
 /// can and cannot claim.
 const CALLS_NOTE: &str = "note: recorded call edges only — calls the parser could not resolve \
      (dynamic dispatch, untyped receivers) are absent, so this is a lower \
      bound.\n";
 
-fn call_listing(
-    plane: &PlaneHandle<'_>,
-    node: &NodeRecord,
-    dir: crate::Dir,
-    heading: &str,
-) -> Result<String> {
-    let key = node.external_key.as_deref().unwrap_or("<keyless>");
-    let hops = plane.neighbors(node.id, dir, Some("CALLS"))?;
-    let mut out = format!("{heading} {key} ({}):\n", hops.len());
-    for hop in &hops {
-        let Some(other) = plane.node(hop.node)? else {
-            continue;
-        };
-        let mut line = one_line(&other);
-        if let Some(edge) = plane.edge(hop.edge)?
-            && let Some(l) = prop_int(&edge.properties, "line")
-        {
-            line.push_str(&format!("  call@{l}"));
+/// Most entries printed per edge group before eliding with a count.
+const GROUP_CAP: usize = 20;
+
+/// `context` — the primary agent verb: one symbol's whole neighborhood in a
+/// single round trip. The head and properties are [`describe`]'s; then the
+/// graph around it — who contains it, who calls it (with call sites), what
+/// it calls, and every other edge type grouped — so callers/callees/what-is
+/// questions are all answered by this one call, and the agent never has to
+/// choose among narrower verbs. Ambiguity returns the candidate list, which
+/// is itself the useful one-call reply.
+pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
+    let node = match resolve(plane, name)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(candidates(name, &hits)),
+        Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
+    };
+    let mut out = describe_record(plane, &node)?;
+
+    // Group every edge by (direction, type). CONTAINS-in is rendered as the
+    // parent ("contained by"); CALLS carry their call-site lines.
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(&'static str, String), Vec<String>> = BTreeMap::new();
+    let mut had_calls = false;
+    for (dir, tag) in [(crate::Dir::In, "in"), (crate::Dir::Out, "out")] {
+        for hop in plane.neighbors(node.id, dir, None)? {
+            let Some(other) = plane.node(hop.node)? else {
+                continue;
+            };
+            let Some(edge) = plane.edge(hop.edge)? else {
+                continue;
+            };
+            let mut line = one_line(&other);
+            if edge.ty == "CALLS" {
+                had_calls = true;
+                if let Some(l) = prop_int(&edge.properties, "line") {
+                    line.push_str(&format!("  call@{l}"));
+                }
+                if hop.node == node.id {
+                    line.push_str("  (self)");
+                }
+            }
+            groups.entry((tag, edge.ty.clone())).or_default().push(line);
         }
-        if hop.node == node.id {
-            line.push_str("  (self)");
-        }
-        out.push_str(&line);
-        out.push('\n');
     }
-    out.push_str(CALLS_NOTE);
+
+    let mut section = |title: &str, key: (&'static str, String), out: &mut String| {
+        if let Some(lines) = groups.remove(&key) {
+            out.push_str(&format!("{title} ({}):\n", lines.len()));
+            for l in lines.iter().take(GROUP_CAP) {
+                out.push_str("  ");
+                out.push_str(l);
+                out.push('\n');
+            }
+            if lines.len() > GROUP_CAP {
+                out.push_str(&format!("  … and {} more\n", lines.len() - GROUP_CAP));
+            }
+        }
+    };
+    section("contained by", ("in", "CONTAINS".into()), &mut out);
+    section("callers", ("in", "CALLS".into()), &mut out);
+    section("callees", ("out", "CALLS".into()), &mut out);
+    section("contains", ("out", "CONTAINS".into()), &mut out);
+    // Whatever edge vocabulary remains (IMPLEMENTS, EXTENDS, HAS_METHOD,
+    // IMPORTS, STYLED_BY, …) renders under its own name, direction marked.
+    let rest: Vec<((&'static str, String), Vec<String>)> = groups.into_iter().collect();
+    for ((dir, ty), lines) in rest {
+        let arrow = if dir == "in" { "←" } else { "→" };
+        let mut buf = format!("{ty} {arrow} ({}):\n", lines.len());
+        for l in lines.iter().take(GROUP_CAP) {
+            buf.push_str("  ");
+            buf.push_str(l);
+            buf.push('\n');
+        }
+        if lines.len() > GROUP_CAP {
+            buf.push_str(&format!("  … and {} more\n", lines.len() - GROUP_CAP));
+        }
+        out.push_str(&buf);
+    }
+    if had_calls {
+        out.push_str(CALLS_NOTE);
+    }
     Ok(out)
 }
 
-/// `callers` — who calls this symbol, one caller per line with the call site.
-pub fn callers(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
-    Ok(match resolve(plane, name)? {
-        Resolved::One(n) => call_listing(plane, &n, crate::Dir::In, "callers of")?,
-        Resolved::Many(hits) => candidates(name, &hits),
-        Resolved::None => format!("no symbol matches `{name}` in this plane\n"),
-    })
-}
-
-/// `callees` — what this symbol calls.
-pub fn callees(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
-    Ok(match resolve(plane, name)? {
-        Resolved::One(n) => call_listing(plane, &n, crate::Dir::Out, "callees of")?,
-        Resolved::Many(hits) => candidates(name, &hits),
-        Resolved::None => format!("no symbol matches `{name}` in this plane\n"),
-    })
+/// `search` — semantic lookup for questions that name no identifier: cosine
+/// top-k over the plane's `embedding` vectors, one hit per line with its
+/// score, the best hit expanded to its full [`describe`] block. The query
+/// vector comes from the caller (the serving layer embeds the text — core
+/// holds no provider).
+pub fn search(plane: &PlaneHandle<'_>, query: &[f32], k: u64) -> Result<String> {
+    let hits = plane
+        .query()
+        .vector_top_k(
+            None,
+            "embedding",
+            query.to_vec(),
+            crate::Metric::Cosine,
+            k.max(1),
+        )
+        .scored_nodes()?;
+    if hits.is_empty() {
+        return Ok(
+            "no embedded nodes in this plane — `drsg vectorize` builds the vectors\n".to_string(),
+        );
+    }
+    let mut out = String::new();
+    for (n, score) in &hits {
+        if let Some(score) = score {
+            out.push_str(&format!("{score:.3}  "));
+        }
+        out.push_str(&one_line(n));
+        out.push('\n');
+    }
+    if let Some((top, _)) = hits.first() {
+        out.push_str("\nbest match:\n");
+        out.push_str(&describe_record(plane, top)?);
+    }
+    Ok(out)
 }
 
 /// `describe` — one node's content as `prop: value` lines. Vectors and
@@ -186,7 +242,11 @@ pub fn describe(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
         Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
     };
-    let mut out = one_line(&node);
+    describe_record(plane, &node)
+}
+
+fn describe_record(_plane: &PlaneHandle<'_>, node: &NodeRecord) -> Result<String> {
+    let mut out = one_line(node);
     out.push('\n');
     if node.labels.len() > 1 {
         out.push_str(&format!("labels: {}\n", node.labels.join(", ")));
@@ -280,32 +340,37 @@ mod tests {
             Resolved::One(_)
         ));
         // A suffix shared by two symbols is ambiguous — and says so.
-        let out = find_symbol(&p, "go").unwrap();
+        let out = context(&p, "go").unwrap();
         assert!(out.contains("ambiguous"), "{out}");
         assert!(out.contains("m::api::go") && out.contains("m::util::go"));
         // A unique substring resolves.
         assert!(matches!(resolve(&p, "util").unwrap(), Resolved::One(_)));
         // Nothing matches: said plainly.
-        assert!(find_symbol(&p, "zzz").unwrap().contains("no symbol"));
+        assert!(context(&p, "zzz").unwrap().contains("no symbol"));
     }
 
     #[test]
-    fn callers_render_one_line_per_fact_with_call_site() {
+    fn context_answers_callers_callees_and_what_is_in_one_call() {
         let db = seeded();
         let p = db.plane("code").unwrap();
-        let out = callers(&p, "m::api::go").unwrap();
-        assert!(out.starts_with("callers of m::api::go (1):"), "{out}");
+        let out = context(&p, "m::api::go").unwrap();
+        // The describe half: head line + signature.
+        assert!(
+            out.starts_with("m::api::go  Function  src/api.rs:10"),
+            "{out}"
+        );
+        assert!(out.contains("signature: fn go()"), "{out}");
+        // The callers half, call site included.
+        assert!(out.contains("callers (1):"), "{out}");
         assert!(
             out.contains("m::api::run  Function  src/api.rs:40  call@44"),
             "{out}"
         );
         assert!(out.contains("lower"), "honesty footer missing: {out}");
-        // The fuzzy form works through the same path.
-        let via_fuzzy = callers(&p, "run").unwrap();
-        assert!(
-            via_fuzzy.contains("callers of m::api::run (0):"),
-            "{via_fuzzy}"
-        );
+        // The caller's own context shows the same edge from the other side.
+        let caller = context(&p, "m::api::run").unwrap();
+        assert!(caller.contains("callees (1):"), "{caller}");
+        assert!(caller.contains("m::api::go"), "{caller}");
     }
 
     #[test]

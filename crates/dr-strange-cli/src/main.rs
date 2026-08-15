@@ -91,27 +91,32 @@ enum Command {
         #[arg(long = "param", value_name = "NAME=JSON")]
         param: Vec<String>,
     },
-    /// Find a symbol by name (fuzzy): exact key, `::name`/`.name` suffix,
-    /// else substring. Compact text output — the agent verb.
-    Find {
+    /// One symbol's whole neighborhood in one call: definition, signature,
+    /// doc, fields, callers with call sites, callees, containment and every
+    /// other edge — the primary agent verb. Fuzzy names allowed; ambiguity
+    /// returns candidates.
+    Context {
         name: String,
         #[arg(long, default_value = "startup")]
         plane: String,
     },
-    /// Who calls this symbol — one caller per line with the call site.
-    /// Accepts a fuzzy name like `find`.
-    Callers {
-        name: String,
+    /// Semantic lookup when no identifier is known: embeds the query, runs
+    /// cosine top-k over the plane's `embedding` vectors, expands the best
+    /// hit. Requires the plane to be vectorized.
+    Search {
+        query: String,
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        #[arg(long)]
+        embed_model: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        k: u64,
     },
-    /// What this symbol calls — one callee per line with the call site.
-    Callees {
-        name: String,
-        #[arg(long, default_value = "startup")]
-        plane: String,
-    },
-    /// One symbol's content as `prop: value` lines (vectors elided).
+    /// One symbol's content as `prop: value` lines (vectors elided) — the
+    /// lightweight node-only view; `context` adds the edges.
     Describe {
         name: String,
         #[arg(long, default_value = "startup")]
@@ -572,24 +577,33 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             };
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
         }
-        Command::Find { name, plane } => {
+        Command::Context { name, plane } => {
             let db = commands::open(&cli.db)?;
-            commands::compact(
-                &db,
-                &plane,
-                &name,
-                dr_strange_core::compact::find_symbol,
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::context, out)
+        }
+        #[cfg(feature = "digest")]
+        Command::Search {
+            query,
+            plane,
+            embed,
+            embed_model,
+            k,
+        } => {
+            let db = commands::open(&cli.db)?;
+            let embedder =
+                dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
+            write!(
                 out,
-            )
+                "{}",
+                dr_strange_llm::semantic_search(&db, &plane, &query, &embedder, k)?
+            )?;
+            Ok(())
         }
-        Command::Callers { name, plane } => {
-            let db = commands::open(&cli.db)?;
-            commands::compact(&db, &plane, &name, dr_strange_core::compact::callers, out)
-        }
-        Command::Callees { name, plane } => {
-            let db = commands::open(&cli.db)?;
-            commands::compact(&db, &plane, &name, dr_strange_core::compact::callees, out)
-        }
+        #[cfg(not(feature = "digest"))]
+        Command::Search { .. } => anyhow::bail!(
+            "`drsg search` embeds the query and needs the digest feature; \
+             rebuild with default features"
+        ),
         Command::Describe { name, plane } => {
             let db = commands::open(&cli.db)?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)

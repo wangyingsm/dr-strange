@@ -373,22 +373,6 @@ struct Digest {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct Search {
-    #[serde(default = "default_plane")]
-    plane: String,
-    /// Restrict to a label (omit to search the whole plane).
-    label: Option<String>,
-    /// The vector property to compare.
-    property: String,
-    /// The query embedding.
-    query: Vec<f32>,
-    /// `cosine` (default), `dot`, or `l2`.
-    metric: Option<String>,
-    /// Number of nearest neighbours (default 10).
-    k: Option<u32>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct Traverse {
     #[serde(default = "default_plane")]
     plane: String,
@@ -614,6 +598,18 @@ struct SymbolReq {
     name: String,
 }
 
+/// `search`'s request: free text and a plane.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// What to look for, in plain words — no identifier needed.
+    query: String,
+    /// How many hits (default 8).
+    #[serde(default)]
+    k: Option<u64>,
+}
+
 fn compact_logic(
     db: &Database,
     req: SymbolReq,
@@ -633,22 +629,6 @@ fn get_node_logic(db: &Database, req: GetNode) -> AnyResult<Value> {
     Ok(node
         .map(|n| json::node_to_json_lean(&n))
         .unwrap_or(Value::Null))
-}
-
-fn search_logic(db: &Database, req: Search) -> AnyResult<Value> {
-    let p = db.plane(&req.plane)?;
-    let metric = parse_metric(req.metric.as_deref());
-    let hits = p
-        .query()
-        .vector_top_k(
-            req.label.as_deref(),
-            &req.property,
-            req.query,
-            metric,
-            req.k.unwrap_or(10) as u64,
-        )
-        .scored_nodes()?;
-    Ok(scored_rows(&hits))
 }
 
 fn traverse_logic(db: &Database, req: Traverse) -> AnyResult<Value> {
@@ -1287,41 +1267,55 @@ impl DrStrange {
             .await
     }
 
-    #[tool(
-        description = "Find a symbol by name (fuzzy: exact key,         `::name`/`.name` suffix, else substring). Compact text: one         candidate per line as `key  label  file:line`. Start here when you         do not know the exact key."
-    )]
-    async fn find_symbol(
+    #[tool(description = "The primary code-context tool: one symbol's whole \
+        neighborhood in a single call — definition, signature, doc comment, \
+        fields, callers with call sites, callees, containment and every \
+        other edge, as compact text. Accepts a fuzzy name (exact key, \
+        `::name`/`.name` suffix, or substring); ambiguity returns the \
+        candidates. Use this first for any what-is/who-calls/what-calls \
+        question.")]
+    async fn context(
         &self,
         Parameters(req): Parameters<SymbolReq>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking("find_symbol", move |db| {
-            compact_logic(db, req, dr_strange_core::compact::find_symbol)
+        self.blocking("context", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::context)
         })
         .await
     }
 
-    #[tool(
-        description = "Who calls this symbol — one caller per line as         `key  label  file:defline  call@line`, resolved by the parser at         ingest (a lower bound: unresolvable calls carry no edge). Accepts a         fuzzy name like find_symbol."
-    )]
-    async fn callers(
+    #[tool(description = "Semantic lookup when no identifier is known: embeds \
+        the query text and returns the closest symbols by meaning (cosine \
+        over the plane's `embedding` vectors), best hit expanded. Requires \
+        the plane to be vectorized and the server to have an embed provider \
+        configured.")]
+    async fn search(
         &self,
-        Parameters(req): Parameters<SymbolReq>,
+        Parameters(req): Parameters<SearchReq>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking("callers", move |db| {
-            compact_logic(db, req, dr_strange_core::compact::callers)
-        })
-        .await
-    }
-
-    #[tool(
-        description = "What this symbol calls — one callee per line with         the call site. Accepts a fuzzy name like find_symbol."
-    )]
-    async fn callees(
-        &self,
-        Parameters(req): Parameters<SymbolReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("callees", move |db| {
-            compact_logic(db, req, dr_strange_core::compact::callees)
+        let embed = self.embed.clone();
+        self.blocking("search", move |db| {
+            let Some(cfg) = &embed else {
+                anyhow::bail!(
+                    "no embed provider configured on this server — set \
+                     [server] embed provider (and its key env) in drsg.toml"
+                );
+            };
+            let embedder = dr_strange_llm::build_provider(
+                &cfg.provider,
+                cfg.model.as_deref(),
+                None,
+                cfg.key_env.as_deref(),
+                true,
+            )?;
+            let text = dr_strange_llm::semantic_search(
+                db,
+                &req.plane,
+                &req.query,
+                &embedder,
+                req.k.unwrap_or(8),
+            )?;
+            Ok(Value::String(text))
         })
         .await
     }
@@ -1345,16 +1339,6 @@ impl DrStrange {
         Parameters(req): Parameters<GetNode>,
     ) -> Result<CallToolResult, McpError> {
         self.blocking("get_node", move |db| get_node_logic(db, req))
-            .await
-    }
-
-    #[tool(description = "Vector similarity search: the k nodes closest to \
-        `query` by their `property` embedding, with similarity scores.")]
-    async fn search(
-        &self,
-        Parameters(req): Parameters<Search>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("search", move |db| search_logic(db, req))
             .await
     }
 
@@ -1876,16 +1860,28 @@ mod tests {
     }
 
     #[test]
-    fn search_uses_index_and_scores() {
-        let db = fixture();
-        let rows = search_logic(
-            &db,
-            from_value(jval!({"property": "emb", "query": [0.0, 0.0], "metric": "l2", "k": 1}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rows[0]["external_key"], jval!("d0"));
-        assert!(rows[0]["score"].is_number());
+    fn compact_search_ranks_by_vector_and_expands_best() {
+        use dr_strange_core::{PropDesc, PropValue, Properties};
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("v", Properties::new()).unwrap();
+        let mut txn = plane.write().unwrap();
+        for (key, vec) in [("near", vec![0.0, 0.1]), ("far", vec![1.0, 1.0])] {
+            let mut props = Properties::new();
+            props.insert(
+                "embedding".into(),
+                PropDesc::described("v", PropValue::Vector(vec)),
+            );
+            props.insert(
+                "doc_comment".into(),
+                PropDesc::described("d", PropValue::Str(format!("about {key}"))),
+            );
+            txn.create_node_with_key(key, &["Doc"], props).unwrap();
+        }
+        txn.commit().unwrap();
+        let out = dr_strange_core::compact::search(&plane, &[0.0, 0.0], 2).unwrap();
+        assert!(out.lines().next().unwrap().contains("near"), "{out}");
+        assert!(out.contains("best match:"), "{out}");
+        assert!(out.contains("about near"), "{out}");
     }
 
     #[test]
