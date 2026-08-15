@@ -91,6 +91,32 @@ enum Command {
         #[arg(long = "param", value_name = "NAME=JSON")]
         param: Vec<String>,
     },
+    /// Find a symbol by name (fuzzy): exact key, `::name`/`.name` suffix,
+    /// else substring. Compact text output — the agent verb.
+    Find {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// Who calls this symbol — one caller per line with the call site.
+    /// Accepts a fuzzy name like `find`.
+    Callers {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// What this symbol calls — one callee per line with the call site.
+    Callees {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// One symbol's content as `prop: value` lines (vectors elided).
+    Describe {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         #[arg(long)]
@@ -545,6 +571,28 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 query
             };
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
+        }
+        Command::Find { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(
+                &db,
+                &plane,
+                &name,
+                dr_strange_core::compact::find_symbol,
+                out,
+            )
+        }
+        Command::Callers { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::callers, out)
+        }
+        Command::Callees { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::callees, out)
+        }
+        Command::Describe { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)
         }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;

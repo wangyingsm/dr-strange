@@ -576,6 +576,21 @@ fn run_plan(p: PlaneHandle<'_>, plan: LogicalPlan, out: &mut dyn Write) -> Resul
     Ok(())
 }
 
+/// The compact agent verbs (`find`/`callers`/`callees`/`describe`): one
+/// shared driver, the rendering shared with the MCP tools via
+/// [`dr_strange_core::compact`].
+pub fn compact(
+    db: &Database,
+    plane_name: &str,
+    name: &str,
+    render: fn(&PlaneHandle<'_>, &str) -> dr_strange_core::Result<String>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let p = plane(db, plane_name)?;
+    write!(out, "{}", render(&p, name)?)?;
+    Ok(())
+}
+
 pub fn catalog(db: &Database, plane_name: Option<&str>, out: &mut dyn Write) -> Result<()> {
     let cat = match plane_name {
         Some(name) => plane(db, name)?.catalog()?,

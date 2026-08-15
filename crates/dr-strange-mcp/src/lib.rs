@@ -605,6 +605,24 @@ fn describe_plane_logic(db: &Database, req: PlaneOnly) -> AnyResult<Value> {
     Ok(serde_json::to_value(db.plane(&req.plane)?.catalog()?)?)
 }
 
+/// The compact agent verbs' shared request: a fuzzy name and a plane.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SymbolReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Symbol name: an exact key, a `::name`/`.name` suffix, or a substring.
+    name: String,
+}
+
+fn compact_logic(
+    db: &Database,
+    req: SymbolReq,
+    render: fn(&dr_strange_core::PlaneHandle<'_>, &str) -> dr_strange_core::Result<String>,
+) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    Ok(Value::String(render(&plane, &req.name)?))
+}
+
 fn get_node_logic(db: &Database, req: GetNode) -> AnyResult<Value> {
     let p = db.plane(&req.plane)?;
     let node = match (req.id, &req.key) {
@@ -1267,6 +1285,58 @@ impl DrStrange {
     ) -> Result<CallToolResult, McpError> {
         self.blocking("describe_plane", move |db| describe_plane_logic(db, req))
             .await
+    }
+
+    #[tool(
+        description = "Find a symbol by name (fuzzy: exact key,         `::name`/`.name` suffix, else substring). Compact text: one         candidate per line as `key  label  file:line`. Start here when you         do not know the exact key."
+    )]
+    async fn find_symbol(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("find_symbol", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::find_symbol)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Who calls this symbol — one caller per line as         `key  label  file:defline  call@line`, resolved by the parser at         ingest (a lower bound: unresolvable calls carry no edge). Accepts a         fuzzy name like find_symbol."
+    )]
+    async fn callers(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("callers", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::callers)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "What this symbol calls — one callee per line with         the call site. Accepts a fuzzy name like find_symbol."
+    )]
+    async fn callees(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("callees", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::callees)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "One symbol's content as `prop: value` text lines         (signature, doc comment, …; vectors elided). Accepts a fuzzy name."
+    )]
+    async fn describe(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("describe", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::describe)
+        })
+        .await
     }
 
     #[tool(description = "Fetch one node by `id` or external `key`.")]
