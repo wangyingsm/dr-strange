@@ -425,19 +425,28 @@ impl From<DirArg> for Dir {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    /// Declare (and build) a vector index on a `(label, property)`.
+    /// Declare (and build) a vector index. Two arguments (`LABEL PROPERTY`)
+    /// index one label; one argument (`PROPERTY`) indexes **every label in
+    /// the plane that carries the property** — the one-command follow-up to
+    /// `drsg vectorize`.
     Ensure {
-        label: String,
-        property: String,
+        #[arg(value_name = "LABEL|PROPERTY")]
+        first: String,
+        #[arg(value_name = "PROPERTY")]
+        second: Option<String>,
         #[arg(long, default_value = "startup")]
         plane: String,
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
     },
-    /// Declare (and build) a BM25 keyword index on a `(label, property)`.
+    /// Declare (and build) a BM25 keyword index. Two arguments
+    /// (`LABEL PROPERTY`) index one label; one argument (`PROPERTY`) indexes
+    /// every label in the plane that carries the property.
     Keyword {
-        label: String,
-        property: String,
+        #[arg(value_name = "LABEL|PROPERTY")]
+        first: String,
+        #[arg(value_name = "PROPERTY")]
+        second: Option<String>,
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Analyzer language (name or code, e.g. `english`/`en`, `french`/`fr`).
@@ -608,23 +617,33 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             )
         }
         Command::Index(IndexCmd::Ensure {
-            label,
-            property,
+            first,
+            second,
             plane,
             metric,
         }) => {
             let db = commands::open(&cli.db)?;
-            commands::index_ensure(&db, &plane, &label, &property, metric.into(), out)
+            match second {
+                Some(property) => {
+                    commands::index_ensure(&db, &plane, &first, &property, metric.into(), out)
+                }
+                None => commands::index_ensure_all(&db, &plane, &first, metric.into(), out),
+            }
         }
         Command::Index(IndexCmd::Keyword {
-            label,
-            property,
+            first,
+            second,
             plane,
             lang,
         }) => {
             let db = commands::open(&cli.db)?;
             let language = lang.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            commands::keyword_index_ensure(&db, &plane, &label, &property, language, out)
+            match second {
+                Some(property) => {
+                    commands::keyword_index_ensure(&db, &plane, &first, &property, language, out)
+                }
+                None => commands::keyword_index_ensure_all(&db, &plane, &first, language, out),
+            }
         }
         Command::Stats => {
             let db = commands::open(&cli.db)?;
@@ -832,6 +851,28 @@ mod tests {
                 ));
             }
             _ => panic!("should parse as Serve(Watch)"),
+        }
+    }
+
+    /// One positional = property, sweeping all labels; two = label, property.
+    #[test]
+    fn index_ensure_takes_one_or_two_positionals() {
+        let one = Cli::try_parse_from(["drsg", "index", "ensure", "embedding"]).unwrap();
+        match one.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "embedding");
+                assert_eq!(second, None);
+            }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+        let two =
+            Cli::try_parse_from(["drsg", "index", "ensure", "Function", "embedding"]).unwrap();
+        match two.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "Function");
+                assert_eq!(second.as_deref(), Some("embedding"));
+            }
+            _ => panic!("should parse as Index(Ensure)"),
         }
     }
 

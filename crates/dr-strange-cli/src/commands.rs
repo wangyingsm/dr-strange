@@ -701,6 +701,74 @@ pub fn index_ensure(
     Ok(())
 }
 
+/// The labels of `plane_name` whose nodes actually carry `property` — what
+/// "ensure an index for every label" should mean. A label without the
+/// property would only gain an empty index and a misleading line of output.
+fn labels_carrying(db: &Database, plane_name: &str, property: &str) -> Result<Vec<String>> {
+    let cat = plane(db, plane_name)?.catalog()?;
+    Ok(cat
+        .labels
+        .iter()
+        .filter(|(_, st)| st.properties.contains_key(property))
+        .map(|(l, _)| l.clone())
+        .collect())
+}
+
+/// `drsg index ensure <property>` — one vector index per label that carries
+/// the property, so a freshly vectorized plane becomes searchable in one
+/// command instead of one per label.
+pub fn index_ensure_all(
+    db: &Database,
+    plane_name: &str,
+    property: &str,
+    metric: Metric,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let labels = labels_carrying(db, plane_name, property)?;
+    if labels.is_empty() {
+        writeln!(
+            out,
+            "no label in plane '{plane_name}' carries `{property}` — nothing to index"
+        )?;
+        return Ok(());
+    }
+    let p = plane(db, plane_name)?;
+    for label in &labels {
+        p.ensure_vector_index(label, property, metric)?;
+        writeln!(out, "ensured vector index on {label}.{property}")?;
+    }
+    writeln!(out, "{} label(s) indexed", labels.len())?;
+    Ok(())
+}
+
+/// `drsg index keyword <property>` — the same sweep for BM25.
+pub fn keyword_index_ensure_all(
+    db: &Database,
+    plane_name: &str,
+    property: &str,
+    language: Language,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let labels = labels_carrying(db, plane_name, property)?;
+    if labels.is_empty() {
+        writeln!(
+            out,
+            "no label in plane '{plane_name}' carries `{property}` — nothing to index"
+        )?;
+        return Ok(());
+    }
+    let p = plane(db, plane_name)?;
+    for label in &labels {
+        p.ensure_keyword_index(label, property, language)?;
+        writeln!(
+            out,
+            "ensured keyword index on {label}.{property} ({language:?})"
+        )?;
+    }
+    writeln!(out, "{} label(s) indexed", labels.len())?;
+    Ok(())
+}
+
 pub fn keyword_index_ensure(
     db: &Database,
     plane_name: &str,
@@ -833,7 +901,7 @@ pub fn vectorize(
     )?;
     writeln!(
         out,
-        "  `drsg index ensure <label> embedding --plane {plane_name}` builds the vector index"
+        "  `drsg index ensure embedding --plane {plane_name}` builds the vector indexes"
     )?;
     Ok(())
 }
@@ -2499,6 +2567,38 @@ mod tests {
         run(&mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("embedded 1 node(s)"), "{text}");
+    }
+
+    /// `index ensure <property>` sweeps exactly the labels that carry it.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn index_ensure_all_targets_only_labels_with_the_property() {
+        use dr_strange_core::{PropDesc, PropValue};
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("v", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let mut with_vec = Properties::new();
+        with_vec.insert(
+            "embedding".into(),
+            PropDesc::described("v", PropValue::Vector(vec![1.0, 0.0])),
+        );
+        txn.create_node(&["Function"], with_vec.clone()).unwrap();
+        txn.create_node(&["Paper"], with_vec).unwrap();
+        txn.create_node(&["Bare"], Properties::new()).unwrap();
+        txn.commit().unwrap();
+
+        let out = cap(|o| index_ensure_all(&db, "v", "embedding", Metric::Cosine, o));
+        assert!(out.contains("Function.embedding"), "{out}");
+        assert!(out.contains("Paper.embedding"), "{out}");
+        assert!(
+            !out.contains("Bare"),
+            "a label without the property was indexed: {out}"
+        );
+        assert!(out.contains("2 label(s) indexed"), "{out}");
+
+        // No label carries a made-up property: say so, index nothing.
+        let none = cap(|o| index_ensure_all(&db, "v", "nope", Metric::Cosine, o));
+        assert!(none.contains("no label"), "{none}");
     }
 
     /// The sync point round-trips through plane properties, and the watch
