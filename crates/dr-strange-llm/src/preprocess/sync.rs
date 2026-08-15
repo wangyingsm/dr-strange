@@ -109,10 +109,14 @@ pub fn sync_paths(
             continue; // keyless nodes are a model's, never a parser's
         };
         let by_key = affected.contains(key.as_str());
-        let by_file = matches!(
-            node.properties.get("file").map(|d| &d.value),
-            Some(PropValue::Str(f)) if affected.contains(f.as_str())
-        );
+        // `file` is the family convention; `path` is what a file-level node
+        // (rust's module, whose key is the module path) carries instead.
+        let by_file = ["file", "path"].iter().any(|p| {
+            matches!(
+                node.properties.get(*p).map(|d| &d.value),
+                Some(PropValue::Str(f)) if affected.contains(f.as_str())
+            )
+        });
         if by_key || by_file {
             old.insert(key, node);
         }

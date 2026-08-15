@@ -371,6 +371,20 @@ impl Preprocessor for AaLang {
                 extra_labels: Vec::new(),
                 props: Properties::new(),
             });
+            // A module-style node: keyed by a logical name, its file carried
+            // under `path` (rust's convention for file-level modules) — the
+            // sync must attribute it to the file all the same.
+            let mut mprops = Properties::new();
+            mprops.insert(
+                "path".into(),
+                PropDesc::described("file", PropValue::Str(path.clone())),
+            );
+            out.nodes.push(DigestNode {
+                key: format!("mod::{path}"),
+                label: "Module".into(),
+                extra_labels: Vec::new(),
+                props: mprops,
+            });
             out.edges.push(DigestEdge {
                 src: "pkg".into(),
                 dst: path.clone(),
@@ -487,11 +501,32 @@ fn a_deleted_file_takes_its_nodes_and_dangling_calls_with_it() {
         ..Default::default()
     };
     let stats = sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
-    assert_eq!(stats.nodes_deleted, 2, "File node and its one function");
+    assert_eq!(
+        stats.nodes_deleted, 3,
+        "File node, its module node, and its one function"
+    );
     assert!(key_id(&db, "b.aa").is_none());
     assert!(key_id(&db, "b.aa::h").is_none());
     // f's call onto the deleted symbol cascaded away with its target.
     assert_eq!(calls(&db, "a.aa::f"), Vec::<String>::new());
+}
+
+/// A node keyed by a logical name whose file lives under `path` (rust's
+/// file-level module) must be attributed — and so deleted — with its file.
+#[test]
+fn path_prop_attributes_a_node_to_its_file() {
+    let (tree, db, plugins) = sync_fixture("pathprop");
+    assert!(key_id(&db, "mod::b.aa").is_some(), "module node missing");
+    std::fs::remove_file(tree.0.join("b.aa")).unwrap();
+    let delta = CommitDelta {
+        deleted: vec!["b.aa".to_string()],
+        ..Default::default()
+    };
+    sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    assert!(
+        key_id(&db, "mod::b.aa").is_none(),
+        "a path-attributed node outlived its file"
+    );
 }
 
 /// The trap the first live drill caught: a fact edge whose source the fold
