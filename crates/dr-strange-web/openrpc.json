@@ -334,6 +334,13 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "name": "lean",
+          "schema": {
+            "type": "boolean",
+            "description": "Omit vector-valued properties (replaced by a `$vector(N dims, omitted)` marker) — the agent shape. Default false: existing callers see the full records."
+          }
         }
       ],
       "result": {
@@ -593,6 +600,13 @@
           "schema": {
             "type": "object",
             "description": "Values for $name placeholders in the query (no string interpolation)."
+          }
+        },
+        {
+          "name": "lean",
+          "schema": {
+            "type": "boolean",
+            "description": "Omit vector-valued properties (replaced by a `$vector(N dims, omitted)` marker) — the agent shape. Default false: existing callers see the full records."
           }
         }
       ],

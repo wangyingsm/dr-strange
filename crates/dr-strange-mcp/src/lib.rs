@@ -579,7 +579,7 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
     Value::Array(
         rows.iter()
             .map(|(n, s)| {
-                let mut obj = json::node_to_json(n);
+                let mut obj = json::node_to_json_lean(n);
                 if let (Some(score), Value::Object(map)) = (s, &mut obj) {
                     map.insert("score".into(), jval!(score));
                 }
@@ -612,7 +612,9 @@ fn get_node_logic(db: &Database, req: GetNode) -> AnyResult<Value> {
         (None, Some(key)) => p.node_by_key(key)?,
         (None, None) => anyhow::bail!("provide `id` or `key`"),
     };
-    Ok(node.map(|n| json::node_to_json(&n)).unwrap_or(Value::Null))
+    Ok(node
+        .map(|n| json::node_to_json_lean(&n))
+        .unwrap_or(Value::Null))
 }
 
 fn search_logic(db: &Database, req: Search) -> AnyResult<Value> {
@@ -775,7 +777,7 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
     let mut results = Vec::with_capacity(hits.len());
     for h in &hits {
         let mut obj = match plane.node(h.node)? {
-            Some(node) => json::node_to_json(&node),
+            Some(node) => json::node_to_json_lean(&node),
             None => jval!({ "id": h.node.0 }),
         };
         if let Value::Object(map) = &mut obj {
@@ -825,7 +827,7 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
         &opts,
     )?;
     // The matched subgraph: nodes + edges among them (source + traversal).
-    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
+    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json_lean).collect();
     let edges: Vec<Value> = res
         .edges
         .iter()
@@ -1233,7 +1235,7 @@ fn digest_logic(
                 jval!({
                     "key": n.key,
                     "label": n.label,
-                    "properties": json::properties_to_json(&n.props),
+                    "properties": json::properties_to_json_lean(&n.props),
                 })
             })
             .collect();

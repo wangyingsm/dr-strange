@@ -151,9 +151,68 @@ pub fn node_to_json(node: &NodeRecord) -> Value {
     Value::Object(obj)
 }
 
+/// [`properties_to_json`] minus vector-valued properties — the lean shape
+/// for agent surfaces. An embedding is a thousand floats no reader reads:
+/// in a `node.get` reply it is pure context cost (a measured 45 KB for two
+/// nodes), so the lean shape replaces each vector with a marker carrying
+/// its dimension, keeping the property visible without its payload.
+pub fn properties_to_json_lean(props: &Properties) -> Value {
+    Value::Object(
+        props
+            .iter()
+            .map(|(k, p)| {
+                let v = match &p.value {
+                    PropValue::Vector(vec) => {
+                        json!(format!("$vector({} dims, omitted)", vec.len()))
+                    }
+                    _ => propdesc_to_json(p),
+                };
+                (k.clone(), v)
+            })
+            .collect(),
+    )
+}
+
+/// [`node_to_json`] with lean properties — what RPC's `lean: true` and the
+/// MCP tools return.
+pub fn node_to_json_lean(node: &NodeRecord) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), json!(node.id.0));
+    if let Some(key) = &node.external_key {
+        obj.insert("external_key".into(), json!(key));
+    }
+    obj.insert("labels".into(), json!(node.labels));
+    obj.insert(
+        "properties".into(),
+        properties_to_json_lean(&node.properties),
+    );
+    Value::Object(obj)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lean shape: a vector is a marker with its dimension, everything
+    /// else identical — measured 45 KB → ~1 KB per pair of embedded nodes.
+    #[test]
+    fn lean_replaces_vectors_with_a_marker() {
+        let mut props = Properties::new();
+        props.insert(
+            "embedding".into(),
+            PropDesc::new(PropValue::Vector(vec![0.5; 1024])),
+        );
+        props.insert(
+            "doc_comment".into(),
+            PropDesc::new(PropValue::Str("real content".into())),
+        );
+        let lean = properties_to_json_lean(&props);
+        assert_eq!(lean["embedding"], json!("$vector(1024 dims, omitted)"));
+        assert_eq!(lean["doc_comment"], json!("real content"));
+        // The full shape still carries the floats for whoever asks for them.
+        let full = properties_to_json(&props);
+        assert!(full["embedding"].as_array().is_some() || full["embedding"].is_object());
+    }
 
     #[test]
     fn scalars_round_trip() {

@@ -470,6 +470,11 @@ pub struct GetNode {
     id: Option<u64>,
     #[serde(default)]
     key: Option<String>,
+    /// Omit vector-valued properties (an embedding is a thousand floats no
+    /// reader reads). Off by default so existing callers — the dashboard —
+    /// see the exact shape they always did; agents pass `true`.
+    #[serde(default)]
+    lean: bool,
 }
 
 /// `node.get` — one node by id or external key; `null` if absent.
@@ -481,7 +486,12 @@ pub fn node_get(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         (None, Some(key)) => app(plane.node_by_key(key))?,
         (None, None) => return Err(RpcError::invalid_params("provide `id` or `key`")),
     };
-    Ok(node.map(|n| json::node_to_json(&n)).unwrap_or(Value::Null))
+    let render = if req.lean {
+        json::node_to_json_lean
+    } else {
+        json::node_to_json
+    };
+    Ok(node.map(|n| render(&n)).unwrap_or(Value::Null))
 }
 
 #[derive(Deserialize)]
@@ -615,6 +625,10 @@ pub struct CypherReq {
     /// Values for `$name` placeholders in the query.
     #[serde(default)]
     params: serde_json::Map<String, Value>,
+    /// Omit vector-valued properties from returned nodes (agents' shape;
+    /// the dashboard leaves it unset and sees the full records).
+    #[serde(default)]
+    lean: bool,
 }
 
 /// Convert a JSON params object to the parser's `Params` (name → PropValue).
@@ -641,6 +655,7 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         &req.query,
         req.embed.as_deref().unwrap_or("openai"),
         &params,
+        req.lean,
     )
 }
 
@@ -656,6 +671,7 @@ pub fn cypher_subgraph(
     query: &str,
     embed_provider: &str,
     params: &dr_strange_parser::Params,
+    lean: bool,
 ) -> Result<Value, RpcError> {
     let embedder = make_embedder(embed_provider);
     let stmt = dr_strange_parser::parse_statement_full(
@@ -693,7 +709,11 @@ pub fn cypher_subgraph(
     let nodes: Vec<Value> = rows
         .iter()
         .map(|(n, s)| {
-            let mut obj = json::node_to_json(n);
+            let mut obj = if lean {
+                json::node_to_json_lean(n)
+            } else {
+                json::node_to_json(n)
+            };
             if let (Some(score), Value::Object(map)) = (s, &mut obj) {
                 map.insert("score".into(), jval!(score));
             }
