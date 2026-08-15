@@ -189,6 +189,8 @@ enum Command {
     /// Incremental: nodes whose text is unchanged since the last run are
     /// skipped. Parser facts embed a stable projection (no positional
     /// properties); document-extracted nodes embed all their content.
+    /// Finishes by ensuring a cosine vector index on `embedding` for every
+    /// label that carries it — the plane is searchable when this returns.
     #[cfg(feature = "digest")]
     #[command(alias = "vec")]
     Vectorize {

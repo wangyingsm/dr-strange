@@ -848,7 +848,9 @@ pub fn vectorize(
             out,
             "nothing to embed: {current} node(s) already current, {empty} with no text"
         )?;
-        return Ok(());
+        // Indexes are still ensured: embeddings may be current while a label
+        // gained since the last run has no index yet.
+        return index_ensure_all(db, plane_name, "embedding", Metric::Cosine, out);
     }
 
     // Identical texts embed once — external stand-ins and boilerplate repeat.
@@ -899,11 +901,9 @@ pub fn vectorize(
         current,
         empty
     )?;
-    writeln!(
-        out,
-        "  `drsg index ensure --plane {plane_name}` builds the vector indexes"
-    )?;
-    Ok(())
+    // Finish the job: the plane answers similarity queries the moment this
+    // returns, no follow-up command per label to remember.
+    index_ensure_all(db, plane_name, "embedding", Metric::Cosine, out)
 }
 
 /// A stable fingerprint of an embedded text — what `_embedded_from` stores
@@ -2529,6 +2529,9 @@ mod tests {
         run(&mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("embedded 2 node(s)"), "{text}");
+        // The plane is searchable when vectorize returns: both labels indexed.
+        assert!(text.contains("Function.embedding"), "{text}");
+        assert!(text.contains("Paper.embedding"), "{text}");
         let node = p.node(fact_id).unwrap().unwrap();
         assert!(matches!(
             node.properties.get("embedding").map(|d| &d.value),
