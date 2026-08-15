@@ -636,57 +636,83 @@ fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
 const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
 
 #[cfg(feature = "digest")]
-/// The official plugins, by name and release URL — what the interactive
-/// installer offers. Versions move when the extensions repository tags a
-/// new release for that plugin.
-pub const OFFICIAL_PLUGINS: &[(&str, &str, &str)] = &[
-    // (name, claims, url)
+/// The official plugins — what the interactive installer offers. The URLs
+/// are pinned to release tags, and a tagged artifact never changes, so its
+/// SHA-256 is pinned right beside it: the chooser can say "installed" or
+/// "upgradable" offline, by comparing against the local store. Both move
+/// together when the extensions repository tags a new release.
+pub const OFFICIAL_PLUGINS: &[(&str, &str, &str, &str)] = &[
+    // (name, claims, url, sha256 of the release artifact)
     (
         "rust",
         ".rs",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.0.0/rust.wasm",
+        "f0170fcf1406c6e52f03a9a3f7ff4f4ab525c82ab8e11e475e0253fc07a3e3d4",
     ),
     (
         "go",
         ".go",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.0.0/go.wasm",
+        "5bf6017feb020489e19fff4968ebae44e3ca4775dde3c654d8d91deb9f2879b0",
     ),
     (
         "ts",
         ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.0.0/ts.wasm",
+        "ee724ded0940a4c8ab55a5d03ea02e27b9caf9973a1b358b436a4a97598cd4e8",
     ),
     (
         "py",
         ".py .pyi .pyw",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.0.0/py.wasm",
+        "92ad64539ab5a1579a282bf54d939165012ce67f3ccca27b7f2fef8848b7c390",
     ),
     (
         "java",
         ".java",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.0.0/java.wasm",
+        "6aa3ad0c31d585ffb5222829b85a97636db4477f3a3b2641a2fcf2dde8a4b14b",
     ),
     (
         "c",
         ".c .h",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.0.0/c.wasm",
+        "abfe018a2101cffcc17cde87d488e5ecd5dab252ba38f892c12e3f33eabc09f1",
     ),
     (
         "web",
         ".html .htm .css",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.0.0/web.wasm",
+        "757debd83ffcddf7ca506dbad42edca24cb6aa79e914d392336dfc99fe3f19b7",
     ),
     (
         "toml",
         ".toml",
         "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.0.0/toml.wasm",
+        "f7f98d2f90dd8d0c178b04a6156cdae6d721f12325f74ea629f3be1203d156c5",
     ),
 ];
+
+/// One catalog entry's status against the local store: `[installed]` when
+/// the stored hash matches the release artifact's, `[upgradable]` when a
+/// plugin of that name is installed but its bytes differ (an older release,
+/// or a local build), nothing when it is absent.
+fn official_status(
+    installed: &std::collections::BTreeMap<String, String>,
+    name: &str,
+    release_sha: &str,
+) -> &'static str {
+    match installed.get(name) {
+        Some(have) if have == release_sha => "  [installed]",
+        Some(_) => "  [upgradable]",
+        None => "",
+    }
+}
 
 /// The interactive chooser behind bare `drsg plugin install`: the official
 /// catalog by number, `0` for all of it, a pasted path/URL, `q` to walk
 /// away. Returns the sources to install.
-fn choose_plugins(out: &mut dyn Write) -> Result<Vec<String>> {
+fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> Result<Vec<String>> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
@@ -694,10 +720,26 @@ fn choose_plugins(out: &mut dyn Write) -> Result<Vec<String>> {
              e.g. `drsg plugin install <file.wasm | url>`"
         );
     }
+    let installed: std::collections::BTreeMap<String, String> = store
+        .list()?
+        .into_iter()
+        .map(|p| (p.name, p.sha256))
+        .collect();
+    let claims_w = OFFICIAL_PLUGINS
+        .iter()
+        .map(|(_, claims, _, _)| claims.len())
+        .max()
+        .unwrap_or(0);
     writeln!(out, "official plugins:")?;
     writeln!(out, "  0) all of the below")?;
-    for (i, (name, claims, _)) in OFFICIAL_PLUGINS.iter().enumerate() {
-        writeln!(out, "  {}) {:5} {claims}", i + 1, name)?;
+    for (i, (name, claims, _, sha)) in OFFICIAL_PLUGINS.iter().enumerate() {
+        writeln!(
+            out,
+            "  {}) {:5} {claims:claims_w$}{}",
+            i + 1,
+            name,
+            official_status(&installed, name, sha)
+        )?;
     }
     write!(out, "install [number, path/URL, or q to cancel]: ")?;
     out.flush()?;
@@ -713,10 +755,10 @@ fn choose_plugins(out: &mut dyn Write) -> Result<Vec<String>> {
         if n == 0 {
             return Ok(OFFICIAL_PLUGINS
                 .iter()
-                .map(|(_, _, u)| u.to_string())
+                .map(|(_, _, u, _)| u.to_string())
                 .collect());
         }
-        if let Some((_, _, url)) = OFFICIAL_PLUGINS.get(n - 1) {
+        if let Some((_, _, url, _)) = OFFICIAL_PLUGINS.get(n - 1) {
             return Ok(vec![url.to_string()]);
         }
         anyhow::bail!("no option {n} — pick 0..={}", OFFICIAL_PLUGINS.len());
@@ -767,7 +809,7 @@ pub fn plugin_install(
 ) -> Result<()> {
     let sources = match source {
         Some(s) => vec![s.to_string()],
-        None => choose_plugins(out)?,
+        None => choose_plugins(&plugin_store(cfg)?, out)?,
     };
     for source in &sources {
         install_one(cfg, allow_private, source, out)?;
@@ -1969,6 +2011,40 @@ mod tests {
         assert_eq!(parsed[0]["extensions"][0], "fix");
         assert_eq!(parsed[0]["sha256"].as_str().unwrap().len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_chooser_tags_installed_and_upgradable_against_the_release_hash() {
+        let installed: std::collections::BTreeMap<String, String> = [
+            ("rust".to_string(), "aaaa".to_string()),
+            ("go".to_string(), "bbbb".to_string()),
+        ]
+        .into();
+        // Hash matches the release artifact → nothing to do.
+        assert_eq!(official_status(&installed, "rust", "aaaa"), "  [installed]");
+        // Same name, different bytes — an older release or a local build.
+        assert_eq!(official_status(&installed, "go", "cccc"), "  [upgradable]");
+        // Absent stays unmarked.
+        assert_eq!(official_status(&installed, "ts", "dddd"), "");
+    }
+
+    /// The pinned hashes must stay well-formed: a typo'd hash would tag a
+    /// correctly installed plugin `[upgradable]` forever.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn every_official_entry_pins_a_plausible_sha256() {
+        for (name, _, url, sha) in OFFICIAL_PLUGINS {
+            assert_eq!(sha.len(), 64, "{name}: not a sha256 hex digest");
+            assert!(
+                sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "{name}: non-hex in pinned hash"
+            );
+            assert!(
+                url.contains(&format!("/{name}.wasm")),
+                "{name}: url names a different artifact"
+            );
+        }
     }
 
     #[cfg(feature = "digest")]
