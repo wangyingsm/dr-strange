@@ -46,6 +46,7 @@ impl Preprocessor for Probe {
             name: "probe".into(),
             version: "1".into(),
             extensions: vec!["rs".into()],
+            logo: None,
         }
     }
 
@@ -224,6 +225,7 @@ fn a_cross_handler_collision_is_counted_not_fatal() {
                     "one" => "aa".into(),
                     _ => "bb".into(),
                 }],
+                logo: None,
             }
         }
         fn preprocess(&self, _: &Input<'_>, _: &dyn Host) -> Result<Preprocessed> {

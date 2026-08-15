@@ -1955,6 +1955,9 @@ mod tests {
         assert_eq!(parsed[0]["name"], "fixture");
         assert_eq!(parsed[0]["extensions"][0], "fix");
         assert_eq!(parsed[0]["sha256"].as_str().unwrap().len(), 64);
+        // The fixture ships a manifest logo; the store records it and the
+        // machine surface carries it to UIs.
+        assert!(parsed[0]["logo"].as_str().unwrap().starts_with("<svg"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

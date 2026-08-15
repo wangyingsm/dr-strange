@@ -213,6 +213,7 @@ impl WasmPlugin {
                 name: "<undescribed>".into(),
                 version: String::new(),
                 extensions: Vec::new(),
+                logo: None,
             },
             limits,
             options,
@@ -242,6 +243,7 @@ impl WasmPlugin {
                     .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
                     .filter(|e| !e.is_empty())
                     .collect(),
+                logo: m.logo.filter(|l| !l.trim().is_empty()),
             })
         })
     }

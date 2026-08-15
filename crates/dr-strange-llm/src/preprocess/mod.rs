@@ -125,6 +125,9 @@ pub struct Manifest {
     pub version: String,
     /// Extensions this handles, lowercase and without the dot.
     pub extensions: Vec<String>,
+    /// An inline SVG for UIs to show beside the name; `None` means the UI's
+    /// default mark. Rendered without script execution.
+    pub logo: Option<String>,
 }
 
 impl Manifest {

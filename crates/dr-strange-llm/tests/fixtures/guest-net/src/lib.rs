@@ -19,6 +19,7 @@ impl Guest for Grabby {
             name: "dialer".into(),
             version: "0".into(),
             extensions: vec!["dial".into()],
+            logo: None,
         }
     }
 

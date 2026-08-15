@@ -60,50 +60,50 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "rust",
         claims: ".rs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.0.0/rust.wasm",
-        sha256: "f0170fcf1406c6e52f03a9a3f7ff4f4ab525c82ab8e11e475e0253fc07a3e3d4",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.1.0/rust.wasm",
+        sha256: "bae204d425170686b67ad700a003a39425f8157ef0bdc0103c2a7ea4122977ae",
     },
     OfficialPlugin {
         name: "go",
         claims: ".go",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.0.0/go.wasm",
-        sha256: "5bf6017feb020489e19fff4968ebae44e3ca4775dde3c654d8d91deb9f2879b0",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.1.0/go.wasm",
+        sha256: "61278bfda6f316ddf61f2d26d172bd8e4e4c9a076148db882594de0354d2f74d",
     },
     OfficialPlugin {
         name: "ts",
         claims: ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.0.0/ts.wasm",
-        sha256: "ee724ded0940a4c8ab55a5d03ea02e27b9caf9973a1b358b436a4a97598cd4e8",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.1.0/ts.wasm",
+        sha256: "e759702bc4c0cdff9196301fe73b1dd29169bf1dd14f87dd3a7726f73ca39d28",
     },
     OfficialPlugin {
         name: "py",
         claims: ".py .pyi .pyw",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.0.0/py.wasm",
-        sha256: "92ad64539ab5a1579a282bf54d939165012ce67f3ccca27b7f2fef8848b7c390",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.1.0/py.wasm",
+        sha256: "b8664629a05a4e523c9c16f4ca29106b4ea325974b5d9f9b9ee1c1d1ad765d41",
     },
     OfficialPlugin {
         name: "java",
         claims: ".java",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.0.0/java.wasm",
-        sha256: "6aa3ad0c31d585ffb5222829b85a97636db4477f3a3b2641a2fcf2dde8a4b14b",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.1.0/java.wasm",
+        sha256: "2ae57f4dcbee971bfb68afbf94809c781aba72d84062288b49553a6aee46864d",
     },
     OfficialPlugin {
         name: "c",
         claims: ".c .h",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.0.0/c.wasm",
-        sha256: "abfe018a2101cffcc17cde87d488e5ecd5dab252ba38f892c12e3f33eabc09f1",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.1.0/c.wasm",
+        sha256: "d2d438502d941613b58480955fec0cc8b10d920d430464a6ea2fb84453daa659",
     },
     OfficialPlugin {
         name: "web",
         claims: ".html .htm .css",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.0.0/web.wasm",
-        sha256: "757debd83ffcddf7ca506dbad42edca24cb6aa79e914d392336dfc99fe3f19b7",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.1.0/web.wasm",
+        sha256: "3b475f37294e3235650e95e540d4ce7d0ae3a53ab96f757a457172ad436d26ae",
     },
     OfficialPlugin {
         name: "toml",
         claims: ".toml",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.0.0/toml.wasm",
-        sha256: "f7f98d2f90dd8d0c178b04a6156cdae6d721f12325f74ea629f3be1203d156c5",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.1.0/toml.wasm",
+        sha256: "3f66997444cde44c0873f85c66d8d80323567db70216ec3c639b445974ee2128",
     },
 ];
 
@@ -121,6 +121,10 @@ pub struct InstalledPlugin {
     /// Cached from `describe()` so routing can be answered without
     /// instantiating every plugin; re-checked against the component at load.
     pub extensions: Vec<String>,
+    /// The manifest's inline SVG, cached at install for UIs to show without
+    /// instantiating the component. Absent means the UI's default mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -194,6 +198,7 @@ impl PluginStore {
             sha256,
             source: source.to_string(),
             extensions: manifest.extensions.clone(),
+            logo: manifest.logo.clone(),
         };
 
         let mut registry = self.read()?;

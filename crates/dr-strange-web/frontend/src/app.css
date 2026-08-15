@@ -232,6 +232,15 @@ article.plugin-card {
 }
 .plugin-card h3 {
   margin: 0 0 0.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.plugin-logo {
+  width: 1.3rem;
+  height: 1.3rem;
+  flex: none;
+  object-fit: contain;
 }
 .plugin-card .badge {
   font-size: 0.68rem;

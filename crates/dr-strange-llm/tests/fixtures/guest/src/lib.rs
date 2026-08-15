@@ -53,6 +53,8 @@ impl Guest for Fixture {
             name: "fixture".into(),
             version: "0".into(),
             extensions: vec!["fix".into()],
+            // A real logo, so the host suite proves the field round-trips.
+            logo: Some(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#d9a441" stroke-width="2"/></svg>"##.into()),
         }
     }
 

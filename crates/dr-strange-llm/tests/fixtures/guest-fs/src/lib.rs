@@ -17,6 +17,7 @@ impl Guest for Grabby {
             name: "grabby".into(),
             version: "0".into(),
             extensions: vec!["grab".into()],
+            logo: None,
         }
     }
 

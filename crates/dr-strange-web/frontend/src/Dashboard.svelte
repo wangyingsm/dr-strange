@@ -13,6 +13,8 @@
 
   let stats = $state(null) // live db.stats (planes/nodes/edges/file_size)
   let planes = $state([]) // plane cards
+  import extensionLogo from './assets/extension-logo.svg'
+
   let plugins = $state([]) // installed preprocessor plugins
   let catalog = $state([]) // the official catalog this build pins
   let busy = $state({}) // plugin name -> true while an install/upgrade runs
@@ -131,6 +133,11 @@
 
   async function loadPlugins() {
     plugins = await rpc('plugin.list')
+  }
+
+  function logoSrc(svg) {
+    if (!svg) return extensionLogo
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg)
   }
 
   async function installOfficial(c) {
@@ -271,6 +278,7 @@
   {#each officials as c (c.name)}
     <article class="card plugin-card">
       <h3>
+        <img class="plugin-logo" src={logoSrc(c.inst?.logo)} alt="" />
         {c.name}{#if c.inst}<span class="plugin-ver">@{c.inst.version}</span>{/if}
         {#if c.state === 'installed'}<span class="badge ok">installed</span>
         {:else if c.state === 'upgradable'}<span class="badge up">upgradable</span>{/if}
@@ -299,7 +307,7 @@
   {/each}
   {#each thirdParty as p (p.name)}
     <article class="card plugin-card">
-      <h3>{p.name}<span class="plugin-ver">@{p.version}</span></h3>
+      <h3><img class="plugin-logo" src={logoSrc(p.logo)} alt="" />{p.name}<span class="plugin-ver">@{p.version}</span></h3>
       <p class="plugin-exts">{p.extensions.map((e) => '.' + e).join(' ')}</p>
       <p class="plugin-sha" title={p.source}>sha256:{p.sha256.slice(0, 12)}</p>
       <div class="card-actions">

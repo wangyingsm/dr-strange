@@ -1,10 +1,10 @@
 // The preprocessor plugin contract (ROADMAP §11).
 //
-// **Vendored copy — do not edit here.** The canonical file lives at the root
-// of the `dr-strange-extensions` repository, where every language SDK
-// generates from it. This copy exists because the host cannot generate
-// bindings from a repository it does not contain; CI checks the two match, and
-// a change belongs upstream and arrives here as a re-vendor.
+// **This is the canonical copy.** It lives at the root of the extensions
+// repository because every language SDK generates from it; each SDK carries a
+// vendored copy where its packaging demands one, and so does the `dr-strange`
+// repository for its host bindings. `just check-wit` fails when any copy has
+// drifted. Changes are made here.
 //
 // A plugin turns a format-specific input into **facts** — nodes and edges it is
 // certain about — and **prose**, the residue that still needs a model. An input
@@ -60,6 +60,11 @@ interface preprocessor {
         version: string,
         /// Extensions this handles, lowercase and without the dot.
         extensions: list<string>,
+        /// An inline SVG for UIs to show beside the plugin's name — the
+        /// whole `<svg>…</svg>` element as a string, small enough to embed.
+        /// `none` means the UI shows its default mark instead. Rendered
+        /// without script execution, so keep it plain shapes and paths.
+        logo: option<string>,
     }
 
     /// A single document — an upload, a fetched body, one file.
