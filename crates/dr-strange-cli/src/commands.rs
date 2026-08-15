@@ -191,6 +191,18 @@ fn parse_params(param: &[String]) -> Result<dr_strange_parser::Params> {
     Ok(params)
 }
 
+/// The plane a digest lands in when `--plane` is not given: the source
+/// directory's own name, so `drsg digest` in a checkout writes a plane named
+/// after the repo. Anything that doesn't yield one — a URL, a bare file, a
+/// nameless path like `/` — stays `startup`.
+pub fn default_plane(source: &str) -> String {
+    std::fs::canonicalize(source)
+        .ok()
+        .filter(|p| p.is_dir())
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "startup".to_string())
+}
+
 /// Parse a statement, embedding a text `SEARCH … NEAR "…"` when an `embed`
 /// provider is given, and resolving `$name` placeholders from `params`.
 /// Embedding lives behind the `digest` feature (which pulls in dr-strange-llm);
@@ -1066,7 +1078,16 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
     })?;
     let (mut facts, source) = read_source(args, out)?;
 
-    let p = plane(db, args.plane)?;
+    // Digest creates its target plane on demand: with the plane defaulting
+    // to the source directory's name, `drsg digest` in a fresh checkout must
+    // not fail over a plane nobody had a chance to create.
+    let p = match db.plane(args.plane) {
+        Ok(p) => p,
+        Err(_) => {
+            writeln!(out, "created plane '{}'", args.plane)?;
+            db.create_plane(args.plane, Properties::new())?
+        }
+    };
     let run_id = format!(
         "{}-{}",
         source,

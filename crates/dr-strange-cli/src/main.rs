@@ -197,11 +197,14 @@ enum Command {
         /// routed per file, so a project's code becomes parsed facts and its
         /// documents become prose (ROADMAP §11). **Omitted**: the current
         /// directory — `drsg digest` alone digests the repository you are
-        /// standing in, into `graph.drsg`'s `startup` plane.
+        /// standing in, into `graph.drsg`.
         #[arg(default_value = ".")]
         source: String,
-        #[arg(long, default_value = "startup")]
-        plane: String,
+        /// Target plane. **Omitted**: the source directory's own name, so a
+        /// repo lands in a plane named after itself; `startup` when the
+        /// source is not a directory.
+        #[arg(long)]
+        plane: Option<String>,
         /// Write the result (default is a dry-run preview).
         #[arg(long)]
         apply: bool,
@@ -691,7 +694,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 topic: topic.as_deref(),
                 pages,
                 depth,
-                plane: &plane,
+                plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,
                 chunk_chars,
                 concurrency,
@@ -722,7 +725,7 @@ mod tests {
     /// must mean "this repository, into graph.drsg's startup plane".
     #[cfg(feature = "digest")]
     #[test]
-    fn bare_digest_means_cwd_into_startup_of_graph_drsg() {
+    fn bare_digest_means_cwd_into_a_plane_named_after_it() {
         let cli = Cli::try_parse_from(["drsg", "digest"]).unwrap();
         assert_eq!(cli.db, PathBuf::from("graph.drsg"));
         match cli.command {
@@ -733,11 +736,22 @@ mod tests {
                 ..
             } => {
                 assert_eq!(source, ".");
-                assert_eq!(plane, "startup");
+                // Resolved at dispatch: the source directory's own name.
+                assert_eq!(plane, None);
+                assert_eq!(commands::default_plane(&source), "dr-strange-cli");
                 assert!(!apply, "a bare digest must stay a dry run");
             }
             _ => panic!("digest should parse as Digest"),
         }
+    }
+
+    /// Sources that don't name a directory keep the `startup` fallback.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn non_directory_sources_default_to_startup() {
+        assert_eq!(commands::default_plane("https://example.com/x"), "startup");
+        assert_eq!(commands::default_plane("Cargo.toml"), "startup");
+        assert_eq!(commands::default_plane("/"), "startup");
     }
 
     /// `drsg plugin install` with nothing after it must parse — the missing
