@@ -195,7 +195,10 @@ enum Command {
         /// A URL is fetched, converted to Markdown, and its links followed
         /// under `--pages`/`--depth` (ROADMAP §9). A directory is walked and
         /// routed per file, so a project's code becomes parsed facts and its
-        /// documents become prose (ROADMAP §11).
+        /// documents become prose (ROADMAP §11). **Omitted**: the current
+        /// directory — `drsg digest` alone digests the repository you are
+        /// standing in, into `graph.drsg`'s `startup` plane.
+        #[arg(default_value = ".")]
         source: String,
         #[arg(long, default_value = "startup")]
         plane: String,
@@ -281,10 +284,20 @@ enum PluginCmd {
     /// again is the upgrade path.
     Install {
         /// Path to a `.wasm` component, or a URL to download one from.
-        source: String,
+        /// **Omitted**: an interactive chooser lists the official plugins —
+        /// pick by number (`0` = all of them), paste a path/URL, or `q` to
+        /// cancel.
+        source: Option<String>,
     },
-    /// List installed plugins: name, version, extensions, hash, source.
-    List,
+    /// List installed plugins as a table: name, version, extensions, hash,
+    /// source.
+    List {
+        /// Print machine-readable JSON instead of the table — the same
+        /// records `plugin.list` returns over RPC, so an agent can read
+        /// them from either surface.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove an installed plugin by name.
     Remove { name: String },
 }
@@ -634,9 +647,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 .collect::<Result<_>>()?;
             match cmd {
                 PluginCmd::Install { source } => {
-                    commands::plugin_install(&plugin_config, &allow, &source, out)
+                    commands::plugin_install(&plugin_config, &allow, source.as_deref(), out)
                 }
-                PluginCmd::List => commands::plugin_list(&plugin_config, out),
+                PluginCmd::List { json } => commands::plugin_list(&plugin_config, json, out),
                 PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
             }
         }
@@ -697,6 +710,45 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 plugin_config,
             };
             commands::digest(&db, &args, out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The zero-argument invocations are the contract: `drsg digest` alone
+    /// must mean "this repository, into graph.drsg's startup plane".
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_digest_means_cwd_into_startup_of_graph_drsg() {
+        let cli = Cli::try_parse_from(["drsg", "digest"]).unwrap();
+        assert_eq!(cli.db, PathBuf::from("graph.drsg"));
+        match cli.command {
+            Command::Digest {
+                source,
+                plane,
+                apply,
+                ..
+            } => {
+                assert_eq!(source, ".");
+                assert_eq!(plane, "startup");
+                assert!(!apply, "a bare digest must stay a dry run");
+            }
+            _ => panic!("digest should parse as Digest"),
+        }
+    }
+
+    /// `drsg plugin install` with nothing after it must parse — the missing
+    /// source is what routes to the interactive chooser.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_plugin_install_parses_without_a_source() {
+        let cli = Cli::try_parse_from(["drsg", "plugin", "install"]).unwrap();
+        match cli.command {
+            Command::Plugin(PluginCmd::Install { source }) => assert!(source.is_none()),
+            _ => panic!("should parse as Plugin(Install)"),
         }
     }
 }

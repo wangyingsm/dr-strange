@@ -636,6 +636,114 @@ fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
 const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
 
 #[cfg(feature = "digest")]
+/// The official plugins, by name and release URL — what the interactive
+/// installer offers. Versions move when the extensions repository tags a
+/// new release for that plugin.
+pub const OFFICIAL_PLUGINS: &[(&str, &str, &str)] = &[
+    // (name, claims, url)
+    (
+        "rust",
+        ".rs",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.0.0/rust.wasm",
+    ),
+    (
+        "go",
+        ".go",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.0.0/go.wasm",
+    ),
+    (
+        "ts",
+        ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.0.0/ts.wasm",
+    ),
+    (
+        "py",
+        ".py .pyi .pyw",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.0.0/py.wasm",
+    ),
+    (
+        "java",
+        ".java",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.0.0/java.wasm",
+    ),
+    (
+        "c",
+        ".c .h",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.0.0/c.wasm",
+    ),
+    (
+        "web",
+        ".html .htm .css",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.0.0/web.wasm",
+    ),
+    (
+        "toml",
+        ".toml",
+        "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.0.0/toml.wasm",
+    ),
+];
+
+/// The interactive chooser behind bare `drsg plugin install`: the official
+/// catalog by number, `0` for all of it, a pasted path/URL, `q` to walk
+/// away. Returns the sources to install.
+fn choose_plugins(out: &mut dyn Write) -> Result<Vec<String>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "no source given and stdin is not a terminal — pass a path or URL, \
+             e.g. `drsg plugin install <file.wasm | url>`"
+        );
+    }
+    writeln!(out, "official plugins:")?;
+    writeln!(out, "  0) all of the below")?;
+    for (i, (name, claims, _)) in OFFICIAL_PLUGINS.iter().enumerate() {
+        writeln!(out, "  {}) {:5} {claims}", i + 1, name)?;
+    }
+    write!(out, "install [number, path/URL, or q to cancel]: ")?;
+    out.flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit")
+    {
+        writeln!(out, "cancelled")?;
+        return Ok(Vec::new());
+    }
+    if let Ok(n) = answer.parse::<usize>() {
+        if n == 0 {
+            return Ok(OFFICIAL_PLUGINS
+                .iter()
+                .map(|(_, _, u)| u.to_string())
+                .collect());
+        }
+        if let Some((_, _, url)) = OFFICIAL_PLUGINS.get(n - 1) {
+            return Ok(vec![url.to_string()]);
+        }
+        anyhow::bail!("no option {n} — pick 0..={}", OFFICIAL_PLUGINS.len());
+    }
+    Ok(vec![answer.to_string()])
+}
+
+/// Installed plugins (other than `manifest`'s own name) that already claim
+/// any of its extensions — the head-on collision `install` must not create
+/// silently: the router routes each extension to exactly one handler.
+fn extension_conflicts(
+    store: &dr_strange_llm::PluginStore,
+    name: &str,
+    extensions: &[String],
+) -> Result<Vec<dr_strange_llm::InstalledPlugin>> {
+    let mut out = Vec::new();
+    for installed in store.list()? {
+        if installed.name == name {
+            continue; // same name is the upgrade path, not a conflict
+        }
+        if installed.extensions.iter().any(|e| extensions.contains(e)) {
+            out.push(installed);
+        }
+    }
+    Ok(out)
+}
+
 fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::PluginStore> {
     match &cfg.store_dir {
         Some(dir) => dr_strange_llm::PluginStore::open(dir.clone()),
@@ -654,6 +762,22 @@ fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::Pl
 pub fn plugin_install(
     cfg: &dr_strange_llm::PluginConfig,
     allow_private: &[dr_strange_web::fetch::Prefix],
+    source: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let sources = match source {
+        Some(s) => vec![s.to_string()],
+        None => choose_plugins(out)?,
+    };
+    for source in &sources {
+        install_one(cfg, allow_private, source, out)?;
+    }
+    Ok(())
+}
+
+fn install_one(
+    cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
     source: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -666,6 +790,73 @@ pub fn plugin_install(
     };
 
     let store = plugin_store(cfg)?;
+
+    // The router routes each extension to exactly one handler, so an
+    // install that would create a second claimant is a decision, not a
+    // default: cancel, or remove the incumbent and continue.
+    let manifest = {
+        use dr_strange_llm::preprocess::Preprocessor as _;
+        dr_strange_llm::WasmPlugin::from_bytes(
+            &bytes,
+            Vec::new(),
+            dr_strange_llm::Limits::default(),
+        )?
+        .manifest()
+    };
+    let conflicts = extension_conflicts(&store, &manifest.name, &manifest.extensions)?;
+    if !conflicts.is_empty() {
+        use std::io::IsTerminal;
+        let named = conflicts
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}@{} ({})",
+                    p.name,
+                    p.version,
+                    p.extensions
+                        .iter()
+                        .map(|e| format!(".{e}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "{}@{} claims extensions already handled by {named} — remove \
+                 the incumbent first (`drsg plugin remove <name>`) or run \
+                 interactively to choose",
+                manifest.name,
+                manifest.version
+            );
+        }
+        writeln!(
+            out,
+            "{}@{} claims extensions already handled by {named}",
+            manifest.name, manifest.version
+        )?;
+        write!(
+            out,
+            "  c) cancel installation\n  r) remove and continue\nchoice [c/r]: "
+        )?;
+        out.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        match line.trim() {
+            "r" | "R" => {
+                for p in &conflicts {
+                    let removed = store.remove(&p.name)?;
+                    writeln!(out, "removed {}@{}", removed.name, removed.version)?;
+                }
+            }
+            _ => {
+                writeln!(out, "cancelled")?;
+                return Ok(());
+            }
+        }
+    }
+
     let (entry, replaced) = store.install(&bytes, source)?;
     match replaced {
         Some(old) if old != entry.version => writeln!(
@@ -704,9 +895,19 @@ pub fn plugin_install(
 }
 
 #[cfg(feature = "digest")]
-pub fn plugin_list(cfg: &dr_strange_llm::PluginConfig, out: &mut dyn Write) -> Result<()> {
+pub fn plugin_list(
+    cfg: &dr_strange_llm::PluginConfig,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
     let store = plugin_store(cfg)?;
     let plugins = store.list()?;
+    if json {
+        // The same records `plugin.list` serves over RPC — one shape for
+        // agents whichever surface they read.
+        writeln!(out, "{}", serde_json::to_string_pretty(&plugins)?)?;
+        return Ok(());
+    }
     if plugins.is_empty() {
         writeln!(
             out,
@@ -714,16 +915,44 @@ pub fn plugin_list(cfg: &dr_strange_llm::PluginConfig, out: &mut dyn Write) -> R
         )?;
         return Ok(());
     }
-    for p in plugins {
-        writeln!(
-            out,
-            "{}@{}	.{}	sha256:{}	from {}",
-            p.name,
-            p.version,
-            p.extensions.join(", ."),
-            &p.sha256[..12],
-            p.source
-        )?;
+    // A terminal table: fixed columns sized to the content.
+    let rows: Vec<[String; 5]> = plugins
+        .iter()
+        .map(|p| {
+            [
+                p.name.clone(),
+                p.version.clone(),
+                p.extensions
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                p.sha256[..12].to_string(),
+                p.source.clone(),
+            ]
+        })
+        .collect();
+    let header = ["NAME", "VERSION", "EXTENSIONS", "SHA256", "SOURCE"];
+    let mut widths = header.map(str::len);
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.len());
+        }
+    }
+    let print_row = |out: &mut dyn Write, cells: [&str; 5]| -> Result<()> {
+        let mut line = String::new();
+        for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(&format!("{cell:<w$}"));
+        }
+        writeln!(out, "{}", line.trim_end())?;
+        Ok(())
+    };
+    print_row(out, header)?;
+    for row in &rows {
+        print_row(out, [&row[0], &row[1], &row[2], &row[3], &row[4]])?;
     }
     Ok(())
 }
@@ -1671,5 +1900,103 @@ mod tests {
         assert!(query(&db, "startup", "not json", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "9999", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "@nope", &mut Vec::new()).is_err());
+    }
+
+    // ---- plugin management ------------------------------------------------
+
+    /// The sandbox suite's committed fixture — a real component claiming
+    /// `.fix` — so these tests exercise the actual validate/store path, not
+    /// a mock of it.
+    #[cfg(feature = "digest")]
+    const FIXTURE_WASM: &[u8] = include_bytes!("../../dr-strange-llm/tests/fixtures/fixture.wasm");
+
+    /// A throwaway store directory wired through `PluginConfig` — the same
+    /// knob `[plugins] store_dir` sets, so nothing here touches the user's
+    /// real per-user store.
+    #[cfg(feature = "digest")]
+    fn scratch_store(name: &str) -> (std::path::PathBuf, dr_strange_llm::PluginConfig) {
+        let dir = std::env::temp_dir().join(format!("drsg-cli-plug-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dr_strange_llm::PluginConfig {
+            store_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        (dir, cfg)
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn plugin_list_reports_the_empty_store_in_both_shapes() {
+        let (dir, cfg) = scratch_store("empty");
+        // JSON stays machine-readable even when there is nothing to say —
+        // an agent parsing it must never meet prose.
+        let json = cap(|o| plugin_list(&cfg, true, o));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+        // The human shape says what to do next instead.
+        let table = cap(|o| plugin_list(&cfg, false, o));
+        assert!(table.contains("no plugins installed"), "{table}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn install_from_a_path_then_list_as_table_and_json() {
+        let (dir, cfg) = scratch_store("list");
+        let wasm = dir.join("fixture.wasm");
+        std::fs::write(&wasm, FIXTURE_WASM).unwrap();
+
+        let out = cap(|o| plugin_install(&cfg, &[], Some(wasm.to_str().unwrap()), o));
+        assert!(out.contains("installed fixture@0"), "{out}");
+        assert!(out.contains("handles: .fix"), "{out}");
+
+        let table = cap(|o| plugin_list(&cfg, false, o));
+        assert!(
+            table.contains("NAME") && table.contains("EXTENSIONS"),
+            "{table}"
+        );
+        assert!(
+            table.contains("fixture") && table.contains(".fix"),
+            "{table}"
+        );
+
+        // `--json` is the agent surface: the same records `plugin.list`
+        // serves over RPC, parseable without scraping the table.
+        let json = cap(|o| plugin_list(&cfg, true, o));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["name"], "fixture");
+        assert_eq!(parsed[0]["extensions"][0], "fix");
+        assert_eq!(parsed[0]["sha256"].as_str().unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn a_second_claimant_conflicts_but_a_reinstall_does_not() {
+        let (dir, cfg) = scratch_store("conflict");
+        let store = plugin_store(&cfg).unwrap();
+        store.install(FIXTURE_WASM, "test").unwrap();
+
+        // A different plugin claiming `.fix` collides with the incumbent…
+        let hits =
+            extension_conflicts(&store, "fixture2", std::slice::from_ref(&"fix".to_string()))
+                .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "fixture");
+
+        // …but the same name re-claiming its own extension is the upgrade
+        // path, and a disjoint claim collides with nothing.
+        assert!(
+            extension_conflicts(&store, "fixture", std::slice::from_ref(&"fix".to_string()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            extension_conflicts(&store, "other", std::slice::from_ref(&"zig".to_string()))
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
