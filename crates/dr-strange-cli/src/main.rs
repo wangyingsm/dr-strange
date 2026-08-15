@@ -427,10 +427,11 @@ impl From<DirArg> for Dir {
 enum IndexCmd {
     /// Declare (and build) a vector index. Two arguments (`LABEL PROPERTY`)
     /// index one label; one argument (`PROPERTY`) indexes **every label in
-    /// the plane that carries the property** — the one-command follow-up to
-    /// `drsg vectorize`.
+    /// the plane that carries the property**; no arguments defaults the
+    /// property to `embedding` — so `drsg index ensure --plane <p>` is the
+    /// whole follow-up to `drsg vectorize`.
     Ensure {
-        #[arg(value_name = "LABEL|PROPERTY")]
+        #[arg(value_name = "LABEL|PROPERTY", default_value = "embedding")]
         first: String,
         #[arg(value_name = "PROPERTY")]
         second: Option<String>,
@@ -855,6 +856,18 @@ mod tests {
     }
 
     /// One positional = property, sweeping all labels; two = label, property.
+    #[test]
+    fn bare_index_ensure_defaults_to_the_embedding_property() {
+        let none = Cli::try_parse_from(["drsg", "index", "ensure"]).unwrap();
+        match none.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "embedding");
+                assert_eq!(second, None);
+            }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+    }
+
     #[test]
     fn index_ensure_takes_one_or_two_positionals() {
         let one = Cli::try_parse_from(["drsg", "index", "ensure", "embedding"]).unwrap();

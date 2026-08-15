@@ -901,7 +901,7 @@ pub fn vectorize(
     )?;
     writeln!(
         out,
-        "  `drsg index ensure embedding --plane {plane_name}` builds the vector indexes"
+        "  `drsg index ensure --plane {plane_name}` builds the vector indexes"
     )?;
     Ok(())
 }
