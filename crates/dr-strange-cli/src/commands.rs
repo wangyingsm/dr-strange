@@ -203,6 +203,168 @@ pub fn default_plane(source: &str) -> String {
         .unwrap_or_else(|| "startup".to_string())
 }
 
+// ---- serve watch (ROADMAP §11) -------------------------------------------
+
+/// How often the watcher asks the repository where HEAD is. Commits are
+/// human-paced; two seconds is invisible latency and negligible cost.
+#[cfg(feature = "digest")]
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The entry `drsg serve watch` hands to the server's `on_start` hook: run
+/// the loop forever, and if it stops, say why — the server stays up either
+/// way, and a watcher that died silently would just look like a quiet repo.
+#[cfg(feature = "digest")]
+pub fn watch(
+    db: std::sync::Arc<Database>,
+    dir: std::path::PathBuf,
+    plane_name: String,
+    plugin_config: dr_strange_llm::PluginConfig,
+) {
+    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config) {
+        tracing::error!(error = format!("{e:#}"), "repository watch stopped");
+    }
+}
+
+#[cfg(feature = "digest")]
+fn watch_loop(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    plugin_config: &dr_strange_llm::PluginConfig,
+) -> Result<()> {
+    let mut head =
+        git_head(dir).with_context(|| format!("{} is not a git repository", dir.display()))?;
+    if db.plane(plane_name).is_err() {
+        db.create_plane(plane_name, Properties::new())?;
+        tracing::info!(plane = plane_name, "created plane");
+    }
+    let source = dir
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| dir.display().to_string());
+    tracing::info!(
+        dir = %dir.display(),
+        plane = plane_name,
+        head = %head,
+        "watching repository — each commit folds into the graph"
+    );
+    loop {
+        std::thread::sleep(WATCH_POLL);
+        let now = match git_head(dir) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), "reading HEAD failed; will retry");
+                continue;
+            }
+        };
+        if now == head {
+            continue;
+        }
+        // One diff covers however far HEAD moved — several commits, a rebase,
+        // a branch switch. What matters is the file set between the states.
+        let step = (|| -> Result<()> {
+            let delta = git_changes(dir, &head, &now)?;
+            if delta.changed.is_empty() && delta.deleted.is_empty() {
+                return Ok(());
+            }
+            // Reloaded each commit so a `drsg plugin install` between commits
+            // is picked up without restarting the server.
+            let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+            let host = dr_strange_llm::LocalFiles::new(dir)?;
+            let stats =
+                dr_strange_llm::sync_paths(db, plane_name, &host, &delta, &plugins, &source, &now)?;
+            tracing::info!(
+                commit = %&now[..12.min(now.len())],
+                changed = delta.changed.len(),
+                deleted = delta.deleted.len(),
+                nodes_loaded = stats.nodes_loaded,
+                nodes_deleted = stats.nodes_deleted,
+                edges_written = stats.edges_written,
+                edges_reattached = stats.edges_reattached,
+                edges_dropped = stats.edges_dropped,
+                prose_skipped_chars = stats.prose_chars,
+                "commit folded into the graph"
+            );
+            for note in &stats.notes {
+                tracing::info!(note, "sync note");
+            }
+            Ok(())
+        })();
+        if let Err(e) = step {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                from = %head, to = %now,
+                "folding the commit failed; watching continues from the new HEAD"
+            );
+        }
+        head = now;
+    }
+}
+
+#[cfg(feature = "digest")]
+fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("running git — `serve watch` needs it on PATH")?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(feature = "digest")]
+fn git_head(dir: &Path) -> Result<String> {
+    let out = git(dir, &["rev-parse", "HEAD"])?;
+    Ok(String::from_utf8(out)?.trim().to_string())
+}
+
+/// The files between two commits, rename-aware: `(changed, deleted)`, where
+/// changed paths' current content should be believed and deleted ones no
+/// longer exist (a rename contributes one of each).
+#[cfg(feature = "digest")]
+fn git_changes(dir: &Path, old: &str, new: &str) -> Result<dr_strange_llm::CommitDelta> {
+    // `-z` because paths are data: NUL separators cannot collide with them.
+    let out = git(dir, &["diff", "--name-status", "-M", "-z", old, new])?;
+    let (changed, deleted) = parse_name_status(&out);
+    Ok(dr_strange_llm::CommitDelta { changed, deleted })
+}
+
+/// Parse `git diff --name-status -z` output. Statuses carry one path, except
+/// renames/copies which carry two (source, then destination).
+#[cfg(feature = "digest")]
+fn parse_name_status(raw: &[u8]) -> (Vec<String>, Vec<String>) {
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned());
+    let (mut changed, mut deleted) = (Vec::new(), Vec::new());
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        match status.chars().next() {
+            Some('D') => deleted.push(path),
+            Some('R') | Some('C') => {
+                let Some(target) = fields.next() else { break };
+                // The source of a copy still exists; a rename's does not.
+                if status.starts_with('R') {
+                    deleted.push(path);
+                }
+                changed.push(target);
+            }
+            // A/M/T and anything exotic: believe the file's current content.
+            _ => changed.push(path),
+        }
+    }
+    (changed, deleted)
+}
+
 /// Parse a statement, embedding a text `SEARCH … NEAR "…"` when an `embed`
 /// provider is given, and resolving `$name` placeholders from `params`.
 /// Embedding lives behind the `digest` feature (which pulls in dr-strange-llm);
@@ -1980,6 +2142,30 @@ mod tests {
         // machine surface carries it to UIs.
         assert!(parsed[0]["logo"].as_str().unwrap().starts_with("<svg"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git diff --name-status -z` per status letter: one path each, except
+    /// renames/copies which carry source then destination.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn name_status_parses_every_shape_the_diff_emits() {
+        let raw =
+            b"M src/lib.rs A src/new.rs D old.rs R100 from.rs to.rs C75 base.rs copy.rs T link.rs ";
+        let (changed, deleted) = parse_name_status(raw);
+        assert_eq!(
+            changed,
+            vec!["src/lib.rs", "src/new.rs", "to.rs", "copy.rs", "link.rs"]
+        );
+        // A rename's source is gone; a copy's still exists.
+        assert_eq!(deleted, vec!["old.rs", "from.rs"]);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn name_status_survives_truncated_input() {
+        // A status with no path (defensive; git won't produce it).
+        assert_eq!(parse_name_status(b"M "), (vec![], vec![]));
+        assert_eq!(parse_name_status(b""), (vec![], vec![]));
     }
 
     #[cfg(feature = "digest")]

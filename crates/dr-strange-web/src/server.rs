@@ -652,7 +652,11 @@ fn startup_banner() {
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
-pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
+pub async fn run(
+    db: Database,
+    db_path: Option<PathBuf>,
+    mut opts: ServeOptions,
+) -> anyhow::Result<()> {
     startup_banner();
     // Read the secret once so the checker (`authorizer`) and the SPA's injected
     // copy (`bootstrap_token`) can never disagree.
@@ -688,6 +692,14 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         fetch: opts.fetch,
         query_timeout: opts.query_timeout,
     });
+    // The caller's background task (e.g. the repository watcher behind
+    // `drsg serve watch`) gets its own handle to the shared database. A plain
+    // thread rather than a tokio task: the work is blocking (git, parsing,
+    // write transactions) and must not stall the request executor.
+    if let Some(on_start) = opts.on_start.take() {
+        let db = state.db.clone();
+        std::thread::spawn(move || on_start(db));
+    }
     let app = router(state, opts.max_concurrent, opts.embed_provider.clone());
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths

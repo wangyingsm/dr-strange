@@ -65,6 +65,12 @@ pub struct ServeOptions {
     /// nodes by forgetting a flag. The key is read from the environment at call
     /// time, never carried here.
     pub embed_provider: Option<(String, Option<String>, Option<String>)>,
+    /// Run once on a background thread after the server is up, with a handle
+    /// to the same database the server writes through — how `drsg serve
+    /// watch` runs its repository watcher against the one open database
+    /// rather than fighting it for the file lock. The server neither waits
+    /// on it nor restarts it.
+    pub on_start: Option<Box<dyn FnOnce(std::sync::Arc<Database>) + Send>>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -144,6 +150,7 @@ impl Default for ServeOptions {
             write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
             query_timeout: Some(DEFAULT_QUERY_TIMEOUT),
             embed_provider: None,
+            on_start: None,
         }
     }
 }

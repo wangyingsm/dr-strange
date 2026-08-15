@@ -43,6 +43,7 @@
 mod ground;
 #[cfg(feature = "plugins")]
 mod registry;
+mod sync;
 #[cfg(feature = "plugins")]
 mod wasm;
 
@@ -60,6 +61,7 @@ use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore};
+pub use sync::{CommitDelta, SyncStats, sync_paths};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
 
@@ -549,6 +551,21 @@ pub fn route_tree(
     handler: Option<&str>,
     plugins: &Plugins,
 ) -> Result<Preprocessed> {
+    let paths = host.list("")?;
+    route_paths(host, paths, handler, plugins)
+}
+
+/// Route an explicit set of paths — the same bucketing as [`route_tree`],
+/// over a list the caller chose. This is what an incremental sync runs: the
+/// files one commit touched, not the tree. Handlers may still pull *other*
+/// files through the host — that is where cross-file resolution comes from —
+/// but facts are only expected for the paths given.
+pub fn route_paths(
+    host: &dyn Host,
+    paths: Vec<String>,
+    handler: Option<&str>,
+    plugins: &Plugins,
+) -> Result<Preprocessed> {
     let registry = &plugins.handlers;
     if let Some(want) = handler
         && !registry.iter().any(|p| p.manifest().name == want)
@@ -558,7 +575,7 @@ pub fn route_tree(
 
     // Bucket by handler index; `None` is the built-in reader's pile.
     let mut buckets: BTreeMap<Option<usize>, Vec<String>> = BTreeMap::new();
-    for path in host.list("")? {
+    for path in paths {
         let idx = index_for(registry, &extension_of(&path), handler);
         buckets.entry(idx).or_default().push(path);
     }

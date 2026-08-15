@@ -151,6 +151,8 @@ enum Command {
         /// defaults to 127.0.0.1:7700 when neither is set.
         #[arg(long)]
         addr: Option<SocketAddr>,
+        #[command(subcommand)]
+        mode: Option<ServeMode>,
     },
     /// Ask a natural-language question; an LLM turns it into a read-only plan
     /// and runs it (ROADMAP §3).
@@ -273,6 +275,24 @@ enum Command {
         /// URL only: how far to follow links. 0 reads just the page named.
         #[arg(long, default_value_t = 1)]
         depth: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServeMode {
+    /// Serve as usual, and watch a git repository beside it: every commit's
+    /// changed files run through the installed plugins and the plane is
+    /// updated in place — new symbols created, gone ones deleted, edges
+    /// rewritten. Facts only; no model is ever called.
+    #[cfg(feature = "digest")]
+    Watch {
+        /// Repository to watch.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Target plane. **Omitted**: the directory's own name, `startup`
+        /// as the fallback.
+        #[arg(long)]
+        plane: Option<String>,
     },
 }
 
@@ -601,9 +621,21 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             let db = commands::open(&cli.db)?;
             commands::restore(&db, &input, out)
         }
-        Command::Serve { addr } => {
+        Command::Serve { addr, mode } => {
             let db = commands::open(&cli.db)?;
-            let opts = config::serve_options(cfg, addr);
+            #[allow(unused_mut)]
+            let mut opts = config::serve_options(cfg, addr);
+            #[cfg(feature = "digest")]
+            if let Some(ServeMode::Watch { dir, plane }) = mode {
+                let plane =
+                    plane.unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
+                let plugin_config = config::plugin_config(cfg)?;
+                opts.on_start = Some(Box::new(move |db| {
+                    commands::watch(db, dir, plane, plugin_config)
+                }));
+            }
+            #[cfg(not(feature = "digest"))]
+            let _ = mode;
             // Hands off to the web crate, which owns its own async runtime and
             // blocks until a shutdown signal; `out` is unused (the server logs
             // itself).
@@ -742,6 +774,24 @@ mod tests {
                 assert!(!apply, "a bare digest must stay a dry run");
             }
             _ => panic!("digest should parse as Digest"),
+        }
+    }
+
+    /// `drsg serve watch` with nothing else watches $CWD into a plane named
+    /// after it, beside the normally-served dashboard.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_serve_watch_takes_cwd_and_no_explicit_plane() {
+        let cli = Cli::try_parse_from(["drsg", "serve", "watch"]).unwrap();
+        match cli.command {
+            Command::Serve {
+                mode: Some(ServeMode::Watch { dir, plane }),
+                ..
+            } => {
+                assert_eq!(dir, PathBuf::from("."));
+                assert_eq!(plane, None);
+            }
+            _ => panic!("should parse as Serve(Watch)"),
         }
     }
 

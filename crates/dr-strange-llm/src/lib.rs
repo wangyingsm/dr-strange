@@ -30,8 +30,9 @@ pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
 pub use preprocess::{
-    FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins, Preprocessed,
-    Preprocessor, fold, route_document, route_tree, stamp_run,
+    CommitDelta, FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins,
+    Preprocessed, Preprocessor, SyncStats, fold, route_document, route_paths, route_tree,
+    stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
 pub use preprocess::{

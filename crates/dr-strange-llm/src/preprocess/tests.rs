@@ -318,3 +318,209 @@ fn the_host_refuses_to_read_outside_its_root() {
         "{msg}"
     );
 }
+
+// ---- sync (watch mode) ----------------------------------------------------
+
+use dr_strange_core::Properties;
+
+/// A code-shaped handler for the sync tests: claims `.aa`; each line of a
+/// file is a symbol, `name->key` also asserts a CALLS edge onto `key`. Small
+/// enough that what a failure implicates is the sync, not the parser.
+struct AaLang;
+
+impl AaLang {
+    fn file_prop(path: &str) -> Properties {
+        let mut p = Properties::new();
+        p.insert(
+            "file".into(),
+            PropDesc::described("file", PropValue::Str(path.to_string())),
+        );
+        p
+    }
+}
+
+impl Preprocessor for AaLang {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: "aa".into(),
+            version: "1".into(),
+            extensions: vec!["aa".into()],
+            logo: None,
+        }
+    }
+
+    fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed> {
+        let mut out = Preprocessed::default();
+        let Input::Files { paths } = input else {
+            anyhow::bail!("sync routes files");
+        };
+        for path in *paths {
+            out.nodes.push(DigestNode {
+                key: path.clone(),
+                label: "File".into(),
+                extra_labels: Vec::new(),
+                props: Properties::new(),
+            });
+            let body = String::from_utf8(host.read(path)?)?;
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                let (name, callee) = match line.split_once("->") {
+                    Some((n, c)) => (n.trim(), Some(c.trim())),
+                    None => (line.trim(), None),
+                };
+                let key = format!("{path}::{name}");
+                out.nodes.push(DigestNode {
+                    key: key.clone(),
+                    label: "Function".into(),
+                    extra_labels: Vec::new(),
+                    props: Self::file_prop(path),
+                });
+                out.edges.push(DigestEdge {
+                    src: path.clone(),
+                    dst: key.clone(),
+                    ty: "CONTAINS".into(),
+                    props: Properties::new(),
+                });
+                if let Some(callee) = callee {
+                    out.edges.push(DigestEdge {
+                        src: key,
+                        dst: callee.to_string(),
+                        ty: "CALLS".into(),
+                        props: Properties::new(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn sync_fixture(name: &str) -> (Tree, dr_strange_core::Database, Plugins) {
+    let tree = Tree::new(name);
+    tree.write("a.aa", "f->b.aa::h\ng\n");
+    tree.write("b.aa", "h->a.aa::f\n");
+    let db = dr_strange_core::Database::in_memory().unwrap();
+    db.create_plane("code", Properties::new()).unwrap();
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+    let delta = CommitDelta {
+        changed: vec!["a.aa".to_string(), "b.aa".to_string()],
+        ..Default::default()
+    };
+    sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c0").unwrap();
+    (tree, db, plugins)
+}
+
+fn key_id(db: &dr_strange_core::Database, key: &str) -> Option<dr_strange_core::NodeId> {
+    db.plane("code")
+        .unwrap()
+        .node_by_key(key)
+        .unwrap()
+        .map(|n| n.id)
+}
+
+fn calls(db: &dr_strange_core::Database, src: &str) -> Vec<String> {
+    let plane = db.plane("code").unwrap();
+    let Some(id) = key_id(db, src) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = plane
+        .neighbors(id, dr_strange_core::Dir::Out, Some("CALLS"))
+        .unwrap()
+        .into_iter()
+        .filter_map(|n| plane.node(n.node).unwrap().and_then(|r| r.external_key))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn the_first_sync_loads_the_whole_set() {
+    let (_tree, db, _plugins) = sync_fixture("first");
+    // 2 files + 3 functions, and the cross-file calls resolved both ways.
+    for key in ["a.aa", "b.aa", "a.aa::f", "a.aa::g", "b.aa::h"] {
+        assert!(key_id(&db, key).is_some(), "missing {key}");
+    }
+    assert_eq!(calls(&db, "a.aa::f"), vec!["b.aa::h"]);
+    assert_eq!(calls(&db, "b.aa::h"), vec!["a.aa::f"]);
+}
+
+#[test]
+fn a_modified_file_drops_its_stale_symbols_and_keeps_incoming_edges() {
+    let (tree, db, plugins) = sync_fixture("modify");
+    // g disappears; f survives the rewrite.
+    tree.write("a.aa", "f->b.aa::h\n");
+    let delta = CommitDelta {
+        changed: vec!["a.aa".to_string()],
+        ..Default::default()
+    };
+    let stats = sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    assert!(key_id(&db, "a.aa::g").is_none(), "stale symbol survived");
+    assert!(key_id(&db, "a.aa::f").is_some());
+    // The untouched file's assertion onto the re-created node was re-attached…
+    assert_eq!(calls(&db, "b.aa::h"), vec!["a.aa::f"]);
+    assert_eq!(stats.edges_reattached, 1);
+    // …and the re-parsed file's own outgoing edge still resolves cross-file.
+    assert_eq!(calls(&db, "a.aa::f"), vec!["b.aa::h"]);
+}
+
+#[test]
+fn a_deleted_file_takes_its_nodes_and_dangling_calls_with_it() {
+    let (tree, db, plugins) = sync_fixture("delete");
+    std::fs::remove_file(tree.0.join("b.aa")).unwrap();
+    let delta = CommitDelta {
+        deleted: vec!["b.aa".to_string()],
+        ..Default::default()
+    };
+    let stats = sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    assert_eq!(stats.nodes_deleted, 2, "File node and its one function");
+    assert!(key_id(&db, "b.aa").is_none());
+    assert!(key_id(&db, "b.aa::h").is_none());
+    // f's call onto the deleted symbol cascaded away with its target.
+    assert_eq!(calls(&db, "a.aa::f"), Vec::<String>::new());
+}
+
+#[test]
+fn reserved_and_vector_props_survive_the_reload() {
+    let (tree, db, plugins) = sync_fixture("carry");
+    {
+        let plane = db.plane("code").unwrap();
+        let id = key_id(&db, "a.aa::f").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.set_prop(
+            id,
+            "emb",
+            PropDesc::described("embedding", PropValue::Vector(vec![1.0, 0.0])),
+        )
+        .unwrap();
+        txn.set_prop(
+            id,
+            "_reviewed",
+            PropDesc::described("mark", PropValue::Bool(true)),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    tree.write("a.aa", "f->b.aa::h\n");
+    let delta = CommitDelta {
+        changed: vec!["a.aa".to_string()],
+        ..Default::default()
+    };
+    sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    let node = db
+        .plane("code")
+        .unwrap()
+        .node_by_key("a.aa::f")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            node.properties.get("emb").map(|d| &d.value),
+            Some(PropValue::Vector(_))
+        ),
+        "embedding lost in the reload"
+    );
+    assert!(node.properties.contains_key("_reviewed"));
+    // The parser's own view is fresh, not carried: _run moved to the new sync.
+    assert!(
+        matches!(node.properties.get("_run").map(|d| &d.value), Some(PropValue::Str(s)) if s == "c1")
+    );
+}
