@@ -502,6 +502,16 @@ pub struct Neighbors {
     direction: Option<String>,
     #[serde(default, rename = "type")]
     edge_type: Option<String>,
+    /// Return full records instead of id pairs: each hop becomes
+    /// `{node: {…}, edge: {id, type, properties}}` — the composition that
+    /// lets `node.get` + `neighbors` answer "who calls this?" in two calls,
+    /// call-site lines included, with no per-id follow-ups. Off by default:
+    /// existing callers see the exact id pairs they always did.
+    #[serde(default)]
+    hydrate: bool,
+    /// With `hydrate`, render nodes lean (vectors elided) — the agent shape.
+    #[serde(default)]
+    lean: bool,
     #[serde(flatten)]
     at: AsOfParams,
 }
@@ -531,11 +541,39 @@ pub fn plane_neighbors(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let plane = plane_at(ctx, &req.plane, &req.at)?;
     let dir = parse_dir(req.direction.as_deref());
     let hops = app(plane.neighbors(NodeId(req.id), dir, req.edge_type.as_deref()))?;
-    Ok(Value::Array(
-        hops.iter()
-            .map(|n| jval!({ "node": n.node.0, "edge": n.edge.0 }))
-            .collect(),
-    ))
+    if !req.hydrate {
+        return Ok(Value::Array(
+            hops.iter()
+                .map(|n| jval!({ "node": n.node.0, "edge": n.edge.0 }))
+                .collect(),
+        ));
+    }
+    let render = if req.lean {
+        json::node_to_json_lean
+    } else {
+        json::node_to_json
+    };
+    let mut out = Vec::with_capacity(hops.len());
+    for n in &hops {
+        let node = match app(plane.node(n.node))? {
+            Some(record) => render(&record),
+            None => jval!({ "id": n.node.0 }),
+        };
+        let edge = match app(plane.edge(n.edge))? {
+            Some(e) => jval!({
+                "id": e.id.0,
+                "type": e.ty,
+                "properties": if req.lean {
+                    json::properties_to_json_lean(&e.properties)
+                } else {
+                    json::properties_to_json(&e.properties)
+                },
+            }),
+            None => jval!({ "id": n.edge.0 }),
+        };
+        out.push(jval!({ "node": node, "edge": edge }));
+    }
+    Ok(Value::Array(out))
 }
 
 #[derive(Deserialize)]

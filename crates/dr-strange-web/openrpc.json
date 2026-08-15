@@ -411,6 +411,20 @@
             "type": "integer"
           },
           "description": "Time-travel: pin the read to the latest commit at or before this unix-epoch millisecond (native backend only)."
+        },
+        {
+          "name": "hydrate",
+          "schema": {
+            "type": "boolean",
+            "description": "Return full records per hop: {node: {…}, edge: {id, type, properties}} instead of id pairs. With node.get, answers callers/callees in two calls, call-site lines included. Default false."
+          }
+        },
+        {
+          "name": "lean",
+          "schema": {
+            "type": "boolean",
+            "description": "With hydrate: elide vector-valued properties (agent shape). Default false."
+          }
         }
       ],
       "result": {
