@@ -805,6 +805,7 @@ pub fn vectorize(
     db: &Database,
     plane_name: &str,
     embedder: &dyn dr_strange_llm::Embedder,
+    metric: Metric,
     out: &mut dyn Write,
 ) -> Result<()> {
     /// Inputs have provider token ceilings; a pathological `value` should
@@ -850,7 +851,7 @@ pub fn vectorize(
         )?;
         // Indexes are still ensured: embeddings may be current while a label
         // gained since the last run has no index yet.
-        return index_ensure_all(db, plane_name, "embedding", Metric::Cosine, out);
+        return index_ensure_all(db, plane_name, "embedding", metric, out);
     }
 
     // Identical texts embed once — external stand-ins and boilerplate repeat.
@@ -903,7 +904,7 @@ pub fn vectorize(
     )?;
     // Finish the job: the plane answers similarity queries the moment this
     // returns, no follow-up command per label to remember.
-    index_ensure_all(db, plane_name, "embedding", Metric::Cosine, out)
+    index_ensure_all(db, plane_name, "embedding", metric, out)
 }
 
 /// A stable fingerprint of an embedded text — what `_embedded_from` stores
@@ -2523,7 +2524,7 @@ mod tests {
         txn.commit().unwrap();
 
         let mock = dr_strange_llm::MockProvider::new(Vec::new(), 4);
-        let run = |out: &mut Vec<u8>| vectorize(&db, "v", &mock, out).unwrap();
+        let run = |out: &mut Vec<u8>| vectorize(&db, "v", &mock, Metric::Cosine, out).unwrap();
 
         let mut out = Vec::new();
         run(&mut out);

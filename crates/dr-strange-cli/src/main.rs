@@ -202,6 +202,9 @@ enum Command {
         /// Embedding model override (default: the provider's).
         #[arg(long)]
         embed_model: Option<String>,
+        /// Distance metric for the ensured indexes (`l2` is euclidean).
+        #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
+        metric: MetricArg,
     },
     /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
     /// that turn source files into graph facts before any model reads them.
@@ -689,11 +692,12 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             embed,
             embed_model,
+            metric,
         } => {
             let db = commands::open(&cli.db)?;
             let embedder =
                 dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
-            commands::vectorize(&db, &plane, &embedder, out)
+            commands::vectorize(&db, &plane, &embedder, metric.into(), out)
         }
         #[cfg(feature = "digest")]
         Command::Ask {
