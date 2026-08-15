@@ -354,11 +354,27 @@ impl Preprocessor for AaLang {
         let Input::Files { paths } = input else {
             anyhow::bail!("sync routes files");
         };
+        // A package-style umbrella node no file owns — its key is not a path
+        // and it carries no `file` prop, so a sync never attributes it to a
+        // commit. Its CONTAINS edges are re-asserted by every parse, which is
+        // exactly the duplicate-edge trap the sync must not fall into.
+        out.nodes.push(DigestNode {
+            key: "pkg".into(),
+            label: "Package".into(),
+            extra_labels: Vec::new(),
+            props: Properties::new(),
+        });
         for path in *paths {
             out.nodes.push(DigestNode {
                 key: path.clone(),
                 label: "File".into(),
                 extra_labels: Vec::new(),
+                props: Properties::new(),
+            });
+            out.edges.push(DigestEdge {
+                src: "pkg".into(),
+                dst: path.clone(),
+                ty: "CONTAINS".into(),
                 props: Properties::new(),
             });
             let body = String::from_utf8(host.read(path)?)?;
@@ -476,6 +492,39 @@ fn a_deleted_file_takes_its_nodes_and_dangling_calls_with_it() {
     assert!(key_id(&db, "b.aa::h").is_none());
     // f's call onto the deleted symbol cascaded away with its target.
     assert_eq!(calls(&db, "a.aa::f"), Vec::<String>::new());
+}
+
+/// The trap the first live drill caught: a fact edge whose source the fold
+/// did not re-create (the package umbrella, or any node without file
+/// attribution) still has its old copy standing, and every fold re-asserts
+/// it. One copy must survive, however many folds run.
+#[test]
+fn edges_from_untouched_sources_never_duplicate() {
+    let (tree, db, plugins) = sync_fixture("dedup");
+    for run in ["c1", "c2", "c3"] {
+        tree.write(
+            "a.aa",
+            &format!(
+                "f->b.aa::h
+// {run}
+"
+            ),
+        );
+        let delta = CommitDelta {
+            changed: vec!["a.aa".to_string()],
+            ..Default::default()
+        };
+        sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", run).unwrap();
+    }
+    let plane = db.plane("code").unwrap();
+    let pkg = plane.node_by_key("pkg").unwrap().unwrap();
+    let onto_a: Vec<_> = plane
+        .neighbors(pkg.id, dr_strange_core::Dir::Out, Some("CONTAINS"))
+        .unwrap()
+        .into_iter()
+        .filter(|n| plane.node(n.node).unwrap().and_then(|r| r.external_key) == Some("a.aa".into()))
+        .collect();
+    assert_eq!(onto_a.len(), 1, "one CONTAINS per fold would stack forever");
 }
 
 #[test]

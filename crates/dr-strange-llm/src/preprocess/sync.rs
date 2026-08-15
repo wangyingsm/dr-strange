@@ -188,8 +188,33 @@ pub fn sync_paths(
         }
         Ok(plane.node_by_key(key)?.is_some())
     };
+    // A fact edge between two nodes the fold did NOT re-create — an unchanged
+    // manifest's CONTAINS onto its re-parsed module, or any node the plane
+    // holds without file attribution — still has its old copy standing, since
+    // only affected nodes' edges cascaded. Re-asserting it would stack a
+    // duplicate per fold, so it is skipped when the same (src, dst, type)
+    // already exists.
+    let already = |src: &str, dst: &str, ty: &str| -> Result<bool> {
+        if batch_keys.contains(src) || batch_keys.contains(dst) {
+            return Ok(false); // at least one endpoint is fresh: no old copy
+        }
+        let (Some(s), Some(d)) = (plane.node_by_key(src)?, plane.node_by_key(dst)?) else {
+            return Ok(false);
+        };
+        Ok(plane
+            .neighbors(s.id, Dir::Out, Some(ty))?
+            .iter()
+            .any(|n| n.node == d.id))
+    };
+    let mut seen: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
     let mut edges: Vec<BulkEdge> = Vec::new();
     for edge in &facts.edges {
+        if !seen.insert((&edge.src, &edge.dst, &edge.ty)) {
+            continue; // the same assertion twice in one batch is one fact
+        }
+        if already(&edge.src, &edge.dst, &edge.ty)? {
+            continue;
+        }
         if resolves(&edge.src, &old)? && resolves(&edge.dst, &old)? {
             edges.push(BulkEdge {
                 src_key: &edge.src,
@@ -214,6 +239,16 @@ pub fn sync_paths(
         let Some(dst) = plane.node_by_key(&edge.dst_key)? else {
             continue; // the symbol vanished; the dangling assertion goes too
         };
+        // The load may already have re-asserted this very edge (a fact edge
+        // whose source lives outside the batch); reads here see the committed
+        // load, so the copy is visible and the snapshot yields to it.
+        if plane
+            .neighbors(edge.src, Dir::Out, Some(&edge.ty))?
+            .iter()
+            .any(|n| n.node == dst.id)
+        {
+            continue;
+        }
         txn.create_edge(edge.src, dst.id, &edge.ty, edge.props.clone())?;
         stats.edges_reattached += 1;
     }
