@@ -232,14 +232,18 @@ article.plugin-card {
 }
 .plugin-card h3 {
   margin: 0 0 0.25rem;
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
+  /* leave room for the top-right logo */
+  padding-right: 3rem;
+}
+article.plugin-card {
+  position: relative;
 }
 .plugin-logo {
-  width: 1.3rem;
-  height: 1.3rem;
-  flex: none;
+  position: absolute;
+  top: 0.9rem;
+  right: 0.9rem;
+  width: 2.6rem;
+  height: 2.6rem;
   object-fit: contain;
 }
 .plugin-card .badge {

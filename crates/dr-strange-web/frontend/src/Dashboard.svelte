@@ -277,8 +277,8 @@
 <section class="plugins">
   {#each officials as c (c.name)}
     <article class="card plugin-card">
+      <img class="plugin-logo" src={logoSrc(c.inst?.logo)} alt="" />
       <h3>
-        <img class="plugin-logo" src={logoSrc(c.inst?.logo)} alt="" />
         {c.name}{#if c.inst}<span class="plugin-ver">@{c.inst.version}</span>{/if}
         {#if c.state === 'installed'}<span class="badge ok">installed</span>
         {:else if c.state === 'upgradable'}<span class="badge up">upgradable</span>{/if}
@@ -307,7 +307,8 @@
   {/each}
   {#each thirdParty as p (p.name)}
     <article class="card plugin-card">
-      <h3><img class="plugin-logo" src={logoSrc(p.logo)} alt="" />{p.name}<span class="plugin-ver">@{p.version}</span></h3>
+      <img class="plugin-logo" src={logoSrc(p.logo)} alt="" />
+      <h3>{p.name}<span class="plugin-ver">@{p.version}</span></h3>
       <p class="plugin-exts">{p.extensions.map((e) => '.' + e).join(' ')}</p>
       <p class="plugin-sha" title={p.source}>sha256:{p.sha256.slice(0, 12)}</p>
       <div class="card-actions">
