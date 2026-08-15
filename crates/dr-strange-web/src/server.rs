@@ -700,6 +700,10 @@ pub async fn run(
         let db = state.db.clone();
         std::thread::spawn(move || on_start(db));
     }
+    // Held past the serve future: the watcher thread's Arc clone keeps the
+    // database's Drop from ever running, so the sidecars must be saved
+    // explicitly at shutdown or every restart rebuilds the indexes.
+    let db_at_shutdown = state.db.clone();
     let app = router(state, opts.max_concurrent, opts.embed_provider.clone());
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
@@ -714,7 +718,7 @@ pub async fn run(
         max_concurrent = opts.max_concurrent,
         "drsg serve: dashboard + JSON-RPC listening on {scheme}://{bound}"
     );
-    match opts.tls {
+    let served = match opts.tls {
         Some(tls) => serve_tls(app, std_listener, tls).await,
         None => {
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
@@ -747,7 +751,10 @@ pub async fn run(
             }
             Ok(())
         }
-    }
+    };
+    db_at_shutdown.save_sidecars();
+    tracing::info!("index sidecars saved; next open loads instead of rebuilding");
+    served
 }
 
 /// Serve HTTPS on an already-bound listener, terminating TLS with rustls.

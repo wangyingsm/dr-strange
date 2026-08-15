@@ -320,11 +320,24 @@ fn keyword_sidecar_path(db: &Path) -> PathBuf {
 }
 
 impl Drop for Database {
-    /// Persist the vector indexes to the sidecar so the next open can skip the
-    /// rebuild-from-KV. Best-effort: the registry is kept coherent with each
-    /// committed write, so stamping it with the current commit sequence is
-    /// valid; any failure just means the next open rebuilds (still correct).
+    /// Persist the index sidecars so the next open can skip the
+    /// rebuild-from-KV. See [`Database::save_sidecars`].
     fn drop(&mut self) {
+        self.save_sidecars();
+    }
+}
+
+impl Database {
+    /// Persist the vector and keyword indexes to their sidecars, stamped with
+    /// the current commit sequence, so the next open loads instead of
+    /// rebuilding from the KV. Best-effort: the registries are kept coherent
+    /// with each committed write, so the stamp is always valid; any failure
+    /// just means the next open rebuilds (still correct).
+    ///
+    /// Runs from `Drop` — but callers holding the database in an `Arc` that
+    /// never reaches zero (a server whose watcher thread loops forever) must
+    /// call it explicitly at shutdown, or every restart pays the rebuild.
+    pub fn save_sidecars(&self) {
         let seq = match self.engine.with_read(|txn| graph::read_commit_seq(txn)) {
             Ok(seq) => seq,
             Err(_) => return, // no meta ⇒ nothing coherent to stamp
@@ -340,9 +353,7 @@ impl Drop for Database {
             tracing::warn!(error = %e, path = %path.display(), "failed to write BM25 sidecar");
         }
     }
-}
 
-impl Database {
     /// Opens (creating if needed) an on-disk database at `path`, using whichever
     /// storage backend the crate features select (`native-backend` takes
     /// precedence over `redb-backend`). Requires a backend feature; a
@@ -425,8 +436,13 @@ impl Database {
         }) {
             Some(reg) => reg,
             None => {
+                let started = std::time::Instant::now();
                 let mut reg = VectorRegistry::new();
                 engine.with_read(|txn| reg.rebuild_from(txn))?;
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "rebuilt vector indexes from the KV (HNSW sidecar missing or stale)"
+                );
                 reg
             }
         };
@@ -443,8 +459,13 @@ impl Database {
             }) {
             Some(reg) => reg,
             None => {
+                let started = std::time::Instant::now();
                 let mut reg = KeywordRegistry::new();
                 engine.with_read(|txn| reg.rebuild_from(txn))?;
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "rebuilt keyword indexes from the KV (BM25 sidecar missing or stale)"
+                );
                 reg
             }
         };

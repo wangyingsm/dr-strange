@@ -414,6 +414,9 @@ fn watch_loop(
                 if let Err(e) = record_sync_point(db, plane_name, dir) {
                     tracing::warn!(error = format!("{e:#}"), "recording the sync point failed");
                 }
+                // Folds are commit-paced, so keeping the sidecars fresh here
+                // is cheap — and a hard kill then costs the next boot nothing.
+                db.save_sidecars();
             }
             Err(e) => {
                 // The in-memory cursor advances so polling continues, but the
