@@ -689,7 +689,7 @@ impl Database {
 }
 
 /// Returns its argument unchanged. Exists as the serve-watch end-to-end
-/// drill: one commit introduces it and wires it into [`PlaneHandle::node`],
+/// drill: a commit introduces it and wires it into [`PlaneHandle::node`],
 /// the revert removes it, and the watched plane must follow both moves.
 fn identity<T>(x: T) -> T {
     x
