@@ -13,9 +13,22 @@
 
   let stats = $state(null) // live db.stats (planes/nodes/edges/file_size)
   let planes = $state([]) // plane cards
-  let plugins = $state([]) // installed preprocessor plugins (extensions section)
+  let plugins = $state([]) // installed preprocessor plugins
+  let catalog = $state([]) // the official catalog this build pins
+  let busy = $state({}) // plugin name -> true while an install/upgrade runs
   let installing = $state(false)
   let installUrl = $state('')
+
+  // The Extensions section pins every official plugin (catalog order) and
+  // judges each against the store by hash: installed, upgradable, or absent.
+  let officials = $derived(
+    catalog.map((c) => {
+      const inst = plugins.find((p) => p.name === c.name)
+      const state = !inst ? 'absent' : inst.sha256 === c.sha256 ? 'installed' : 'upgradable'
+      return { ...c, inst, state }
+    })
+  )
+  let thirdParty = $derived(plugins.filter((p) => !catalog.some((c) => c.name === p.name)))
   let error = $state(null)
   let connected = $state(false)
 
@@ -120,6 +133,18 @@
     plugins = await rpc('plugin.list')
   }
 
+  async function installOfficial(c) {
+    busy = { ...busy, [c.name]: true }
+    try {
+      await rpc('plugin.install', { url: c.url })
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    } finally {
+      busy = { ...busy, [c.name]: false }
+    }
+  }
+
   async function removePlugin(name) {
     if (!confirm(`Remove plugin ${name}? Files it handled will fall back to the document reader.`)) return
     try {
@@ -149,6 +174,9 @@
       .catch((e) => (error = e.message))
     loadPlanes().catch((e) => (error = e.message))
     loadPlugins().catch((e) => (error = e.message))
+    rpc('plugin.catalog')
+      .then((c) => (catalog = c))
+      .catch((e) => (error = e.message))
     return liveStats(
       (s) => {
         stats = s
@@ -240,21 +268,42 @@
 
 <h2>Extensions</h2>
 <section class="plugins">
-  {#each plugins as p (p.name)}
+  {#each officials as c (c.name)}
+    <article class="card plugin-card">
+      <h3>
+        {c.name}{#if c.inst}<span class="plugin-ver">@{c.inst.version}</span>{/if}
+        {#if c.state === 'installed'}<span class="badge ok">installed</span>
+        {:else if c.state === 'upgradable'}<span class="badge up">upgradable</span>{/if}
+      </h3>
+      <p class="plugin-exts">{c.claims}</p>
+      {#if c.inst}
+        <p class="plugin-sha" title={c.inst.source}>sha256:{c.inst.sha256.slice(0, 12)}</p>
+      {:else}
+        <p class="plugin-sha" title={c.url}>official release</p>
+      {/if}
+      <div class="card-actions">
+        {#if c.state === 'absent'}
+          <button class="install" onclick={() => installOfficial(c)} disabled={busy[c.name]}>
+            {busy[c.name] ? 'installing…' : 'Install'}
+          </button>
+        {:else if c.state === 'upgradable'}
+          <button class="install" onclick={() => installOfficial(c)} disabled={busy[c.name]}>
+            {busy[c.name] ? 'installing…' : 'Upgrade'}
+          </button>
+          <button class="del" onclick={() => removePlugin(c.name)} disabled={busy[c.name]}>Remove</button>
+        {:else}
+          <button class="del" onclick={() => removePlugin(c.name)} disabled={busy[c.name]}>Remove</button>
+        {/if}
+      </div>
+    </article>
+  {/each}
+  {#each thirdParty as p (p.name)}
     <article class="card plugin-card">
       <h3>{p.name}<span class="plugin-ver">@{p.version}</span></h3>
       <p class="plugin-exts">{p.extensions.map((e) => '.' + e).join(' ')}</p>
       <p class="plugin-sha" title={p.source}>sha256:{p.sha256.slice(0, 12)}</p>
       <div class="card-actions">
-        <button class="del" onclick={() => removePlugin(p.name)} title="Remove this plugin">
-          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M2.75 4.25h10.5" />
-            <path d="M6.25 4.25V2.75h3.5v1.5" />
-            <path d="M4.35 4.25l.55 8.4a1 1 0 0 0 1 .9h4.2a1 1 0 0 0 1-.9l.55-8.4" />
-            <path d="M6.75 6.75v4M9.25 6.75v4" />
-          </svg>
-          Remove
-        </button>
+        <button class="del" onclick={() => removePlugin(p.name)}>Remove</button>
       </div>
     </article>
   {/each}

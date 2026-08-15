@@ -34,7 +34,9 @@ pub use preprocess::{
     Preprocessor, fold, route_document, route_tree, stamp_run,
 };
 #[cfg(feature = "plugins")]
-pub use preprocess::{InstalledPlugin, Limits, PluginStore, WasmPlugin};
+pub use preprocess::{
+    InstalledPlugin, Limits, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore, WasmPlugin,
+};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;

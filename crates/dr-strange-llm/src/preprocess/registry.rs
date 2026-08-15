@@ -36,6 +36,77 @@ use sha2::{Digest, Sha256};
 use super::Preprocessor;
 use super::wasm::{Limits, WasmPlugin};
 
+/// One entry of the official catalog: a release-tagged artifact and its
+/// pinned hash.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OfficialPlugin {
+    pub name: &'static str,
+    /// The extensions it claims, as display text (`.rs`, `.ts .tsx …`).
+    pub claims: &'static str,
+    pub url: &'static str,
+    /// Hex SHA-256 of the artifact at `url`.
+    pub sha256: &'static str,
+}
+
+/// The official plugins — what the CLI's interactive installer offers and
+/// the dashboard pins. The URLs are pinned to release tags, and a tagged
+/// artifact never changes, so its SHA-256 is pinned right beside it: any
+/// surface can say "installed" or "upgradable" offline, by comparing
+/// against the local store. The pins are also a compatibility statement —
+/// these exact artifacts are known-good with this build's contract — so
+/// they move together with the host, in a release, when the extensions
+/// repository tags new versions.
+pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
+    OfficialPlugin {
+        name: "rust",
+        claims: ".rs",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.0.0/rust.wasm",
+        sha256: "f0170fcf1406c6e52f03a9a3f7ff4f4ab525c82ab8e11e475e0253fc07a3e3d4",
+    },
+    OfficialPlugin {
+        name: "go",
+        claims: ".go",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.0.0/go.wasm",
+        sha256: "5bf6017feb020489e19fff4968ebae44e3ca4775dde3c654d8d91deb9f2879b0",
+    },
+    OfficialPlugin {
+        name: "ts",
+        claims: ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.0.0/ts.wasm",
+        sha256: "ee724ded0940a4c8ab55a5d03ea02e27b9caf9973a1b358b436a4a97598cd4e8",
+    },
+    OfficialPlugin {
+        name: "py",
+        claims: ".py .pyi .pyw",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.0.0/py.wasm",
+        sha256: "92ad64539ab5a1579a282bf54d939165012ce67f3ccca27b7f2fef8848b7c390",
+    },
+    OfficialPlugin {
+        name: "java",
+        claims: ".java",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.0.0/java.wasm",
+        sha256: "6aa3ad0c31d585ffb5222829b85a97636db4477f3a3b2641a2fcf2dde8a4b14b",
+    },
+    OfficialPlugin {
+        name: "c",
+        claims: ".c .h",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.0.0/c.wasm",
+        sha256: "abfe018a2101cffcc17cde87d488e5ecd5dab252ba38f892c12e3f33eabc09f1",
+    },
+    OfficialPlugin {
+        name: "web",
+        claims: ".html .htm .css",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.0.0/web.wasm",
+        sha256: "757debd83ffcddf7ca506dbad42edca24cb6aa79e914d392336dfc99fe3f19b7",
+    },
+    OfficialPlugin {
+        name: "toml",
+        claims: ".toml",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.0.0/toml.wasm",
+        sha256: "f7f98d2f90dd8d0c178b04a6156cdae6d721f12325f74ea629f3be1203d156c5",
+    },
+];
+
 /// One installed plugin, as `registry.toml` records it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstalledPlugin {

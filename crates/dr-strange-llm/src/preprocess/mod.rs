@@ -59,7 +59,7 @@ use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
-pub use registry::{InstalledPlugin, PluginStore};
+pub use registry::{InstalledPlugin, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
 

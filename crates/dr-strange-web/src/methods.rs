@@ -327,6 +327,16 @@ pub fn plugin_list(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     serde_json::to_value(plugins).map_err(|e| RpcError::server(e.to_string()))
 }
 
+/// `plugin.catalog` — the official plugins this build pins: release-tagged
+/// URLs and their artifact hashes. The pins are a compatibility statement
+/// (known-good with this build's contract), so the catalog is a constant of
+/// the binary, not a network lookup — the dashboard joins it against
+/// `plugin.list` to tag each entry installed/upgradable/absent.
+pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
+    serde_json::to_value(dr_strange_llm::OFFICIAL_PLUGINS)
+        .map_err(|e| RpcError::server(e.to_string()))
+}
+
 #[derive(Deserialize)]
 pub struct PluginInstall {
     /// A URL to download the component from. Server-local file paths are

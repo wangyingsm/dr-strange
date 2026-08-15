@@ -233,6 +233,42 @@ article.plugin-card {
 .plugin-card h3 {
   margin: 0 0 0.25rem;
 }
+.plugin-card .badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  vertical-align: middle;
+  margin-left: 0.35rem;
+}
+.plugin-card .badge.ok {
+  color: var(--ok, #3fb950);
+  border: 1px solid color-mix(in srgb, var(--ok, #3fb950) 50%, transparent);
+}
+.plugin-card .badge.up {
+  color: var(--warn, #d29922);
+  border: 1px solid color-mix(in srgb, var(--warn, #d29922) 50%, transparent);
+}
+.plugin-card .card-actions .install {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--ok, #3fb950);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--ok, #3fb950) 55%, var(--border));
+  border-radius: 8px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.plugin-card .card-actions .install:hover:enabled {
+  border-color: var(--ok, #3fb950);
+}
+.plugin-card .card-actions .install:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 .plugin-card .card-actions {
   flex-direction: row;
   justify-content: flex-end;

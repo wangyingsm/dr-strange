@@ -635,63 +635,10 @@ fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
 #[cfg(feature = "digest")]
 const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
 
+/// The official catalog, shared with the dashboard's `plugin.catalog` —
+/// pinned release URLs and hashes, one source of truth in dr-strange-llm.
 #[cfg(feature = "digest")]
-/// The official plugins — what the interactive installer offers. The URLs
-/// are pinned to release tags, and a tagged artifact never changes, so its
-/// SHA-256 is pinned right beside it: the chooser can say "installed" or
-/// "upgradable" offline, by comparing against the local store. Both move
-/// together when the extensions repository tags a new release.
-pub const OFFICIAL_PLUGINS: &[(&str, &str, &str, &str)] = &[
-    // (name, claims, url, sha256 of the release artifact)
-    (
-        "rust",
-        ".rs",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.0.0/rust.wasm",
-        "f0170fcf1406c6e52f03a9a3f7ff4f4ab525c82ab8e11e475e0253fc07a3e3d4",
-    ),
-    (
-        "go",
-        ".go",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.0.0/go.wasm",
-        "5bf6017feb020489e19fff4968ebae44e3ca4775dde3c654d8d91deb9f2879b0",
-    ),
-    (
-        "ts",
-        ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.0.0/ts.wasm",
-        "ee724ded0940a4c8ab55a5d03ea02e27b9caf9973a1b358b436a4a97598cd4e8",
-    ),
-    (
-        "py",
-        ".py .pyi .pyw",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.0.0/py.wasm",
-        "92ad64539ab5a1579a282bf54d939165012ce67f3ccca27b7f2fef8848b7c390",
-    ),
-    (
-        "java",
-        ".java",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.0.0/java.wasm",
-        "6aa3ad0c31d585ffb5222829b85a97636db4477f3a3b2641a2fcf2dde8a4b14b",
-    ),
-    (
-        "c",
-        ".c .h",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.0.0/c.wasm",
-        "abfe018a2101cffcc17cde87d488e5ecd5dab252ba38f892c12e3f33eabc09f1",
-    ),
-    (
-        "web",
-        ".html .htm .css",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.0.0/web.wasm",
-        "757debd83ffcddf7ca506dbad42edca24cb6aa79e914d392336dfc99fe3f19b7",
-    ),
-    (
-        "toml",
-        ".toml",
-        "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.0.0/toml.wasm",
-        "f7f98d2f90dd8d0c178b04a6156cdae6d721f12325f74ea629f3be1203d156c5",
-    ),
-];
+pub use dr_strange_llm::OFFICIAL_PLUGINS;
 
 /// One catalog entry's status against the local store: `[installed]` when
 /// the stored hash matches the release artifact's, `[upgradable]` when a
@@ -727,18 +674,19 @@ fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> R
         .collect();
     let claims_w = OFFICIAL_PLUGINS
         .iter()
-        .map(|(_, claims, _, _)| claims.len())
+        .map(|p| p.claims.len())
         .max()
         .unwrap_or(0);
     writeln!(out, "official plugins:")?;
     writeln!(out, "  0) all of the below")?;
-    for (i, (name, claims, _, sha)) in OFFICIAL_PLUGINS.iter().enumerate() {
+    for (i, p) in OFFICIAL_PLUGINS.iter().enumerate() {
         writeln!(
             out,
-            "  {}) {:5} {claims:claims_w$}{}",
+            "  {}) {:5} {:claims_w$}{}",
             i + 1,
-            name,
-            official_status(&installed, name, sha)
+            p.name,
+            p.claims,
+            official_status(&installed, p.name, p.sha256)
         )?;
     }
     write!(out, "install [number, path/URL, or q to cancel]: ")?;
@@ -753,13 +701,10 @@ fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> R
     }
     if let Ok(n) = answer.parse::<usize>() {
         if n == 0 {
-            return Ok(OFFICIAL_PLUGINS
-                .iter()
-                .map(|(_, _, u, _)| u.to_string())
-                .collect());
+            return Ok(OFFICIAL_PLUGINS.iter().map(|p| p.url.to_string()).collect());
         }
-        if let Some((_, _, url, _)) = OFFICIAL_PLUGINS.get(n - 1) {
-            return Ok(vec![url.to_string()]);
+        if let Some(p) = OFFICIAL_PLUGINS.get(n - 1) {
+            return Ok(vec![p.url.to_string()]);
         }
         anyhow::bail!("no option {n} — pick 0..={}", OFFICIAL_PLUGINS.len());
     }
@@ -2034,15 +1979,17 @@ mod tests {
     #[cfg(feature = "digest")]
     #[test]
     fn every_official_entry_pins_a_plausible_sha256() {
-        for (name, _, url, sha) in OFFICIAL_PLUGINS {
-            assert_eq!(sha.len(), 64, "{name}: not a sha256 hex digest");
+        for p in OFFICIAL_PLUGINS {
+            assert_eq!(p.sha256.len(), 64, "{}: not a sha256 hex digest", p.name);
             assert!(
-                sha.chars().all(|c| c.is_ascii_hexdigit()),
-                "{name}: non-hex in pinned hash"
+                p.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}: non-hex in pinned hash",
+                p.name
             );
             assert!(
-                url.contains(&format!("/{name}.wasm")),
-                "{name}: url names a different artifact"
+                p.url.contains(&format!("/{}.wasm", p.name)),
+                "{}: url names a different artifact",
+                p.name
             );
         }
     }

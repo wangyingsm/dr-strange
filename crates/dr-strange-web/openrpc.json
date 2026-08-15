@@ -117,6 +117,43 @@
       }
     },
     {
+      "name": "plugin.catalog",
+      "summary": "The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent.",
+      "params": [],
+      "result": {
+        "name": "catalog",
+        "schema": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "claims": {
+                "type": "string",
+                "description": "Claimed extensions as display text, e.g. \".ts .tsx\""
+              },
+              "url": {
+                "type": "string",
+                "description": "Release-tagged download URL; the artifact at it never changes"
+              },
+              "sha256": {
+                "type": "string",
+                "description": "Hex SHA-256 of the artifact at url"
+              }
+            },
+            "required": [
+              "name",
+              "claims",
+              "url",
+              "sha256"
+            ]
+          }
+        }
+      }
+    },
+    {
       "name": "plugin.install",
       "summary": "Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC.",
       "params": [
