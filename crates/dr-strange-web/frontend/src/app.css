@@ -181,7 +181,7 @@ h2 {
 
 .health {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.75rem;
 }
 
@@ -218,10 +218,31 @@ h2 {
   color: var(--muted);
 }
 
-.planes {
+.planes,
+.plugins {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.75rem;
+}
+
+.plugin-card h3 {
+  margin: 0 0 0.25rem;
+}
+.plugin-ver {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.85em;
+}
+.plugin-exts {
+  margin: 0 0 0.25rem;
+  font-size: 0.8rem;
+  word-break: break-word;
+}
+.plugin-sha {
+  margin: 0 0 0.5rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
 }
 
 .card {

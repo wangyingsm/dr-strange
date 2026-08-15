@@ -318,6 +318,62 @@ fn on_disk_bytes(path: &std::path::Path) -> u64 {
     total
 }
 
+/// `plugin.list` — the installed preprocessor plugins, exactly the records
+/// `drsg plugin list --json` prints: one shape for agents whichever surface
+/// they read (arch/07, ROADMAP §11).
+pub fn plugin_list(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
+    let store = plugin_store()?;
+    let plugins = store.list().map_err(plug)?;
+    serde_json::to_value(plugins).map_err(|e| RpcError::server(e.to_string()))
+}
+
+#[derive(Deserialize)]
+pub struct PluginInstall {
+    /// A URL to download the component from. Server-local file paths are
+    /// deliberately not accepted over RPC: a remote caller naming paths on
+    /// the server's disk is a probe, not a workflow.
+    url: String,
+}
+
+/// `plugin.install` — download, validate, hash-pin and store a plugin.
+/// Write-gated; the URL passes the same resolved-address network policy as
+/// every other fetch (public addresses only).
+pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PluginInstall = params(p)?;
+    if !(req.url.starts_with("http://") || req.url.starts_with("https://")) {
+        return Err(RpcError::invalid_params(
+            "plugin.install takes an http(s) URL".to_string(),
+        ));
+    }
+    const CAP: usize = 256 << 20;
+    let bytes = crate::fetch::fetch_bytes(&req.url, CAP, &[])
+        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    let store = plugin_store()?;
+    let (entry, replaced) = store.install(&bytes, &req.url).map_err(plug)?;
+    Ok(jval!({ "installed": entry, "replaced": replaced }))
+}
+
+#[derive(Deserialize)]
+pub struct PluginRemove {
+    name: String,
+}
+
+/// `plugin.remove` — uninstall by name. Write-gated.
+pub fn plugin_remove(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PluginRemove = params(p)?;
+    let store = plugin_store()?;
+    let entry = store.remove(&req.name).map_err(plug)?;
+    Ok(jval!({ "removed": entry }))
+}
+
+fn plugin_store() -> Result<dr_strange_llm::PluginStore, RpcError> {
+    dr_strange_llm::PluginStore::open_default().map_err(plug)
+}
+
+fn plug(e: anyhow::Error) -> RpcError {
+    RpcError::server(format!("{e:#}"))
+}
+
 /// `db.catalog` — the soft schema across every plane.
 pub fn db_catalog(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let cat = app(ctx.db.catalog())?;

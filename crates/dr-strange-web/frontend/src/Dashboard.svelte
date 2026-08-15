@@ -13,6 +13,9 @@
 
   let stats = $state(null) // live db.stats (planes/nodes/edges/file_size)
   let planes = $state([]) // plane cards
+  let plugins = $state([]) // installed preprocessor plugins (extensions section)
+  let installing = $state(false)
+  let installUrl = $state('')
   let error = $state(null)
   let connected = $state(false)
 
@@ -113,11 +116,39 @@
     stats?.nodes ? ((stats.edges * 2) / stats.nodes).toFixed(1) : '—',
   )
 
+  async function loadPlugins() {
+    plugins = await rpc('plugin.list')
+  }
+
+  async function removePlugin(name) {
+    if (!confirm(`Remove plugin ${name}? Files it handled will fall back to the document reader.`)) return
+    try {
+      await rpc('plugin.remove', { name })
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  async function submitInstall() {
+    const url = installUrl.trim()
+    if (!url) return
+    try {
+      await rpc('plugin.install', { url })
+      installing = false
+      installUrl = ''
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    }
+  }
+
   onMount(() => {
     rpc('db.stats')
       .then((s) => (stats = s))
       .catch((e) => (error = e.message))
     loadPlanes().catch((e) => (error = e.message))
+    loadPlugins().catch((e) => (error = e.message))
     return liveStats(
       (s) => {
         stats = s
@@ -206,6 +237,60 @@
     <span class="new-card-label">New plane</span>
   </button>
 </section>
+
+<h2>Extensions</h2>
+<section class="plugins">
+  {#each plugins as p (p.name)}
+    <article class="card plugin-card">
+      <h3>{p.name}<span class="plugin-ver">@{p.version}</span></h3>
+      <p class="plugin-exts">{p.extensions.map((e) => '.' + e).join(' ')}</p>
+      <p class="plugin-sha" title={p.source}>sha256:{p.sha256.slice(0, 12)}</p>
+      <div class="card-actions">
+        <button class="del" onclick={() => removePlugin(p.name)} title="Remove this plugin">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2.75 4.25h10.5" />
+            <path d="M6.25 4.25V2.75h3.5v1.5" />
+            <path d="M4.35 4.25l.55 8.4a1 1 0 0 0 1 .9h4.2a1 1 0 0 0 1-.9l.55-8.4" />
+            <path d="M6.75 6.75v4M9.25 6.75v4" />
+          </svg>
+          Remove
+        </button>
+      </div>
+    </article>
+  {/each}
+  <button class="card new-card" onclick={() => (installing = true)} title="Install a plugin from a URL" aria-label="Install a plugin">
+    <span aria-hidden="true">+</span>
+    <span class="new-card-label">Install plugin</span>
+  </button>
+</section>
+
+{#if installing}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Install plugin">
+      <header>
+        Install plugin
+        <button class="close" onclick={() => (installing = false)} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <p>
+          Paste a plugin <code>.wasm</code> URL — official releases live at
+          <a href="https://github.com/wangyingsm/dr-strange-extension/releases" target="_blank" rel="noreferrer">dr-strange-extension</a>.
+          The artifact is validated and its hash pinned before anything runs.
+        </p>
+        <input
+          type="text"
+          placeholder="https://…/rust.wasm"
+          bind:value={installUrl}
+          onkeydown={(e) => e.key === 'Enter' && submitInstall()}
+        />
+        <div class="dlg-actions">
+          <button onclick={() => (installing = false)}>Cancel</button>
+          <button class="primary" onclick={submitInstall} disabled={!installUrl.trim()}>Install</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <CreatePlane bind:open={creating} onCreated={afterCreate} />
 
