@@ -608,3 +608,51 @@ fn reserved_and_vector_props_survive_the_reload() {
         matches!(node.properties.get("_run").map(|d| &d.value), Some(PropValue::Str(s)) if s == "c1")
     );
 }
+
+/// `--force` against a plane that does not exist yet is simply the initial
+/// build: nothing to drop, everything to load, baseline established.
+#[test]
+fn resync_builds_a_plane_that_never_existed() {
+    let tree = Tree::new("resync-fresh");
+    tree.write(
+        "a.aa", "f
+",
+    );
+    let db = dr_strange_core::Database::in_memory().unwrap();
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+    assert!(db.plane("code").is_err(), "plane must not pre-exist");
+    let stats = resync(&db, "code", &tree.host(), &plugins, "test", "r1").unwrap();
+    assert!(key_id(&db, "a.aa::f").is_some());
+    assert_eq!(stats.nodes_deleted, 0, "nothing existed to delete");
+}
+
+/// `--force`: the plane is rebuilt from the whole tree — junk from a
+/// mismatched past is gone, and running it twice is idempotent.
+#[test]
+fn resync_replaces_the_plane_wholesale() {
+    let (tree, db, plugins) = sync_fixture("resync");
+    // Pollute the plane the way a basis mismatch would: an unattributable
+    // node the incremental sync could never clean up.
+    {
+        let plane = db.plane("code").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_node_with_key("junk::orphan", &["Junk"], Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let first = resync(&db, "code", &tree.host(), &plugins, "test", "r1").unwrap();
+    assert!(
+        key_id(&db, "junk::orphan").is_none(),
+        "junk survived --force"
+    );
+    assert!(key_id(&db, "a.aa::f").is_some());
+    assert_eq!(
+        calls(&db, "b.aa::h"),
+        vec!["a.aa::f"],
+        "cross-file resolution"
+    );
+
+    let second = resync(&db, "code", &tree.host(), &plugins, "test", "r2").unwrap();
+    assert_eq!(first.nodes_loaded, second.nodes_loaded, "not idempotent");
+    assert_eq!(first.edges_written, second.edges_written, "not idempotent");
+}

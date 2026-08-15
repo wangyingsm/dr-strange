@@ -293,6 +293,11 @@ enum ServeMode {
         /// as the fallback.
         #[arg(long)]
         plane: Option<String>,
+        /// Rebuild the plane from the whole tree before serving: drop it,
+        /// re-create it, and fold every file through the installed plugins.
+        /// Facts only — embeddings return on the next `drsg digest`.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -626,12 +631,12 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             #[allow(unused_mut)]
             let mut opts = config::serve_options(cfg, addr);
             #[cfg(feature = "digest")]
-            if let Some(ServeMode::Watch { dir, plane }) = mode {
+            if let Some(ServeMode::Watch { dir, plane, force }) = mode {
                 let plane =
                     plane.unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
                 let plugin_config = config::plugin_config(cfg)?;
                 opts.on_start = Some(Box::new(move |db| {
-                    commands::watch(db, dir, plane, plugin_config)
+                    commands::watch(db, dir, plane, plugin_config, force)
                 }));
             }
             #[cfg(not(feature = "digest"))]
@@ -785,11 +790,19 @@ mod tests {
         let cli = Cli::try_parse_from(["drsg", "serve", "watch"]).unwrap();
         match cli.command {
             Command::Serve {
-                mode: Some(ServeMode::Watch { dir, plane }),
+                mode: Some(ServeMode::Watch { dir, plane, .. }),
                 ..
             } => {
                 assert_eq!(dir, PathBuf::from("."));
                 assert_eq!(plane, None);
+                let forced = Cli::try_parse_from(["drsg", "serve", "watch", "--force"]).unwrap();
+                assert!(matches!(
+                    forced.command,
+                    Command::Serve {
+                        mode: Some(ServeMode::Watch { force: true, .. }),
+                        ..
+                    }
+                ));
             }
             _ => panic!("should parse as Serve(Watch)"),
         }

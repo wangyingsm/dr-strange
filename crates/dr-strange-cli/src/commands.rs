@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
     BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
+    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions,
 };
 use serde_json::{Value, json};
 
@@ -210,6 +210,56 @@ pub fn default_plane(source: &str) -> String {
 #[cfg(feature = "digest")]
 const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Plane properties recording what the graph reflects: the commit the last
+/// digest or fold left it at, and the directory the facts were parsed from.
+/// Together they answer "is the graph in sync with the repository?" — and
+/// which basis its `file` props are relative to.
+#[cfg(feature = "digest")]
+pub const SYNC_COMMIT_PROP: &str = "synced_commit";
+#[cfg(feature = "digest")]
+pub const SYNC_ROOT_PROP: &str = "synced_root";
+
+/// Stamp the plane with the commit and parse basis it now reflects. A quiet
+/// no-op outside a git repository — there is no commit to speak of.
+#[cfg(feature = "digest")]
+fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> {
+    let Ok(head) = git_head(dir) else {
+        return Ok(());
+    };
+    let root = dir
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
+    let plane = db.plane(plane_name)?;
+    let mut props = plane.properties()?;
+    props.insert(
+        SYNC_COMMIT_PROP.into(),
+        PropDesc::described("commit the plane reflects", PropValue::Str(head)),
+    );
+    props.insert(
+        SYNC_ROOT_PROP.into(),
+        PropDesc::described("directory the facts were parsed from", PropValue::Str(root)),
+    );
+    plane.set_properties(props)?;
+    Ok(())
+}
+
+/// The recorded sync point, if any: `(commit, root)`.
+#[cfg(feature = "digest")]
+fn recorded_sync_point(db: &Database, plane_name: &str) -> (Option<String>, Option<String>) {
+    let Ok(plane) = db.plane(plane_name) else {
+        return (None, None);
+    };
+    let Ok(props) = plane.properties() else {
+        return (None, None);
+    };
+    let get = |k: &str| match props.get(k).map(|d| &d.value) {
+        Some(PropValue::Str(v)) => Some(v.clone()),
+        _ => None,
+    };
+    (get(SYNC_COMMIT_PROP), get(SYNC_ROOT_PROP))
+}
+
 /// The entry `drsg serve watch` hands to the server's `on_start` hook: run
 /// the loop forever, and if it stops, say why — the server stays up either
 /// way, and a watcher that died silently would just look like a quiet repo.
@@ -219,8 +269,9 @@ pub fn watch(
     dir: std::path::PathBuf,
     plane_name: String,
     plugin_config: dr_strange_llm::PluginConfig,
+    force: bool,
 ) {
-    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config) {
+    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, force) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
     }
 }
@@ -231,18 +282,83 @@ fn watch_loop(
     dir: &Path,
     plane_name: &str,
     plugin_config: &dr_strange_llm::PluginConfig,
+    force: bool,
 ) -> Result<()> {
     let mut head =
         git_head(dir).with_context(|| format!("{} is not a git repository", dir.display()))?;
-    if db.plane(plane_name).is_err() {
-        db.create_plane(plane_name, Properties::new())?;
-        tracing::info!(plane = plane_name, "created plane");
-    }
+    let root = dir
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
     let source = dir
         .canonicalize()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| dir.display().to_string());
+
+    if force {
+        // Rebuild before serving anything stale: drop, re-create, fold the
+        // whole tree as one delta. Facts only — embeddings return on the next
+        // real digest.
+        tracing::info!(
+            plane = plane_name,
+            "--force: rebuilding the plane from the tree"
+        );
+        let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+        let host = dr_strange_llm::LocalFiles::new(dir)?;
+        let stats = dr_strange_llm::resync(db, plane_name, &host, &plugins, &source, &head)?;
+        record_sync_point(db, plane_name, dir)?;
+        tracing::info!(
+            commit = %&head[..12.min(head.len())],
+            nodes_loaded = stats.nodes_loaded,
+            edges_written = stats.edges_written,
+            prose_skipped_chars = stats.prose_chars,
+            "plane rebuilt; embeddings return on the next digest"
+        );
+    } else {
+        if db.plane(plane_name).is_err() {
+            db.create_plane(plane_name, Properties::new())?;
+            tracing::info!(plane = plane_name, "created plane");
+        }
+        // Where does the graph stand relative to the repository? The plane
+        // says which commit it reflects; the answer decides how to start.
+        let (rec_commit, rec_root) = recorded_sync_point(db, plane_name);
+        if let Some(r) = &rec_root
+            && *r != root
+        {
+            tracing::warn!(
+                plane_root = %r,
+                watch_root = %root,
+                "the plane was parsed from a different directory — file                  attribution will not line up; `--force` (or a re-digest from                  this directory) puts them on one basis"
+            );
+        }
+        match rec_commit {
+            Some(rec) if rec == head => {
+                tracing::info!(commit = %&rec[..12.min(rec.len())], "graph and repository are in sync");
+            }
+            Some(rec) if commit_known(dir, &rec) => {
+                tracing::info!(
+                    from = %&rec[..12.min(rec.len())],
+                    to = %&head[..12.min(head.len())],
+                    "graph is behind the repository — catching up"
+                );
+                // The ordinary fold covers the gap: start from the recorded
+                // commit and let the first poll diff it against HEAD.
+                head = rec;
+            }
+            Some(rec) => {
+                tracing::warn!(
+                    recorded = %&rec[..12.min(rec.len())],
+                    "the plane's sync point is unknown to this repository                      (rewritten history, or another repo) — folding forward                      from the current HEAD; `--force` re-establishes exact sync"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "the plane records no sync point, so graph and repository                      cannot be compared — folding forward from the current                      HEAD; a digest of this directory (or `--force`)                      establishes one"
+                );
+            }
+        }
+    }
     tracing::info!(
         dir = %dir.display(),
         plane = plane_name,
@@ -291,12 +407,23 @@ fn watch_loop(
             }
             Ok(())
         })();
-        if let Err(e) = step {
-            tracing::warn!(
-                error = format!("{e:#}"),
-                from = %head, to = %now,
-                "folding the commit failed; watching continues from the new HEAD"
-            );
+        match step {
+            Ok(()) => {
+                // The plane now reflects `now`; say so durably, so the next
+                // start knows where to catch up from.
+                if let Err(e) = record_sync_point(db, plane_name, dir) {
+                    tracing::warn!(error = format!("{e:#}"), "recording the sync point failed");
+                }
+            }
+            Err(e) => {
+                // The in-memory cursor advances so polling continues, but the
+                // recorded point stays behind — a restart retries this gap.
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    from = %head, to = %now,
+                    "folding the commit failed; watching continues from the new HEAD"
+                );
+            }
         }
         head = now;
     }
@@ -318,6 +445,12 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+/// Whether `sha` names a commit this repository knows.
+#[cfg(feature = "digest")]
+fn commit_known(dir: &Path, sha: &str) -> bool {
+    git(dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
 }
 
 #[cfg(feature = "digest")]
@@ -1372,6 +1505,15 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
                 "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"
             )?;
         }
+        // A directory inside a git repository gets its sync point stamped, so
+        // `serve watch` can later say whether the graph is current and catch
+        // up from exactly here.
+        if std::fs::metadata(args.source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            record_sync_point(db, args.plane, Path::new(args.source))?;
+        }
     } else {
         for n in result.nodes.iter().take(12) {
             writeln!(out, "  [{}] {} ({} props)", n.label, n.key, n.props.len())?;
@@ -2148,6 +2290,95 @@ mod tests {
         // machine surface carries it to UIs.
         assert!(parsed[0]["logo"].as_str().unwrap().starts_with("<svg"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sync point round-trips through plane properties, and the watch
+    /// startup can tell in-sync from behind from unknowable.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn sync_point_records_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("drsg-syncpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c1",
+        ]);
+
+        let db = Database::in_memory().unwrap();
+        db.create_plane("p", Properties::new()).unwrap();
+
+        // Nothing recorded yet — the graph cannot be compared.
+        assert_eq!(recorded_sync_point(&db, "p"), (None, None));
+
+        record_sync_point(&db, "p", &dir).unwrap();
+        let (commit, root) = recorded_sync_point(&db, "p");
+        let head = git_head(&dir).unwrap();
+        assert_eq!(commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            root.as_deref(),
+            Some(dir.canonicalize().unwrap().to_str().unwrap())
+        );
+        assert!(commit_known(&dir, &head));
+        assert!(!commit_known(
+            &dir,
+            "0000000000000000000000000000000000000000"
+        ));
+
+        // A new commit: the recorded point is behind but known — the catch-up
+        // case — and re-recording moves it forward.
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c2",
+        ]);
+        let new_head = git_head(&dir).unwrap();
+        assert_ne!(commit.as_deref(), Some(new_head.as_str()));
+        assert!(commit_known(&dir, commit.as_deref().unwrap()));
+        record_sync_point(&db, "p", &dir).unwrap();
+        assert_eq!(
+            recorded_sync_point(&db, "p").0.as_deref(),
+            Some(new_head.as_str())
+        );
+
+        // Outside a repository: recording is a quiet no-op.
+        let plain =
+            std::env::temp_dir().join(format!("drsg-syncpoint-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        db.create_plane("q", Properties::new()).unwrap();
+        record_sync_point(&db, "q", &plain).unwrap();
+        assert_eq!(recorded_sync_point(&db, "q"), (None, None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     /// `git diff --name-status -z` per status letter: one path each, except

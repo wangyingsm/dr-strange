@@ -31,7 +31,7 @@ pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
 pub use preprocess::{
     CommitDelta, FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins,
-    Preprocessed, Preprocessor, SyncStats, fold, route_document, route_paths, route_tree,
+    Preprocessed, Preprocessor, SyncStats, fold, resync, route_document, route_paths, route_tree,
     stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]

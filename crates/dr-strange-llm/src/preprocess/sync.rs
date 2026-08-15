@@ -275,3 +275,30 @@ pub fn sync_paths(
 
     Ok(stats)
 }
+
+/// Rebuild `plane_name` from the whole tree: drop it, re-create it, and fold
+/// every file the host lists as one delta — `serve watch --force`.
+///
+/// One delta means one assemble over the full set, so cross-file resolution
+/// matches a fresh digest's facts rather than a per-commit fold's. Facts
+/// only, like every sync: embeddings and model prose are a digest's business
+/// and return on the next one.
+pub fn resync(
+    db: &Database,
+    plane_name: &str,
+    host: &dyn Host,
+    plugins: &Plugins,
+    source: &str,
+    run_id: &str,
+) -> Result<SyncStats> {
+    if let Ok(plane) = db.plane(plane_name) {
+        let id = plane.id();
+        db.drop_plane(id)?;
+    }
+    db.create_plane(plane_name, Properties::new())?;
+    let delta = CommitDelta {
+        changed: host.list("")?,
+        deleted: Vec::new(),
+    };
+    sync_paths(db, plane_name, host, &delta, plugins, source, run_id)
+}
