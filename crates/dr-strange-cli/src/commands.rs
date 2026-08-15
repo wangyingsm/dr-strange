@@ -332,7 +332,13 @@ fn git_head(dir: &Path) -> Result<String> {
 #[cfg(feature = "digest")]
 fn git_changes(dir: &Path, old: &str, new: &str) -> Result<dr_strange_llm::CommitDelta> {
     // `-z` because paths are data: NUL separators cannot collide with them.
-    let out = git(dir, &["diff", "--name-status", "-M", "-z", old, new])?;
+    // `--relative` because the watched directory may be a subdirectory of the
+    // repository: paths must be relative to what the host serves (and files
+    // outside the watched directory are rightly excluded).
+    let out = git(
+        dir,
+        &["diff", "--relative", "--name-status", "-M", "-z", old, new],
+    )?;
     let (changed, deleted) = parse_name_status(&out);
     Ok(dr_strange_llm::CommitDelta { changed, deleted })
 }
