@@ -59,6 +59,12 @@ impl CandidateSource for FactsAndPlane<'_> {
         }
     }
 
+    fn wants_similar(&self) -> bool {
+        // Facts alone answer `similar` with nothing; only a real plane behind
+        // them makes a chunk vector worth producing.
+        self.inner.is_some_and(|inner| inner.wants_similar())
+    }
+
     fn existing_keys(&self, keys: &[String]) -> Result<Vec<ExistingEntity>> {
         let mut found = match self.inner {
             Some(inner) => inner.existing_keys(keys)?,

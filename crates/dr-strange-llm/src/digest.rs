@@ -58,6 +58,14 @@ pub trait CandidateSource {
     /// Best-effort: an empty result simply means "propose everything as new".
     fn similar(&self, query: &[f32], k: usize) -> Result<Vec<ExistingEntity>>;
 
+    /// Whether [`similar`](Self::similar) can return anything at all. `false`
+    /// lets the digest skip embedding a chunk whose vector nobody will read —
+    /// which is also what keeps `--no-link --no-embed` from needing an
+    /// embedding key.
+    fn wants_similar(&self) -> bool {
+        true
+    }
+
     /// Which of `keys` the target graph already holds, looked up **exactly**.
     ///
     /// Similarity search cannot answer this: it depends on the plane's nodes
@@ -431,7 +439,11 @@ pub fn digest(
     let mut blocks: Vec<Option<String>> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         let block = match candidates {
-            Some(src) => {
+            // `wants_similar` gates the chunk embedding: a grounding-only
+            // source (facts with no plane behind them — `--no-link`) answers
+            // `similar` with nothing, so embedding the chunk would spend a
+            // provider call, and require a key, for a vector nobody reads.
+            Some(src) if src.wants_similar() => {
                 let emb = embedder.embed(std::slice::from_ref(chunk))?;
                 report.embed_tokens += emb.tokens;
                 let cands = match emb.vectors.first() {
@@ -444,7 +456,7 @@ pub fn digest(
                 }
                 block
             }
-            None => None,
+            _ => None,
         };
         blocks.push(block);
     }
