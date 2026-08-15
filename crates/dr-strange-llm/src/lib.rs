@@ -24,7 +24,8 @@ mod refine;
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
     ApplyStats, CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport,
-    DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, entity_text,
+    DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, embeddable_text,
+    entity_text, fact_text,
 };
 pub use document::to_markdown;
 pub use identity::IdentityReport;

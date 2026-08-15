@@ -185,6 +185,22 @@ enum Command {
         #[arg(long)]
         embed_model: Option<String>,
     },
+    /// Embed every node in a plane for similarity search (alias: `vec`).
+    /// Incremental: nodes whose text is unchanged since the last run are
+    /// skipped. Parser facts embed a stable projection (no positional
+    /// properties); document-extracted nodes embed all their content.
+    #[cfg(feature = "digest")]
+    #[command(alias = "vec")]
+    Vectorize {
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        /// Embedding model override (default: the provider's).
+        #[arg(long)]
+        embed_model: Option<String>,
+    },
     /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
     /// that turn source files into graph facts before any model reads them.
     #[cfg(feature = "digest")]
@@ -645,6 +661,17 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             // blocks until a shutdown signal; `out` is unused (the server logs
             // itself).
             dr_strange_web::serve(db, Some(cli.db.clone()), opts)
+        }
+        #[cfg(feature = "digest")]
+        Command::Vectorize {
+            plane,
+            embed,
+            embed_model,
+        } => {
+            let db = commands::open(&cli.db)?;
+            let embedder =
+                dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
+            commands::vectorize(&db, &plane, &embedder, out)
         }
         #[cfg(feature = "digest")]
         Command::Ask {

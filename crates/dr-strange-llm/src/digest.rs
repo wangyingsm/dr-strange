@@ -910,6 +910,64 @@ fn embed_text(n: &DigestNode) -> String {
     entity_text(&n.key, std::slice::from_ref(&n.label), &n.props)
 }
 
+/// The text embedded for a **parser fact**: identity, then string content
+/// only — `Int`/`Float`/`Bool` properties are dropped, unlike
+/// [`entity_text`]'s promote-everything rule.
+///
+/// Two reasons, and the second is the load-bearing one. Precision: `line: 833`
+/// describes where a symbol sits, not what it is. Stability: positional
+/// properties churn with every commit above the symbol, so including them
+/// would re-vectorize an unchanged function on every fold — while with them
+/// excluded, an unchanged symbol's text is byte-stable and re-embedding can
+/// skip it outright. Document-extracted entities keep [`entity_text`]:
+/// `year: 2020` on a paper is content, and documents rarely churn.
+pub fn fact_text(key: &str, labels: &[String], props: &Properties) -> String {
+    let mut s = match labels {
+        [] => key.to_string(),
+        _ => format!("{} ({})", key, labels.join(", ")),
+    };
+    for (k, pd) in props {
+        if k.starts_with('_') {
+            continue;
+        }
+        let text = match &pd.value {
+            PropValue::Str(v) => {
+                let t = v.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            }
+            PropValue::List(items) => {
+                let parts: Vec<&str> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropValue::Str(t) => {
+                            let t = t.trim();
+                            (!t.is_empty()).then_some(t)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            s.push_str(&format!("\n{k}: {text}"));
+        }
+    }
+    s
+}
+
+/// The text to embed for any node, chosen by provenance: a node a parser
+/// stamped (`_generated_by`) gets [`fact_text`]'s projection; everything else
+/// — model extractions, agent writes — gets [`entity_text`] in full.
+pub fn embeddable_text(key: &str, labels: &[String], props: &Properties) -> String {
+    if props.contains_key("_generated_by") {
+        fact_text(key, labels, props)
+    } else {
+        entity_text(key, labels, props)
+    }
+}
+
 /// The canonical text for an entity, shared by every path that embeds one.
 ///
 /// Identity first (`key (Label)`), then each property that has text, as
@@ -1298,6 +1356,68 @@ mod tests {
     fn a_document_with_no_markers_chunks_exactly_as_before() {
         let doc = "One paragraph.\n\nAnother paragraph.\n\nA third.";
         assert_eq!(chunk(doc, 4000).len(), 1, "markers are the only new break");
+    }
+
+    /// Parser facts embed a projection: strings and string-lists only.
+    /// `line: 833` would churn the vector of an unchanged symbol on every
+    /// commit above it; the projection keeps the text byte-stable instead.
+    #[test]
+    fn fact_text_drops_numerics_and_keeps_content() {
+        let mut props = Properties::new();
+        let put = |props: &mut Properties, k: &str, v: PropValue| {
+            props.insert(k.into(), PropDesc::described(k, v));
+        };
+        put(
+            &mut props,
+            "doc_comment",
+            PropValue::Str("Fetches one node.".into()),
+        );
+        put(
+            &mut props,
+            "signature",
+            PropValue::Str("fn node(&self)".into()),
+        );
+        put(&mut props, "line", PropValue::Int(833));
+        put(&mut props, "is_async", PropValue::Bool(false));
+        put(
+            &mut props,
+            "fields",
+            PropValue::List(vec![PropValue::Str("id: NodeId".into()), PropValue::Int(9)]),
+        );
+        put(&mut props, "_run", PropValue::Str("abc".into()));
+
+        let t = fact_text("k::node", &["Method".into()], &props);
+        assert!(t.starts_with("k::node (Method)"));
+        assert!(t.contains("doc_comment: Fetches one node."));
+        assert!(t.contains("fields: id: NodeId"), "{t}");
+        assert!(!t.contains("833"), "positional noise embedded: {t}");
+        assert!(!t.contains("is_async"), "{t}");
+        assert!(!t.contains("_run"), "{t}");
+        // entity_text, by contrast, promotes the number — that is the
+        // document rule, where `year: 2020` is content.
+        assert!(entity_text("k::node", &["Method".into()], &props).contains("line: 833"));
+    }
+
+    /// Provenance picks the recipe: `_generated_by` → projection, else full.
+    #[test]
+    fn embeddable_text_chooses_by_provenance() {
+        let mut fact = Properties::new();
+        fact.insert(
+            "_generated_by".into(),
+            PropDesc::described("parser", PropValue::Str("rust@2".into())),
+        );
+        fact.insert(
+            "line".into(),
+            PropDesc::described("line", PropValue::Int(7)),
+        );
+        assert!(!embeddable_text("k", &[], &fact).contains("line: 7"));
+
+        let mut doc = Properties::new();
+        doc.insert(
+            "year".into(),
+            PropDesc::described("year", PropValue::Int(2020)),
+        );
+        assert!(embeddable_text("k", &[], &doc).contains("year: 2020"));
     }
 
     #[test]
