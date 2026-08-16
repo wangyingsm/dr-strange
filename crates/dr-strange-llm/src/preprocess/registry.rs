@@ -78,8 +78,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "py",
         claims: ".py .pyi .pyw",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.2.0/py.wasm",
-        sha256: "518729ad65e59b5c040ee437676d33ba1ffb2033d15a0e2fec806d0282cf3ef0",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.2.1/py.wasm",
+        sha256: "a218cb9b0d7cad89bac1f649ad320bd9702c984476fea69c0fa7659e2d841b91",
     },
     OfficialPlugin {
         name: "java",
