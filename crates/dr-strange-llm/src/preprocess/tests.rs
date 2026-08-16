@@ -656,3 +656,147 @@ fn resync_replaces_the_plane_wholesale() {
     assert_eq!(first.nodes_loaded, second.nodes_loaded, "not idempotent");
     assert_eq!(first.edges_written, second.edges_written, "not idempotent");
 }
+
+// ---- P0 eval harness: fold-vs-full convergence -----------------------------
+
+/// A handler that resolves cross-file the way the real parsers do: a call
+/// edge is emitted only when its target is defined by a file **in the same
+/// assemble batch**. Whole-tree digests see everything; per-file folds see
+/// one file — which is exactly the divergence the benchmark exposed
+/// (catalog::count misbound in a fold, correct in a full digest).
+struct XLang;
+
+impl Preprocessor for XLang {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: "xx".into(),
+            version: "1".into(),
+            extensions: vec!["xx".into()],
+            logo: None,
+        }
+    }
+
+    fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed> {
+        let mut out = Preprocessed::default();
+        let Input::Files { paths } = input else {
+            anyhow::bail!("files only");
+        };
+        // Batch-wide definition table — the "assemble sees the batch" model.
+        let mut defined: Vec<(String, String)> = Vec::new(); // (name, key)
+        let mut bodies: Vec<(String, String)> = Vec::new();
+        for path in *paths {
+            let body = String::from_utf8(host.read(path)?)?;
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                let name = line.split("->").next().unwrap().trim().to_string();
+                defined.push((name.clone(), format!("{path}::{name}")));
+            }
+            bodies.push((path.clone(), body));
+        }
+        for (path, body) in &bodies {
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                let (name, callee) = match line.split_once("->") {
+                    Some((n, c)) => (n.trim(), Some(c.trim())),
+                    None => (line.trim(), None),
+                };
+                let key = format!("{path}::{name}");
+                out.nodes.push(DigestNode {
+                    key: key.clone(),
+                    label: "Function".into(),
+                    extra_labels: Vec::new(),
+                    props: {
+                        let mut p = Properties::new();
+                        p.insert(
+                            "file".into(),
+                            PropDesc::described("file", PropValue::Str(path.clone())),
+                        );
+                        p
+                    },
+                });
+                if let Some(callee) = callee {
+                    // Resolve against the batch, like a real assemble.
+                    if let Some((_, dst)) = defined.iter().find(|(n, _)| n == callee) {
+                        out.edges.push(DigestEdge {
+                            src: key,
+                            dst: dst.clone(),
+                            ty: "CALLS".into(),
+                            props: Properties::new(),
+                        });
+                    } else {
+                        out.report.notes.push(format!("unresolved: {callee}"));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One plane's shape as comparable sets: node keys and (src, ty, dst) edges.
+fn graph_shape(
+    db: &dr_strange_core::Database,
+    plane: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<(String, String, String)>,
+) {
+    let p = db.plane(plane).unwrap();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut edges = std::collections::BTreeSet::new();
+    for n in p.query().scan_all().nodes().unwrap() {
+        let Some(k) = n.external_key.clone() else {
+            continue;
+        };
+        for hop in p
+            .neighbors(n.id, dr_strange_core::Dir::Out, None)
+            .unwrap()
+        {
+            let dst = p
+                .node(hop.node)
+                .unwrap()
+                .and_then(|r| r.external_key)
+                .unwrap_or_default();
+            let ty = p.edge(hop.edge).unwrap().unwrap().ty;
+            edges.insert((k.clone(), ty, dst));
+        }
+        keys.insert(k);
+    }
+    (keys, edges)
+}
+
+/// The convergence requirement: folding a repository file-by-file must land
+/// on the same graph as digesting it whole. Today it does not — a per-file
+/// fold assembles alone, so cross-file resolution differs.
+#[test]
+#[ignore = "P4: per-file folds assemble without cross-file candidates — not convergent with full rebuild"]
+fn folds_converge_with_full_rebuild() {
+    let tree = Tree::new("p0-drift");
+    tree.write("a.xx", "f->h\n");
+    tree.write("b.xx", "h\n");
+    let plugins = || Plugins::from_handlers(vec![Box::new(XLang)]);
+
+    // Full: everything in one delta — the whole-tree digest.
+    let full = dr_strange_core::Database::in_memory().unwrap();
+    full.create_plane("code", Properties::new()).unwrap();
+    let delta = CommitDelta {
+        changed: vec!["a.xx".to_string(), "b.xx".to_string()],
+        ..Default::default()
+    };
+    sync_paths(&full, "code", &tree.host(), &delta, &plugins(), "t", "c0").unwrap();
+
+    // Folded: the same files arriving one commit at a time.
+    let folded = dr_strange_core::Database::in_memory().unwrap();
+    folded.create_plane("code", Properties::new()).unwrap();
+    for f in ["b.xx", "a.xx"] {
+        let delta = CommitDelta {
+            changed: vec![f.to_string()],
+            ..Default::default()
+        };
+        sync_paths(&folded, "code", &tree.host(), &delta, &plugins(), "t", f).unwrap();
+    }
+
+    assert_eq!(
+        graph_shape(&full, "code"),
+        graph_shape(&folded, "code"),
+        "a fold-built plane must equal the digest-built plane"
+    );
+}
