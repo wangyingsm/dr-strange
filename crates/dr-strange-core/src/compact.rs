@@ -153,6 +153,13 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
                 if hop.node == node.id {
                     line.push_str("  (self)");
                 }
+                // The unresolved ledger (P1): a boundary is announced, not
+                // hidden — the reason travels on the edge.
+                if other.labels.first().map(String::as_str) == Some("UnresolvedRef")
+                    && let Some(reason) = prop_str(&edge.properties, "_reason")
+                {
+                    line.push_str(&format!("  [{reason}]"));
+                }
             }
             groups.entry((tag, edge.ty.clone())).or_default().push(line);
         }
