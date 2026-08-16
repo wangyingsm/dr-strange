@@ -485,9 +485,11 @@ fn a_modified_file_drops_its_stale_symbols_and_keeps_incoming_edges() {
     let stats = sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
     assert!(key_id(&db, "a.aa::g").is_none(), "stale symbol survived");
     assert!(key_id(&db, "a.aa::f").is_some());
-    // The untouched file's assertion onto the re-created node was re-attached…
+    // The untouched file's assertion onto the surviving node stands — under
+    // diff-apply the node was never deleted, so nothing needed re-attaching.
     assert_eq!(calls(&db, "b.aa::h"), vec!["a.aa::f"]);
-    assert_eq!(stats.edges_reattached, 1);
+    assert_eq!(stats.edges_reattached, 0);
+    assert_eq!(stats.nodes_deleted, 1, "exactly g goes");
     // …and the re-parsed file's own outgoing edge still resolves cross-file.
     assert_eq!(calls(&db, "a.aa::f"), vec!["b.aa::h"]);
 }
@@ -603,9 +605,11 @@ fn reserved_and_vector_props_survive_the_reload() {
         "embedding lost in the reload"
     );
     assert!(node.properties.contains_key("_reviewed"));
-    // The parser's own view is fresh, not carried: _run moved to the new sync.
+    // `_run` names the fold that last *changed* this node's content — f's
+    // facts did not change here, so its provenance stays at the first sync
+    // rather than churning on every fold that merely re-read the file.
     assert!(
-        matches!(node.properties.get("_run").map(|d| &d.value), Some(PropValue::Str(s)) if s == "c1")
+        matches!(node.properties.get("_run").map(|d| &d.value), Some(PropValue::Str(s)) if s == "c0")
     );
 }
 
@@ -746,10 +750,7 @@ fn graph_shape(
         let Some(k) = n.external_key.clone() else {
             continue;
         };
-        for hop in p
-            .neighbors(n.id, dr_strange_core::Dir::Out, None)
-            .unwrap()
-        {
+        for hop in p.neighbors(n.id, dr_strange_core::Dir::Out, None).unwrap() {
             let dst = p
                 .node(hop.node)
                 .unwrap()
@@ -767,7 +768,6 @@ fn graph_shape(
 /// on the same graph as digesting it whole. Today it does not — a per-file
 /// fold assembles alone, so cross-file resolution differs.
 #[test]
-#[ignore = "P4: per-file folds assemble without cross-file candidates — not convergent with full rebuild"]
 fn folds_converge_with_full_rebuild() {
     let tree = Tree::new("p0-drift");
     tree.write("a.xx", "f->h\n");
