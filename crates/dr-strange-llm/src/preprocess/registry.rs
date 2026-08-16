@@ -60,8 +60,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "rust",
         claims: ".rs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.1.2/rust.wasm",
-        sha256: "92d6e4f8df0d10a27665677a4115a908080de473b3f97c4dd8e0b809fbae67aa",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.2.0/rust.wasm",
+        sha256: "ae78b8ac3d9b53ff55d3472bc3d89c89b2d0cfd329d2db09b8438de9f206cacf",
     },
     OfficialPlugin {
         name: "go",
@@ -78,8 +78,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "py",
         claims: ".py .pyi .pyw",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.1.0/py.wasm",
-        sha256: "b8664629a05a4e523c9c16f4ca29106b4ea325974b5d9f9b9ee1c1d1ad765d41",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.2.0/py.wasm",
+        sha256: "518729ad65e59b5c040ee437676d33ba1ffb2033d15a0e2fec806d0282cf3ef0",
     },
     OfficialPlugin {
         name: "java",
