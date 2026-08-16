@@ -107,6 +107,21 @@ fn candidates(name: &str, hits: &[NodeRecord]) -> String {
     out
 }
 
+/// Freshness, stated where the answer is read: a watched plane records the
+/// commit it last folded, and an agent holding a newer checkout should know
+/// the graph may lag it. Silence means the plane records no sync point (a
+/// plain digest), where staleness is simply the digest's age.
+fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
+    let props = plane.properties()?;
+    Ok(props.get("synced_commit").and_then(|d| match &d.value {
+        crate::PropValue::Str(commit) => Some(format!(
+            "synced: commit {}\n",
+            &commit[..12.min(commit.len())]
+        )),
+        _ => None,
+    }))
+}
+
 /// The honesty footer every call listing carries: what a recorded edge set
 /// can and cannot claim.
 const CALLS_NOTE: &str = "note: recorded call edges only — calls the parser could not resolve \
@@ -115,6 +130,13 @@ const CALLS_NOTE: &str = "note: recorded call edges only — calls the parser co
 
 /// Most entries printed per edge group before eliding with a count.
 const GROUP_CAP: usize = 20;
+
+/// Ceiling on a whole `context` reply, in characters. A hub node (a module
+/// containing hundreds of symbols, a base type everything calls) must not
+/// flood the caller's context window: when the full rendering exceeds this,
+/// the per-group cap shrinks until it fits, and every elision names the
+/// count it hides.
+const CONTEXT_BUDGET: usize = 24_000;
 
 /// `context` — the primary agent verb: one symbol's whole neighborhood in a
 /// single round trip. The head and properties are [`describe`]'s; then the
@@ -130,6 +152,9 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
     };
     let mut out = describe_record(plane, &node)?;
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
 
     // Group every edge by (direction, type). CONTAINS-in is rendered as the
     // parent ("contained by"); CALLS carry their call-site lines.
@@ -165,43 +190,52 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         }
     }
 
-    let mut section = |title: &str, key: (&'static str, String), out: &mut String| {
-        if let Some(lines) = groups.remove(&key) {
-            out.push_str(&format!("{title} ({}):\n", lines.len()));
-            for l in lines.iter().take(GROUP_CAP) {
-                out.push_str("  ");
-                out.push_str(l);
-                out.push('\n');
-            }
-            if lines.len() > GROUP_CAP {
-                out.push_str(&format!("  … and {} more\n", lines.len() - GROUP_CAP));
-            }
+    // Sections in fixed order: the named four first, then whatever edge
+    // vocabulary remains (IMPLEMENTS, EXTENDS, HAS_METHOD, IMPORTS, …) under
+    // its own name, direction marked.
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for (title, key) in [
+        ("contained by", ("in", "CONTAINS")),
+        ("callers", ("in", "CALLS")),
+        ("callees", ("out", "CALLS")),
+        ("contains", ("out", "CONTAINS")),
+    ] {
+        if let Some(lines) = groups.remove(&(key.0, key.1.to_string())) {
+            sections.push((title.to_string(), lines));
         }
-    };
-    section("contained by", ("in", "CONTAINS".into()), &mut out);
-    section("callers", ("in", "CALLS".into()), &mut out);
-    section("callees", ("out", "CALLS".into()), &mut out);
-    section("contains", ("out", "CONTAINS".into()), &mut out);
-    // Whatever edge vocabulary remains (IMPLEMENTS, EXTENDS, HAS_METHOD,
-    // IMPORTS, STYLED_BY, …) renders under its own name, direction marked.
-    let rest: Vec<((&'static str, String), Vec<String>)> = groups.into_iter().collect();
-    for ((dir, ty), lines) in rest {
+    }
+    for ((dir, ty), lines) in std::mem::take(&mut groups) {
         let arrow = if dir == "in" { "←" } else { "→" };
-        let mut buf = format!("{ty} {arrow} ({}):\n", lines.len());
-        for l in lines.iter().take(GROUP_CAP) {
-            buf.push_str("  ");
-            buf.push_str(l);
-            buf.push('\n');
-        }
-        if lines.len() > GROUP_CAP {
-            buf.push_str(&format!("  … and {} more\n", lines.len() - GROUP_CAP));
-        }
-        out.push_str(&buf);
+        sections.push((format!("{ty} {arrow}"), lines));
     }
-    if had_calls {
-        out.push_str(CALLS_NOTE);
+
+    let render = |cap: usize| -> String {
+        let mut buf = out.clone();
+        for (title, lines) in &sections {
+            buf.push_str(&format!("{title} ({}):\n", lines.len()));
+            for l in lines.iter().take(cap) {
+                buf.push_str("  ");
+                buf.push_str(l);
+                buf.push('\n');
+            }
+            if lines.len() > cap {
+                buf.push_str(&format!("  … and {} more\n", lines.len() - cap));
+            }
+        }
+        if had_calls {
+            buf.push_str(CALLS_NOTE);
+        }
+        buf
+    };
+    // The budget beats the group cap: shrink until it fits (never below 3 —
+    // a section reduced past that says nothing worth its lines).
+    let mut cap = GROUP_CAP;
+    let mut rendered = render(cap);
+    while rendered.len() > CONTEXT_BUDGET && cap > 3 {
+        cap = (cap / 2).max(3);
+        rendered = render(cap);
     }
-    Ok(out)
+    Ok(rendered)
 }
 
 /// `search` — semantic lookup for questions that name no identifier: cosine
@@ -226,6 +260,9 @@ pub fn search(plane: &PlaneHandle<'_>, query: &[f32], k: u64) -> Result<String> 
         );
     }
     let mut out = String::new();
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
     for (n, score) in &hits {
         if let Some(score) = score {
             out.push_str(&format!("{score:.3}  "));
@@ -335,6 +372,58 @@ mod tests {
         let _ = g;
         txn.commit().unwrap();
         db
+    }
+
+    #[test]
+    fn a_hub_context_stays_within_budget_and_names_elisions() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let hub = txn
+            .create_node_with_key("m::hub", &["Module"], Properties::new())
+            .unwrap();
+        // Enough long-keyed children that a GROUP_CAP rendering blows the
+        // budget: the cap must shrink and the elision must count the rest.
+        for i in 0..600 {
+            let long = "x".repeat(120);
+            let child = txn
+                .create_node_with_key(
+                    &format!("m::hub::{long}::symbol_{i}"),
+                    &["Function"],
+                    Properties::new(),
+                )
+                .unwrap();
+            txn.create_edge(hub, child, "CONTAINS", Properties::new())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let out = context(&db.plane("code").unwrap(), "m::hub").unwrap();
+        assert!(
+            out.len() <= CONTEXT_BUDGET,
+            "context must respect its budget, got {} chars",
+            out.len()
+        );
+        assert!(out.contains("contains (600):"), "the true count is stated");
+        assert!(out.contains("more"), "the elision names what it hides");
+    }
+
+    #[test]
+    fn a_synced_plane_states_its_commit() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(
+            out.contains("synced: commit abcdef012345"),
+            "freshness is stated where the answer is read: {out}"
+        );
     }
 
     #[test]

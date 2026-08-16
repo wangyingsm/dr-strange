@@ -738,8 +738,11 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 let plane =
                     plane.unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
                 let plugin_config = config::plugin_config(cfg)?;
+                // The same embed config the server's search uses keeps the
+                // watched plane's vectors current after each fold.
+                let embed = opts.embed_provider.clone();
                 opts.on_start = Some(Box::new(move |db| {
-                    commands::watch(db, dir, plane, plugin_config, force)
+                    commands::watch(db, dir, plane, plugin_config, embed, force)
                 }));
             }
             #[cfg(not(feature = "digest"))]

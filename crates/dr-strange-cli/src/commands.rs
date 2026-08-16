@@ -269,9 +269,10 @@ pub fn watch(
     dir: std::path::PathBuf,
     plane_name: String,
     plugin_config: dr_strange_llm::PluginConfig,
+    embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
 ) {
-    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, force) {
+    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, embed, force) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
     }
 }
@@ -282,10 +283,56 @@ fn watch_loop(
     dir: &Path,
     plane_name: &str,
     plugin_config: &dr_strange_llm::PluginConfig,
+    embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
 ) -> Result<()> {
     let mut head =
         git_head(dir).with_context(|| format!("{} is not a git repository", dir.display()))?;
+    // The server's embed config, when it has one, keeps a watched plane
+    // searchable: after a fold changes facts, the changed nodes re-embed
+    // (`_embedded_from` makes that pass incremental). No config, or a
+    // provider that cannot be built (missing key), degrades to facts-only —
+    // said once here, not per fold.
+    let embedder: Option<Box<dyn dr_strange_llm::Embedder>> = match &embed {
+        Some((provider, model, key_env)) => {
+            match dr_strange_llm::build_provider(
+                provider,
+                model.as_deref(),
+                None,
+                key_env.as_deref(),
+                true,
+            ) {
+                Ok(e) => Some(Box::new(e) as Box<dyn dr_strange_llm::Embedder>),
+                Err(e) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "embed provider unavailable — folds will update facts only"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let revectorize = |why: &str| {
+        let Some(e) = embedder.as_deref() else {
+            return;
+        };
+        match dr_strange_llm::vectorize_plane(db, plane_name, e, dr_strange_core::Metric::Cosine) {
+            Ok(v) if v.embedded > 0 => tracing::info!(
+                embedded = v.embedded,
+                current = v.current,
+                tokens = v.tokens,
+                why,
+                "re-vectorized changed nodes"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "re-vectorizing after the fold failed; facts are current, vectors lag"
+            ),
+        }
+    };
     let root = dir
         .canonicalize()
         .map(|p| p.display().to_string())
@@ -313,8 +360,9 @@ fn watch_loop(
             nodes_loaded = stats.nodes_loaded,
             edges_written = stats.edges_written,
             prose_skipped_chars = stats.prose_chars,
-            "plane rebuilt; embeddings return on the next digest"
+            "plane rebuilt"
         );
+        revectorize("--force rebuild");
     } else {
         if db.plane(plane_name).is_err() {
             db.create_plane(plane_name, Properties::new())?;
@@ -379,10 +427,10 @@ fn watch_loop(
         }
         // One diff covers however far HEAD moved — several commits, a rebase,
         // a branch switch. What matters is the file set between the states.
-        let step = (|| -> Result<()> {
+        let step = (|| -> Result<bool> {
             let delta = git_changes(dir, &head, &now)?;
             if delta.changed.is_empty() && delta.deleted.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             // Reloaded each commit so a `drsg plugin install` between commits
             // is picked up without restarting the server.
@@ -407,14 +455,17 @@ fn watch_loop(
             for note in &stats.notes {
                 tracing::info!(note, "sync note");
             }
-            Ok(())
+            Ok(stats.nodes_loaded + stats.nodes_patched + stats.nodes_deleted > 0)
         })();
         match step {
-            Ok(()) => {
+            Ok(changed) => {
                 // The plane now reflects `now`; say so durably, so the next
                 // start knows where to catch up from.
                 if let Err(e) = record_sync_point(db, plane_name, dir) {
                     tracing::warn!(error = format!("{e:#}"), "recording the sync point failed");
+                }
+                if changed {
+                    revectorize("commit fold");
                 }
                 // Folds are commit-paced, so keeping the sidecars fresh here
                 // is cheap — and a hard kill then costs the next boot nothing.
