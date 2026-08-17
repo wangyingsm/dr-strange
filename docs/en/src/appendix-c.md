@@ -3,7 +3,9 @@
 Dr Strange calls an external language model for a specific, bounded set of
 features. Everything else — the graph store, vector and keyword indexes, hybrid
 retrieval over pre-computed vectors, graph algorithms, time-travel, the change
-feed, and backup — runs with no model at all.
+feed, backup, and code digestion through the parser plugins (a repository that
+yields only parsed facts is ingested without a single model call) — runs with
+no model at all.
 
 This appendix delineates exactly which features require model support, how to run
 Dr Strange with none, and how to point the model features at a local model
@@ -19,7 +21,7 @@ on one or both:
 
 | Feature | Needs | Why |
 |---|---|---|
-| Embedding a **text** similarity query (`SEARCH … NEAR "text"`, semantic `plane.find`, a hybrid vector channel from text) | embedding provider | the query string is embedded server-side before the search |
+| Embedding a **text** similarity query (`SEARCH … NEAR "text"`, semantic `plane.find`, the `search` agent tool, a hybrid vector channel from text) | embedding provider | the query string is embedded server-side before the search |
 | **Natural-language query** (`ask` / `plane.ask`) | chat provider (+ embedding provider for the grounding tools) | the model compiles the question into a plan, optionally calling embedding-backed `find_edge` / `find_entity` tools |
 | **Document ingestion** (`digest` / AIgest) | chat + embedding providers | the model extracts entities and relations, then cleans up the extraction (`--mode`); the entities are embedded |
 
