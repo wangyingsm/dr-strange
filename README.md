@@ -47,12 +47,16 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 
 <table>
   <tr>
-    <td width="50%"><a href="screenshots/00.jpg"><img src="screenshots/00.jpg" width="100%" alt="Dashboard — plane statistics and management"></a><br><sub><b>Dashboard</b> — live plane statistics and management</sub></td>
+    <td width="50%"><a href="screenshots/00.jpg"><img src="screenshots/00.jpg" width="100%" alt="Dashboard — live statistics, planes, and installed parser plugins"></a><br><sub><b>Dashboard</b> — live statistics, plane management, and the installed parser plugins</sub></td>
     <td width="50%"><a href="screenshots/01.jpg"><img src="screenshots/01.jpg" width="100%" alt="Explore — interactive graph with a node inspector"></a><br><sub><b>Explore</b> — interactive graph with a node inspector</sub></td>
   </tr>
   <tr>
     <td width="50%"><a href="screenshots/02.jpg"><img src="screenshots/02.jpg" width="100%" alt="Algorithms — shortest path on the graph"></a><br><sub><b>Algorithms</b> — PageRank, communities, and shortest path</sub></td>
     <td width="50%"><a href="screenshots/03.jpg"><img src="screenshots/03.jpg" width="100%" alt="AIgest — LLM document ingestion into entities and relations"></a><br><sub><b>AIgest</b> — LLM document ingestion into entities &amp; relations</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="screenshots/04.jpg"><img src="screenshots/04.jpg" width="100%" alt="Explore — a module's import neighborhood on a digested code plane"></a><br><sub><b>Code graph</b> — one module's import neighborhood on a digested plane</sub></td>
+    <td width="50%"><a href="screenshots/05.jpg"><img src="screenshots/05.jpg" width="100%" alt="Explore — a whole code plane, every fact carrying file, line, and its generating plugin"></a><br><sub><b>Code plane</b> — the whole graph at once; each fact carries file, line, signature, and the plugin that parsed it</sub></td>
   </tr>
 </table>
 
