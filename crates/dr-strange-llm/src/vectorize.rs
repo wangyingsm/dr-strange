@@ -145,3 +145,25 @@ fn text_hash(text: &str) -> String {
     // node.
     d.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
+
+/// `search` behind the agent surface: embed the query text, run the plane's
+/// cosine top-k, render compactly. Core holds no provider, so the text→vector
+/// step lives here and every surface (CLI, MCP) shares it.
+pub fn semantic_search(
+    db: &Database,
+    plane_name: &str,
+    query: &str,
+    embedder: &dyn Embedder,
+    k: u64,
+) -> Result<String> {
+    let reply = embedder
+        .embed(std::slice::from_ref(&query.to_string()))
+        .context("embedding the query")?;
+    let vector = reply
+        .vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the embedder returned no vector"))?;
+    let plane = db.plane(plane_name)?;
+    Ok(dr_strange_core::compact::search(&plane, &vector, k)?)
+}

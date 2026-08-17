@@ -44,4 +44,4 @@ pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;
 pub use refine::RefineReport;
-pub use vectorize::{VectorizeStats, vectorize_plane};
+pub use vectorize::{VectorizeStats, semantic_search, vectorize_plane};
