@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.7.0"
+version = "2.0.0-alpha"
 edition = "2024"
 # 1.94: wasmtime 47 (the plugin sandbox, ROADMAP §11) declares it. Said out
 # loud rather than arriving silently — CI tracks stable, which is well past it.

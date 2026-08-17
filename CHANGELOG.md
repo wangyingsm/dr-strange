@@ -4,6 +4,66 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0-alpha] - 2026-08-18
+
+The code-intelligence release: a repository becomes a resolved call graph
+with no model in the loop, stays synced to every commit, and answers an
+agent's structural questions in one round trip. Alpha because the plugin
+contract and the agent tools are new surfaces still settling; the graph
+engine underneath is the same 1.x core.
+
+### Added
+- **Preprocessor plugins (ROADMAP §11).** Sandboxed `wasm32-wasip2`
+  components behind a two-phase WIT contract (`parse` chunks in parallel,
+  one `assemble` for cross-file resolution), installed by URL or file with
+  the SHA-256 pinned and re-checked at every load. The official catalog
+  covers eight languages — Rust, Go, TypeScript/JavaScript, Python, Java,
+  C, web (HTML/CSS), TOML — each wrapping a canonical parser. The sandbox
+  grants three host functions and nothing else: no network, no clock, no
+  entropy, fuel and memory budgets. No plugin can call a model — a
+  repository that yields only parsed facts is digested without a single
+  model call.
+- **`drsg serve watch`.** Serve as usual and follow a repository commit by
+  commit: changed files re-run through the plugins and fold into the plane
+  in place — convergent with a full re-digest, embeddings and foreign edges
+  surviving patches — with incremental re-vectorization when the server has
+  an embed provider. Every agent answer opens with `synced: commit <sha>`.
+- **The agent tools**: `context` · `search` · `describe` · `grep` · `trace`
+  · `impact` · `snippet`, identical over MCP and the CLI (`grep`/`snippet`
+  live with the server, which knows the source tree). Compact one-fact-per-
+  line output under a fixed context budget; ambiguous names return
+  candidates; call listings are stated lower bounds backed by the
+  `UnresolvedRef` ledger, where every unresolved call carries its reason.
+- **Resolution disciplines across all eight parsers**: qualified-name keys,
+  file/line on every fact, `_resolved_by`/`_confidence`/`_ref` stamps on
+  every resolved edge, receiver typing from declared facts only, closure
+  and callback parameters typed by the callee's declared bounds,
+  function-as-value and string-literal REFERENCES.
+- **RPC + SDKs**: `plane.vectorize` and the `plugin.list` / `plugin.catalog`
+  / `plugin.install` / `plugin.remove` methods; all five generated SDK
+  clients cover them.
+- **Dashboard**: an extensions panel (installed plugins, upgrade/remove,
+  install) and a Vectorize button on every plane card.
+- **Docs**: two new book chapters (Plugins; Coding Agent) in both
+  languages, AGENT-BENCHMARKS.md beside the engine benchmarks, and a
+  precision pass across the README, arch/ notes, and the book.
+
+### Changed
+- **The MCP `search` tool changed shape** (the major-version reason): it
+  was a raw-vector top-k that took an embedding; it now embeds the query
+  text server-side (the `[digest]` embed settings) and expands the best
+  hit. Callers that sent raw vectors should use `query` plans or `hybrid`.
+- `describe` on MCP is now the node-only view of one symbol, matching the
+  CLI verb of the same name.
+
+### Fixed
+- A configured-but-keyless embedding provider now fails in milliseconds
+  with the variable name it wants, instead of hanging a search to the
+  300-second request timeout; embedding calls also carry their own
+  60-second timeout, and MCP errors render the full cause chain.
+- The `semantic_search` definition behind the `search` verb was committed;
+  the callers had landed ahead of it.
+
 ## [1.7.0] - 2026-08-11
 
 ### Added
