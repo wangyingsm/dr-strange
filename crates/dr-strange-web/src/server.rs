@@ -209,6 +209,7 @@ fn mcp_router(
     state: Arc<AppState>,
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
+    source_root: Option<std::path::PathBuf>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -227,6 +228,9 @@ fn mcp_router(
     let service = StreamableHttpService::new(
         move || {
             let mut svc = DrStrange::with_digest(db.clone(), digest).with_tool_gate(tools.clone());
+            if let Some(root) = &source_root {
+                svc = svc.with_source_root(root.clone());
+            }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
                     provider: provider.clone(),
@@ -256,6 +260,7 @@ fn router(
     state: Arc<AppState>,
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
+    source_root: Option<std::path::PathBuf>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -279,7 +284,12 @@ fn router(
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
-        .merge(mcp_router(state.clone(), max_concurrent, embed))
+        .merge(mcp_router(
+            state.clone(),
+            max_concurrent,
+            embed,
+            source_root,
+        ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
@@ -713,7 +723,12 @@ pub async fn run(
     // database's Drop from ever running, so the sidecars must be saved
     // explicitly at shutdown or every restart rebuilds the indexes.
     let db_at_shutdown = state.db.clone();
-    let app = router(state, opts.max_concurrent, opts.embed_provider.clone());
+    let app = router(
+        state,
+        opts.max_concurrent,
+        opts.embed_provider.clone(),
+        opts.source_root.clone(),
+    );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
     // register it with tokio, which rejects a blocking fd — so make it

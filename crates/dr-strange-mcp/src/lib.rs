@@ -47,6 +47,9 @@ pub struct DrStrange {
     /// Whether `digest` may read a `path` the caller names — see
     /// [`DrStrange::with_local_files`]. Off unless the host says otherwise.
     local_files: bool,
+    /// The source tree behind the graph, when the host attached one — what
+    /// the `grep` tool searches. `serve watch` attaches its `--dir`.
+    source_root: Option<std::path::PathBuf>,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -106,6 +109,7 @@ impl DrStrange {
             tools: Arc::new(Semaphore::new(DEFAULT_TOOL_CONCURRENCY)),
             embed: None,
             local_files: false,
+            source_root: None,
         }
     }
 
@@ -133,6 +137,14 @@ impl DrStrange {
     /// A node that already carries `embedding` is left alone.
     pub fn with_embed_provider(mut self, provider: EmbedProvider) -> Self {
         self.embed = Some(provider);
+        self
+    }
+
+    /// Attach the source tree the graph was parsed from, enabling the
+    /// `grep` tool: literal text is the one question a graph should not
+    /// pretend to answer, and with the tree attached it need not.
+    pub fn with_source_root(mut self, root: std::path::PathBuf) -> Self {
+        self.source_root = Some(root);
         self
     }
 
@@ -601,6 +613,19 @@ struct SymbolReq {
     name: String,
 }
 
+/// `grep`'s request: literal text over the attached source tree.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GrepReq {
+    /// Literal text to find (no regex — what you type is what is matched).
+    pattern: String,
+    /// Case-insensitive matching (default false).
+    #[serde(default)]
+    ignore_case: Option<bool>,
+    /// Max matching lines returned (default 50, capped at 200).
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
 /// `search`'s request: free text and a plane.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchReq {
@@ -611,6 +636,110 @@ struct SearchReq {
     /// How many hits (default 8).
     #[serde(default)]
     k: Option<u64>,
+}
+
+/// Bounded literal search under `root`: build dirs and binaries skipped,
+/// results and line lengths capped, paths relative to the root.
+fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".venv",
+        ".codegraph",
+        ".codebase-memory",
+    ];
+    const MAX_FILE: u64 = 2 * 1024 * 1024;
+    const MAX_LINE: usize = 300;
+    let cap = req.max_results.unwrap_or(50).clamp(1, 200);
+    let fold = req.ignore_case.unwrap_or(false);
+    let needle = if fold {
+        req.pattern.to_lowercase()
+    } else {
+        req.pattern.clone()
+    };
+    if needle.trim().is_empty() {
+        anyhow::bail!("an empty pattern matches everything and helps no one");
+    }
+
+    let mut out = String::new();
+    let mut hits = 0usize;
+    let mut capped = false;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if meta.len() > MAX_FILE {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes[..bytes.len().min(4096)].contains(&0) {
+                continue; // binary
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (i, line) in text.lines().enumerate() {
+                let hay = if fold {
+                    std::borrow::Cow::Owned(line.to_lowercase())
+                } else {
+                    std::borrow::Cow::Borrowed(line)
+                };
+                if !hay.contains(needle.as_str()) {
+                    continue;
+                }
+                if hits == cap {
+                    capped = true;
+                    break;
+                }
+                let mut shown = line.trim_end();
+                if shown.len() > MAX_LINE {
+                    let mut end = MAX_LINE;
+                    while !shown.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    shown = &shown[..end];
+                }
+                out.push_str(&format!("{rel}:{}: {shown}\n", i + 1));
+                hits += 1;
+            }
+            if capped {
+                break;
+            }
+        }
+        if capped {
+            break;
+        }
+    }
+    if hits == 0 {
+        out.push_str("no matches\n");
+    } else if capped {
+        out.push_str(&format!(
+            "… capped at {cap} matches — narrow the pattern or raise max_results\n"
+        ));
+    }
+    Ok(out)
 }
 
 fn compact_logic(
@@ -1319,6 +1448,25 @@ impl DrStrange {
                 req.k.unwrap_or(8),
             )?;
             Ok(Value::String(text))
+        })
+        .await
+    }
+
+    #[tool(description = "Literal text search over the source tree behind \
+        the graph (the watched directory). One matching line per result, \
+        `file:line: text`. For log messages, config values, comments — \
+        anything the graph deliberately does not model. No regex.")]
+    async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
+        let root = self.source_root.clone();
+        self.blocking("grep", move |_db| {
+            let Some(root) = root else {
+                anyhow::bail!(
+                    "no source tree attached to this server — `serve watch` \
+                     attaches its --dir; a plain serve has only the graph, \
+                     so run grep locally instead"
+                );
+            };
+            Ok(Value::String(grep_tree(&root, &req)?))
         })
         .await
     }
@@ -2055,5 +2203,54 @@ mod tests {
         assert!(matches!(parse_dir(Some("in")), Dir::In));
         assert!(matches!(parse_dir(Some("both")), Dir::Both));
         assert!(matches!(parse_dir(None), Dir::Out));
+    }
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::*;
+
+    fn req(pattern: &str) -> GrepReq {
+        GrepReq {
+            pattern: pattern.into(),
+            ignore_case: None,
+            max_results: None,
+        }
+    }
+
+    #[test]
+    fn finds_lines_skips_build_dirs_and_binaries() {
+        let dir = std::env::temp_dir().join(format!("drsg-grep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn main() {\n    // needle here\n}\n").unwrap();
+        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+
+        let out = grep_tree(&dir, &req("needle")).unwrap();
+        assert!(out.contains("src/a.rs:2:"), "{out}");
+        assert!(!out.contains("target/"), "build dirs are skipped: {out}");
+        assert!(!out.contains("blob.bin"), "binaries are skipped: {out}");
+
+        let none = grep_tree(&dir, &req("absent-text")).unwrap();
+        assert!(none.contains("no matches"));
+
+        let folded = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "NEEDLE".into(),
+                ignore_case: Some(true),
+                max_results: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(folded.contains("src/a.rs:2:"), "{folded}");
+
+        assert!(
+            grep_tree(&dir, &req("  ")).is_err(),
+            "empty pattern refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

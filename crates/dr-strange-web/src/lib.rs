@@ -65,6 +65,9 @@ pub struct ServeOptions {
     /// nodes by forgetting a flag. The key is read from the environment at call
     /// time, never carried here.
     pub embed_provider: Option<(String, Option<String>, Option<String>)>,
+    /// The source tree behind the graph, when one is attached — enables the
+    /// MCP `grep` tool. `serve watch` sets it to its `--dir`.
+    pub source_root: Option<std::path::PathBuf>,
     /// Run once on a background thread after the server is up, with a handle
     /// to the same database the server writes through — how `drsg serve
     /// watch` runs its repository watcher against the one open database
@@ -150,6 +153,7 @@ impl Default for ServeOptions {
             write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
             query_timeout: Some(DEFAULT_QUERY_TIMEOUT),
             embed_provider: None,
+            source_root: None,
             on_start: None,
         }
     }

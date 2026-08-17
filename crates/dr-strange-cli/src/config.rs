@@ -163,6 +163,10 @@ pub struct ServerCfg {
     pub token: Option<String>,
     /// Ceiling on requests in flight at once.
     pub max_concurrent: Option<usize>,
+    /// The source tree behind the graph, for the MCP `grep` tool. `serve
+    /// watch` attaches its `--dir` automatically; this covers a plain
+    /// `serve` over a digested database.
+    pub source_root: Option<std::path::PathBuf>,
     /// How long a write waits for the single writer slot before returning a
     /// retryable timeout. `0` waits forever (the embedded default); omitted
     /// means 30s.
@@ -250,6 +254,9 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     let mut opts = ServeOptions::default();
     if let Some(addr) = cli_addr.or(cfg.server.addr) {
         opts.addr = addr;
+    }
+    if let Some(root) = &cfg.server.source_root {
+        opts.source_root = Some(root.clone());
     }
     if let Some(max_concurrent) = cfg.server.max_concurrent {
         opts.max_concurrent = max_concurrent;

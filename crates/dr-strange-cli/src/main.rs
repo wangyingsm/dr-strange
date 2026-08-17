@@ -741,6 +741,10 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 // The same embed config the server's search uses keeps the
                 // watched plane's vectors current after each fold.
                 let embed = opts.embed_provider.clone();
+                // The watched tree is the graph's source — attach it, so the
+                // MCP `grep` tool answers literal-text questions beside the
+                // graph's structural ones.
+                opts.source_root = Some(dir.clone());
                 opts.on_start = Some(Box::new(move |db| {
                     commands::watch(db, dir, plane, plugin_config, embed, force)
                 }));
