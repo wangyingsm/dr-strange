@@ -30,11 +30,9 @@ WebSocket change feed, with client SDKs in six languages.
 The early chapters establish the fundamentals: what Dr Strange is, how to build
 it, and what its AI-native design entails. The middle chapters are a reference
 for the query language and each access surface — the web UI, the language SDKs,
-the command line, and the MCP server for LLM agents. The final chapter documents
-the architecture.
+the command line, and the MCP server for LLM agents. Two chapters then cover
+the code-intelligence half: the parser plugin system, and what it gives a
+coding agent. The final chapter documents the architecture.
 
 > **Status.** This book began alongside the **v1.0** release and is kept
-> current as features land. The newest capability — code digestion through
-> parser plugins, the commit-synced watch, and the agent tools — is documented
-> in the repository's README and `arch/` notes for now; its chapter will
-> follow.
+> current as features land.

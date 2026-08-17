@@ -31,7 +31,7 @@ features to a conventional graph database after the fact.
 Like SQLite, it is **embedded**: a library linked into an application, backed by a
 single on-disk database, with no server to operate. Unlike SQLite, it can also
 **serve** — `drsg serve` exposes a JSON-RPC 2.0 API, a browser dashboard, and a
-WebSocket change feed, with client SDKs in five languages.
+WebSocket change feed, with client SDKs in six languages.
 
 It is also a code-intelligence engine. Sandboxed wasm parser plugins digest a
 repository into a graph of symbols and resolved relationships — eight official
@@ -72,7 +72,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 | **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
 | **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
 | **Backup / restore** | consistent, id-faithful whole-database snapshots |
-| **Interfaces** | a web UI, five language SDKs, a CLI, and an MCP server speaking the agent verbs |
+| **Interfaces** | a web UI, six language SDKs, a CLI, and an MCP server speaking the agent verbs |
 
 The model-backed features (natural-language query, document ingestion, and
 text-embedding search) call an external or local LLM; everything else runs with
@@ -230,6 +230,8 @@ The book covers each part in depth:
 [SDK](https://wangyingsm.github.io/dr-strange/en/book/sdk.html) ·
 [Embedded CLI](https://wangyingsm.github.io/dr-strange/en/book/embedded-cli.html) ·
 [MCP](https://wangyingsm.github.io/dr-strange/en/book/mcp.html) ·
+[Plugins](https://wangyingsm.github.io/dr-strange/en/book/plugins.html) ·
+[Coding Agent](https://wangyingsm.github.io/dr-strange/en/book/coding-agent.html) ·
 [JSON-RPC API list](https://wangyingsm.github.io/dr-strange/en/book/appendix-a.html) ·
 [Query-language grammar](https://wangyingsm.github.io/dr-strange/en/book/appendix-b.html).
 

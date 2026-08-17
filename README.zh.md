@@ -29,7 +29,7 @@ AI 功能。
 
 与 SQLite 类似，它是**嵌入式**的：以库的形式链接进应用，由单个磁盘文件承载，无需
 运维独立的服务进程。但与 SQLite 不同，它同样可以**对外服务**——`drsg serve` 提供
-JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有五种语言的客户端 SDK。
+JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有六种语言的客户端 SDK。
 
 它同时也是一台代码智能引擎。沙箱化的 wasm 解析器插件将一个代码仓库图化为符号与
 已解析关系——官方支持八种语言，全程无需模型参与——`drsg serve watch` 让这张图随
@@ -68,7 +68,7 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **提交同步监视** | `serve watch` 将每次提交折叠进平面，结果与全量重新消化收敛一致 |
 | **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`——每个问题一次往返 |
 | **备份 / 恢复** | 一致且保留 id 的全库快照 |
-| **接口** | Web 控制台、五种语言 SDK、命令行工具，以及提供智能体工具的 MCP 服务器 |
+| **接口** | Web 控制台、六种语言 SDK、命令行工具，以及提供智能体工具的 MCP 服务器 |
 
 依赖模型的功能（自然语言查询、文档摄取与文本嵌入检索）会调用外部或本地的 LLM；其余
 功能均无需任何模型即可运行。参见[附录 C](https://wangyingsm.github.io/dr-strange/zh/book/appendix-c.html)。
@@ -211,6 +211,8 @@ web（HTML/CSS）与 TOML——逐一固定到
 [SDK](https://wangyingsm.github.io/dr-strange/zh/book/sdk.html) ·
 [嵌入式 CLI](https://wangyingsm.github.io/dr-strange/zh/book/embedded-cli.html) ·
 [MCP](https://wangyingsm.github.io/dr-strange/zh/book/mcp.html) ·
+[插件](https://wangyingsm.github.io/dr-strange/zh/book/plugins.html) ·
+[编码智能体](https://wangyingsm.github.io/dr-strange/zh/book/coding-agent.html) ·
 [JSON-RPC API 清单](https://wangyingsm.github.io/dr-strange/zh/book/appendix-a.html) ·
 [查询语言文法](https://wangyingsm.github.io/dr-strange/zh/book/appendix-b.html)。
 

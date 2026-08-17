@@ -139,7 +139,7 @@ $ drsg --db graph.drsg digest https://example.com/paper --plane papers \\
 ## 备份与完整性
 
 `snapshot` 在单一提交序号上写出一个一致的整库快照包；`restore` 将其重建进一个空
-数据库，并保留 id、提交序号与已构建的检索索引（[第 9 章](./architecture.md)）。
+数据库，并保留 id、提交序号与已构建的检索索引（[第 11 章](./architecture.md)）。
 `stats` 与 `check` 报告计数，并扫描每个平面的可读性：
 
 ```console

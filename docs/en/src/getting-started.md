@@ -225,7 +225,7 @@ embed_key_env = "OPENAI_API_KEY"            # env var holding its key
 
 [plugins]                                   # preprocessor sandbox tuning (all optional)
 fuel = 200000000000                         # instruction budget per sandbox call (0 disables)
-memory_mb = 3072                            # guest linear memory per call, MiB
+memory_mb = 3072                            # guest linear memory per call, MiB (wasm32 allows at most 4096)
 
 [fetch]                                     # URL ingestion (Chapter 3)
 enabled = true                              # false refuses URL fetching outright

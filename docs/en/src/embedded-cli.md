@@ -155,7 +155,7 @@ usage ([Chapter 3](./ai-native.md#extraction-precision)).
 
 `snapshot` writes a consistent whole-database bundle at one commit sequence;
 `restore` rebuilds it into an empty database, preserving ids, the commit
-sequence, and the built search indexes ([Chapter 9](./architecture.md)).
+sequence, and the built search indexes ([Chapter 11](./architecture.md)).
 `stats` and `check` report counts and scan every plane for readability:
 
 ```console
