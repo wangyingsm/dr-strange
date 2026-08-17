@@ -2,7 +2,7 @@
 
 An AI-native embedded graph database, written in Rust.
 
-**Status**: draft for review · 2026-07-22
+**Status**: living design notes, kept current with the code · begun 2026-07-22
 
 Per-layer designs live beside this file; this document holds the vision, the
 locked top-level decisions, and everything that spans layers.
@@ -45,6 +45,10 @@ graph database with AI features bolted on:
 | Deployment shape | Embedded-first (SQLite/DuckDB/Kùzu style) | Core is a Rust library. Server, MCP service, and web UI are thin processes wrapping it. Zero-ops embedding for MCP users; a network server later reuses the same core. |
 | Query interface | Programmatic (builder) API in v1; query language in v2 | Ship the execution engine first; a Cypher/GQL-subset parser lands in v2 on top of the same logical plan layer. |
 | Wire protocol | **JSON-RPC 2.0** for every remote surface (web UI backend, future network server) | One call convention everywhere — MCP is itself JSON-RPC 2.0, so wrappers share framing, error model, and method-naming; serialized plans/values ride as params verbatim. |
+
+The "v2" items in this table have since shipped: the openCypher-subset
+language (`drsg cypher`, the `dr-strange-parser` crate) and the native LSM
+engine that replaced the bootstrap KV behind the same `StorageEngine` trait.
 
 ## 3. Layer diagram
 
@@ -93,6 +97,8 @@ dr-strange/
     dr-strange-parser/     # the openCypher-subset query language
     dr-strange-web/        # `drsg serve` — JSON-RPC API + dashboard
     dr-strange-log/        # the binaries' tracing subscriber
+  sdk/             # client SDKs (six languages)
+  benchmarks/      # the cross-engine comparison harness
   arch/            # these documents
   docs/            # the tutorial book (en + zh)
 ```
@@ -104,11 +110,11 @@ boundaries demand it; start unified.
 
 Each milestone ends with a working vertical slice, not a finished layer.
 
-- **M0 — walking skeleton**: workspace layout; `StorageEngine` trait + redb
+- **M0 — walking skeleton** ✅: workspace layout; `StorageEngine` trait + redb
   backend; the full node/edge/adjacency encoding (both adjacency tables,
   label index, property codec) and a create → get → 1-hop-expand vertical
   slice, round-tripped through a smoke test.
-- **M1 — real graph storage**: deletes (node cascades to incident edges,
+- **M1 — real graph storage** ✅: deletes (node cascades to incident edges,
   edge, plane), external keys (`create_node_with_key` / lookup), property
   mutation (`set_prop`/`remove_prop` on nodes and edges), batched node/edge
   ID allocation; property-based tests against an in-memory model.
@@ -141,7 +147,7 @@ Each milestone ends with a working vertical slice, not a finished layer.
   comparison (Kùzu/Neo4j), and — informed by the benchmarks — building the
   moka `CachedReader` and the HNSW sidecar. Then decide v2: query language,
   custom storage engine, network server.
-- **M6 — web UI v1**: `drsg serve` (JSON-RPC 2.0 backend) with dashboard and
+- **M6 — web UI v1** ✅: `drsg serve` (JSON-RPC 2.0 backend) with dashboard and
   visual graph plots ([08-web-ui.md](08-web-ui.md)).
 
 ## 6. Cross-cutting decisions

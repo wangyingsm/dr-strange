@@ -1,7 +1,7 @@
 # Computation Layer
 
-**Status**: draft · query engine + native hybrid search + catalog built
-(M2–M3) · 2026-07-28
+**Status**: shipped — query engine + native hybrid search + catalog built
+(M2–M3) · living design notes, begun 2026-07-28
 
 **M2 landed** the non-hybrid core: `Source`
 (ScanAll/ScanLabel/SeekIds/SeekKeys) + `Step`

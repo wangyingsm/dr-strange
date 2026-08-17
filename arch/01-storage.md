@@ -1,6 +1,7 @@
 # Storage Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: shipped (M0–M5; the native LSM engine has since replaced the
+bootstrap KV) · living design notes, begun 2026-07-22
 
 Scope: durable representation of the graph — KV backend abstraction, key
 encodings, property serialization, identifiers, vector index persistence,

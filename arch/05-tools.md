@@ -1,8 +1,9 @@
 # CLI Tools Layer
 
 **Status**: shipped — `drsg` (M4) and `digest`, the latter as AIgest's three
-passes (ROADMAP §8), reading URLs (§9) and any office document (§7 here) ·
-last revised 2026-08-11
+passes (ROADMAP §8), reading URLs (§9) and any office document (§7 here);
+the agent verbs and plugin management landed with ROADMAP §11 ·
+last revised 2026-08-18
 
 **M4 landed** the `drsg` binary (clap): init, plane list/create/drop/show,
 import/export (JSONL in the `json` dialect below), get (id or
@@ -17,22 +18,33 @@ wrapper over `dr-strange-core`. First consumer of the public API; its job is equ
 parts utility and **forcing the API to be ergonomic early**. Contains no
 database logic.
 
-## 1. Command surface (v1)
+## 1. Command surface (current)
 
 ```
 drsg init <path>                          # create a database
 drsg plane list|create|drop|show          # plane lifecycle (09-planes.md)
-drsg import <file> --plane P              # JSONL/CSV ingest (bulk writer)
-drsg digest <doc>... --plane P            # LLM-powered document → graph ingest (§3)
-drsg export --plane P [--format jsonl]    # snapshot export
-drsg query [--plane P] <builder-json>     # run a serialized plan; table/JSON output
+drsg import <file> --plane P              # JSONL ingest (bulk writer)
+drsg export --plane P                     # snapshot export
 drsg get <id|@external-key> [--plane P]   # single record, with descriptions
+drsg query [--plane P] <plan-json>        # run a serialized plan
+drsg cypher '<stmt>' --plane P            # openCypher subset, compiled to a plan
+drsg context|describe|trace|impact <name> # agent verbs over a digested plane
+drsg search '<query>' --plane P           # semantic top-k (embeds the query)
 drsg catalog [--plane P]                  # soft-schema view (labels, props, descriptions)
+drsg algo … / drsg hybrid …               # graph algorithms; fused retrieval
 drsg index ensure <label> <prop> --plane P --metric cosine
-drsg stats                                # cache hit rates, sizes, counters
-drsg check                                # integrity: KV invariants, sidecar freshness
-drsg bench <suite>                        # micro/traversal/hybrid benchmarks (M5)
+drsg vectorize --plane P                  # embed a plane for similarity search
+drsg stats / drsg check                   # counters; integrity scan
+drsg snapshot / drsg restore              # whole-database backup bundles
+drsg serve [watch]                        # dashboard + JSON-RPC + MCP; watch keeps a code plane commit-synced
+drsg ask '<question>'                     # NL → read-only plan → run
+drsg plugin install|list|remove           # preprocessor plugins (07 §1)
+drsg digest [<src>] --plane P             # document/repo → graph ingest, dry-run by default (§3)
 ```
+
+(The M5 benchmark suites moved out of the binary: criterion micro-benches and
+the cross-engine harness live in `benchmarks/` — `just benchmark` /
+`just bench-compare`.)
 
 ## 2. Design notes
 

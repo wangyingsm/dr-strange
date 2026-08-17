@@ -1,7 +1,7 @@
 # LLM Layer
 
 **Status**: digest pipeline designed and shipped (ROADMAP §8, extended to URLs
-in §9 and to preprocessor plugins in §11) · last revised 2026-08-14
+in §9 and to preprocessor plugins in §11) · last revised 2026-08-18
 
 Scope: the `dr-strange-llm` crate — everything that talks to a language or embedding
 model, **plus the ingestion front door that feeds it**. Sits strictly **above** the
@@ -20,10 +20,10 @@ from the same file. Two readers would mean two vector spaces for one corpus.
 |---|---|
 | Embedding generation | text → vector at ingest/query time; pluggable providers (OpenAI-compatible, which covers gateways and a local `ollama`/`llama.cpp` through a configurable base URL), batched per call. Configured **per server** (`[digest] embed_provider`), not per plane: a per-plane model recorded as plane properties was considered and not built, since nothing yet needs to detect mixed-model vectors and the config an operator actually sets is process-wide |
 | Document reading | bytes → GitHub-Flavored Markdown for Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF (via `anydoc`), with Markdown and plain text passing through. Format is detected from the content, not the filename. Deterministic and model-free — the step before digestion, shared by every surface |
-| Preprocessing | an input's own structure → **facts** (nodes and edges a parser is certain of) plus **prose** (the residue needing a model), routed per file so a polyglot tree fans out and merges (ROADMAP §11). Handlers are **installed wasm plugins** (`drsg plugin install`, SHA-256 pinned; official ones exist for Rust, Go, TypeScript/JavaScript, Python, Java, and C). The sandbox grants nothing: an empty preopen table (a guest runtime may *import* `wasi:filesystem` — Go's does before the plugin's first line runs — but there is nothing behind it), `wasi:sockets` refused at load by name, frozen clocks, entropy dealt from a fixed sequence (Go seeds map order from it), fuel- and memory-bounded, and a trapped guest's stderr is captured into the error. Contract and SDKs live in the `dr-strange-extensions` repo. Document reading is the built-in fallback every unclaimed input lands on. An input yielding only facts is digested with **no model call at all**. Local-only: the CLI and the stdio MCP server, never a shared server — see §2 |
+| Preprocessing | an input's own structure → **facts** (nodes and edges a parser is certain of) plus **prose** (the residue needing a model), routed per file so a polyglot tree fans out and merges (ROADMAP §11). Handlers are **installed wasm plugins** (`drsg plugin install`, SHA-256 pinned; official ones exist for Rust, Go, TypeScript/JavaScript, Python, Java, C, web (HTML/CSS), and TOML). The sandbox grants nothing: an empty preopen table (a guest runtime may *import* `wasi:filesystem` — Go's does before the plugin's first line runs — but there is nothing behind it), `wasi:sockets` refused at load by name, frozen clocks, entropy dealt from a fixed sequence (Go seeds map order from it), fuel- and memory-bounded, and a trapped guest's stderr is captured into the error. Contract and SDKs live in the `dr-strange-extensions` repo. Document reading is the built-in fallback every unclaimed input lands on. An input yielding only facts is digested with **no model call at all**. Local-only: the CLI and the stdio MCP server, never a shared server — see §2 |
 | Document digestion | the engine behind `drsg digest` / MCP `digest`: an LLM parses that Markdown into entities, relations, `PropDesc` descriptions, and embeddings, written through the bulk API. Shipped as AIgest's three passes (ROADMAP §8) |
 | Entity resolution | propose cross-plane / intra-plane duplicate candidates by external key, name similarity, and embedding distance; output is a *proposal set* the caller (human or agent) confirms — feeds plane `merge` (09 §3) |
-| NL → plan translation | natural-language question → serialized logical plan, grounded on the per-plane catalog (labels + property descriptions); v1.5, once the plan format is stable |
+| NL → plan translation | natural-language question → serialized logical plan, grounded on the per-plane catalog (labels + property descriptions); shipped as `drsg ask` (ROADMAP §3), read-only by construction — see §3 |
 
 ## 2. Design rules
 
@@ -42,8 +42,11 @@ from the same file. Two readers would mean two vector spaces for one corpus.
   plugin pulling the files *around* the one it was handed — and that pull is
   exactly what a shared server must not offer, since the only filesystem it
   could reach is the server's own. So the CLI and the stdio MCP server route
-  through it; `drsg serve` and the HTTP MCP server do not, and text sent over
-  the wire stays prose. *What the host will answer* is the capability grant,
+  through it; bytes arriving at `drsg serve` or the HTTP MCP server over the
+  wire stay prose. The one deliberate exception is `serve watch`: there the
+  operator points the server at a repository on its own machine (`--dir`),
+  which is an explicit filesystem grant, so commit folds run through the
+  installed plugins. *What the host will answer* is the capability grant,
   rather than a policy document beside it that can drift.
 - Provider abstraction is minimal: `trait Embedder` and `trait Chat` with
   plain HTTP implementations (JSON-RPC where the provider supports it, REST

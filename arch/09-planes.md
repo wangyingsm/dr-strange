@@ -1,6 +1,6 @@
 # Planes
 
-**Status**: draft for review · 2026-07-22
+**Status**: shipped · living design notes, begun 2026-07-22
 
 A **plane** is a canvas of graph: the database is a pile of planes, each
 holding its own nodes, edges, and vectors. Planes are the unit of scoping,

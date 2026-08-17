@@ -1,6 +1,6 @@
 # API Layer (DB core surface)
 
-**Status**: draft for review · 2026-07-22
+**Status**: shipped · living design notes, begun 2026-07-22
 
 Scope: the public Rust API of `dr-strange-core` — the only surface wrappers (CLI,
 MCP, LLM helpers, future server) are allowed to use. Design rule: **every

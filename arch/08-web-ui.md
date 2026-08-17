@@ -1,6 +1,7 @@
 # Web UI Layer
 
-**Status**: draft for review · 2026-07-22
+**Status**: v1 shipped (locked 2026-07-29), v2 drafted 2026-08-09 · begun
+2026-07-22
 
 Scope: a local-first UI with two jobs in v1 — a **dashboard** over the
 database and **visual graph plots** for exploration. Build starts post-M4
