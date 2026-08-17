@@ -35,10 +35,10 @@ WebSocket change feed, with client SDKs in five languages.
 
 It is also a code-intelligence engine. Sandboxed wasm parser plugins digest a
 repository into a graph of symbols and resolved relationships — eight official
-languages, no model in the loop — `drsg serve watch` keeps that graph synced to
-every commit, and a compact agent surface answers structural questions (who
-calls this, what breaks if it changes, how does X reach Y) in one round trip.
-See [For coding agents](#for-coding-agents).
+languages, no model in the loop. `drsg serve watch` keeps that graph synced to
+every commit, and a compact set of agent tools answers structural questions —
+who calls this, what breaks if it changes, how does X reach Y — in one round
+trip. See [For coding agents](#for-coding-agents).
 
 For applications built around a knowledge graph, a GraphRAG pipeline, or an
 agent's long-term memory, Dr Strange aims to be the single store for all of it.
@@ -70,7 +70,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 | **Change feed** | subscribe to a plane and receive mutations live |
 | **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — 8 official languages, an SDK for community parsers |
 | **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
-| **Agent surface** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
+| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
 | **Backup / restore** | consistent, id-faithful whole-database snapshots |
 | **Interfaces** | a web UI, five language SDKs, a CLI, and an MCP server speaking the agent verbs |
 
@@ -180,7 +180,7 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` skips embeddings — parsing needs no model. Run `drsg vectorize`
 later to make the plane semantically searchable.
 
-Seven verbs answer an agent's questions, each in one round trip, all compact
+Seven verbs answer an agent's questions, one round trip each, as compact
 one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are
 also CLI subcommands (`grep` and `snippet` read the watched source tree, so
 they live with the server).
@@ -195,7 +195,7 @@ they live with the server).
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `snippet` | one symbol's source text |
 
-Two disciplines run through the whole surface. An ambiguous name is never
+Two disciplines run through every tool. An ambiguous name is never
 guessed at: the reply is a list of candidates to pick from. And a call
 listing is a stated lower bound: what the parser could not resolve is kept
 as `UnresolvedRef` facts with reasons, and the answer says so — a wrong edge
@@ -265,16 +265,16 @@ engine loads the **same** deterministic dataset — 100 K nodes, 500 K edges,
 
 | Operation (median latency, ↓ better) | dr-strange | Kùzu | SQLite | Neo4j |
 |---|---|---|---|---|
-| Point lookup by key | 3.8 µs | 266.2 µs | **3.6 µs** | 299.7 µs |
-| 1-hop expansion | **6.8 µs** | 1.71 ms | 9.0 µs | 381.9 µs |
-| 2-hop reachable set | **30.7 µs** | 7.19 ms | 67.4 µs | 931.9 µs |
-| Vector top-k query | **306.2 µs** | 7.75 ms | — | 2.66 ms |
+| Point lookup by key | **3.3 µs** | 256.0 µs | 3.4 µs | 286.6 µs |
+| 1-hop expansion | **6.2 µs** | 1.64 ms | 8.2 µs | 328.0 µs |
+| 2-hop reachable set | **26.8 µs** | 6.72 ms | 64.8 µs | 842.9 µs |
+| Vector top-k query | **290.0 µs** | 7.43 ms | — | 2.43 ms |
 
 The embedded KV design keeps every graph query in single-digit-to-tens of
-microseconds — point lookup tied with SQLite, expansion and multi-hop traversal
-fastest of the field — and vector search is where it pulls away: top-k ~9×
-below Neo4j and ~25× below Kùzu, with index build several times faster than
-both (full table in BENCHMARKS.md). Bulk load still trails the mature columnar
+microseconds — point lookup effectively tied with SQLite, expansion and
+multi-hop traversal fastest of the field — and vector search is where it pulls
+away: top-k ~8× below Neo4j and ~26× below Kùzu, with index build several
+times faster than both (full table in BENCHMARKS.md). Bulk load still trails the mature columnar
 engines. Every figure is the median of three measurement passes, all engines
 pinned to the same cores on one machine — **indicative, not a leaderboard**.
 Methodology, caveats, per-op spreads, the load-throughput figures, and how to

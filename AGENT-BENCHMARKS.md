@@ -1,7 +1,7 @@
 # Agent benchmarks
 
 [BENCHMARKS.md](BENCHMARKS.md) measures the engine; this document measures
-the **agent surface**: how completely, and in how many round trips, a coding
+the **agent tools**: how completely, and in how many round trips, a coding
 agent can answer real structural questions over a codebase. Dr Strange is
 compared against a plain ripgrep workflow and two open-source code-graph MCP
 tools. As with the engine numbers: **indicative, not a leaderboard** — these
@@ -91,7 +91,7 @@ bounds.
 ## Versus ripgrep
 
 An earlier two-way round (same corpora, same arm design) compared the graph
-surface against an agent driving ripgrep directly:
+tools against an agent driving ripgrep directly:
 
 - Structural questions: one `context` call versus 3–5 rg calls, with the
   graph arm ≈2× cheaper in marginal tokens — an rg arm reconstructs
