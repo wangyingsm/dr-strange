@@ -75,6 +75,55 @@ type Subgraph struct {
 	Truncated bool         `json:"truncated"`
 }
 
+type PluginListItem struct {
+	Extensions []string `json:"extensions,omitempty"`
+	File       *string  `json:"file,omitempty"`
+	Name       *string  `json:"name,omitempty"`
+	Sha256     *string  `json:"sha256,omitempty"`
+	Source     *string  `json:"source,omitempty"`
+	Version    *string  `json:"version,omitempty"`
+}
+
+type PluginCatalogItem struct {
+	Claims string `json:"claims"`
+	Name   string `json:"name"`
+	Sha256 string `json:"sha256"`
+	URL    string `json:"url"`
+}
+
+type PluginInstallResult struct {
+	Installed map[string]any `json:"installed,omitempty"`
+	Replaced  *string        `json:"replaced,omitempty"`
+}
+
+type PluginInstallParams struct {
+	URL string `json:"url"`
+}
+
+type PluginRemoveResult struct {
+	Removed map[string]any `json:"removed,omitempty"`
+}
+
+type PluginRemoveParams struct {
+	Name string `json:"name"`
+}
+
+type PlaneVectorizeResult struct {
+	Current  *int64   `json:"current,omitempty"`
+	Embedded *int64   `json:"embedded,omitempty"`
+	Empty    *int64   `json:"empty,omitempty"`
+	Labels   []string `json:"labels,omitempty"`
+	Tokens   *int64   `json:"tokens,omitempty"`
+	Unique   *int64   `json:"unique,omitempty"`
+}
+
+type PlaneVectorizeParams struct {
+	Plane      string  `json:"plane"`
+	Embed      *string `json:"embed,omitempty"`
+	EmbedModel *string `json:"embed_model,omitempty"`
+	Metric     *string `json:"metric,omitempty"`
+}
+
 type PlaneCatalogParams struct {
 	Plane string `json:"plane"`
 }
@@ -83,6 +132,7 @@ type NodeGetParams struct {
 	Plane string  `json:"plane"`
 	ID    *int64  `json:"id,omitempty"`
 	Key   *string `json:"key,omitempty"`
+	Lean  *bool   `json:"lean,omitempty"`
 }
 
 type PlaneNeighborsItem struct {
@@ -97,6 +147,8 @@ type PlaneNeighborsParams struct {
 	Type      *string `json:"type,omitempty"`
 	AsOf      *int64  `json:"as_of,omitempty"`
 	AsOfMs    *int64  `json:"as_of_ms,omitempty"`
+	Hydrate   *bool   `json:"hydrate,omitempty"`
+	Lean      *bool   `json:"lean,omitempty"`
 }
 
 type PlaneHistoryResult struct {
@@ -125,6 +177,7 @@ type PlaneCypherParams struct {
 	Query  string         `json:"query"`
 	Embed  *string        `json:"embed,omitempty"`
 	Params map[string]any `json:"params,omitempty"`
+	Lean   *bool          `json:"lean,omitempty"`
 }
 
 type PlaneFindParams struct {
@@ -325,10 +378,45 @@ func (c *Client) DbCatalog(ctx context.Context) (map[string]any, error) {
 	return out, err
 }
 
+// PluginList Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11).
+func (c *Client) PluginList(ctx context.Context) ([]PluginListItem, error) {
+	var out []PluginListItem
+	err := c.call(ctx, "plugin.list", nil, &out)
+	return out, err
+}
+
+// PluginCatalog The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent.
+func (c *Client) PluginCatalog(ctx context.Context) ([]PluginCatalogItem, error) {
+	var out []PluginCatalogItem
+	err := c.call(ctx, "plugin.catalog", nil, &out)
+	return out, err
+}
+
+// PluginInstall Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC.
+func (c *Client) PluginInstall(ctx context.Context, p PluginInstallParams) (*PluginInstallResult, error) {
+	var out *PluginInstallResult
+	err := c.call(ctx, "plugin.install", p, &out)
+	return out, err
+}
+
+// PluginRemove Uninstall a plugin by name. Write-gated.
+func (c *Client) PluginRemove(ctx context.Context, p PluginRemoveParams) (*PluginRemoveResult, error) {
+	var out *PluginRemoveResult
+	err := c.call(ctx, "plugin.remove", p, &out)
+	return out, err
+}
+
 // PlaneList Every plane with its id, name, counts, and own properties. (access: read)
 func (c *Client) PlaneList(ctx context.Context) ([]PlaneCard, error) {
 	var out []PlaneCard
 	err := c.call(ctx, "plane.list", nil, &out)
+	return out, err
+}
+
+// PlaneVectorize Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment.
+func (c *Client) PlaneVectorize(ctx context.Context, p PlaneVectorizeParams) (*PlaneVectorizeResult, error) {
+	var out *PlaneVectorizeResult
+	err := c.call(ctx, "plane.vectorize", p, &out)
 	return out, err
 }
 

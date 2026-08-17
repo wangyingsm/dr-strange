@@ -28,11 +28,64 @@ struct json_object *drsg_db_catalog(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
+/* Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err) {
+    struct json_object *p = NULL;
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plugin.list", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err) {
+    struct json_object *p = NULL;
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plugin.catalog", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+struct json_object *drsg_plugin_install(drsg_client *c, const char *url, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "url", json_object_new_string(url));
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plugin.install", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Uninstall a plugin by name. Write-gated. */
+struct json_object *drsg_plugin_remove(drsg_client *c, const char *name, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "name", json_object_new_string(name));
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plugin.remove", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
 /* Every plane with its id, name, counts, and own properties. (access: read) */
 struct json_object *drsg_plane_list(drsg_client *c, drsg_error *err) {
     struct json_object *p = NULL;
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.list", p, &result, err);
+    if (p) json_object_put(p);
+    return rc == 0 ? result : NULL;
+}
+
+/* Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+struct json_object *drsg_plane_vectorize(drsg_client *c, const char *plane, const drsg_plane_vectorize_opts *opts, drsg_error *err) {
+    struct json_object *p = json_object_new_object();
+    json_object_object_add(p, "plane", json_object_new_string(plane));
+    if (opts) {
+        if (opts->embed) json_object_object_add(p, "embed", json_object_new_string(opts->embed));
+        if (opts->embed_model) json_object_object_add(p, "embed_model", json_object_new_string(opts->embed_model));
+        if (opts->metric) json_object_object_add(p, "metric", json_object_new_string(opts->metric));
+    }
+    struct json_object *result = NULL;
+    int rc = drsg_call(c, "plane.vectorize", p, &result, err);
     if (p) json_object_put(p);
     return rc == 0 ? result : NULL;
 }
@@ -54,6 +107,7 @@ struct json_object *drsg_node_get(drsg_client *c, const char *plane, const drsg_
     if (opts) {
         if (opts->id) json_object_object_add(p, "id", json_object_new_int64(*opts->id));
         if (opts->key) json_object_object_add(p, "key", json_object_new_string(opts->key));
+        if (opts->lean) json_object_object_add(p, "lean", json_object_new_boolean(*opts->lean));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "node.get", p, &result, err);
@@ -71,6 +125,8 @@ struct json_object *drsg_plane_neighbors(drsg_client *c, const char *plane, int6
         if (opts->type) json_object_object_add(p, "type", json_object_new_string(opts->type));
         if (opts->as_of) json_object_object_add(p, "as_of", json_object_new_int64(*opts->as_of));
         if (opts->as_of_ms) json_object_object_add(p, "as_of_ms", json_object_new_int64(*opts->as_of_ms));
+        if (opts->hydrate) json_object_object_add(p, "hydrate", json_object_new_boolean(*opts->hydrate));
+        if (opts->lean) json_object_object_add(p, "lean", json_object_new_boolean(*opts->lean));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.neighbors", p, &result, err);
@@ -127,6 +183,7 @@ struct json_object *drsg_plane_cypher(drsg_client *c, const char *plane, const c
     if (opts) {
         if (opts->embed) json_object_object_add(p, "embed", json_object_new_string(opts->embed));
         if (opts->params) json_object_object_add(p, "params", json_object_get(opts->params));
+        if (opts->lean) json_object_object_add(p, "lean", json_object_new_boolean(*opts->lean));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.cypher", p, &result, err);

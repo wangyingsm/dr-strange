@@ -85,6 +85,79 @@ public class Drsg extends Client {
             Long fileSize) {
     }
 
+    public record PluginListItem(
+            String name,
+            String version,
+            String file,
+            String sha256,
+            String source,
+            List<String> extensions) {
+    }
+
+    public record PluginCatalogItem(
+            String name,
+            String claims,
+            String url,
+            String sha256) {
+    }
+
+    public record PluginInstallResult(
+            Map<String, Object> installed,
+            String replaced) {
+    }
+
+    public record PluginInstallParams(
+            String url) {
+
+        public static PluginInstallParams of(String url) {
+            return new PluginInstallParams(url);
+        }
+    }
+
+    public record PluginRemoveResult(
+            Map<String, Object> removed) {
+    }
+
+    public record PluginRemoveParams(
+            String name) {
+
+        public static PluginRemoveParams of(String name) {
+            return new PluginRemoveParams(name);
+        }
+    }
+
+    public record PlaneVectorizeResult(
+            Long embedded,
+            Long unique,
+            Long tokens,
+            Long current,
+            Long empty,
+            List<String> labels) {
+    }
+
+    public record PlaneVectorizeParams(
+            String plane,
+            String embed,
+            String embedModel,
+            String metric) {
+
+        public static PlaneVectorizeParams of(String plane) {
+            return new PlaneVectorizeParams(plane, null, null, null);
+        }
+
+        public PlaneVectorizeParams withEmbed(String embed) {
+            return new PlaneVectorizeParams(plane, embed, embedModel, metric);
+        }
+
+        public PlaneVectorizeParams withEmbedModel(String embedModel) {
+            return new PlaneVectorizeParams(plane, embed, embedModel, metric);
+        }
+
+        public PlaneVectorizeParams withMetric(String metric) {
+            return new PlaneVectorizeParams(plane, embed, embedModel, metric);
+        }
+    }
+
     public record PlaneCatalogParams(
             String plane) {
 
@@ -96,18 +169,23 @@ public class Drsg extends Client {
     public record NodeGetParams(
             String plane,
             Long id,
-            String key) {
+            String key,
+            Boolean lean) {
 
         public static NodeGetParams of(String plane) {
-            return new NodeGetParams(plane, null, null);
+            return new NodeGetParams(plane, null, null, null);
         }
 
         public NodeGetParams withId(Long id) {
-            return new NodeGetParams(plane, id, key);
+            return new NodeGetParams(plane, id, key, lean);
         }
 
         public NodeGetParams withKey(String key) {
-            return new NodeGetParams(plane, id, key);
+            return new NodeGetParams(plane, id, key, lean);
+        }
+
+        public NodeGetParams withLean(Boolean lean) {
+            return new NodeGetParams(plane, id, key, lean);
         }
     }
 
@@ -122,26 +200,36 @@ public class Drsg extends Client {
             String direction,
             String type,
             Long asOf,
-            Long asOfMs) {
+            Long asOfMs,
+            Boolean hydrate,
+            Boolean lean) {
 
         public static PlaneNeighborsParams of(String plane, long id) {
-            return new PlaneNeighborsParams(plane, id, null, null, null, null);
+            return new PlaneNeighborsParams(plane, id, null, null, null, null, null, null);
         }
 
         public PlaneNeighborsParams withDirection(String direction) {
-            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
         }
 
         public PlaneNeighborsParams withType(String type) {
-            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
         }
 
         public PlaneNeighborsParams withAsOf(Long asOf) {
-            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
         }
 
         public PlaneNeighborsParams withAsOfMs(Long asOfMs) {
-            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs);
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
+        }
+
+        public PlaneNeighborsParams withHydrate(Boolean hydrate) {
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
+        }
+
+        public PlaneNeighborsParams withLean(Boolean lean) {
+            return new PlaneNeighborsParams(plane, id, direction, type, asOf, asOfMs, hydrate, lean);
         }
     }
 
@@ -198,18 +286,23 @@ public class Drsg extends Client {
             String plane,
             String query,
             String embed,
-            Map<String, Object> params) {
+            Map<String, Object> params,
+            Boolean lean) {
 
         public static PlaneCypherParams of(String plane, String query) {
-            return new PlaneCypherParams(plane, query, null, null);
+            return new PlaneCypherParams(plane, query, null, null, null);
         }
 
         public PlaneCypherParams withEmbed(String embed) {
-            return new PlaneCypherParams(plane, query, embed, params);
+            return new PlaneCypherParams(plane, query, embed, params, lean);
         }
 
         public PlaneCypherParams withParams(Map<String, Object> params) {
-            return new PlaneCypherParams(plane, query, embed, params);
+            return new PlaneCypherParams(plane, query, embed, params, lean);
+        }
+
+        public PlaneCypherParams withLean(Boolean lean) {
+            return new PlaneCypherParams(plane, query, embed, params, lean);
         }
     }
 
@@ -789,9 +882,34 @@ public class Drsg extends Client {
         return call("db.catalog", null, new TypeReference<Map<String, Object>>() {});
     }
 
+    /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+    public List<PluginListItem> pluginList() throws DrsgException {
+        return call("plugin.list", null, new TypeReference<List<PluginListItem>>() {});
+    }
+
+    /** The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+    public List<PluginCatalogItem> pluginCatalog() throws DrsgException {
+        return call("plugin.catalog", null, new TypeReference<List<PluginCatalogItem>>() {});
+    }
+
+    /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+    public PluginInstallResult pluginInstall(PluginInstallParams params) throws DrsgException {
+        return call("plugin.install", params, new TypeReference<PluginInstallResult>() {});
+    }
+
+    /** Uninstall a plugin by name. Write-gated. */
+    public PluginRemoveResult pluginRemove(PluginRemoveParams params) throws DrsgException {
+        return call("plugin.remove", params, new TypeReference<PluginRemoveResult>() {});
+    }
+
     /** Every plane with its id, name, counts, and own properties. (access: read) */
     public List<PlaneCard> planeList() throws DrsgException {
         return call("plane.list", null, new TypeReference<List<PlaneCard>>() {});
+    }
+
+    /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+    public PlaneVectorizeResult planeVectorize(PlaneVectorizeParams params) throws DrsgException {
+        return call("plane.vectorize", params, new TypeReference<PlaneVectorizeResult>() {});
     }
 
     /** One plane's soft schema (labels, property descriptions, edge types, counts). (access: read) */

@@ -34,11 +34,43 @@ class Drsg(_Client):
         Access: read."""
         return self._call("db.catalog")
 
+    def plugin_list(self) -> Any:
+        """Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11)."""
+        return self._call("plugin.list")
+
+    def plugin_catalog(self) -> Any:
+        """The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent."""
+        return self._call("plugin.catalog")
+
+    def plugin_install(self, url) -> Any:
+        """Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC."""
+        _p: dict = {}
+        _p["url"] = url
+        return self._call("plugin.install", _p)
+
+    def plugin_remove(self, name) -> Any:
+        """Uninstall a plugin by name. Write-gated."""
+        _p: dict = {}
+        _p["name"] = name
+        return self._call("plugin.remove", _p)
+
     def plane_list(self) -> Any:
         """Every plane with its id, name, counts, and own properties.
 
         Access: read."""
         return self._call("plane.list")
+
+    def plane_vectorize(self, plane, embed=None, embed_model=None, metric=None) -> Any:
+        """Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment."""
+        _p: dict = {}
+        _p["plane"] = plane
+        if embed is not None:
+            _p["embed"] = embed
+        if embed_model is not None:
+            _p["embed_model"] = embed_model
+        if metric is not None:
+            _p["metric"] = metric
+        return self._call("plane.vectorize", _p)
 
     def plane_catalog(self, plane) -> Any:
         """One plane's soft schema (labels, property descriptions, edge types, counts).
@@ -48,7 +80,7 @@ class Drsg(_Client):
         _p["plane"] = plane
         return self._call("plane.catalog", _p)
 
-    def node_get(self, plane, id=None, key=None) -> Any:
+    def node_get(self, plane, id=None, key=None, lean=None) -> Any:
         """One node by id or external key; null if absent.
 
         Access: read."""
@@ -58,9 +90,11 @@ class Drsg(_Client):
             _p["id"] = id
         if key is not None:
             _p["key"] = key
+        if lean is not None:
+            _p["lean"] = lean
         return self._call("node.get", _p)
 
-    def plane_neighbors(self, plane, id, direction=None, type=None, as_of=None, as_of_ms=None) -> Any:
+    def plane_neighbors(self, plane, id, direction=None, type=None, as_of=None, as_of_ms=None, hydrate=None, lean=None) -> Any:
         """1-hop expansion as {node, edge} id pairs.
 
         Access: read."""
@@ -75,6 +109,10 @@ class Drsg(_Client):
             _p["as_of"] = as_of
         if as_of_ms is not None:
             _p["as_of_ms"] = as_of_ms
+        if hydrate is not None:
+            _p["hydrate"] = hydrate
+        if lean is not None:
+            _p["lean"] = lean
         return self._call("plane.neighbors", _p)
 
     def plane_history(self) -> Any:
@@ -112,7 +150,7 @@ class Drsg(_Client):
             _p["as_of_ms"] = as_of_ms
         return self._call("plane.query", _p)
 
-    def plane_cypher(self, plane, query, embed=None, params=None) -> Any:
+    def plane_cypher(self, plane, query, embed=None, params=None, lean=None) -> Any:
         """Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated.
 
         Access: write."""
@@ -123,6 +161,8 @@ class Drsg(_Client):
             _p["embed"] = embed
         if params is not None:
             _p["params"] = params
+        if lean is not None:
+            _p["lean"] = lean
         return self._call("plane.cypher", _p)
 
     def plane_find(self, plane, q, limit=None, semantic=None, provider=None, embed_model=None, as_of=None, as_of_ms=None) -> Any:

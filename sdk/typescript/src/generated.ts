@@ -90,9 +90,34 @@ export class Drsg extends Client {
     return this._call("db.catalog") as Promise<Record<string, unknown>>;
   }
 
+  /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+  pluginList(): Promise<Array<{ name?: string; version?: string; file?: string; sha256?: string; source?: string; extensions?: Array<string> }>> {
+    return this._call("plugin.list") as Promise<Array<{ name?: string; version?: string; file?: string; sha256?: string; source?: string; extensions?: Array<string> }>>;
+  }
+
+  /** The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+  pluginCatalog(): Promise<Array<{ name: string; claims: string; url: string; sha256: string }>> {
+    return this._call("plugin.catalog") as Promise<Array<{ name: string; claims: string; url: string; sha256: string }>>;
+  }
+
+  /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+  pluginInstall(params: { url: string }): Promise<{ installed?: Record<string, unknown>; replaced?: string | null }> {
+    return this._call("plugin.install", params) as Promise<{ installed?: Record<string, unknown>; replaced?: string | null }>;
+  }
+
+  /** Uninstall a plugin by name. Write-gated. */
+  pluginRemove(params: { name: string }): Promise<{ removed?: Record<string, unknown> }> {
+    return this._call("plugin.remove", params) as Promise<{ removed?: Record<string, unknown> }>;
+  }
+
   /** Every plane with its id, name, counts, and own properties. (access: read) */
   planeList(): Promise<Array<PlaneCard>> {
     return this._call("plane.list") as Promise<Array<PlaneCard>>;
+  }
+
+  /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+  planeVectorize(params: { plane: string; embed?: string; embed_model?: string; metric?: "cosine" | "dot" | "l2" }): Promise<{ embedded?: number; unique?: number; tokens?: number; current?: number; empty?: number; labels?: Array<string> }> {
+    return this._call("plane.vectorize", params) as Promise<{ embedded?: number; unique?: number; tokens?: number; current?: number; empty?: number; labels?: Array<string> }>;
   }
 
   /** One plane's soft schema (labels, property descriptions, edge types, counts). (access: read) */
@@ -101,12 +126,12 @@ export class Drsg extends Client {
   }
 
   /** One node by id or external key; null if absent. (access: read) */
-  nodeGet(params: { plane: string; id?: number; key?: string }): Promise<NodeRecord | null> {
+  nodeGet(params: { plane: string; id?: number; key?: string; lean?: boolean }): Promise<NodeRecord | null> {
     return this._call("node.get", params) as Promise<NodeRecord | null>;
   }
 
   /** 1-hop expansion as {node, edge} id pairs. (access: read) */
-  planeNeighbors(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string; as_of?: number; as_of_ms?: number }): Promise<Array<{ node?: number; edge?: number }>> {
+  planeNeighbors(params: { plane: string; id: number; direction?: "out" | "in" | "both"; type?: string; as_of?: number; as_of_ms?: number; hydrate?: boolean; lean?: boolean }): Promise<Array<{ node?: number; edge?: number }>> {
     return this._call("plane.neighbors", params) as Promise<Array<{ node?: number; edge?: number }>>;
   }
 
@@ -126,7 +151,7 @@ export class Drsg extends Client {
   }
 
   /** Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
-  planeCypher(params: { plane: string; query: string; embed?: string; params?: Record<string, unknown> }): Promise<Record<string, unknown>> {
+  planeCypher(params: { plane: string; query: string; embed?: string; params?: Record<string, unknown>; lean?: boolean }): Promise<Record<string, unknown>> {
     return this._call("plane.cypher", params) as Promise<Record<string, unknown>>;
   }
 

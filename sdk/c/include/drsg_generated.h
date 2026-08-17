@@ -13,8 +13,29 @@ struct json_object *drsg_db_stats(drsg_client *c, drsg_error *err);
 /* The soft-schema catalog rolled up across every plane. (access: read) */
 struct json_object *drsg_db_catalog(drsg_client *c, drsg_error *err);
 
+/* Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err);
+
+/* The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err);
+
+/* Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+struct json_object *drsg_plugin_install(drsg_client *c, const char *url, drsg_error *err);
+
+/* Uninstall a plugin by name. Write-gated. */
+struct json_object *drsg_plugin_remove(drsg_client *c, const char *name, drsg_error *err);
+
 /* Every plane with its id, name, counts, and own properties. (access: read) */
 struct json_object *drsg_plane_list(drsg_client *c, drsg_error *err);
+
+typedef struct {
+    const char *embed;
+    const char *embed_model;
+    const char *metric;
+} drsg_plane_vectorize_opts;
+
+/* Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+struct json_object *drsg_plane_vectorize(drsg_client *c, const char *plane, const drsg_plane_vectorize_opts *opts, drsg_error *err);
 
 /* One plane's soft schema (labels, property descriptions, edge types, counts). (access: read) */
 struct json_object *drsg_plane_catalog(drsg_client *c, const char *plane, drsg_error *err);
@@ -22,6 +43,7 @@ struct json_object *drsg_plane_catalog(drsg_client *c, const char *plane, drsg_e
 typedef struct {
     const int64_t *id;
     const char *key;
+    const int *lean;
 } drsg_node_get_opts;
 
 /* One node by id or external key; null if absent. (access: read) */
@@ -32,6 +54,8 @@ typedef struct {
     const char *type;
     const int64_t *as_of;
     const int64_t *as_of_ms;
+    const int *hydrate;
+    const int *lean;
 } drsg_plane_neighbors_opts;
 
 /* 1-hop expansion as {node, edge} id pairs. (access: read) */
@@ -60,6 +84,7 @@ struct json_object *drsg_plane_query(drsg_client *c, const char *plane, struct j
 typedef struct {
     const char *embed;
     struct json_object *params;
+    const int *lean;
 } drsg_plane_cypher_opts;
 
 /* Run a statement in the query language (openCypher subset). A read returns {nodes, edges, count}; a write (CREATE/MERGE/SET/REMOVE/DELETE) returns {write: true, ...change-counts}. Write-gated. (access: write) */
