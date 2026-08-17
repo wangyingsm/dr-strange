@@ -60,38 +60,38 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "rust",
         claims: ".rs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.2.0/rust.wasm",
-        sha256: "ae78b8ac3d9b53ff55d3472bc3d89c89b2d0cfd329d2db09b8438de9f206cacf",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.3.0/rust.wasm",
+        sha256: "99ff5511fb94dd2fd8f7fcf32fd5488553ec3a8ecdc5fe4075fa8a66892fe087",
     },
     OfficialPlugin {
         name: "go",
         claims: ".go",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.1.0/go.wasm",
-        sha256: "61278bfda6f316ddf61f2d26d172bd8e4e4c9a076148db882594de0354d2f74d",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.2.0/go.wasm",
+        sha256: "3076fd9b336f73e6685562b54e6adad6a03265b8981253982689b477f38e1457",
     },
     OfficialPlugin {
         name: "ts",
         claims: ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.1.0/ts.wasm",
-        sha256: "e759702bc4c0cdff9196301fe73b1dd29169bf1dd14f87dd3a7726f73ca39d28",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.2.0/ts.wasm",
+        sha256: "5faa013419e3e53ae5bdcadf9af13d9e314a22f24d8a1485a4e0ee61400e83c8",
     },
     OfficialPlugin {
         name: "py",
         claims: ".py .pyi .pyw",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.2.1/py.wasm",
-        sha256: "a218cb9b0d7cad89bac1f649ad320bd9702c984476fea69c0fa7659e2d841b91",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.3.0/py.wasm",
+        sha256: "bcf0428bd5ba7ca99371ff9389db4d00cb0dd63a4edcf82e77b5dfa77fb88d0b",
     },
     OfficialPlugin {
         name: "java",
         claims: ".java",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.1.0/java.wasm",
-        sha256: "2ae57f4dcbee971bfb68afbf94809c781aba72d84062288b49553a6aee46864d",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.2.0/java.wasm",
+        sha256: "26876c3e293b7b43dd7b52a3397b7e5301bd4a9984c36bc862c2bfcbb0ece2a5",
     },
     OfficialPlugin {
         name: "c",
         claims: ".c .h",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.1.0/c.wasm",
-        sha256: "d2d438502d941613b58480955fec0cc8b10d920d430464a6ea2fb84453daa659",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.2.0/c.wasm",
+        sha256: "92a17ae63eb4cea544cfa42dd3bc4957393e381644ac41523294d42cd1dd1663",
     },
     OfficialPlugin {
         name: "web",
@@ -102,8 +102,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "toml",
         claims: ".toml",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.1.0/toml.wasm",
-        sha256: "3f66997444cde44c0873f85c66d8d80323567db70216ec3c639b445974ee2128",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.2.0/toml.wasm",
+        sha256: "6af62778e48dc580a60762b6609134b36867b22d3123bdadcf611fb2ce22a9b8",
     },
 ];
 
