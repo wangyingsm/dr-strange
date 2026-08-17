@@ -33,6 +33,8 @@ for the query language and each access surface — the web UI, the language SDKs
 the command line, and the MCP server for LLM agents. The final chapter documents
 the architecture.
 
-> **Status.** This book is written alongside the **v1.0** release. Each chapter
-> opens with a short introduction and a *draft outline* of its sections; the
-> prose is filled in section by section.
+> **Status.** This book began alongside the **v1.0** release and is kept
+> current as features land. The newest capability — code digestion through
+> parser plugins, the commit-synced watch, and the agent tools — is documented
+> in the repository's README and `arch/` notes for now; its chapter will
+> follow.
