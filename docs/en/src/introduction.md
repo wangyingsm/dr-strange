@@ -13,7 +13,7 @@ conventional graph database after the fact.
 Like SQLite, it is **embedded**: a library linked into an application, backed by
 a single on-disk database, with no server to operate. Unlike SQLite, it can also
 **serve** — `drsg serve` exposes a JSON-RPC 2.0 API, a browser dashboard, and a
-WebSocket change feed, with client SDKs in five languages.
+WebSocket change feed, with client SDKs in six languages.
 
 ## Intended audience
 

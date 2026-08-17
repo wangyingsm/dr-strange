@@ -1,8 +1,9 @@
 # SDK
 
-Dr Strange 提供**五种语言**的客户端库——TypeScript、Python、Go、Java 与 C。每一种都
-通过 JSON-RPC 2.0 与正在运行的 `drsg serve` 通信，且其带类型的方法接口是**由服务端的
-OpenRPC schema 生成的**，因此每个 SDK 都与线协议精确一致，并在各版本间与之保持同步。
+Dr Strange 提供**六种语言**的客户端库——TypeScript、Python、Go、Java、C 与 Zig。
+每一种都通过 JSON-RPC 2.0 与正在运行的 `drsg serve` 通信，且其带类型的方法接口是
+**由服务端的 OpenRPC schema 生成的**，因此每个 SDK 都与线协议精确一致，并在各版本间
+与之保持同步。（Zig 客户端是对生成的 C 客户端的一层胶水封装，因此继承同样的保证。）
 
 ## 获取 SDK
 
@@ -16,6 +17,7 @@ OpenRPC schema 生成的**，因此每个 SDK 都与线协议精确一致，并�
 | Go | `sdk/go` | 模块 `github.com/wangyingsm/dr-strange/sdk/go` |
 | Java | `sdk/java` | 一个 Maven 模块（Jackson + JDK HttpClient） |
 | C | `sdk/c` | `make` → `libdrsg.a` + `drsg.h`（libcurl + json-c） |
+| Zig | `sdk/zig` | 一个 `build.zig` 模块，胶水封装 C 客户端（Zig 0.16） |
 
 ## 连接与调用
 
@@ -30,6 +32,7 @@ OpenRPC schema 生成的**，因此每个 SDK 都与线协议精确一致，并�
 | Go | `drsg.New(drsg.WithBaseURL(…), drsg.WithToken(…))` | `db.NodeCreate(ctx, …)` |
 | Java | `new Drsg(baseUrl, token)` | `db.nodeCreate(…)` |
 | C | `drsg_client_new(base_url, token)` | `drsg_node_create(…)` |
+| Zig | `try drsg.Client.init(base_url, token)` | `c.drsg_node_create(client.handle, …)` |
 
 其形态是统一的。以 TypeScript 为例：
 

@@ -74,8 +74,11 @@ SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 5 RETURN d
 | **自然语言查询** | 用自然语言提问 → 生成计划 → 执行 |
 | **时间旅行** | 读取图在某个历史提交或时间戳时的样子 |
 | **变更流** | 订阅一个平面，实时接收其变更 |
+| **代码图化** | 沙箱化的 wasm 解析器插件将代码仓库转化为已解析的调用图（官方支持 8 种语言） |
+| **提交同步监视** | `serve watch` 将每次提交折叠进平面 |
+| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`——每个问题一次往返 |
 | **备份 / 恢复** | 一致、保 id 的整库快照 |
-| **访问方式** | Web 界面、五种语言 SDK、命令行，以及 MCP 服务 |
+| **访问方式** | Web 界面、六种语言 SDK、命令行，以及 MCP 服务 |
 
 ## v1.0 意味着什么
 
