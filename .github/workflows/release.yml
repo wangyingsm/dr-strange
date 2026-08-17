@@ -21,9 +21,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # The Linux runners are pinned, not `-latest`: the runner's glibc is
+          # the oldest glibc the released binary can run on, and `ubuntu-latest`
+          # moving to 24.04 silently raised that floor to 2.39 — v2.0.0-alpha's
+          # first build refused to start on a 22.04 host that ran v1.7.0 fine.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -120,6 +124,9 @@ jobs:
             dist/dr-strange-*.zip.sha256
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
+          # A hyphen in the tag (v2.0.0-alpha, -rc.1, …) is semver's pre-release
+          # marker; flag the GitHub release to match, so nobody does it by hand.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   docker:
     name: Docker image → GHCR
