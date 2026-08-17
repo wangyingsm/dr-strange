@@ -12,6 +12,7 @@ import {
   alphaFor,
   dim,
   focusDistances,
+  frontierIds,
   hubsToFold,
   sectorLeaves,
   weightByImportance,
@@ -47,6 +48,20 @@ const HOVER_COLOR = '#f59e0b' // amber — visible on both light and dark
 const PATH_COLOR = '#f59e0b'
 const MUTED_NODE = '#9aa0aa'
 const MUTED_EDGE = '#c7ccd4'
+
+// How an edge looks at rest, relative to how it looks under the cursor.
+//
+// A dense subgraph is mostly edges by area, and at full weight they read as
+// the subject of the picture rather than as the relations between the things
+// that are. Thinner and more transparent lets the nodes and their labels come
+// first while the shape of the graph still reads — this is recession, not
+// hiding, so the numbers stay well clear of invisible.
+//
+// Hover and selection then restore full weight rather than exaggerating it:
+// the emphasis is the edge returning to normal, which is a smaller and calmer
+// movement than the thickening it replaces.
+const EDGE_REST_THICKNESS = 0.6
+const EDGE_REST_ALPHA = 0.55
 // Connect-drag endpoints: the node the drag started on (source) and the one
 // under the cursor (target) get loud, distinct solid colours while dragging.
 const CONNECT_SRC = '#16a34a' // green
@@ -60,8 +75,10 @@ const BEAD_EDGE_PREFIX = '~beadedge:'
 //  - the SELECTED node (sigma routes `highlighted` nodes here) draws as a
 //    hollow ring in its own colour — interior filled with the canvas bg — so it
 //    inverts from the solid nodes around it and is unmistakable;
-//  - a plain hover draws the label box (sigma's default paints it hardcoded
-//    white, invisible under light text in dark mode).
+//  - a plain hover draws the label box inverted — text colour as the box, box
+//    colour as the text — so the key under the cursor stands out from every
+//    other label. (Sigma's own default paints the box hardcoded white, which is
+//    invisible under light text in dark mode, so it could not be reused.)
 // `label`/`bg`/`canvasBg` are getters read every draw, so theme flips track;
 // `graph` gives access to the node's stored (untouched) category colour.
 function drawNodeHover(label, bg, canvasBg, graph) {
@@ -90,7 +107,18 @@ function drawNodeHover(label, bg, canvasBg, graph) {
       return
     }
 
-    context.fillStyle = bg()
+    // Hovered: the label chip is drawn **inverted** — the text colour becomes
+    // the box and the box colour becomes the text — so the key under the
+    // cursor reads as a solid swatch against a field of plain labels.
+    //
+    // Inversion rather than a new accent colour, because both values are the
+    // ones already chosen for this theme: it is legible on either background
+    // by construction, and there is no third colour to keep in step when the
+    // palette changes.
+    const boxFill = label()
+    const textFill = bg()
+
+    context.fillStyle = boxFill
     context.shadowOffsetX = 0
     context.shadowOffsetY = 0
     context.shadowBlur = 8
@@ -118,7 +146,7 @@ function drawNodeHover(label, bg, canvasBg, graph) {
     }
     context.shadowBlur = 0
     if (data.label) {
-      context.fillStyle = label()
+      context.fillStyle = textFill
       context.fillText(data.label, data.x + data.size + 3, data.y + size / 3)
     }
   }
@@ -168,14 +196,15 @@ export class Plot {
       labelRenderedSizeThreshold: 5,
       // Edge picking reads a downsized framebuffer, so a thin edge has no
       // clickable pixels and the hit falls through to the stage. Give edges a
-      // floor thickness so they can actually be selected/hovered.
-      minEdgeThickness: 3.5,
-      // Highlight the hovered OR selected edge — thicker, amber, with its type
-      // label forced visible. Hover makes the clickable region obvious; the
-      // selected edge stays lit so a click/search focus is visible.
+      // floor thickness so they can actually be selected/hovered — this is why
+      // the resting weight above is a fraction and not a vanishing one.
+      minEdgeThickness: 2.5,
+      // Highlight the hovered OR selected edge: full weight, amber, with its
+      // type label forced visible. Hover makes the clickable region obvious;
+      // the selected edge stays lit so a click/search focus is visible.
       edgeReducer: (edge, data) => {
         if (edge === this.hoveredEdge || edge === this.selectedEdge) {
-          return { ...data, size: (data.size ?? 4) * 1.8, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
+          return { ...data, size: data.size ?? 4, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
         }
         if (this.hiddenLabels.size) {
           const src = this.graph.source(edge)
@@ -184,6 +213,8 @@ export class Plot {
             !this.graph.getNodeAttribute(n, 'bead') && this.hiddenLabels.has(this._categoryOf(n))
           if (gone(src) || gone(dst)) return { ...data, hidden: true }
         }
+        // An overlay lit this one on purpose — leave it exactly as it asked.
+        if (data.emphasis) return data
         // An edge is only as near as its further end.
         const alpha = this.focusDist
           ? Math.min(
@@ -191,9 +222,14 @@ export class Plot {
               this._alphaOf(this.graph.target(edge)),
             )
           : 1
-        return alpha >= 1
-          ? data
-          : { ...data, color: dim(data.color ?? MUTED_EDGE, alpha), label: '' }
+        // The resting style, composed with focus fade rather than replaced by
+        // it: a far edge is fainter still, and a near one is already receded.
+        const rest = {
+          ...data,
+          size: (data.size ?? 4) * EDGE_REST_THICKNESS,
+          color: dim(data.color ?? MUTED_EDGE, alpha * EDGE_REST_ALPHA),
+        }
+        return alpha >= 1 ? rest : { ...rest, label: '' }
       },
       // The selected node renders as a hollow ring. Sigma draws a highlighted
       // node's solid WebGL disc *over* anything the hover drawer paints, so we
@@ -364,6 +400,35 @@ export class Plot {
   /** Whether a node id is currently on the canvas. */
   hasNode(id) {
     return this.graph.hasNode(String(id))
+  }
+
+  /** How many real entities are held, counting those folded into beads. */
+  entityCount() {
+    let n = 0
+    this.graph.forEachNode((_node, attrs) => {
+      if (!attrs.bead) n += 1
+    })
+    for (const { nodes } of this.collapsed.values()) n += nodes.length
+    return n
+  }
+
+  /**
+   * The frontier: entities with at most one edge *on the canvas*.
+   *
+   * These are where the picture stops rather than where the graph does — a node
+   * shown with one connection is almost always one whose other neighbours were
+   * never fetched. Expanding exactly these grows the view outward by a ring,
+   * instead of re-fetching the well-connected interior already drawn.
+   *
+   * **Folded leaves count.** `_collapseLeaves` drops a hub's leaves from the
+   * graph and leaves a bead in their place, so after any seed most of the
+   * frontier is inside beads rather than in the graph. A bead is how those
+   * nodes are *drawn*; it says nothing about whether their neighbours have been
+   * fetched, and skipping them leaves the frontier looking empty on exactly the
+   * views that have one.
+   */
+  leafIds() {
+    return frontierIds(this.graph, this.collapsed)
   }
 
   /**
@@ -799,6 +864,10 @@ export class Plot {
       const on = ep.has(e)
       this.graph.setEdgeAttribute(e, 'color', on ? PATH_COLOR : MUTED_EDGE)
       this.graph.setEdgeAttribute(e, 'size', on ? 6 : 2)
+      // Exempt from the resting recession: an edge on the route is the thing
+      // the reader asked to see, so it keeps the weight this overlay gave it.
+      // The rest still recede, which is the point of the overlay.
+      this.graph.setEdgeAttribute(e, 'emphasis', on)
     })
     this.sigma.refresh()
   }
@@ -817,6 +886,7 @@ export class Plot {
     })
     this.graph.forEachEdge((e) => {
       this.graph.removeEdgeAttribute(e, 'color')
+      this.graph.removeEdgeAttribute(e, 'emphasis')
       this.graph.setEdgeAttribute(e, 'size', 4)
     })
     this._sizeByDegree()

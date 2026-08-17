@@ -91,6 +91,56 @@ enum Command {
         #[arg(long = "param", value_name = "NAME=JSON")]
         param: Vec<String>,
     },
+    /// One symbol's whole neighborhood in one call: definition, signature,
+    /// doc, fields, callers with call sites, callees, containment and every
+    /// other edge — the primary agent verb. Fuzzy names allowed; ambiguity
+    /// returns candidates.
+    Context {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// Semantic lookup when no identifier is known: embeds the query, runs
+    /// cosine top-k over the plane's `embedding` vectors, expands the best
+    /// hit. Requires the plane to be vectorized.
+    Search {
+        query: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        #[arg(long)]
+        embed_model: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        k: u64,
+    },
+    /// One symbol's content as `prop: value` lines (vectors elided) — the
+    /// lightweight node-only view; `context` adds the edges.
+    Describe {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// How one symbol reaches another: the shortest recorded CALLS path,
+    /// one hop per line; the reverse direction is tried and said when the
+    /// forward holds nothing.
+    Trace {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// Blast radius: everything reaching this symbol through incoming
+    /// structural edges, grouped by distance with exact counts.
+    Impact {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Hops to walk (max 6).
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         #[arg(long)]
@@ -151,6 +201,8 @@ enum Command {
         /// defaults to 127.0.0.1:7700 when neither is set.
         #[arg(long)]
         addr: Option<SocketAddr>,
+        #[command(subcommand)]
+        mode: Option<ServeMode>,
     },
     /// Ask a natural-language question; an LLM turns it into a read-only plan
     /// and runs it (ROADMAP §3).
@@ -183,15 +235,49 @@ enum Command {
         #[arg(long)]
         embed_model: Option<String>,
     },
+    /// Embed every node in a plane for similarity search (alias: `vec`).
+    /// Incremental: nodes whose text is unchanged since the last run are
+    /// skipped. Parser facts embed a stable projection (no positional
+    /// properties); document-extracted nodes embed all their content.
+    /// Finishes by ensuring a cosine vector index on `embedding` for every
+    /// label that carries it — the plane is searchable when this returns.
+    #[cfg(feature = "digest")]
+    #[command(alias = "vec")]
+    Vectorize {
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
+        #[arg(long, default_value = "openai")]
+        embed: String,
+        /// Embedding model override (default: the provider's).
+        #[arg(long)]
+        embed_model: Option<String>,
+        /// Distance metric for the ensured indexes (`l2` is euclidean).
+        #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
+        metric: MetricArg,
+    },
+    /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
+    /// that turn source files into graph facts before any model reads them.
+    #[cfg(feature = "digest")]
+    #[command(subcommand)]
+    Plugin(PluginCmd),
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
-        /// Document to digest: a file (text / markdown) or an `http(s)://` URL.
+        /// What to digest: a file, a **directory**, or an `http(s)://` URL.
         /// A URL is fetched, converted to Markdown, and its links followed
-        /// under `--pages`/`--depth` (ROADMAP §9).
+        /// under `--pages`/`--depth` (ROADMAP §9). A directory is walked and
+        /// routed per file, so a project's code becomes parsed facts and its
+        /// documents become prose (ROADMAP §11). **Omitted**: the current
+        /// directory — `drsg digest` alone digests the repository you are
+        /// standing in, into `graph.drsg`.
+        #[arg(default_value = ".")]
         source: String,
-        #[arg(long, default_value = "startup")]
-        plane: String,
+        /// Target plane. **Omitted**: the source directory's own name, so a
+        /// repo lands in a plane named after itself; `startup` when the
+        /// source is not a directory.
+        #[arg(long)]
+        plane: Option<String>,
         /// Write the result (default is a dry-run preview).
         #[arg(long)]
         apply: bool,
@@ -247,10 +333,72 @@ enum Command {
         /// URL only: ceiling on pages kept, the root included.
         #[arg(long, default_value_t = 10)]
         pages: usize,
+        /// Force a preprocessor by name (e.g. `rust`) instead of routing by
+        /// file extension. A router that guesses is worse than one that asks.
+        #[arg(long)]
+        handler: Option<String>,
+        /// Store each parsed function's own source on its node, for retrieval.
+        /// Off by default: it is roughly a copy of the codebase in the graph,
+        /// and properties share one record, so every read of that node decodes
+        /// the body too.
+        #[arg(long)]
+        plugin_source: bool,
         /// URL only: how far to follow links. 0 reads just the page named.
         #[arg(long, default_value_t = 1)]
         depth: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ServeMode {
+    /// Serve as usual, and watch a git repository beside it: every commit's
+    /// changed files run through the installed plugins and the plane is
+    /// updated in place — new symbols created, gone ones deleted, edges
+    /// rewritten. Facts only; no model is ever called.
+    #[cfg(feature = "digest")]
+    Watch {
+        /// Repository to watch.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Target plane. **Omitted**: the directory's own name, `startup`
+        /// as the fallback.
+        #[arg(long)]
+        plane: Option<String>,
+        /// Rebuild the plane from the whole tree before serving: drop it,
+        /// re-create it, and fold every file through the installed plugins.
+        /// Facts only — embeddings return on the next `drsg digest`.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[cfg(feature = "digest")]
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install a plugin from a local `.wasm` file or an `http(s)://` URL.
+    ///
+    /// The artifact is validated as a component, asked to describe itself, and
+    /// its SHA-256 pinned; every later load re-checks the hash, so a file that
+    /// changes on disk is refused rather than silently run. Installing a name
+    /// again is the upgrade path.
+    Install {
+        /// Path to a `.wasm` component, or a URL to download one from.
+        /// **Omitted**: an interactive chooser lists the official plugins —
+        /// pick by number (`0` = all of them), paste a path/URL, or `q` to
+        /// cancel.
+        source: Option<String>,
+    },
+    /// List installed plugins as a table: name, version, extensions, hash,
+    /// source.
+    List {
+        /// Print machine-readable JSON instead of the table — the same
+        /// records `plugin.list` returns over RPC, so an agent can read
+        /// them from either surface.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an installed plugin by name.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -332,19 +480,29 @@ impl From<DirArg> for Dir {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    /// Declare (and build) a vector index on a `(label, property)`.
+    /// Declare (and build) a vector index. Two arguments (`LABEL PROPERTY`)
+    /// index one label; one argument (`PROPERTY`) indexes **every label in
+    /// the plane that carries the property**; no arguments defaults the
+    /// property to `embedding` — so `drsg index ensure --plane <p>` is the
+    /// whole follow-up to `drsg vectorize`.
     Ensure {
-        label: String,
-        property: String,
+        #[arg(value_name = "LABEL|PROPERTY", default_value = "embedding")]
+        first: String,
+        #[arg(value_name = "PROPERTY")]
+        second: Option<String>,
         #[arg(long, default_value = "startup")]
         plane: String,
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
     },
-    /// Declare (and build) a BM25 keyword index on a `(label, property)`.
+    /// Declare (and build) a BM25 keyword index. Two arguments
+    /// (`LABEL PROPERTY`) index one label; one argument (`PROPERTY`) indexes
+    /// every label in the plane that carries the property.
     Keyword {
-        label: String,
-        property: String,
+        #[arg(value_name = "LABEL|PROPERTY")]
+        first: String,
+        #[arg(value_name = "PROPERTY")]
+        second: Option<String>,
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Analyzer language (name or code, e.g. `english`/`en`, `french`/`fr`).
@@ -438,6 +596,53 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             };
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
         }
+        Command::Context { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::context, out)
+        }
+        #[cfg(feature = "digest")]
+        Command::Search {
+            query,
+            plane,
+            embed,
+            embed_model,
+            k,
+        } => {
+            let db = commands::open(&cli.db)?;
+            let embedder =
+                dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
+            write!(
+                out,
+                "{}",
+                dr_strange_llm::semantic_search(&db, &plane, &query, &embedder, k)?
+            )?;
+            Ok(())
+        }
+        #[cfg(not(feature = "digest"))]
+        Command::Search { .. } => anyhow::bail!(
+            "`drsg search` embeds the query and needs the digest feature; \
+             rebuild with default features"
+        ),
+        Command::Describe { name, plane } => {
+            let db = commands::open(&cli.db)?;
+            commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)
+        }
+        Command::Trace { from, to, plane } => {
+            let db = commands::open(&cli.db)?;
+            let p = db.plane(&plane)?;
+            write!(out, "{}", dr_strange_core::compact::trace(&p, &from, &to)?)?;
+            Ok(())
+        }
+        Command::Impact { name, plane, depth } => {
+            let db = commands::open(&cli.db)?;
+            let p = db.plane(&plane)?;
+            write!(
+                out,
+                "{}",
+                dr_strange_core::compact::impact(&p, &name, depth)?
+            )?;
+            Ok(())
+        }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;
             commands::catalog(&db, plane.as_deref(), out)
@@ -515,23 +720,33 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             )
         }
         Command::Index(IndexCmd::Ensure {
-            label,
-            property,
+            first,
+            second,
             plane,
             metric,
         }) => {
             let db = commands::open(&cli.db)?;
-            commands::index_ensure(&db, &plane, &label, &property, metric.into(), out)
+            match second {
+                Some(property) => {
+                    commands::index_ensure(&db, &plane, &first, &property, metric.into(), out)
+                }
+                None => commands::index_ensure_all(&db, &plane, &first, metric.into(), out),
+            }
         }
         Command::Index(IndexCmd::Keyword {
-            label,
-            property,
+            first,
+            second,
             plane,
             lang,
         }) => {
             let db = commands::open(&cli.db)?;
             let language = lang.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            commands::keyword_index_ensure(&db, &plane, &label, &property, language, out)
+            match second {
+                Some(property) => {
+                    commands::keyword_index_ensure(&db, &plane, &first, &property, language, out)
+                }
+                None => commands::keyword_index_ensure_all(&db, &plane, &first, language, out),
+            }
         }
         Command::Stats => {
             let db = commands::open(&cli.db)?;
@@ -549,13 +764,44 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             let db = commands::open(&cli.db)?;
             commands::restore(&db, &input, out)
         }
-        Command::Serve { addr } => {
+        Command::Serve { addr, mode } => {
             let db = commands::open(&cli.db)?;
-            let opts = config::serve_options(cfg, addr);
+            #[allow(unused_mut)]
+            let mut opts = config::serve_options(cfg, addr);
+            #[cfg(feature = "digest")]
+            if let Some(ServeMode::Watch { dir, plane, force }) = mode {
+                let plane =
+                    plane.unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
+                let plugin_config = config::plugin_config(cfg)?;
+                // The same embed config the server's search uses keeps the
+                // watched plane's vectors current after each fold.
+                let embed = opts.embed_provider.clone();
+                // The watched tree is the graph's source — attach it, so the
+                // MCP `grep` tool answers literal-text questions beside the
+                // graph's structural ones.
+                opts.source_root = Some(dir.clone());
+                opts.on_start = Some(Box::new(move |db| {
+                    commands::watch(db, dir, plane, plugin_config, embed, force)
+                }));
+            }
+            #[cfg(not(feature = "digest"))]
+            let _ = mode;
             // Hands off to the web crate, which owns its own async runtime and
             // blocks until a shutdown signal; `out` is unused (the server logs
             // itself).
             dr_strange_web::serve(db, Some(cli.db.clone()), opts)
+        }
+        #[cfg(feature = "digest")]
+        Command::Vectorize {
+            plane,
+            embed,
+            embed_model,
+            metric,
+        } => {
+            let db = commands::open(&cli.db)?;
+            let embedder =
+                dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
+            commands::vectorize(&db, &plane, &embedder, metric.into(), out)
         }
         #[cfg(feature = "digest")]
         Command::Ask {
@@ -585,6 +831,25 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             )
         }
         #[cfg(feature = "digest")]
+        #[cfg(feature = "digest")]
+        Command::Plugin(cmd) => {
+            let plugin_config = config::plugin_config(cfg)?;
+            let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
+                .fetch
+                .allow_private
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|s| dr_strange_web::fetch::Prefix::parse(s))
+                .collect::<Result<_>>()?;
+            match cmd {
+                PluginCmd::Install { source } => {
+                    commands::plugin_install(&plugin_config, &allow, source.as_deref(), out)
+                }
+                PluginCmd::List { json } => commands::plugin_list(&plugin_config, json, out),
+                PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
+            }
+        }
         Command::Digest {
             source,
             plane,
@@ -605,14 +870,25 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             topic,
             pages,
             depth,
+            handler,
+            plugin_source,
         } => {
             let db = commands::open(&cli.db)?;
+            // The `[plugins]` section, with the legacy flag folded in on top.
+            let mut plugin_config = config::plugin_config(cfg)?;
+            if plugin_source {
+                plugin_config
+                    .options
+                    .entry("rust".to_string())
+                    .or_default()
+                    .push(("include_source".to_string(), "true".to_string()));
+            }
             let args = commands::DigestArgs {
                 source: &source,
                 topic: topic.as_deref(),
                 pages,
                 depth,
-                plane: &plane,
+                plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,
                 chunk_chars,
                 concurrency,
@@ -627,8 +903,120 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 embed_url: embed_url.as_deref(),
                 chat_key_env: chat_key_env.as_deref(),
                 embed_key_env: embed_key_env.as_deref(),
+                handler: handler.as_deref(),
+                plugin_config,
             };
             commands::digest(&db, &args, out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The zero-argument invocations are the contract: `drsg digest` alone
+    /// must mean "this repository, into graph.drsg's startup plane".
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_digest_means_cwd_into_a_plane_named_after_it() {
+        let cli = Cli::try_parse_from(["drsg", "digest"]).unwrap();
+        assert_eq!(cli.db, PathBuf::from("graph.drsg"));
+        match cli.command {
+            Command::Digest {
+                source,
+                plane,
+                apply,
+                ..
+            } => {
+                assert_eq!(source, ".");
+                // Resolved at dispatch: the source directory's own name.
+                assert_eq!(plane, None);
+                assert_eq!(commands::default_plane(&source), "dr-strange-cli");
+                assert!(!apply, "a bare digest must stay a dry run");
+            }
+            _ => panic!("digest should parse as Digest"),
+        }
+    }
+
+    /// `drsg serve watch` with nothing else watches $CWD into a plane named
+    /// after it, beside the normally-served dashboard.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_serve_watch_takes_cwd_and_no_explicit_plane() {
+        let cli = Cli::try_parse_from(["drsg", "serve", "watch"]).unwrap();
+        match cli.command {
+            Command::Serve {
+                mode: Some(ServeMode::Watch { dir, plane, .. }),
+                ..
+            } => {
+                assert_eq!(dir, PathBuf::from("."));
+                assert_eq!(plane, None);
+                let forced = Cli::try_parse_from(["drsg", "serve", "watch", "--force"]).unwrap();
+                assert!(matches!(
+                    forced.command,
+                    Command::Serve {
+                        mode: Some(ServeMode::Watch { force: true, .. }),
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("should parse as Serve(Watch)"),
+        }
+    }
+
+    /// One positional = property, sweeping all labels; two = label, property.
+    #[test]
+    fn bare_index_ensure_defaults_to_the_embedding_property() {
+        let none = Cli::try_parse_from(["drsg", "index", "ensure"]).unwrap();
+        match none.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "embedding");
+                assert_eq!(second, None);
+            }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+    }
+
+    #[test]
+    fn index_ensure_takes_one_or_two_positionals() {
+        let one = Cli::try_parse_from(["drsg", "index", "ensure", "embedding"]).unwrap();
+        match one.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "embedding");
+                assert_eq!(second, None);
+            }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+        let two =
+            Cli::try_parse_from(["drsg", "index", "ensure", "Function", "embedding"]).unwrap();
+        match two.command {
+            Command::Index(IndexCmd::Ensure { first, second, .. }) => {
+                assert_eq!(first, "Function");
+                assert_eq!(second.as_deref(), Some("embedding"));
+            }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+    }
+
+    /// Sources that don't name a directory keep the `startup` fallback.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn non_directory_sources_default_to_startup() {
+        assert_eq!(commands::default_plane("https://example.com/x"), "startup");
+        assert_eq!(commands::default_plane("Cargo.toml"), "startup");
+        assert_eq!(commands::default_plane("/"), "startup");
+    }
+
+    /// `drsg plugin install` with nothing after it must parse — the missing
+    /// source is what routes to the interactive chooser.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn bare_plugin_install_parses_without_a_source() {
+        let cli = Cli::try_parse_from(["drsg", "plugin", "install"]).unwrap();
+        match cli.command {
+            Command::Plugin(PluginCmd::Install { source }) => assert!(source.is_none()),
+            _ => panic!("should parse as Plugin(Install)"),
         }
     }
 }

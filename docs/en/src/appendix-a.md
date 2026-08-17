@@ -57,6 +57,14 @@ or an external key.
 - **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
 - **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string (`coarse` \| `fine` \| `super`, default `fine` — see [Chapter 3](./ai-native.md#extraction-precision); `super` costs ~15× the input tokens).
 - **`digest.write`** · write — write a previously-computed proposal (no LLM call). Params: `plane` string!, `nodes` array!, `edges` array.
+- **`plane.vectorize`** · write — embed every node in a plane (unchanged texts are skipped) and ensure a vector index on `embedding` per label; the provider key comes from the server's environment. Params: `plane` string!, `embed` string, `embed_model` string, `metric` string.
+
+## Plugins
+
+- **`plugin.list`** · read — the installed preprocessor plugins, the same records `drsg plugin list --json` prints. Params: none.
+- **`plugin.catalog`** · read — the official catalog this build pins (release URLs + SHA-256 hashes); a constant of the binary, joinable against `plugin.list`. Params: none.
+- **`plugin.install`** · write — download, validate, hash-pin and store a plugin from an `http(s)` URL (server-local paths are refused over RPC). Params: `url` string!.
+- **`plugin.remove`** · write — uninstall a plugin by name. Params: `name` string!.
 
 ## WebSocket subscription
 

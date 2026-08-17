@@ -161,6 +161,65 @@ fn merge_counts<K: Ord + Clone>(dst: &mut BTreeMap<K, u64>, src: &BTreeMap<K, u6
     }
 }
 
+/// The always-current summary the dashboard reads: totals and per-name
+/// counts, **maintained transactionally** with every mutation and stored as
+/// one row per plane — so reading it is a point lookup, not a scan. The full
+/// [`CatalogSnapshot`] (property stats, connections) stays scan-computed:
+/// it is the deep schema view, not the health panel.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaneCounters {
+    pub nodes: u64,
+    pub edges: u64,
+    /// label → nodes carrying it (a two-label node counts in both).
+    pub labels: BTreeMap<String, u64>,
+    /// edge type → edges of it.
+    pub edge_types: BTreeMap<String, u64>,
+}
+
+impl PlaneCounters {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| crate::error::Error::Corrupt(format!("counters row: {e}")))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("counters serialize cannot fail")
+    }
+
+    /// Folds `other` in — the cross-plane roll-up.
+    pub fn merge(&mut self, other: &PlaneCounters) {
+        self.nodes += other.nodes;
+        self.edges += other.edges;
+        merge_counts(&mut self.labels, &other.labels);
+        merge_counts(&mut self.edge_types, &other.edge_types);
+    }
+}
+
+/// Counts one plane by scanning it — the backfill for a database written
+/// before counters existed, and the fallback for a time-travel snapshot
+/// older than its plane's row. Deliberately lighter than [`compute`]: no
+/// property stats, no per-edge endpoint lookups.
+pub fn count(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<PlaneCounters> {
+    let mut out = PlaneCounters::default();
+    for id in graph::scan_all(txn, plane)? {
+        let Some(node) = graph::get_node(txn, plane, id)? else {
+            continue;
+        };
+        out.nodes += 1;
+        for label in &node.labels {
+            *out.labels.entry(label.clone()).or_default() += 1;
+        }
+    }
+    for id in graph::scan_edges(txn, plane)? {
+        let Some(edge) = graph::get_edge(txn, plane, id)? else {
+            continue;
+        };
+        out.edges += 1;
+        *out.edge_types.entry(edge.ty.clone()).or_default() += 1;
+    }
+    Ok(out)
+}
+
 /// Computes the catalog for one plane by scanning it (arch/03 §5).
 pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnapshot> {
     let mut cat = CatalogSnapshot::default();

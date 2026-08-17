@@ -1,10 +1,11 @@
 # SDK
 
-Dr Strange ships client libraries for **five languages** — TypeScript, Python,
-Go, Java, and C. Each communicates with a running `drsg serve` over JSON-RPC 2.0,
-and its typed method surface is **generated from the server's OpenRPC schema**,
-so every SDK matches the wire protocol exactly and stays in step with it across
-releases.
+Dr Strange ships client libraries for **six languages** — TypeScript, Python,
+Go, Java, C, and Zig. Each communicates with a running `drsg serve` over
+JSON-RPC 2.0, and its typed method surface is **generated from the server's
+OpenRPC schema**, so every SDK matches the wire protocol exactly and stays in
+step with it across releases. (The Zig client is a thin idiomatic binding over
+the generated C client, so it inherits the same guarantee.)
 
 ## Obtaining the SDKs
 
@@ -19,6 +20,7 @@ project or depend on it in place:
 | Go | `sdk/go` | module `github.com/wangyingsm/dr-strange/sdk/go` |
 | Java | `sdk/java` | a Maven module (Jackson + JDK HttpClient) |
 | C | `sdk/c` | `make` → `libdrsg.a` + `drsg.h` (libcurl + json-c) |
+| Zig | `sdk/zig` | a `build.zig` module binding the C client (Zig 0.16) |
 
 ## Connecting and calling
 
@@ -34,6 +36,7 @@ one, adapted to each language's convention:
 | Go | `drsg.New(drsg.WithBaseURL(…), drsg.WithToken(…))` | `db.NodeCreate(ctx, …)` |
 | Java | `new Drsg(baseUrl, token)` | `db.nodeCreate(…)` |
 | C | `drsg_client_new(base_url, token)` | `drsg_node_create(…)` |
+| Zig | `try drsg.Client.init(base_url, token)` | `c.drsg_node_create(client.handle, …)` |
 
 The shape is uniform. In TypeScript:
 

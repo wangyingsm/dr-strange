@@ -1,6 +1,8 @@
 # MCP Service Layer
 
-**Status**: draft · `drsg-mcp` built (M4), `digest` deferred · 2026-07-28
+**Status**: shipped — `drsg-mcp` stdio (M4), streamable HTTP on `drsg serve`
+(ROADMAP §10), `digest` tool live, agent verbs landed (§11) ·
+last revised 2026-08-18
 
 **M4 landed** the `drsg-mcp` stdio server on the **official `rmcp` SDK**
 (resolving arch's hand-rolled-vs-SDK question toward the SDK: spec-correct
@@ -21,21 +23,22 @@ MCP speaks **JSON-RPC 2.0**, which is also the project-wide wire protocol
 in MCP tool params/results are byte-identical to those of the web UI backend
 and the future network server. One serialization, three surfaces.
 
-## 1. Tool surface (v1)
+## 1. Tool surface (current)
 
 Exploration-first, mirroring how an agent actually works a graph — orient,
 then narrow, then act:
 
 | Tool | Purpose |
 |---|---|
+| `context` · `describe` · `search` · `grep` · `trace` · `impact` · `snippet` | the seven agent verbs over a digested code plane — one round trip each, compact one-fact-per-line text, ambiguity returns candidates, call listings state their lower bound. `context` is the primary verb; `grep` and `snippet` read the watched source tree |
 | `list_planes` | planes with names, descriptions, sizes — "which canvas?" |
 | `describe_plane` | per-plane catalog: labels, properties with **dominant descriptions**, edge-type connectivity, vector indexes, counts |
-| `get_node` / `get_edge` | one record, properties **with descriptions**, adjacency summary (per-type counts, not the edges themselves) |
-| `search` | one hybrid entry point: vector/structural/text — compiles to a plan (`VectorTopK` / `FrontierTopK` / label+filter) |
+| `get_node` | one record, properties **with descriptions**, adjacency summary (per-type counts, not the edges themselves) |
 | `traverse` | bounded expansion from seeds (direction, edge types, depth, limit) |
-| `query` | full serialized-plan execution for sophisticated callers |
-| `write_nodes` / `write_edges` | batched upserts by external key; `PropDesc` descriptions writable |
-| `digest` | LLM-powered document → graph ingest, same engine as `drsg digest` (05 §3; detailed design deferred to [07-llm.md](07-llm.md)) |
+| `query` / `cypher` | serialized-plan execution; the openCypher subset compiled to the same plans |
+| `algo` / `hybrid` / `ask` | graph algorithms; fused vector+keyword+proximity retrieval; NL → read-only plan |
+| `write_nodes` / `write_edges` | batched creates by external key; `PropDesc` descriptions writable |
+| `digest` | LLM-powered document → graph ingest, same engine as `drsg digest` (05 §3, [07-llm.md](07-llm.md)) |
 | `create_plane` / `drop_plane` | canvas lifecycle (drop gated — §3) |
 
 ## 2. Token frugality (design rules)
@@ -72,16 +75,21 @@ writing descriptions back; future sessions inherit them.
 
 1. ~~**`search` tool scope** — one polymorphic tool vs split
    `vector_search`/`find_nodes`?~~ **Resolved: split.** Each tool carries a
-   schema an agent can read without branching — `vector_search`, `get_node`,
-   `expand`, `cypher` and the rest — and the tool budget never became the
-   binding constraint the polymorphic option was hedging against.
-2. **Embedding generation on write** — should `write_nodes` auto-embed text
-   properties via `dr-strange-llm`, or must callers supply vectors? (Leaning: opt-in
-   auto-embed configured per plane, provider set at server start.)
+   schema an agent can read without branching, and the tool budget never
+   became the binding constraint the polymorphic option was hedging against.
+   (The names have since evolved — `search` today is the semantic agent verb,
+   with `traverse`/`query`/`cypher` beside it — but the one-tool-one-schema
+   principle held.)
+2. ~~**Embedding generation on write** — should `write_nodes` auto-embed text
+   properties via `dr-strange-llm`, or must callers supply vectors?~~
+   **Resolved: opt-in auto-embed, configured per server.** The `[server]`
+   embed settings (`embed_provider` / `embed_model` / `embed_key_env`) drive
+   `write_nodes` and the `search` verb alike; callers may still supply
+   vectors directly.
 3. **Multi-database serving** — one MCP server per DB file vs a `db`
    argument on every tool.
-4. **Transport** — stdio shipped and remains the right answer for a single
-   agent: point a host at a path, nothing to run. Streamable HTTP is landing as
-   an endpoint on `drsg serve` rather than a client mode here (ROADMAP §10),
-   because the tools must run in-process against the same `Database` to keep
-   batch atomicity. Its security model is 08 §4.2.
+4. ~~**Transport**~~ — **settled, both shipped.** stdio remains the right
+   answer for a single agent: point a host at a path, nothing to run.
+   Streamable HTTP landed as an endpoint on `drsg serve` rather than a client
+   mode here (ROADMAP §10), because the tools must run in-process against the
+   same `Database` to keep batch atomicity. Its security model is 08 §4.2.

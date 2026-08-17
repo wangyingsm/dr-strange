@@ -182,6 +182,7 @@ $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 addr = "0.0.0.0:7700"                       # 监听地址（命令行 --addr 覆盖此项）
 token = "please-change-me"                  # 共享 API 令牌（→ DRSG_TOKEN）
 max_concurrent = 256                        # 并发请求上限
+source_root = "/srv/myrepo"                 # grep/snippet 智能体工具读取的源码树（serve watch 会用 --dir 设置它）
 allowed_origins = ["https://app.example.com"]  # 额外允许的浏览器来源
 
 [server.tls]                                # 存在此节 ⇒ 以 HTTPS 提供服务
@@ -199,6 +200,13 @@ DASHSCOPE_API_KEY = "…"
 [digest]                                    # 服务端 AIgest 调优
 concurrency = 8                             # 并发进行的分块抽取调用数
 chunk_chars = 4000                          # 目标分块大小
+embed_provider = "openai"                   # search / write_nodes / watch 重新向量化所用的嵌入提供方
+embed_model = "text-embedding-3-small"      # 其模型（各提供方均有默认值）
+embed_key_env = "OPENAI_API_KEY"            # 存放密钥的环境变量
+
+[plugins]                                   # 预处理沙箱调优（均可省略）
+fuel = 200000000000                         # 每次沙箱调用的指令预算（0 为不设限）
+memory_mb = 3072                            # 每次调用的线性内存上限，MiB；按照 wasm32 标准，最高支持 4096
 
 [fetch]                                     # URL 导入（第 3 章）
 enabled = true                              # 置为 false 则彻底拒绝 URL 抓取

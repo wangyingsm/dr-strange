@@ -58,6 +58,14 @@ pub trait CandidateSource {
     /// Best-effort: an empty result simply means "propose everything as new".
     fn similar(&self, query: &[f32], k: usize) -> Result<Vec<ExistingEntity>>;
 
+    /// Whether [`similar`](Self::similar) can return anything at all. `false`
+    /// lets the digest skip embedding a chunk whose vector nobody will read —
+    /// which is also what keeps `--no-link --no-embed` from needing an
+    /// embedding key.
+    fn wants_similar(&self) -> bool {
+        true
+    }
+
     /// Which of `keys` the target graph already holds, looked up **exactly**.
     ///
     /// Similarity search cannot answer this: it depends on the plane's nodes
@@ -173,12 +181,24 @@ struct ExRelation {
 
 // ---- the result ----------------------------------------------------------
 
+#[derive(Debug, Default)]
 pub struct DigestNode {
     pub key: String,
+    /// The label a model chose, and the one stage 1 reconciles: `Func`,
+    /// `function` and `Function` are folded to a single name across chunks.
     pub label: String,
+    /// Further labels **asserted rather than chosen** — constants a
+    /// preprocessor knows to be true, like `External` on a node standing in for
+    /// something outside the tree it read.
+    ///
+    /// Separate from `label` because they must not take part in vocabulary
+    /// reconciliation: there is no disagreement to settle, and nothing a model
+    /// should be able to rename them to. A node is written with all of them.
+    pub extra_labels: Vec<String>,
     pub props: Properties,
 }
 
+#[derive(Debug)]
 pub struct DigestEdge {
     pub src: String,
     pub dst: String,
@@ -210,8 +230,15 @@ pub struct DigestReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub embed_tokens: u64,
+    /// Anything a reader of this result would want said in words — what a
+    /// preprocessor skipped, what it could not resolve, what it dropped.
+    ///
+    /// A thin graph should be explained by its report rather than investigated
+    /// by re-running the ingest with different arguments.
+    pub notes: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct DigestResult {
     pub nodes: Vec<DigestNode>,
     pub edges: Vec<DigestEdge>,
@@ -331,7 +358,17 @@ impl DigestResult {
             fresh.push(n);
         }
 
-        let label_slots: Vec<[&str; 1]> = fresh.iter().map(|n| [n.label.as_str()]).collect();
+        // The reconciled label first, then whatever a preprocessor asserted —
+        // an external trait is written `["Trait", "External"]`, saying both what
+        // it is and that it is not ours.
+        let label_slots: Vec<Vec<&str>> = fresh
+            .iter()
+            .map(|n| {
+                std::iter::once(n.label.as_str())
+                    .chain(n.extra_labels.iter().map(String::as_str))
+                    .collect()
+            })
+            .collect();
         let nodes: Vec<BulkNode> = fresh
             .iter()
             .zip(&label_slots)
@@ -402,7 +439,11 @@ pub fn digest(
     let mut blocks: Vec<Option<String>> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         let block = match candidates {
-            Some(src) => {
+            // `wants_similar` gates the chunk embedding: a grounding-only
+            // source (facts with no plane behind them — `--no-link`) answers
+            // `similar` with nothing, so embedding the chunk would spend a
+            // provider call, and require a key, for a vector nobody reads.
+            Some(src) if src.wants_similar() => {
                 let emb = embedder.embed(std::slice::from_ref(chunk))?;
                 report.embed_tokens += emb.tokens;
                 let cands = match emb.vectors.first() {
@@ -415,7 +456,7 @@ pub fn digest(
                 }
                 block
             }
-            None => None,
+            _ => None,
         };
         blocks.push(block);
     }
@@ -446,6 +487,7 @@ pub fn digest(
             let node = entities.entry(e.key.clone()).or_insert_with(|| DigestNode {
                 key: e.key.clone(),
                 label: String::new(),
+                extra_labels: Vec::new(),
                 props: Properties::new(),
             });
             if node.label.is_empty() && !e.label.is_empty() {
@@ -573,6 +615,7 @@ pub fn digest(
                 let survivor = entities.entry(into.clone()).or_insert_with(|| DigestNode {
                     key: into.clone(),
                     label: absorbed.label.clone(),
+                    extra_labels: Vec::new(),
                     props: Properties::new(),
                 });
                 if survivor.label.is_empty() {
@@ -877,6 +920,64 @@ fn add_provenance(props: &mut Properties, opts: &DigestOptions) {
 /// (`Properties` is a `BTreeMap`), keeping the run-scoped dedup reproducible.
 fn embed_text(n: &DigestNode) -> String {
     entity_text(&n.key, std::slice::from_ref(&n.label), &n.props)
+}
+
+/// The text embedded for a **parser fact**: identity, then string content
+/// only — `Int`/`Float`/`Bool` properties are dropped, unlike
+/// [`entity_text`]'s promote-everything rule.
+///
+/// Two reasons, and the second is the load-bearing one. Precision: `line: 833`
+/// describes where a symbol sits, not what it is. Stability: positional
+/// properties churn with every commit above the symbol, so including them
+/// would re-vectorize an unchanged function on every fold — while with them
+/// excluded, an unchanged symbol's text is byte-stable and re-embedding can
+/// skip it outright. Document-extracted entities keep [`entity_text`]:
+/// `year: 2020` on a paper is content, and documents rarely churn.
+pub fn fact_text(key: &str, labels: &[String], props: &Properties) -> String {
+    let mut s = match labels {
+        [] => key.to_string(),
+        _ => format!("{} ({})", key, labels.join(", ")),
+    };
+    for (k, pd) in props {
+        if k.starts_with('_') {
+            continue;
+        }
+        let text = match &pd.value {
+            PropValue::Str(v) => {
+                let t = v.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            }
+            PropValue::List(items) => {
+                let parts: Vec<&str> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropValue::Str(t) => {
+                            let t = t.trim();
+                            (!t.is_empty()).then_some(t)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            s.push_str(&format!("\n{k}: {text}"));
+        }
+    }
+    s
+}
+
+/// The text to embed for any node, chosen by provenance: a node a parser
+/// stamped (`_generated_by`) gets [`fact_text`]'s projection; everything else
+/// — model extractions, agent writes — gets [`entity_text`] in full.
+pub fn embeddable_text(key: &str, labels: &[String], props: &Properties) -> String {
+    if props.contains_key("_generated_by") {
+        fact_text(key, labels, props)
+    } else {
+        entity_text(key, labels, props)
+    }
 }
 
 /// The canonical text for an entity, shared by every path that embeds one.
@@ -1267,6 +1368,68 @@ mod tests {
     fn a_document_with_no_markers_chunks_exactly_as_before() {
         let doc = "One paragraph.\n\nAnother paragraph.\n\nA third.";
         assert_eq!(chunk(doc, 4000).len(), 1, "markers are the only new break");
+    }
+
+    /// Parser facts embed a projection: strings and string-lists only.
+    /// `line: 833` would churn the vector of an unchanged symbol on every
+    /// commit above it; the projection keeps the text byte-stable instead.
+    #[test]
+    fn fact_text_drops_numerics_and_keeps_content() {
+        let mut props = Properties::new();
+        let put = |props: &mut Properties, k: &str, v: PropValue| {
+            props.insert(k.into(), PropDesc::described(k, v));
+        };
+        put(
+            &mut props,
+            "doc_comment",
+            PropValue::Str("Fetches one node.".into()),
+        );
+        put(
+            &mut props,
+            "signature",
+            PropValue::Str("fn node(&self)".into()),
+        );
+        put(&mut props, "line", PropValue::Int(833));
+        put(&mut props, "is_async", PropValue::Bool(false));
+        put(
+            &mut props,
+            "fields",
+            PropValue::List(vec![PropValue::Str("id: NodeId".into()), PropValue::Int(9)]),
+        );
+        put(&mut props, "_run", PropValue::Str("abc".into()));
+
+        let t = fact_text("k::node", &["Method".into()], &props);
+        assert!(t.starts_with("k::node (Method)"));
+        assert!(t.contains("doc_comment: Fetches one node."));
+        assert!(t.contains("fields: id: NodeId"), "{t}");
+        assert!(!t.contains("833"), "positional noise embedded: {t}");
+        assert!(!t.contains("is_async"), "{t}");
+        assert!(!t.contains("_run"), "{t}");
+        // entity_text, by contrast, promotes the number — that is the
+        // document rule, where `year: 2020` is content.
+        assert!(entity_text("k::node", &["Method".into()], &props).contains("line: 833"));
+    }
+
+    /// Provenance picks the recipe: `_generated_by` → projection, else full.
+    #[test]
+    fn embeddable_text_chooses_by_provenance() {
+        let mut fact = Properties::new();
+        fact.insert(
+            "_generated_by".into(),
+            PropDesc::described("parser", PropValue::Str("rust@2".into())),
+        );
+        fact.insert(
+            "line".into(),
+            PropDesc::described("line", PropValue::Int(7)),
+        );
+        assert!(!embeddable_text("k", &[], &fact).contains("line: 7"));
+
+        let mut doc = Properties::new();
+        doc.insert(
+            "year".into(),
+            PropDesc::described("year", PropValue::Int(2020)),
+        );
+        assert!(embeddable_text("k", &[], &doc).contains("year: 2020"));
     }
 
     #[test]

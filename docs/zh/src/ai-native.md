@@ -174,6 +174,75 @@ URL 抓取默认启用。默认*不*包含的，是触及私有网络的能力�
 已知限制：正文由浏览器中的 JavaScript 组装而成的页面，抓取到的只是一具没有正文的
 外壳。本项目不包含无头渲染器。
 
+### 读取代码库
+
+将 `digest` 指向一个目录，它会遍历整棵树，并把每个文件交给能够处理它的处理器。源码
+文件是被**解析**的，而不是被阅读的：得到的是一个编译器级别的解析器所确知的事实，而
+非模型对文本的理解。
+
+解析器是**插件**——安装一次、随处可用的沙箱化 WebAssembly 组件：
+
+```console
+$ drsg plugin install https://github.com/…/releases/download/rust-v2/rust.wasm
+installed rust@2  sha256:e3a586a150d0
+  handles: .rs
+```
+
+制品的 SHA-256 在安装时被锁定，并在每次加载时重新校验，因此磁盘上被改动过的文件会
+被拒绝，而不是被悄悄运行。在沙箱内，插件能触及的只有三件事——列出文件、读取文件、
+询问这棵树的名字——全部以被导入的目录为根，并按解析后的路径检查。没有文件系统，没
+有网络，没有环境变量，时钟被冻结，指令数与内存都有硬性预算（`drsg.toml` 的
+`[plugins]` 节）。一个哪怕只是导入了文件系统接口的组件，都会在安装时被指名拒绝。
+
+```console
+$ drsg --db graph.drsg digest ./crates/dr-strange-core/src --plane code --apply
+preprocessed by rust@2 (5528 facts)
+no prose left to read — digested without a model call
+  0 chat request(s); tokens 0 in / 0 out / 0 embed
+applied: wrote 1139 nodes, 2739 edges
+```
+
+请重读第三行：**当时没有设置任何 API key，也没有发出任何请求。** 语法树不需要推断
+`parse()` 调用了 `lex()`——它本就知道；因此把文件当作散文交给模型，是在花费 token
+去换取一个比手上已有答案更差的结果。凡是解析器确知之处，模型都不会被问及。
+
+每个处理器都带来自己的一套词汇，由处理器本身固定，而不是逐份文档临时发明——这正是事
+后无需再作调和的原因，也是**某个处理器所产出的标签与属性由该处理器自行记录**、而不
+记录在此处的原因。请查阅你正在使用的那一个；`drsg digest --handler <name>` 即指定了
+它的名字。
+
+每一条事实都带有 `_generated_by`，其中记有处理器的名字与版本，因此解析所得的事实与
+模型的猜测始终可以区分。当两者认领同一个 key 时，**以解析器为准**，模型给出的那一份
+被丢弃并计数。
+
+上例指向的是 `src/` 而非 crate 根目录，这正是「不调用模型」与「调用模型」之间的分
+界：crate 根目录下有 `Cargo.toml`，通常还有 README，而它们确实是需要阅读的散文。当
+指向某个 `src/` 目录时，crate 仍会以其上层目录命名，因此导入同一 plane 的两个 crate
+依然是两个 crate。
+
+真实的代码库不止一种语言，所以整棵树是逐文件路由的：Rust 被解析，Markdown 与配置文
+件成为交给模型的散文，无法读取的文件则被跳过并**计数**。解析器无法确定的部分会被报
+告出来，而不是被悄悄略去——调用另一个 crate 的函数不构成边，而一个同时匹配两个函数
+的名字会被留白，而不是靠猜：
+
+```
+note: 553 call(s) named nothing defined here — calls into other crates and
+      the standard library are not edges
+```
+
+`--handler rust` 强制指定处理器，而不按扩展名路由。插件自身的设置位于 `drsg.toml`
+的 `[plugins.<name>]` 节，原样透传——`[plugins.rust] include_source = true` 会把每个
+函数自身的源码存到它的节点上以供取回，默认关闭，因为那几乎等于把整个代码库复制进
+图里。
+
+遍历会遵守 `.gitignore` 与 `.dockerignore`（一个项目对「什么是衍生物、什么是源码」
+的自我声明，胜过本工具所能猜测的任何清单），并且总是跳过 `target/`、`node_modules/`
+之类的目录。对未改动的树运行两次，得到的图逐字节相同。
+
+这一能力被刻意限定为**仅限本地**——你自己机器上的 `drsg` 与 stdio MCP 服务器，而绝不
+包括共享的 `drsg serve`。使解析值得其代价的，是处理器能够拉取它所拿到的那个文件**周
+围**的文件；而共享服务器唯一能提供的文件系统，是它自己的那一个。
+
 ## 提供方与密钥
 
 LLM 相关功能——语义检索的嵌入、`ask` 与导入——都会调用一个外部提供方。已内置

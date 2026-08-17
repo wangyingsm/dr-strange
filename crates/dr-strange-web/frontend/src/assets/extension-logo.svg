@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 72" fill="none" stroke="#d9a441" stroke-width="2" stroke-linejoin="round">
+  <!-- The dr-strange magic circle, as upstream draws it. -->
+  <g>
+    <circle cx="36" cy="36" r="30"/>
+    <circle cx="36" cy="36" r="25.5" stroke-width="3" stroke-dasharray="1.2 3"/>
+    <rect x="20" y="20" width="32" height="32"/>
+    <rect x="20" y="20" width="32" height="32" transform="rotate(45 36 36)"/>
+    <circle cx="36" cy="36" r="11"/>
+    <circle cx="36" cy="36" r="3.5" fill="#d9a441" stroke="none"/>
+  </g>
+  <!-- The add-on: a satellite circle docking onto the sigil — an extension,
+       drawn in the same hand. The spark inside is a plug-in's socket. -->
+  <g>
+    <line x1="63" y1="42" x2="72" y2="46"/>
+    <circle cx="78" cy="49" r="12"/>
+    <circle cx="78" cy="49" r="8.5" stroke-dasharray="1.2 3" stroke-width="2.5"/>
+    <path d="M74 49 h8 M78 45 v8" stroke-width="2.5"/>
+  </g>
+</svg>

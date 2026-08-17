@@ -14,6 +14,7 @@ import {
   alphaFor,
   dim,
   focusDistances,
+  frontierIds,
   hubsToFold,
   leavesOf,
   sectorLeaves,
@@ -294,5 +295,57 @@ describe('weightByImportance', () => {
     const [g, scores] = pair(1, 0)
     weightByImportance(g, scores, 3)
     expect(g.getEdgeAttribute('ab', 'weight')).toBeGreaterThan(1)
+  })
+})
+
+describe('frontierIds', () => {
+  // A hub with two leaves and one well-connected interior node.
+  const plotted = () => {
+    const g = new Graph({ type: 'directed', multi: true })
+    for (const n of ['hub', 'mid', 'leafA', 'leafB']) g.addNode(n, {})
+    g.addEdgeWithKey('e1', 'hub', 'mid', {})
+    g.addEdgeWithKey('e2', 'mid', 'hub', {})
+    g.addEdgeWithKey('e3', 'hub', 'leafA', {})
+    g.addEdgeWithKey('e4', 'hub', 'leafB', {})
+    return g
+  }
+
+  test('a node with one edge is on the frontier; a connected one is not', () => {
+    const front = frontierIds(plotted())
+    expect(front.sort()).toEqual(['leafA', 'leafB'])
+  })
+
+  test('leaves folded into a bead are still on the frontier', () => {
+    // What the plot actually looks like after `_collapseLeaves`: the leaves are
+    // gone from the graph and a bead stands in their place. Reading only the
+    // graph here reports an empty frontier, and "expand" appears to do nothing.
+    const g = new Graph({ type: 'directed', multi: true })
+    g.addNode('hub', {})
+    g.addNode('mid', {})
+    g.addEdgeWithKey('e1', 'hub', 'mid', {})
+    g.addEdgeWithKey('e2', 'mid', 'hub', {})
+    g.addNode('~bead:hub', { bead: true, count: 2 })
+    g.addEdgeWithKey('~beadedge:hub', 'hub', '~bead:hub', {})
+    const collapsed = new Map([
+      ['~bead:hub', { hub: 'hub', nodes: [{ id: 10 }, { id: 11 }], edges: [] }],
+    ])
+
+    expect(frontierIds(g, collapsed).sort()).toEqual(['10', '11'])
+  })
+
+  test('the bead itself is never offered as an entity to expand', () => {
+    const g = new Graph({ type: 'directed', multi: true })
+    g.addNode('hub', {})
+    g.addNode('~bead:hub', { bead: true })
+    g.addEdgeWithKey('~beadedge:hub', 'hub', '~bead:hub', {})
+    const front = frontierIds(g, new Map())
+    expect(front).not.toContain('~bead:hub')
+  })
+
+  test('an entity both drawn and folded is offered once', () => {
+    const g = new Graph({ type: 'directed', multi: true })
+    g.addNode('10', {})
+    const collapsed = new Map([['~bead:x', { hub: 'x', nodes: [{ id: 10 }], edges: [] }]])
+    expect(frontierIds(g, collapsed)).toEqual(['10'])
   })
 })

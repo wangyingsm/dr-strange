@@ -3,6 +3,7 @@
   import { rpc, authHeaders, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
+  import { renderMarkdown } from './markdown.js'
   import CreatePlane from './CreatePlane.svelte'
   import Icon from './Icon.svelte'
 
@@ -52,6 +53,43 @@
   let status = $state('')
   let error = $state(null)
   let vectorView = $state(null) // { k, values } — floats popup, null = closed
+  let textView = $state(null) // { k, text } — full-value popup, null = closed
+  let hint = $state(null) // { path, label, x, y } — floating hint, null = hidden
+
+  // Anchored under the link rather than at the cursor, so it does not jitter
+  // with the mouse, and clamped to the viewport so a long path near the right
+  // edge is still readable rather than clipped.
+  const HINT_WIDTH = 420
+  function showHint(event, path, label) {
+    const box = event.currentTarget.getBoundingClientRect()
+    hint = {
+      path,
+      label,
+      x: Math.max(8, Math.min(box.left, window.innerWidth - HINT_WIDTH - 8)),
+      y: box.bottom + 6,
+    }
+  }
+
+  // ---- long property values ------------------------------------------------
+  //
+  // A doc comment is a paragraph and a path can be a line, and either one makes
+  // the inspector scroll past everything else on the node. Values are shown as
+  // an excerpt with the whole thing one click away.
+  //
+  // Two limits, because a value can be long in two different ways: many words
+  // (prose) or few but enormous (a path, a blob). Either alone would let the
+  // other through.
+  const EXCERPT_WORDS = 50
+  const EXCERPT_CHARS = 300
+
+  const isLongText = (v) =>
+    typeof v === 'string' &&
+    (v.length > EXCERPT_CHARS || v.trim().split(/\s+/).length > EXCERPT_WORDS)
+
+  function excerpt(v) {
+    const words = v.trim().split(/\s+/).slice(0, EXCERPT_WORDS).join(' ')
+    return words.length > EXCERPT_CHARS ? words.slice(0, EXCERPT_CHARS) : words
+  }
 
   // Algorithm overlays (ROADMAP §1): decorate the plotted graph with a
   // `plane.algo` result. `algoLegend` (when set) supersedes the category legend.
@@ -284,6 +322,66 @@
   // A numeric array = an embedding vector; render a button, not 128+ floats.
   const isVector = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')
 
+  // ---- properties that name other nodes -----------------------------------
+  //
+  // A preprocessor's module lists what it imports, and every one of those is a
+  // node in this plane — `crate::storage::node` as itself, `std::fmt::Display`
+  // as an external stand-in. Left as text they are only readable; resolved,
+  // they are the graph's own links.
+  //
+  // The rule is deliberately about the *value*, not the property name: an entry
+  // links when a node in this plane actually carries it as an external key.
+  // Keying off a name like `imports` would wire one handler's vocabulary into
+  // the dashboard, and the next handler would need another patch here.
+  const LINK_MAX_ENTRIES = 256 // a real module's import list runs to dozens
+  const LINK_MAX_LEN = 200
+
+  let keyLinks = $state({}) // external key -> { id, label } | null (looked up, absent)
+
+  // Split a value the way these lists are written, or return null if it cannot
+  // be one — no whitespace inside an entry, and not too many of them.
+  function keyCandidates(v) {
+    if (typeof v !== 'string' || !v.trim()) return null
+    const parts = v.split(',').map((s) => s.trim())
+    if (parts.length > LINK_MAX_ENTRIES) return null
+    if (parts.some((p) => !p || p.length > LINK_MAX_LEN || /\s/.test(p))) return null
+    return parts
+  }
+
+  // Resolve every candidate the selected node mentions, once per distinct key.
+  // Point lookups against an embedded database, run together rather than in
+  // series, and only for values already shaped like a key list.
+  async function resolveKeyLinks(props) {
+    const wanted = new Set()
+    for (const pe of propEntries(props)) {
+      for (const c of keyCandidates(pe.v) ?? []) if (!(c in keyLinks)) wanted.add(c)
+    }
+    if (!wanted.size) return
+    const found = await Promise.all(
+      [...wanted].map(async (key) => {
+        try {
+          const n = await rpc('node.get', { plane, key })
+          return [key, n ? { id: n.id, label: n.labels?.[0] ?? '' } : null]
+        } catch {
+          return [key, null] // a failed lookup is simply not a link
+        }
+      }),
+    )
+    keyLinks = { ...keyLinks, ...Object.fromEntries(found) }
+  }
+
+  // A property's entries, each carrying the node it names when there is one.
+  function linkedEntries(v) {
+    const parts = keyCandidates(v)
+    if (!parts) return null
+    const linked = parts.map((text) => ({ text, node: keyLinks[text] ?? null }))
+    return linked.some((p) => p.node) ? linked : null
+  }
+
+  $effect(() => {
+    if (selected?.kind === 'node') resolveKeyLinks(selected.data.properties)
+  })
+
   // Pretty grid: fixed-width columns of 6 values, index-addressable via rows.
   function formatVector(v) {
     const cols = 6
@@ -302,6 +400,104 @@
     } catch {
       labels = []
       catLabels = {}
+    }
+  }
+
+  /**
+   * Back to the plane's ranked seed.
+   *
+   * Reload means reload — the ranked default, not whatever the view was last
+   * widened to. `Show All` and `+ more` raise `seedLimit` deliberately, and
+   * leaving it raised turned Reload into a second Show All, which is neither
+   * what it says nor a way back.
+   */
+  async function reload() {
+    seedLimit = SEED_STEPS[0]
+    await seed()
+  }
+
+  /**
+   * Plot the plane entire, rather than its most connected few.
+   *
+   * The ranked seed exists because an arbitrary slice of a large graph is a
+   * hairball, but that is a default and not a verdict — a reader who asks for
+   * everything has decided the shape is what they want to see. `seedTotal` is
+   * known only after a seed has run, so a plane not yet plotted asks for a
+   * ceiling well above the ranked steps and takes what the plane has.
+   */
+  async function showAll() {
+    seedLimit = Math.max(seedTotal, SEED_STEPS.at(-1) * 10)
+    await seed()
+  }
+
+  /**
+   * Grow the plotted graph outward by one hop, from its frontier.
+   *
+   * Only the *leaves* are expanded — nodes drawn with at most one edge — since
+   * those are where the picture stops rather than where the graph does. The
+   * interior is already surrounded by what it connects to, so expanding it
+   * would re-fetch what is on screen and change nothing.
+   *
+   * Both directions, because "what is next to this" is not a question about
+   * edge direction; a node reached only by its inbound edges is exactly the
+   * one whose outbound side is missing.
+   */
+  const EXPAND_FRONTIER_CAP = 300 // one click should not become a thousand calls
+  let expanding = $state(false)
+
+  async function expandOne() {
+    if (expanding) return
+    error = null
+    expanding = true
+    try {
+      const leaves = plot.leafIds()
+      if (!leaves.length) {
+        status = 'nothing left to expand — no node is drawn with a single edge'
+        return
+      }
+      const take = leaves.slice(0, EXPAND_FRONTIER_CAP)
+      // `Number(id)`: graphology keys nodes by string, and `graph.expand` takes
+      // a u64 — a string id is refused outright rather than coerced.
+      let failures = 0
+      const parts = await Promise.all(
+        take.map((id) =>
+          rpc('graph.expand', {
+            plane,
+            id: Number(id),
+            direction: 'both',
+            ...atParams(),
+          }).catch(() => {
+            // One unreachable node must not sink the ring, but a silent catch
+            // turns "every call failed" into a cheerful "+0 nodes" — so they
+            // are counted and reported.
+            failures += 1
+            return null
+          }),
+        ),
+      )
+
+      // Merged and added **once**: every `addSubgraph` unfolds the beads,
+      // re-folds them and runs the force layout, so doing it per node would
+      // run the layout three hundred times and freeze the tab.
+      const before = plot.entityCount()
+      plot.addSubgraph({
+        nodes: parts.flatMap((sg) => sg?.nodes ?? []),
+        edges: parts.flatMap((sg) => sg?.edges ?? []),
+      })
+      const added = plot.entityCount() - before
+      legend = plot.legendEntries()
+      // Say what was left out rather than quietly stopping at the cap: a graph
+      // that grew less than asked should explain itself.
+      const capped =
+        leaves.length > take.length
+          ? ` — ${leaves.length - take.length} more left for a second click`
+          : ''
+      const failed = failures ? ` · ${failures} failed` : ''
+      status = `expanded ${take.length} frontier node(s) · +${added} nodes${capped}${failed}`
+    } catch (e) {
+      error = e.message
+    } finally {
+      expanding = false
     }
   }
 
@@ -714,6 +910,57 @@
     }
   }
 
+  // ---- copying ------------------------------------------------------------
+  //
+  // Two things are worth copying out of the inspector: the key, which is what
+  // every other surface addresses a node by (`drsg get @key`, `key(n) = "…"`,
+  // an MCP call), and the whole record as JSON, which is what you paste into an
+  // issue or hand to an agent. They are different lengths of answer to
+  // "what is this?", so they are two buttons rather than one.
+  let copiedWhat = $state(null) // 'key' | 'json' | null — the brief flash
+  let copiedTimer
+
+  async function copyToClipboard(text, tag) {
+    if (!(await writeClipboard(text))) {
+      error = 'clipboard copy failed'
+      return
+    }
+    copiedWhat = tag
+    clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => (copiedWhat = null), 1200)
+  }
+
+  async function writeClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // `navigator.clipboard` is a secure-context feature, so it is simply
+      // absent when this dashboard is reached over plain http from another
+      // machine — which is the deployment it is designed for. Fall back to the
+      // old selection trick rather than telling a LAN user copying is broken.
+      return legacyCopy(text)
+    }
+  }
+
+  function legacyCopy(text) {
+    const box = document.createElement('textarea')
+    box.value = text
+    box.setAttribute('readonly', '')
+    box.style.position = 'fixed'
+    box.style.top = '-1000px'
+    document.body.appendChild(box)
+    box.select()
+    let ok = false
+    try {
+      ok = document.execCommand('copy')
+    } catch {
+      ok = false
+    }
+    box.remove()
+    return ok
+  }
+
   // Copy the generated plan JSON to the clipboard (brief "copied" flash).
   let copyTimer
   async function copyPlans() {
@@ -978,6 +1225,10 @@
     if (!started || plane === seededPlane) return
     seededPlane = plane
     labelFilter = ''
+    // A different plane is a different question, so it starts from the ranked
+    // seed rather than inheriting a `Show All` from the plane before it —
+    // which could be a graph of a wholly different size.
+    seedLimit = SEED_STEPS[0]
     // The catalog (labels + embedding-prop detection) is loaded by loadIndexes,
     // which runs on the same plane-change signal — no need to fetch it twice.
     await seed()
@@ -1071,7 +1322,19 @@
         {/each}
       </select>
     </label>
-    <button onclick={seed}>Reload</button>
+    <button onclick={reload} title="Back to the {SEED_STEPS[0]} most connected nodes">
+      Reload
+    </button>
+    <button onclick={showAll} title="Plot every node in the plane, not the most connected few">
+      Show All
+    </button>
+    <button
+      onclick={expandOne}
+      disabled={expanding}
+      title="Pull in the neighbours of every node drawn with a single edge, both directions"
+    >
+      {expanding ? 'Expanding…' : 'Expand One'}
+    </button>
     <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
     <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
     <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
@@ -1486,12 +1749,33 @@
 
   {#if selected}
     <aside class="inspector">
+      <!-- The key's copy button sits with the identity it copies; the JSON one
+           sits with the other whole-record actions, below. -->
+      <div class="inspector-head">
+        <h3>{selected.kind === 'node' ? 'Node' : 'Edge'} {selected.data.id}</h3>
+        {#if selected.data.external_key}
+          <button
+            class="copy-btn"
+            title="Copy the key on its own"
+            onclick={() => copyToClipboard(selected.data.external_key, 'key')}
+          >{copiedWhat === 'key' ? '✓ copied' : '⧉ key'}</button>
+        {/if}
+      </div>
       {#if selected.kind === 'node'}
-        <h3>Node {selected.data.id}</h3>
-        {#if selected.data.external_key}<p class="key">@{selected.data.external_key}</p>{/if}
+        {#if selected.data.external_key}
+          {#if isLongText(selected.data.external_key)}
+            <button
+              class="key text-more"
+              title="Show the whole key"
+              onclick={() =>
+                (textView = { k: 'key', text: selected.data.external_key, raw: true })}
+            >@{excerpt(selected.data.external_key)}<span class="more">… more</span></button>
+          {:else}
+            <p class="key">@{selected.data.external_key}</p>
+          {/if}
+        {/if}
         <p class="sub">{selected.data.labels?.join(', ') || '(no labels)'}</p>
       {:else}
-        <h3>Edge {selected.data.id}</h3>
         <p class="sub">{selected.data.type} · {selected.data.src} → {selected.data.dst}</p>
       {/if}
       {#if !editing}
@@ -1503,6 +1787,44 @@
                 <button class="vec-btn" onclick={() => (vectorView = { k: pe.k, values: pe.v })}>
                   show vector ({pe.v.length} dims)
                 </button>
+              {:else if Array.isArray(pe.v)}
+                <!-- Any other list collapses the same way an embedding does:
+                     an enum's variants are a dozen signatures, and inlining
+                     them buries every other property on the node. One per line
+                     in the popup, because each item is a whole thing. -->
+                <button
+                  class="vec-btn"
+                  onclick={() =>
+                    (textView = { k: pe.k, text: pe.v.join('\n'), raw: true })}
+                >
+                  show {pe.v.length} item{pe.v.length === 1 ? '' : 's'}
+                </button>
+              {:else if linkedEntries(pe.v)}
+                {#each linkedEntries(pe.v) as le, i (le.text)}
+                  {#if i > 0}<span class="sep">, </span>{/if}
+                  {#if le.node}
+                    <!-- The id alone: sixty full paths is a wall of text, and
+                         the path is one hover away when it is wanted. The hint
+                         is ours rather than a `title`, which cannot colour the
+                         label apart from the path. -->
+                    <button
+                      class="key-link"
+                      onclick={() => focusNode(le.node.id)}
+                      onmouseenter={(e) => showHint(e, le.text, le.node.label)}
+                      onmouseleave={() => (hint = null)}
+                      onfocus={(e) => showHint(e, le.text, le.node.label)}
+                      onblur={() => (hint = null)}
+                    >#{le.node.id}</button>
+                  {:else}
+                    <span class="key-plain">{le.text}</span>
+                  {/if}
+                {/each}
+              {:else if isLongText(pe.v)}
+                <button
+                  class="text-more"
+                  title="Show the whole value"
+                  onclick={() => (textView = { k: pe.k, text: pe.v })}
+                >{excerpt(pe.v)}<span class="more">… more</span></button>
               {:else}
                 {typeof pe.v === 'string' ? pe.v : JSON.stringify(pe.v)}
               {/if}
@@ -1512,6 +1834,11 @@
         <div class="inspector-actions">
           <button onclick={startEdit}>Edit</button>
           <button class="danger" onclick={askDelete}>Delete</button>
+          <button
+            class="copy-btn json-btn"
+            title="Copy this {selected.kind} as JSON"
+            onclick={() => copyToClipboard(JSON.stringify(selected.data, null, 2), 'json')}
+          >{copiedWhat === 'json' ? '✓ copied' : '⧉ JSON'}</button>
         </div>
       {:else}
         <div class="edit-field">
@@ -1554,6 +1881,36 @@
           <button class="close" onclick={() => (vectorView = null)}>×</button>
         </header>
         <pre class="floats">{formatVector(vectorView.values)}</pre>
+      </div>
+    </div>
+  {/if}
+
+  {#if hint}
+    <div class="key-hint" style="left: {hint.x}px; top: {hint.y}px">
+      <span class="hint-path">{hint.path}</span>
+      {#if hint.label}<span class="hint-label">[{hint.label}]</span>{/if}
+    </div>
+  {/if}
+
+  {#if textView}
+    <div class="modal-backdrop">
+      <div class="modal">
+        <header>
+          <span>{textView.k}</span>
+          <button class="close" onclick={() => (textView = null)}>×</button>
+        </header>
+        {#if textView.raw}
+          <!-- A key is an identifier, not prose: it is shown exactly as it is,
+               since `*` and `_` inside one are characters rather than markup. -->
+          <pre class="full-text raw">{textView.text}</pre>
+        {:else}
+          <!-- Rendered, not printed: a doc comment is Markdown, and reading one
+               as a wall of `#`, backticks and hyphens is reading its source
+               rather than the thing itself. `renderMarkdown` escapes every
+               character before emitting any tag, so `{@html}` here cannot
+               introduce markup the value did not already have as text. -->
+          <div class="full-text md">{@html renderMarkdown(textView.text)}</div>
+        {/if}
       </div>
     </div>
   {/if}

@@ -87,8 +87,11 @@ for all of it.
 | **Natural-language query** | Ask in plain language → plan → run |
 | **Time-travel** | Read the graph *as of* a past commit or timestamp |
 | **Change feed** | Subscribe to a plane and receive mutations live |
+| **Code digestion** | Sandboxed wasm parser plugins turn a repository into a resolved call graph (8 official languages) |
+| **Commit-synced watch** | `serve watch` folds every commit into the plane |
+| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
 | **Backup / restore** | Consistent, id-faithful whole-database snapshots |
-| **Interfaces** | Web UI, five language SDKs, a CLI, and an MCP server |
+| **Interfaces** | Web UI, six language SDKs, a CLI, and an MCP server |
 
 ## What v1.0 is
 

@@ -24,14 +24,20 @@
 | `hybrid <查询> --plane` | 融合的向量 + 关键词 + 图邻近度检索 |
 | `index ensure \| keyword` | 声明一个向量或关键词索引 |
 | `ask <问题> --plane` | 自然语言查询 |
-| `digest <文件\|url> --plane [--mode]` | 经由 LLM 导入一篇文档（或一个页面及其链接） |
-
-文件可以是 Markdown 或纯文本，也可以是 Word、PowerPoint、Excel、OpenDocument、RTF、
-EPUB、CSV 与 PDF——后者会先转换为 Markdown，使模型读到的是标题、表格与列表，而非散乱
-的字符。格式依据文件内容判断，因此扩展名写错也不影响。
+| `digest <文件\|目录\|url> --plane [--mode]` | 导入一篇文档、一个代码仓库，或一个页面及其链接 |
+| `search <查询> --plane` | 语义查找：嵌入查询文本，返回最近的节点 |
+| `context \| describe \| trace \| impact <名称> --plane` | 已图化代码平面上的智能体动词 |
+| `vectorize --plane` | 为一个平面的节点生成向量嵌入，以供相似度检索 |
+| `plugin install \| list \| remove` | 管理预处理插件（沙箱化的 wasm 解析器） |
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |
 | `stats` / `check` | 汇总计数 / 完整性扫描 |
-| `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 |
+| `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 + MCP 端点 |
+| `serve watch [--dir]` | 对外服务，并让代码平面随每次提交保持同步 |
+
+被消化的文件可以是 Markdown 或纯文本，也可以是 Word、PowerPoint、Excel、
+OpenDocument、RTF、EPUB、CSV 与 PDF——后者会先转换为 Markdown，使模型读到的是标题、
+表格与列表，而非散乱的字符。格式依据文件内容判断，因此扩展名写错也不影响。目录会被
+逐文件遍历并分发：源码经由已安装的解析器插件成为事实，文档则作为散文交给模型。
 
 全局选项为 `--db <路径>` 与 `--config <路径>`（配置文件，见
 [第 2 章](./getting-started.md#配置文件)）。
@@ -133,7 +139,7 @@ $ drsg --db graph.drsg digest https://example.com/paper --plane papers \\
 ## 备份与完整性
 
 `snapshot` 在单一提交序号上写出一个一致的整库快照包；`restore` 将其重建进一个空
-数据库，并保留 id、提交序号与已构建的检索索引（[第 9 章](./architecture.md)）。
+数据库，并保留 id、提交序号与已构建的检索索引（[第 11 章](./architecture.md)）。
 `stats` 与 `check` 报告计数，并扫描每个平面的可读性：
 
 ```console

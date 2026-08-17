@@ -35,6 +35,17 @@ pub const META_NEXT_EDGE_TYPE_ID: &[u8] = b"next_edge_type_id";
 /// reader reads it from its own snapshot — the cache's version stamp.
 pub const META_COMMIT_SEQ: &[u8] = b"commit_seq";
 
+/// Per-plane summary counters (arch/03 §5): postcard-encoded
+/// [`PlaneCounters`](crate::compute::catalog::PlaneCounters), maintained
+/// inside every write transaction so the dashboard reads a row instead of
+/// scanning the plane.
+pub fn counters_key(plane: PlaneId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9 + 4);
+    k.extend_from_slice(b"counters/");
+    k.extend_from_slice(&plane.0.to_be_bytes());
+    k
+}
+
 /// Wall-clock time (unix-epoch milliseconds, i64 BE) of the latest commit,
 /// stamped inside every write txn. The time index for time-addressed
 /// time-travel (ROADMAP §4): `AS OF <timestamp>` resolves against it.

@@ -15,20 +15,33 @@ mod digest;
 pub mod document;
 mod identity;
 mod openai;
+pub mod preprocess;
 mod preset;
 mod provider;
 mod reconcile;
 mod refine;
+mod vectorize;
 
 pub use ask::{AskOptions, AskResult, ask};
 pub use digest::{
     ApplyStats, CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport,
-    DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, entity_text,
+    DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, embeddable_text,
+    entity_text, fact_text,
 };
 pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
+pub use preprocess::{
+    CommitDelta, FactsAndPlane, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins,
+    Preprocessed, Preprocessor, SyncStats, fold, resync, route_document, route_paths, route_tree,
+    stamp_run, sync_paths,
+};
+#[cfg(feature = "plugins")]
+pub use preprocess::{
+    InstalledPlugin, Limits, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore, WasmPlugin,
+};
 pub use preset::{PRESET_NAMES, ProviderPreset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;
 pub use refine::RefineReport;
+pub use vectorize::{VectorizeStats, semantic_search, vectorize_plane};

@@ -13,6 +13,26 @@
 
   let stats = $state(null) // live db.stats (planes/nodes/edges/file_size)
   let planes = $state([]) // plane cards
+  import extensionLogo from './assets/extension-logo.svg'
+
+  let plugins = $state([]) // installed preprocessor plugins
+  let catalog = $state([]) // the official catalog this build pins
+  let busy = $state({}) // plugin name -> true while an install/upgrade runs
+  let vecBusy = $state({}) // plane name -> true while a vectorize runs
+  let vecMsg = $state({}) // plane name -> last vectorize summary
+  let installing = $state(false)
+  let installUrl = $state('')
+
+  // The Extensions section pins every official plugin (catalog order) and
+  // judges each against the store by hash: installed, upgradable, or absent.
+  let officials = $derived(
+    catalog.map((c) => {
+      const inst = plugins.find((p) => p.name === c.name)
+      const state = !inst ? 'absent' : inst.sha256 === c.sha256 ? 'installed' : 'upgradable'
+      return { ...c, inst, state }
+    })
+  )
+  let thirdParty = $derived(plugins.filter((p) => !catalog.some((c) => c.name === p.name)))
   let error = $state(null)
   let connected = $state(false)
 
@@ -113,11 +133,78 @@
     stats?.nodes ? ((stats.edges * 2) / stats.nodes).toFixed(1) : '—',
   )
 
+  async function loadPlugins() {
+    plugins = await rpc('plugin.list')
+  }
+
+  function logoSrc(svg) {
+    if (!svg) return extensionLogo
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg)
+  }
+
+  async function vectorizePlane(name) {
+    vecBusy = { ...vecBusy, [name]: true }
+    vecMsg = { ...vecMsg, [name]: '' }
+    try {
+      const st = await rpc('plane.vectorize', { plane: name })
+      vecMsg = {
+        ...vecMsg,
+        [name]:
+          st.embedded > 0
+            ? `embedded ${st.embedded} (${st.tokens} tokens), ${st.current} current`
+            : `up to date (${st.current} current)`,
+      }
+    } catch (e) {
+      vecMsg = { ...vecMsg, [name]: `failed: ${e.message}` }
+    } finally {
+      vecBusy = { ...vecBusy, [name]: false }
+    }
+  }
+
+  async function installOfficial(c) {
+    busy = { ...busy, [c.name]: true }
+    try {
+      await rpc('plugin.install', { url: c.url })
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    } finally {
+      busy = { ...busy, [c.name]: false }
+    }
+  }
+
+  async function removePlugin(name) {
+    if (!confirm(`Remove plugin ${name}? Files it handled will fall back to the document reader.`)) return
+    try {
+      await rpc('plugin.remove', { name })
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    }
+  }
+
+  async function submitInstall() {
+    const url = installUrl.trim()
+    if (!url) return
+    try {
+      await rpc('plugin.install', { url })
+      installing = false
+      installUrl = ''
+      await loadPlugins()
+    } catch (e) {
+      error = e.message
+    }
+  }
+
   onMount(() => {
     rpc('db.stats')
       .then((s) => (stats = s))
       .catch((e) => (error = e.message))
     loadPlanes().catch((e) => (error = e.message))
+    loadPlugins().catch((e) => (error = e.message))
+    rpc('plugin.catalog')
+      .then((c) => (catalog = c))
+      .catch((e) => (error = e.message))
     return liveStats(
       (s) => {
         stats = s
@@ -176,6 +263,20 @@
         </div>
       </button>
       <div class="card-actions">
+        <button
+          class="export"
+          onclick={() => vectorizePlane(p.name)}
+          disabled={vecBusy[p.name]}
+          title="Embed every node for similarity search (incremental) and build the vector indexes"
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="4" cy="12" r="1.6" />
+            <circle cx="8" cy="5" r="1.6" />
+            <circle cx="12.5" cy="10.5" r="1.6" />
+            <path d="M5.2 10.9 6.9 6.4M9.5 5.9l1.8 3.4" />
+          </svg>
+          {vecBusy[p.name] ? 'Vectorizing…' : 'Vectorize'}
+        </button>
         <button class="export" onclick={() => exportPlane(p.name)} title="Export this plane as JSONL">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M8 2.5v7" />
@@ -199,6 +300,9 @@
           Delete
         </button>
       </div>
+      {#if vecMsg[p.name]}
+        <p class="vec-msg" class:err={vecMsg[p.name].startsWith('failed')}>{vecMsg[p.name]}</p>
+      {/if}
     </article>
   {/each}
   <button class="card new-card" onclick={() => (creating = true)} title="Create a new plane" aria-label="Create a new plane">
@@ -206,6 +310,83 @@
     <span class="new-card-label">New plane</span>
   </button>
 </section>
+
+<h2>Extensions</h2>
+<section class="plugins">
+  {#each officials as c (c.name)}
+    <article class="card plugin-card">
+      <img class="plugin-logo" src={logoSrc(c.inst?.logo)} alt="" />
+      <h3>
+        {c.name}{#if c.inst}<span class="plugin-ver">@{c.inst.version}</span>{/if}
+        {#if c.state === 'installed'}<span class="badge ok">installed</span>
+        {:else if c.state === 'upgradable'}<span class="badge up">upgradable</span>{/if}
+      </h3>
+      <p class="plugin-exts">{c.claims}</p>
+      {#if c.inst}
+        <p class="plugin-sha" title={c.inst.source}>sha256:{c.inst.sha256.slice(0, 12)}</p>
+      {:else}
+        <p class="plugin-sha" title={c.url}>official release</p>
+      {/if}
+      <div class="card-actions">
+        {#if c.state === 'absent'}
+          <button class="install" onclick={() => installOfficial(c)} disabled={busy[c.name]}>
+            {busy[c.name] ? 'installing…' : 'Install'}
+          </button>
+        {:else if c.state === 'upgradable'}
+          <button class="install" onclick={() => installOfficial(c)} disabled={busy[c.name]}>
+            {busy[c.name] ? 'installing…' : 'Upgrade'}
+          </button>
+          <button class="del" onclick={() => removePlugin(c.name)} disabled={busy[c.name]}>Remove</button>
+        {:else}
+          <button class="del" onclick={() => removePlugin(c.name)} disabled={busy[c.name]}>Remove</button>
+        {/if}
+      </div>
+    </article>
+  {/each}
+  {#each thirdParty as p (p.name)}
+    <article class="card plugin-card">
+      <img class="plugin-logo" src={logoSrc(p.logo)} alt="" />
+      <h3>{p.name}<span class="plugin-ver">@{p.version}</span></h3>
+      <p class="plugin-exts">{p.extensions.map((e) => '.' + e).join(' ')}</p>
+      <p class="plugin-sha" title={p.source}>sha256:{p.sha256.slice(0, 12)}</p>
+      <div class="card-actions">
+        <button class="del" onclick={() => removePlugin(p.name)}>Remove</button>
+      </div>
+    </article>
+  {/each}
+  <button class="card new-card" onclick={() => (installing = true)} title="Install a plugin from a URL" aria-label="Install a plugin">
+    <span aria-hidden="true">+</span>
+    <span class="new-card-label">Install plugin</span>
+  </button>
+</section>
+
+{#if installing}
+  <div class="dlg-backdrop">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="Install plugin">
+      <header>
+        Install plugin
+        <button class="close" onclick={() => (installing = false)} aria-label="Close">×</button>
+      </header>
+      <div class="dlg-body">
+        <p>
+          Paste a plugin <code>.wasm</code> URL — official releases live at
+          <a href="https://github.com/wangyingsm/dr-strange-extension/releases" target="_blank" rel="noreferrer">dr-strange-extension</a>.
+          The artifact is validated and its hash pinned before anything runs.
+        </p>
+        <input
+          type="text"
+          placeholder="https://…/rust.wasm"
+          bind:value={installUrl}
+          onkeydown={(e) => e.key === 'Enter' && submitInstall()}
+        />
+        <div class="dlg-actions">
+          <button onclick={() => (installing = false)}>Cancel</button>
+          <button class="primary" onclick={submitInstall} disabled={!installUrl.trim()}>Install</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <CreatePlane bind:open={creating} onCreated={afterCreate} />
 

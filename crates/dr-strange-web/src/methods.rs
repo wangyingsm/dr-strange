@@ -265,7 +265,11 @@ pub fn rpc_discover(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 /// and the file size when the backend is on disk.
 pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let planes = app(ctx.db.planes())?;
-    let cat = app(ctx.db.catalog())?;
+    // Summary counters, maintained transactionally with every mutation —
+    // a point lookup per plane, where the catalog would scan everything
+    // (arch/03 §5). This is what keeps the dashboard at ms whatever the
+    // graph grows to.
+    let counters = app(ctx.db.counters())?;
     let commit_seq = app(ctx.db.commit_seq())?;
     // Declared vector + keyword indexes across every plane.
     let mut indexes = 0usize;
@@ -273,21 +277,153 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         let plane = ctx.plane(name)?;
         indexes += plane.vector_indexes().len() + plane.keyword_indexes().len();
     }
-    let file_size = ctx
-        .db_path
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len());
+    let file_size = ctx.db_path.map(on_disk_bytes);
     Ok(jval!({
         "planes": planes.len(),
-        "nodes": cat.node_count,
-        "edges": cat.edge_count,
-        "labels": cat.labels.len(),
-        "edge_types": cat.edge_types.len(),
+        "nodes": counters.nodes,
+        "edges": counters.edges,
+        "labels": counters.labels.len(),
+        "edge_types": counters.edge_types.len(),
         "indexes": indexes,
         "commit_seq": commit_seq,
         "persistent": ctx.db_path.is_some(),
         "file_size": file_size,
     }))
+}
+
+/// Bytes the database occupies on disk. The native backend's "path" is a
+/// directory — `fs::metadata` on one reports the inode (4 KB, famously
+/// wrong on the dashboard) — so a directory is walked and its files summed.
+/// The vector and keyword sidecars sit *beside* the path and count too.
+fn on_disk_bytes(path: &std::path::Path) -> u64 {
+    fn du(p: &std::path::Path) -> u64 {
+        let Ok(meta) = std::fs::metadata(p) else {
+            return 0;
+        };
+        if meta.is_file() {
+            return meta.len();
+        }
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return 0;
+        };
+        entries.flatten().map(|e| du(&e.path())).sum()
+    }
+    let mut total = du(path);
+    for sidecar in ["hnsw", "bm25"] {
+        let mut os = path.as_os_str().to_owned();
+        os.push(".");
+        os.push(sidecar);
+        total += du(std::path::Path::new(&os));
+    }
+    total
+}
+
+/// `plugin.list` — the installed preprocessor plugins, exactly the records
+/// `drsg plugin list --json` prints: one shape for agents whichever surface
+/// they read (arch/07, ROADMAP §11).
+pub fn plugin_list(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
+    let store = plugin_store()?;
+    let plugins = store.list().map_err(plug)?;
+    serde_json::to_value(plugins).map_err(|e| RpcError::server(e.to_string()))
+}
+
+/// `plugin.catalog` — the official plugins this build pins: release-tagged
+/// URLs and their artifact hashes. The pins are a compatibility statement
+/// (known-good with this build's contract), so the catalog is a constant of
+/// the binary, not a network lookup — the dashboard joins it against
+/// `plugin.list` to tag each entry installed/upgradable/absent.
+pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
+    serde_json::to_value(dr_strange_llm::OFFICIAL_PLUGINS)
+        .map_err(|e| RpcError::server(e.to_string()))
+}
+
+#[derive(Deserialize)]
+pub struct PlaneVectorize {
+    plane: String,
+    /// Embedding provider preset or base URL; the key comes from the
+    /// server's environment, mirroring `digest.run`.
+    #[serde(default)]
+    embed: Option<String>,
+    #[serde(default)]
+    embed_model: Option<String>,
+    /// `cosine` (default), `dot`, or `l2`.
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+/// `plane.vectorize` — embed every node in a plane and ensure its vector
+/// indexes: the dashboard's per-plane button, same engine as `drsg vec`.
+/// Incremental by meaning, so pressing it twice costs one pass.
+pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PlaneVectorize = params(p)?;
+    let metric = match req.metric.as_deref() {
+        None | Some("cosine") => dr_strange_core::Metric::Cosine,
+        Some("dot") => dr_strange_core::Metric::Dot,
+        Some("l2") => dr_strange_core::Metric::L2,
+        Some(other) => {
+            return Err(RpcError::invalid_params(format!(
+                "unknown metric `{other}` — cosine, dot or l2"
+            )));
+        }
+    };
+    let embedder = dr_strange_llm::build_provider(
+        req.embed.as_deref().unwrap_or("openai"),
+        req.embed_model.as_deref(),
+        None,
+        None,
+        true,
+    )
+    .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    let stats = dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric)
+        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    serde_json::to_value(stats).map_err(|e| RpcError::server(e.to_string()))
+}
+
+#[derive(Deserialize)]
+pub struct PluginInstall {
+    /// A URL to download the component from. Server-local file paths are
+    /// deliberately not accepted over RPC: a remote caller naming paths on
+    /// the server's disk is a probe, not a workflow.
+    url: String,
+}
+
+/// `plugin.install` — download, validate, hash-pin and store a plugin.
+/// Write-gated; the URL passes the same resolved-address network policy as
+/// every other fetch (public addresses only).
+pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PluginInstall = params(p)?;
+    if !(req.url.starts_with("http://") || req.url.starts_with("https://")) {
+        return Err(RpcError::invalid_params(
+            "plugin.install takes an http(s) URL".to_string(),
+        ));
+    }
+    const CAP: usize = 256 << 20;
+    let bytes = crate::fetch::fetch_bytes(&req.url, CAP, &[])
+        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    let store = plugin_store()?;
+    let (entry, replaced) = store.install(&bytes, &req.url).map_err(plug)?;
+    Ok(jval!({ "installed": entry, "replaced": replaced }))
+}
+
+#[derive(Deserialize)]
+pub struct PluginRemove {
+    name: String,
+}
+
+/// `plugin.remove` — uninstall by name. Write-gated.
+pub fn plugin_remove(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
+    let req: PluginRemove = params(p)?;
+    let store = plugin_store()?;
+    let entry = store.remove(&req.name).map_err(plug)?;
+    Ok(jval!({ "removed": entry }))
+}
+
+fn plugin_store() -> Result<dr_strange_llm::PluginStore, RpcError> {
+    dr_strange_llm::PluginStore::open_default().map_err(plug)
+}
+
+fn plug(e: anyhow::Error) -> RpcError {
+    RpcError::server(format!("{e:#}"))
 }
 
 /// `db.catalog` — the soft schema across every plane.
@@ -301,13 +437,13 @@ pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let mut out = Vec::new();
     for (id, name) in app(ctx.db.planes())? {
         let plane = ctx.plane(&name)?;
-        let cat = app(plane.catalog())?;
+        let counters = app(plane.counters())?;
         let props = app(plane.properties())?;
         out.push(jval!({
             "id": id.0,
             "name": name,
-            "nodes": cat.node_count,
-            "edges": cat.edge_count,
+            "nodes": counters.nodes,
+            "edges": counters.edges,
             "properties": json::properties_to_json(&props),
         }));
     }
@@ -334,6 +470,11 @@ pub struct GetNode {
     id: Option<u64>,
     #[serde(default)]
     key: Option<String>,
+    /// Omit vector-valued properties (an embedding is a thousand floats no
+    /// reader reads). Off by default so existing callers — the dashboard —
+    /// see the exact shape they always did; agents pass `true`.
+    #[serde(default)]
+    lean: bool,
 }
 
 /// `node.get` — one node by id or external key; `null` if absent.
@@ -345,7 +486,12 @@ pub fn node_get(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         (None, Some(key)) => app(plane.node_by_key(key))?,
         (None, None) => return Err(RpcError::invalid_params("provide `id` or `key`")),
     };
-    Ok(node.map(|n| json::node_to_json(&n)).unwrap_or(Value::Null))
+    let render = if req.lean {
+        json::node_to_json_lean
+    } else {
+        json::node_to_json
+    };
+    Ok(node.map(|n| render(&n)).unwrap_or(Value::Null))
 }
 
 #[derive(Deserialize)]
@@ -356,6 +502,16 @@ pub struct Neighbors {
     direction: Option<String>,
     #[serde(default, rename = "type")]
     edge_type: Option<String>,
+    /// Return full records instead of id pairs: each hop becomes
+    /// `{node: {…}, edge: {id, type, properties}}` — the composition that
+    /// lets `node.get` + `neighbors` answer "who calls this?" in two calls,
+    /// call-site lines included, with no per-id follow-ups. Off by default:
+    /// existing callers see the exact id pairs they always did.
+    #[serde(default)]
+    hydrate: bool,
+    /// With `hydrate`, render nodes lean (vectors elided) — the agent shape.
+    #[serde(default)]
+    lean: bool,
     #[serde(flatten)]
     at: AsOfParams,
 }
@@ -385,11 +541,39 @@ pub fn plane_neighbors(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let plane = plane_at(ctx, &req.plane, &req.at)?;
     let dir = parse_dir(req.direction.as_deref());
     let hops = app(plane.neighbors(NodeId(req.id), dir, req.edge_type.as_deref()))?;
-    Ok(Value::Array(
-        hops.iter()
-            .map(|n| jval!({ "node": n.node.0, "edge": n.edge.0 }))
-            .collect(),
-    ))
+    if !req.hydrate {
+        return Ok(Value::Array(
+            hops.iter()
+                .map(|n| jval!({ "node": n.node.0, "edge": n.edge.0 }))
+                .collect(),
+        ));
+    }
+    let render = if req.lean {
+        json::node_to_json_lean
+    } else {
+        json::node_to_json
+    };
+    let mut out = Vec::with_capacity(hops.len());
+    for n in &hops {
+        let node = match app(plane.node(n.node))? {
+            Some(record) => render(&record),
+            None => jval!({ "id": n.node.0 }),
+        };
+        let edge = match app(plane.edge(n.edge))? {
+            Some(e) => jval!({
+                "id": e.id.0,
+                "type": e.ty,
+                "properties": if req.lean {
+                    json::properties_to_json_lean(&e.properties)
+                } else {
+                    json::properties_to_json(&e.properties)
+                },
+            }),
+            None => jval!({ "id": n.edge.0 }),
+        };
+        out.push(jval!({ "node": node, "edge": edge }));
+    }
+    Ok(Value::Array(out))
 }
 
 #[derive(Deserialize)]
@@ -479,6 +663,10 @@ pub struct CypherReq {
     /// Values for `$name` placeholders in the query.
     #[serde(default)]
     params: serde_json::Map<String, Value>,
+    /// Omit vector-valued properties from returned nodes (agents' shape;
+    /// the dashboard leaves it unset and sees the full records).
+    #[serde(default)]
+    lean: bool,
 }
 
 /// Convert a JSON params object to the parser's `Params` (name → PropValue).
@@ -505,6 +693,7 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         &req.query,
         req.embed.as_deref().unwrap_or("openai"),
         &params,
+        req.lean,
     )
 }
 
@@ -520,6 +709,7 @@ pub fn cypher_subgraph(
     query: &str,
     embed_provider: &str,
     params: &dr_strange_parser::Params,
+    lean: bool,
 ) -> Result<Value, RpcError> {
     let embedder = make_embedder(embed_provider);
     let stmt = dr_strange_parser::parse_statement_full(
@@ -557,7 +747,11 @@ pub fn cypher_subgraph(
     let nodes: Vec<Value> = rows
         .iter()
         .map(|(n, s)| {
-            let mut obj = json::node_to_json(n);
+            let mut obj = if lean {
+                json::node_to_json_lean(n)
+            } else {
+                json::node_to_json(n)
+            };
             if let (Some(score), Value::Object(map)) = (s, &mut obj) {
                 map.insert("score".into(), jval!(score));
             }

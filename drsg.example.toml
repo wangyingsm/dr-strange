@@ -64,3 +64,14 @@ dir = "logs"
 # embed_provider = "openai"
 # embed_model = "text-embedding-3-small"
 # embed_key_env = "OPENAI_API_KEY"
+
+# Preprocessor plugins (ROADMAP §11): sandboxed wasm components installed with
+# `drsg plugin install <file.wasm | url>`. Budgets apply per sandbox call.
+[plugins]
+# fuel = 200000000000    # instructions per call; 0 disables the check
+# memory_mb = 3072       # linear memory per call (wasm32 caps at 4096 anyway)
+
+# Each plugin's own settings, passed through uninterpreted — what a plugin can
+# be configured to do is the plugin's business, not the database's.
+# [plugins.rust]
+# include_source = true  # store each function's source under `_code`

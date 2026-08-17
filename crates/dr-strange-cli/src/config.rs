@@ -41,6 +41,10 @@ pub struct Config {
     /// URL-fetch policy for the web AIgest (ROADMAP §9).
     #[serde(default)]
     pub fetch: FetchCfg,
+    /// Preprocessor plugins (ROADMAP §11): sandbox budgets, and each plugin's
+    /// own settings.
+    #[serde(default)]
+    pub plugins: PluginsCfg,
 }
 
 /// The `[digest]` section — server-side ingestion tuning.
@@ -88,6 +92,67 @@ pub struct FetchCfg {
     pub allow_private: Option<Vec<String>>,
 }
 
+/// The `[plugins]` section — sandbox budgets, plus one sub-table per plugin.
+///
+/// ```toml
+/// [plugins]
+/// fuel = 200000000000    # instructions per sandbox call; 0 = unbounded
+/// memory_mb = 3072       # linear memory per call
+///
+/// [plugins.rust]
+/// include_source = true  # a plugin's own settings pass through untouched
+/// ```
+///
+/// No `deny_unknown_fields` here, deliberately: the unknown fields *are* the
+/// per-plugin sub-tables, and what a plugin can be configured to do is the
+/// plugin's business, not this file's.
+#[derive(Debug, Default, Deserialize)]
+pub struct PluginsCfg {
+    /// Instructions one sandbox call may execute. `0` disables the check for a
+    /// trusted plugin on an input big enough to make the ceiling a nuisance.
+    pub fuel: Option<u64>,
+    /// Linear memory per sandbox call, in MiB. No value lifts the 4 GiB
+    /// ceiling wasm32 itself imposes.
+    pub memory_mb: Option<u64>,
+    /// An explicit plugin-store directory; defaults to the per-user store.
+    pub store_dir: Option<PathBuf>,
+    /// `[plugins.<name>]` sub-tables, passed to each plugin uninterpreted.
+    #[serde(flatten)]
+    pub each: BTreeMap<String, BTreeMap<String, toml::Value>>,
+}
+
+/// The `[plugins]` section as the routing layer wants it.
+#[cfg(feature = "digest")]
+pub fn plugin_config(cfg: &Config) -> Result<dr_strange_llm::PluginConfig> {
+    let mut options: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (plugin, table) in &cfg.plugins.each {
+        let mut kv = Vec::new();
+        for (key, value) in table {
+            // A plugin reads strings; scalars render as the text an author
+            // would have quoted. Structured values have no such rendering, and
+            // guessing one would hand the plugin something it never wrote.
+            let rendered = match value {
+                toml::Value::String(v) => v.clone(),
+                toml::Value::Integer(v) => v.to_string(),
+                toml::Value::Float(v) => v.to_string(),
+                toml::Value::Boolean(v) => v.to_string(),
+                other => anyhow::bail!(
+                    "[plugins.{plugin}] {key}: a plugin setting must be a                      string, number or bool, not {}",
+                    other.type_str()
+                ),
+            };
+            kv.push((key.clone(), rendered));
+        }
+        options.insert(plugin.clone(), kv);
+    }
+    Ok(dr_strange_llm::PluginConfig {
+        options,
+        store_dir: cfg.plugins.store_dir.clone(),
+        fuel: cfg.plugins.fuel,
+        memory_bytes: cfg.plugins.memory_mb.map(|mb| (mb as usize) << 20),
+    })
+}
+
 /// The `[server]` section.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +163,10 @@ pub struct ServerCfg {
     pub token: Option<String>,
     /// Ceiling on requests in flight at once.
     pub max_concurrent: Option<usize>,
+    /// The source tree behind the graph, for the MCP `grep` tool. `serve
+    /// watch` attaches its `--dir` automatically; this covers a plain
+    /// `serve` over a digested database.
+    pub source_root: Option<std::path::PathBuf>,
     /// How long a write waits for the single writer slot before returning a
     /// retryable timeout. `0` waits forever (the embedded default); omitted
     /// means 30s.
@@ -185,6 +254,9 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     let mut opts = ServeOptions::default();
     if let Some(addr) = cli_addr.or(cfg.server.addr) {
         opts.addr = addr;
+    }
+    if let Some(root) = &cfg.server.source_root {
+        opts.source_root = Some(root.clone());
     }
     if let Some(max_concurrent) = cfg.server.max_concurrent {
         opts.max_concurrent = max_concurrent;

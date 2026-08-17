@@ -1,0 +1,15 @@
+[package]
+name = "drsg-fixture-fs"
+description = "A component that reaches for wasi:filesystem — exists to be refused"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[workspace]
+members = []

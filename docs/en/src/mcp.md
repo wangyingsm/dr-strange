@@ -183,7 +183,13 @@ wait, it does not turn it away.
 | `list_planes` | read | list planes with node/edge counts |
 | `describe_plane` | read | a plane's soft schema (labels, properties, edge types) |
 | `get_node` | read | fetch one node by id or external key |
-| `search` | read | vector similarity — the *k* nearest nodes |
+| `search` | read | semantic lookup — embeds the query, returns the *k* nearest nodes |
+| `context` | read | one symbol's whole neighborhood on a digested code plane — the primary agent verb |
+| `describe` | read | one symbol's properties, the lightweight node-only view |
+| `grep` | read | literal text search over the watched source tree |
+| `trace` | read | the shortest recorded call path between two symbols |
+| `impact` | read | everything reaching a symbol, grouped by distance |
+| `snippet` | read | one symbol's source text |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
 | `cypher` | read | run an openCypher-subset statement |

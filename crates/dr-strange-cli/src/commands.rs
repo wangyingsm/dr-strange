@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
     BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
+    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions,
 };
 use serde_json::{Value, json};
 
@@ -191,6 +191,375 @@ fn parse_params(param: &[String]) -> Result<dr_strange_parser::Params> {
     Ok(params)
 }
 
+/// The plane a digest lands in when `--plane` is not given: the source
+/// directory's own name, so `drsg digest` in a checkout writes a plane named
+/// after the repo. Anything that doesn't yield one — a URL, a bare file, a
+/// nameless path like `/` — stays `startup`.
+pub fn default_plane(source: &str) -> String {
+    std::fs::canonicalize(source)
+        .ok()
+        .filter(|p| p.is_dir())
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "startup".to_string())
+}
+
+// ---- serve watch (ROADMAP §11) -------------------------------------------
+
+/// How often the watcher asks the repository where HEAD is. Commits are
+/// human-paced; two seconds is invisible latency and negligible cost.
+#[cfg(feature = "digest")]
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Plane properties recording what the graph reflects: the commit the last
+/// digest or fold left it at, and the directory the facts were parsed from.
+/// Together they answer "is the graph in sync with the repository?" — and
+/// which basis its `file` props are relative to.
+#[cfg(feature = "digest")]
+pub const SYNC_COMMIT_PROP: &str = "synced_commit";
+#[cfg(feature = "digest")]
+pub const SYNC_ROOT_PROP: &str = "synced_root";
+
+/// Stamp the plane with the commit and parse basis it now reflects. A quiet
+/// no-op outside a git repository — there is no commit to speak of.
+#[cfg(feature = "digest")]
+fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> {
+    let Ok(head) = git_head(dir) else {
+        return Ok(());
+    };
+    let root = dir
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
+    let plane = db.plane(plane_name)?;
+    let mut props = plane.properties()?;
+    props.insert(
+        SYNC_COMMIT_PROP.into(),
+        PropDesc::described("commit the plane reflects", PropValue::Str(head)),
+    );
+    props.insert(
+        SYNC_ROOT_PROP.into(),
+        PropDesc::described("directory the facts were parsed from", PropValue::Str(root)),
+    );
+    plane.set_properties(props)?;
+    Ok(())
+}
+
+/// The recorded sync point, if any: `(commit, root)`.
+#[cfg(feature = "digest")]
+fn recorded_sync_point(db: &Database, plane_name: &str) -> (Option<String>, Option<String>) {
+    let Ok(plane) = db.plane(plane_name) else {
+        return (None, None);
+    };
+    let Ok(props) = plane.properties() else {
+        return (None, None);
+    };
+    let get = |k: &str| match props.get(k).map(|d| &d.value) {
+        Some(PropValue::Str(v)) => Some(v.clone()),
+        _ => None,
+    };
+    (get(SYNC_COMMIT_PROP), get(SYNC_ROOT_PROP))
+}
+
+/// The entry `drsg serve watch` hands to the server's `on_start` hook: run
+/// the loop forever, and if it stops, say why — the server stays up either
+/// way, and a watcher that died silently would just look like a quiet repo.
+#[cfg(feature = "digest")]
+pub fn watch(
+    db: std::sync::Arc<Database>,
+    dir: std::path::PathBuf,
+    plane_name: String,
+    plugin_config: dr_strange_llm::PluginConfig,
+    embed: Option<(String, Option<String>, Option<String>)>,
+    force: bool,
+) {
+    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, embed, force) {
+        tracing::error!(error = format!("{e:#}"), "repository watch stopped");
+    }
+}
+
+#[cfg(feature = "digest")]
+fn watch_loop(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    plugin_config: &dr_strange_llm::PluginConfig,
+    embed: Option<(String, Option<String>, Option<String>)>,
+    force: bool,
+) -> Result<()> {
+    let mut head =
+        git_head(dir).with_context(|| format!("{} is not a git repository", dir.display()))?;
+    // The server's embed config, when it has one, keeps a watched plane
+    // searchable: after a fold changes facts, the changed nodes re-embed
+    // (`_embedded_from` makes that pass incremental). No config, or a
+    // provider that cannot be built (missing key), degrades to facts-only —
+    // said once here, not per fold.
+    let embedder: Option<Box<dyn dr_strange_llm::Embedder>> = match &embed {
+        Some((provider, model, key_env)) => {
+            match dr_strange_llm::build_provider(
+                provider,
+                model.as_deref(),
+                None,
+                key_env.as_deref(),
+                true,
+            ) {
+                Ok(e) => Some(Box::new(e) as Box<dyn dr_strange_llm::Embedder>),
+                Err(e) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "embed provider unavailable — folds will update facts only"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let revectorize = |why: &str| {
+        let Some(e) = embedder.as_deref() else {
+            return;
+        };
+        match dr_strange_llm::vectorize_plane(db, plane_name, e, dr_strange_core::Metric::Cosine) {
+            Ok(v) if v.embedded > 0 => tracing::info!(
+                embedded = v.embedded,
+                current = v.current,
+                tokens = v.tokens,
+                why,
+                "re-vectorized changed nodes"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "re-vectorizing after the fold failed; facts are current, vectors lag"
+            ),
+        }
+    };
+    let root = dir
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
+    let source = dir
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| dir.display().to_string());
+
+    if force {
+        // Rebuild before serving anything stale: drop, re-create, fold the
+        // whole tree as one delta. Facts only — embeddings return on the next
+        // real digest.
+        tracing::info!(
+            plane = plane_name,
+            "--force: rebuilding the plane from the tree"
+        );
+        let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+        let host = dr_strange_llm::LocalFiles::new(dir)?;
+        let stats = dr_strange_llm::resync(db, plane_name, &host, &plugins, &source, &head)?;
+        record_sync_point(db, plane_name, dir)?;
+        tracing::info!(
+            commit = %&head[..12.min(head.len())],
+            nodes_loaded = stats.nodes_loaded,
+            edges_written = stats.edges_written,
+            prose_skipped_chars = stats.prose_chars,
+            "plane rebuilt"
+        );
+        revectorize("--force rebuild");
+    } else {
+        if db.plane(plane_name).is_err() {
+            db.create_plane(plane_name, Properties::new())?;
+            tracing::info!(plane = plane_name, "created plane");
+        }
+        // Where does the graph stand relative to the repository? The plane
+        // says which commit it reflects; the answer decides how to start.
+        let (rec_commit, rec_root) = recorded_sync_point(db, plane_name);
+        if let Some(r) = &rec_root
+            && *r != root
+        {
+            tracing::warn!(
+                plane_root = %r,
+                watch_root = %root,
+                "the plane was parsed from a different directory — file                  attribution will not line up; `--force` (or a re-digest from                  this directory) puts them on one basis"
+            );
+        }
+        match rec_commit {
+            Some(rec) if rec == head => {
+                tracing::info!(commit = %&rec[..12.min(rec.len())], "graph and repository are in sync");
+            }
+            Some(rec) if commit_known(dir, &rec) => {
+                tracing::info!(
+                    from = %&rec[..12.min(rec.len())],
+                    to = %&head[..12.min(head.len())],
+                    "graph is behind the repository — catching up"
+                );
+                // The ordinary fold covers the gap: start from the recorded
+                // commit and let the first poll diff it against HEAD.
+                head = rec;
+            }
+            Some(rec) => {
+                tracing::warn!(
+                    recorded = %&rec[..12.min(rec.len())],
+                    "the plane's sync point is unknown to this repository                      (rewritten history, or another repo) — folding forward                      from the current HEAD; `--force` re-establishes exact sync"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "the plane records no sync point, so graph and repository                      cannot be compared — folding forward from the current                      HEAD; a digest of this directory (or `--force`)                      establishes one"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        plane = plane_name,
+        head = %head,
+        "watching repository — each commit folds into the graph"
+    );
+    loop {
+        std::thread::sleep(WATCH_POLL);
+        let now = match git_head(dir) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), "reading HEAD failed; will retry");
+                continue;
+            }
+        };
+        if now == head {
+            continue;
+        }
+        // One diff covers however far HEAD moved — several commits, a rebase,
+        // a branch switch. What matters is the file set between the states.
+        let step = (|| -> Result<bool> {
+            let delta = git_changes(dir, &head, &now)?;
+            if delta.changed.is_empty() && delta.deleted.is_empty() {
+                return Ok(false);
+            }
+            // Reloaded each commit so a `drsg plugin install` between commits
+            // is picked up without restarting the server.
+            let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+            let host = dr_strange_llm::LocalFiles::new(dir)?;
+            let stats =
+                dr_strange_llm::sync_paths(db, plane_name, &host, &delta, &plugins, &source, &now)?;
+            tracing::info!(
+                commit = %&now[..12.min(now.len())],
+                changed = delta.changed.len(),
+                deleted = delta.deleted.len(),
+                nodes_loaded = stats.nodes_loaded,
+                nodes_patched = stats.nodes_patched,
+                nodes_deleted = stats.nodes_deleted,
+                edges_written = stats.edges_written,
+                edges_deleted = stats.edges_deleted,
+                edges_reattached = stats.edges_reattached,
+                edges_dropped = stats.edges_dropped,
+                prose_skipped_chars = stats.prose_chars,
+                "commit folded into the graph"
+            );
+            for note in &stats.notes {
+                tracing::info!(note, "sync note");
+            }
+            Ok(stats.nodes_loaded + stats.nodes_patched + stats.nodes_deleted > 0)
+        })();
+        match step {
+            Ok(changed) => {
+                // The plane now reflects `now`; say so durably, so the next
+                // start knows where to catch up from.
+                if let Err(e) = record_sync_point(db, plane_name, dir) {
+                    tracing::warn!(error = format!("{e:#}"), "recording the sync point failed");
+                }
+                if changed {
+                    revectorize("commit fold");
+                }
+                // Folds are commit-paced, so keeping the sidecars fresh here
+                // is cheap — and a hard kill then costs the next boot nothing.
+                db.save_sidecars();
+            }
+            Err(e) => {
+                // The in-memory cursor advances so polling continues, but the
+                // recorded point stays behind — a restart retries this gap.
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    from = %head, to = %now,
+                    "folding the commit failed; watching continues from the new HEAD"
+                );
+            }
+        }
+        head = now;
+    }
+}
+
+#[cfg(feature = "digest")]
+fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("running git — `serve watch` needs it on PATH")?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// Whether `sha` names a commit this repository knows.
+#[cfg(feature = "digest")]
+fn commit_known(dir: &Path, sha: &str) -> bool {
+    git(dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
+#[cfg(feature = "digest")]
+fn git_head(dir: &Path) -> Result<String> {
+    let out = git(dir, &["rev-parse", "HEAD"])?;
+    Ok(String::from_utf8(out)?.trim().to_string())
+}
+
+/// The files between two commits, rename-aware: `(changed, deleted)`, where
+/// changed paths' current content should be believed and deleted ones no
+/// longer exist (a rename contributes one of each).
+#[cfg(feature = "digest")]
+fn git_changes(dir: &Path, old: &str, new: &str) -> Result<dr_strange_llm::CommitDelta> {
+    // `-z` because paths are data: NUL separators cannot collide with them.
+    // `--relative` because the watched directory may be a subdirectory of the
+    // repository: paths must be relative to what the host serves (and files
+    // outside the watched directory are rightly excluded).
+    let out = git(
+        dir,
+        &["diff", "--relative", "--name-status", "-M", "-z", old, new],
+    )?;
+    let (changed, deleted) = parse_name_status(&out);
+    Ok(dr_strange_llm::CommitDelta { changed, deleted })
+}
+
+/// Parse `git diff --name-status -z` output. Statuses carry one path, except
+/// renames/copies which carry two (source, then destination).
+#[cfg(feature = "digest")]
+fn parse_name_status(raw: &[u8]) -> (Vec<String>, Vec<String>) {
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned());
+    let (mut changed, mut deleted) = (Vec::new(), Vec::new());
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        match status.chars().next() {
+            Some('D') => deleted.push(path),
+            Some('R') | Some('C') => {
+                let Some(target) = fields.next() else { break };
+                // The source of a copy still exists; a rename's does not.
+                if status.starts_with('R') {
+                    deleted.push(path);
+                }
+                changed.push(target);
+            }
+            // A/M/T and anything exotic: believe the file's current content.
+            _ => changed.push(path),
+        }
+    }
+    (changed, deleted)
+}
+
 /// Parse a statement, embedding a text `SEARCH … NEAR "…"` when an `embed`
 /// provider is given, and resolving `$name` placeholders from `params`.
 /// Embedding lives behind the `digest` feature (which pulls in dr-strange-llm);
@@ -257,6 +626,21 @@ fn run_plan(p: PlaneHandle<'_>, plan: LogicalPlan, out: &mut dyn Write) -> Resul
         }
         writeln!(out, "{obj}")?;
     }
+    Ok(())
+}
+
+/// The compact agent verbs (`find`/`callers`/`callees`/`describe`): one
+/// shared driver, the rendering shared with the MCP tools via
+/// [`dr_strange_core::compact`].
+pub fn compact(
+    db: &Database,
+    plane_name: &str,
+    name: &str,
+    render: fn(&PlaneHandle<'_>, &str) -> dr_strange_core::Result<String>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let p = plane(db, plane_name)?;
+    write!(out, "{}", render(&p, name)?)?;
     Ok(())
 }
 
@@ -388,6 +772,74 @@ pub fn index_ensure(
     Ok(())
 }
 
+/// The labels of `plane_name` whose nodes actually carry `property` — what
+/// "ensure an index for every label" should mean. A label without the
+/// property would only gain an empty index and a misleading line of output.
+fn labels_carrying(db: &Database, plane_name: &str, property: &str) -> Result<Vec<String>> {
+    let cat = plane(db, plane_name)?.catalog()?;
+    Ok(cat
+        .labels
+        .iter()
+        .filter(|(_, st)| st.properties.contains_key(property))
+        .map(|(l, _)| l.clone())
+        .collect())
+}
+
+/// `drsg index ensure <property>` — one vector index per label that carries
+/// the property, so a freshly vectorized plane becomes searchable in one
+/// command instead of one per label.
+pub fn index_ensure_all(
+    db: &Database,
+    plane_name: &str,
+    property: &str,
+    metric: Metric,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let labels = labels_carrying(db, plane_name, property)?;
+    if labels.is_empty() {
+        writeln!(
+            out,
+            "no label in plane '{plane_name}' carries `{property}` — nothing to index"
+        )?;
+        return Ok(());
+    }
+    let p = plane(db, plane_name)?;
+    for label in &labels {
+        p.ensure_vector_index(label, property, metric)?;
+        writeln!(out, "ensured vector index on {label}.{property}")?;
+    }
+    writeln!(out, "{} label(s) indexed", labels.len())?;
+    Ok(())
+}
+
+/// `drsg index keyword <property>` — the same sweep for BM25.
+pub fn keyword_index_ensure_all(
+    db: &Database,
+    plane_name: &str,
+    property: &str,
+    language: Language,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let labels = labels_carrying(db, plane_name, property)?;
+    if labels.is_empty() {
+        writeln!(
+            out,
+            "no label in plane '{plane_name}' carries `{property}` — nothing to index"
+        )?;
+        return Ok(());
+    }
+    let p = plane(db, plane_name)?;
+    for label in &labels {
+        p.ensure_keyword_index(label, property, language)?;
+        writeln!(
+            out,
+            "ensured keyword index on {label}.{property} ({language:?})"
+        )?;
+    }
+    writeln!(out, "{} label(s) indexed", labels.len())?;
+    Ok(())
+}
+
 pub fn keyword_index_ensure(
     db: &Database,
     plane_name: &str,
@@ -408,6 +860,43 @@ pub fn keyword_index_ensure(
 
 fn fmt_channel(v: Option<f32>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{x:.3}"))
+}
+
+/// `drsg vectorize` — embed every node in a plane so it answers similarity
+/// search, incrementally, then ensure the vector indexes. The engine lives
+/// in [`dr_strange_llm::vectorize_plane`], shared with `plane.vectorize`
+/// over RPC; this is its terminal voice.
+#[cfg(feature = "digest")]
+pub fn vectorize(
+    db: &Database,
+    plane_name: &str,
+    embedder: &dyn dr_strange_llm::Embedder,
+    metric: Metric,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let stats = dr_strange_llm::vectorize_plane(db, plane_name, embedder, metric)?;
+    if stats.embedded == 0 {
+        writeln!(
+            out,
+            "nothing to embed: {} node(s) already current, {} with no text",
+            stats.current, stats.empty
+        )?;
+    } else {
+        writeln!(
+            out,
+            "embedded {} node(s) ({} unique texts, {} tokens); {} already current, {} with no text",
+            stats.embedded, stats.unique, stats.tokens, stats.current, stats.empty
+        )?;
+    }
+    if !stats.labels.is_empty() {
+        writeln!(
+            out,
+            "  vector indexes ensured ({metric:?}) on `embedding` for {} label(s): {}",
+            stats.labels.len(),
+            stats.labels.join(", ")
+        )?;
+    }
+    Ok(())
 }
 
 /// Embed a query string for the vector channel. Needs the `digest` feature
@@ -480,13 +969,15 @@ pub fn hybrid(
 
 pub fn stats(db: &Database, out: &mut dyn Write) -> Result<()> {
     let planes = db.planes()?;
-    let cat = db.catalog()?;
+    // The maintained summary row, not the catalog scan — same numbers,
+    // constant time (arch/03 §5).
+    let counters = db.counters()?;
     writeln!(
         out,
         "{} planes, {} nodes, {} edges",
         planes.len(),
-        cat.node_count,
-        cat.edge_count
+        counters.nodes,
+        counters.edges
     )?;
     Ok(())
 }
@@ -538,6 +1029,12 @@ pub struct DigestArgs<'a> {
     pub embed_url: Option<&'a str>,
     pub chat_key_env: Option<&'a str>,
     pub embed_key_env: Option<&'a str>,
+    /// Force a preprocessor by name instead of routing by extension
+    /// (ROADMAP §11). A router that guesses is worse than one that asks.
+    pub handler: Option<&'a str>,
+    /// The `[plugins]` section, resolved: budgets, store, and each plugin's
+    /// own settings.
+    pub plugin_config: dr_strange_llm::PluginConfig,
 }
 
 /// Natural-language query (ROADMAP §3): an LLM turns `question` into a
@@ -611,8 +1108,348 @@ pub fn ask(
 /// relevance floor and *says* what it kept and what it dropped. A crawl that
 /// quietly read less than the reader expected would be worse than one that
 /// read nothing.
+/// The routing handlers for this invocation: built-ins plus every installed
+/// plugin, loaded once. Built only on the branches that route — a URL digest
+/// never needs them, and must not fail because an installed plugin is broken.
 #[cfg(feature = "digest")]
-fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String)> {
+fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
+    dr_strange_llm::Plugins::load(&args.plugin_config)
+}
+
+// ---- plugins (ROADMAP §11) -----------------------------------------------
+
+/// A plugin artifact is code this process will execute, so the download cap is
+/// not a courtesy: nothing legitimate is near it, and an endless body should
+/// stop mattering early.
+#[cfg(feature = "digest")]
+const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
+
+/// The official catalog, shared with the dashboard's `plugin.catalog` —
+/// pinned release URLs and hashes, one source of truth in dr-strange-llm.
+#[cfg(feature = "digest")]
+pub use dr_strange_llm::OFFICIAL_PLUGINS;
+
+/// One catalog entry's status against the local store: `[installed]` when
+/// the stored hash matches the release artifact's, `[upgradable]` when a
+/// plugin of that name is installed but its bytes differ (an older release,
+/// or a local build), nothing when it is absent.
+fn official_status(
+    installed: &std::collections::BTreeMap<String, String>,
+    name: &str,
+    release_sha: &str,
+) -> &'static str {
+    match installed.get(name) {
+        Some(have) if have == release_sha => "  [installed]",
+        Some(_) => "  [upgradable]",
+        None => "",
+    }
+}
+
+/// The interactive chooser behind bare `drsg plugin install`: the official
+/// catalog by number, `0` for all of it, a pasted path/URL, `q` to walk
+/// away. Returns the sources to install.
+fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> Result<Vec<String>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "no source given and stdin is not a terminal — pass a path or URL, \
+             e.g. `drsg plugin install <file.wasm | url>`"
+        );
+    }
+    let installed: std::collections::BTreeMap<String, String> = store
+        .list()?
+        .into_iter()
+        .map(|p| (p.name, p.sha256))
+        .collect();
+    let claims_w = OFFICIAL_PLUGINS
+        .iter()
+        .map(|p| p.claims.len())
+        .max()
+        .unwrap_or(0);
+    writeln!(out, "official plugins:")?;
+    writeln!(out, "  0) all of the below")?;
+    for (i, p) in OFFICIAL_PLUGINS.iter().enumerate() {
+        writeln!(
+            out,
+            "  {}) {:5} {:claims_w$}{}",
+            i + 1,
+            p.name,
+            p.claims,
+            official_status(&installed, p.name, p.sha256)
+        )?;
+    }
+    write!(out, "install [number, path/URL, or q to cancel]: ")?;
+    out.flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit")
+    {
+        writeln!(out, "cancelled")?;
+        return Ok(Vec::new());
+    }
+    if let Ok(n) = answer.parse::<usize>() {
+        if n == 0 {
+            return Ok(OFFICIAL_PLUGINS.iter().map(|p| p.url.to_string()).collect());
+        }
+        if let Some(p) = OFFICIAL_PLUGINS.get(n - 1) {
+            return Ok(vec![p.url.to_string()]);
+        }
+        anyhow::bail!("no option {n} — pick 0..={}", OFFICIAL_PLUGINS.len());
+    }
+    Ok(vec![answer.to_string()])
+}
+
+/// Installed plugins (other than `manifest`'s own name) that already claim
+/// any of its extensions — the head-on collision `install` must not create
+/// silently: the router routes each extension to exactly one handler.
+fn extension_conflicts(
+    store: &dr_strange_llm::PluginStore,
+    name: &str,
+    extensions: &[String],
+) -> Result<Vec<dr_strange_llm::InstalledPlugin>> {
+    let mut out = Vec::new();
+    for installed in store.list()? {
+        if installed.name == name {
+            continue; // same name is the upgrade path, not a conflict
+        }
+        if installed.extensions.iter().any(|e| extensions.contains(e)) {
+            out.push(installed);
+        }
+    }
+    Ok(out)
+}
+
+fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::PluginStore> {
+    match &cfg.store_dir {
+        Some(dir) => dr_strange_llm::PluginStore::open(dir.clone()),
+        None => dr_strange_llm::PluginStore::open_default(),
+    }
+}
+
+/// Install a plugin from a local `.wasm` or a URL.
+///
+/// A URL goes through the same network policy as every other fetch (ROADMAP
+/// §9): resolved-address checks, the private-range guard at every redirect
+/// hop, a size cap. The artifact is then validated as a component, asked to
+/// describe itself, hashed, and only then stored — nothing unloadable enters
+/// the store to fail later at digest time.
+#[cfg(feature = "digest")]
+pub fn plugin_install(
+    cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    source: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let sources = match source {
+        Some(s) => vec![s.to_string()],
+        None => choose_plugins(&plugin_store(cfg)?, out)?,
+    };
+    for source in &sources {
+        install_one(cfg, allow_private, source, out)?;
+    }
+    Ok(())
+}
+
+fn install_one(
+    cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    source: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let is_url = source.starts_with("http://") || source.starts_with("https://");
+    let bytes = if is_url {
+        writeln!(out, "downloading {source}")?;
+        dr_strange_web::fetch::fetch_bytes(source, PLUGIN_DOWNLOAD_CAP, allow_private)?
+    } else {
+        std::fs::read(source).with_context(|| format!("reading {source}"))?
+    };
+
+    let store = plugin_store(cfg)?;
+
+    // The router routes each extension to exactly one handler, so an
+    // install that would create a second claimant is a decision, not a
+    // default: cancel, or remove the incumbent and continue.
+    let manifest = {
+        use dr_strange_llm::preprocess::Preprocessor as _;
+        dr_strange_llm::WasmPlugin::from_bytes(
+            &bytes,
+            Vec::new(),
+            dr_strange_llm::Limits::default(),
+        )?
+        .manifest()
+    };
+    let conflicts = extension_conflicts(&store, &manifest.name, &manifest.extensions)?;
+    if !conflicts.is_empty() {
+        use std::io::IsTerminal;
+        let named = conflicts
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}@{} ({})",
+                    p.name,
+                    p.version,
+                    p.extensions
+                        .iter()
+                        .map(|e| format!(".{e}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "{}@{} claims extensions already handled by {named} — remove \
+                 the incumbent first (`drsg plugin remove <name>`) or run \
+                 interactively to choose",
+                manifest.name,
+                manifest.version
+            );
+        }
+        writeln!(
+            out,
+            "{}@{} claims extensions already handled by {named}",
+            manifest.name, manifest.version
+        )?;
+        write!(
+            out,
+            "  c) cancel installation\n  r) remove and continue\nchoice [c/r]: "
+        )?;
+        out.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        match line.trim() {
+            "r" | "R" => {
+                for p in &conflicts {
+                    let removed = store.remove(&p.name)?;
+                    writeln!(out, "removed {}@{}", removed.name, removed.version)?;
+                }
+            }
+            _ => {
+                writeln!(out, "cancelled")?;
+                return Ok(());
+            }
+        }
+    }
+
+    let (entry, replaced) = store.install(&bytes, source)?;
+    match replaced {
+        Some(old) if old != entry.version => writeln!(
+            out,
+            "installed {}@{} (replacing {old})  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+        Some(_) => writeln!(
+            out,
+            "reinstalled {}@{}  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+        None => writeln!(
+            out,
+            "installed {}@{}  sha256:{}",
+            entry.name,
+            entry.version,
+            &entry.sha256[..12]
+        )?,
+    }
+    writeln!(
+        out,
+        "  handles: {}",
+        entry
+            .extensions
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+pub fn plugin_list(
+    cfg: &dr_strange_llm::PluginConfig,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let store = plugin_store(cfg)?;
+    let plugins = store.list()?;
+    if json {
+        // The same records `plugin.list` serves over RPC — one shape for
+        // agents whichever surface they read.
+        writeln!(out, "{}", serde_json::to_string_pretty(&plugins)?)?;
+        return Ok(());
+    }
+    if plugins.is_empty() {
+        writeln!(
+            out,
+            "no plugins installed — `drsg plugin install <file.wasm | url>` adds one"
+        )?;
+        return Ok(());
+    }
+    // A terminal table: fixed columns sized to the content.
+    let rows: Vec<[String; 5]> = plugins
+        .iter()
+        .map(|p| {
+            [
+                p.name.clone(),
+                p.version.clone(),
+                p.extensions
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                p.sha256[..12].to_string(),
+                p.source.clone(),
+            ]
+        })
+        .collect();
+    let header = ["NAME", "VERSION", "EXTENSIONS", "SHA256", "SOURCE"];
+    let mut widths = header.map(str::len);
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.len());
+        }
+    }
+    let print_row = |out: &mut dyn Write, cells: [&str; 5]| -> Result<()> {
+        let mut line = String::new();
+        for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(&format!("{cell:<w$}"));
+        }
+        writeln!(out, "{}", line.trim_end())?;
+        Ok(())
+    };
+    print_row(out, header)?;
+    for row in &rows {
+        print_row(out, [&row[0], &row[1], &row[2], &row[3], &row[4]])?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+pub fn plugin_remove(
+    cfg: &dr_strange_llm::PluginConfig,
+    name: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let store = plugin_store(cfg)?;
+    let entry = store.remove(name)?;
+    writeln!(out, "removed {}@{}", entry.name, entry.version)?;
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+fn read_source(
+    args: &DigestArgs,
+    out: &mut dyn Write,
+) -> Result<(dr_strange_llm::Preprocessed, String)> {
     let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
     if !is_url {
         let path = Path::new(args.source);
@@ -620,13 +1457,30 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
+
+        // A directory is a legal source since ROADMAP §11: a preprocessor pulls
+        // the files it wants through the host, so "digest this project" needs
+        // no file list from the caller.
+        if path.is_dir() {
+            let host = dr_strange_llm::LocalFiles::new(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let plugins = load_plugins(args)?;
+            let facts = dr_strange_llm::route_tree(&host, args.handler, &plugins)?;
+            return Ok((facts, name));
+        }
+
         // Bytes, not `read_to_string`: a PDF or .docx is not UTF-8, and the old
         // read failed on one before the user learned whether it was supported.
         // Markdown and plain text pass straight through the converter.
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let doc = dr_strange_llm::to_markdown(&name, &bytes)
+        // The host is the file's own directory: a preprocessor handed one
+        // source file may still need to follow an import beside it.
+        let host = dr_strange_llm::LocalFiles::new(path.parent().unwrap_or(Path::new(".")))
             .with_context(|| format!("reading {}", path.display()))?;
-        return Ok((doc, name));
+        let plugins = load_plugins(args)?;
+        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, &plugins)
+            .with_context(|| format!("reading {}", path.display()))?;
+        return Ok((facts, name));
     }
 
     let opts = dr_strange_web::fetch::FetchOptions {
@@ -678,7 +1532,10 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
     if doc.trim().is_empty() {
         bail!("{} yielded no readable text", args.source);
     }
-    Ok((doc, args.source.to_string()))
+    Ok((
+        dr_strange_llm::Preprocessed::prose_only("fetch", doc),
+        args.source.to_string(),
+    ))
 }
 
 /// Digests a document into the plane: an LLM extracts entities/relations
@@ -689,25 +1546,25 @@ fn read_source(args: &DigestArgs, out: &mut dyn Write) -> Result<(String, String
 pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let (doc, source) = read_source(args, out)?;
+    // Mode is parsed before anything expensive: a typo should not cost a crawl.
+    let mode = dr_strange_llm::DigestMode::parse(args.mode).ok_or_else(|| {
+        anyhow!(
+            "unknown digest mode `{}` — expected coarse, fine or super",
+            args.mode
+        )
+    })?;
+    let (mut facts, source) = read_source(args, out)?;
 
-    let chat = dr_strange_llm::build_provider(
-        args.chat_provider,
-        args.model,
-        args.chat_url,
-        args.chat_key_env,
-        false,
-    )?;
-    let chat_model = chat.model().to_string();
-    let embedder = dr_strange_llm::build_provider(
-        args.embed_provider,
-        args.embed_model,
-        args.embed_url,
-        args.embed_key_env,
-        args.embed,
-    )?;
-
-    let p = plane(db, args.plane)?;
+    // Digest creates its target plane on demand: with the plane defaulting
+    // to the source directory's name, `drsg digest` in a fresh checkout must
+    // not fail over a plane nobody had a chance to create.
+    let p = match db.plane(args.plane) {
+        Ok(p) => p,
+        Err(_) => {
+            writeln!(out, "created plane '{}'", args.plane)?;
+            db.create_plane(args.plane, Properties::new())?
+        }
+    };
     let run_id = format!(
         "{}-{}",
         source,
@@ -716,28 +1573,72 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let opts = dr_strange_llm::DigestOptions {
-        source,
-        model: chat_model,
-        run_id,
-        chunk_chars: args.chunk_chars,
-        embed: args.embed,
-        concurrency: args.concurrency,
-        mode: dr_strange_llm::DigestMode::parse(args.mode).ok_or_else(|| {
-            anyhow!(
-                "unknown digest mode `{}` — expected coarse, fine or super",
-                args.mode
-            )
-        })?,
-        refine_max_entities: None,
-        refine_max_context: None,
+    dr_strange_llm::stamp_run(&mut facts, &source, &run_id);
+
+    if !facts.report.handlers.is_empty() {
+        let ran: Vec<String> = facts
+            .report
+            .handlers
+            .iter()
+            .map(|(n, c)| format!("{n} ({c} facts)"))
+            .collect();
+        writeln!(out, "preprocessed by {}", ran.join(", "))?;
+    }
+    // The preprocess notes print here — before any provider is built — because
+    // the one that matters most ("no installed plugin claims `.rs`") must not
+    // be lost behind a model-call failure that happens later. Drained, so the
+    // folded report does not say everything twice.
+    for note in facts.report.notes.drain(..) {
+        writeln!(out, "  note: {note}")?;
+    }
+
+    // The §11 headline: an input that yields only facts is digested with **no
+    // model call at all** — no provider constructed, no key read, no request
+    // made. Building the chat client eagerly would defeat it, since that is
+    // where a missing API key turns into an error.
+    let result = if facts.needs_model() {
+        let chat = dr_strange_llm::build_provider(
+            args.chat_provider,
+            args.model,
+            args.chat_url,
+            args.chat_key_env,
+            false,
+        )?;
+        let embedder = dr_strange_llm::build_provider(
+            args.embed_provider,
+            args.embed_model,
+            args.embed_url,
+            args.embed_key_env,
+            args.embed,
+        )?;
+        let opts = dr_strange_llm::DigestOptions {
+            source,
+            model: chat.model().to_string(),
+            run_id,
+            chunk_chars: args.chunk_chars,
+            embed: args.embed,
+            concurrency: args.concurrency,
+            mode,
+            refine_max_entities: None,
+            refine_max_context: None,
+        };
+
+        let cands = dr_strange_llm::PlaneCandidates::new(&p);
+        let plane_source = args
+            .link
+            .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+        // Grounded whether or not `--link` is on: without this the model is
+        // told the facts this very run parsed are new, and proposes a second
+        // `parse` beside the one the AST just established.
+        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+        let extracted =
+            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+        dr_strange_llm::fold(facts, extracted)
+    } else {
+        writeln!(out, "no prose left to read — digested without a model call")?;
+        dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
     };
 
-    let cands = dr_strange_llm::PlaneCandidates::new(&p);
-    let candidates = args
-        .link
-        .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-    let result = dr_strange_llm::digest(&doc, &chat, &embedder, candidates, &opts)?;
     let r = &result.report;
     writeln!(
         out,
@@ -749,6 +1650,9 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         "  {} chat request(s); tokens {} in / {} out / {} embed",
         r.chat_requests, r.input_tokens, r.output_tokens, r.embed_tokens
     )?;
+    for note in &r.notes {
+        writeln!(out, "  note: {note}")?;
+    }
 
     if args.apply {
         let mut txn = p.write()?;
@@ -768,11 +1672,23 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
                 stats.skipped.join(", ")
             )?;
         }
-        if args.embed {
+        // Only when something was actually embedded: a facts-only digest calls
+        // no provider at all, and pointing at an `embedding` property nothing
+        // wrote would send a reader to build an index over empty vectors.
+        if args.embed && r.embed_tokens > 0 {
             writeln!(
                 out,
                 "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"
             )?;
+        }
+        // A directory inside a git repository gets its sync point stamped, so
+        // `serve watch` can later say whether the graph is current and catch
+        // up from exactly here.
+        if std::fs::metadata(args.source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            record_sync_point(db, args.plane, Path::new(args.source))?;
         }
     } else {
         for n in result.nodes.iter().take(12) {
@@ -1478,5 +2394,370 @@ mod tests {
         assert!(query(&db, "startup", "not json", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "9999", &mut Vec::new()).is_err());
         assert!(get(&db, "startup", "@nope", &mut Vec::new()).is_err());
+    }
+
+    // ---- plugin management ------------------------------------------------
+
+    /// The sandbox suite's committed fixture — a real component claiming
+    /// `.fix` — so these tests exercise the actual validate/store path, not
+    /// a mock of it.
+    #[cfg(feature = "digest")]
+    const FIXTURE_WASM: &[u8] = include_bytes!("../../dr-strange-llm/tests/fixtures/fixture.wasm");
+
+    /// A throwaway store directory wired through `PluginConfig` — the same
+    /// knob `[plugins] store_dir` sets, so nothing here touches the user's
+    /// real per-user store.
+    #[cfg(feature = "digest")]
+    fn scratch_store(name: &str) -> (std::path::PathBuf, dr_strange_llm::PluginConfig) {
+        let dir = std::env::temp_dir().join(format!("drsg-cli-plug-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dr_strange_llm::PluginConfig {
+            store_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        (dir, cfg)
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn plugin_list_reports_the_empty_store_in_both_shapes() {
+        let (dir, cfg) = scratch_store("empty");
+        // JSON stays machine-readable even when there is nothing to say —
+        // an agent parsing it must never meet prose.
+        let json = cap(|o| plugin_list(&cfg, true, o));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+        // The human shape says what to do next instead.
+        let table = cap(|o| plugin_list(&cfg, false, o));
+        assert!(table.contains("no plugins installed"), "{table}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn install_from_a_path_then_list_as_table_and_json() {
+        let (dir, cfg) = scratch_store("list");
+        let wasm = dir.join("fixture.wasm");
+        std::fs::write(&wasm, FIXTURE_WASM).unwrap();
+
+        let out = cap(|o| plugin_install(&cfg, &[], Some(wasm.to_str().unwrap()), o));
+        assert!(out.contains("installed fixture@0"), "{out}");
+        assert!(out.contains("handles: .fix"), "{out}");
+
+        let table = cap(|o| plugin_list(&cfg, false, o));
+        assert!(
+            table.contains("NAME") && table.contains("EXTENSIONS"),
+            "{table}"
+        );
+        assert!(
+            table.contains("fixture") && table.contains(".fix"),
+            "{table}"
+        );
+
+        // `--json` is the agent surface: the same records `plugin.list`
+        // serves over RPC, parseable without scraping the table.
+        let json = cap(|o| plugin_list(&cfg, true, o));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["name"], "fixture");
+        assert_eq!(parsed[0]["extensions"][0], "fix");
+        assert_eq!(parsed[0]["sha256"].as_str().unwrap().len(), 64);
+        // The fixture ships a manifest logo; the store records it and the
+        // machine surface carries it to UIs.
+        assert!(parsed[0]["logo"].as_str().unwrap().starts_with("<svg"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vectorize` embeds once, skips what is current, and re-embeds only
+    /// what changed — the whole point of the `_embedded_from` hash.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn vectorize_is_incremental() {
+        use dr_strange_core::{PropDesc, PropValue};
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("v", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        // A parser fact (projection) and a document entity (full text).
+        let mut fact = Properties::new();
+        fact.insert(
+            "_generated_by".into(),
+            PropDesc::described("parser", PropValue::Str("rust@2".into())),
+        );
+        fact.insert(
+            "signature".into(),
+            PropDesc::described("sig", PropValue::Str("fn go()".into())),
+        );
+        fact.insert(
+            "line".into(),
+            PropDesc::described("line", PropValue::Int(9)),
+        );
+        let fact_id = txn
+            .create_node_with_key("k::go", &["Function"], fact)
+            .unwrap();
+        let mut doc = Properties::new();
+        doc.insert(
+            "year".into(),
+            PropDesc::described("year", PropValue::Int(2020)),
+        );
+        txn.create_node_with_key("paper", &["Paper"], doc).unwrap();
+        txn.commit().unwrap();
+
+        let mock = dr_strange_llm::MockProvider::new(Vec::new(), 4);
+        let run = |out: &mut Vec<u8>| vectorize(&db, "v", &mock, Metric::Cosine, out).unwrap();
+
+        let mut out = Vec::new();
+        run(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("embedded 2 node(s)"), "{text}");
+        // The plane is searchable when vectorize returns: both labels indexed.
+        assert!(text.contains("Function, Paper"), "{text}");
+        let node = p.node(fact_id).unwrap().unwrap();
+        assert!(matches!(
+            node.properties.get("embedding").map(|d| &d.value),
+            Some(PropValue::Vector(v)) if v.len() == 4
+        ));
+
+        // Nothing changed: nothing re-embeds.
+        let mut out = Vec::new();
+        run(&mut out);
+        assert!(String::from_utf8(out).unwrap().contains("nothing to embed"));
+
+        // A positional change on the fact: the projection is unchanged, so
+        // still nothing to do — the stability the projection exists for.
+        let mut txn = p.write().unwrap();
+        txn.set_prop(
+            fact_id,
+            "line",
+            PropDesc::described("line", PropValue::Int(99)),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let mut out = Vec::new();
+        run(&mut out);
+        assert!(String::from_utf8(out).unwrap().contains("nothing to embed"));
+
+        // A semantic change re-embeds exactly that node.
+        let mut txn = p.write().unwrap();
+        txn.set_prop(
+            fact_id,
+            "signature",
+            PropDesc::described("sig", PropValue::Str("fn go(x: u8)".into())),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let mut out = Vec::new();
+        run(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("embedded 1 node(s)"), "{text}");
+    }
+
+    /// `index ensure <property>` sweeps exactly the labels that carry it.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn index_ensure_all_targets_only_labels_with_the_property() {
+        use dr_strange_core::{PropDesc, PropValue};
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("v", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let mut with_vec = Properties::new();
+        with_vec.insert(
+            "embedding".into(),
+            PropDesc::described("v", PropValue::Vector(vec![1.0, 0.0])),
+        );
+        txn.create_node(&["Function"], with_vec.clone()).unwrap();
+        txn.create_node(&["Paper"], with_vec).unwrap();
+        txn.create_node(&["Bare"], Properties::new()).unwrap();
+        txn.commit().unwrap();
+
+        let out = cap(|o| index_ensure_all(&db, "v", "embedding", Metric::Cosine, o));
+        assert!(out.contains("Function.embedding"), "{out}");
+        assert!(out.contains("Paper.embedding"), "{out}");
+        assert!(
+            !out.contains("Bare"),
+            "a label without the property was indexed: {out}"
+        );
+        assert!(out.contains("2 label(s) indexed"), "{out}");
+
+        // No label carries a made-up property: say so, index nothing.
+        let none = cap(|o| index_ensure_all(&db, "v", "nope", Metric::Cosine, o));
+        assert!(none.contains("no label"), "{none}");
+    }
+
+    /// The sync point round-trips through plane properties, and the watch
+    /// startup can tell in-sync from behind from unknowable.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn sync_point_records_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("drsg-syncpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c1",
+        ]);
+
+        let db = Database::in_memory().unwrap();
+        db.create_plane("p", Properties::new()).unwrap();
+
+        // Nothing recorded yet — the graph cannot be compared.
+        assert_eq!(recorded_sync_point(&db, "p"), (None, None));
+
+        record_sync_point(&db, "p", &dir).unwrap();
+        let (commit, root) = recorded_sync_point(&db, "p");
+        let head = git_head(&dir).unwrap();
+        assert_eq!(commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            root.as_deref(),
+            Some(dir.canonicalize().unwrap().to_str().unwrap())
+        );
+        assert!(commit_known(&dir, &head));
+        assert!(!commit_known(
+            &dir,
+            "0000000000000000000000000000000000000000"
+        ));
+
+        // A new commit: the recorded point is behind but known — the catch-up
+        // case — and re-recording moves it forward.
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c2",
+        ]);
+        let new_head = git_head(&dir).unwrap();
+        assert_ne!(commit.as_deref(), Some(new_head.as_str()));
+        assert!(commit_known(&dir, commit.as_deref().unwrap()));
+        record_sync_point(&db, "p", &dir).unwrap();
+        assert_eq!(
+            recorded_sync_point(&db, "p").0.as_deref(),
+            Some(new_head.as_str())
+        );
+
+        // Outside a repository: recording is a quiet no-op.
+        let plain =
+            std::env::temp_dir().join(format!("drsg-syncpoint-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        db.create_plane("q", Properties::new()).unwrap();
+        record_sync_point(&db, "q", &plain).unwrap();
+        assert_eq!(recorded_sync_point(&db, "q"), (None, None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    /// `git diff --name-status -z` per status letter: one path each, except
+    /// renames/copies which carry source then destination.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn name_status_parses_every_shape_the_diff_emits() {
+        let raw =
+            b"M src/lib.rs A src/new.rs D old.rs R100 from.rs to.rs C75 base.rs copy.rs T link.rs ";
+        let (changed, deleted) = parse_name_status(raw);
+        assert_eq!(
+            changed,
+            vec!["src/lib.rs", "src/new.rs", "to.rs", "copy.rs", "link.rs"]
+        );
+        // A rename's source is gone; a copy's still exists.
+        assert_eq!(deleted, vec!["old.rs", "from.rs"]);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn name_status_survives_truncated_input() {
+        // A status with no path (defensive; git won't produce it).
+        assert_eq!(parse_name_status(b"M "), (vec![], vec![]));
+        assert_eq!(parse_name_status(b""), (vec![], vec![]));
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_chooser_tags_installed_and_upgradable_against_the_release_hash() {
+        let installed: std::collections::BTreeMap<String, String> = [
+            ("rust".to_string(), "aaaa".to_string()),
+            ("go".to_string(), "bbbb".to_string()),
+        ]
+        .into();
+        // Hash matches the release artifact → nothing to do.
+        assert_eq!(official_status(&installed, "rust", "aaaa"), "  [installed]");
+        // Same name, different bytes — an older release or a local build.
+        assert_eq!(official_status(&installed, "go", "cccc"), "  [upgradable]");
+        // Absent stays unmarked.
+        assert_eq!(official_status(&installed, "ts", "dddd"), "");
+    }
+
+    /// The pinned hashes must stay well-formed: a typo'd hash would tag a
+    /// correctly installed plugin `[upgradable]` forever.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn every_official_entry_pins_a_plausible_sha256() {
+        for p in OFFICIAL_PLUGINS {
+            assert_eq!(p.sha256.len(), 64, "{}: not a sha256 hex digest", p.name);
+            assert!(
+                p.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}: non-hex in pinned hash",
+                p.name
+            );
+            assert!(
+                p.url.contains(&format!("/{}.wasm", p.name)),
+                "{}: url names a different artifact",
+                p.name
+            );
+        }
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn a_second_claimant_conflicts_but_a_reinstall_does_not() {
+        let (dir, cfg) = scratch_store("conflict");
+        let store = plugin_store(&cfg).unwrap();
+        store.install(FIXTURE_WASM, "test").unwrap();
+
+        // A different plugin claiming `.fix` collides with the incumbent…
+        let hits =
+            extension_conflicts(&store, "fixture2", std::slice::from_ref(&"fix".to_string()))
+                .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "fixture");
+
+        // …but the same name re-claiming its own extension is the upgrade
+        // path, and a disjoint claim collides with nothing.
+        assert!(
+            extension_conflicts(&store, "fixture", std::slice::from_ref(&"fix".to_string()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            extension_conflicts(&store, "other", std::slice::from_ref(&"zig".to_string()))
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

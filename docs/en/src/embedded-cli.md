@@ -28,15 +28,23 @@ access, and the CLI for offline operations.
 | `hybrid <query> --plane` | fused vector + keyword + graph-proximity search |
 | `index ensure \| keyword` | declare a vector or keyword index |
 | `ask <question> --plane` | natural-language query |
-| `digest <file\|url> --plane [--mode]` | ingest a document (or a page and its links) via an LLM |
-
-A file may be Markdown or plain text, or any of Word, PowerPoint, Excel,
-OpenDocument, RTF, EPUB, CSV and PDF — those are converted to Markdown first, so
-the model reads headings, tables and lists rather than loose characters. The
-format is detected from the file's contents, so a wrong extension still works.
+| `digest <file\|dir\|url> --plane [--mode]` | ingest a document, a repository, or a page and its links |
+| `search <query> --plane` | semantic lookup: embeds the query, returns the nearest nodes |
+| `context \| describe \| trace \| impact <name> --plane` | the agent verbs over a digested code plane |
+| `vectorize --plane` | embed a plane's nodes for similarity search |
+| `plugin install \| list \| remove` | manage preprocessor plugins (sandboxed wasm parsers) |
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |
 | `stats` / `check` | summary counts / integrity scan |
-| `serve [--addr]` | run the web dashboard + JSON-RPC API |
+| `serve [--addr]` | run the web dashboard + JSON-RPC API + MCP endpoint |
+| `serve watch [--dir]` | serve, and keep a code plane synced to every commit |
+
+A digested file may be Markdown or plain text, or any of Word, PowerPoint,
+Excel, OpenDocument, RTF, EPUB, CSV and PDF — those are converted to Markdown
+first, so the model reads headings, tables and lists rather than loose
+characters. The format is detected from the file's contents, so a wrong
+extension still works. A directory is walked and routed per file: source code
+goes through the installed parser plugins as facts, documents go to the model
+as prose.
 
 Global options are `--db <path>` and `--config <path>` (the configuration file,
 [Chapter 2](./getting-started.md#configuration-file)).
@@ -147,7 +155,7 @@ usage ([Chapter 3](./ai-native.md#extraction-precision)).
 
 `snapshot` writes a consistent whole-database bundle at one commit sequence;
 `restore` rebuilds it into an empty database, preserving ids, the commit
-sequence, and the built search indexes ([Chapter 9](./architecture.md)).
+sequence, and the built search indexes ([Chapter 11](./architecture.md)).
 `stats` and `check` report counts and scan every plane for readability:
 
 ```console

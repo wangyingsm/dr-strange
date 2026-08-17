@@ -100,3 +100,10 @@ benchmark:
 # Embedded engines end-to-end (Neo4j is opt-in: bench-neo4j-up → bench-neo4j).
 bench-compare: bench-gen bench-drsg bench-sqlite bench-kuzu bench-report
     @echo "Embedded engines done. For Neo4j: just bench-neo4j-up && just bench-neo4j && just bench-report && just bench-neo4j-down"
+
+# The P0 eval board (revision plan): known resolution gaps as ignored tests,
+# red until their phase lands. Failing here is the expected state — this
+# recipe watches the reds turn green; it never gates CI. Pair with
+# `just -f extensions/justfile eval` for the parser-side board.
+eval:
+    -cargo test -p dr-strange-llm --lib -- --ignored

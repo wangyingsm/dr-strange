@@ -13,3 +13,8 @@ logs/
 
 # CodeGraph's local symbol index — a machine-local cache rebuilt from source.
 .codegraph/
+
+# The official plugins live in their own repository (`dr-strange-extensions`),
+# checked out here so the two can be worked on together. Its history is its
+# own: a plugin ships a fix without waiting for a database release.
+extensions/

@@ -209,6 +209,7 @@ fn mcp_router(
     state: Arc<AppState>,
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
+    source_root: Option<std::path::PathBuf>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -227,6 +228,9 @@ fn mcp_router(
     let service = StreamableHttpService::new(
         move || {
             let mut svc = DrStrange::with_digest(db.clone(), digest).with_tool_gate(tools.clone());
+            if let Some(root) = &source_root {
+                svc = svc.with_source_root(root.clone());
+            }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
                     provider: provider.clone(),
@@ -256,6 +260,7 @@ fn router(
     state: Arc<AppState>,
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
+    source_root: Option<std::path::PathBuf>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -279,7 +284,12 @@ fn router(
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
-        .merge(mcp_router(state.clone(), max_concurrent, embed))
+        .merge(mcp_router(
+            state.clone(),
+            max_concurrent,
+            embed,
+            source_root,
+        ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
         .route("/digest/extract", post(extract_http))
@@ -591,7 +601,16 @@ async fn cypher_http(
         let state = state.clone();
         let plane = plane.clone();
         // The SPA doesn't send params; plane.cypher does (methods::plane_cypher).
-        move || methods::cypher_subgraph(&state.ctx(), &plane, &query, &embed, &Default::default())
+        move || {
+            methods::cypher_subgraph(
+                &state.ctx(),
+                &plane,
+                &query,
+                &embed,
+                &Default::default(),
+                false,
+            )
+        }
     })
     .await;
 
@@ -652,7 +671,11 @@ fn startup_banner() {
 
 /// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
-pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
+pub async fn run(
+    db: Database,
+    db_path: Option<PathBuf>,
+    mut opts: ServeOptions,
+) -> anyhow::Result<()> {
     startup_banner();
     // Read the secret once so the checker (`authorizer`) and the SPA's injected
     // copy (`bootstrap_token`) can never disagree.
@@ -688,7 +711,24 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         fetch: opts.fetch,
         query_timeout: opts.query_timeout,
     });
-    let app = router(state, opts.max_concurrent, opts.embed_provider.clone());
+    // The caller's background task (e.g. the repository watcher behind
+    // `drsg serve watch`) gets its own handle to the shared database. A plain
+    // thread rather than a tokio task: the work is blocking (git, parsing,
+    // write transactions) and must not stall the request executor.
+    if let Some(on_start) = opts.on_start.take() {
+        let db = state.db.clone();
+        std::thread::spawn(move || on_start(db));
+    }
+    // Held past the serve future: the watcher thread's Arc clone keeps the
+    // database's Drop from ever running, so the sidecars must be saved
+    // explicitly at shutdown or every restart rebuilds the indexes.
+    let db_at_shutdown = state.db.clone();
+    let app = router(
+        state,
+        opts.max_concurrent,
+        opts.embed_provider.clone(),
+        opts.source_root.clone(),
+    );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
     // register it with tokio, which rejects a blocking fd — so make it
@@ -702,7 +742,7 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
         max_concurrent = opts.max_concurrent,
         "drsg serve: dashboard + JSON-RPC listening on {scheme}://{bound}"
     );
-    match opts.tls {
+    let served = match opts.tls {
         Some(tls) => serve_tls(app, std_listener, tls).await,
         None => {
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
@@ -735,7 +775,10 @@ pub async fn run(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> 
             }
             Ok(())
         }
-    }
+    };
+    db_at_shutdown.save_sidecars();
+    tracing::info!("index sidecars saved; next open loads instead of rebuilding");
+    served
 }
 
 /// Serve HTTPS on an already-bound listener, terminating TLS with rustls.

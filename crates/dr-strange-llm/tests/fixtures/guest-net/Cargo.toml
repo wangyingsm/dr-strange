@@ -1,0 +1,15 @@
+[package]
+name = "drsg-fixture-net"
+description = "A component that reaches for wasi:sockets — exists to be refused at load"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[workspace]
+members = []

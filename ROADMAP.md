@@ -644,13 +644,12 @@ problem does not arise for that portion of the graph and stage 1 has nothing to
 reconcile there. A facts-only plugin is a digest with **no model call at all**,
 which puts a whole class of ingestion on the LLM-free side of Appendix C.
 
-**The problem.** `extract.rs`'s `extract_text_with_progress` is already this
-router — it just has the table compiled in (`.pdf` → pdf-extract, `.docx` →
-zip + XML, `.txt`/`.md` → passthrough) and only ever produces text. This item
-generalizes the table and widens the return type. It is also the seam §9 lands
-on: a fetched URL arrives as bytes plus a content type, which is the same
-routing question a file's extension asks, and there should be one dispatch point
-rather than two.
+**The problem.** `document::to_markdown(name, bytes) -> String` is already this
+router — it just has the table compiled in (anydoc by signature, then extension;
+`.txt`/`.md` passthrough) and only ever produces text. This item generalizes the
+table and widens the return type. It is also the seam §9 lands on: a fetched URL
+arrives as bytes plus a content type, which is the same routing question a
+file's extension asks, and there should be one dispatch point rather than two.
 
 **Scope sketch.**
 
@@ -706,7 +705,20 @@ precedent in the CLI: the capability is there for anyone who wants it, and
 not. A plugin system that requires rebuilding the database before it can load a
 plugin is not one.
 
-The default flip costs binary size and build time, and it changes no security
+The default flip costs binary size and build time — **measured, as promised,
+once the weight was real**: the release `drsg` went 37.0 MB → 57.6 MB with
+wasmtime trimmed to `runtime`, `component-model`, `cranelift`, `std`. Kept on
+against that number: a fifth of the binary buys the entire plugin system, and
+`--no-default-features` still drops it. Throughput through the sandbox, same
+corpus as the native baseline: 8.6 MiB/s end-to-end against native's 23 —
+this workspace in ~190 ms (7.5 after line provenance was added: span
+tracking costs ~13%, paid knowingly — a fact you cannot jump to is half a
+fact). The first measurement said 4.5 and was challenged
+as kernel-inadequate; pre-linking the component at load, per-file `parse`
+dispatch and a binary partial format closed it to ~2.7×, of which ~2.1× is
+the wasm instruction floor (the single-document bench) and the rest the
+serial `assemble` tail. The next lever, if a real tree ever demands it, is a
+tree-reduce `assemble` — a contract change, deliberately not taken now. And the flip changes no security
 posture: **the runtime being compiled in is not a plugin running.** No module is
 loaded that the configuration did not name, so a default install executes
 exactly as much third-party code as it does today, which is none.
@@ -724,25 +736,151 @@ The protocol above is deliberately transport-independent, so a subprocess host
 (for a plugin in a language that will not compile to wasm, or one that genuinely
 needs the network) can be added later without the plugin contract changing.
 
-**Forks to settle.**
-- *Which wasm flavour.* The **component model / WIT** gives a typed contract and
-  generated bindings — the right shape for a third-party interface — but its
-  language support outside Rust is still uneven. Core wasm + WASI preview 1 with
-  hand-rolled marshalling works in more toolchains today and ages worse.
-- *What the example plugins are written in.* Both in Rust is the low-risk answer
-  (`syn` for Rust, a tree-sitter grammar for Go, both compiling to wasm32
-  cleanly) and it proves the interface is language-neutral less convincingly
-  than writing the Go plugin in Go — which depends on TinyGo's stdlib coverage
-  holding up under `go/parser`.
-- *Plugin identity.* Pin a plugin by SHA-256 in the configuration, the way the
-  installers already verify release binaries, or trust the path?
-- *Version in provenance.* `_generated_by` carries the name; a plugin's version
-  belongs somewhere too, in that value or a sibling property.
-- *Enforced determinism.* Deny the clock and randomness outright, or grant them
-  on request and lose reproducible ingestion for plugins that ask?
-- *Facts that conflict with the model's extraction.* A plugin says a symbol is a
-  `Function` and the LLM pass calls it a `Concept`. Plugin wins by rule, or does
-  this go to stage 2 as an identity question?
+**Settled — version travels inside `_generated_by`.** One property holding
+`rust@1`, not a name and a sibling version: they are never useful apart.
+
+**Settled — the plugin wins a conflict.** Where a parsed fact and a model entity
+claim one key, the fact is kept and the model's is dropped and counted. A parser
+knows where a model infers, and routing it to §8 stage 2 would spend a model
+call re-litigating what the AST already settled. Edges are *not* deduplicated
+this way: an edge carries no identity of its own, so dropping a relation the
+model found because a parser found something between the same nodes would lose
+real information.
+
+**Settled — preprocessing is local-only.** The CLI and the **stdio** MCP server
+route through it; `drsg serve` and the HTTP MCP server do not. What makes
+parsing worth its cost is a plugin pulling the files *around* the one it was
+handed, and that pull is exactly what a shared server must not offer — routing
+it there would hand every caller a handler whose only reachable input is the
+server's own filesystem. Text sent over the wire stays prose.
+
+**Shipped (v2, slice 2) — the sandbox, and plugins you install.** Plugins are
+wasm **components** against a WIT contract with two phases: `parse` turns one
+chunk into an opaque partial (the host runs chunks in parallel — that is where
+the cores are, and the guest stays single-threaded), and `assemble` turns every
+partial into the result, once — cross-file resolution stays in the plugin
+because it is language semantics and the database holds none. `drsg plugin
+install <file.wasm | url>` validates the component, refuses one that imports
+`wasi:filesystem`/`wasi:sockets` by name, pins its SHA-256 (re-checked at every
+load — the *plugin identity* fork, settled), and records it in a per-user
+store. A plugin reaches exactly `list`/`read`/`label`, rooted and resolved-path
+checked; both wasi clocks are frozen; fuel and memory are bounded per call and
+operator-settable — each guarantee proven against a committed hostile fixture.
+The **Rust parser left this repository** for `dr-strange-extensions` (the
+official extension repo: the language-neutral WIT, per-language SDKs starting
+with `dr-strange-ext`, and the plugins), installed like anything else and
+verified to produce the identical graph — 1324 nodes, 4204 edges on
+`dr-strange-core/src` — to the native parser it replaced. Trees whose facts
+exceed wasm32's 4 GiB address space are ingested a subtree at a time with the
+plane as the accumulator: `apply()` is key-idempotent and keys are stable
+qualified paths, so cross-subtree edges bind by exact key.
+
+**Shipped (v2, slice 1) — the contract, natively.** `dr_strange_llm::preprocess`
+holds `Preprocessed`/`Preprocessor`/`Host`/`Manifest`, the router
+(`route_document` for one input, `route_tree` for a polyglot tree), grounding
+(`FactsAndPlane`), the conflict rule (`fold`), and an in-tree Rust plugin built
+on `syn`. Keys are module paths (`dr_strange_core::compute::exec::execute`), a
+trait impl's methods are keyed by qualified path (`<T as From<i64>>::from`), and
+calls resolve by locality — the caller's own module first, then each enclosing
+one. What stays unresolved is counted in the report rather than guessed at.
+`drsg digest <dir>` on a code-only tree writes a graph with **zero provider
+calls**, which is the item's headline made real.
+
+The wasm host is slice 2. It implements a trait that has already run in anger,
+rather than one designed against a host that has never executed a module — and
+the dependency weight wasmtime brings (Cranelift, `libc`, `object`, `rustix`)
+deserves a deliberate re-look against the default-on decision above when it
+lands, not a silent arrival.
+
+**Forks settled by slice 2.** The wasm flavour is the **component model /
+WIT**. Plugin identity is the SHA-256 pinned at install and re-checked at every
+load. Determinism is enforced rather than requested: frozen clocks, fixed-size
+chunking, partials assembled in chunk order.
+
+**Shipped (v2, slice 3): the Go plugin — and what holding a second runtime
+taught the sandbox.** `go@1` lives in the extensions repo beside the Rust
+plugin: `go/parser` under TinyGo, the same parser/component split, 28 native
+tests, and Go's own qualified names as keys (the module path from the nearest
+`go.mod`, then `path.Ident`, then `path.Type.Method`). Interface satisfaction
+is decided structurally under certainty rules — textual signatures within a
+package, predeclared-only signatures across packages, an interface embedding
+anything the tree does not declare left unmatched and counted. On a real
+chain node (345 files, 6.2 MiB) it wrote 7.4k nodes and 13.8k edges in ~3.5 s
+end-to-end, ~325 ms of that in the sandbox — and TinyGo's stdlib coverage
+held: `go/parser`, `go/ast` and `encoding/json` all compile.
+
+**Shipped (v2, slice 4): the TypeScript/JavaScript plugin.** `ts@1` claims
+all of TS and JS (`ts, tsx, mts, cts, js, jsx, mjs, cjs`) — written in Rust
+on `swc_ecma_parser`, one parser with a per-extension syntax switch, on the
+proven wasip2 pipeline; the sdk/ts + componentize-js ecosystem proof is
+deliberately its own later slice, so SDK risk never touches a flagship
+parser. Keys are logical module identity (nearest `package.json` names the
+package, `/index` collapses, `pkg/src/api.Client.connect` is a class
+member); resolution covers named/default/namespace/aliased imports,
+re-export chains through barrel files, `this.m()` lexically, JSX components
+as calls — and **CommonJS**, because the first pure-JS corpus ingested had
+524 `require()` sites and a graph with no imports at all: `require` is an
+import wearing a call's syntax, `module.exports` is the export list, both
+written down and both now read. `implements`/`extends` are syntactic in TS,
+so those edges are certain where Go's had to be structural; `EXTENDS` joins
+the vocabulary. 30 native tests; wasm == native exactly on a real OSS corpus
+(zod: 3863 nodes / 6599 edges, notes identical); ~18 MiB/s through the
+sandbox — the fastest of the three, as swc should be.
+
+**Shipped (v2, slice 5): the Python plugin.** `py@1` (py, pyi, pyw), written
+in Rust on ruff's parser — the same fork as TS, decided the same way. Module
+identity is the language's own rule (`__init__.py` marks a package, the
+first directory without one is the sys.path root, so `src/` layouts need no
+special case); relative imports are package geometry resolved where the
+module is known; dotted chains walk modules and stop the moment a step lands
+on a value; `self.m()` resolves lexically; decorators are the calls they
+are; class bases become EXTENDS; `__all__` is the written export list with
+PEP 8's underscore rule as fallback, and ALL_CAPS sorts Const from Var
+because PEP 8 says so. 21 native tests; wasm == native on psf/requests
+(1049/1966) and on a 759-file agent codebase (21148/54632); ~21 MiB/s.
+Four of five ecosystems now ship official parsers; Java remains, plus the
+sdk/ts and sdk/py ecosystem-proof slices.
+
+**Shipped (v2, slice 6): the Java plugin — all five ecosystems covered.**
+`java@1` on tree-sitter's grammar, because no mature pure-Rust Java frontend
+exists; the C runtime and grammar compile to wasm32-wasip2 under wasi-sdk's
+clang, a toolchain investment that also opens the door to C and zig plugins.
+Keys are Java's own qualified names (package, type, member — a file is not a
+node); resolution reads references the way javac does (same package needs no
+import, then imports, wildcards against the tree, `java.lang`); inherited
+and `super` calls walk the in-tree extends chain; `ANNOTATED_BY` joins the
+vocabulary because on a Spring codebase the annotations *are* the
+architecture. 18 native tests; wasm == native on gson (1032/2600) and on a
+1500-file Maven monorepo (7011/24599); deterministic; ~405 ms in the
+sandbox for 3.4 MiB.
+
+**Shipped (v2, slice 7): the C plugin.** `c@1` (.c, .h) on tree-sitter-c,
+through the wasi-sdk toolchain the Java slice bought. The design is the
+linker's model: external linkage is one flat namespace (a non-static
+function's key is its bare name), `static` is file-local
+(`filestem.name`), a header's declaration and its source's definition share
+one key and the definition wins the node; a static shadows a global in its
+own file, the compiler's rule. The preprocessor is recorded, not expanded —
+`#define` becomes Const or Macro as written, include guards stay out,
+`#ifdef` arms are walked so both platform variants are facts; `#include`
+resolves same-directory then unambiguous-tail against the parsed set, and
+ambiguity is counted because include paths are build configuration a parser
+does not have. libc is external by name. 16 native tests; wasm == native on
+redis/src (9633/34751, 2740 header declarations merged into definitions)
+and on a CMake-built SDK (1746/5953); deterministic; ~15.5 MiB/s.
+
+The sandbox had to *change shape* to hold it, in ways that were the slice's
+real findings. A Go runtime imports `wasi:filesystem` before the plugin's
+first line runs — as the Python and JS runtimes will too — so refusing that
+import by name was refusing the toolchain, not the intent; the refusal moved
+to where it is real: an **empty preopen table** (nothing to read, probe, or
+enumerate), with `wasi:sockets` alone still refused at load because nothing
+needs sockets to start. `wasi:random` now deals a **fixed byte sequence**,
+because Go seeds map iteration order from it and real entropy would have
+broken re-ingest determinism. And a trapped guest's stderr is **captured and
+surfaced** in the error, because a Go panic prints there and a bare
+"trapped" hid the whole diagnosis. Each guarantee is pinned by a hostile
+fixture, as before.
 
 ---
 

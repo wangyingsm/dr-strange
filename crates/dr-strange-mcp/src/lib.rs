@@ -47,6 +47,9 @@ pub struct DrStrange {
     /// Whether `digest` may read a `path` the caller names — see
     /// [`DrStrange::with_local_files`]. Off unless the host says otherwise.
     local_files: bool,
+    /// The source tree behind the graph, when the host attached one — what
+    /// the `grep` tool searches. `serve watch` attaches its `--dir`.
+    source_root: Option<std::path::PathBuf>,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -106,6 +109,7 @@ impl DrStrange {
             tools: Arc::new(Semaphore::new(DEFAULT_TOOL_CONCURRENCY)),
             embed: None,
             local_files: false,
+            source_root: None,
         }
     }
 
@@ -133,6 +137,14 @@ impl DrStrange {
     /// A node that already carries `embedding` is left alone.
     pub fn with_embed_provider(mut self, provider: EmbedProvider) -> Self {
         self.embed = Some(provider);
+        self
+    }
+
+    /// Attach the source tree the graph was parsed from, enabling the
+    /// `grep` tool: literal text is the one question a graph should not
+    /// pretend to answer, and with the tree attached it need not.
+    pub fn with_source_root(mut self, root: std::path::PathBuf) -> Self {
+        self.source_root = Some(root);
         self
     }
 
@@ -307,6 +319,11 @@ struct Digest {
     /// OpenDocument, RTF, EPUB, CSV, PDF, Markdown or plain text — converted to
     /// Markdown before digesting.
     ///
+    /// May also be a **directory**, walked and routed per file: source files
+    /// are parsed into facts and documents become prose (ROADMAP §11). Reading
+    /// a checkout this way is what makes it worth parsing — a plugin follows
+    /// imports across the tree — which is also why it stays stdio-only.
+    ///
     /// Only honoured by the stdio server, which runs on the same machine as the
     /// agent that spawned it. A shared `drsg serve` refuses it: reading any path
     /// the caller names would let an authenticated remote agent pull arbitrary
@@ -356,22 +373,15 @@ struct Digest {
     /// against all the passages mentioning it — most accurate, most costly.
     #[serde(default)]
     mode: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct Search {
-    #[serde(default = "default_plane")]
-    plane: String,
-    /// Restrict to a label (omit to search the whole plane).
-    label: Option<String>,
-    /// The vector property to compare.
-    property: String,
-    /// The query embedding.
-    query: Vec<f32>,
-    /// `cosine` (default), `dot`, or `l2`.
-    metric: Option<String>,
-    /// Number of nearest neighbours (default 10).
-    k: Option<u32>,
+    /// `path` only: force a preprocessor by name (e.g. `rust`) instead of
+    /// routing by file extension. A router that guesses is worse than one that
+    /// asks. Ignored for `text`, which is always read as prose.
+    #[serde(default)]
+    handler: Option<String>,
+    /// `path` only: store each parsed function's own source on its node, for
+    /// retrieval. Default false — it is roughly a copy of the code in the graph.
+    #[serde(default)]
+    plugin_source: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -548,8 +558,11 @@ impl DrStrange {
                 ok(value)
             }
             Err(e) => {
-                tracing::warn!(tool, error = %e, "mcp tool failed");
-                tool_error(e.to_string())
+                tracing::warn!(tool, error = format!("{e:#}"), "mcp tool failed");
+                // The whole chain, not the outermost context: "embedding the
+                // query" without "DASHSCOPE_API_KEY is not set" behind it
+                // tells an agent nothing it can act on.
+                tool_error(format!("{e:#}"))
             }
         })
     }
@@ -565,7 +578,7 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
     Value::Array(
         rows.iter()
             .map(|(n, s)| {
-                let mut obj = json::node_to_json(n);
+                let mut obj = json::node_to_json_lean(n);
                 if let (Some(score), Value::Object(map)) = (s, &mut obj) {
                     map.insert("score".into(), jval!(score));
                 }
@@ -591,6 +604,186 @@ fn describe_plane_logic(db: &Database, req: PlaneOnly) -> AnyResult<Value> {
     Ok(serde_json::to_value(db.plane(&req.plane)?.catalog()?)?)
 }
 
+/// The compact agent verbs' shared request: a fuzzy name and a plane.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SymbolReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Symbol name: an exact key, a `::name`/`.name` suffix, or a substring.
+    name: String,
+}
+
+/// `grep`'s request: literal text over the attached source tree.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GrepReq {
+    /// Literal text to find (no regex — what you type is what is matched).
+    pattern: String,
+    /// Case-insensitive matching (default false).
+    #[serde(default)]
+    ignore_case: Option<bool>,
+    /// Max matching lines returned (default 50, capped at 200).
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+/// `trace`'s request: two symbols, fuzzy like everywhere else.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TraceReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Where the flow starts.
+    from: String,
+    /// What it should reach.
+    to: String,
+}
+
+/// `impact`'s request: one symbol and how far to look.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ImpactReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Hops of incoming structural edges to walk (default 3, max 6).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+/// `snippet`'s request: one symbol's source.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SnippetReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Lines of source returned from the declaration down (default 40).
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
+/// `search`'s request: free text and a plane.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// What to look for, in plain words — no identifier needed.
+    query: String,
+    /// How many hits (default 8).
+    #[serde(default)]
+    k: Option<u64>,
+}
+
+/// Bounded literal search under `root`: build dirs and binaries skipped,
+/// results and line lengths capped, paths relative to the root.
+fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".venv",
+        ".codegraph",
+        ".codebase-memory",
+    ];
+    const MAX_FILE: u64 = 2 * 1024 * 1024;
+    const MAX_LINE: usize = 300;
+    let cap = req.max_results.unwrap_or(50).clamp(1, 200);
+    let fold = req.ignore_case.unwrap_or(false);
+    let needle = if fold {
+        req.pattern.to_lowercase()
+    } else {
+        req.pattern.clone()
+    };
+    if needle.trim().is_empty() {
+        anyhow::bail!("an empty pattern matches everything and helps no one");
+    }
+
+    let mut out = String::new();
+    let mut hits = 0usize;
+    let mut capped = false;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if meta.len() > MAX_FILE {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes[..bytes.len().min(4096)].contains(&0) {
+                continue; // binary
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (i, line) in text.lines().enumerate() {
+                let hay = if fold {
+                    std::borrow::Cow::Owned(line.to_lowercase())
+                } else {
+                    std::borrow::Cow::Borrowed(line)
+                };
+                if !hay.contains(needle.as_str()) {
+                    continue;
+                }
+                if hits == cap {
+                    capped = true;
+                    break;
+                }
+                let mut shown = line.trim_end();
+                if shown.len() > MAX_LINE {
+                    let mut end = MAX_LINE;
+                    while !shown.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    shown = &shown[..end];
+                }
+                out.push_str(&format!("{rel}:{}: {shown}\n", i + 1));
+                hits += 1;
+            }
+            if capped {
+                break;
+            }
+        }
+        if capped {
+            break;
+        }
+    }
+    if hits == 0 {
+        out.push_str("no matches\n");
+    } else if capped {
+        out.push_str(&format!(
+            "… capped at {cap} matches — narrow the pattern or raise max_results\n"
+        ));
+    }
+    Ok(out)
+}
+
+fn compact_logic(
+    db: &Database,
+    req: SymbolReq,
+    render: fn(&dr_strange_core::PlaneHandle<'_>, &str) -> dr_strange_core::Result<String>,
+) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    Ok(Value::String(render(&plane, &req.name)?))
+}
+
 fn get_node_logic(db: &Database, req: GetNode) -> AnyResult<Value> {
     let p = db.plane(&req.plane)?;
     let node = match (req.id, &req.key) {
@@ -598,23 +791,9 @@ fn get_node_logic(db: &Database, req: GetNode) -> AnyResult<Value> {
         (None, Some(key)) => p.node_by_key(key)?,
         (None, None) => anyhow::bail!("provide `id` or `key`"),
     };
-    Ok(node.map(|n| json::node_to_json(&n)).unwrap_or(Value::Null))
-}
-
-fn search_logic(db: &Database, req: Search) -> AnyResult<Value> {
-    let p = db.plane(&req.plane)?;
-    let metric = parse_metric(req.metric.as_deref());
-    let hits = p
-        .query()
-        .vector_top_k(
-            req.label.as_deref(),
-            &req.property,
-            req.query,
-            metric,
-            req.k.unwrap_or(10) as u64,
-        )
-        .scored_nodes()?;
-    Ok(scored_rows(&hits))
+    Ok(node
+        .map(|n| json::node_to_json_lean(&n))
+        .unwrap_or(Value::Null))
 }
 
 fn traverse_logic(db: &Database, req: Traverse) -> AnyResult<Value> {
@@ -761,7 +940,7 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
     let mut results = Vec::with_capacity(hits.len());
     for h in &hits {
         let mut obj = match plane.node(h.node)? {
-            Some(node) => json::node_to_json(&node),
+            Some(node) => json::node_to_json_lean(&node),
             None => jval!({ "id": h.node.0 }),
         };
         if let Value::Object(map) = &mut obj {
@@ -811,7 +990,7 @@ fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
         &opts,
     )?;
     // The matched subgraph: nodes + edges among them (source + traversal).
-    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json).collect();
+    let results: Vec<Value> = res.nodes.iter().map(json::node_to_json_lean).collect();
     let edges: Vec<Value> = res
         .edges
         .iter()
@@ -1050,25 +1229,64 @@ fn digest_logic(
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Resolve the document before anything else: a refused `path` should cost
+    // Built only on the branch that routes: a text digest never needs the
+    // plugin store, and must not fail because something in it is broken.
+    let load_plugins = || -> AnyResult<dr_strange_llm::Plugins> {
+        let mut options = std::collections::BTreeMap::new();
+        if req.plugin_source.unwrap_or(false) {
+            options.insert(
+                "rust".to_string(),
+                vec![("include_source".to_string(), "true".to_string())],
+            );
+        }
+        dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
+            options,
+            ..Default::default()
+        })
+    };
+    let handler = req.handler.as_deref();
+
+    // Resolve the input before anything else: a refused `path` should cost
     // no provider call.
-    let document = match &req.path {
-        None => req.text.clone(),
+    let mut facts = match &req.path {
+        // Text sent over the wire stays prose, deliberately. Preprocessing is
+        // for reading a checkout the agent already has — it is worth its cost
+        // when a plugin can pull the files around the one it was handed, and
+        // that pull is exactly what a shared server must not offer. Routing it
+        // here would hand every caller a handler whose only reachable input is
+        // the server's own filesystem.
+        None => dr_strange_llm::Preprocessed::prose_only("text", req.text.clone()),
         Some(_) if !local_files => anyhow::bail!(
             "this server does not read local files — send the document as `text`. \
              (`path` is honoured only by the stdio server, which runs on your own machine.)"
         ),
         Some(path) => {
-            let name = std::path::Path::new(path)
+            let p = std::path::Path::new(path);
+            let name = p
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.clone());
-            let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-            dr_strange_llm::to_markdown(&name, &bytes)
-                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            // A directory is a legal source since ROADMAP §11: the preprocessor
+            // pulls what it needs, so "digest this project" needs no file list.
+            if p.is_dir() {
+                let host = dr_strange_llm::LocalFiles::new(p)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
+                dr_strange_llm::route_tree(&host, handler, &plugins)?
+            } else {
+                let bytes =
+                    std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let host = dr_strange_llm::LocalFiles::new(
+                    p.parent().unwrap_or(std::path::Path::new(".")),
+                )
+                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
+                dr_strange_llm::route_document(&name, &bytes, handler, &host, &plugins)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            }
         }
     };
-    if document.trim().is_empty() {
+    if facts.nodes.is_empty() && !facts.needs_model() {
         anyhow::bail!("nothing to digest — give `text`, or `path` on a stdio server");
     }
 
@@ -1077,23 +1295,12 @@ fn digest_logic(
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
-    // Provider keys come from the server's environment (never tool params) —
-    // `key_env` names the variable, it does not carry the key.
-    let chat = dr_strange_llm::build_provider(
-        chat_provider,
-        req.model.as_deref(),
-        None,
-        req.key_env.as_deref(),
-        false,
-    )?;
-    let chat_model = chat.model().to_string();
-    let embedder = dr_strange_llm::build_provider(
-        embed_provider,
-        req.embed_model.as_deref(),
-        None,
-        req.embed_key_env.as_deref(),
-        embed,
-    )?;
+    // Parsed before anything expensive: a typo should not cost a provider call.
+    let mode = match req.mode.as_deref() {
+        None => dr_strange_llm::DigestMode::default(),
+        Some(m) => dr_strange_llm::DigestMode::parse(m)
+            .ok_or_else(|| anyhow::anyhow!("unknown digest mode `{m}`"))?,
+    };
 
     let p = db.plane(&req.plane)?;
     let run_id = format!(
@@ -1103,25 +1310,53 @@ fn digest_logic(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let opts = dr_strange_llm::DigestOptions {
-        source: req.source.unwrap_or_else(|| "mcp-digest".into()),
-        model: chat_model,
-        run_id,
-        chunk_chars: tuning.chunk_chars,
-        embed,
-        concurrency: tuning.concurrency,
-        mode: match req.mode.as_deref() {
-            None => dr_strange_llm::DigestMode::default(),
-            Some(m) => dr_strange_llm::DigestMode::parse(m)
-                .ok_or_else(|| anyhow::anyhow!("unknown digest mode `{m}`"))?,
-        },
-        refine_max_entities: None,
-        refine_max_context: None,
-    };
+    let source = req.source.unwrap_or_else(|| "mcp-digest".into());
+    dr_strange_llm::stamp_run(&mut facts, &source, &run_id);
 
-    let cands = dr_strange_llm::PlaneCandidates::new(&p);
-    let candidates = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-    let result = dr_strange_llm::digest(&document, &chat, &embedder, candidates, &opts)?;
+    // The §11 headline: an input that yields only facts is digested with **no
+    // model call at all** — no provider constructed, no key read from the
+    // environment, no request made.
+    let result = if facts.needs_model() {
+        // Provider keys come from the server's environment (never tool params) —
+        // `key_env` names the variable, it does not carry the key.
+        let chat = dr_strange_llm::build_provider(
+            chat_provider,
+            req.model.as_deref(),
+            None,
+            req.key_env.as_deref(),
+            false,
+        )?;
+        let embedder = dr_strange_llm::build_provider(
+            embed_provider,
+            req.embed_model.as_deref(),
+            None,
+            req.embed_key_env.as_deref(),
+            embed,
+        )?;
+        let opts = dr_strange_llm::DigestOptions {
+            source,
+            model: chat.model().to_string(),
+            run_id,
+            chunk_chars: tuning.chunk_chars,
+            embed,
+            concurrency: tuning.concurrency,
+            mode,
+            refine_max_entities: None,
+            refine_max_context: None,
+        };
+
+        let cands = dr_strange_llm::PlaneCandidates::new(&p);
+        let plane_source = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+        // Grounded whether or not `link` is on: without this the model is told
+        // the facts this very run parsed are new, and proposes a duplicate of
+        // what the parser just established.
+        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+        let extracted =
+            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+        dr_strange_llm::fold(facts, extracted)
+    } else {
+        dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
+    };
     let r = &result.report;
     let mut out = jval!({
         "applied": req.apply,
@@ -1135,6 +1370,10 @@ fn digest_logic(
             "input_tokens": r.input_tokens,
             "output_tokens": r.output_tokens,
             "embed_tokens": r.embed_tokens,
+            // What a preprocessor skipped or could not resolve. An agent
+            // reading a thinner graph than it expected should be able to see
+            // why here, rather than re-running the ingest to find out.
+            "notes": r.notes,
         },
     });
 
@@ -1159,7 +1398,7 @@ fn digest_logic(
                 jval!({
                     "key": n.key,
                     "label": n.label,
-                    "properties": json::properties_to_json(&n.props),
+                    "properties": json::properties_to_json_lean(&n.props),
                 })
             })
             .collect();
@@ -1193,22 +1432,192 @@ impl DrStrange {
             .await
     }
 
+    #[tool(description = "The primary code-context tool: one symbol's whole \
+        neighborhood in a single call — definition, signature, doc comment, \
+        fields, callers with call sites, callees, containment and every \
+        other edge, as compact text. Accepts a fuzzy name (exact key, \
+        `::name`/`.name` suffix, or substring); ambiguity returns the \
+        candidates. Use this first for any what-is/who-calls/what-calls \
+        question.")]
+    async fn context(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("context", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::context)
+        })
+        .await
+    }
+
+    #[tool(description = "Semantic lookup when no identifier is known: embeds \
+        the query text and returns the closest symbols by meaning (cosine \
+        over the plane's `embedding` vectors), best hit expanded. Requires \
+        the plane to be vectorized and the server to have an embed provider \
+        configured.")]
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let embed = self.embed.clone();
+        self.blocking("search", move |db| {
+            let Some(cfg) = &embed else {
+                anyhow::bail!(
+                    "no embed provider configured on this server — set \
+                     [server] embed provider (and its key env) in drsg.toml"
+                );
+            };
+            let embedder = dr_strange_llm::build_provider(
+                &cfg.provider,
+                cfg.model.as_deref(),
+                None,
+                cfg.key_env.as_deref(),
+                true,
+            )?;
+            let text = dr_strange_llm::semantic_search(
+                db,
+                &req.plane,
+                &req.query,
+                &embedder,
+                req.k.unwrap_or(8),
+            )?;
+            Ok(Value::String(text))
+        })
+        .await
+    }
+
+    #[tool(description = "Literal text search over the source tree behind \
+        the graph (the watched directory). One matching line per result, \
+        `file:line: text`. For log messages, config values, comments — \
+        anything the graph deliberately does not model. No regex.")]
+    async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
+        let root = self.source_root.clone();
+        self.blocking("grep", move |_db| {
+            let Some(root) = root else {
+                anyhow::bail!(
+                    "no source tree attached to this server — `serve watch` \
+                     attaches its --dir; a plain serve has only the graph, \
+                     so run grep locally instead"
+                );
+            };
+            Ok(Value::String(grep_tree(&root, &req)?))
+        })
+        .await
+    }
+
+    #[tool(description = "How one symbol reaches another: the shortest \
+        recorded CALLS path, one hop per line; tries the reverse direction \
+        and says so when the forward holds nothing. Fuzzy names.")]
+    async fn trace(
+        &self,
+        Parameters(req): Parameters<TraceReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("trace", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::trace(
+                &plane, &req.from, &req.to,
+            )?))
+        })
+        .await
+    }
+
+    #[tool(description = "Blast radius: everything reaching this symbol \
+        through incoming structural edges (CALLS, REFERENCES, INSTANTIATES, \
+        IMPORTS, EXTENDS, IMPLEMENTS), grouped by distance with exact \
+        counts. Fuzzy name; depth defaults to 3.")]
+    async fn impact(
+        &self,
+        Parameters(req): Parameters<ImpactReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("impact", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::impact(
+                &plane,
+                &req.name,
+                req.depth.unwrap_or(3),
+            )?))
+        })
+        .await
+    }
+
+    #[tool(description = "One symbol's source text: from the graph when the \
+        digest stored it, else read from the attached source tree at the \
+        symbol's recorded file:line. Fuzzy name.")]
+    async fn snippet(
+        &self,
+        Parameters(req): Parameters<SnippetReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.source_root.clone();
+        self.blocking("snippet", move |db| {
+            let plane = db.plane(&req.plane)?;
+            let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
+                dr_strange_core::compact::Resolved::One(n) => n,
+                dr_strange_core::compact::Resolved::Many(hits) => {
+                    anyhow::bail!(
+                        "`{}` is ambiguous — {} matches; use an exact key",
+                        req.name,
+                        hits.len()
+                    );
+                }
+                dr_strange_core::compact::Resolved::None => {
+                    anyhow::bail!("no symbol matches `{}` in this plane", req.name);
+                }
+            };
+            // The digest's own copy first — exact by construction.
+            if let Some(dr_strange_core::PropValue::Str(src)) =
+                node.properties.get("source").map(|d| &d.value)
+            {
+                return Ok(Value::String(src.clone()));
+            }
+            let file = ["file", "path"].iter().find_map(|k| {
+                match node.properties.get(*k).map(|d| &d.value) {
+                    Some(dr_strange_core::PropValue::Str(f)) => Some(f.clone()),
+                    _ => None,
+                }
+            });
+            let line = match node.properties.get("line").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
+                _ => None,
+            };
+            let (Some(root), Some(file), Some(line)) = (&root, file, line) else {
+                anyhow::bail!(
+                    "no stored source and no source tree attached — digest with \
+                     include_source, or attach the tree (`serve watch` does; \
+                     [server] source_root otherwise)"
+                );
+            };
+            let text = std::fs::read_to_string(root.join(&file))
+                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+            let want = req.lines.unwrap_or(40).clamp(1, 200);
+            let start = line.saturating_sub(1);
+            let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
+            let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
+            for (i, l) in slice.iter().enumerate() {
+                out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
+            }
+            Ok(Value::String(out))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "One symbol's content as `prop: value` text lines         (signature, doc comment, …; vectors elided). Accepts a fuzzy name."
+    )]
+    async fn describe(
+        &self,
+        Parameters(req): Parameters<SymbolReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("describe", move |db| {
+            compact_logic(db, req, dr_strange_core::compact::describe)
+        })
+        .await
+    }
+
     #[tool(description = "Fetch one node by `id` or external `key`.")]
     async fn get_node(
         &self,
         Parameters(req): Parameters<GetNode>,
     ) -> Result<CallToolResult, McpError> {
         self.blocking("get_node", move |db| get_node_logic(db, req))
-            .await
-    }
-
-    #[tool(description = "Vector similarity search: the k nodes closest to \
-        `query` by their `property` embedding, with similarity scores.")]
-    async fn search(
-        &self,
-        Parameters(req): Parameters<Search>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("search", move |db| search_logic(db, req))
             .await
     }
 
@@ -1730,16 +2139,28 @@ mod tests {
     }
 
     #[test]
-    fn search_uses_index_and_scores() {
-        let db = fixture();
-        let rows = search_logic(
-            &db,
-            from_value(jval!({"property": "emb", "query": [0.0, 0.0], "metric": "l2", "k": 1}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rows[0]["external_key"], jval!("d0"));
-        assert!(rows[0]["score"].is_number());
+    fn compact_search_ranks_by_vector_and_expands_best() {
+        use dr_strange_core::{PropDesc, PropValue, Properties};
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("v", Properties::new()).unwrap();
+        let mut txn = plane.write().unwrap();
+        for (key, vec) in [("near", vec![0.0, 0.1]), ("far", vec![1.0, 1.0])] {
+            let mut props = Properties::new();
+            props.insert(
+                "embedding".into(),
+                PropDesc::described("v", PropValue::Vector(vec)),
+            );
+            props.insert(
+                "doc_comment".into(),
+                PropDesc::described("d", PropValue::Str(format!("about {key}"))),
+            );
+            txn.create_node_with_key(key, &["Doc"], props).unwrap();
+        }
+        txn.commit().unwrap();
+        let out = dr_strange_core::compact::search(&plane, &[0.0, 0.0], 2).unwrap();
+        assert!(out.lines().next().unwrap().contains("near"), "{out}");
+        assert!(out.contains("best match:"), "{out}");
+        assert!(out.contains("about near"), "{out}");
     }
 
     #[test]
@@ -1910,5 +2331,54 @@ mod tests {
         assert!(matches!(parse_dir(Some("in")), Dir::In));
         assert!(matches!(parse_dir(Some("both")), Dir::Both));
         assert!(matches!(parse_dir(None), Dir::Out));
+    }
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::*;
+
+    fn req(pattern: &str) -> GrepReq {
+        GrepReq {
+            pattern: pattern.into(),
+            ignore_case: None,
+            max_results: None,
+        }
+    }
+
+    #[test]
+    fn finds_lines_skips_build_dirs_and_binaries() {
+        let dir = std::env::temp_dir().join(format!("drsg-grep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn main() {\n    // needle here\n}\n").unwrap();
+        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+
+        let out = grep_tree(&dir, &req("needle")).unwrap();
+        assert!(out.contains("src/a.rs:2:"), "{out}");
+        assert!(!out.contains("target/"), "build dirs are skipped: {out}");
+        assert!(!out.contains("blob.bin"), "binaries are skipped: {out}");
+
+        let none = grep_tree(&dir, &req("absent-text")).unwrap();
+        assert!(none.contains("no matches"));
+
+        let folded = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "NEEDLE".into(),
+                ignore_case: Some(true),
+                max_results: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(folded.contains("src/a.rs:2:"), "{folded}");
+
+        assert!(
+            grep_tree(&dir, &req("  ")).is_err(),
+            "empty pattern refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
