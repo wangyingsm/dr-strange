@@ -626,6 +626,39 @@ struct GrepReq {
     max_results: Option<usize>,
 }
 
+/// `trace`'s request: two symbols, fuzzy like everywhere else.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TraceReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Where the flow starts.
+    from: String,
+    /// What it should reach.
+    to: String,
+}
+
+/// `impact`'s request: one symbol and how far to look.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ImpactReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Hops of incoming structural edges to walk (default 3, max 6).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+/// `snippet`'s request: one symbol's source.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SnippetReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Lines of source returned from the declaration down (default 40).
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
 /// `search`'s request: free text and a plane.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchReq {
@@ -1467,6 +1500,101 @@ impl DrStrange {
                 );
             };
             Ok(Value::String(grep_tree(&root, &req)?))
+        })
+        .await
+    }
+
+    #[tool(description = "How one symbol reaches another: the shortest \
+        recorded CALLS path, one hop per line; tries the reverse direction \
+        and says so when the forward holds nothing. Fuzzy names.")]
+    async fn trace(
+        &self,
+        Parameters(req): Parameters<TraceReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("trace", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::trace(
+                &plane, &req.from, &req.to,
+            )?))
+        })
+        .await
+    }
+
+    #[tool(description = "Blast radius: everything reaching this symbol \
+        through incoming structural edges (CALLS, REFERENCES, INSTANTIATES, \
+        IMPORTS, EXTENDS, IMPLEMENTS), grouped by distance with exact \
+        counts. Fuzzy name; depth defaults to 3.")]
+    async fn impact(
+        &self,
+        Parameters(req): Parameters<ImpactReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("impact", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::impact(
+                &plane,
+                &req.name,
+                req.depth.unwrap_or(3),
+            )?))
+        })
+        .await
+    }
+
+    #[tool(description = "One symbol's source text: from the graph when the \
+        digest stored it, else read from the attached source tree at the \
+        symbol's recorded file:line. Fuzzy name.")]
+    async fn snippet(
+        &self,
+        Parameters(req): Parameters<SnippetReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.source_root.clone();
+        self.blocking("snippet", move |db| {
+            let plane = db.plane(&req.plane)?;
+            let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
+                dr_strange_core::compact::Resolved::One(n) => n,
+                dr_strange_core::compact::Resolved::Many(hits) => {
+                    anyhow::bail!(
+                        "`{}` is ambiguous — {} matches; use an exact key",
+                        req.name,
+                        hits.len()
+                    );
+                }
+                dr_strange_core::compact::Resolved::None => {
+                    anyhow::bail!("no symbol matches `{}` in this plane", req.name);
+                }
+            };
+            // The digest's own copy first — exact by construction.
+            if let Some(dr_strange_core::PropValue::Str(src)) =
+                node.properties.get("source").map(|d| &d.value)
+            {
+                return Ok(Value::String(src.clone()));
+            }
+            let file = ["file", "path"].iter().find_map(|k| {
+                match node.properties.get(*k).map(|d| &d.value) {
+                    Some(dr_strange_core::PropValue::Str(f)) => Some(f.clone()),
+                    _ => None,
+                }
+            });
+            let line = match node.properties.get("line").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
+                _ => None,
+            };
+            let (Some(root), Some(file), Some(line)) = (&root, file, line) else {
+                anyhow::bail!(
+                    "no stored source and no source tree attached — digest with \
+                     include_source, or attach the tree (`serve watch` does; \
+                     [server] source_root otherwise)"
+                );
+            };
+            let text = std::fs::read_to_string(root.join(&file))
+                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+            let want = req.lines.unwrap_or(40).clamp(1, 200);
+            let start = line.saturating_sub(1);
+            let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
+            let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
+            for (i, l) in slice.iter().enumerate() {
+                out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
+            }
+            Ok(Value::String(out))
         })
         .await
     }

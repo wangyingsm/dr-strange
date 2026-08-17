@@ -280,6 +280,158 @@ pub fn search(plane: &PlaneHandle<'_>, query: &[f32], k: u64) -> Result<String> 
 /// `describe` — one node's content as `prop: value` lines. Vectors and
 /// `_`-provenance stay out (only `_generated_by` is kept, as one line —
 /// which parser asserted this is worth a reader's glance).
+/// `trace` — how `from` reaches `to`: breadth-first over outgoing CALLS
+/// edges, the shortest recorded path rendered one hop per line. When the
+/// forward direction holds nothing, the reverse is tried and said. Recorded
+/// edges only — the honesty note rides every answer.
+pub fn trace(plane: &PlaneHandle<'_>, from: &str, to: &str) -> Result<String> {
+    let a = match resolve(plane, from)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(candidates(from, &hits)),
+        Resolved::None => return Ok(format!("no symbol matches `{from}` in this plane\n")),
+    };
+    let b = match resolve(plane, to)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(candidates(to, &hits)),
+        Resolved::None => return Ok(format!("no symbol matches `{to}` in this plane\n")),
+    };
+    let mut out = String::new();
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    match calls_path(plane, a.id, b.id)? {
+        Some(path) => render_path(plane, &path, &mut out)?,
+        None => match calls_path(plane, b.id, a.id)? {
+            Some(path) => {
+                out.push_str("no forward path; the call flow runs the other way:\n");
+                render_path(plane, &path, &mut out)?;
+            }
+            None => out.push_str(
+                "no recorded CALLS path in either direction — the graph holds \
+                 resolved edges only, so an unresolved hop (dynamic dispatch, \
+                 untyped receiver) breaks the chain; `impact` shows what IS \
+                 recorded around each end\n",
+            ),
+        },
+    }
+    out.push_str(CALLS_NOTE);
+    Ok(out)
+}
+
+/// Shortest recorded CALLS path, breadth-first, bounded.
+fn calls_path(
+    plane: &PlaneHandle<'_>,
+    from: crate::NodeId,
+    to: crate::NodeId,
+) -> Result<Option<Vec<crate::NodeId>>> {
+    use std::collections::{BTreeMap, VecDeque};
+    const MAX_VISITED: usize = 20_000;
+    let mut prev: BTreeMap<crate::NodeId, crate::NodeId> = BTreeMap::new();
+    let mut queue = VecDeque::from([from]);
+    let mut seen = std::collections::BTreeSet::from([from]);
+    while let Some(node) = queue.pop_front() {
+        if node == to {
+            let mut path = vec![to];
+            let mut cur = to;
+            while let Some(&p) = prev.get(&cur) {
+                path.push(p);
+                cur = p;
+            }
+            path.reverse();
+            return Ok(Some(path));
+        }
+        if seen.len() > MAX_VISITED {
+            break;
+        }
+        for hop in plane.neighbors(node, crate::Dir::Out, Some("CALLS"))? {
+            if seen.insert(hop.node) {
+                prev.insert(hop.node, node);
+                queue.push_back(hop.node);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn render_path(plane: &PlaneHandle<'_>, path: &[crate::NodeId], out: &mut String) -> Result<()> {
+    for (i, id) in path.iter().enumerate() {
+        let Some(n) = plane.node(*id)? else { continue };
+        if i == 0 {
+            out.push_str(&one_line(&n));
+        } else {
+            out.push_str("  -> ");
+            out.push_str(&one_line(&n));
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
+/// `impact` — the blast radius: what reaches this symbol, breadth-first over
+/// INCOMING structural edges (CALLS, REFERENCES, INSTANTIATES, IMPORTS,
+/// EXTENDS, IMPLEMENTS), grouped by distance, counts always exact even when
+/// listings elide.
+pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<String> {
+    const LEVEL_CAP: usize = 20;
+    const IMPACT_EDGES: &[&str] = &[
+        "CALLS",
+        "REFERENCES",
+        "INSTANTIATES",
+        "IMPORTS",
+        "EXTENDS",
+        "IMPLEMENTS",
+    ];
+    let node = match resolve(plane, name)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(candidates(name, &hits)),
+        Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
+    };
+    let depth = depth.clamp(1, 6);
+    let mut out = one_line(&node);
+    out.push('\n');
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    let mut seen = std::collections::BTreeSet::from([node.id]);
+    let mut frontier = vec![node.id];
+    let mut total = 0usize;
+    for level in 1..=depth {
+        let mut next: Vec<(crate::NodeId, String)> = Vec::new();
+        for id in &frontier {
+            for hop in plane.neighbors(*id, crate::Dir::In, None)? {
+                let Some(edge) = plane.edge(hop.edge)? else {
+                    continue;
+                };
+                if !IMPACT_EDGES.contains(&edge.ty.as_str()) {
+                    continue;
+                }
+                if seen.insert(hop.node)
+                    && let Some(n) = plane.node(hop.node)?
+                {
+                    next.push((hop.node, format!("{}  [{}]", one_line(&n), edge.ty)));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        total += next.len();
+        out.push_str(&format!("depth {level} ({}):\n", next.len()));
+        for (_, line) in next.iter().take(LEVEL_CAP) {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        if next.len() > LEVEL_CAP {
+            out.push_str(&format!("  … and {} more\n", next.len() - LEVEL_CAP));
+        }
+        frontier = next.into_iter().map(|(id, _)| id).collect();
+    }
+    out.push_str(&format!("total affected within depth {depth}: {total}\n"));
+    out.push_str(CALLS_NOTE);
+    Ok(out)
+}
+
 pub fn describe(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
@@ -423,6 +575,67 @@ mod tests {
         assert!(
             out.contains("synced: commit abcdef012345"),
             "freshness is stated where the answer is read: {out}"
+        );
+    }
+
+    #[test]
+    fn trace_renders_the_shortest_calls_path_and_says_reverse() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let a = txn
+            .create_node_with_key("m::a", &["Function"], Properties::new())
+            .unwrap();
+        let b = txn
+            .create_node_with_key("m::b", &["Function"], Properties::new())
+            .unwrap();
+        let c = txn
+            .create_node_with_key("m::c", &["Function"], Properties::new())
+            .unwrap();
+        txn.create_edge(a, b, "CALLS", Properties::new()).unwrap();
+        txn.create_edge(b, c, "CALLS", Properties::new()).unwrap();
+        txn.commit().unwrap();
+        let plane = db.plane("code").unwrap();
+        let out = trace(&plane, "m::a", "m::c").unwrap();
+        assert!(
+            out.contains("m::a") && out.contains("-> m::b") && out.contains("-> m::c"),
+            "{out}"
+        );
+        let back = trace(&plane, "m::c", "m::a").unwrap();
+        assert!(back.contains("the other way"), "{back}");
+    }
+
+    #[test]
+    fn impact_groups_by_depth_with_exact_totals() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let target = txn
+            .create_node_with_key("m::t", &["Function"], Properties::new())
+            .unwrap();
+        let d1 = txn
+            .create_node_with_key("m::caller", &["Function"], Properties::new())
+            .unwrap();
+        let d2 = txn
+            .create_node_with_key("m::outer", &["Function"], Properties::new())
+            .unwrap();
+        let reff = txn
+            .create_node_with_key("m::wire", &["Function"], Properties::new())
+            .unwrap();
+        txn.create_edge(d1, target, "CALLS", Properties::new())
+            .unwrap();
+        txn.create_edge(reff, target, "REFERENCES", Properties::new())
+            .unwrap();
+        txn.create_edge(d2, d1, "CALLS", Properties::new()).unwrap();
+        txn.commit().unwrap();
+        let plane = db.plane("code").unwrap();
+        let out = impact(&plane, "m::t", 3).unwrap();
+        assert!(out.contains("depth 1 (2):"), "{out}");
+        assert!(out.contains("depth 2 (1):"), "{out}");
+        assert!(out.contains("total affected within depth 3: 3"), "{out}");
+        assert!(
+            out.contains("[CALLS]") && out.contains("[REFERENCES]"),
+            "{out}"
         );
     }
 

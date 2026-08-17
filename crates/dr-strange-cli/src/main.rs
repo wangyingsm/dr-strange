@@ -122,6 +122,25 @@ enum Command {
         #[arg(long, default_value = "startup")]
         plane: String,
     },
+    /// How one symbol reaches another: the shortest recorded CALLS path,
+    /// one hop per line; the reverse direction is tried and said when the
+    /// forward holds nothing.
+    Trace {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+    },
+    /// Blast radius: everything reaching this symbol through incoming
+    /// structural edges, grouped by distance with exact counts.
+    Impact {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Hops to walk (max 6).
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         #[arg(long)]
@@ -607,6 +626,22 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         Command::Describe { name, plane } => {
             let db = commands::open(&cli.db)?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)
+        }
+        Command::Trace { from, to, plane } => {
+            let db = commands::open(&cli.db)?;
+            let p = db.plane(&plane)?;
+            write!(out, "{}", dr_strange_core::compact::trace(&p, &from, &to)?)?;
+            Ok(())
+        }
+        Command::Impact { name, plane, depth } => {
+            let db = commands::open(&cli.db)?;
+            let p = db.plane(&plane)?;
+            write!(
+                out,
+                "{}",
+                dr_strange_core::compact::impact(&p, &name, depth)?
+            )?;
+            Ok(())
         }
         Command::Catalog { plane } => {
             let db = commands::open(&cli.db)?;
