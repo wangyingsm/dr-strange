@@ -32,6 +32,10 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 /// error the caller can retry rather than an indefinite stall.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Embeddings are small, fast requests — a stalled endpoint should fail a
+/// `search` in seconds, not hold it for the chat-completion budget above.
+const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Total tries for one request, the first included. Reaching a provider over
 /// the open internet fails occasionally for reasons that have nothing to do
 /// with the request — a dropped handshake, a moment of congestion — and a
@@ -96,10 +100,17 @@ pub fn build_provider(
         .or_else(|| looks_like_url(provider).then(|| provider.to_string()))
         .ok_or_else(|| anyhow!("unknown provider '{provider}'; give a base URL instead"))?;
     let key_env = key_env.or_else(|| p.map(|p| p.key_env)).unwrap_or("");
-    let key = if key_env.is_empty() {
-        String::new()
+    // A missing key is not an error *here* — providers are built eagerly for
+    // runs that may never call them (`--no-embed`, dry runs). It is recorded,
+    // and the first actual request fails fast with the variable's name
+    // instead of going to the network keyless and stalling.
+    let (key, missing) = if key_env.is_empty() {
+        (String::new(), None)
     } else {
-        std::env::var(key_env).unwrap_or_default()
+        match std::env::var(key_env) {
+            Ok(k) if !k.trim().is_empty() => (k, None),
+            _ => (String::new(), Some(key_env.to_string())),
+        }
     };
     let model = model
         .or_else(|| p.map(|p| if embed { p.embed_model } else { p.chat_model }))
@@ -110,7 +121,9 @@ pub fn build_provider(
         );
     }
     let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
-    Ok(OpenAiProvider::new(base, key, model).with_embed_batch(batch))
+    let mut provider = OpenAiProvider::new(base, key, model).with_embed_batch(batch);
+    provider.missing_key_env = missing;
+    Ok(provider)
 }
 
 pub struct OpenAiProvider {
@@ -120,6 +133,9 @@ pub struct OpenAiProvider {
     /// Max texts per embeddings request. OpenAI accepts large batches; some
     /// providers (DashScope/Qwen) cap it, so it's configurable.
     embed_batch: usize,
+    /// The key environment variable that was expected but not set — the
+    /// first request bails fast with its name instead of stalling keyless.
+    missing_key_env: Option<String>,
     /// Optional `reasoning_effort` sent on chat completions. Reasoning models
     /// (e.g. DeepSeek-v4-flash) emit long thinking tokens that fill the output
     /// cap and truncate the structured JSON dr-strange needs; setting this to
@@ -139,6 +155,7 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             model: model.into(),
             embed_batch: 256,
+            missing_key_env: None,
             reasoning_effort: None,
         }
     }
@@ -162,6 +179,19 @@ impl OpenAiProvider {
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
+        self.post_with_timeout(path, body, REQUEST_TIMEOUT)
+    }
+
+    fn post_with_timeout(&self, path: &str, body: Value, timeout: Duration) -> Result<Value> {
+        // A key the environment never provided fails here, in microseconds,
+        // with the variable's name — not at the far end of a network stall.
+        if let Some(env) = &self.missing_key_env {
+            bail!(
+                "environment variable {env} is not set — the provider at {} \
+                 needs a key; export it (never put it in a config file)",
+                self.base_url
+            );
+        }
         let url = format!("{}/{path}", self.base_url);
         for attempt in 1..=MAX_ATTEMPTS {
             // Bounded: ureq applies no timeout of its own, so a provider that
@@ -169,7 +199,7 @@ impl OpenAiProvider {
             // caller forever — an `ask` loop or a digest run with no way out
             // but Ctrl-C. A generous cap still ends the wait.
             let mut req = ureq::post(&url)
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(timeout)
                 .set("Content-Type", "application/json");
             if !self.api_key.is_empty() {
                 req = req.set("Authorization", &format!("Bearer {}", self.api_key));
@@ -222,7 +252,11 @@ impl OpenAiProvider {
     }
 
     fn embed_once(&self, texts: &[String]) -> Result<EmbedReply> {
-        let v = self.post("embeddings", json!({ "model": self.model, "input": texts }))?;
+        let v = self.post_with_timeout(
+            "embeddings",
+            json!({ "model": self.model, "input": texts }),
+            EMBED_TIMEOUT,
+        )?;
         let data = v["data"]
             .as_array()
             .context("embeddings reply had no `data`")?;
@@ -409,6 +443,29 @@ mod tests {
             panic!("an embedding provider with no model must be rejected");
         };
         assert!(e.to_string().contains("no embedding model"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_key_fails_fast_at_first_use_not_at_the_network() {
+        // Build stays lenient (a --no-embed run never calls the provider),
+        // but the first request must bail with the variable's name before
+        // any network I/O.
+        let p = build_provider(
+            "http://127.0.0.1:9/v1",
+            Some("m"),
+            None,
+            Some("DRSG_TEST_KEY_THAT_IS_NEVER_SET"),
+            true,
+        )
+        .expect("build is lazy about keys");
+        let Err(e) = p.embed_once(&["x".into()]) else {
+            panic!("a keyless request to a key-wanting provider must fail");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("DRSG_TEST_KEY_THAT_IS_NEVER_SET") && msg.contains("not set"),
+            "{msg}"
+        );
     }
 
     /// A one-connection-at-a-time HTTP server that answers with each of

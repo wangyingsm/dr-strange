@@ -546,8 +546,11 @@ impl DrStrange {
                 ok(value)
             }
             Err(e) => {
-                tracing::warn!(tool, error = %e, "mcp tool failed");
-                tool_error(e.to_string())
+                tracing::warn!(tool, error = format!("{e:#}"), "mcp tool failed");
+                // The whole chain, not the outermost context: "embedding the
+                // query" without "DASHSCOPE_API_KEY is not set" behind it
+                // tells an agent nothing it can act on.
+                tool_error(format!("{e:#}"))
             }
         })
     }
