@@ -60,8 +60,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "rust",
         claims: ".rs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.0/rust.wasm",
-        sha256: "bbb0cba006c13a586b79700fb5015e8f372d181a7b8bc16c7908f8f460004bc0",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm",
+        sha256: "8e3c32be0add9c720c7f641de89e14edff72600e24c20ba1e903fa9bb573b7ff",
     },
     OfficialPlugin {
         name: "go",
