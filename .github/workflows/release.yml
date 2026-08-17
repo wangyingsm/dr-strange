@@ -42,7 +42,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # Swatinem/rust-cache's default key does not vary by target, only by OS —
+      # so two matrix legs on one runner (the two macOS targets share
+      # macos-latest) or a runner-label change between releases (ubuntu-latest
+      # -> ubuntu-22.04, below) restore a cache built for a DIFFERENT target
+      # onto this one. Cargo trusts the fingerprints and skips rebuilding
+      # crates whose actual artifacts are missing or incompatible, which
+      # surfaces as "can't find crate" for something deep in the graph
+      # (wasmtime, here) rather than as a cache-miss. `key` scopes the cache
+      # to this matrix leg exactly.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - uses: oven-sh/setup-bun@v2
       # Build the real dashboard so it is embedded into the release binary
       # rather than the build.rs placeholder.
