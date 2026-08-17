@@ -31,6 +31,11 @@ AI 功能。
 运维独立的服务进程。但与 SQLite 不同，它同样可以**对外服务**——`drsg serve` 提供
 JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有五种语言的客户端 SDK。
 
+它同时也是一台代码智能引擎。沙箱化的 wasm 解析器插件将一个代码仓库图化为符号与
+已解析关系——官方支持八种语言，全程无需模型参与——`drsg serve watch` 让这张图随
+每一次提交保持同步，一组紧凑的智能体工具则以单次往返回答结构性问题（谁调用了它、
+改动它会影响什么、X 如何到达 Y）。参见[面向编码智能体](#面向编码智能体)。
+
 对于围绕知识图谱、GraphRAG 流水线或智能体长期记忆构建的应用，Dr Strange 力求成为
 承载这一切的单一存储。
 
@@ -59,8 +64,11 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **自然语言查询** | 以自然语言提问 → 生成计划 → 执行 |
 | **时间旅行** | 读取图在过去某次提交或某个时间戳**时刻**的状态 |
 | **变更流** | 订阅某个平面并实时接收其变更 |
+| **代码图化** | 沙箱化的 wasm 解析器插件将代码仓库转化为已解析的调用图——官方支持 8 种语言，并提供社区解析器 SDK |
+| **提交同步监视** | `serve watch` 将每次提交折叠进平面，结果与全量重新消化收敛一致 |
+| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`——每个问题一次往返 |
 | **备份 / 恢复** | 一致且保留 id 的全库快照 |
-| **接口** | Web 控制台、五种语言 SDK、命令行工具与 MCP 服务器 |
+| **接口** | Web 控制台、五种语言 SDK、命令行工具，以及提供智能体工具的 MCP 服务器 |
 
 依赖模型的功能（自然语言查询、文档摄取与文本嵌入检索）会调用外部或本地的 LLM；其余
 功能均无需任何模型即可运行。参见[附录 C](https://wangyingsm.github.io/dr-strange/zh/book/appendix-c.html)。
@@ -134,6 +142,66 @@ $ drsg --db graph.drsg serve
 [English](https://wangyingsm.github.io/dr-strange/en/book/getting-started.html) ·
 [中文](https://wangyingsm.github.io/dr-strange/zh/book/getting-started.html)。
 
+## 面向编码智能体
+
+Dr Strange 对待代码库的方式，与对待其他知识并无二致：一张图。解析器插件——沙箱化
+的 wasm 组件，每种语言一个——将源码文件转化为符号与已解析的关系（带调用位置的
+CALLS、REFERENCES、IMPORTS、EXTENDS 等），全程无需模型参与。`serve watch` 随后
+跟踪每次提交，智能体查询到的图即已提交的代码——且每个回答开头都会注明对应的提交
+（`synced: commit <sha>`）。
+
+```console
+# 安装解析器插件：不带参数时打开官方目录的交互式选择器（0 = 全部）；
+# 也可以直接给出任意 .wasm 路径或 URL。
+$ drsg plugin install
+
+# 将一个代码仓库图化为一个以其命名的平面
+$ drsg --db codes.drsg digest ~/src/myrepo --apply --no-embed
+
+# 启动 API + MCP 服务，并让平面随每次提交保持同步
+$ drsg --db codes.drsg serve watch --dir ~/src/myrepo
+
+# 一个符号的完整邻域，一次调用
+$ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
+```
+
+`--no-embed` 跳过向量嵌入——解析无需任何模型。之后运行 `drsg vectorize` 即可让
+平面支持语义检索。
+
+七个动词回答智能体的问题，每个都在一次往返内完成，输出均为紧凑的每行一条事实的
+文本。七个动词全部是 `drsg serve` 上的 MCP 工具；其中五个同时是 CLI 子命令
+（`grep` 与 `snippet` 需要读取被监视的源码树，因此只随服务端提供）。
+
+| 动词 | 它回答的问题 |
+|---|---|
+| `context` | 关于一个符号的一切——定义、带调用位置的调用者、被调用者、引用——首选动词 |
+| `search` | “我不知道名字”：在平面的向量嵌入上做语义 top-k |
+| `describe` | 一个符号的属性——只看节点的轻量视图 |
+| `grep` | 在被监视的源码树上做字面文本检索，有界且带计数 |
+| `trace` | 一个符号如何到达另一个：图中记录的最短调用路径 |
+| `impact` | 影响范围：所有能到达该符号的东西，按距离分组 |
+| `snippet` | 一个符号的源码文本 |
+
+两条纪律贯穿整套工具。歧义的名字从不猜测：回答是一份候选清单，由调用方挑选。
+调用清单是一个明示的下界：解析器无法解析的调用会连同原因保留为 `UnresolvedRef`
+事实，并且回答会说明这一点——错误的边比缺失的边更糟。
+
+**插件。** `drsg plugin install` 可以安装任何解析器插件——本地 `.wasm` 文件或
+URL——安装时验证其为合法组件并固定其 SHA-256，之后每次加载都会复查。不带参数时
+列出官方目录：八种语言——Rust、Go、TypeScript/JavaScript、Python、Java、C、
+web（HTML/CSS）与 TOML——逐一固定到
+[dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension)
+仓库的发布标签（[最新发布](https://github.com/wangyingsm/dr-strange-extension/releases)）。
+同一仓库也承载插件 SDK：解析器契约是一份公开的 WIT 接口，社区据此构建的解析器
+与官方插件以完全相同的方式安装、在完全相同的沙箱中运行。
+
+**对比表现。** 在与 ripgrep 工作流以及两款开源代码图 MCP 工具的智能体任务基准
+中，drsg 完成了每一种任务形态——调用者、影响面、调用链与复合审计——每项任务只需
+2–4 次工具调用，边际 token 开销最低，且是唯一会在回答中明示自身边界的工具。
+方法、任务清单与完整表格见 [AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md)（英文）。
+设计笔记：[arch/07-llm.md](arch/07-llm.md)（图化、插件与监视）与
+[arch/06-mcp.md](arch/06-mcp.md)（MCP 服务）。
+
 ## 文档
 
 手册逐一深入讲解各个部分：
@@ -162,6 +230,10 @@ LLM）则位于内核之上。
   [缓存](arch/02-cache.md)、
   [计算](arch/03-computation.md)、
   [API](arch/04-api.md)、
+  [工具](arch/05-tools.md)、
+  [MCP](arch/06-mcp.md)、
+  [LLM 与代码图化](arch/07-llm.md)、
+  [Web 控制台](arch/08-web-ui.md)、
   [平面](arch/09-planes.md)。
 
 ## 基准测试

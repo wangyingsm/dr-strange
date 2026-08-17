@@ -33,6 +33,13 @@ single on-disk database, with no server to operate. Unlike SQLite, it can also
 **serve** — `drsg serve` exposes a JSON-RPC 2.0 API, a browser dashboard, and a
 WebSocket change feed, with client SDKs in five languages.
 
+It is also a code-intelligence engine. Sandboxed wasm parser plugins digest a
+repository into a graph of symbols and resolved relationships — eight official
+languages, no model in the loop — `drsg serve watch` keeps that graph synced to
+every commit, and a compact agent surface answers structural questions (who
+calls this, what breaks if it changes, how does X reach Y) in one round trip.
+See [For coding agents](#for-coding-agents).
+
 For applications built around a knowledge graph, a GraphRAG pipeline, or an
 agent's long-term memory, Dr Strange aims to be the single store for all of it.
 
@@ -61,8 +68,11 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 | **Natural-language query** | ask in plain language → plan → run |
 | **Time-travel** | read the graph *as of* a past commit or timestamp |
 | **Change feed** | subscribe to a plane and receive mutations live |
+| **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — 8 official languages, an SDK for community parsers |
+| **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
+| **Agent surface** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
 | **Backup / restore** | consistent, id-faithful whole-database snapshots |
-| **Interfaces** | a web UI, five language SDKs, a CLI, and an MCP server |
+| **Interfaces** | a web UI, five language SDKs, a CLI, and an MCP server speaking the agent verbs |
 
 The model-backed features (natural-language query, document ingestion, and
 text-embedding search) call an external or local LLM; everything else runs with
@@ -142,6 +152,75 @@ book's **Getting Started** chapter:
 [English](https://wangyingsm.github.io/dr-strange/en/book/getting-started.html) ·
 [中文](https://wangyingsm.github.io/dr-strange/zh/book/getting-started.html).
 
+## For coding agents
+
+Dr Strange treats a codebase the way it treats any other knowledge: as a
+graph. Parser plugins — sandboxed wasm components, one per language — turn
+source files into symbols and resolved relationships (CALLS with call sites,
+REFERENCES, IMPORTS, EXTENDS, …), with no model in the loop. `serve watch`
+then follows the repository commit by commit, so the graph an agent queries
+is the code as committed — and each answer opens by saying which commit
+(`synced: commit <sha>`).
+
+```console
+# Install parser plugins: no argument opens an interactive chooser over the
+# official catalog (0 = all); or pass any .wasm path or URL directly.
+$ drsg plugin install
+
+# Digest a repository into a plane named after it
+$ drsg --db codes.drsg digest ~/src/myrepo --apply --no-embed
+
+# Serve the API + MCP surface and keep the plane synced to every commit
+$ drsg --db codes.drsg serve watch --dir ~/src/myrepo
+
+# One symbol's whole neighborhood, one call
+$ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
+```
+
+`--no-embed` skips embeddings — parsing needs no model. Run `drsg vectorize`
+later to make the plane semantically searchable.
+
+Seven verbs answer an agent's questions, each in one round trip, all compact
+one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are
+also CLI subcommands (`grep` and `snippet` read the watched source tree, so
+they live with the server).
+
+| Verb | The question it answers |
+|---|---|
+| `context` | everything about one symbol — definition, callers with call sites, callees, references — the primary verb |
+| `search` | "I don't know the name": semantic top-k over the plane's embeddings |
+| `describe` | one symbol's properties — the lightweight node-only view |
+| `grep` | literal text over the watched source tree, bounded and counted |
+| `trace` | how one symbol reaches another: the shortest recorded call path |
+| `impact` | blast radius: everything reaching a symbol, grouped by distance |
+| `snippet` | one symbol's source text |
+
+Two disciplines run through the whole surface. An ambiguous name is never
+guessed at: the reply is a list of candidates to pick from. And a call
+listing is a stated lower bound: what the parser could not resolve is kept
+as `UnresolvedRef` facts with reasons, and the answer says so — a wrong edge
+is worse than a missing one.
+
+**Plugins.** `drsg plugin install` installs any parser plugin — a local
+`.wasm` file or a URL — validating it as a component and pinning its SHA-256,
+re-checked at every load. The no-argument form offers the official catalog:
+eight languages — Rust, Go, TypeScript/JavaScript, Python, Java, C, web
+(HTML/CSS), and TOML — pinned to release tags of the
+[dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension)
+repository ([latest releases](https://github.com/wangyingsm/dr-strange-extension/releases)).
+The same repository carries the plugin SDKs: the parser contract is an open
+WIT interface, and a community parser built against it installs and runs in
+the same sandbox as an official one.
+
+**How it compares.** In agent-task benchmarks against a ripgrep-driven
+workflow and two open-source code-graph MCP tools, drsg completed every task
+shape — callers, impact, flow, and a compound audit — in 2–4 tool calls at
+the lowest marginal token cost, and was the only tool whose answers state
+their own bounds. Methodology, ledgers, and the full tables:
+[AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md). Design notes:
+[arch/07-llm.md](arch/07-llm.md) (digestion, plugins, watch) and
+[arch/06-mcp.md](arch/06-mcp.md) (the MCP surface).
+
 ## Documentation
 
 The book covers each part in depth:
@@ -171,6 +250,10 @@ above the core.
   [cache](arch/02-cache.md),
   [computation](arch/03-computation.md),
   [API](arch/04-api.md),
+  [tools](arch/05-tools.md),
+  [MCP](arch/06-mcp.md),
+  [LLM & code digestion](arch/07-llm.md),
+  [web UI](arch/08-web-ui.md),
   [planes](arch/09-planes.md).
 
 ## Benchmarks
