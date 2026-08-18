@@ -42,7 +42,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Bootstrap this repository for agent MCP access: digest it, spawn
+    /// `serve watch` detached in the background on a freshly-picked
+    /// address+token, and write the connection details to `.mcp.json`.
+    #[cfg(feature = "digest")]
+    Init {
+        /// Repository to digest and watch.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Target plane. **Omitted**: the directory's own name, `startup`
+        /// as the fallback.
+        #[arg(long)]
+        plane: Option<String>,
+        /// Address for the spawned server to listen on. **Omitted**: an
+        /// OS-assigned free port on 127.0.0.1.
+        #[arg(long)]
+        addr: Option<SocketAddr>,
+        /// Bearer token for the spawned server. **Omitted**: a random token
+        /// is generated, unless `DRSG_TOKEN`/`drsg.toml`'s `[server] token`
+        /// is already set.
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Create a new database.
+    #[cfg(not(feature = "digest"))]
     Init,
     /// Plane lifecycle.
     #[command(subcommand)]
@@ -546,6 +569,17 @@ fn main() -> Result<()> {
 
 fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
     match cli.command {
+        #[cfg(feature = "digest")]
+        Command::Init {
+            dir,
+            plane,
+            addr,
+            token,
+        } => {
+            let token = token.or_else(|| cfg.server.token.clone());
+            commands::init_bootstrap(&cli.db, dir, plane, addr, token, out)
+        }
+        #[cfg(not(feature = "digest"))]
         Command::Init => commands::init(&cli.db, out),
         Command::Plane(cmd) => {
             let db = commands::open(&cli.db)?;

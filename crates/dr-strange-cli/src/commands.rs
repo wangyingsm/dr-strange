@@ -4,6 +4,8 @@
 
 use std::io::{BufRead, Write};
 use std::path::Path;
+#[cfg(feature = "digest")]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
@@ -46,10 +48,233 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> Result<Pl
     Ok(p)
 }
 
+#[cfg(not(feature = "digest"))]
 pub fn init(path: &Path, out: &mut dyn Write) -> Result<()> {
     open(path)?;
     writeln!(out, "initialized dr-strange database at {}", path.display())?;
     Ok(())
+}
+
+// ---- init bootstrap (drsg init) -------------------------------------------
+
+#[cfg(feature = "digest")]
+const INIT_TOKEN_LEN: usize = 40;
+
+#[cfg(feature = "digest")]
+const INIT_HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(feature = "digest")]
+const GITIGNORE_PATTERNS: &[&str] = &[
+    "*.drsg",
+    "*.drsg.jsonl",
+    "*.drsg.hnsw",
+    "*.drsg.bm25",
+    "logs/",
+    ".mcp.json",
+];
+
+/// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
+/// artifacts this leaves behind, spawns `drsg serve watch` detached in the
+/// background on a freshly-picked address+token, waits for it to come up,
+/// and writes the connection details to `dir`'s `.mcp.json`. Never blocks
+/// past the health check — the spawned server keeps running after this
+/// returns, the same way this repo's own `serve watch` instances do.
+#[cfg(feature = "digest")]
+pub fn init_bootstrap(
+    db_path: &Path,
+    dir: PathBuf,
+    plane: Option<String>,
+    addr: Option<std::net::SocketAddr>,
+    token: Option<String>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    use rand::distr::{Alphanumeric, SampleString};
+
+    let db_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        dir.join(db_path)
+    };
+    open(&db_path)?;
+    ensure_gitignore_patterns(&dir)?;
+
+    let addr = match addr {
+        Some(addr) => addr,
+        None => pick_free_port()?,
+    };
+    let token =
+        token.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN));
+    let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
+
+    let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.current_dir(&dir)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("serve")
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("watch")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--plane")
+        .arg(&plane_name)
+        .arg("--force")
+        .env("DRSG_TOKEN", &token)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid()` is async-signal-safe and touches only the
+        // child's own process state; this runs in the forked child before
+        // exec, per `pre_exec`'s contract.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "spawning `{} serve watch` for {}",
+            exe.display(),
+            dir.display()
+        )
+    })?;
+    let pid = child.id();
+
+    if !wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
+        let log_tail =
+            tail_recent_log(&dir).unwrap_or_else(|| "(no log file found under logs/)".to_string());
+        let _ = child.kill();
+        bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
+    }
+
+    write_mcp_json_entry(&dir, &addr, &token)?;
+
+    writeln!(
+        out,
+        "plane '{plane_name}' bootstrapped — serve watch pid {pid}, http://{addr}/mcp, wrote {}",
+        dir.join(".mcp.json").display()
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "digest")]
+fn pick_free_port() -> Result<std::net::SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("picking a free port")?;
+    listener.local_addr().context("reading the picked port")
+}
+
+/// Polls `addr` until something accepts a TCP connection, the child exits
+/// first, or `timeout` elapses.
+#[cfg(feature = "digest")]
+fn wait_for_listener(
+    addr: std::net::SocketAddr,
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return true;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The last few lines of the most recently modified file under `dir/logs`
+/// (the same rolling log `dr_strange_log::init` already writes) — the best
+/// available diagnostic when the spawned server never comes up.
+#[cfg(feature = "digest")]
+fn tail_recent_log(dir: &Path) -> Option<String> {
+    let logs_dir = dir.join("logs");
+    let newest = std::fs::read_dir(&logs_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())?;
+    let contents = std::fs::read_to_string(newest.path()).ok()?;
+    let tail: Vec<&str> = contents.lines().rev().take(20).collect();
+    Some(format!(
+        "--- tail of {} ---\n{}",
+        newest.path().display(),
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    ))
+}
+
+/// Appends whichever of `GITIGNORE_PATTERNS` are missing from `dir`'s
+/// `.gitignore` (creating it if absent) — idempotent, never duplicates, and
+/// never touches unrelated lines.
+#[cfg(feature = "digest")]
+fn ensure_gitignore_patterns(dir: &Path) -> Result<()> {
+    let path = dir.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let have: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = GITIGNORE_PATTERNS
+        .iter()
+        .copied()
+        .filter(|p| !have.contains(p))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(
+        "# drsg — local database, logs, and the MCP config carrying a live bearer token\n",
+    );
+    for p in missing {
+        content.push_str(p);
+        content.push('\n');
+    }
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Upserts the `"drsg-watch"` entry under `dir`'s `.mcp.json`'s
+/// `mcpServers`, preserving every other key untouched.
+#[cfg(feature = "digest")]
+fn write_mcp_json_entry(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<()> {
+    let path = dir.join(".mcp.json");
+    let mut root: Value = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("{} exists but is not valid JSON", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"mcpServers": {}}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} does not contain a JSON object", path.display()))?;
+    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}'s 'mcpServers' key is not an object", path.display()))?;
+    servers.insert(
+        "drsg-watch".to_string(),
+        json!({
+            "type": "http",
+            "url": format!("http://{addr}/mcp"),
+            "headers": { "Authorization": format!("Bearer {token}") },
+        }),
+    );
+    let pretty = serde_json::to_string_pretty(&root)?;
+    std::fs::write(&path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
 }
 
 // ---- planes --------------------------------------------------------------
@@ -2758,6 +2983,82 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("drsg-cli-init-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn pick_free_port_returns_a_bindable_loopback_address() {
+        let addr = pick_free_port().unwrap();
+        assert_eq!(addr.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_ne!(addr.port(), 0);
+        // The picked port is actually free to bind again immediately after.
+        std::net::TcpListener::bind(addr).unwrap();
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn ensure_gitignore_patterns_is_idempotent_and_preserves_unrelated_lines() {
+        let dir = scratch_dir("gitignore");
+        std::fs::write(dir.join(".gitignore"), "node_modules/\n*.drsg\n").unwrap();
+
+        ensure_gitignore_patterns(&dir).unwrap();
+        let first = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(first.contains("node_modules/"), "kept unrelated line: {first}");
+        for pat in GITIGNORE_PATTERNS {
+            assert!(first.contains(pat), "missing {pat}: {first}");
+        }
+
+        ensure_gitignore_patterns(&dir).unwrap();
+        let second = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(first, second, "a second run must not duplicate lines");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn mcp_json_upsert_adds_overwrites_and_preserves_other_entries() {
+        let dir = scratch_dir("mcpjson");
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // Fresh file: creates `mcpServers` and the entry.
+        write_mcp_json_entry(&dir, &addr, "tok1").unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["url"],
+            "http://127.0.0.1:12345/mcp"
+        );
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer tok1"
+        );
+
+        // An existing, unrelated server entry survives an overwrite.
+        let mut v = v;
+        v["mcpServers"]["other"] = json!({"type": "stdio", "command": "foo"});
+        std::fs::write(dir.join(".mcp.json"), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        write_mcp_json_entry(&dir, &addr, "tok2").unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer tok2",
+            "must overwrite in place, not duplicate"
+        );
+        assert_eq!(v["mcpServers"]["other"]["command"], "foo", "unrelated entry preserved");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
