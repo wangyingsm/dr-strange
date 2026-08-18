@@ -24,6 +24,20 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` 跳过向量嵌入——解析无需任何模型。之后运行 `drsg vectorize` 即可让
 平面支持语义检索。
 
+**`drsg init`** 把图化与启动服务这两步合并成一条命令：在插件已安装的前提下从
+代码仓库自身运行，它会把工作目录图化为一个以其命名的平面，在后台启动一个监听于
+随机选定地址、携带随机生成令牌的 `serve watch` 进程，并写入 `.mcp.json`——这是
+Claude Code 自身的约定，GitHub Copilot 也原样读取它。随后它会为 Cursor、
+OpenCode、Gemini CLI 或 Codex CLI 各自写入一份匹配的 MCP 配置，但仅当该工具
+自己的标记（它会创建的目录，或它已拥有的配置文件）已经存在于这个仓库中时才会
+写入。
+
+```console
+$ drsg init
+plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp, wrote .mcp.json
+  + Cursor: wrote .cursor/mcp.json
+```
+
 ## 事实为智能体带来什么
 
 依赖 grep 工作的智能体，每个问题都要重建一遍结构：搜索、打开文件、阅读、推断谁

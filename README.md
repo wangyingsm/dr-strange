@@ -184,6 +184,22 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` skips embeddings — parsing needs no model. Run `drsg vectorize`
 later to make the plane semantically searchable.
 
+**`drsg init`** collapses the digest-and-serve steps into one command, run
+from the repository itself (plugins still need installing first): it digests
+the working directory into a plane named after it, spawns `serve watch`
+detached on a freshly-picked address and bearer token, and writes
+`.mcp.json` — Claude Code's own convention, also read as-is by GitHub
+Copilot. It then writes a matching MCP config for Cursor, OpenCode, Gemini
+CLI, or Codex CLI, but only for a tool whose own marker (a directory it
+creates, or a config file it already owns) is already present in the
+repository.
+
+```console
+$ drsg init
+plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp, wrote .mcp.json
+  + Cursor: wrote .cursor/mcp.json
+```
+
 Seven verbs answer an agent's questions, one round trip each, as compact
 one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are
 also CLI subcommands (`grep` and `snippet` read the watched source tree, so
