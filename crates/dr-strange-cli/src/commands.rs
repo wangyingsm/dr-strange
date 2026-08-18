@@ -156,12 +156,47 @@ pub fn init_bootstrap(
     }
 
     write_mcp_json_entry(&dir, &addr, &token)?;
-
     writeln!(
         out,
         "plane '{plane_name}' bootstrapped — serve watch pid {pid}, http://{addr}/mcp, wrote {}",
         dir.join(".mcp.json").display()
     )?;
+
+    // Beyond Claude Code's `.mcp.json`, only add a file for an agent whose
+    // own marker (a directory it creates, or a config file it already owns)
+    // is already present — writing one for a tool nobody here uses would
+    // just be repo clutter.
+    if probe_and_write_cursor(&dir, &addr, &token)? {
+        writeln!(
+            out,
+            "  + Cursor: wrote {}",
+            dir.join(".cursor/mcp.json").display()
+        )?;
+    }
+    if probe_and_write_opencode(&dir, &addr, &token)? {
+        writeln!(
+            out,
+            "  + OpenCode: wrote {}",
+            dir.join(".opencode.json").display()
+        )?;
+    }
+    if probe_and_write_gemini(&dir, &addr, &token)? {
+        writeln!(
+            out,
+            "  + Gemini CLI: wrote {}",
+            dir.join(".gemini/settings.json").display()
+        )?;
+    }
+    if probe_and_write_codex(&dir, &addr)? {
+        writeln!(
+            out,
+            "  + Codex CLI: wrote {} (no token inside it — Codex reads the bearer from its \
+             own process environment; export {CODEX_TOKEN_ENV_VAR}={token} before launching \
+             `codex` here, and mark this project trusted, or its project-scoped MCP config is \
+             ignored)",
+            dir.join(".codex/config.toml").display()
+        )?;
+    }
     Ok(())
 }
 
@@ -247,34 +282,163 @@ fn ensure_gitignore_patterns(dir: &Path) -> Result<()> {
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Upserts the `"drsg-watch"` entry under `dir`'s `.mcp.json`'s
-/// `mcpServers`, preserving every other key untouched.
+/// Upserts `entry` under `path`'s JSON `top_key.entry_name`, preserving
+/// every other key untouched. Creates `path` fresh (as `{top_key: {}}`) if
+/// it doesn't exist yet.
 #[cfg(feature = "digest")]
-fn write_mcp_json_entry(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<()> {
-    let path = dir.join(".mcp.json");
-    let mut root: Value = match std::fs::read_to_string(&path) {
+fn upsert_json_mcp_entry(path: &Path, top_key: &str, entry_name: &str, entry: Value) -> Result<()> {
+    let mut root: Value = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s)
             .with_context(|| format!("{} exists but is not valid JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"mcpServers": {}}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let obj = root
         .as_object_mut()
         .ok_or_else(|| anyhow!("{} does not contain a JSON object", path.display()))?;
-    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = obj.entry(top_key).or_insert_with(|| json!({}));
     let servers = servers
         .as_object_mut()
-        .ok_or_else(|| anyhow!("{}'s 'mcpServers' key is not an object", path.display()))?;
-    servers.insert(
-        "drsg-watch".to_string(),
+        .ok_or_else(|| anyhow!("{}'s '{top_key}' key is not an object", path.display()))?;
+    servers.insert(entry_name.to_string(), entry);
+    let pretty = serde_json::to_string_pretty(&root)?;
+    std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
+}
+
+/// Upserts the `"drsg-watch"` entry under `dir`'s `.mcp.json`'s
+/// `mcpServers` — Claude Code's own convention, also read as-is by GitHub
+/// Copilot CLI (which walks from cwd up to the repo root looking for this
+/// exact file).
+#[cfg(feature = "digest")]
+fn write_mcp_json_entry(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<()> {
+    upsert_json_mcp_entry(
+        &dir.join(".mcp.json"),
+        "mcpServers",
+        "drsg-watch",
         json!({
             "type": "http",
             "url": format!("http://{addr}/mcp"),
             "headers": { "Authorization": format!("Bearer {token}") },
         }),
+    )
+}
+
+/// Cursor reads the identical shape from its own path instead of
+/// `.mcp.json`. Only written when `.cursor/` already exists — that's
+/// Cursor's own marker, created the first time someone opens this repo in
+/// it, regardless of MCP use.
+#[cfg(feature = "digest")]
+fn probe_and_write_cursor(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+    if !dir.join(".cursor").is_dir() {
+        return Ok(false);
+    }
+    upsert_json_mcp_entry(
+        &dir.join(".cursor").join("mcp.json"),
+        "mcpServers",
+        "drsg-watch",
+        json!({
+            "type": "http",
+            "url": format!("http://{addr}/mcp"),
+            "headers": { "Authorization": format!("Bearer {token}") },
+        }),
+    )?;
+    Ok(true)
+}
+
+/// OpenCode has no directory marker of its own (it's terminal-first, no
+/// rules/config dir it creates unprompted) — the only honest signal that
+/// this repo's contributors already use it is a pre-existing
+/// `.opencode.json`, so that's the marker, not something created fresh.
+#[cfg(feature = "digest")]
+fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+    if !dir.join(".opencode.json").is_file() {
+        return Ok(false);
+    }
+    upsert_json_mcp_entry(
+        &dir.join(".opencode.json"),
+        "mcp",
+        "drsg-watch",
+        json!({
+            "type": "remote",
+            "url": format!("http://{addr}/mcp"),
+            "headers": { "Authorization": format!("Bearer {token}") },
+            "enabled": true,
+        }),
+    )?;
+    Ok(true)
+}
+
+/// Gemini CLI shares Claude Code's `mcpServers` key but names the URL field
+/// `httpUrl` instead of `url`, and has no `type` discriminator. Written
+/// only when `.gemini/` already exists.
+#[cfg(feature = "digest")]
+fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+    if !dir.join(".gemini").is_dir() {
+        return Ok(false);
+    }
+    upsert_json_mcp_entry(
+        &dir.join(".gemini").join("settings.json"),
+        "mcpServers",
+        "drsg-watch",
+        json!({
+            "httpUrl": format!("http://{addr}/mcp"),
+            "headers": { "Authorization": format!("Bearer {token}") },
+        }),
+    )?;
+    Ok(true)
+}
+
+/// The env var Codex CLI reads its bearer token from at its *own* launch
+/// time — Codex's schema takes `bearer_token_env_var` (a variable name),
+/// never a literal token, so the secret never lands in `.codex/config.toml`
+/// itself. The caller still has to export it before running `codex` here.
+#[cfg(feature = "digest")]
+const CODEX_TOKEN_ENV_VAR: &str = "DRSG_TOKEN";
+
+/// Codex CLI's project-scoped MCP config, `.codex/config.toml`, is TOML —
+/// parsed and re-emitted as a generic table (like the JSON upserts above,
+/// this preserves every other *key* but not hand-written comments or
+/// formatting). Written only when `.codex/` already exists. Note this does
+/// **not** set `trust_level = "trusted"`: Codex treats that as a deliberate
+/// user decision and ignores project-scoped MCP config for untrusted
+/// projects, so the caller still has to trust the project themselves.
+#[cfg(feature = "digest")]
+fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool> {
+    let path = dir.join(".codex").join("config.toml");
+    if !dir.join(".codex").is_dir() {
+        return Ok(false);
+    }
+    let mut root: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => s
+            .parse()
+            .with_context(|| format!("{} exists but is not valid TOML", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(Default::default())
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let root_table = root
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("{} does not contain a TOML table", path.display()))?;
+    let mcp_servers = root_table
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let mcp_servers = mcp_servers
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("{}'s 'mcp_servers' key is not a table", path.display()))?;
+    let mut entry = toml::value::Table::new();
+    entry.insert(
+        "url".to_string(),
+        toml::Value::String(format!("http://{addr}/mcp")),
     );
-    let pretty = serde_json::to_string_pretty(&root)?;
-    std::fs::write(&path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
+    entry.insert(
+        "bearer_token_env_var".to_string(),
+        toml::Value::String(CODEX_TOKEN_ENV_VAR.to_string()),
+    );
+    mcp_servers.insert("drsg-watch".to_string(), toml::Value::Table(entry));
+    let rendered = toml::to_string_pretty(&root)?;
+    std::fs::write(&path, rendered).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
 // ---- planes --------------------------------------------------------------
@@ -3064,6 +3228,117 @@ mod tests {
         assert_eq!(
             v["mcpServers"]["other"]["command"], "foo",
             "unrelated entry preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn agent_probes_skip_when_their_marker_is_absent() {
+        let dir = scratch_dir("no-markers");
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(!probe_and_write_cursor(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_codex(&dir, &addr).unwrap());
+        assert!(!dir.join(".cursor").exists());
+        assert!(!dir.join(".opencode.json").exists());
+        assert!(!dir.join(".gemini").exists());
+        assert!(!dir.join(".codex").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn cursor_probe_writes_the_mcp_shape_when_dot_cursor_exists() {
+        let dir = scratch_dir("cursor");
+        std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(probe_and_write_cursor(&dir, &addr, "tok").unwrap());
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".cursor/mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["url"],
+            "http://127.0.0.1:12345/mcp"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn opencode_probe_only_fires_on_an_existing_opencode_json() {
+        let dir = scratch_dir("opencode");
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // No pre-existing `.opencode.json`: nothing is created.
+        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(!dir.join(".opencode.json").exists());
+
+        // Once it exists, the entry is upserted under `mcp`, not `mcpServers`.
+        std::fs::write(dir.join(".opencode.json"), "{}").unwrap();
+        assert!(probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["mcp"]["drsg-watch"]["type"], "remote");
+        assert_eq!(v["mcp"]["drsg-watch"]["url"], "http://127.0.0.1:12345/mcp");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn gemini_probe_uses_http_url_field_not_url() {
+        let dir = scratch_dir("gemini");
+        std::fs::create_dir_all(dir.join(".gemini")).unwrap();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["httpUrl"],
+            "http://127.0.0.1:12345/mcp"
+        );
+        assert!(
+            v["mcpServers"]["drsg-watch"]["url"].is_null(),
+            "must use httpUrl, not url"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn codex_probe_writes_toml_with_env_var_name_never_the_raw_token() {
+        let dir = scratch_dir("codex");
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(probe_and_write_codex(&dir, &addr).unwrap());
+        let rendered = std::fs::read_to_string(dir.join(".codex/config.toml")).unwrap();
+        let v: toml::Value = rendered.parse().unwrap();
+        assert_eq!(
+            v["mcp_servers"]["drsg-watch"]["url"].as_str().unwrap(),
+            "http://127.0.0.1:12345/mcp"
+        );
+        assert_eq!(
+            v["mcp_servers"]["drsg-watch"]["bearer_token_env_var"]
+                .as_str()
+                .unwrap(),
+            CODEX_TOKEN_ENV_VAR
+        );
+        assert!(
+            !rendered.contains("Bearer"),
+            "the raw token must never land in this file: {rendered}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
