@@ -4,6 +4,20 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-08-19
+
+### Added
+- **`drsg init` as a one-command MCP bootstrap.** Repurposed to configure not
+  just Claude Code but also Cursor, OpenCode, Gemini CLI, and Codex CLI in
+  one pass, probing each tool's config location and writing the MCP server
+  entry it expects.
+- **`list_planes` surfaces `synced_root`/`synced_commit`.** Callers can now
+  match a plane to their working directory and confirm which commit it
+  reflects, instead of guessing from the plane name alone.
+
+### Changed
+- Repo now gitignores `.mcp.json` and ships its own `drsg.toml`.
+
 ## [2.0.0-alpha] - 2026-08-18
 
 The code-intelligence release: a repository becomes a resolved call graph
