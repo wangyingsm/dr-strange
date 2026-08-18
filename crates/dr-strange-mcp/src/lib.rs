@@ -591,10 +591,13 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
 fn list_planes_logic(db: &Database) -> AnyResult<Value> {
     let mut out = Vec::new();
     for (id, name) in db.planes()? {
-        let cat = db.plane(&name)?.catalog()?;
+        let plane = db.plane(&name)?;
+        let cat = plane.catalog()?;
+        let props = plane.properties()?;
         out.push(jval!({
             "id": id.0, "name": name,
             "nodes": cat.node_count, "edges": cat.edge_count,
+            "properties": json::properties_to_json(&props),
         }));
     }
     Ok(Value::Array(out))
@@ -1417,7 +1420,12 @@ fn digest_logic(
 
 #[tool_router(router = tool_router)]
 impl DrStrange {
-    #[tool(description = "List all planes with their node/edge counts.")]
+    #[tool(description = "List all planes with their node/edge counts and \
+        properties — including `synced_root` (the canonical source \
+        directory) and `synced_commit` when the plane was created by \
+        `digest`/`serve watch`. Match `synced_root` against the caller's \
+        cwd to find the right plane instead of relying on any tool's \
+        default.")]
     async fn list_planes(&self) -> Result<CallToolResult, McpError> {
         self.blocking("list_planes", list_planes_logic).await
     }
@@ -2060,6 +2068,30 @@ mod tests {
         assert_eq!(planes[0]["edges"], jval!(1));
         let cat = describe_plane_logic(&db, from_value(jval!({})).unwrap()).unwrap();
         assert_eq!(cat["labels"]["Doc"]["count"], jval!(2));
+    }
+
+    /// `list_planes` must surface plane properties like `synced_root` so an
+    /// agent can match its cwd against the real source directory instead of
+    /// relying on any tool's "startup" default.
+    #[test]
+    fn list_planes_surfaces_properties() {
+        let db = fixture();
+        let plane = db.plane("startup").unwrap();
+        let mut props = plane.properties().unwrap();
+        props.insert(
+            "synced_root".into(),
+            PropDesc::described(
+                "directory the facts were parsed from",
+                PropValue::Str("/home/wangying/workspace/dr-strange".into()),
+            ),
+        );
+        plane.set_properties(props).unwrap();
+
+        let planes = list_planes_logic(&db).unwrap();
+        assert_eq!(
+            planes[0]["properties"]["synced_root"]["$value"],
+            jval!("/home/wangying/workspace/dr-strange")
+        );
     }
 
     /// Gemini's tool-schema converter rejects a *bare boolean* where a Schema
