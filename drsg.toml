@@ -1,0 +1,11 @@
+# drsg server configuration — auto-loaded from ./drsg.toml by every drsg
+# command run in this directory ($DRSG_CONFIG overrides the path).
+
+[digest]
+# Server-side embedding provider: powers the MCP `search` tool, embed-on-write
+# for `/mcp` write_nodes, and any surface that embeds a query on the server.
+# `qwen` is the DashScope preset (chat qwen-plus, embeddings text-embedding-v4
+# — the same space the planes were vectorized in). The API key is read from
+# the serve process's environment (DASHSCOPE_API_KEY for this preset), never
+# from this file.
+embed_provider = "qwen"

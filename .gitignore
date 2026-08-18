@@ -14,6 +14,10 @@ logs/
 # CodeGraph's local symbol index — a machine-local cache rebuilt from source.
 .codegraph/
 
+# Local MCP server registrations — carries a bearer token for a `serve watch`
+# instance bound to an ephemeral, machine-local port. Never share or commit.
+.mcp.json
+
 # The official plugins live in their own repository (`dr-strange-extensions`),
 # checked out here so the two can be worked on together. Its history is its
 # own: a plugin ships a fix without waiting for a database release.
