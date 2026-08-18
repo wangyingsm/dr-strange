@@ -3011,7 +3011,10 @@ mod tests {
 
         ensure_gitignore_patterns(&dir).unwrap();
         let first = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
-        assert!(first.contains("node_modules/"), "kept unrelated line: {first}");
+        assert!(
+            first.contains("node_modules/"),
+            "kept unrelated line: {first}"
+        );
         for pat in GITIGNORE_PATTERNS {
             assert!(first.contains(pat), "missing {pat}: {first}");
         }
@@ -3032,8 +3035,7 @@ mod tests {
         // Fresh file: creates `mcpServers` and the entry.
         write_mcp_json_entry(&dir, &addr, "tok1").unwrap();
         let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
         assert_eq!(
             v["mcpServers"]["drsg-watch"]["url"],
             "http://127.0.0.1:12345/mcp"
@@ -3046,18 +3048,23 @@ mod tests {
         // An existing, unrelated server entry survives an overwrite.
         let mut v = v;
         v["mcpServers"]["other"] = json!({"type": "stdio", "command": "foo"});
-        std::fs::write(dir.join(".mcp.json"), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+        .unwrap();
 
         write_mcp_json_entry(&dir, &addr, "tok2").unwrap();
         let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
         assert_eq!(
-            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"],
-            "Bearer tok2",
+            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"], "Bearer tok2",
             "must overwrite in place, not duplicate"
         );
-        assert_eq!(v["mcpServers"]["other"]["command"], "foo", "unrelated entry preserved");
+        assert_eq!(
+            v["mcpServers"]["other"]["command"], "foo",
+            "unrelated entry preserved"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
