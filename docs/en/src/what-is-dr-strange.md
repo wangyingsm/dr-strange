@@ -100,4 +100,20 @@ one storage engine (a hand-rolled LSM, with a legacy alternative), and a stable
 JSON-RPC wire protocol that the SDKs are generated from. The chapters that
 follow show you how to use each part.
 
+## What v2.0 provides
+
+v2.0 adds a repository's own source tree as a second kind of graph. Sandboxed
+wasm parser plugins turn source files into a resolved call graph — symbols,
+callers with call sites, and every other structural edge — with no model in
+the loop, covering eight languages out of the box. `serve watch` keeps the
+resulting plane synced to the repository's own commit history, folding each
+commit's changes in as they land. Seven agent verbs — `context`, `search`,
+`describe`, `grep`, `trace`, `impact`, `snippet` — turn that graph into
+single-round-trip answers for a coding agent, each one stating the bounds of
+what it found: candidates instead of a guessed match, an `UnresolvedRef`
+ledger entry instead of a silently wrong edge. `drsg init` bootstraps all of
+it — digest, watch, and MCP configuration for whichever host tool is in use —
+in one command. [Plugins](./plugins.md) and [Coding Agent](./coding-agent.md)
+cover this ground in depth.
+
 > **Reading in another language?** 中文版见 [Chinese edition](../../zh/book/index.html)。

@@ -1,13 +1,13 @@
 # 附录 A：JSON-RPC 接口清单
 
 本附录是 `drsg serve` 所暴露 JSON-RPC 2.0 方法的参考。位于
-`crates/dr-strange-web/openrpc.json` 的 `OpenRPC` schema 是权威来源——服务端从
-`rpc.discover` 返回它，各 SDK 由它生成。
+`crates/dr-strange-web/openrpc.json` 的 `OpenRPC` schema 是权威来源：服务端会从
+`rpc.discover` 返回它，各 SDK 也由它生成。
 
-每一条目标出方法、其**访问**层级（`read` / `write` / `admin`；在单一共享令牌下，三者
-需要同一个令牌）、一行摘要，及其参数。参数写作 `name` 类型；**`!` 标记必填参数**。
-类型为 JSON 值；`Properties` 是属性映射方言（`{"$vector":[…]}`、
-`{"$desc":…,"$value":…}`），`NodeRef` 是一个节点 id 或一个外部键。
+每一条目都列出方法名、**访问**层级（`read` / `write` / `admin`；在单一共享令牌下，
+三者用的是同一个令牌）、一行摘要及其参数。参数写作 `name` 类型，类型一律是 JSON
+值；**`!` 标记必填参数**。`Properties` 是属性映射的方言（`{"$vector":[…]}`、
+`{"$desc":…,"$value":…}`），`NodeRef` 则指一个节点 id 或一个外部键。
 
 ## 发现与数据库
 
@@ -46,7 +46,7 @@
 - **`plane.hybrid`** · read —— 融合的向量 + 关键词 + 图邻近度检索。参数：`plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string。
 - **`plane.algo`** · read —— 作用于一个平面或某个标签子集的图算法。参数：`plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number。
 - **`plane.ask`** · read —— 自然语言查询 → 计划 → 执行。参数：`plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string。
-- **`graph.seed`** · read —— 一块由若干节点及其诱导边构成的初始画布。参数：`plane` string!, `label` string, `limit` integer, `order` string（`scan` \| `degree` \| `pagerank`，默认 `scan`）, `as_of` integer, `as_of_ms` integer。指定排序时返回得分最高的节点，而非扫描最先遇到的那些，并附带其 `scores`——若要取骨架，宜用 `degree`，因为 PageRank 会把权重汇聚到汇点上。
+- **`graph.seed`** · read —— 一块由若干节点及其诱导边构成的初始画布。参数：`plane` string!, `label` string, `limit` integer, `order` string（`scan` \| `degree` \| `pagerank`，默认 `scan`）, `as_of` integer, `as_of_ms` integer。指定排序时，返回的是得分最高的节点而非扫描时最先遇到的那些，并附带其 `scores`。若要取骨架，建议用 `degree`：PageRank 会把权重汇聚到汇点，不适合这个用途。
 - **`graph.expand`** · read —— 围绕某个节点的、防枢纽的一跳邻域。参数：`plane` string!, `id` integer!, `direction` string, `type` string, `limit` integer, `as_of` integer, `as_of_ms` integer。
 
 ## 索引与导入
@@ -54,7 +54,7 @@
 - **`index.ensure`** · admin —— 在 `(标签, 属性)` 上声明一个向量或关键词索引。参数：`plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string。
 - **`digest.run`** · write —— 经由 LLM 从文本抽取节点/边方案（dry-run）。参数：`plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string（`coarse` \| `fine` \| `super`，默认 `fine`——见[第 3 章](./ai-native.md#抽取精度)；`super` 的输入 token 用量约为 15 倍）。
 - **`digest.write`** · write —— 写入一个先前算得的方案（不调用 LLM）。参数：`plane` string!, `nodes` array!, `edges` array。
-- **`plane.vectorize`** · write —— 为平面中的每个节点生成向量嵌入（文本未变的节点会跳过），并按标签确保 `embedding` 上的向量索引；提供方密钥来自服务端环境。参数：`plane` string!, `embed` string, `embed_model` string, `metric` string。
+- **`plane.vectorize`** · write —— 为平面中的每个节点生成向量嵌入（文本未变的节点会跳过），并按标签确保 `embedding` 上的向量索引。提供方密钥来自服务端环境。参数：`plane` string!, `embed` string, `embed_model` string, `metric` string。
 
 ## 插件
 

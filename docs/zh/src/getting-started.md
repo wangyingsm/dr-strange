@@ -1,7 +1,7 @@
 # 快速上手
 
-本章介绍如何安装 Dr Strange——既可使用发行版二进制，也可从源码构建——以及初始化
-数据库、在命令行中发起查询，并运行服务：既包括本地方式，也包括以容器镜像方式部署。
+本章介绍如何安装 Dr Strange（用发行版二进制或从源码构建均可）、如何初始化数据库、
+在命令行中发起查询，以及如何运行服务，包括本地运行和以容器镜像方式部署。
 
 ## 环境准备
 
@@ -31,7 +31,7 @@ $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scri
 $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
 ```
 
-**macOS**——同一个脚本；Apple 芯片与 Intel 版本均有发布。
+**macOS**（脚本相同，Apple 芯片与 Intel 版本均有发布）
 
 ```console
 # 命令行与服务端 —— drsg
@@ -68,10 +68,10 @@ shell 配置：
 $ export PATH="$HOME/.local/bin:$PATH"
 ```
 
-归档包及其校验和亦可从[发行页](https://github.com/wangyingsm/dr-strange/releases)直接
-下载；安装脚本只是针对同一批产物的便捷封装，两个脚本均位于
-[`scripts/`](https://github.com/wangyingsm/dr-strange/tree/master/scripts)，可在使用前
-自行审阅。
+归档包及其校验和也可以从[发行页](https://github.com/wangyingsm/dr-strange/releases)
+直接下载。安装脚本只是对同一批产物的便捷封装，两个脚本都放在
+[`scripts/`](https://github.com/wangyingsm/dr-strange/tree/master/scripts)，可以在
+使用前自行查看。
 
 ## 从源码构建
 
@@ -102,8 +102,8 @@ $ cargo build --release -p dr-strange-mcp
 
 ## 磁盘布局
 
-`--db` 参数用于选择数据库路径。在原生后端下，数据库是一个**目录**——预写日志（WAL）
-与有序的 SST 文件驻留其中——并伴有两个存放检索索引的伴生文件：
+`--db` 参数用于选择数据库路径。在原生后端下，数据库是一个**目录**，里面存放着
+预写日志（WAL）与有序的 SST 文件，此外还有两个存放检索索引的伴生文件：
 
 ```text
 graph.drsg/          数据库（WAL + SST 文件）
@@ -144,7 +144,7 @@ $ drsg --db graph.drsg catalog --plane social
 
 向量是普通的属性值。在某个 `(标签, 属性)` 对上声明索引，然后对其发起查询。对文本
 查询做嵌入是在服务端执行的，因此进程环境中需要一个提供方密钥（例如
-`OPENAI_API_KEY`）；针对字面量向量的查询则无需任何提供方。
+`OPENAI_API_KEY`）。针对字面量向量的查询则不需要任何提供方。
 
 ```console
 $ drsg --db graph.drsg index ensure Doc embedding --plane social
@@ -164,7 +164,7 @@ $ drsg --db graph.drsg serve
 此命令启动 JSON-RPC 2.0 接口、WebSocket 变更流以及内嵌的仪表盘，并报告所绑定的
 地址（默认 `127.0.0.1:7700`）。
 
-**鉴权。** 未配置令牌时，仅同源的浏览器界面被授权调用接口。若要允许来自 SDK 或
+**鉴权。** 未配置令牌时，只有同源的浏览器界面可以调用接口。若要允许来自 SDK 或
 `curl` 的程序化访问，请配置一个共享令牌，并以 Bearer 凭据形式携带：
 
 ```console
@@ -175,7 +175,7 @@ $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 
 服务、日志与提供方设置也可以通过一个 TOML 配置文件提供，而非逐个使用命令行标志与
 环境变量。配置文件的解析顺序为：`--config <路径>`，其次 `$DRSG_CONFIG`，再次为
-当前目录下的 `./drsg.toml`（若存在）。未知键将被拒绝。
+当前目录下的 `./drsg.toml`（若存在）。系统会拒绝未知的键。
 
 ```toml
 [server]
@@ -218,13 +218,14 @@ allow_private = []                          # 见下文——通常保持为空
 
 **`[fetch]` 改变的是服务端的网络姿态**，在启用其中任何一项之前值得先读一读。当 URL
 导入处于开启状态（默认如此）时，客户端可以指定一个地址，而后由**服务端**去连接它。
-服务端在网络中所处的位置通常更为特权，因此一切不可路由的地址都会被拒绝：回环地址、
+服务端在网络中所处的位置通常更为特权，因此系统会拒绝一切不可路由的地址：回环地址、
 RFC-1918 私有网段、链路本地地址（`169.254.0.0/16`，云实例元数据服务在此应答凭据）
 等等。检查针对的是**解析之后的地址**而非主机名，并在每一次重定向跳转时重新执行。
 
-`allow_private` 用于重新放行特定的 CIDR 网段——例如以 `["10.0.0.0/8"]` 读取内网
-wiki——它是上述规则唯一经过深思的例外，而**不是**一个关闭该防护的开关；可被不受信任
-的客户端访问的服务端应当保持其为空。若要完全拒绝 URL 抓取，请设置 `enabled = false`。
+`allow_private` 用来重新放行特定的 CIDR 网段（例如设为 `["10.0.0.0/8"]`，以便
+读取内网 wiki）。它是上述规则唯一经过深思的例外，而**不是**关闭这层防护的开关：
+暴露给不受信任客户端的服务端应当让它保持为空。若要完全拒绝 URL 抓取，请设置
+`enabled = false`。
 
 优先级是固定的：进程中已设置的环境变量始终优先于配置文件中对应的取值，而 `--addr`
 标志覆盖 `[server].addr`。提供 `[server.tls]` 会将服务切换为 HTTPS。
@@ -242,8 +243,8 @@ $ docker run -p 7700:7700 -v drsg-data:/data \
 
 `docker run` 会在首次使用时拉取镜像。若需可复现的部署，请以版本标签
 `ghcr.io/wangyingsm/dr-strange:1.0.2` 替代 `:latest`。运行时镜像绑定到
-`0.0.0.0:7700`，并将数据库存放于 `/data` 卷（原生后端数据库是一个目录，由该卷
-持久化）。提供方密钥以环境变量形式提供。
+`0.0.0.0:7700`，数据库存放在 `/data` 卷中（原生后端下数据库是一个目录，这个卷
+负责把它持久化保存）。提供方密钥通过环境变量传入。
 
 对于持久化部署，`docker-compose.yml` 拉取同一镜像并定义了一个具名卷：
 

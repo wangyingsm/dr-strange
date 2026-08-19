@@ -1,6 +1,6 @@
 # SDK
 
-Dr Strange 提供**六种语言**的客户端库——TypeScript、Python、Go、Java、C 与 Zig。
+Dr Strange 提供**六种语言**的客户端库：TypeScript、Python、Go、Java、C 与 Zig。
 每一种都通过 JSON-RPC 2.0 与正在运行的 `drsg serve` 通信，且其带类型的方法接口是
 **由服务端的 OpenRPC schema 生成的**，因此每个 SDK 都与线协议精确一致，并在各版本间
 与之保持同步。（Zig 客户端是对生成的 C 客户端的一层胶水封装，因此继承同样的保证。）
@@ -49,22 +49,22 @@ const stats = await db.dbStats();
 console.log(stats.nodes, stats.edges);
 ```
 
-其它语言以各自的惯用法遵循同一套方法接口——Go 在每次调用中传入一个
-`context.Context`，Python 与 Java 抛出异常，C 返回一个由调用方拥有的 `json_object`，
-并通过一个出参报告失败。
+其它语言遵循同一套方法接口，只是各自用本地习惯的写法：Go 在每次调用中传入一个
+`context.Context`；Python 与 Java 直接抛出异常；C 返回一个由调用方持有的
+`json_object`，并通过一个出参报告失败。
 
 ## 错误处理
 
 应用级失败（未知平面、非法计划）是一个 JSON-RPC 错误；被拒绝的凭据对应错误码
-`-32001`。各 SDK 以带类型的错误呈现之：TypeScript 与 Python 中的 `DrsgError` /
+`-32001`。各 SDK 都会把它包装成带类型的错误：TypeScript 与 Python 中的 `DrsgError` /
 `DrsgAuthError`，Go 中带 `IsAuthError` 的 `*drsg.Error`，Java 中的 `DrsgException` /
 `DrsgAuthException`，以及 C 中一个填充好的 `drsg_error`（配 `drsg_is_auth_error`）。
 
 ## 变更流
 
 每个 SDK 都能打开一条长连接 WebSocket，订阅某个平面的变更流（[第 3 章](./ai-native.md)），
-接收每一个已提交的 `ChangeEvent`——`{ plane, seq, truncated, changes }`，其中每个变更
-为 `{ kind, op, id, labels?, record? }`。订阅遵循各语言自然的并发模型：
+接收每一个已提交的 `ChangeEvent`：结构为 `{ plane, seq, truncated, changes }`，其中每个
+变更为 `{ kind, op, id, labels?, record? }`。订阅遵循各语言自然的并发模型：
 
 **TypeScript** —— 一个回调；套接字自动重连。`close()` 停止它。
 
@@ -118,13 +118,13 @@ drsg_watch(client, "social", NULL, on_change, NULL, &err);
 一个可选的标签会将订阅收窄到对该标签节点的变更。投递是尽力而为的：落后过多的订阅者
 会丢弃溢出部分，而不会拖住写入方。
 
-由于每个事件都携带其落库时的提交序号，订阅者可以读取图在该序号处的 `as_of` 状态——
-以及其前一个序号处的 `as_of` 状态——从而重建一次变更的确切前后（[第 4 章](./query-language.md)）。
+由于每个事件都携带其落库时的提交序号，订阅者可以分别读取该序号和前一个序号处的
+`as_of` 状态，从而重建一次变更前后的确切状态（[第 4 章](./query-language.md)）。
 
 ## 代码生成
 
 每个 SDK 带类型的方法接口都由 `crates/dr-strange-web/openrpc.json` 生成，这也是服务端
 从 `rpc.discover` 返回的唯一权威来源。每个 SDK 都携带一个小型代码生成器与一个漂移
 （drift）测试；一旦已提交的客户端不再与该 schema 匹配，测试便会失败，因此这些库无法
-在无声无息中偏离线协议。手写的部分——传输层、错误类型，以及 WebSocket 的 `watch`——
-位于生成的接口之下。
+在无声无息中偏离线协议。生成的接口之下是手写的部分：传输层、错误类型，以及
+WebSocket 的 `watch`。
