@@ -661,6 +661,61 @@ fn resync_replaces_the_plane_wholesale() {
     assert_eq!(first.edges_written, second.edges_written, "not idempotent");
 }
 
+/// A host that looks at the plane from *inside* the rebuild. `read` runs while
+/// the refill is in flight, which is the only moment the marker is meant to be
+/// visible — and the only moment a real caller could be misled.
+struct Peeking<'a> {
+    inner: LocalFiles,
+    db: &'a dr_strange_core::Database,
+    saw_marker: std::sync::atomic::AtomicBool,
+}
+
+impl Host for Peeking<'_> {
+    fn list(&self, suffix: &str) -> Result<Vec<String>> {
+        self.inner.list(suffix)
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        if let Ok(plane) = self.db.plane("code")
+            && let Ok(props) = plane.properties()
+            && props.contains_key(dr_strange_core::compact::REBUILDING_PROP)
+        {
+            self.saw_marker
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.read(path)
+    }
+}
+
+/// `--force` drops the plane and refills it. In between, the plane is not
+/// wrong but *incomplete*, and a lookup for something not yet folded reads
+/// exactly like a lookup for something that does not exist. The plane says so
+/// while it rebuilds, and stops saying it the moment it finishes.
+#[test]
+fn a_rebuild_marks_the_plane_while_it_refills_and_clears_it_after() {
+    let tree = Tree::new("resync-marker");
+    tree.write("a.aa", "f\n").write("b.aa", "g\n");
+    let db = dr_strange_core::Database::in_memory().unwrap();
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+
+    let host = Peeking {
+        inner: tree.host(),
+        db: &db,
+        saw_marker: std::sync::atomic::AtomicBool::new(false),
+    };
+    resync(&db, "code", &host, &plugins, "test", "r1").unwrap();
+
+    assert!(
+        host.saw_marker.load(std::sync::atomic::Ordering::Relaxed),
+        "the plane was refilling and said nothing about it"
+    );
+    let props = db.plane("code").unwrap().properties().unwrap();
+    assert!(
+        !props.contains_key(dr_strange_core::compact::REBUILDING_PROP),
+        "a finished rebuild must stop claiming to be one"
+    );
+}
+
 // ---- P0 eval harness: fold-vs-full convergence -----------------------------
 
 /// A handler that resolves cross-file the way the real parsers do: a call

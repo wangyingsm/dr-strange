@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use dr_strange_core::{BulkEdge, BulkNode, Database, Dir, EdgeId, PropValue, Properties};
+use dr_strange_core::{BulkEdge, BulkNode, Database, Dir, EdgeId, PropDesc, PropValue, Properties};
 
 use super::{Host, Plugins, route_paths, stamp_run};
 
@@ -384,8 +384,21 @@ pub fn resync(
         let id = plane.id();
         db.drop_plane(id)?;
     }
-    db.create_plane(plane_name, Properties::new())?;
-    sync_paths(
+    // Created already carrying the marker, in the same call: a plane that is
+    // empty *and* silent about why is the window this closes, so there must
+    // not be an instant where one exists without the other. Cleared below only
+    // on success — a rebuild that dies halfway leaves a plane that really is
+    // incomplete, and the marker is then exactly the right thing to find.
+    let mut props = Properties::new();
+    props.insert(
+        dr_strange_core::compact::REBUILDING_PROP.into(),
+        PropDesc::described(
+            "unix time this plane's rebuild started; absent once it finished",
+            PropValue::Int(now_unix()),
+        ),
+    );
+    db.create_plane(plane_name, props)?;
+    let stats = sync_paths(
         db,
         plane_name,
         host,
@@ -393,5 +406,19 @@ pub fn resync(
         plugins,
         source,
         run_id,
-    )
+    )?;
+    let plane = db.plane(plane_name)?;
+    let mut props = plane.properties()?;
+    props.remove(dr_strange_core::compact::REBUILDING_PROP);
+    plane.set_properties(props)?;
+    Ok(stats)
+}
+
+/// Seconds since the epoch, or 0 on a clock before it — the marker is a
+/// human-readable "how long has this been going", not an ordering key.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
