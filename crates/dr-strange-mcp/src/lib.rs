@@ -1416,6 +1416,77 @@ fn digest_logic(
     Ok(out)
 }
 
+/// `snippet`'s body. `fallback_root` is the tree the process was started with,
+/// used only when the plane does not record one of its own.
+fn snippet_logic(
+    db: &Database,
+    fallback_root: Option<&std::path::Path>,
+    req: SnippetReq,
+) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
+        dr_strange_core::compact::Resolved::One(n) => n,
+        dr_strange_core::compact::Resolved::Many(hits) => {
+            anyhow::bail!(
+                "`{}` is ambiguous — {} matches; use an exact key",
+                req.name,
+                hits.len()
+            );
+        }
+        dr_strange_core::compact::Resolved::None => {
+            anyhow::bail!("no symbol matches `{}` in this plane", req.name);
+        }
+    };
+    // The digest's own copy first — exact by construction.
+    if let Some(dr_strange_core::PropValue::Str(src)) =
+        node.properties.get("source").map(|d| &d.value)
+    {
+        return Ok(Value::String(src.clone()));
+    }
+    let file =
+        ["file", "path"]
+            .iter()
+            .find_map(|k| match node.properties.get(*k).map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Str(f)) => Some(f.clone()),
+                _ => None,
+            });
+    let line = match node.properties.get("line").map(|d| &d.value) {
+        Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
+        _ => None,
+    };
+    // `file` is relative to whatever directory *this plane* was parsed from,
+    // which the digest records on the plane as `synced_root`. The process's own
+    // tree is only a fallback: once a server holds a second code plane, using it
+    // reads another repository's file at the same relative path — a plausible
+    // answer with no error, which is worse than failing.
+    let plane_root = plane.properties().ok().and_then(|props| {
+        match props.get("synced_root").map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
+            _ => None,
+        }
+    });
+    let (Some(root), Some(file), Some(line)) =
+        (plane_root.as_deref().or(fallback_root), file, line)
+    else {
+        anyhow::bail!(
+            "no stored source, and no source tree for this plane — the plane \
+             records no `synced_root` and none is attached to this server; \
+             digest with include_source, or attach the tree (`serve watch` \
+             does; [server] source_root otherwise)"
+        );
+    };
+    let text = std::fs::read_to_string(root.join(&file))
+        .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+    let want = req.lines.unwrap_or(40).clamp(1, 200);
+    let start = line.saturating_sub(1);
+    let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
+    let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
+    for (i, l) in slice.iter().enumerate() {
+        out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
+    }
+    Ok(Value::String(out))
+}
+
 // ---- tools (rmcp wrappers) ------------------------------------------------
 
 #[tool_router(router = tool_router)]
@@ -1548,63 +1619,16 @@ impl DrStrange {
     }
 
     #[tool(description = "One symbol's source text: from the graph when the \
-        digest stored it, else read from the attached source tree at the \
-        symbol's recorded file:line. Fuzzy name.")]
+        digest stored it, else read at the symbol's recorded file:line from \
+        the tree that plane was parsed from (its `synced_root`), falling back \
+        to the tree attached to this server. Fuzzy name.")]
     async fn snippet(
         &self,
         Parameters(req): Parameters<SnippetReq>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.source_root.clone();
-        self.blocking("snippet", move |db| {
-            let plane = db.plane(&req.plane)?;
-            let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
-                dr_strange_core::compact::Resolved::One(n) => n,
-                dr_strange_core::compact::Resolved::Many(hits) => {
-                    anyhow::bail!(
-                        "`{}` is ambiguous — {} matches; use an exact key",
-                        req.name,
-                        hits.len()
-                    );
-                }
-                dr_strange_core::compact::Resolved::None => {
-                    anyhow::bail!("no symbol matches `{}` in this plane", req.name);
-                }
-            };
-            // The digest's own copy first — exact by construction.
-            if let Some(dr_strange_core::PropValue::Str(src)) =
-                node.properties.get("source").map(|d| &d.value)
-            {
-                return Ok(Value::String(src.clone()));
-            }
-            let file = ["file", "path"].iter().find_map(|k| {
-                match node.properties.get(*k).map(|d| &d.value) {
-                    Some(dr_strange_core::PropValue::Str(f)) => Some(f.clone()),
-                    _ => None,
-                }
-            });
-            let line = match node.properties.get("line").map(|d| &d.value) {
-                Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
-                _ => None,
-            };
-            let (Some(root), Some(file), Some(line)) = (&root, file, line) else {
-                anyhow::bail!(
-                    "no stored source and no source tree attached — digest with \
-                     include_source, or attach the tree (`serve watch` does; \
-                     [server] source_root otherwise)"
-                );
-            };
-            let text = std::fs::read_to_string(root.join(&file))
-                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
-            let want = req.lines.unwrap_or(40).clamp(1, 200);
-            let start = line.saturating_sub(1);
-            let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
-            let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
-            for (i, l) in slice.iter().enumerate() {
-                out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
-            }
-            Ok(Value::String(out))
-        })
-        .await
+        self.blocking("snippet", move |db| snippet_logic(db, root.as_deref(), req))
+            .await
     }
 
     #[tool(
@@ -2412,5 +2436,116 @@ mod grep_tests {
             "empty pattern refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use dr_strange_core::{PropDesc, PropValue, Properties};
+    use serde_json::from_value;
+
+    use super::*;
+
+    /// Two trees, same relative path, different content — the shape that makes
+    /// reading the wrong one silent rather than an error.
+    fn two_repos(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("drsg-snippet-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("repo-a"), base.join("repo-b"));
+        for (dir, body) in [
+            (&a, "fn f() { \"from repo A\" }"),
+            (&b, "fn f() { \"from repo B\" }"),
+        ] {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), format!("{body}\n")).unwrap();
+        }
+        (a, b)
+    }
+
+    /// A plane whose facts were parsed from `root`, holding one symbol at
+    /// `src/lib.rs:1`. `root = None` leaves the plane without a sync point,
+    /// as a hand-built plane has.
+    fn plane_with(db: &Database, name: &str, root: Option<&std::path::Path>) {
+        db.create_plane(name, Properties::new()).unwrap();
+        write_nodes_logic(
+            db,
+            from_value(jval!({"plane": name, "nodes": [
+                {"external_key": "f", "labels": ["Function"],
+                 "properties": {"file": "src/lib.rs", "line": 1}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        if let Some(root) = root {
+            let plane = db.plane(name).unwrap();
+            let mut props = plane.properties().unwrap();
+            props.insert(
+                "synced_root".into(),
+                PropDesc::described(
+                    "directory the facts were parsed from",
+                    PropValue::Str(root.display().to_string()),
+                ),
+            );
+            plane.set_properties(props).unwrap();
+        }
+    }
+
+    fn snippet(db: &Database, fallback: Option<&std::path::Path>, plane: &str) -> String {
+        snippet_logic(
+            db,
+            fallback,
+            from_value(jval!({"plane": plane, "name": "f"})).unwrap(),
+        )
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+    }
+
+    /// The bug this guards: `snippet` resolved the *node* in the requested
+    /// plane but read the *file* from whichever tree the process was started
+    /// with. With a second code plane on the same server that returns another
+    /// repository's file at the same relative path — plausible text, no error.
+    /// So the assertion is on content, not on success.
+    #[test]
+    fn reads_the_planes_own_root_not_the_processs() {
+        let (a, b) = two_repos("own-root");
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "repo-b", Some(&b));
+
+        // The process is watching repo-a — the wrong tree for this plane.
+        let out = snippet(&db, Some(&a), "repo-b");
+        assert!(
+            out.contains("from repo B"),
+            "read the wrong repository's file: {out}"
+        );
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    /// A plane with no recorded root still works off the attached tree: that is
+    /// the plain `serve` + `[server] source_root` case, and every plane digested
+    /// before `synced_root` existed.
+    #[test]
+    fn falls_back_to_the_attached_tree() {
+        let (a, _b) = two_repos("fallback");
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "hand-built", None);
+
+        let out = snippet(&db, Some(&a), "hand-built");
+        assert!(out.contains("from repo A"), "{out}");
+
+        // No plane root and no attached tree is an error, not a wrong answer.
+        let db2 = Database::in_memory().unwrap();
+        plane_with(&db2, "hand-built", None);
+        assert!(
+            snippet_logic(
+                &db2,
+                None,
+                from_value(jval!({"plane": "hand-built", "name": "f"})).unwrap()
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
     }
 }
