@@ -55,10 +55,15 @@ tracing.workspace = true
 # Trimmed hard: the default feature set carries async, three GC strategies,
 # threads, stack-switching, profiling, coredump, caching and `wat`, none of
 # which a synchronous one-call-per-input host uses.
+# `parallel-compilation` is the one addition back: compiling the installed
+# components dominates `Plugins::load` — measured 13.7s for six, and single-
+# threaded to the millisecond (13.5s user of 13.8s wall) — and every load pays
+# it again. It only pulls in rayon, which this crate already depends on.
 wasmtime = { version = "47", default-features = false, features = [
     "runtime",
     "component-model",
     "cranelift",
+    "parallel-compilation",
     "std",
 ], optional = true }
 wasmtime-wasi = { version = "47", optional = true }
