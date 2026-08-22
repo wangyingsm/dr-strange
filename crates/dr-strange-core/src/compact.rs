@@ -107,12 +107,46 @@ fn candidates(name: &str, hits: &[NodeRecord]) -> String {
     out
 }
 
+/// The property a full rebuild stamps on the plane while it refills it, and
+/// clears when it finishes. Written by the digest side; read here.
+pub const REBUILDING_PROP: &str = "rebuilding_since";
+
+/// A rebuild in flight, stated wherever an answer is read.
+///
+/// A full resync drops the plane and refills it, so in between a query meets a
+/// plane that is not wrong but *incomplete* — and an incomplete plane answers
+/// "nothing matches" in exactly the words it uses for a symbol that genuinely
+/// is not there. Saying so is the whole point: silence here is the one failure
+/// mode a caller cannot detect. A marker left behind by a rebuild that died
+/// halfway deserves the same warning, which is why this is persisted rather
+/// than held in the rebuilding process.
+fn rebuilding_note(props: &Properties) -> Option<String> {
+    let since = match props.get(REBUILDING_PROP).map(|d| &d.value) {
+        Some(PropValue::Int(t)) => *t,
+        _ => return None,
+    };
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 - since)
+        .unwrap_or(0)
+        .max(0);
+    Some(format!(
+        "note: this plane is being rebuilt (started {ago}s ago) — it holds only \
+         what has been folded so far, so a miss here may mean \"not yet\" \
+         rather than \"not present\"; ask again when it finishes.\n"
+    ))
+}
+
 /// Freshness, stated where the answer is read: a watched plane records the
 /// commit it last folded, and an agent holding a newer checkout should know
 /// the graph may lag it. Silence means the plane records no sync point (a
-/// plain digest), where staleness is simply the digest's age.
+/// plain digest), where staleness is simply the digest's age — unless a
+/// rebuild is in flight, which outranks it and is said instead.
 fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
     let props = plane.properties()?;
+    if let Some(note) = rebuilding_note(&props) {
+        return Ok(Some(note));
+    }
     Ok(props.get("synced_commit").and_then(|d| match &d.value {
         crate::PropValue::Str(commit) => Some(format!(
             "synced: commit {}\n",
@@ -120,6 +154,19 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
         )),
         _ => None,
     }))
+}
+
+/// What to say when a lenient lookup found nothing.
+///
+/// Its whole job is to keep "not present" and "not yet folded" apart; every
+/// verb routes its empty case through here so no surface can quietly report
+/// absence during a rebuild.
+pub fn no_match(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
+    let mut out = format!("no symbol matches `{name}` in this plane\n");
+    if let Some(note) = rebuilding_note(&plane.properties()?) {
+        out.push_str(&note);
+    }
+    Ok(out)
 }
 
 /// The honesty footer every call listing carries: what a recorded edge set
@@ -149,7 +196,7 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
-        Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
+        Resolved::None => return no_match(plane, name),
     };
     let mut out = describe_record(plane, &node)?;
     if let Some(note) = synced_note(plane)? {
@@ -288,12 +335,12 @@ pub fn trace(plane: &PlaneHandle<'_>, from: &str, to: &str) -> Result<String> {
     let a = match resolve(plane, from)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(from, &hits)),
-        Resolved::None => return Ok(format!("no symbol matches `{from}` in this plane\n")),
+        Resolved::None => return no_match(plane, from),
     };
     let b = match resolve(plane, to)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(to, &hits)),
-        Resolved::None => return Ok(format!("no symbol matches `{to}` in this plane\n")),
+        Resolved::None => return no_match(plane, to),
     };
     let mut out = String::new();
     if let Some(note) = synced_note(plane)? {
@@ -384,7 +431,7 @@ pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
-        Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
+        Resolved::None => return no_match(plane, name),
     };
     let depth = depth.clamp(1, 6);
     let mut out = one_line(&node);
@@ -436,7 +483,7 @@ pub fn describe(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
-        Resolved::None => return Ok(format!("no symbol matches `{name}` in this plane\n")),
+        Resolved::None => return no_match(plane, name),
     };
     describe_record(plane, &node)
 }
@@ -575,6 +622,74 @@ mod tests {
         assert!(
             out.contains("synced: commit abcdef012345"),
             "freshness is stated where the answer is read: {out}"
+        );
+    }
+
+    fn mark_rebuilding(db: &Database, since: i64) {
+        let p = db.plane("code").unwrap();
+        let mut props = p.properties().unwrap();
+        props.insert(REBUILDING_PROP.into(), PropDesc::new(PropValue::Int(since)));
+        p.set_properties(props).unwrap();
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// The window a full rebuild opens: the plane has been dropped and is
+    /// refilling, so it answers "nothing matches" for symbols it simply has
+    /// not folded yet — word for word what it says about a symbol that does
+    /// not exist. Every verb must break that tie.
+    #[test]
+    fn a_miss_during_a_rebuild_is_not_reported_as_absence() {
+        let db = seeded();
+
+        // Baseline: a real miss says nothing about rebuilding.
+        let clean = context(&db.plane("code").unwrap(), "m::nope").unwrap();
+        assert!(clean.contains("no symbol matches"), "{clean}");
+        assert!(!clean.contains("being rebuilt"), "{clean}");
+
+        mark_rebuilding(&db, now() - 3);
+        let plane = db.plane("code").unwrap();
+        for out in [
+            context(&plane, "m::nope").unwrap(),
+            describe(&plane, "m::nope").unwrap(),
+            impact(&plane, "m::nope", 3).unwrap(),
+            trace(&plane, "m::nope", "m::api::go").unwrap(),
+            trace(&plane, "m::api::go", "m::nope").unwrap(),
+        ] {
+            assert!(out.contains("no symbol matches"), "{out}");
+            assert!(
+                out.contains("being rebuilt"),
+                "a miss mid-rebuild must not read as absence: {out}"
+            );
+        }
+    }
+
+    /// A *found* symbol mid-rebuild is equally provisional — the edges around
+    /// it may not all be folded yet — so the warning rides the answer, and
+    /// outranks the ordinary freshness line.
+    #[test]
+    fn a_hit_during_a_rebuild_says_so_instead_of_claiming_freshness() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        mark_rebuilding(&db, now());
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("being rebuilt"), "{out}");
+        assert!(
+            !out.contains("synced: commit"),
+            "a rebuilding plane must not also claim to be synced: {out}"
         );
     }
 
