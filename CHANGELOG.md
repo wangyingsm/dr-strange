@@ -4,6 +4,27 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-08-22
+
+### Fixed
+- **`snippet` reads source from the plane's own root.** It previously
+  resolved the node in the named plane but read the file from the
+  process-level `source_root`, so a second plane could silently return
+  another repository's file at the same relative path. Now uses the
+  plane's own `synced_root`, falling back to the process-level tree only
+  when neither is available.
+- **`serve watch` marks a plane mid-rebuild instead of reporting it
+  absent.** A lookup against a plane that `resync` is still refilling used
+  to read identically to "not found." The plane now carries a persisted
+  `rebuilding_since` marker, and every verb's response notes it — on both
+  empty and found answers — until the rebuild completes.
+
+### Performance
+- **Wasm plugin compilation runs in parallel.** `Plugins::load` now
+  enables wasmtime's `parallel-compilation` feature instead of compiling
+  every installed component on one thread; measured 13.8s -> 2.2s to load,
+  cutting `serve watch` startup-to-servable from ~15s to ~4s.
+
 ## [2.0.1] - 2026-08-19
 
 ### Added
