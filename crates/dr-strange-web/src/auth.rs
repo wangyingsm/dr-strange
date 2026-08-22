@@ -110,6 +110,20 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Wraps another [`Authorizer`], never granting `Write`/`Admin` regardless of
+/// what the inner backend would allow (`serve --follow`, arch/01 §9) — a
+/// third, orthogonal layer alongside the Origin guard and the bearer token:
+/// even a valid token cannot mutate a replica. Defense-in-depth alongside
+/// `NativeEngine`'s `read_only` flag, which also blocks any write that
+/// somehow bypassed HTTP entirely.
+pub struct ReadOnlyAuthorizer<A>(pub A);
+
+impl<A: Authorizer> Authorizer for ReadOnlyAuthorizer<A> {
+    fn allows(&self, access: Access, creds: &Credentials) -> bool {
+        access == Access::Read && self.0.allows(Access::Read, creds)
+    }
+}
+
 /// The resolved authorization for one request: a backend plus the caller's
 /// extracted credentials. Threaded through [`crate::rpc::handle`] so each
 /// method's [`Access`] is enforced at dispatch.
@@ -250,6 +264,18 @@ mod tests {
         assert!(!guarded.allows(Access::Write, &browser(None)));
         assert!(guarded.allows(Access::Read, &browser(Some("s3cret"))));
         assert!(guarded.allows(Access::Write, &browser(Some("s3cret"))));
+    }
+
+    #[test]
+    fn read_only_authorizer_never_grants_write_or_admin() {
+        let inner = SharedToken::new(Some("s3cret".into()));
+        let ro = ReadOnlyAuthorizer(inner);
+        let valid = native(Some("s3cret"));
+        assert!(ro.allows(Access::Read, &valid));
+        assert!(!ro.allows(Access::Write, &valid));
+        assert!(!ro.allows(Access::Admin, &valid));
+        // A bad token still fails, same as the inner authorizer would.
+        assert!(!ro.allows(Access::Read, &native(Some("wrong"))));
     }
 
     #[test]

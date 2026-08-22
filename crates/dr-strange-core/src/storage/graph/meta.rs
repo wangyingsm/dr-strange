@@ -444,7 +444,7 @@ pub fn drop_plane(txn: &mut dyn WriteTransaction, id: PlaneId) -> Result<()> {
         return Ok(());
     };
 
-    // `node_plane` is keyed by bare node id (no plane prefix — arch/01 §8
+    // `node_plane` is keyed by bare node id (no plane prefix — arch/01 §10
     // open question 7), so its entries can't be prefix-deleted. Collect the
     // plane's node ids from the (still-intact) Nodes table first.
     let prefix = keys::plane_key(id).to_vec();

@@ -31,6 +31,18 @@ pub enum Error {
     #[error("database is corrupt: {0}")]
     Corrupt(String),
 
+    /// A write was attempted against an engine in read-only mode (a
+    /// `serve --follow` replica; arch/01 §9). Replicated writes bypass this —
+    /// only the public [`crate::storage::engine::StorageEngine::begin_write`]
+    /// path is gated.
+    #[error("database is read-only: {0}")]
+    ReadOnly(String),
+
+    /// A capability only the native engine provides (WAL replication) was
+    /// invoked against a different backend (redb, in-memory).
+    #[error("not supported by this storage backend: {0}")]
+    Unsupported(String),
+
     /// A storage-backend failure. The concrete backend error (e.g. redb's)
     /// is preserved as the boxed source rather than appearing in this type:
     /// backends are swappable implementation details (arch/01 §1), so their

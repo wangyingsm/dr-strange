@@ -39,6 +39,10 @@ pub use compute::{
 pub use error::{Error, Result};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
 pub use storage::vector::Metric;
+/// Replication wire types (`serve --follow`, arch/01 §9) — ship regardless of
+/// backend feature; only [`Database::apply_replicated`]/[`Database::on_wal_commit`]
+/// (native-only) actually produce or consume them.
+pub use storage::{ReplicatedBatch, ReplicatedOp};
 pub use text::{Analyzer, Language};
 pub use types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,

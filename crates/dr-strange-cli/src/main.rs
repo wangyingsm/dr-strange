@@ -19,7 +19,7 @@ use std::io::{self, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use dr_strange_core::{Dir, Metric};
 
@@ -226,6 +226,21 @@ enum Command {
         addr: Option<SocketAddr>,
         #[command(subcommand)]
         mode: Option<ServeMode>,
+        /// Run as a read-only replica of another `drsg serve` (arch/01 §9):
+        /// every write RPC is refused, and this database (`--db`) mirrors
+        /// the master's, bootstrapping from its `/snapshot` then tailing its
+        /// `/ws/wal`. The master's address, e.g. `ws://host:7700` or
+        /// `wss://host:7700`. Mutually exclusive with `mode` (checked at
+        /// startup, not by clap — a subcommand can't be a `conflicts_with`
+        /// target) — a replica mirrors its master rather than running its
+        /// own ingestion.
+        #[arg(long, value_name = "URL")]
+        follow: Option<String>,
+        /// Bearer token presented to the `--follow` master. Falls back to
+        /// `DRSG_FOLLOW_TOKEN`. Distinct from this replica's own `DRSG_TOKEN`,
+        /// which still gates *its* downstream clients.
+        #[arg(long, requires = "follow")]
+        follow_token: Option<String>,
     },
     /// Ask a natural-language question; an LLM turns it into a read-only plan
     /// and runs it (ROADMAP §3).
@@ -798,32 +813,67 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             let db = commands::open(&cli.db)?;
             commands::restore(&db, &input, out)
         }
-        Command::Serve { addr, mode } => {
-            let db = commands::open(&cli.db)?;
-            #[allow(unused_mut)]
-            let mut opts = config::serve_options(cfg, addr);
-            #[cfg(feature = "digest")]
-            if let Some(ServeMode::Watch { dir, plane, force }) = mode {
-                let plane =
-                    plane.unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
-                let plugin_config = config::plugin_config(cfg)?;
-                // The same embed config the server's search uses keeps the
-                // watched plane's vectors current after each fold.
-                let embed = opts.embed_provider.clone();
-                // The watched tree is the graph's source — attach it, so the
-                // MCP `grep` tool answers literal-text questions beside the
-                // graph's structural ones.
-                opts.source_root = Some(dir.clone());
-                opts.on_start = Some(Box::new(move |db| {
-                    commands::watch(db, dir, plane, plugin_config, embed, force)
-                }));
+        Command::Serve {
+            addr,
+            mode,
+            follow,
+            follow_token,
+        } => {
+            if follow.is_some() && mode.is_some() {
+                bail!("--follow and a serve subcommand (e.g. `watch`) are mutually exclusive");
             }
-            #[cfg(not(feature = "digest"))]
-            let _ = mode;
-            // Hands off to the web crate, which owns its own async runtime and
-            // blocks until a shutdown signal; `out` is unused (the server logs
-            // itself).
-            dr_strange_web::serve(db, Some(cli.db.clone()), opts)
+            if let Some(upstream) = follow {
+                let follow_opts = dr_strange_web::FollowOptions {
+                    upstream,
+                    token: follow_token.or_else(|| std::env::var("DRSG_FOLLOW_TOKEN").ok()),
+                };
+                // Every (re)connect is a full resync from scratch (arch/01
+                // §9): each loop iteration wipes `cli.db` and reopens a fresh,
+                // empty, read-only engine before `serve` bootstraps it from
+                // the master's `/snapshot`.
+                loop {
+                    commands::prepare_follower_dir(&cli.db)?;
+                    let db = dr_strange_core::Database::open_read_only(&cli.db)
+                        .with_context(|| format!("opening replica at {}", cli.db.display()))?;
+                    let mut opts = config::serve_options(cfg, addr);
+                    opts.follow = Some(follow_opts.clone());
+                    match dr_strange_web::serve(db, Some(cli.db.clone()), opts)? {
+                        dr_strange_web::ServeOutcome::Stopped => break Ok(()),
+                        dr_strange_web::ServeOutcome::ResyncNeeded => {
+                            tracing::warn!(
+                                "resyncing from master after losing the replication stream"
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    }
+                }
+            } else {
+                let db = commands::open(&cli.db)?;
+                #[allow(unused_mut)]
+                let mut opts = config::serve_options(cfg, addr);
+                #[cfg(feature = "digest")]
+                if let Some(ServeMode::Watch { dir, plane, force }) = mode {
+                    let plane = plane
+                        .unwrap_or_else(|| commands::default_plane(&dir.display().to_string()));
+                    let plugin_config = config::plugin_config(cfg)?;
+                    // The same embed config the server's search uses keeps the
+                    // watched plane's vectors current after each fold.
+                    let embed = opts.embed_provider.clone();
+                    // The watched tree is the graph's source — attach it, so the
+                    // MCP `grep` tool answers literal-text questions beside the
+                    // graph's structural ones.
+                    opts.source_root = Some(dir.clone());
+                    opts.on_start = Some(Box::new(move |db| {
+                        commands::watch(db, dir, plane, plugin_config, embed, force)
+                    }));
+                }
+                #[cfg(not(feature = "digest"))]
+                let _ = mode;
+                // Hands off to the web crate, which owns its own async runtime
+                // and blocks until a shutdown signal; `out` is unused (the
+                // server logs itself). Never `--follow`, so always `Stopped`.
+                dr_strange_web::serve(db, Some(cli.db.clone()), opts).map(|_| ())
+            }
         }
         #[cfg(feature = "digest")]
         Command::Vectorize {

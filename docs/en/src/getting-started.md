@@ -254,6 +254,31 @@ takes precedence over the corresponding file value, and the `--addr` flag
 overrides `[server].addr`. Providing `[server.tls]` switches the server to
 HTTPS.
 
+## Read-only replicas (`serve --follow`)
+
+A second `drsg serve`, started with `--follow`, mirrors a running one
+read-only — for scaling reads across a cluster of agents without funnelling
+every query through one process:
+
+```console
+$ drsg --db replica.drsg serve --addr 127.0.0.1:7701 \
+    --follow ws://master-host:7700 --follow-token please-change-me
+```
+
+Every write RPC is refused regardless of token. On startup — and again after
+any disconnect — the replica pulls a full, consistent snapshot from the
+master's `/snapshot` endpoint, then tails its `/ws/wal` for new commits;
+every reconnect resyncs from scratch (arch/01 §9), so `--db` must name an
+empty directory or one this same replica already owns (a `.drsg-follower`
+marker records that) — anything else is refused rather than silently wiped.
+
+`--follow-token` (or `DRSG_FOLLOW_TOKEN`) is the credential presented to the
+master; it is independent of this replica's own `DRSG_TOKEN`, which still
+gates its own downstream clients. Point `--follow` at `wss://` rather than
+`ws://` for a master reachable over anything but loopback — the bearer token
+otherwise travels in plaintext, the same requirement `[server.tls]` already
+carries for inbound connections.
+
 ## Container image
 
 A multi-arch image (`linux/amd64` and `linux/arm64`) is published to the GitHub

@@ -18,7 +18,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use dr_strange_core::{ChangeSet, Database, PlaneId};
+use dr_strange_core::{ChangeSet, Database, PlaneId, ReplicatedBatch};
 use dr_strange_mcp::DrStrange;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -35,7 +35,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::ServeOptions;
 use crate::assets::static_handler;
-use crate::auth::{Access, AllowedOrigins, Auth, Authorizer, Credentials, SharedToken};
+use crate::auth::{
+    Access, AllowedOrigins, Auth, Authorizer, Credentials, ReadOnlyAuthorizer, SharedToken,
+};
+#[cfg(feature = "native-backend")]
+use crate::follow;
 use crate::methods::{self, Ctx};
 use crate::rpc;
 
@@ -72,6 +76,11 @@ pub struct AppState {
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
     /// drops events rather than stalling writers.
     pub changes: broadcast::Sender<Arc<ChangeSet>>,
+    /// Raw-WAL replication feed (`serve --follow`, arch/01 §9): the core
+    /// observer publishes each committed batch here, and `/ws/wal` forwards
+    /// it to every follower — no filtering, unlike `changes`, since a
+    /// follower mirrors the whole database.
+    pub wal_changes: broadcast::Sender<Arc<ReplicatedBatch>>,
     /// Server-side `digest.run` defaults (from `[digest]` config / built-ins).
     pub digest: crate::DigestDefaults,
     /// URL-fetch policy and budgets (from `[fetch]` config / built-ins).
@@ -300,6 +309,13 @@ fn router(
         // so the local-UI Origin check can't see it and a tokenless server
         // would 401 its own UI. POST always carries Origin.
         .route("/export", post(export_http))
+        // `serve --follow` (arch/01 §9): the one-shot bootstrap bundle and
+        // the live WAL tail. GET is fine for both — unlike /export/cypher,
+        // callers here are always a follower process carrying an explicit
+        // bearer token, never a same-origin browser GET relying on the
+        // Origin-based local-UI bypass.
+        .route("/snapshot", get(snapshot_http))
+        .route("/ws/wal", get(ws_wal_upgrade))
         // POST: the query text is the body; kept off /rpc (and thus the OpenRPC
         // schema / SDKs) as a web-only surface, like /export.
         .route("/cypher", post(cypher_http))
@@ -560,6 +576,103 @@ async fn export_http(
     }
 }
 
+/// `GET /snapshot` — the one-shot bootstrap bundle for `serve --follow`
+/// (arch/01 §9): the whole database, id-faithful, at one commit sequence
+/// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire). Same
+/// full-buffer-then-respond shape as `export_http`: this project's scale
+/// doesn't yet need chunked transfer.
+async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let built = tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || -> Result<Vec<u8>, dr_strange_core::Error> {
+            let mut buf = Vec::new();
+            state.db.snapshot(&mut buf)?;
+            Ok(buf)
+        }
+    })
+    .await;
+    match built {
+        Ok(Ok(bytes)) => {
+            tracing::info!(bytes = bytes.len(), "served a replication snapshot");
+            Response::builder()
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "snapshot export failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        Err(_) => {
+            tracing::error!("snapshot export task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot export task failed",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /ws/wal` — the live tail for `serve --follow` (arch/01 §9): every
+/// commit's raw ops, forwarded verbatim from [`AppState::wal_changes`] to
+/// whichever follower is subscribed. No bootstrap data ever rides this
+/// socket — `/snapshot` is the one-shot bundle; this is purely the ongoing
+/// feed, subscribed to *before* a follower pulls its snapshot so nothing
+/// committed in between is ever missed (the same ordering `/ws`'s
+/// `plane.watch` already relies on).
+async fn ws_wal_upgrade(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, q.token) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    ws.on_upgrade(move |socket| ws_wal_task(socket, state))
+}
+
+async fn ws_wal_task(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut changes = state.wal_changes.subscribe();
+    loop {
+        match changes.recv().await {
+            Ok(batch) => {
+                let bytes = match postcard::to_stdvec(&*batch) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode a replicated batch");
+                        continue;
+                    }
+                };
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+            }
+            // A follower that falls too far behind loses the overflow, same
+            // best-effort posture as the `changes` feed — but for WAL
+            // replication that's not survivable (every op matters), so it
+            // must trigger a fresh resync rather than silently continuing.
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                tracing::warn!("follower fell behind the WAL feed; closing so it resyncs");
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct CypherQuery {
     #[serde(default)]
@@ -669,19 +782,31 @@ fn startup_banner() {
     );
 }
 
-/// Runs the server until Ctrl-C. Owns the tokio runtime setup's payload; the
+/// Why [`run`] returned: a normal shutdown (Ctrl-C / SIGTERM), or — only ever
+/// in `--follow` mode — the replication stream from the master was lost.
+/// The caller (the CLI's `Serve` handler) matches on this to decide whether
+/// to reopen a fresh, empty database and call [`crate::serve`] again to
+/// resync from scratch, per arch/01 §9's "every reconnect is a full resync"
+/// design.
+pub enum ServeOutcome {
+    Stopped,
+    ResyncNeeded,
+}
+
+/// Runs the server until Ctrl-C — or, in `--follow` mode, until the
+/// replication stream is lost. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
 pub async fn run(
     db: Database,
     db_path: Option<PathBuf>,
-    mut opts: ServeOptions,
-) -> anyhow::Result<()> {
+    opts: ServeOptions,
+) -> anyhow::Result<ServeOutcome> {
     startup_banner();
     // Read the secret once so the checker (`authorizer`) and the SPA's injected
     // copy (`bootstrap_token`) can never disagree.
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
-    let authorizer = SharedToken::new(token.clone());
-    if authorizer.is_configured() {
+    let shared_token = SharedToken::new(token.clone());
+    if shared_token.is_configured() {
         tracing::info!(
             "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
         );
@@ -690,6 +815,15 @@ pub async fn run(
             "no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
         );
     }
+    // `serve --follow` (arch/01 §9): every write RPC is refused regardless of
+    // token — a third, orthogonal layer alongside the Origin guard and the
+    // bearer token itself.
+    let authorizer: Arc<dyn Authorizer> = if opts.follow.is_some() {
+        tracing::info!("read-only replica (serve --follow): all write RPCs are refused");
+        Arc::new(ReadOnlyAuthorizer(shared_token))
+    } else {
+        Arc::new(shared_token)
+    };
     // Change feed (ROADMAP §5): publish every committed ChangeSet to a
     // broadcast channel that `/ws` subscribers drain. Registered before the db
     // is shared, and best-effort — `send` failing (no live subscriber) is fine.
@@ -700,17 +834,91 @@ pub async fn run(
             let _ = tx.send(Arc::new(cs));
         });
     }
+    // Raw-WAL replication feed (arch/01 §9): every commit's ops, for any
+    // `/ws/wal` subscriber. Native-only; a redb/in-memory database (existing
+    // tests use `Database::in_memory()`) simply has no feed to publish —
+    // fine, unless this process itself is meant to be followed by someone
+    // else, which `--follow` never is (a follower doesn't serve its own
+    // followers in this design), so that combination can't arise.
+    let (wal_changes, _) = broadcast::channel::<Arc<ReplicatedBatch>>(CHANGE_FEED_CAPACITY);
+    #[cfg(feature = "native-backend")]
+    {
+        let tx = wal_changes.clone();
+        if let Err(e) = db.on_wal_commit(move |batch| {
+            let _ = tx.send(Arc::new(batch));
+        }) {
+            tracing::debug!(error = %e, "WAL replication feed unavailable for this database");
+        }
+    }
+    if opts.follow.is_some() && !cfg!(feature = "native-backend") {
+        anyhow::bail!("serve --follow requires the native-backend feature");
+    }
+
+    // `serve --follow`: bootstrap from the master before this server ever
+    // answers a request — an empty database serving reads would just be
+    // wrong, not merely stale. Subscribes to `/ws/wal` before pulling the
+    // snapshot (see `follow::bootstrap`), so nothing committed on the master
+    // during the pull is lost. `mod follow` (and so this block) only exists
+    // under `native-backend`; the bail-out above already guarantees
+    // `opts.follow` is `None` whenever it's compiled out.
+    let resync_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follow_lost = Arc::new(tokio::sync::Notify::new());
+    #[cfg(feature = "native-backend")]
+    if let Some(follow_opts) = opts.follow.clone() {
+        let bootstrapped = follow::bootstrap(&db, &follow_opts)
+            .await
+            .context("bootstrapping from the master")?;
+        tracing::info!(
+            seq = bootstrapped.stats.seq,
+            nodes = bootstrapped.stats.nodes,
+            edges = bootstrapped.stats.edges,
+            "resynced from master"
+        );
+        let db_for_tail = Arc::new(db);
+        tokio::spawn(follow::run_live_tail(
+            db_for_tail.clone(),
+            bootstrapped.batches,
+            resync_needed.clone(),
+            follow_lost.clone(),
+        ));
+        let state = Arc::new(AppState {
+            db: db_for_tail,
+            db_path,
+            authorizer,
+            origins: AllowedOrigins::from_env(),
+            bootstrap_token: token,
+            changes,
+            wal_changes,
+            digest: opts.digest,
+            fetch: opts.fetch.clone(),
+            query_timeout: opts.query_timeout,
+        });
+        return run_app(state, opts, &resync_needed, &follow_lost).await;
+    }
     let state = Arc::new(AppState {
         db: Arc::new(db),
         db_path,
-        authorizer: Arc::new(authorizer),
+        authorizer,
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
         changes,
+        wal_changes,
         digest: opts.digest,
-        fetch: opts.fetch,
+        fetch: opts.fetch.clone(),
         query_timeout: opts.query_timeout,
     });
+    run_app(state, opts, &resync_needed, &follow_lost).await
+}
+
+/// The rest of `run`, shared by the follow and non-follow paths once
+/// `AppState` exists: start `on_start`, build the router, bind, and serve
+/// until shutdown or (`--follow` only) `follow_lost`.
+async fn run_app(
+    state: Arc<AppState>,
+    mut opts: ServeOptions,
+    resync_needed: &std::sync::atomic::AtomicBool,
+    follow_lost: &tokio::sync::Notify,
+) -> anyhow::Result<ServeOutcome> {
     // The caller's background task (e.g. the repository watcher behind
     // `drsg serve watch`) gets its own handle to the shared database. A plain
     // thread rather than a tokio task: the work is blocking (git, parsing,
@@ -743,7 +951,7 @@ pub async fn run(
         "drsg serve: dashboard + JSON-RPC listening on {scheme}://{bound}"
     );
     let served = match opts.tls {
-        Some(tls) => serve_tls(app, std_listener, tls).await,
+        Some(tls) => serve_tls(app, std_listener, tls, follow_lost).await,
         None => {
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
             // Bound the drain, as the TLS path already does. `axum::serve`
@@ -772,13 +980,27 @@ pub async fn run(
                         "connections still open after the drain deadline; exiting anyway"
                     );
                 }
+                // `--follow` losing its replication stream: resync as soon as
+                // possible rather than waiting out a graceful drain — unlike
+                // Ctrl-C, this isn't an operator-requested shutdown, so
+                // in-flight reads are cut short rather than awaited.
+                _ = follow_lost.notified() => {
+                    tracing::warn!("replication stream lost; ending this session to resync");
+                }
             }
             Ok(())
         }
     };
     db_at_shutdown.save_sidecars();
     tracing::info!("index sidecars saved; next open loads instead of rebuilding");
-    served
+    served?;
+    Ok(
+        if resync_needed.load(std::sync::atomic::Ordering::Relaxed) {
+            ServeOutcome::ResyncNeeded
+        } else {
+            ServeOutcome::Stopped
+        },
+    )
 }
 
 /// Serve HTTPS on an already-bound listener, terminating TLS with rustls.
@@ -787,6 +1009,7 @@ async fn serve_tls(
     app: Router,
     listener: std::net::TcpListener,
     tls: crate::TlsOptions,
+    follow_lost: &tokio::sync::Notify,
 ) -> anyhow::Result<()> {
     use axum_server::tls_rustls::RustlsConfig;
 
@@ -812,10 +1035,17 @@ async fn serve_tls(
             handle.graceful_shutdown(Some(DRAIN_GRACE));
         }
     });
-    axum_server::from_tcp_rustls(listener, config)?
+    let serve = axum_server::from_tcp_rustls(listener, config)?
         .handle(handle)
-        .serve(app.into_make_service())
-        .await?;
+        .serve(app.into_make_service());
+    tokio::select! {
+        res = serve => res?,
+        // `--follow` losing its replication stream: same immediate-not-
+        // graceful posture as the plain-HTTP path (see there for why).
+        _ = follow_lost.notified() => {
+            tracing::warn!("replication stream lost; ending this session to resync");
+        }
+    }
     Ok(())
 }
 

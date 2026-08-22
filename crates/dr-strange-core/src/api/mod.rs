@@ -37,6 +37,8 @@ use crate::error::{Error, Result};
 use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
+#[cfg(feature = "native-backend")]
+use crate::storage::engine::{ReplicatedBatch, WalObserver};
 use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 #[cfg(feature = "native-backend")]
@@ -109,28 +111,59 @@ impl Engine {
         }
     }
 
+    /// Like [`with_write`](Self::with_write), but bypasses `read_only`
+    /// (native-only, via `begin_write_unchecked`). Used only by
+    /// [`Database::init`]'s one-time-per-open plane/counters bootstrap,
+    /// which must succeed even on a read-only-opened (`serve --follow`)
+    /// database — it's the engine's own setup, not a caller's write.
+    fn with_write_bootstrap<T>(
+        &self,
+        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        macro_rules! run {
+            ($begin:expr) => {{
+                let mut txn = $begin?;
+                let out = f(&mut txn)?;
+                graph::bump_commit_seq(&mut txn)?;
+                graph::write_commit_time(&mut txn, now_millis())?;
+                txn.commit()?;
+                Ok(out)
+            }};
+        }
+        match self {
+            Engine::Memory(e) => run!(e.begin_write()),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => run!(e.begin_write()),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => run!(e.begin_write_unchecked()),
+        }
+    }
+
     /// Like [`with_write`](Self::with_write) but WITHOUT bumping the commit
     /// sequence — the caller sets it explicitly. Used only by snapshot restore
     /// (ROADMAP §6), which must land the source's exact commit sequence so the
-    /// restored sidecars (stamped with it) stay valid.
+    /// restored sidecars (stamped with it) stay valid. Bypasses `read_only`
+    /// (native-only, via `begin_write_unchecked`) since restoring a snapshot
+    /// is precisely how a `serve --follow` replica (arch/01 §9) bootstraps —
+    /// the one write path a read-only-opened database is meant to accept.
     fn with_write_raw<T>(
         &self,
         f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
     ) -> Result<T> {
         macro_rules! run {
-            ($e:expr) => {{
-                let mut txn = $e.begin_write()?;
+            ($begin:expr) => {{
+                let mut txn = $begin?;
                 let out = f(&mut txn)?;
                 txn.commit()?;
                 Ok(out)
             }};
         }
         match self {
-            Engine::Memory(e) => run!(e),
+            Engine::Memory(e) => run!(e.begin_write()),
             #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
-            Engine::Redb(e) => run!(e),
+            Engine::Redb(e) => run!(e.begin_write()),
             #[cfg(feature = "native-backend")]
-            Engine::Native(e) => run!(e),
+            Engine::Native(e) => run!(e.begin_write_unchecked()),
         }
     }
 
@@ -160,6 +193,30 @@ impl Engine {
             Engine::Memory(_) => Err(no_time_travel()),
         }
     }
+
+    /// Apply a batch replicated from another engine's WAL (`serve --follow`,
+    /// arch/01 §9), landing it at the batch's own sequence. Native-only — the
+    /// WAL this replicates is a native-engine concept.
+    #[cfg(feature = "native-backend")]
+    fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
+        match self {
+            Engine::Native(e) => e.apply_replicated(batch),
+            Engine::Memory(_) => Err(no_replication()),
+        }
+    }
+
+    /// Register (`Some`) or clear (`None`) the observer invoked after every
+    /// commit's WAL fsync. Native-only.
+    #[cfg(feature = "native-backend")]
+    fn set_wal_observer(&self, f: Option<WalObserver>) -> Result<()> {
+        match self {
+            Engine::Native(e) => {
+                e.set_wal_observer(f);
+                Ok(())
+            }
+            Engine::Memory(_) => Err(no_replication()),
+        }
+    }
 }
 
 /// The error a memory database returns for a time-travel request (no history).
@@ -167,6 +224,14 @@ impl Engine {
 fn no_time_travel() -> Error {
     Error::InvalidArgument(
         "time-travel (AS OF) needs an on-disk native database; this one is in memory".into(),
+    )
+}
+
+/// The error a memory database returns for a WAL-replication request.
+#[cfg(feature = "native-backend")]
+fn no_replication() -> Error {
+    Error::Unsupported(
+        "WAL replication needs an on-disk native database; this one is in memory".into(),
     )
 }
 
@@ -374,6 +439,44 @@ impl Database {
         Ok(db)
     }
 
+    /// Opens (creating if needed) an on-disk database at `path` in read-only
+    /// mode: [`Error::ReadOnly`] on any write attempt, for the handle's whole
+    /// lifetime (`serve --follow`, arch/01 §9 — a replica never gets
+    /// promoted, so this needs no runtime toggle). [`Self::apply_replicated`]
+    /// is the one write path unaffected by it. Native-only — replication
+    /// mirrors the native engine's own WAL.
+    #[cfg(feature = "native-backend")]
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let engine = Engine::Native(Box::new(NativeEngine::open_read_only(path)?));
+        let db = Self::init(
+            engine,
+            Some(sidecar_path(path)),
+            Some(keyword_sidecar_path(path)),
+        )?;
+        tracing::info!(path = %path.display(), "opened database (read-only replica)");
+        Ok(db)
+    }
+
+    /// Apply a batch replicated from another engine's WAL, landing it at the
+    /// batch's own commit sequence rather than allocating a new one — so a
+    /// replica's KV content converges byte-for-byte with its source
+    /// (`serve --follow`, arch/01 §9). Native-only.
+    #[cfg(feature = "native-backend")]
+    pub fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
+        self.engine.apply_replicated(batch)
+    }
+
+    /// Register a replication observer, invoked synchronously right after
+    /// every commit's WAL fsync (`serve --follow`, arch/01 §9) — same
+    /// contract as the `ChangeSet` observer below: cheap and non-blocking,
+    /// the web layer just forwards into a broadcast channel. Replaces any
+    /// previously registered observer. Native-only.
+    #[cfg(feature = "native-backend")]
+    pub fn on_wal_commit(&self, f: impl Fn(ReplicatedBatch) + Send + Sync + 'static) -> Result<()> {
+        self.engine.set_wal_observer(Some(Arc::new(f)))
+    }
+
     /// Bound how long a write transaction waits for the single writer slot
     /// before failing with [`Error::Timeout`]. `None` (the default) waits
     /// forever.
@@ -407,13 +510,13 @@ impl Database {
         // stamped with on the previous drop. A brand-new database has no meta
         // yet (read errors) and no sidecar to match anyway → `None`.
         let prior_seq = engine.with_read(|txn| graph::read_commit_seq(txn)).ok();
-        engine.with_write(|txn| graph::init(txn))?;
+        engine.with_write_bootstrap(|txn| graph::init(txn))?;
         // Backfill: a database written before summary counters existed has
         // no rows — count each such plane once, here, so every later
         // dashboard read is a point lookup (arch/03 §5). A fresh database
         // pays nothing (its planes are empty); an already-migrated one pays
         // one row read per plane.
-        engine.with_write(|txn| {
+        engine.with_write_bootstrap(|txn| {
             for (plane, _name) in graph::list_planes(txn)? {
                 let key = crate::storage::keys::counters_key(plane);
                 if txn.get(TableId::Meta, &key)?.is_none() {

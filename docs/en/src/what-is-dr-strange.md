@@ -91,6 +91,7 @@ for all of it.
 | **Commit-synced watch** | `serve watch` folds every commit into the plane |
 | **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
 | **Backup / restore** | Consistent, id-faithful whole-database snapshots |
+| **Read-only replicas** | `serve --follow` mirrors a running server for read-scaling across a cluster |
 | **Interfaces** | Web UI, six language SDKs, a CLI, and an MCP server |
 
 ## What v1.0 is

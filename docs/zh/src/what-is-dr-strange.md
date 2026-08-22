@@ -80,6 +80,7 @@ SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 5 RETURN d
 | **提交同步监视** | `serve watch` 将每次提交折叠进平面 |
 | **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`，每个问题一次往返 |
 | **备份 / 恢复** | 一致、保 id 的整库快照 |
+| **只读副本** | `serve --follow` 镜像一个正在运行的服务，用于跨集群扩展读取 |
 | **访问方式** | Web 界面、六种语言 SDK、命令行，以及 MCP 服务 |
 
 ## v1.0 意味着什么

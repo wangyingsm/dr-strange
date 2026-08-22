@@ -21,6 +21,36 @@ pub fn open(path: &Path) -> Result<Database> {
     Database::open(path).with_context(|| format!("opening database at {}", path.display()))
 }
 
+/// Marker file left in a `serve --follow` replica's directory (arch/01 §9)
+/// after a successful resync, so the next resync knows it's safe to wipe.
+const FOLLOWER_MARKER: &str = ".drsg-follower";
+
+/// Prepares `path` for a fresh `serve --follow` resync: wipes it if empty,
+/// absent, or already marked as a prior replica copy, then recreates it with
+/// the marker in place. Refuses to touch a directory that holds something
+/// else — a replica resyncs by deleting everything it has, so silently
+/// wiping a real database would be exactly the wrong kind of convenient.
+pub fn prepare_follower_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        let has_content = std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if has_content && !path.join(FOLLOWER_MARKER).exists() {
+            bail!(
+                "{} is not empty and not a previous `serve --follow` replica; \
+                 refusing to wipe it. Point --db at an empty or dedicated \
+                 directory for --follow.",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("clearing the replica directory {}", path.display()))?;
+    }
+    std::fs::create_dir_all(path)?;
+    std::fs::write(path.join(FOLLOWER_MARKER), b"")?;
+    Ok(())
+}
+
 fn plane<'db>(db: &'db Database, name: &str) -> Result<PlaneHandle<'db>> {
     db.plane(name)
         .with_context(|| format!("no such plane '{name}'"))

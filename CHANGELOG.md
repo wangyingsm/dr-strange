@@ -4,6 +4,17 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`serve --follow` — read-only replicas (arch/01 §9).** A second
+  `drsg serve` can mirror a running one for read-scaling across a cluster:
+  every write RPC is refused regardless of token, and the replica
+  bootstraps from the master's `GET /snapshot` then tails its `GET /ws/wal`
+  for new commits, shipped as raw WAL ops so the replica's KV content
+  converges byte-for-byte with its source. Every reconnect does a full
+  resync from scratch — no partial catch-up. Native-backend only.
+
 ## [2.0.2] - 2026-08-22
 
 ### Fixed

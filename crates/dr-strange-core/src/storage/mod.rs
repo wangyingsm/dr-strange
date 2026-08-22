@@ -28,5 +28,8 @@ pub mod redb_backend;
 #[cfg(test)]
 mod conformance_tests;
 
-pub use engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
+pub use engine::{
+    ReadTransaction, ReplicatedBatch, ReplicatedOp, StorageEngine, TableId, WalObserver,
+    WriteTransaction,
+};
 pub use vector::VectorIndex;

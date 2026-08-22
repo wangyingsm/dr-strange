@@ -6,7 +6,7 @@ use crate::error::Result;
 
 /// Logical tables of the graph encoding (arch/01 §3). Backends map these to
 /// their own namespaces (redb tables, prefixes, ...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TableId {
     Meta,
     Planes,
@@ -42,9 +42,43 @@ impl TableId {
             .position(|t| *t == self)
             .expect("all variants listed")
     }
+
+    /// Reverse of [`Self::index`]: the table a WAL/replication byte tag
+    /// names, or `None` for a tag no known table maps to.
+    pub fn from_index(index: u8) -> Option<TableId> {
+        Self::ALL.get(index as usize).copied()
+    }
 }
 
 pub type KvPair = (Vec<u8>, Vec<u8>);
+
+/// One raw table write, as replicated from a committing engine to a
+/// `serve --follow` replica (arch/01 §9). `None` value is a tombstone
+/// (delete) — mirrors the native engine's on-disk WAL op exactly, so a
+/// replica lands byte-for-byte the same KV content as the source, including
+/// tables the graph API doesn't itself model (indices, counters).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplicatedOp {
+    pub table: TableId,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// One committed transaction's worth of raw ops, tagged with the commit
+/// sequence it landed at — the wire message for `/ws/wal` (arch/01 §9). A
+/// replica applies these with [`crate::api::Database::apply_replicated`],
+/// which lands them at this exact `seq` rather than allocating a new one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplicatedBatch {
+    pub seq: u64,
+    pub ops: Vec<ReplicatedOp>,
+}
+
+/// A registered replication observer, invoked synchronously right after a
+/// commit's WAL fsync (native engine only). Same shape/contract as
+/// `api::ChangeObserver` — cheap and non-blocking; the web layer forwards
+/// into a broadcast channel.
+pub type WalObserver = std::sync::Arc<dyn Fn(ReplicatedBatch) + Send + Sync>;
 
 pub trait StorageEngine: Send + Sync + 'static {
     type ReadTxn<'a>: ReadTransaction

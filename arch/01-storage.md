@@ -221,7 +221,69 @@ Inherited from redb in v1:
   committed snapshot is `Arc`-shared (M5), so a read is an O(1) pointer clone
   and a write is copy-on-write — no longer a full deep copy per read.
 
-## 8. Open questions
+## 9. Replication (`serve --follow`)
+
+**Status: shipped.** A read-only replica of another running `drsg serve`,
+for scaling reads across a cluster of agents without funnelling every query
+through one process — the escape hatch arch/08 §4 named when it accepted
+"one process owns the database" as a v1 limit.
+
+**Scope, decided up front:** read-scaling only, no promotion/failover — the
+master stays the permanent single writer. Every (re)connect does a full
+resync from scratch; no partial/bounded-WAL catch-up. Whole-database, not
+per-plane — the WAL has no cheaper per-plane filter without inspecting every
+key.
+
+**Reused rather than reinvented:**
+
+- **The WAL itself.** Each commit's `WalBatch { seq, ops }` (§6's on-disk
+  form) is exactly the wire format replication needs — raw
+  `(table, key, value | tombstone)` triples, shipped as-is to `/ws/wal`
+  subscribers. This is what makes replication byte-for-byte faithful,
+  including tables the graph API doesn't itself model (indices, counters) —
+  a graph-semantic replay (`create_node`/`create_edge` calls) would miss
+  those.
+- **`Database::snapshot`/`restore`** (§8, ROADMAP §6). The one-shot bootstrap
+  bundle a fresh or reconnecting replica pulls from the master's
+  `GET /snapshot`, unchanged: id-faithful, lands the source's exact commit
+  sequence, and `restore` already refuses a non-empty target.
+- **The `/ws` + broadcast ordering already used for `ChangeSet`** (arch/08
+  §5.3): a follower subscribes to `/ws/wal` *before* pulling its snapshot,
+  so nothing committed on the master during the pull is ever missed — any
+  batch that lands before the snapshot's own cutover sequence is already
+  reflected in it and is simply skipped.
+- **The per-method `Access` gate** (arch/08). Refusing writes needed no
+  per-method change — a `ReadOnlyAuthorizer` decorator that never grants
+  `Write`/`Admin` regardless of the token, layered alongside the Origin
+  guard and the bearer token as a third, independent gate.
+
+**Storage-layer specifics:**
+
+- `NativeEngine` gained a `read_only: bool`, fixed at open
+  (`NativeEngine::open_read_only`) for the engine's whole lifetime — a
+  replica never gets promoted, so this needs no runtime setter.
+  `begin_write` refuses immediately when set; `apply_replicated` (the
+  replica's own write path, landing a batch at its master's exact `seq`)
+  bypasses it entirely, since it isn't the gate this flag exists for.
+- `Database::init`'s one-time-per-open plane/counters bootstrap, and
+  `restore`, both need to succeed on a read-only-opened engine — they're the
+  engine's own setup, not a caller's write. Both go through a
+  `begin_write_unchecked` path at the storage layer instead of the
+  read-only-gated `begin_write`.
+- A commit-time observer (`Database::on_wal_commit`, mirroring the existing
+  `ChangeObserver` — synchronous, cheap, the web layer forwards into a
+  broadcast channel) fires right after the WAL fsync, so a subscriber only
+  ever sees a batch that is already durable on the master.
+- Native-only: replication mirrors the native engine's own WAL, so
+  `redb-backend`/in-memory databases return `Error::Unsupported` from
+  `apply_replicated`/`on_wal_commit` rather than participating.
+
+**Out of scope, deliberately:** scoped read-only API tokens (today's single
+shared token already covers "read only" via `ReadOnlyAuthorizer`; a future
+scoped-key backend, mentioned in arch/08's auth section, slots in without
+touching this design).
+
+## 10. Open questions
 
 1. ~~**Property codec** — MessagePack vs postcard vs custom.~~ **Resolved
    (M0/M1): postcard.** bincode was the other leading candidate but is

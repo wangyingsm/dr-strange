@@ -41,7 +41,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, backend};
 use crate::storage::engine::{
-    KvPair, ReadTransaction, StorageEngine, TableId, WriteTransaction, prefix_successor,
+    KvPair, ReadTransaction, ReplicatedBatch, ReplicatedOp, StorageEngine, TableId, WalObserver,
+    WriteTransaction, prefix_successor,
 };
 
 /// Serializes writers within one process, with an optional deadline.
@@ -278,6 +279,17 @@ pub struct NativeEngine {
     /// versions down to `committed_seq - n`; older snapshots are compacted away.
     /// Compaction floors its GC at `min(oldest live reader, this)`.
     retain_commits: AtomicU64,
+    /// Set once at open by a `serve --follow` replica (arch/01 §9): rejects
+    /// `begin_write` outright for the engine's whole lifetime — a replica
+    /// never gets promoted, so this needs no runtime setter.
+    /// [`Self::apply_replicated`] bypasses it — it's the one write path a
+    /// replica is meant to use.
+    read_only: bool,
+    /// Registered by the web layer once a follower may be subscribed;
+    /// invoked synchronously right after each commit's WAL fsync, same
+    /// contract as `api::ChangeObserver` ("cheap and non-blocking — the web
+    /// layer just forwards into a broadcast channel").
+    wal_observer: Mutex<Option<WalObserver>>,
 }
 
 impl NativeEngine {
@@ -293,12 +305,30 @@ impl NativeEngine {
     /// Open (creating if absent) the engine directory at `path`: load its SSTs,
     /// then replay the WAL tail into the memtable.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_threshold(path, DEFAULT_FLUSH_THRESHOLD)
+        Self::open_with_options(path, DEFAULT_FLUSH_THRESHOLD, false)
     }
 
+    /// Open in read-only mode (`serve --follow`, arch/01 §9): `begin_write`
+    /// refuses for this handle's whole lifetime. [`Self::apply_replicated`]
+    /// is unaffected — it's how a replica applies what it follows.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, DEFAULT_FLUSH_THRESHOLD, true)
+    }
+
+    /// Test-only: the conformance suite wants a tiny flush threshold to
+    /// exercise SST rotation without writing megabytes of fixtures.
+    #[cfg(test)]
     pub(crate) fn open_with_threshold(
         path: impl AsRef<Path>,
         flush_threshold: usize,
+    ) -> Result<Self> {
+        Self::open_with_options(path, flush_threshold, false)
+    }
+
+    fn open_with_options(
+        path: impl AsRef<Path>,
+        flush_threshold: usize,
+        read_only: bool,
     ) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -345,6 +375,8 @@ impl NativeEngine {
             // Unbounded history by default (keep every version): time-travel to
             // any past commit "just works". A host caps it via `set_retention`.
             retain_commits: AtomicU64::new(0),
+            read_only,
+            wal_observer: Mutex::new(None),
         })
     }
 
@@ -597,21 +629,12 @@ impl StorageEngine for NativeEngine {
     }
 
     fn begin_write(&self) -> Result<NativeWriteTxn<'_>> {
-        let ms = self.write_timeout_ms.load(Ordering::Relaxed);
-        let gate = self
-            .write_gate
-            .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
-        let snapshot = self
-            .store
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .committed_seq;
-        Ok(NativeWriteTxn {
-            engine: self,
-            _gate: gate,
-            snapshot,
-            buf: BTreeMap::new(),
-        })
+        if self.read_only {
+            return Err(Error::ReadOnly(
+                "this database is a read-only replica (serve --follow)".into(),
+            ));
+        }
+        self.begin_write_unchecked()
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) {
@@ -824,10 +847,21 @@ impl WriteTransaction for NativeWriteTxn<'_> {
             return Ok(());
         }
         let seq = self.snapshot + 1;
+        self.engine.durable_commit(seq, self.buf)
+    }
+}
+
+impl NativeEngine {
+    /// Append `ops` as one WAL batch at `seq`, fsync, notify a registered
+    /// replication observer, then publish to the memtable and flush/compact
+    /// as needed. Shared by [`NativeWriteTxn::commit`] (`seq = snapshot + 1`,
+    /// a freshly allocated sequence) and [`Self::apply_replicated`] (`seq`
+    /// taken verbatim from the source it's replicating, so a replica's
+    /// commit sequence matches its master's exactly).
+    fn durable_commit(&self, seq: u64, ops: BTreeMap<(u8, Vec<u8>), Op>) -> Result<()> {
         let batch = WalBatchRef {
             seq,
-            ops: self
-                .buf
+            ops: ops
                 .iter()
                 .map(|((t, k), op)| WalOpRef {
                     table: *t,
@@ -842,24 +876,108 @@ impl WriteTransaction for NativeWriteTxn<'_> {
 
         // Durability first: append + fsync the WAL before publishing.
         {
-            let mut wal = self.engine.wal.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
             append_batch(&mut *wal, &batch)?;
             wal.flush()?;
             wal.get_ref().sync_all()?;
         }
 
+        // Notify a replication subscriber, if any, before publishing — same
+        // "durable before visible" ordering as the WAL fsync itself. Skipped
+        // entirely (no clone of `ops`) when nobody's registered, so a master
+        // with no followers pays nothing for this.
+        {
+            let observer = self.wal_observer.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(obs) = observer.as_ref() {
+                let replicated = ReplicatedBatch {
+                    seq,
+                    ops: ops
+                        .iter()
+                        .map(|((t, k), op)| ReplicatedOp {
+                            table: TableId::from_index(*t)
+                                .expect("table byte written by this engine is always valid"),
+                            key: k.clone(),
+                            value: match op {
+                                Op::Put(v) => Some(v.clone()),
+                                Op::Del => None,
+                            },
+                        })
+                        .collect(),
+                };
+                obs(replicated);
+            }
+        }
+
         // Publish to the memtable, advance the sequence, then flush if large.
         {
-            let mut store = self.engine.store.write().unwrap_or_else(|e| e.into_inner());
-            for ((t, k), op) in self.buf {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            for ((t, k), op) in ops {
                 store.mem_bytes += 1 + k.len() + 8 + op.value_len();
                 store.mem.insert((t, k, Reverse(seq)), op);
             }
             store.committed_seq = seq;
-            self.engine.maybe_flush(&mut store)?;
+            self.maybe_flush(&mut store)?;
         }
         // Compact outside the store lock (heavy merge I/O shouldn't block reads).
-        self.engine.maybe_compact()
+        self.maybe_compact()
+    }
+
+    /// The guts of `begin_write`, minus the `read_only` check — used by
+    /// `begin_write` itself, and by `Engine::with_write_bootstrap` for the
+    /// one-time-per-open plane/counters bootstrap (`Database::init`), which
+    /// must succeed even when this engine was opened read-only: it's the
+    /// engine's own setup, not a caller-initiated write.
+    pub(crate) fn begin_write_unchecked(&self) -> Result<NativeWriteTxn<'_>> {
+        let ms = self.write_timeout_ms.load(Ordering::Relaxed);
+        let gate = self
+            .write_gate
+            .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
+        let snapshot = self
+            .store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed_seq;
+        Ok(NativeWriteTxn {
+            engine: self,
+            _gate: gate,
+            snapshot,
+            buf: BTreeMap::new(),
+        })
+    }
+
+    /// Apply a batch replicated from a master's WAL (`serve --follow`,
+    /// arch/01 §9), landing it at the master's own `seq` rather than
+    /// allocating a new one — so a replica's KV content converges
+    /// byte-for-byte with its source. Bypasses the public `begin_write` gate
+    /// (and so ignores `read_only`) but still serializes through
+    /// `write_gate`, exactly like a normal commit.
+    pub fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
+        if batch.ops.is_empty() {
+            return Ok(());
+        }
+        let ms = self.write_timeout_ms.load(Ordering::Relaxed);
+        let _gate = self
+            .write_gate
+            .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
+        let ops: BTreeMap<(u8, Vec<u8>), Op> = batch
+            .ops
+            .into_iter()
+            .map(|op| {
+                (
+                    (op.table.index() as u8, op.key),
+                    op.value.map_or(Op::Del, Op::Put),
+                )
+            })
+            .collect();
+        self.durable_commit(batch.seq, ops)
+    }
+
+    /// Register (or clear, with `None`) the replication observer invoked
+    /// after every commit's WAL fsync. `dr-strange-web` wires this to a
+    /// broadcast channel once a follower may subscribe; see
+    /// `api::Database::on_wal_commit`.
+    pub fn set_wal_observer(&self, f: Option<WalObserver>) {
+        *self.wal_observer.lock().unwrap_or_else(|e| e.into_inner()) = f;
     }
 }
 

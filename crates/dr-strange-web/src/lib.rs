@@ -12,15 +12,37 @@
 mod assets;
 mod auth;
 pub mod fetch;
+// The client half of raw-WAL replication (arch/01 §9) needs
+// `Database::apply_replicated`, which only the native engine provides.
+#[cfg(feature = "native-backend")]
+mod follow;
 mod methods;
 mod rpc;
 mod server;
+
+pub use server::ServeOutcome;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use dr_strange_core::Database;
+
+/// How a `serve --follow` replica reaches the master it follows. Kept
+/// ungated (unlike the `follow` module itself) so `ServeOptions` has one
+/// shape regardless of backend feature — a non-native build can still parse
+/// `--follow`, it just refuses to start with it set (arch/01 §9 replication
+/// mirrors the native engine's own WAL).
+#[derive(Debug, Clone)]
+pub struct FollowOptions {
+    /// The master's `drsg serve` address, e.g. `ws://host:7700` or
+    /// `wss://host:7700` — *without* a path; `/ws/wal` and `/snapshot` are
+    /// appended by the follower.
+    pub upstream: String,
+    /// Bearer token presented to the master. Distinct from this replica's own
+    /// `DRSG_TOKEN`, which still gates *its* downstream clients.
+    pub token: Option<String>,
+}
 
 /// Default listen address when neither the CLI nor a config file specifies one.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7700";
@@ -74,6 +96,11 @@ pub struct ServeOptions {
     /// rather than fighting it for the file lock. The server neither waits
     /// on it nor restarts it.
     pub on_start: Option<Box<dyn FnOnce(std::sync::Arc<Database>) + Send>>,
+    /// When set, this server is a read-only replica of another `drsg serve`
+    /// (`serve --follow`, arch/01 §9): every write RPC is refused regardless
+    /// of token, and a background task bootstraps from the master's
+    /// `/snapshot` then tails its `/ws/wal`.
+    pub follow: Option<FollowOptions>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -155,6 +182,7 @@ impl Default for ServeOptions {
             embed_provider: None,
             source_root: None,
             on_start: None,
+            follow: None,
         }
     }
 }
@@ -168,10 +196,17 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serves `db` (whose file lives at `db_path`, if on disk) per `opts` until a
-/// shutdown signal (Ctrl-C / SIGTERM). Synchronous: it owns a multi-threaded
-/// tokio runtime internally so the sync `drsg` CLI can call it without being
-/// async itself.
-pub fn serve(db: Database, db_path: Option<PathBuf>, opts: ServeOptions) -> anyhow::Result<()> {
+/// shutdown signal (Ctrl-C / SIGTERM) — or, in `--follow` mode, until the
+/// replication stream from the master is lost, in which case the caller
+/// should reopen a fresh `db` (see [`Database::open_read_only`]) and call
+/// this again to resync from scratch (`ServeOutcome::ResyncNeeded`).
+/// Synchronous: it owns a multi-threaded tokio runtime internally so the
+/// sync `drsg` CLI can call it without being async itself.
+pub fn serve(
+    db: Database,
+    db_path: Option<PathBuf>,
+    opts: ServeOptions,
+) -> anyhow::Result<ServeOutcome> {
     // Applied before the first request: unlike an embedded caller, this process
     // has several clients competing for the one writer slot.
     db.set_write_timeout(opts.write_timeout);

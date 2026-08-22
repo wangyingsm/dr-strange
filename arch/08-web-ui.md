@@ -168,10 +168,15 @@ concept.
    cannot call its own backend.
 
 **Accepted limits.** One process owns the database, so it is a single point of
-failure and a throughput ceiling for every client. Read-heavy knowledge sharing
-with occasional writes fits comfortably — `write_gate` serializes writers, MVCC
-keeps readers concurrent. Scaling out later needs replication or a proxy tier;
-the lock makes that a one-way door.
+failure and a throughput ceiling for *writes* — `write_gate` serializes them,
+one at a time, no matter how many clients ask. Read-heavy knowledge sharing
+with occasional writes fits comfortably on that one process; scaling reads out
+further no longer needs a proxy tier — `serve --follow` (arch/01 §9) runs a
+read-only replica of a running `drsg serve`, so a cluster of agents can spread
+reads across several processes without funnelling them all through one. The
+lock still makes *write* scale-out (several processes sharing one writer) a
+one-way door — that remains unbuilt, and `serve --follow` doesn't touch it: a
+replica is read-only for its whole lifetime, never promoted.
 
 ## 5. Decisions since drafting
 
@@ -188,6 +193,11 @@ recorded here so the rationale isn't lost.
    overflow rather than stalling the writer (ROADMAP §5).
 4. **Does `drsg serve` fold into the network server?** — yes; it *is* the network
    server. §4.2 and ROADMAP §10 settle it.
+5. **Read scale-out** — `serve --follow` (arch/01 §9), a read-only replica
+   layered on the same `Authorizer` seam this doc designed: a `ReadOnlyAuthorizer`
+   decorator that never grants `Write`/`Admin`, a third gate alongside the
+   Origin guard and the bearer token, needing no per-method change to any of
+   the RPC methods this doc's `Access` levels already tag.
 
 Still open:
 
