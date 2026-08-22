@@ -113,7 +113,7 @@ pub fn extract(source: &str) -> Extracted {
     let root = doc
         .select(&Selector::parse("body").unwrap())
         .next()
-        .map_or(doc.root_element(), |b| b);
+        .unwrap_or(doc.root_element());
     w.node(*root);
     w.flush();
 
