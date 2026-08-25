@@ -33,9 +33,35 @@ OpenCode、Gemini CLI 或 Codex CLI 各自写入一份匹配的 MCP 配置——
 
 ```console
 $ drsg init
-plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp, wrote .mcp.json
-  + Cursor: wrote .cursor/mcp.json
+plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
+  + wrote ./.mcp.json
+  + Cursor: wrote ./.cursor/mcp.json
 ```
+
+**服务进程没了，就再运行一次 `drsg init`。** 它在后台启动 `serve watch`，并把这个
+进程的地址与令牌记录在 `.mcp.json` 里；但没有任何东西会重启它——MCP 的 `http` 条目
+告诉客户端去哪里连接，而不是去启动什么，所以没有哪个智能体会把它拉起来，它也不会在
+重启、崩溃或被杀掉之后存活。重新运行 `init` 就是恢复的办法，而且任何时候运行都是
+安全的：它会先探测记录下来的端点（`GET /health`，服务端正是为此让这个端点免鉴权），
+服务还活着就原样保留、连数据库都不打开，服务已经死了则用**同一个**地址和令牌重启，
+并且不重新解析源码树——平面会从它记录的提交继续。
+
+```console
+$ drsg init                       # 已在运行：无事可做
+drsg is already serving . at http://127.0.0.1:51900/mcp — reusing it, the plane is untouched
+
+$ drsg init                       # 重启机器之后：地址与令牌都不变
+plane 'myrepo' restarted — serve watch pid 51002, http://127.0.0.1:51900/mcp
+```
+
+复用这条路径上不打开数据库，正是它可以安全地对着一个已在运行的服务执行的原因：一个
+平面同一时刻只允许一个进程打开，若 `init` 为了检查而去打开它，那本身就成了它要避免的
+那次冲突。重启前后每个智能体的配置都依然有效，因为地址和令牌是从 `.mcp.json` 里恢复
+的，而不是重新生成的；如果那个记录下来的端口此时已被别的进程占用，`init` 会换一个空闲
+端口并明确说明。想让端点彻底固定下来，就在 `drsg.toml` 的 `[server]` 下写死 `addr`
+与 `token`。
+
+所以：每个仓库运行一次，此后只要服务没了就再运行一次。
 
 ## 事实为智能体带来什么
 

@@ -197,9 +197,33 @@ repository.
 
 ```console
 $ drsg init
-plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp, wrote .mcp.json
-  + Cursor: wrote .cursor/mcp.json
+plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
+  + wrote ./.mcp.json
+  + Cursor: wrote ./.cursor/mcp.json
 ```
+
+**Run `drsg init` again whenever the server is gone.** It spawns `serve
+watch` detached and records that process's address and bearer token in
+`.mcp.json`, but nothing ever restarts it: an MCP `http` entry tells a client
+where to connect, not what to launch, so no agent relaunches it and it does
+not survive a reboot, a crash, or a kill. Re-running `init` is the way back,
+and it is safe at any time — it probes the recorded endpoint first, leaves a
+live server alone without opening the database (so it cannot collide with the
+running one), and restarts a dead one on the *same* address and token,
+skipping the re-parse because the plane resumes from its recorded commit.
+Every agent's configuration stays valid across the restart.
+
+```console
+$ drsg init                       # already up: nothing to do
+drsg is already serving . at http://127.0.0.1:51900/mcp — reusing it, the plane is untouched
+
+$ drsg init                       # after a reboot: same address, same token
+plane 'myrepo' restarted — serve watch pid 51002, http://127.0.0.1:51900/mcp
+```
+
+Once per repository, then again whenever the server is gone. Pinning `addr`
+and `token` under `[server]` in `drsg.toml` keeps the endpoint byte-identical
+across restarts even if the recorded port is taken by then.
 
 Seven verbs answer an agent's questions, one round trip each, as compact
 one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are

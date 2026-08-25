@@ -4,6 +4,39 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **`drsg init` is idempotent — the "make sure drsg is up here" command.**
+  The server it spawns is nobody's child: an MCP `http` entry is a connect
+  instruction, so no agent client ever relaunches it, and nothing survives a
+  reboot. Answering "is drsg up for this repo?" therefore has to be `init`'s
+  own job. It now reads the endpoint a previous run recorded in `.mcp.json`
+  and probes `GET /health`: a server still answering is left alone and the
+  database is never opened (so re-running no longer dies on the single-writer
+  lock); one that died is restarted on the *same* address and token, so every
+  agent's config stays valid, and without `--force`, so the plane resumes
+  from its sync point instead of re-parsing the whole tree. An HTTP probe
+  rather than a bare TCP connect, because after a reboot an unrelated process
+  may hold that arbitrary port — and if one does, `init` moves to a free port
+  and says so. Safe to run from a `SessionStart` hook.
+- **`drsg init --addr` falls back to `drsg.toml`'s `[server] addr`**, the way
+  `--token` already fell back to `[server] token`. Pinning both keeps a
+  repo's MCP endpoint byte-identical across restarts.
+
+### Fixed
+- **`drsg init` in a project with no commits.** `serve watch` read HEAD
+  before anything else and gave up when there was none, so a directory whose
+  first commit was still unborn — the ordinary state of a new project — got
+  no plane, no digest, and no watcher, while `init` reported success and
+  exited 0 with the real error buried in `logs/`. The tree is now parsed
+  straight away, so the plane is queryable the moment `init` returns; the
+  watcher then waits for the repository's first commit and rebuilds on it
+  (the tree can move between the scan and that commit, and only a real
+  commit can be recorded as a sync point) before folding commits as usual. A
+  directory that is not a repository at all gets the same initial parse and
+  says plainly that nothing will fold into it.
+
 ## [2.1.0] - 2026-08-22
 
 ### Added

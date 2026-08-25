@@ -93,6 +93,12 @@ const INIT_TOKEN_LEN: usize = 40;
 #[cfg(feature = "digest")]
 const INIT_HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The name every agent config gives the entry `init` writes. One constant
+/// because `recorded_endpoint` reads back what `write_mcp_json_entry` wrote:
+/// a restart that kept the old address and token depends on the two agreeing.
+#[cfg(feature = "digest")]
+const MCP_SERVER_NAME: &str = "drsg-watch";
+
 #[cfg(feature = "digest")]
 const GITIGNORE_PATTERNS: &[&str] = &[
     "*.drsg",
@@ -105,10 +111,25 @@ const GITIGNORE_PATTERNS: &[&str] = &[
 
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
 /// artifacts this leaves behind, spawns `drsg serve watch` detached in the
-/// background on a freshly-picked address+token, waits for it to come up,
-/// and writes the connection details to `dir`'s `.mcp.json`. Never blocks
-/// past the health check — the spawned server keeps running after this
-/// returns, the same way this repo's own `serve watch` instances do.
+/// background, waits for it to come up, and writes the connection details to
+/// `dir`'s `.mcp.json`. Never blocks past the health check — the spawned
+/// server keeps running after this returns, the same way this repo's own
+/// `serve watch` instances do.
+///
+/// Safe to run again at any time, which is the point: the spawned server is
+/// nobody's child (no client relaunches an MCP `http` entry, and nothing
+/// survives a reboot), so "is drsg up for this repo?" has to be a question
+/// `init` itself can answer. It reads the endpoint a previous run recorded
+/// and probes it:
+///
+/// * **reachable** — nothing to do. The configs are rewritten (idempotent,
+///   and a newly-present agent gets its file now) and the database is never
+///   opened, so this cannot collide with the running server's lock.
+/// * **recorded but dead** — respawn on the *same* address and token, so
+///   every agent's config stays valid, and without `--force`, so the plane
+///   resumes from its sync point instead of re-parsing the tree.
+/// * **nothing recorded** — a first run: pick a free port and a fresh token,
+///   and build the plane from scratch.
 #[cfg(feature = "digest")]
 pub fn init_bootstrap(
     db_path: &Path,
@@ -125,15 +146,78 @@ pub fn init_bootstrap(
     } else {
         dir.join(db_path)
     };
-    open(&db_path)?;
     ensure_gitignore_patterns(&dir)?;
 
-    let addr = match addr {
-        Some(addr) => addr,
-        None => pick_free_port()?,
+    // What a previous run left behind, and whether it is still answering.
+    let recorded = recorded_endpoint(&dir);
+    let live = recorded
+        .as_ref()
+        .filter(|(recorded_addr, _)| health_ok(*recorded_addr, INIT_HEALTH_CHECK_TIMEOUT));
+
+    if let Some((live_addr, live_token)) = live {
+        // An explicit address asks for something this cannot deliver: the
+        // running server holds the database, so a second one cannot bind.
+        // Say that instead of pretending the flag was honoured.
+        if let Some(wanted) = addr
+            && wanted != *live_addr
+        {
+            bail!(
+                "drsg is already serving {} at http://{live_addr}/mcp, and one process at a \
+                 time may open {}. Stop that server before re-running with --addr {wanted}.",
+                dir.display(),
+                db_path.display()
+            );
+        }
+        let (live_addr, live_token) = (*live_addr, live_token.clone());
+        writeln!(
+            out,
+            "drsg is already serving {} at http://{live_addr}/mcp — reusing it, the plane is \
+             untouched",
+            dir.display()
+        )?;
+        write_agent_configs(&dir, &live_addr, &live_token, out)?;
+        return Ok(());
+    }
+
+    open(&db_path)?;
+
+    // A recorded endpoint that stopped answering is the one worth restoring
+    // verbatim: agents already hold that URL and token. An explicit flag
+    // still wins over it.
+    let (addr, token, force) = match recorded {
+        Some((recorded_addr, recorded_token)) => (
+            match addr {
+                Some(explicit) => explicit,
+                // The recorded port was an arbitrary one the OS handed out,
+                // and after a reboot it may belong to something else — which
+                // the health probe already ruled out as being drsg. Moving is
+                // then the only way to come up at all; agents pick the new
+                // address up from the rewritten configs.
+                None if addr_bindable(recorded_addr) => recorded_addr,
+                None => {
+                    let moved = pick_free_port()?;
+                    writeln!(
+                        out,
+                        "note: {recorded_addr} is taken by another process — moving to {moved}"
+                    )?;
+                    moved
+                }
+            },
+            token.unwrap_or(recorded_token),
+            // The plane already exists and records where it left off; `serve
+            // watch` catches it up from there. Re-parsing the whole tree here
+            // would make every restart cost a full digest.
+            false,
+        ),
+        None => (
+            match addr {
+                Some(addr) => addr,
+                None => pick_free_port()?,
+            },
+            token.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)),
+            true,
+        ),
     };
-    let token =
-        token.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN));
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
 
     let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
@@ -149,11 +233,13 @@ pub fn init_bootstrap(
         .arg(&dir)
         .arg("--plane")
         .arg(&plane_name)
-        .arg("--force")
         .env("DRSG_TOKEN", &token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if force {
+        cmd.arg("--force");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -185,39 +271,54 @@ pub fn init_bootstrap(
         bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
     }
 
-    write_mcp_json_entry(&dir, &addr, &token)?;
+    let what = if force { "bootstrapped" } else { "restarted" };
     writeln!(
         out,
-        "plane '{plane_name}' bootstrapped — serve watch pid {pid}, http://{addr}/mcp, wrote {}",
-        dir.join(".mcp.json").display()
+        "plane '{plane_name}' {what} — serve watch pid {pid}, http://{addr}/mcp"
     )?;
+    write_agent_configs(&dir, &addr, &token, out)
+}
+
+/// Point every agent config in `dir` at `addr`, and say which files that
+/// touched. Idempotent: rewriting the same endpoint changes nothing, so this
+/// runs on a reused server too — a repo that grew a `.cursor/` since the last
+/// `init` gets its file on the next one.
+#[cfg(feature = "digest")]
+fn write_agent_configs(
+    dir: &Path,
+    addr: &std::net::SocketAddr,
+    token: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    write_mcp_json_entry(dir, addr, token)?;
+    writeln!(out, "  + wrote {}", dir.join(".mcp.json").display())?;
 
     // Beyond Claude Code's `.mcp.json`, only add a file for an agent whose
     // own marker (a directory it creates, or a config file it already owns)
     // is already present — writing one for a tool nobody here uses would
     // just be repo clutter.
-    if probe_and_write_cursor(&dir, &addr, &token)? {
+    if probe_and_write_cursor(dir, addr, token)? {
         writeln!(
             out,
             "  + Cursor: wrote {}",
             dir.join(".cursor/mcp.json").display()
         )?;
     }
-    if probe_and_write_opencode(&dir, &addr, &token)? {
+    if probe_and_write_opencode(dir, addr, token)? {
         writeln!(
             out,
             "  + OpenCode: wrote {}",
             dir.join(".opencode.json").display()
         )?;
     }
-    if probe_and_write_gemini(&dir, &addr, &token)? {
+    if probe_and_write_gemini(dir, addr, token)? {
         writeln!(
             out,
             "  + Gemini CLI: wrote {}",
             dir.join(".gemini/settings.json").display()
         )?;
     }
-    if probe_and_write_codex(&dir, &addr)? {
+    if probe_and_write_codex(dir, addr)? {
         writeln!(
             out,
             "  + Codex CLI: wrote {} (no token inside it — Codex reads the bearer from its \
@@ -228,6 +329,75 @@ pub fn init_bootstrap(
         )?;
     }
     Ok(())
+}
+
+/// The address and token a previous `init` wrote into `dir`'s `.mcp.json`,
+/// if one is still there and still parses. This is the only record of them —
+/// the token is generated once and never stored anywhere else — so recovering
+/// it here is what lets a restart keep every agent's config valid.
+#[cfg(feature = "digest")]
+fn recorded_endpoint(dir: &Path) -> Option<(std::net::SocketAddr, String)> {
+    let raw = std::fs::read_to_string(dir.join(".mcp.json")).ok()?;
+    let entry = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("mcpServers")?
+        .get(MCP_SERVER_NAME)?
+        .clone();
+    let url = entry.get("url")?.as_str()?;
+    // `http://host:port/mcp` — take the authority, which is what a socket
+    // address is. Anything else was not written by `init`.
+    let addr = url
+        .strip_prefix("http://")?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()?;
+    let token = entry
+        .get("headers")?
+        .get("Authorization")?
+        .as_str()?
+        .strip_prefix("Bearer ")?
+        .to_string();
+    Some((addr, token))
+}
+
+/// Whether a drsg server is answering on `addr` — `GET /health`, which the
+/// server leaves unauthenticated precisely for probes like this one.
+///
+/// An HTTP round trip rather than a bare TCP connect, because the recorded
+/// port is an arbitrary one the OS handed out: after a reboot some unrelated
+/// process may well hold it, and accepting a connection from *that* would
+/// make `init` report a healthy drsg that does not exist.
+#[cfg(feature = "digest")]
+fn health_ok(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    use std::io::{Read, Write as _};
+
+    let probe = || -> std::io::Result<String> {
+        let mut sock = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+        sock.set_read_timeout(Some(timeout))?;
+        sock.set_write_timeout(Some(timeout))?;
+        write!(
+            sock,
+            "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+        )?;
+        let mut body = Vec::new();
+        // Bounded: a health response is a couple of hundred bytes, and this
+        // must not hang on a socket that answers with a firehose.
+        sock.take(4096).read_to_end(&mut body)?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    };
+    match probe() {
+        Ok(resp) => resp.starts_with("HTTP/1.1 200") && resp.contains("\"status\":\"ok\""),
+        Err(_) => false,
+    }
+}
+
+/// Whether `addr` is free for the spawned server to bind. Racy by nature —
+/// something could take it in between — but it is the difference between
+/// reusing a recorded port and failing to start on one that is gone.
+#[cfg(feature = "digest")]
+fn addr_bindable(addr: std::net::SocketAddr) -> bool {
+    std::net::TcpListener::bind(addr).is_ok()
 }
 
 #[cfg(feature = "digest")]
@@ -344,7 +514,7 @@ fn write_mcp_json_entry(dir: &Path, addr: &std::net::SocketAddr, token: &str) ->
     upsert_json_mcp_entry(
         &dir.join(".mcp.json"),
         "mcpServers",
-        "drsg-watch",
+        MCP_SERVER_NAME,
         json!({
             "type": "http",
             "url": format!("http://{addr}/mcp"),
@@ -365,7 +535,7 @@ fn probe_and_write_cursor(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
     upsert_json_mcp_entry(
         &dir.join(".cursor").join("mcp.json"),
         "mcpServers",
-        "drsg-watch",
+        MCP_SERVER_NAME,
         json!({
             "type": "http",
             "url": format!("http://{addr}/mcp"),
@@ -387,7 +557,7 @@ fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str
     upsert_json_mcp_entry(
         &dir.join(".opencode.json"),
         "mcp",
-        "drsg-watch",
+        MCP_SERVER_NAME,
         json!({
             "type": "remote",
             "url": format!("http://{addr}/mcp"),
@@ -409,7 +579,7 @@ fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
     upsert_json_mcp_entry(
         &dir.join(".gemini").join("settings.json"),
         "mcpServers",
-        "drsg-watch",
+        MCP_SERVER_NAME,
         json!({
             "httpUrl": format!("http://{addr}/mcp"),
             "headers": { "Authorization": format!("Bearer {token}") },
@@ -465,7 +635,7 @@ fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool
         "bearer_token_env_var".to_string(),
         toml::Value::String(CODEX_TOKEN_ENV_VAR.to_string()),
     );
-    mcp_servers.insert("drsg-watch".to_string(), toml::Value::Table(entry));
+    mcp_servers.insert(MCP_SERVER_NAME.to_string(), toml::Value::Table(entry));
     let rendered = toml::to_string_pretty(&root)?;
     std::fs::write(&path, rendered).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
@@ -629,6 +799,12 @@ pub fn default_plane(source: &str) -> String {
 #[cfg(feature = "digest")]
 const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The run id stamped on facts parsed before the repository has a commit.
+/// `_run` is free text, and saying "working-tree" is more honest than a
+/// commit-shaped placeholder nothing could ever resolve.
+#[cfg(feature = "digest")]
+const UNBORN_RUN_ID: &str = "working-tree";
+
 /// Plane properties recording what the graph reflects: the commit the last
 /// digest or fold left it at, and the directory the facts were parsed from.
 /// Together they answer "is the graph in sync with the repository?" — and
@@ -705,8 +881,6 @@ fn watch_loop(
     embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
 ) -> Result<()> {
-    let mut head =
-        git_head(dir).with_context(|| format!("{} is not a git repository", dir.display()))?;
     // The server's embed config, when it has one, keeps a watched plane
     // searchable: after a fold changes facts, the changed nodes re-embed
     // (`_embedded_from` makes that pass incremental). No config, or a
@@ -762,7 +936,34 @@ fn watch_loop(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| dir.display().to_string());
 
-    if force {
+    // Where to start folding from — and, when the repository cannot say,
+    // what to do instead of giving up. A brand-new project has no commit to
+    // anchor on: `git rev-parse HEAD` fails both in a repository whose first
+    // commit is still unborn and in a directory that is not a repository at
+    // all. Neither is a reason to leave the tree unparsed.
+    let (mut head, bootstrapped) = match git_head(dir) {
+        Ok(head) => (head, false),
+        Err(e) => match bootstrap_unborn(
+            db,
+            dir,
+            plane_name,
+            plugin_config,
+            &source,
+            &e,
+            &revectorize,
+        )? {
+            Some(first) => (first, true),
+            // Not a repository: the plane is built and current as of the
+            // scan, but no commit will ever arrive to fold into it.
+            None => return Ok(()),
+        },
+    };
+
+    if bootstrapped {
+        // `bootstrap_unborn` already rebuilt the plane on this commit and
+        // recorded the sync point — there is no staleness left for `--force`
+        // to clear, and nothing to catch up on.
+    } else if force {
         // Rebuild before serving anything stale: drop, re-create, fold the
         // whole tree as one delta. Facts only — embeddings return on the next
         // real digest.
@@ -770,9 +971,7 @@ fn watch_loop(
             plane = plane_name,
             "--force: rebuilding the plane from the tree"
         );
-        let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
-        let host = dr_strange_llm::LocalFiles::new(dir)?;
-        let stats = dr_strange_llm::resync(db, plane_name, &host, &plugins, &source, &head)?;
+        let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, &source, &head)?;
         record_sync_point(db, plane_name, dir)?;
         tracing::info!(
             commit = %&head[..12.min(head.len())],
@@ -904,6 +1103,89 @@ fn watch_loop(
     }
 }
 
+/// Drop the plane and rebuild it from `dir`'s working tree as one delta,
+/// stamping every fact with `run_id`. Facts only — embeddings are the
+/// caller's to refresh.
+#[cfg(feature = "digest")]
+fn rebuild_from_tree(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    plugin_config: &dr_strange_llm::PluginConfig,
+    source: &str,
+    run_id: &str,
+) -> Result<dr_strange_llm::SyncStats> {
+    let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+    let host = dr_strange_llm::LocalFiles::new(dir)?;
+    dr_strange_llm::resync(db, plane_name, &host, &plugins, source, run_id)
+}
+
+/// Start watching a directory that has no HEAD to anchor on.
+///
+/// The plane is built from the working tree straight away, so a brand-new
+/// project is queryable the moment `drsg init` returns rather than only
+/// after its first commit. What happens next depends on why HEAD was
+/// missing: an unborn repository gets waited on, and the plane is rebuilt on
+/// its first commit (the tree can have moved on in between, and only a real
+/// commit can be recorded as a sync point) — that commit comes back as
+/// `Some`. A directory that is not a repository at all has no second act:
+/// `None` says so, and the caller stops watching.
+#[cfg(feature = "digest")]
+fn bootstrap_unborn(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    plugin_config: &dr_strange_llm::PluginConfig,
+    source: &str,
+    why: &anyhow::Error,
+    revectorize: &dyn Fn(&str),
+) -> Result<Option<String>> {
+    let is_repo = is_git_repo(dir);
+    tracing::info!(
+        dir = %dir.display(),
+        plane = plane_name,
+        reason = format!("{why:#}"),
+        "no commit to anchor on — building the plane from the working tree"
+    );
+    let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, source, UNBORN_RUN_ID)?;
+    tracing::info!(
+        nodes_loaded = stats.nodes_loaded,
+        edges_written = stats.edges_written,
+        prose_skipped_chars = stats.prose_chars,
+        "plane built from the working tree — no sync point until a commit exists"
+    );
+    revectorize("working-tree scan");
+
+    if !is_repo {
+        tracing::warn!(
+            dir = %dir.display(),
+            "not a git repository — the plane reflects this scan and nothing will fold into it; `git init` here and restart `drsg serve watch` to follow commits"
+        );
+        return Ok(None);
+    }
+
+    tracing::info!("waiting for this repository's first commit");
+    let first = loop {
+        std::thread::sleep(WATCH_POLL);
+        if let Ok(head) = git_head(dir) {
+            break head;
+        }
+    };
+    // Rebuild rather than fold: there is no earlier commit to diff the first
+    // one against, and the tree may have changed since the scan above.
+    let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, source, &first)?;
+    record_sync_point(db, plane_name, dir)?;
+    tracing::info!(
+        commit = %&first[..12.min(first.len())],
+        nodes_loaded = stats.nodes_loaded,
+        edges_written = stats.edges_written,
+        prose_skipped_chars = stats.prose_chars,
+        "first commit — plane rebuilt on it"
+    );
+    revectorize("first commit");
+    Ok(Some(first))
+}
+
 #[cfg(feature = "digest")]
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = std::process::Command::new("git")
@@ -920,6 +1202,15 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+/// Whether `dir` is inside a git repository at all — the question that
+/// separates "no commit *yet*" from "no commits ever": an unborn HEAD and a
+/// plain directory both fail `rev-parse HEAD`, but only the first is worth
+/// waiting on.
+#[cfg(feature = "digest")]
+fn is_git_repo(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--git-dir"]).is_ok()
 }
 
 /// Whether `sha` names a commit this repository knows.
@@ -3091,6 +3382,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&plain);
     }
 
+    /// A repository whose first commit is unborn has no HEAD, exactly like a
+    /// plain directory — but only one of them is worth waiting on, and
+    /// `is_git_repo` is what tells `bootstrap_unborn` which it is looking at.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn an_unborn_repository_is_told_apart_from_a_plain_directory() {
+        let base = std::env::temp_dir().join(format!("drsg-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let unborn = base.join("repo");
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&unborn).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&unborn)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        // Neither can name a commit …
+        assert!(git_head(&unborn).is_err());
+        assert!(git_head(&plain).is_err());
+        // … but the repository will have one, and the directory will not.
+        assert!(is_git_repo(&unborn));
+        assert!(!is_git_repo(&plain));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// `git diff --name-status -z` per status letter: one path each, except
     /// renames/copies which carry source then destination.
     #[cfg(feature = "digest")]
@@ -3261,6 +3585,74 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.mcp.json` is the only place the generated token is ever written, so
+    /// a restart that keeps agents' configs valid depends on reading back
+    /// exactly what was written — and on declining to guess at anything else.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_recorded_endpoint_round_trips_and_rejects_what_init_did_not_write() {
+        let dir = scratch_dir("recorded-endpoint");
+        let addr: std::net::SocketAddr = "127.0.0.1:41111".parse().unwrap();
+
+        // Nothing written yet: a first run, not a restart.
+        assert_eq!(recorded_endpoint(&dir), None);
+
+        write_mcp_json_entry(&dir, &addr, "tok-1").unwrap();
+        assert_eq!(
+            recorded_endpoint(&dir),
+            Some((addr, "tok-1".to_string())),
+            "the address and token must survive the round trip verbatim"
+        );
+
+        // A file that exists but says nothing `init` would recognise — a
+        // hand-written stdio entry, a different server — is not an endpoint
+        // to restart, and must not be read as one.
+        let write = |v: Value| {
+            std::fs::write(dir.join(".mcp.json"), serde_json::to_string(&v).unwrap()).unwrap()
+        };
+        write(json!({ "mcpServers": { "other": { "type": "stdio", "command": "foo" } } }));
+        assert_eq!(recorded_endpoint(&dir), None, "another server's entry");
+        write(json!({ "mcpServers": { "drsg-watch": { "type": "stdio", "command": "drsg" } } }));
+        assert_eq!(recorded_endpoint(&dir), None, "no url to connect to");
+        write(json!({ "mcpServers": { "drsg-watch": {
+            "url": "http://127.0.0.1:41111/mcp", "headers": { "Authorization": "Basic nope" },
+        } } }));
+        assert_eq!(recorded_endpoint(&dir), None, "not a bearer token");
+        std::fs::write(dir.join(".mcp.json"), "{ not json").unwrap();
+        assert_eq!(recorded_endpoint(&dir), None, "unparseable file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe must answer "no drsg here" for silence *and* for a stranger
+    /// on the port — after a reboot the OS may well have handed that
+    /// arbitrary port to something else.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn health_says_no_for_a_dead_port_and_for_a_process_that_is_not_drsg() {
+        use std::io::{Read, Write as _};
+        let quick = std::time::Duration::from_millis(500);
+
+        // Bound and drop: nothing is listening on that port any more.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        assert!(!health_ok(dead_addr, quick));
+
+        // A listener that accepts and answers, but is not drsg.
+        let stranger = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stranger_addr = stranger.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = stranger.accept() {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            }
+        });
+        assert!(!health_ok(stranger_addr, quick), "200 OK is not enough");
+        t.join().unwrap();
     }
 
     #[cfg(feature = "digest")]

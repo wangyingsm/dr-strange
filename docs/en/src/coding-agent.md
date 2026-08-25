@@ -36,9 +36,40 @@ already owns) is already present in the repository.
 
 ```console
 $ drsg init
-plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp, wrote .mcp.json
-  + Cursor: wrote .cursor/mcp.json
+plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
+  + wrote ./.mcp.json
+  + Cursor: wrote ./.cursor/mcp.json
 ```
+
+**Run `drsg init` again whenever the server is gone.** It spawns `serve
+watch` detached and records that process's address and bearer token in
+`.mcp.json`, but nothing ever restarts it: an MCP `http` entry tells a client
+where to connect, not what to launch, so no agent relaunches it and it does
+not survive a reboot, a crash, or a kill. Re-running `init` is the way back,
+and it is safe at any time — it probes the recorded endpoint first (`GET
+/health`, which the server leaves unauthenticated for exactly this), leaves a
+live server alone without opening the database, and restarts a dead one on
+the *same* address and token, skipping the re-parse because the plane resumes
+from its recorded commit.
+
+```console
+$ drsg init                       # already up: nothing to do
+drsg is already serving . at http://127.0.0.1:51900/mcp — reusing it, the plane is untouched
+
+$ drsg init                       # after a reboot: same address, same token
+plane 'myrepo' restarted — serve watch pid 51002, http://127.0.0.1:51900/mcp
+```
+
+Leaving the database closed on the reuse path is what makes this safe to run
+against a server that is already up: one process at a time may open the
+plane, so an `init` that opened it to check would be the very collision it is
+meant to avoid. Every agent's configuration stays valid across a restart,
+because the address and token are recovered from `.mcp.json` rather than
+generated afresh — and if that recorded port has since been taken by another
+process, `init` moves to a free one and says so. Pinning `addr` and `token`
+under `[server]` in `drsg.toml` fixes the endpoint outright.
+
+So: once per repository, then again whenever the server is gone.
 
 ## What the facts buy an agent
 

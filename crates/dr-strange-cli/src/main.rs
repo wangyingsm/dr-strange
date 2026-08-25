@@ -43,8 +43,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Bootstrap this repository for agent MCP access: digest it, spawn
-    /// `serve watch` detached in the background on a freshly-picked
-    /// address+token, and write the connection details to `.mcp.json`.
+    /// `serve watch` detached in the background, and write the connection
+    /// details to `.mcp.json`.
+    ///
+    /// Safe to re-run — it is the "make sure drsg is up here" command.
+    /// A server that is still answering is left alone; one that died is
+    /// restarted on the address and token agents already hold, without
+    /// re-parsing the tree.
     #[cfg(feature = "digest")]
     Init {
         /// Repository to digest and watch.
@@ -54,13 +59,15 @@ enum Command {
         /// as the fallback.
         #[arg(long)]
         plane: Option<String>,
-        /// Address for the spawned server to listen on. **Omitted**: an
-        /// OS-assigned free port on 127.0.0.1.
+        /// Address for the spawned server to listen on. **Omitted**:
+        /// `drsg.toml`'s `[server] addr`, then the address a previous run
+        /// recorded in `.mcp.json`, then an OS-assigned free port on
+        /// 127.0.0.1.
         #[arg(long)]
         addr: Option<SocketAddr>,
-        /// Bearer token for the spawned server. **Omitted**: a random token
-        /// is generated, unless `DRSG_TOKEN`/`drsg.toml`'s `[server] token`
-        /// is already set.
+        /// Bearer token for the spawned server. **Omitted**:
+        /// `DRSG_TOKEN`/`drsg.toml`'s `[server] token`, then the token a
+        /// previous run recorded in `.mcp.json`, then a fresh random one.
         #[arg(long)]
         token: Option<String>,
     },
@@ -591,6 +598,10 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             addr,
             token,
         } => {
+            // Both fall back to `drsg.toml`'s `[server]`, the same way
+            // `serve` reads them — pinning an address and token there is what
+            // keeps a repo's MCP endpoint stable across restarts.
+            let addr = addr.or(cfg.server.addr);
             let token = token.or_else(|| cfg.server.token.clone());
             commands::init_bootstrap(&cli.db, dir, plane, addr, token, out)
         }
