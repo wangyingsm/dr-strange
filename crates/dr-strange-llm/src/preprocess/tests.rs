@@ -855,3 +855,75 @@ fn folds_converge_with_full_rebuild() {
         "a fold-built plane must equal the digest-built plane"
     );
 }
+
+/// A handler that refuses whatever it is given, the way a plugin does when its
+/// guest traps. The message is shaped like a real one: a diagnosis, then the
+/// evidence under it.
+struct Trapping;
+
+impl Preprocessor for Trapping {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: "trapping".into(),
+            version: "1".into(),
+            extensions: vec!["go".into()],
+            logo: None,
+        }
+    }
+
+    fn preprocess(&self, _input: &Input<'_>, _host: &dyn Host) -> Result<Preprocessed> {
+        Err(anyhow::anyhow!(
+            "plugin `trapping` trapped: wasm trap: out of bounds memory access\n\
+             error while executing at wasm backtrace:\n    0:  0x4cd01 - expr1"
+        ))
+    }
+}
+
+/// One handler failing costs its own files, not the tree.
+///
+/// This is the rule `read_unclaimed` has always applied to the PNG it cannot
+/// read, and the rule the plugin arm did not: a single generated file that
+/// tripped a plugin used to abort the whole ingest, so a repository lost every
+/// other language in it — and reported nothing rather than reporting what it
+/// had.
+#[test]
+fn a_failing_handler_does_not_take_the_tree_with_it() {
+    let t = Tree::new("failing-handler");
+    t.write("a.go", "package main");
+    t.write("b.go", "package main");
+    t.write("src/lib.rs", "pub fn a() {}");
+    t.write("notes.md", "# Hi");
+    let host = t.host();
+    let plugins = Plugins::from_handlers(vec![Box::new(Probe), Box::new(Trapping)]);
+
+    let out = route_tree(&host, None, &plugins).unwrap();
+
+    // Everything the failing handler did not claim came through untouched.
+    assert_eq!(
+        out.nodes.len(),
+        1,
+        "the .rs file still parsed: {:?}",
+        out.nodes
+    );
+    assert!(out.prose.contains("Hi"), "the .md file still read");
+
+    // Its own files are counted, not silently dropped.
+    assert_eq!(out.report.skipped, 2, "both .go files: {:?}", out.report);
+
+    // And the note names the handler and the reason — on one line, because a
+    // wasm backtrace does not belong in a report.
+    let note = out
+        .report
+        .notes
+        .iter()
+        .find(|n| n.contains("trapping@1"))
+        .unwrap_or_else(|| panic!("no note named the handler: {:?}", out.report.notes));
+    assert!(
+        note.contains("out of bounds memory access"),
+        "the note should carry the reason: {note}"
+    );
+    assert!(
+        !note.contains("0x4cd01"),
+        "the backtrace belongs in the log, not the report: {note}"
+    );
+}

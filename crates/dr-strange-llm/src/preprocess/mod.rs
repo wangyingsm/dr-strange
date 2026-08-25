@@ -613,9 +613,28 @@ pub fn route_paths(
         match idx {
             Some(i) => {
                 let mark = registry[i].manifest().stamp();
-                let mut out = registry[i].preprocess(&Input::Files { paths: &paths }, host)?;
-                stamp_provenance(&mut out, &mark);
-                merge(&mut merged, out, &mark, &mut owners);
+                match registry[i].preprocess(&Input::Files { paths: &paths }, host) {
+                    Ok(mut out) => {
+                        stamp_provenance(&mut out, &mark);
+                        merge(&mut merged, out, &mark, &mut owners);
+                    }
+                    // A handler that fails outright loses its own files, not
+                    // the tree — the same rule `read_unclaimed` applies one arm
+                    // below, and for the same reason. Before this, one file a
+                    // plugin choked on took every other language in the
+                    // repository with it, and the ingest reported nothing at
+                    // all rather than reporting what it had.
+                    Err(why) => {
+                        let why = format!("{why:#}");
+                        tracing::warn!(handler = %mark, files = paths.len(), error = %why, "handler failed");
+                        merged.report.skipped += paths.len();
+                        merged.report.notes.push(format!(
+                            "`{mark}` failed and its {} file(s) were skipped: {}",
+                            paths.len(),
+                            first_line(&why)
+                        ));
+                    }
+                }
             }
             None => read_unclaimed(host, &paths, &mut merged, &mut owners),
         }
@@ -623,6 +642,15 @@ pub fn route_paths(
 
     merged.report.prose_chars = merged.prose.chars().count();
     Ok(merged)
+}
+
+/// The first line of an error, for a note that has to stay one line.
+///
+/// A trap arrives with a wasm backtrace and possibly a page of guest stderr
+/// attached; the sentence in front of it is the part a report can carry, and
+/// the log has already taken the whole thing.
+pub(crate) fn first_line(why: &str) -> &str {
+    why.lines().next().unwrap_or(why).trim_end()
 }
 
 /// Hand every unclaimed file to the built-in reader.

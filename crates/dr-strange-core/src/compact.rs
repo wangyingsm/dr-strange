@@ -111,6 +111,13 @@ fn candidates(name: &str, hits: &[NodeRecord]) -> String {
 /// clears when it finishes. Written by the digest side; read here.
 pub const REBUILDING_PROP: &str = "rebuilding_since";
 
+/// How long a marker sits before the rebuild that set it is presumed dead.
+///
+/// Ten minutes is far past an honest fold — a forty-thousand-node plane
+/// rebuilds in seconds — so the only thing this reclassifies is a rebuild that
+/// is not coming back.
+const REBUILD_PRESUMED_DEAD: i64 = 600;
+
 /// A rebuild in flight, stated wherever an answer is read.
 ///
 /// A full resync drops the plane and refills it, so in between a query meets a
@@ -130,6 +137,19 @@ fn rebuilding_note(props: &Properties) -> Option<String> {
         .map(|d| d.as_secs() as i64 - since)
         .unwrap_or(0)
         .max(0);
+    // Past a point, "ask again when it finishes" is advice for something that
+    // is not going to happen: a rebuild that failed or was killed leaves the
+    // marker behind — deliberately, see above — and only its age distinguishes
+    // that from one still running. Saying which costs one comparison and is
+    // the difference between a plane a caller waits on and one a caller fixes.
+    if ago >= REBUILD_PRESUMED_DEAD {
+        return Some(format!(
+            "note: this plane was left mid-rebuild {ago}s ago and nothing has \
+             finished it — it holds only what had been folded by then, so a miss \
+             here may mean \"never folded\" rather than \"not present\". Re-run \
+             the rebuild (`serve watch --force`) to replace it.\n"
+        ));
+    }
     Some(format!(
         "note: this plane is being rebuilt (started {ago}s ago) — it holds only \
          what has been folded so far, so a miss here may mean \"not yet\" \
@@ -690,6 +710,31 @@ mod tests {
         assert!(
             !out.contains("synced: commit"),
             "a rebuilding plane must not also claim to be synced: {out}"
+        );
+    }
+
+    /// A marker outlives the process that set it — on purpose, because a plane
+    /// left half-folded is exactly what a caller needs warning about. But past
+    /// a point "ask again when it finishes" is advice about something that is
+    /// never going to finish, and the note has to say so instead.
+    #[test]
+    fn an_abandoned_rebuild_stops_telling_callers_to_wait() {
+        let db = seeded();
+
+        mark_rebuilding(&db, now() - REBUILD_PRESUMED_DEAD + 5);
+        let waiting = context(&db.plane("code").unwrap(), "m::nope").unwrap();
+        assert!(waiting.contains("being rebuilt"), "{waiting}");
+
+        mark_rebuilding(&db, now() - REBUILD_PRESUMED_DEAD - 5);
+        let stalled = context(&db.plane("code").unwrap(), "m::nope").unwrap();
+        assert!(stalled.contains("no symbol matches"), "{stalled}");
+        assert!(
+            stalled.contains("left mid-rebuild") && stalled.contains("--force"),
+            "an abandoned rebuild should name the fix, not ask for patience: {stalled}"
+        );
+        assert!(
+            !stalled.contains("ask again when it finishes"),
+            "nothing is going to finish it: {stalled}"
         );
     }
 

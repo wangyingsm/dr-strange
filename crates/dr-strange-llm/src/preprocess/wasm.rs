@@ -108,6 +108,17 @@ const DEFAULT_FUEL: u64 = 200_000_000_000;
 /// whatever this is set to.
 const DEFAULT_MEMORY: usize = 3 << 30;
 
+/// A memory fault this close to the top of a 32-bit address space is not a
+/// wild pointer: it is a stack pointer that walked below zero and wrapped.
+///
+/// It is worth naming, because a guest's stack is *not* the one
+/// `Config::max_wasm_stack` governs — that one holds the compiled wasm frames.
+/// A guest's own stack lives at the bottom of its linear memory, and its size
+/// is fixed when the plugin is built (`tinygo -stack-size`, `wasm-ld
+/// -z stack-size`). So no host setting raises it, and the trap message
+/// otherwise reads like a corrupt module rather than a deep input.
+const SP_UNDERFLOW: &str = "memory fault at wasm address 0xffff";
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -348,15 +359,17 @@ impl WasmPlugin {
                  or the input is larger than `[plugins] fuel` allows for"
             );
         }
+        let why = trap_message(name, &format!("{error}"), &format!("{error:#}"));
+
         let said = store.data().stderr.contents();
         if said.is_empty() {
-            return anyhow!("plugin `{name}` trapped: {error}");
+            return anyhow!("{why}");
         }
         // The tail, because a panic message comes last and the front of a
         // long log is the least interesting part of it.
         let tail = said.len().saturating_sub(2048);
         let said = String::from_utf8_lossy(&said[tail..]).trim().to_string();
-        anyhow!("plugin `{name}` trapped: {error}\nits stderr said:\n{said}")
+        anyhow!("{why}\nits stderr said:\n{said}")
     }
 }
 
@@ -367,6 +380,8 @@ impl Preprocessor for WasmPlugin {
 
     fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed> {
         let started = std::time::Instant::now();
+        // What this plugin could not parse: `(the chunk, why)`.
+        let mut refused: Vec<(String, String)> = Vec::new();
         // Phase one: chunks in parallel, partials collected in chunk order —
         // par_iter's collect preserves order, which is the same discipline the
         // native parser used for exactly the same reason.
@@ -380,12 +395,56 @@ impl Preprocessor for WasmPlugin {
                     host,
                 )?]
             }
-            Input::Files { paths } => paths
-                .chunks(CHUNK_FILES)
-                .collect::<Vec<_>>()
-                .par_iter()
-                .map(|chunk| self.parse_chunk(wit_plugin::Input::Files(chunk.to_vec()), host))
-                .collect::<Result<Vec<_>>>()?,
+            Input::Files { paths } => {
+                let chunks: Vec<&[String]> = paths.chunks(CHUNK_FILES).collect();
+                let parsed: Vec<Result<Vec<u8>>> = chunks
+                    .par_iter()
+                    .map(|chunk| self.parse_chunk(wit_plugin::Input::Files(chunk.to_vec()), host))
+                    .collect();
+                let mut kept = Vec::with_capacity(parsed.len());
+                for (chunk, result) in chunks.iter().zip(parsed) {
+                    match result {
+                        Ok(partial) => kept.push(partial),
+                        // A file this plugin chokes on is counted, not fatal —
+                        // the same rule the built-in reader applies to the PNG
+                        // it cannot read. One generated file used to take the
+                        // whole tree down with it, and the tree is the point.
+                        // Which file, too: a chunk is one call, so the error
+                        // can name its input instead of leaving a reader to
+                        // bisect a few thousand paths for it.
+                        Err(why) => {
+                            let files = chunk.join(", ");
+                            let why = format!("{why:#}");
+                            tracing::warn!(
+                                plugin = %self.manifest.name,
+                                files = %files,
+                                error = %why,
+                                "file skipped: the plugin could not parse it"
+                            );
+                            refused.push((files, why));
+                        }
+                    }
+                }
+                // Containment has a floor, and the floor is evidence: a plugin
+                // that parsed *something* has demonstrated it works, so what
+                // failed is about those files. One that parsed nothing at all
+                // has demonstrated nothing — it is broken, out of fuel, or
+                // reaching for what the sandbox refuses — and that is worth an
+                // error rather than an empty plane and a note. The sandbox's
+                // own refusals arrive exactly this way, one file at a time,
+                // and must keep arriving as errors. No ratio in between: any
+                // threshold there would be a number nobody could defend.
+                if kept.is_empty() && !refused.is_empty() {
+                    let (first, why) = &refused[0];
+                    bail!(
+                        "plugin `{}` parsed none of its {} input(s) — that is the \
+                         plugin, not the tree. The first was {first}: {why}",
+                        self.manifest.name,
+                        chunks.len()
+                    );
+                }
+                kept
+            }
         };
         let parsed = std::time::Instant::now();
 
@@ -401,7 +460,14 @@ impl Preprocessor for WasmPlugin {
             assemble_ms = parsed.elapsed().as_millis() as u64,
             "preprocess phases"
         );
-        into_preprocessed(out, &self.manifest.name)
+        let mut out = into_preprocessed(out, &self.manifest.name)?;
+        if !refused.is_empty() {
+            out.report.skipped += refused.len();
+            out.report
+                .notes
+                .push(refusal_note(&self.manifest.name, &refused));
+        }
+        Ok(out)
     }
 }
 
@@ -494,6 +560,63 @@ fn refuse_forbidden_imports(engine: &Engine, component: &Component) -> Result<()
 }
 
 /// Cross back: WIT records into the shapes the digest pipeline already writes.
+/// A trap, worded so that its first line is the diagnosis.
+///
+/// What wasmtime *displays* is the wasm backtrace; the reason — "wasm trap:
+/// out of bounds memory access" — hangs off the source chain behind it, and
+/// only the alternate form renders that. So a trap used to arrive as twenty
+/// frames (wasmtime's own default cap) that never said what had gone wrong,
+/// and a one-line summary of it said nothing at all. The difference between
+/// the two renderings is exactly the cause chain, which is how the reason is
+/// lifted out and put first, with the evidence underneath it — the repeated
+/// frame in a backtrace is what names a recursion.
+fn trap_message(plugin: &str, backtrace: &str, full: &str) -> String {
+    let reason = full
+        .strip_prefix(backtrace)
+        .map(|tail| tail.trim_start_matches(':').trim())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(full);
+
+    let mut why = format!("plugin `{plugin}` trapped: {reason}");
+    // A stack pointer that walked below zero is worth naming, because "out of
+    // bounds memory access" otherwise reads as a corrupt module.
+    if reason.contains(SP_UNDERFLOW) {
+        why.push_str(
+            "\nthat address is the plugin's own stack underflowing, not a wild \
+             pointer: the input nests deeper than the stack the plugin was built \
+             with. A generated file is the usual cause — a descriptor written as \
+             one long chain of `+` is a single expression hundreds of levels deep, \
+             however short its lines look. Only a rebuilt plugin raises that \
+             ceiling; excluding the file is the local fix.",
+        );
+    }
+    if reason != full {
+        why.push('\n');
+        why.push_str(backtrace);
+    }
+    why
+}
+
+/// The files a plugin refused, as one note.
+///
+/// Capped, because a tree that trips a plugin on four hundred files has one
+/// bug and not four hundred, and the first few name it. The count is exact
+/// either way — that is what `skipped` is for.
+fn refusal_note(plugin: &str, refused: &[(String, String)]) -> String {
+    const NAMED: usize = 5;
+    let mut note = format!(
+        "plugin `{plugin}` could not parse {} file(s), which were skipped:",
+        refused.len()
+    );
+    for (files, why) in refused.iter().take(NAMED) {
+        note.push_str(&format!("\n  {files}: {}", super::first_line(why)));
+    }
+    if refused.len() > NAMED {
+        note.push_str(&format!("\n  … and {} more", refused.len() - NAMED));
+    }
+    note
+}
+
 fn into_preprocessed(out: wit_plugin::Output, plugin: &str) -> Result<Preprocessed> {
     let nodes = out
         .nodes
@@ -548,4 +671,52 @@ fn properties(json: &str, plugin: &str) -> Result<dr_strange_core::Properties> {
     })?;
     dr_strange_core::json::json_to_properties(&value)
         .map_err(|e| anyhow!("plugin `{plugin}` returned properties we cannot read: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim from a go plugin trapping on a 92-term string concatenation,
+    /// trimmed to three frames. `backtrace` is what `{}` rendered; `full` is
+    /// what `{:#}` rendered — the same text, plus the cause chain.
+    const BACKTRACE: &str = "error while executing at wasm backtrace:\n    \
+                             0:  0x4cb94 - main!(*go/printer.printer).expr1\n    \
+                             1:  0x4cd01 - main!(*go/printer.printer).expr1\n    \
+                             2:  0x4cd01 - main!(*go/printer.printer).expr1";
+    const CAUSES: &str = ": memory fault at wasm address 0xfffffe50 in linear memory \
+                          of size 0x40000: wasm trap: out of bounds memory access";
+
+    #[test]
+    fn a_trap_leads_with_the_reason_not_the_backtrace() {
+        let full = format!("{BACKTRACE}{CAUSES}");
+        let msg = trap_message("go", BACKTRACE, &full);
+
+        // The first line is the diagnosis, which is all a one-line report note
+        // carries — it used to be "error while executing at wasm backtrace:".
+        let first = super::super::first_line(&msg);
+        assert!(
+            first.starts_with("plugin `go` trapped: memory fault at wasm address"),
+            "the reason should lead: {first}"
+        );
+        assert!(
+            first.ends_with("out of bounds memory access"),
+            "the root cause should survive: {first}"
+        );
+        // The evidence is kept, under the diagnosis.
+        assert!(msg.contains("expr1"), "the backtrace should still be there");
+        // And a fault in the top of the address space is named for what it is.
+        assert!(
+            msg.contains("stack underflowing"),
+            "a wrapped stack pointer should be explained: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_trap_with_no_cause_chain_is_left_alone() {
+        // Nothing hangs off it: both renderings agree, so there is nothing to
+        // lift out and no reason to print the same text twice.
+        let msg = trap_message("go", BACKTRACE, BACKTRACE);
+        assert_eq!(msg, format!("plugin `go` trapped: {BACKTRACE}"));
+    }
 }
