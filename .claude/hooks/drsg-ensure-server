@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# SessionStart hook: make sure this repo's drsg MCP server is running.
+#
+# `drsg init` spawns a detached `serve watch` and records its URL and bearer
+# token in .mcp.json. Nothing else ever restarts that process — an MCP "http"
+# entry is a connect instruction, not a launch one, so no agent client relaunches
+# it and it does not survive a reboot. Every agent then points at a dead port.
+#
+# Re-running `drsg init` is the fix: it probes the recorded endpoint, leaves a
+# live server alone (without opening the database, so it cannot collide with the
+# running one), and restarts a dead one on the same address and token without
+# re-parsing the tree. Requires drsg >= 2.1.1 — older versions die on the
+# single-writer lock instead, and hand out a fresh port and token when they do
+# spawn.
+#
+# Guarded by default: acts only where a previous `drsg init` already ran, so
+# opening an unrelated directory never digests it. Set
+# DRSG_ENSURE_UNCONDITIONAL=1 to bootstrap a repo that has no .mcp.json yet —
+# that first run performs a full digest and blocks until it finishes.
+set -u
+
+cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null || exit 0
+command -v drsg >/dev/null 2>&1 || exit 0
+
+if [ "${DRSG_ENSURE_UNCONDITIONAL:-0}" != "1" ]; then
+  [ -f .mcp.json ] || exit 0
+  grep -q '"drsg-watch"' .mcp.json 2>/dev/null || exit 0
+fi
+
+# stdout only: the tracing log goes to stderr, and its ANSI-coloured lines would
+# otherwise be picked up as the status line.
+out=$(drsg init --dir . 2>/dev/null) || exit 0
+
+# Silent on the common path (the server was already up and nothing changed).
+# Speak only when a plane was built or the process was respawned, since that is
+# when an agent's cached connection details may be stale.
+status=$(printf '%s\n' "$out" | grep -m1 -E 'bootstrapped|restarted') || exit 0
+if command -v jq >/dev/null 2>&1; then
+  printf '{"systemMessage":%s}\n' "$(printf 'drsg: %s' "$status" | jq -Rs .)"
+fi
+exit 0

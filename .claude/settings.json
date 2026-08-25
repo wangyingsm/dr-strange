@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server",
+            "timeout": 300,
+            "statusMessage": "Ensuring the drsg MCP server is up..."
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server",
+            "timeout": 300,
+            "statusMessage": "Ensuring the drsg MCP server is up..."
+          }
+        ]
+      }
+    ]
+  }
+}
