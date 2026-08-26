@@ -4,6 +4,26 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A `RETURN` this subset does not have now says so.** Appendix B promises
+  projections and aggregation are "a clear error, never a silent
+  mis-compile", but `RETURN f.file, f.line, key(f)` stopped the parse at the
+  first dot and surfaced as `unexpected trailing input near \`.file, …\`` — a
+  position, not an answer, and it reads like a typo in a query that has none.
+  Each shape now names itself and says what to write instead: a projection, a
+  column list, a call in RETURN, an `AS` alias. Written for the callers who
+  actually hit it — agents on the MCP `cypher` tool, for whom the error
+  message is the only documentation in reach. The tool's own description now
+  states the restriction too, so the query arrives right the first time.
+- **The MCP `search` tool pointed at a config section that does not exist.**
+  Without an embedding provider it said to set "`[server]` embed provider",
+  but the keys live under `[digest]` — and `[server]` denies unknown fields,
+  so an operator who followed the hint got a server that would not start. It
+  now names `[digest] embed_provider` and `embed_key_env`, and points at
+  `grep` for the text search that needs no provider at all.
+
 ## [2.1.1] - 2026-08-25
 
 ### Changed

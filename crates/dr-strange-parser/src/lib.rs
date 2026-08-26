@@ -210,12 +210,15 @@ fn parse_statement_inner(
 ) -> Result<Statement, ParseError> {
     let (rest, stmt) = parse::statement(input).map_err(|e| ParseError::Syntax(describe(e)))?;
     // Everything must be consumed — trailing tokens mean a mistyped clause.
-    let rest = rest.trim();
-    if !rest.is_empty() {
-        return Err(ParseError::Syntax(format!(
-            "unexpected trailing input near `{}`",
-            snippet(rest)
-        )));
+    let rest = rest.trim_start();
+    if !rest.trim_end().is_empty() {
+        return Err(match unsupported_return(input, rest) {
+            Some(why) => ParseError::Compile(why),
+            None => ParseError::Syntax(format!(
+                "unexpected trailing input near `{}`",
+                snippet(rest.trim_end())
+            )),
+        });
     }
     Ok(match stmt {
         ast::StmtAst::Read(query) => {
@@ -227,6 +230,78 @@ fn parse_statement_inner(
             Statement::Write(write::compile(w, params.clone()).map_err(ParseError::Compile)?)
         }
     })
+}
+
+/// Read a RETURN this subset does not have, and say so in those terms.
+///
+/// `RETURN` takes one variable or `*` (appendix B), so full Cypher's
+/// projections stop the parse mid-clause and surface as "unexpected trailing
+/// input near `.file, …`" — a position, not an answer, and appendix B promises
+/// these are "a clear error, never a silent mis-compile". Whoever wrote
+/// `RETURN f.file, f.line` needs to hear that whole records come back anyway,
+/// not to go hunting for a typo that isn't there.
+///
+/// `rest` is what the parse left, so it is a suffix of `input`: the text
+/// before it is what parsed, and the RETURN clause is recognised there rather
+/// than guessed at, which keeps a `WHERE n.name = 'return'` from being read as
+/// one.
+fn unsupported_return(input: &str, rest: &str) -> Option<String> {
+    let var = returned_variable(&input[..input.len() - rest.len()])?;
+    let what = match rest.as_bytes().first()? {
+        b'.' => format!(
+            "RETURN takes one variable or `*`, so the projection `{var}.…` is not \
+             supported — `RETURN {var}` hands back whole records, properties and \
+             all, and ORDER BY still takes `{var}.…`"
+        ),
+        b',' => format!(
+            "RETURN takes one variable or `*`, so a column list is not supported — \
+             `RETURN {var}` hands back whole records, properties and all"
+        ),
+        b'(' => format!(
+            "RETURN takes one variable or `*`, so calling `{var}(…)` in it is not \
+             supported — there is no aggregation, and `key()` and `score()` belong \
+             in WHERE and ORDER BY; a returned record already carries the key"
+        ),
+        _ => {
+            let after_as = keyword_tail(rest, "as")?;
+            // `AS OF …` is a real clause and parses; reaching here with `OF`
+            // next means its argument is the problem, not an alias.
+            if keyword_tail(after_as, "of").is_some() {
+                return None;
+            }
+            format!(
+                "RETURN takes one variable or `*`, so aliasing `{var}` with AS is not supported"
+            )
+        }
+    };
+    Some(format!("{what} (near `{}`)", snippet(rest.trim_end())))
+}
+
+/// The variable a RETURN clause got as far as naming, if `parsed` ends in one:
+/// the last `RETURN` keyword, an optional `DISTINCT`, and a bare identifier —
+/// exactly what the grammar accepts, and nothing else in between.
+fn returned_variable(parsed: &str) -> Option<&str> {
+    let at = parsed.to_ascii_lowercase().rfind("return")?;
+    let after = keyword_tail(&parsed[at..], "return")?;
+    let after = keyword_tail(after, "distinct").unwrap_or(after).trim();
+    let ident = !after.is_empty()
+        && after.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !after.starts_with(|c: char| c.is_ascii_digit());
+    ident.then_some(after)
+}
+
+/// What follows `word` in `s`, when `s` opens with that keyword as a whole
+/// word — `None` when it does not, so `ordered` never reads as `order`.
+fn keyword_tail<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    let s = s.trim_start();
+    let (head, tail) = s.split_at_checked(word.len())?;
+    if !head.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    match tail.chars().next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => None,
+        _ => Some(tail),
+    }
 }
 
 fn describe(e: nom::Err<nom::error::Error<&str>>) -> String {

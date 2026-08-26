@@ -1540,9 +1540,16 @@ impl DrStrange {
         let embed = self.embed.clone();
         self.blocking("search", move |db| {
             let Some(cfg) = &embed else {
+                // The section is `[digest]`, and saying `[server]` was worse
+                // than saying nothing: `[server]` denies unknown fields, so an
+                // operator who followed this hint got a server that would not
+                // start.
                 anyhow::bail!(
                     "no embed provider configured on this server — set \
-                     [server] embed provider (and its key env) in drsg.toml"
+                     `[digest] embed_provider` in drsg.toml (with \
+                     `embed_key_env` naming the environment variable that \
+                     holds the key), then restart; `grep` searches the tree by \
+                     text without one"
                 );
             };
             let embedder = dr_strange_llm::build_provider(
@@ -1728,7 +1735,10 @@ impl DrStrange {
         CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \
         algorithms. Then BEAM similarity traversal, WHERE (property/label \
         tests, key(n) for a node's external key, x IN [a,b]), \
-        RETURN [DISTINCT], ORDER BY/SKIP/LIMIT, and a trailing \
+        RETURN [DISTINCT] <var>|* — one variable, the pattern's last, and \
+        whole records come back, so there is no column list, projection \
+        (`RETURN f.file`), alias or aggregate; ORDER BY/SKIP/LIMIT take \
+        expressions (`ORDER BY f.line`), and a trailing \
         AS OF <seq|\"RFC-3339\"|TIME ms> to read a past snapshot. \
         Writes (CREATE/MERGE/SET/REMOVE/DELETE) mutate the plane and return \
         change-counts. Examples: \
