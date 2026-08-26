@@ -236,3 +236,64 @@ fn the_same_tree_twice_gives_the_same_facts() {
     assert_eq!(keys(&first), keys(&second));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One file the plugin cannot get through is skipped; the rest of the tree
+/// still lands. The real case was a `.pb.go` whose thousand-term string
+/// concatenation walked the go plugin's printer off its stack: before this,
+/// that single file refused the whole repository, and under `serve watch` it
+/// refused every fold after it — the watcher stopped and the graph stayed
+/// empty while the server kept answering.
+#[test]
+fn one_file_the_plugin_cannot_parse_is_skipped_not_the_tree() {
+    let (dir, host) = scratch("stack-one");
+    std::fs::write(dir.join("deep.fix"), "boom").unwrap();
+    std::fs::write(dir.join("b.fix"), "y").unwrap();
+    let plugin = fixture("stack", Limits::default());
+    let out = plugin
+        .preprocess(
+            &Input::Files {
+                paths: &[
+                    "a.fix".to_string(),
+                    "b.fix".to_string(),
+                    "deep.fix".to_string(),
+                ],
+            },
+            &host,
+        )
+        .expect("one impossible file must not refuse the other two");
+
+    let keys: Vec<&str> = out.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(keys, vec!["a.fix", "b.fix"], "the good files still land");
+    assert_eq!(out.report.skipped, 1);
+    let note = out.report.notes.join(" ");
+    assert!(
+        note.contains("deep.fix") && note.contains("fixture"),
+        "the report should name the file and the plugin: {note}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Failing on *every* file is a different animal — a plugin that does not work
+/// here — and stays fatal, because a plane quietly missing every fact is the
+/// worst of the available answers.
+#[test]
+fn a_plugin_that_fails_on_every_file_is_still_fatal() {
+    let (dir, host) = scratch("stack-all");
+    std::fs::write(dir.join("deep-1.fix"), "boom").unwrap();
+    std::fs::write(dir.join("deep-2.fix"), "boom").unwrap();
+    let plugin = fixture("stack", Limits::default());
+    let err = plugin
+        .preprocess(
+            &Input::Files {
+                paths: &["deep-1.fix".to_string(), "deep-2.fix".to_string()],
+            },
+            &host,
+        )
+        .expect_err("nothing got through, so nothing should be reported as fine");
+    let said = format!("{err:#}");
+    assert!(
+        said.contains("all 2") && said.contains("fixture"),
+        "the error should say the plugin failed on everything: {said}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

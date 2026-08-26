@@ -106,9 +106,17 @@ grant. A guest runtime may *import* `wasi:filesystem` — Go's does, before the
 plugin's first line runs — but the preopen table behind it is empty;
 `wasi:sockets` is refused at load, by name; clocks are frozen; entropy is
 fixed; and each call runs under instruction and memory budgets. A trapped
-guest's stderr is captured into the error the operator sees. Whatever a plugin
-produces comes back as a **return value** — only the host writes to the
-database.
+guest's stderr is captured into the error the operator sees, along with the
+trap code itself. Whatever a plugin produces comes back as a **return value** —
+only the host writes to the database.
+
+A call parses **one file**, so a plugin that trips over one is one file's worth
+of loss: it is skipped and counted, and the report names it. Generated source
+is the usual culprit — a `.pb.go` whose descriptor blob is a thousand-term
+string concatenation will walk a recursive printer straight off the stack the
+plugin was linked with, which is the plugin author's to fix and no host setting
+can raise. A plugin that fails on *every* file it claimed is a different
+matter, and still refuses the run.
 
 The budgets are tunable in `drsg.toml`
 ([Chapter 2](./getting-started.md#configuration-file)):

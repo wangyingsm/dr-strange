@@ -20,6 +20,22 @@
 //! Cross-file resolution therefore stays in the plugin, deliberately — it is
 //! language semantics, and the database holds none.
 //!
+//! ## A chunk that fails is a chunk, not the tree
+//!
+//! A chunk is one file, so a `parse` that traps is one file the plugin cannot
+//! get through — **counted and skipped**, the way the built-in reader counts a
+//! PNG it cannot convert. Real trees contain the file that breaks a parser:
+//! generated source whose thousand-term expression recurses a walker past the
+//! stack the guest was linked with, and no host setting moves that stack. One
+//! such file used to refuse the whole repository, and under `serve watch` it
+//! refused every fold after it too — the watcher stopped, and the graph stayed
+//! empty while the server went on answering.
+//!
+//! Every chunk failing is the other thing entirely: a plugin that does not
+//! work here, and ingesting nothing quietly would be the worst answer
+//! available. That stays fatal, and `assemble` — one call, the whole tree —
+//! has nothing to skip and always did.
+//!
 //! ## What a plugin can reach
 //!
 //! Exactly `list`, `read` and `label` — the [`Host`] trait, handed across the
@@ -340,6 +356,14 @@ impl WasmPlugin {
     ///
     /// Running out of fuel is the one an operator can do something about, so
     /// it says so and names the setting, rather than surfacing as "wasm trap".
+    ///
+    /// Everything else is rendered `{:#}`, not `{}`, and **led by the trap
+    /// code**: wasmtime puts the wasm backtrace in the outer message and the
+    /// code that names what went wrong in the cause, so the plain form opens
+    /// with "error while executing at wasm backtrace: …", twenty frames of
+    /// recursion, and never says why. A guest that blew its own stack is
+    /// indistinguishable from one that divided by zero until the last line —
+    /// which is exactly the line a log line, truncated, drops.
     fn explain_trap(&self, error: wasmtime::Error, store: &Store<State>) -> anyhow::Error {
         let name = &self.manifest.name;
         if self.limits.fuel.is_some() && store.get_fuel().is_ok_and(|left| left == 0) {
@@ -348,15 +372,22 @@ impl WasmPlugin {
                  or the input is larger than `[plugins] fuel` allows for"
             );
         }
+        let rendered = format!("{error:#}");
+        let code = trap_code(&rendered)
+            .map(|c| format!(": {c}"))
+            .unwrap_or_default();
+        let hint = stack_overflow_hint(&rendered)
+            .map(|h| format!(" — {h}"))
+            .unwrap_or_default();
         let said = store.data().stderr.contents();
         if said.is_empty() {
-            return anyhow!("plugin `{name}` trapped: {error}");
+            return anyhow!("plugin `{name}` trapped{code}{hint}\n{rendered}");
         }
         // The tail, because a panic message comes last and the front of a
         // long log is the least interesting part of it.
         let tail = said.len().saturating_sub(2048);
         let said = String::from_utf8_lossy(&said[tail..]).trim().to_string();
-        anyhow!("plugin `{name}` trapped: {error}\nits stderr said:\n{said}")
+        anyhow!("plugin `{name}` trapped{code}{hint}\n{rendered}\nits stderr said:\n{said}")
     }
 }
 
@@ -370,6 +401,8 @@ impl Preprocessor for WasmPlugin {
         // Phase one: chunks in parallel, partials collected in chunk order —
         // par_iter's collect preserves order, which is the same discipline the
         // native parser used for exactly the same reason.
+        let mut refused: Vec<String> = Vec::new();
+        let mut first_refusal: Option<anyhow::Error> = None;
         let partials: Vec<Vec<u8>> = match input {
             Input::Document { name, bytes } => {
                 vec![self.parse_chunk(
@@ -380,16 +413,56 @@ impl Preprocessor for WasmPlugin {
                     host,
                 )?]
             }
-            Input::Files { paths } => paths
-                .chunks(CHUNK_FILES)
-                .collect::<Vec<_>>()
-                .par_iter()
-                .map(|chunk| self.parse_chunk(wit_plugin::Input::Files(chunk.to_vec()), host))
-                .collect::<Result<Vec<_>>>()?,
+            Input::Files { paths } => {
+                let outcomes: Vec<(&[String], Result<Vec<u8>>)> = paths
+                    .par_chunks(CHUNK_FILES)
+                    .map(|chunk| {
+                        let out = self.parse_chunk(wit_plugin::Input::Files(chunk.to_vec()), host);
+                        (chunk, out)
+                    })
+                    .collect();
+                let mut kept = Vec::with_capacity(outcomes.len());
+                for (chunk, outcome) in outcomes {
+                    match outcome {
+                        Ok(partial) => kept.push(partial),
+                        // A file the plugin cannot get through is **counted,
+                        // not fatal** — the same rule the built-in reader
+                        // applies to a PNG it cannot convert. One pathological
+                        // file (generated source that recurses a walker past
+                        // its stack, say) would otherwise refuse a whole
+                        // repository, and under `serve watch` it refuses every
+                        // fold from then on: the watcher stops and the graph
+                        // silently stays empty.
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %self.manifest.name,
+                                files = %chunk.join(", "),
+                                error = format!("{e:#}"),
+                                "the plugin could not parse these files — skipped"
+                            );
+                            refused.extend(chunk.iter().cloned());
+                            first_refusal.get_or_insert(e);
+                        }
+                    }
+                }
+                // Failing on *everything*, though, is not a pathological file:
+                // it is a plugin that does not work here, and quietly ingesting
+                // nothing would be the worst answer available.
+                if kept.is_empty() && !refused.is_empty() {
+                    let n = refused.len();
+                    return Err(first_refusal
+                        .expect("a refusal was recorded")
+                        .context(format!(
+                            "plugin `{}` failed on all {n} of the files it claimed",
+                            self.manifest.name
+                        )));
+                }
+                kept
+            }
         };
         let parsed = std::time::Instant::now();
 
-        // Phase two: once, with everything.
+        // Phase two: once, with everything that got through.
         let out = self.assemble(&partials, host)?;
         // Where a slow run spends its time: the parse phase is as wide as the
         // chunk count, the assemble phase is serial by design — knowing which
@@ -401,8 +474,123 @@ impl Preprocessor for WasmPlugin {
             assemble_ms = parsed.elapsed().as_millis() as u64,
             "preprocess phases"
         );
-        into_preprocessed(out, &self.manifest.name)
+        let mut pre = into_preprocessed(out, &self.manifest.name)?;
+        if !refused.is_empty() {
+            pre.report.skipped += refused.len();
+            let why = first_refusal.map(|e| format!("{e:#}")).unwrap_or_default();
+            pre.report
+                .notes
+                .push(skipped_note(&self.manifest.name, &refused, &why));
+        }
+        Ok(pre)
     }
+}
+
+/// The trap code out of a rendered error chain — `wasm trap: out of bounds
+/// memory access` and the like, which wasmtime writes as the innermost cause
+/// and this lifts to the front so the first line of the message is the one
+/// that says what happened.
+fn trap_code(rendered: &str) -> Option<&str> {
+    const MARK: &str = "wasm trap: ";
+    let at = rendered.rfind(MARK)? + MARK.len();
+    Some(rendered[at..].lines().next()?.trim()).filter(|c| !c.is_empty())
+}
+
+/// Does this trap read like a guest that ran out of stack?
+///
+/// Three shapes say so. Wasmtime's own `call stack exhausted` is the plain
+/// one. A guest whose stack lives at the bottom of linear memory and grows
+/// *down* — TinyGo's does, and wasi-libc's can — instead faults at an address
+/// just below 4 GiB: a stack pointer that decremented past zero and wrapped,
+/// not an index into anything. And where the fault carries no address, the
+/// backtrace still does: the same frame, all the way down.
+///
+/// Worth naming, because the cure is not the operator's to apply: a guest's
+/// stack is sized into the module when it is linked, and no host setting
+/// moves it. What moves it is the plugin — or the input, since what reaches
+/// that depth is usually generated source (a thousand-term `+` chain in a
+/// protobuf blob, say) walked by a hand-written recursive printer.
+fn stack_overflow_hint(rendered: &str) -> Option<&'static str> {
+    const HINT: &str = "the guest overflowed its own stack, which deeply nested input does \
+         to a recursive walker. A plugin's stack is fixed when it is linked, \
+         so no host setting raises it: this one is for the plugin's author";
+    if rendered.contains("call stack exhausted") {
+        return Some(HINT);
+    }
+    if !rendered.contains("out of bounds memory access") {
+        return None;
+    }
+    (wrapped_past_zero(rendered) || one_frame_all_the_way_down(rendered)).then_some(HINT)
+}
+
+/// A fault address within a page of the wasm32 ceiling: nothing is addressed
+/// up there, so it is a pointer that went negative.
+fn wrapped_past_zero(rendered: &str) -> bool {
+    let Some(rest) = rendered.split("memory fault at wasm address ").nth(1) else {
+        return false;
+    };
+    let hex = rest
+        .split(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+        .next();
+    let addr = hex
+        .and_then(|h| h.strip_prefix("0x"))
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+    addr.is_some_and(|a| a >= u64::from(u32::MAX) - (1 << 16))
+}
+
+/// Runaway recursion, read off the backtrace: wasmtime lists the innermost
+/// frames, and when nearly all of them are the same function the guest was
+/// descending, not working.
+fn one_frame_all_the_way_down(rendered: &str) -> bool {
+    // `    3:  0x4f628 - main!go/printer.walkBinary` — and the deepest line may
+    // carry the trap text after a colon, which is not part of the name.
+    let frames: Vec<&str> = rendered
+        .lines()
+        .filter(|l| l.contains(" - ") && l.contains("0x"))
+        .filter_map(|l| l.split(" - ").nth(1))
+        .map(|f| f.split(':').next().unwrap_or(f).trim())
+        .collect();
+    // The most repeated name, not the innermost one: a recursive walker often
+    // trips inside a small helper it calls. Twenty frames at most, so counting
+    // them against each other costs nothing worth a hash map.
+    let deepest_repeat = frames
+        .iter()
+        .map(|a| frames.iter().filter(|b| *b == a).count())
+        .max()
+        .unwrap_or(0);
+    frames.len() >= 8 && deepest_repeat * 4 >= frames.len() * 3
+}
+
+/// The one line a report carries about files a plugin could not get through.
+///
+/// Aggregated rather than one note per file: a tree can hand a plugin
+/// thousands of files, and a report is read by a person. The paths are the
+/// actionable part, so a few of them are named outright and the rest counted;
+/// the plugin's own words come last, first line only — the wasm backtrace
+/// behind it is already in the log at `warn`.
+fn skipped_note(plugin: &str, refused: &[String], why: &str) -> String {
+    const NAMED: usize = 3;
+    let mut which = refused.iter().take(NAMED).cloned().collect::<Vec<_>>();
+    if let Some(rest) = refused.len().checked_sub(NAMED).filter(|r| *r > 0) {
+        which.push(format!("and {rest} more"));
+    }
+    let why = why.lines().next().unwrap_or_default().trim();
+    let n = refused.len();
+    let (files, whose) = if n == 1 {
+        ("file", "its facts are")
+    } else {
+        ("files", "their facts are")
+    };
+    format!(
+        "plugin `{plugin}` could not parse {n} {files} — skipped, so {whose} \
+         missing from this run: {}{}",
+        which.join(", "),
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!(" ({why})")
+        }
+    )
 }
 
 /// Time, stopped. Both wasi clocks return a constant, so two reads agree and
@@ -548,4 +736,94 @@ fn properties(json: &str, plugin: &str) -> Result<dr_strange_core::Properties> {
     })?;
     dr_strange_core::json::json_to_properties(&value)
         .map_err(|e| anyhow!("plugin `{plugin}` returned properties we cannot read: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The go plugin, on a generated `.pb.go` whose `rawDesc` is a
+    /// thousand-term string concatenation — the trap this reading exists for,
+    /// verbatim but for the frames elided in the middle.
+    const GO_STACK_OVERFLOW: &str = "\
+error while executing at wasm backtrace:
+    0:  0x4f79b - main!go/printer.walkBinary
+    1:  0x4f628 - main!go/printer.walkBinary
+    2:  0x4f628 - main!go/printer.walkBinary
+    3:  0x4f628 - main!go/printer.walkBinary
+    4:  0x4f628 - main!go/printer.walkBinary
+    5:  0x4f628 - main!go/printer.walkBinary
+    6:  0x4f628 - main!go/printer.walkBinary
+    7:  0x4f628 - main!go/printer.walkBinary
+    8:  0x4f628 - main!go/printer.walkBinary
+    9:  0x4cd01 - main!(*go/printer.printer).expr1: memory fault at wasm \
+address 0xfffffffc in linear memory of size 0x40000: wasm trap: out of bounds \
+memory access";
+
+    #[test]
+    fn the_trap_code_is_lifted_out_of_the_cause() {
+        assert_eq!(
+            trap_code(GO_STACK_OVERFLOW),
+            Some("out of bounds memory access")
+        );
+        assert_eq!(trap_code("nothing wasm about this"), None);
+    }
+
+    #[test]
+    fn a_wrapped_stack_pointer_reads_as_a_stack_overflow() {
+        assert!(stack_overflow_hint(GO_STACK_OVERFLOW).is_some());
+        assert!(wrapped_past_zero(GO_STACK_OVERFLOW));
+        assert!(stack_overflow_hint("wasm trap: call stack exhausted").is_some());
+    }
+
+    /// A fault with no address at all still reads as recursion when the
+    /// backtrace is one frame repeated — which is what a Rust guest gives.
+    #[test]
+    fn one_frame_repeated_reads_as_recursion() {
+        let mut trace = String::from("error while executing at wasm backtrace:\n");
+        for i in 0..12 {
+            trace.push_str(&format!(
+                "    {i}:   0x45f2 - fixture.wasm!walk_off_the_stack\n"
+            ));
+        }
+        trace.push_str("wasm trap: out of bounds memory access");
+        assert!(stack_overflow_hint(&trace).is_some());
+    }
+
+    /// An ordinary bug is not dressed up as a stack overflow: a short, varied
+    /// backtrace gets the trap code and nothing more.
+    #[test]
+    fn an_ordinary_trap_gets_no_stack_reading() {
+        let trace = "\
+error while executing at wasm backtrace:
+    0:   0x120 - plugin.wasm!parse_header
+    1:   0x340 - plugin.wasm!parse
+    2:   0x510 - plugin.wasm!main: wasm trap: integer divide by zero";
+        assert_eq!(trap_code(trace), Some("integer divide by zero"));
+        assert_eq!(stack_overflow_hint(trace), None);
+    }
+
+    #[test]
+    fn the_skip_note_names_a_few_files_and_counts_the_rest() {
+        let refused: Vec<String> = (0..5).map(|i| format!("gen/{i}.pb.go")).collect();
+        let note = skipped_note(
+            "go",
+            &refused,
+            "plugin `go` trapped: out of bounds\nframe 0",
+        );
+        assert!(note.contains("could not parse 5 files"), "{note}");
+        assert!(
+            note.contains("gen/0.pb.go, gen/1.pb.go, gen/2.pb.go"),
+            "{note}"
+        );
+        assert!(note.contains("and 2 more"), "{note}");
+        // The first line of the plugin's complaint, and not the backtrace
+        // under it.
+        assert!(note.contains("out of bounds"), "{note}");
+        assert!(!note.contains("frame 0"), "{note}");
+
+        let one = skipped_note("go", &["a.go".to_string()], "");
+        assert!(one.contains("1 file — skipped, so its facts are"), "{one}");
+        assert!(!one.contains("more"), "{one}");
+    }
 }

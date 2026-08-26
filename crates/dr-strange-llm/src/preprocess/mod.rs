@@ -113,7 +113,8 @@ pub struct PreprocessReport {
     /// `(name@version, facts emitted)`, in the order the handlers ran.
     pub handlers: Vec<(String, usize)>,
     pub prose_chars: usize,
-    /// Files no handler claimed, or that carried nothing readable.
+    /// Files no handler claimed, that carried nothing readable, or that the
+    /// handler which claimed them could not get through.
     pub skipped: usize,
     /// Keys two handlers both produced — a plugin bug, kept visible.
     pub collisions: Vec<String>,

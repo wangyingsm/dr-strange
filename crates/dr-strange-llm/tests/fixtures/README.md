@@ -19,7 +19,10 @@ cp crates/dr-strange-llm/tests/fixtures/guest-net/target/wasm32-wasip2/release/d
 ```
 
 - `fixture.wasm` — one component, its behaviour picked by `options`:
-  `ok`, `escape`, `spin`, `alloc`, `clock`, `rand`. See `guest/src/lib.rs`.
+  `ok`, `escape`, `spin`, `alloc`, `clock`, `rand`, `stack`. See
+  `guest/src/lib.rs`. `stack` recurses off its own stack, but only on files
+  named `deep…`, so the host's "skip that file, keep the tree" is testable
+  against a mixed directory.
 - `fixture-fs.wasm` — imports `wasi:filesystem` (via `std::fs`). It loads —
   guest runtimes plant this import before a plugin's first line runs — and
   exists to prove the grant behind it is an empty preopen table.
