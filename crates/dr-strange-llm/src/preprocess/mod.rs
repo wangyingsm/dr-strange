@@ -43,6 +43,7 @@
 mod ground;
 #[cfg(feature = "plugins")]
 mod registry;
+mod repo;
 mod sync;
 #[cfg(feature = "plugins")]
 mod wasm;
@@ -61,6 +62,10 @@ use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore};
+pub use repo::{
+    GitDir, PLANE_SUFFIX, REPO_PLUGIN, WriteStats, git_dir, plane_name, route_repository,
+    write_history,
+};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};

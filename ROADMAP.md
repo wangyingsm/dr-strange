@@ -882,6 +882,77 @@ surfaced** in the error, because a Go panic prints there and a bare
 "trapped" hid the whole diagnosis. Each guarantee is pinned by a hostile
 fixture, as before.
 
+
+**Shipped (v2, slice 8): the `git` plugin — history as a second plane.** A
+checkout carries two sources of truth. The tree says what the code *is*; the
+repository says how it got there. `git@1` reads the second one — commits,
+branches, tags, merges, and the rebases only the reflog remembers — straight
+out of `.git`, inside the sandbox, with **no `git` binary run**: it carries
+its own reader for the object store (loose objects, v2 pack indexes, both
+delta forms), refs (`refs/…` and `packed-refs`, loose winning) and the
+reflog. 15 native tests, none of them a captured fixture — every one builds a
+repository with the `git` binary, does something to it (merge, rebase,
+`gc --aggressive`), and reads what git actually wrote; the packed and loose
+readings of one repository must come out identical, property for property.
+Measured on this repository: 429 commits, 11 merges, 15 tags in about two
+seconds, end to end.
+
+*Dispatch is by the shape of the source, not by an extension.* Every other
+handler is chosen by a file's extension, because that is what its input is.
+History is not a file, so `git` declares **no extensions** and the file
+router never dispatches to it; the host runs it when the digested directory
+turns out to have a git directory in it — something the host can see rather
+than guess — and the plugin name `git` is the declaration, reserved the way
+the official catalog reserves the others. Nothing is guessed: with no such
+plugin installed, a digest simply does not read history and says so once.
+
+*The grant is narrower, not wider.* It is handed a host rooted at the **git
+directory** and nothing else: it cannot read a single source file, and the
+tree's plugins still cannot read a single object — `.git` was always excluded
+from the ordinary walk. Two planes for the same reason: `<plane>_git` beside
+the code plane, because a code plane is a picture of the tree *now* and is
+rewritten whenever a file changes, while history only ever grows. Folding one
+into the other would mean re-reading a thousand commits every time a function
+moved, and every `MATCH (n)` over the code would walk a graph mostly made of
+commits.
+
+*Writing is append-mostly, and shaped by what can change.* A commit is
+immutable — its sha is its content — so one already in the plane is left
+exactly as it is and its `PARENT` edges are never rewritten; only a moving
+pointer (a branch, a tag, a rebase) is patched and has its edges re-asserted.
+A second digest of an unchanged repository therefore writes nothing at all,
+and a digest after one commit writes one node and two edges.
+
+*Settled — the one thing that cannot be exact.* A rebase leaves **no trace in
+the commit graph**: it writes new commits and moves a ref, and nothing in any
+object records that one replaced another. The only record is the reflog,
+which is local to one clone and expires (`gc.reflogExpire`, 90 days). So
+`Rebase` nodes are reconstructed from it, carry `_from_reflog`, and the
+report states the limit — an absent `Rebase` must never read as "no rebase
+happened". The same reflog is why commits no ref can reach are kept and
+marked `reachable: false`: they are what a rewrite left behind, and a graph
+showing the rewritten branch without them could not say what changed.
+
+Released as `git-v1.0.0` and pinned in the official catalog
+(`sha256:ce50d72f…`), so `drsg plugin install` offers it like any other.
+
+*Kept current, and readable.* `serve watch` refreshes the history plane at
+startup and on every HEAD move — so `drsg init` bootstraps both planes, and a
+commit that touched no file the code plane holds (an empty one, or one that
+moved only something ignored) still lands, because it moved a branch. The
+read side is one verb, `history`, on the CLI and as an MCP tool: HEAD, the
+branch and tag tips, the rebases with what each replaced, and the newest
+commits, with every listing saying what it is a listing *of*. `list_planes`
+says which plane holds which repository's history, and the server's
+instructions carry the vocabulary, so an agent does not have to discover the
+schema before it can ask a question.
+
+*Open.* Two things. A tag or a branch created **without a commit** reaches the
+history plane on the next HEAD move rather than immediately: the watcher wakes
+on HEAD, and polling every ref would double its git calls for a rare case.
+And nothing yet **links the two planes**: a `Commit` to the symbols it changed
+would need tree diffing, which is a different order of cost and a decision of
+its own.
 ---
 
 ## 12. Scoped identity — shared memory a team can actually run

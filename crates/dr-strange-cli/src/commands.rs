@@ -131,12 +131,14 @@ const GITIGNORE_PATTERNS: &[&str] = &[
 /// * **nothing recorded** — a first run: pick a free port and a fresh token,
 ///   and build the plane from scratch.
 #[cfg(feature = "digest")]
+#[allow(clippy::too_many_arguments)]
 pub fn init_bootstrap(
     db_path: &Path,
     dir: PathBuf,
     plane: Option<String>,
     addr: Option<std::net::SocketAddr>,
     token: Option<String>,
+    plugin_config: &dr_strange_llm::PluginConfig,
     out: &mut dyn Write,
 ) -> Result<()> {
     use rand::distr::{Alphanumeric, SampleString};
@@ -276,7 +278,56 @@ pub fn init_bootstrap(
         out,
         "plane '{plane_name}' {what} — serve watch pid {pid}, http://{addr}/mcp"
     )?;
+    say_history(&dir, &plane_name, plugin_config, out)?;
     write_agent_configs(&dir, &addr, &token, out)
+}
+
+/// Say what will become of this repository's history — one line, and only
+/// where there is something to say.
+///
+/// A checkout whose history is being read should say so, because a second
+/// plane appearing unannounced is exactly the kind of thing a reader later
+/// finds by accident. A checkout whose history is *not* being read should
+/// say that instead: the reason is always the same one, and it is fixable
+/// in one command.
+#[cfg(feature = "digest")]
+fn say_history(
+    dir: &Path,
+    plane_name: &str,
+    plugin_config: &dr_strange_llm::PluginConfig,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if !matches!(
+        dr_strange_llm::git_dir(dir),
+        dr_strange_llm::GitDir::Here(_)
+    ) {
+        return Ok(());
+    }
+    // The registry file, not the components: this asks which plugins are
+    // installed, and compiling one to answer that would be absurd.
+    let installed = plugin_store(plugin_config)
+        .and_then(|s| s.list())
+        .unwrap_or_default();
+    let history = dr_strange_llm::git_plane_name(plane_name);
+    if installed
+        .iter()
+        .any(|p| p.name == dr_strange_llm::REPO_PLUGIN)
+    {
+        writeln!(
+            out,
+            "  history → plane '{history}', current with every commit — \
+             `drsg history --plane {plane_name}`"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  note: no `{}` plugin installed, so this repository's history \
+             (commits, branches, rebases) is not read — `drsg plugin install` \
+             offers one",
+            dr_strange_llm::REPO_PLUGIN
+        )?;
+    }
+    Ok(())
 }
 
 /// Point every agent config in `dir` at `addr`, and say which files that
@@ -641,6 +692,32 @@ fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool
     Ok(true)
 }
 
+/// `drsg history` — a repository's history at a glance.
+///
+/// The plane argument is forgiving in one direction only: naming the **code**
+/// plane finds the history plane beside it, because `myrepo` is what a reader
+/// has in mind and `myrepo_git` is an implementation detail of where the
+/// digest put it. The reverse is not guessed at — a plane that holds no
+/// commits and has no `_git` beside it says so.
+pub fn history(db: &Database, plane_name: &str, limit: usize, out: &mut dyn Write) -> Result<()> {
+    let history_plane = dr_strange_core::compact::history_plane_name(plane_name);
+    let (name, p) = match db.plane(&history_plane) {
+        // A `_git` plane beside the one named: that is the history, whatever
+        // the named plane happens to hold.
+        Ok(p) if !plane_name.ends_with(dr_strange_core::compact::HISTORY_SUFFIX) => {
+            (history_plane, p)
+        }
+        _ => (plane_name.to_string(), plane(db, plane_name)?),
+    };
+    writeln!(out, "plane '{name}':")?;
+    write!(
+        out,
+        "{}",
+        dr_strange_core::compact::history(&p, Some(limit))?
+    )?;
+    Ok(())
+}
+
 // ---- planes --------------------------------------------------------------
 
 pub fn plane_list(db: &Database, out: &mut dyn Write) -> Result<()> {
@@ -859,6 +936,7 @@ fn recorded_sync_point(db: &Database, plane_name: &str) -> (Option<String>, Opti
 /// the loop forever, and if it stops, say why — the server stays up either
 /// way, and a watcher that died silently would just look like a quiet repo.
 #[cfg(feature = "digest")]
+#[allow(clippy::too_many_arguments)]
 pub fn watch(
     db: std::sync::Arc<Database>,
     dir: std::path::PathBuf,
@@ -866,13 +944,15 @@ pub fn watch(
     plugin_config: dr_strange_llm::PluginConfig,
     embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
+    git: bool,
 ) {
-    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, embed, force) {
+    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, embed, force, git) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
     }
 }
 
 #[cfg(feature = "digest")]
+#[allow(clippy::too_many_arguments)]
 fn watch_loop(
     db: &Database,
     dir: &Path,
@@ -880,6 +960,7 @@ fn watch_loop(
     plugin_config: &dr_strange_llm::PluginConfig,
     embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
+    git: bool,
 ) -> Result<()> {
     // The server's embed config, when it has one, keeps a watched plane
     // searchable: after a fold changes facts, the changed nodes re-embed
@@ -995,7 +1076,9 @@ fn watch_loop(
             tracing::warn!(
                 plane_root = %r,
                 watch_root = %root,
-                "the plane was parsed from a different directory — file                  attribution will not line up; `--force` (or a re-digest from                  this directory) puts them on one basis"
+                "the plane was parsed from a different directory — file \
+                 attribution will not line up; `--force` (or a re-digest \
+                 from this directory) puts them on one basis"
             );
         }
         match rec_commit {
@@ -1015,21 +1098,44 @@ fn watch_loop(
             Some(rec) => {
                 tracing::warn!(
                     recorded = %&rec[..12.min(rec.len())],
-                    "the plane's sync point is unknown to this repository                      (rewritten history, or another repo) — folding forward                      from the current HEAD; `--force` re-establishes exact sync"
+                    "the plane's sync point is unknown to this repository \
+                     (rewritten history, or another repo) — folding forward \
+                     from the current HEAD; `--force` re-establishes exact sync"
                 );
             }
             None => {
                 tracing::warn!(
-                    "the plane records no sync point, so graph and repository                      cannot be compared — folding forward from the current                      HEAD; a digest of this directory (or `--force`)                      establishes one"
+                    "the plane records no sync point, so graph and repository \
+                     cannot be compared — folding forward from the current \
+                     HEAD; a digest of this directory (or `--force`) \
+                     establishes one"
                 );
             }
         }
     }
+    // History, once, before serving: a plane bootstrapped by `drsg init` has
+    // never seen a digest, so this is where it first gains one. Loading the
+    // plugins here costs a compile the folds below pay anyway.
+    if git {
+        match dr_strange_llm::Plugins::load(plugin_config) {
+            Ok(plugins) => fold_history(db, dir, plane_name, &plugins, "startup"),
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "loading plugins for the history plane failed"
+            ),
+        }
+    }
+
     tracing::info!(
         dir = %dir.display(),
         plane = plane_name,
         head = %head,
-        "watching repository — each commit folds into the graph"
+        history = git,
+        // Said once, because it is the bound of what follows: the watcher wakes
+        // on HEAD, so a tag or a branch created without a commit reaches the
+        // history plane on the next commit rather than immediately.
+        "watching repository — each commit folds into the graph, and \
+         into the history plane on the next HEAD move"
     );
     loop {
         std::thread::sleep(WATCH_POLL);
@@ -1047,12 +1153,23 @@ fn watch_loop(
         // a branch switch. What matters is the file set between the states.
         let step = (|| -> Result<bool> {
             let delta = git_changes(dir, &head, &now)?;
-            if delta.changed.is_empty() && delta.deleted.is_empty() {
+            let touches_code = !(delta.changed.is_empty() && delta.deleted.is_empty());
+            if !touches_code && !git {
                 return Ok(false);
             }
             // Reloaded each commit so a `drsg plugin install` between commits
             // is picked up without restarting the server.
             let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+            // History first, and regardless of the delta: a commit is a fact
+            // about the repository even when it touched no file the code plane
+            // holds — an empty commit, or one that moved only something
+            // ignored, still moved a branch.
+            if git {
+                fold_history(db, dir, plane_name, &plugins, "commit");
+            }
+            if !touches_code {
+                return Ok(false);
+            }
             let host = dr_strange_llm::LocalFiles::new(dir)?;
             let stats =
                 dr_strange_llm::sync_paths(db, plane_name, &host, &delta, &plugins, &source, &now)?;
@@ -1100,6 +1217,58 @@ fn watch_loop(
             }
         }
         head = now;
+    }
+}
+
+/// Bring `<plane>_git` up to date with the repository — commits, branches,
+/// tags and rebases, facts only.
+///
+/// Logged rather than returned, and never fatal: the code plane is what a
+/// watcher exists to keep current, and a history read that failed is not a
+/// reason to stop following commits. A repository with no `git` plugin
+/// installed is silent — [`route_repository`](dr_strange_llm::route_repository)
+/// says so by returning nothing, and a warning per commit would be noise
+/// about a choice the operator already made.
+#[cfg(feature = "digest")]
+fn fold_history(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    plugins: &dr_strange_llm::Plugins,
+    why: &str,
+) {
+    let plane = dr_strange_llm::git_plane_name(plane_name);
+    let done = (|| -> Result<Option<dr_strange_llm::GitWriteStats>> {
+        let Some(facts) = dr_strange_llm::route_repository(dir, plugins)? else {
+            return Ok(None);
+        };
+        if db.plane(&plane).is_err() {
+            db.create_plane(&plane, Properties::new())?;
+            tracing::info!(plane = %plane, "created the history plane");
+        }
+        Ok(Some(dr_strange_llm::write_history(db, &plane, &facts)?))
+    })();
+    match done {
+        // Nothing written is the ordinary state between commits that add no
+        // history — said at debug, not info, so a quiet repository stays quiet.
+        Ok(Some(stats)) if stats.nodes_created + stats.nodes_patched == 0 => {
+            tracing::debug!(plane = %plane, why, "history already current")
+        }
+        Ok(Some(stats)) => tracing::info!(
+            plane = %plane,
+            why,
+            nodes_created = stats.nodes_created,
+            nodes_patched = stats.nodes_patched,
+            edges_written = stats.edges_created,
+            edges_deleted = stats.edges_deleted,
+            "history folded"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = format!("{e:#}"),
+            plane = %plane,
+            "reading the repository's history failed; the code plane is unaffected"
+        ),
     }
 }
 
@@ -1745,6 +1914,11 @@ pub struct DigestArgs<'a> {
     /// The `[plugins]` section, resolved: budgets, store, and each plugin's
     /// own settings.
     pub plugin_config: dr_strange_llm::PluginConfig,
+    /// Also read the repository's history into its own plane, when the source
+    /// is a git checkout and the `git` plugin is installed (ROADMAP §11).
+    pub git: bool,
+    /// Where that history lands. `None` means `<plane>_git`.
+    pub git_plane: Option<&'a str>,
 }
 
 /// Natural-language query (ROADMAP §3): an LLM turns `question` into a
@@ -2067,16 +2241,23 @@ fn install_one(
             &entry.sha256[..12]
         )?,
     }
-    writeln!(
-        out,
-        "  handles: {}",
-        entry
-            .extensions
-            .iter()
-            .map(|e| format!(".{e}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
+    // A plugin claiming no extension is not a broken one: the `git` plugin is
+    // dispatched by the source being a repository rather than by any file's
+    // name, and printing an empty list would read as a failed install.
+    let handles = entry
+        .extensions
+        .iter()
+        .map(|e| format!(".{e}"))
+        .collect::<Vec<_>>();
+    if handles.is_empty() {
+        writeln!(
+            out,
+            "  claims no file extension — the host dispatches it by what the \
+             source is, not by what a file is called"
+        )?;
+    } else {
+        writeln!(out, "  handles: {}", handles.join(", "))?;
+    }
     Ok(())
 }
 
@@ -2158,6 +2339,7 @@ pub fn plugin_remove(
 #[cfg(feature = "digest")]
 fn read_source(
     args: &DigestArgs,
+    plugins: &dr_strange_llm::Plugins,
     out: &mut dyn Write,
 ) -> Result<(dr_strange_llm::Preprocessed, String)> {
     let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
@@ -2174,8 +2356,7 @@ fn read_source(
         if path.is_dir() {
             let host = dr_strange_llm::LocalFiles::new(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let plugins = load_plugins(args)?;
-            let facts = dr_strange_llm::route_tree(&host, args.handler, &plugins)?;
+            let facts = dr_strange_llm::route_tree(&host, args.handler, plugins)?;
             return Ok((facts, name));
         }
 
@@ -2187,8 +2368,7 @@ fn read_source(
         // source file may still need to follow an import beside it.
         let host = dr_strange_llm::LocalFiles::new(path.parent().unwrap_or(Path::new(".")))
             .with_context(|| format!("reading {}", path.display()))?;
-        let plugins = load_plugins(args)?;
-        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, &plugins)
+        let facts = dr_strange_llm::route_document(&name, &bytes, args.handler, &host, plugins)
             .with_context(|| format!("reading {}", path.display()))?;
         return Ok((facts, name));
     }
@@ -2263,7 +2443,11 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             args.mode
         )
     })?;
-    let (mut facts, source) = read_source(args, out)?;
+    // Loaded once and used twice: compiling the installed components is the
+    // expensive part of a facts-only digest, and the history stage below runs
+    // one of the same plugins.
+    let plugins = load_plugins(args)?;
+    let (mut facts, source) = read_source(args, &plugins, out)?;
 
     // Digest creates its target plane on demand: with the plane defaulting
     // to the source directory's name, `drsg digest` in a fresh checkout must
@@ -2300,6 +2484,18 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
     // folded report does not say everything twice.
     for note in facts.report.notes.drain(..) {
         writeln!(out, "  note: {note}")?;
+    }
+
+    // History first, and deliberately before anything that can reach for a
+    // model: it needs none, so a digest that dies on a missing API key should
+    // not take the repository's history down with it. Reported rather than
+    // propagated, for the same reason in the other direction — an unreadable
+    // repository is not a reason to throw away the code digest that was about
+    // to succeed, and a line saying so is louder than a plane nobody looks at.
+    if args.git
+        && let Err(e) = digest_history(db, args, &plugins, out)
+    {
+        writeln!(out, "history: not read — {e:#}")?;
     }
 
     // The §11 headline: an input that yields only facts is digested with **no
@@ -2408,6 +2604,107 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             writeln!(out, "  … and {} more", result.nodes.len() - 12)?;
         }
         writeln!(out, "dry run — re-run with --apply to write")?;
+    }
+    Ok(())
+}
+
+/// The second half of digesting a checkout: its **history**, into its own
+/// plane (ROADMAP §11).
+///
+/// Separate from the code digest in every way that matters — a different
+/// plugin, a different grant (the git directory, not the working tree), a
+/// different plane, and never a model call — so it is a stage of its own
+/// rather than a branch inside one. Its caller reports a failure here instead
+/// of propagating it: losing the code digest because a repository could not be
+/// read would be the wrong trade.
+#[cfg(feature = "digest")]
+fn digest_history(
+    db: &Database,
+    args: &DigestArgs,
+    plugins: &dr_strange_llm::Plugins,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let dir = Path::new(args.source);
+    if !dir.is_dir() {
+        return Ok(()); // a document or a URL has no repository behind it
+    }
+    match dr_strange_llm::git_dir(dir) {
+        dr_strange_llm::GitDir::Here(_) => {}
+        dr_strange_llm::GitDir::Elsewhere(why) => {
+            writeln!(out, "history: {why}")?;
+            return Ok(());
+        }
+        dr_strange_llm::GitDir::None => return Ok(()),
+    }
+
+    let facts = match dr_strange_llm::route_repository(dir, plugins)? {
+        Some(facts) => facts,
+        // A repository, but nothing installed that reads one. Said plainly and
+        // once: the digest that just succeeded is not diminished by it.
+        None => {
+            writeln!(
+                out,
+                "history: {} is a git repository, but no `{}` plugin is installed — \
+                 `drsg plugin install {}` adds one",
+                dir.display(),
+                dr_strange_llm::REPO_PLUGIN,
+                dr_strange_llm::REPO_PLUGIN
+            )?;
+            return Ok(());
+        }
+    };
+
+    let plane = args
+        .git_plane
+        .map(str::to_string)
+        .unwrap_or_else(|| dr_strange_llm::git_plane_name(args.plane));
+    writeln!(
+        out,
+        "history: {} node(s), {} edge(s) → plane '{plane}'",
+        facts.nodes.len(),
+        facts.edges.len()
+    )?;
+    for note in &facts.report.notes {
+        writeln!(out, "  note: {note}")?;
+    }
+
+    if !args.apply {
+        for n in facts.nodes.iter().take(6) {
+            writeln!(out, "  [{}] {}", n.label, n.key)?;
+        }
+        if facts.nodes.len() > 6 {
+            writeln!(out, "  … and {} more", facts.nodes.len() - 6)?;
+        }
+        writeln!(out, "  dry run — re-run with --apply to write")?;
+        return Ok(());
+    }
+
+    if db.plane(&plane).is_err() {
+        db.create_plane(&plane, Properties::new())?;
+        writeln!(out, "  created plane '{plane}'")?;
+    }
+    let stats = dr_strange_llm::write_history(db, &plane, &facts)?;
+    writeln!(
+        out,
+        "  applied: {} new, {} updated, {} edge(s) written",
+        stats.nodes_created, stats.nodes_patched, stats.edges_created
+    )?;
+    // Every one of these is a silence worth breaking: a key this plugin does
+    // not own, an edge that resolved to nothing, a stale edge removed.
+    if stats.nodes_skipped > 0 {
+        writeln!(
+            out,
+            "  {} key(s) left alone — the plane holds them on nodes this plugin \
+             does not own",
+            stats.nodes_skipped
+        )?;
+    }
+    if stats.edges_deleted > 0 || stats.edges_dropped > 0 {
+        writeln!(
+            out,
+            "  {} stale edge(s) replaced, {} dropped for an endpoint outside the plane",
+            stats.edges_deleted, stats.edges_dropped
+        )?;
     }
     Ok(())
 }

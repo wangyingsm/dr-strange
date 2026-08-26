@@ -185,15 +185,27 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 | `trace` | 一个符号如何到达另一个：图中记录的最短调用路径 |
 | `impact` | 影响范围：所有能到达该符号的东西，按距离分组 |
 | `snippet` | 一个符号的源码文本 |
+| `history` | 代码背后的仓库：HEAD、分支、标签、变基与最新的提交 |
 
 两条纪律贯穿整套工具。歧义的名字从不猜测：回答是一份候选清单，由调用方挑选。
 调用清单是一个明示的下界：解析器无法解析的调用会连同原因保留为 `UnresolvedRef`
 事实，并且回答会说明这一点——错误的边比缺失的边更糟。
 
+**历史同样如此。** digest 一个 git 检出目录时，还会把该仓库的**历史**读进它
+自己的 plane，即 `<plane>_git`：提交、分支、标签、合并（`order = 1` 是提交所在
+的那条线），以及只有 reflog 还记得的变基——每次重放了什么、又改写掉了哪个顶端。
+只产出事实，从不调用模型，也不运行 `git` 可执行文件：`git` 插件在沙箱内自己读
+对象库。分成两个 plane，
+是因为二者回答不同的问题、生命周期也不同——代码 plane 是文件树*此刻*的样子，
+历史只会增长——因此对未变动仓库的第二次 digest 什么也不会写。`serve watch`
+会逐个提交地把它保持在最新状态，因此 `drsg init` 会一次性建好两个 plane；
+`drsg history`（以及同名的 MCP 工具）把它读回来。`--no-git` 可关闭整个阶段，
+`digest` 与 `serve watch` 皆然。
+
 **插件。** `drsg plugin install` 可以安装任何解析器插件——本地 `.wasm` 文件或
 URL——安装时验证其为合法组件并固定其 SHA-256，之后每次加载都会复查。不带参数时
 列出官方目录：八种语言——Rust、Go、TypeScript/JavaScript、Python、Java、C、
-web（HTML/CSS）与 TOML——逐一固定到
+web（HTML/CSS）与 TOML——外加读取仓库历史的 `git`，逐一固定到
 [dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension)
 仓库的发布标签（[最新发布](https://github.com/wangyingsm/dr-strange-extension/releases)）。
 同一仓库也承载插件 SDK：解析器契约是一份公开的 WIT 接口，社区据此构建的解析器
