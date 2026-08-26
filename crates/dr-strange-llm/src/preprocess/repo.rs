@@ -286,7 +286,7 @@ pub fn write_history(db: &Database, plane_name: &str, facts: &Preprocessed) -> R
     }
     for (id, fact) in &patches {
         let old = &stored[fact.key.as_str()];
-        for (key, _) in &old.properties {
+        for key in old.properties.keys() {
             if !key.starts_with('_') && !fact.props.contains_key(key) {
                 txn.remove_prop(*id, key)?;
             }
