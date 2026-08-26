@@ -107,3 +107,100 @@ bench-compare: bench-gen bench-drsg bench-sqlite bench-kuzu bench-report
 # `just -f extensions/justfile eval` for the parser-side board.
 eval:
     -cargo test -p dr-strange-llm --lib -- --ignored
+
+# ---- the gate ------------------------------------------------------------
+
+# Where `cargo build` actually drops the binary. CARGO_TARGET_DIR moves it, and
+# the SDK suites treat a DRSG_BIN that points at nothing as *skip*, not fail —
+# so the gate asserts this path rather than trusting it. Derived, not hardcoded,
+# for the same reason PYTHONPATH is cleared below: the ambient environment is
+# the thing that makes a local run and a CI run disagree.
+drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "target") / "debug" / "drsg"
+
+# What `.github/workflows/ci.yml` runs, in its order, with its flags — so a
+# local pass means a CI pass. `RUSTFLAGS: -D warnings` is the part that bites:
+# without it clippy's findings are warnings locally and errors in CI, and a
+# gate that greps the output rather than trusting the exit code hides them
+# either way. Keep this recipe and that workflow in step: when one changes,
+# change the other in the same commit.
+#
+# Everything CI runs, locally: run this before pushing.
+gate: gate-rust gate-frontend gate-docs gate-sdk
+    @echo "gate: every CI job passed locally"
+
+# The redb pass is the one an all-defaults `cargo test` never covers: the
+# storage backend is a cargo feature, and the other one has its own
+# conformance suite.
+#
+# CI's `rust` job: fmt, clippy, test, and the redb backend.
+gate-rust: _rust-matches-ci
+    RUSTFLAGS="-D warnings" cargo fmt --all --check
+    RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
+    RUSTFLAGS="-D warnings" cargo test --workspace
+    RUSTFLAGS="-D warnings" cargo test -p dr-strange-core --no-default-features --features redb-backend,json
+
+# `bun install` unfrozen, as CI does — the committed lock is a bun-canary
+# format a stable bun cannot parse frozen.
+#
+# CI's `frontend` job: lint, build, test the dashboard.
+gate-frontend:
+    cd crates/dr-strange-web/frontend && bun install && bun run lint && bun run build && bun test
+
+# CI's `docs` job: both editions of the book must build.
+gate-docs:
+    mdbook build docs/en
+    mdbook build docs/zh
+
+# Each drives a real `drsg` through DRSG_BIN, exactly as CI hands them the one
+# the rust job built.
+#
+# `PYTHONPATH` is cleared because CI has none and a developer machine often
+# does — a ROS install on this one, whose `launch` package pytest then tries to
+# import. Clearing it reproduces CI's environment rather than papering over a
+# failure; any other ambient variable that makes the two disagree belongs here
+# for the same reason.
+#
+# CI's five `sdk-*` jobs: drift + e2e against a real binary.
+gate-sdk: _drsg-for-sdk
+    @test -x "{{drsg_bin}}" || { echo "gate: no executable drsg at {{drsg_bin}} — every SDK suite skips a missing DRSG_BIN instead of failing, so the gate would pass with no e2e coverage. Point CARGO_TARGET_DIR at the real target dir, or unset CARGO_BUILD_TARGET." >&2; exit 1; }
+    cd sdk/typescript && bun install && DRSG_BIN="{{drsg_bin}}" bun test
+    cd sdk/python && DRSG_BIN="{{drsg_bin}}" env -u PYTHONPATH uv run --with pytest pytest -q
+    cd sdk/go && DRSG_BIN="{{drsg_bin}}" go test ./...
+    cd sdk/java && DRSG_BIN="{{drsg_bin}}" ./mvnw -q -B test
+    cd sdk/c && DRSG_BIN="{{drsg_bin}}" make test
+
+# RUSTFLAGS matches gate-rust because it is part of cargo's unit fingerprint:
+# flip it and the whole graph recompiles. CI sets it job-wide, so its `Build
+# drsg` step carries it too — dropping it here would both diverge from CI and
+# build the workspace a second time on every gate run.
+#
+# The binary the SDK suites drive, as CI's `rust` job uploads it.
+_drsg-for-sdk:
+    RUSTFLAGS="-D warnings" cargo build -p dr-strange-cli
+
+# CI installs the latest stable (`dtolnay/rust-toolchain@stable`), and an older
+# stable has a strictly smaller clippy lint set — so a green gate here still
+# goes red there the day a new stable lands a lint. Same drift the RUSTFLAGS
+# note above describes, one level up: the flags agree, the compiler reading
+# them does not. Needs the network, as CI does.
+_rust-matches-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    line=$(rustup check | grep '^stable-' || true)
+    if [ -z "$line" ]; then
+        echo "gate: 'rustup check' reported no stable toolchain — is rustup managing this one?" >&2
+        exit 1
+    fi
+    case "$line" in
+        *"update available"*)
+            echo "gate: this stable is behind the one CI installs — run 'rustup update stable'" >&2
+            echo "  $line" >&2
+            exit 1
+            ;;
+    esac
+    latest=${line#*up to date: }
+    have=$(rustc --version | cut -d' ' -f2-)
+    if [ "$latest" != "$have" ]; then
+        echo "gate: cargo runs rustc $have, CI runs stable $latest — 'rustup default stable'" >&2
+        exit 1
+    fi
