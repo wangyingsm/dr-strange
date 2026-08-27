@@ -105,6 +105,15 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.2.0/toml.wasm",
         sha256: "6af62778e48dc580a60762b6609134b36867b22d3123bdadcf611fb2ce22a9b8",
     },
+    // The one entry whose `claims` is not a list of extensions, because its
+    // input is not a file: the host runs it on a directory that turns out to
+    // be a repository (`preprocess::repo`).
+    OfficialPlugin {
+        name: "git",
+        claims: "a repository's history",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/git-v1.0.0/git.wasm",
+        sha256: "ce50d72fcfa5ad755b36a574c3cb4a37ede2837aa5ef579167b2aefdd0a3cd52",
+    },
 ];
 
 /// One installed plugin, as `registry.toml` records it.

@@ -479,6 +479,238 @@ pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     Ok(out)
 }
 
+// ---- history (the git plane) ---------------------------------------------
+
+/// The suffix a repository's history plane takes, beside the code plane it
+/// belongs to: `myrepo` and `myrepo_git`.
+///
+/// Here rather than beside the preprocessor that writes it, because every
+/// surface that *reads* one needs the same convention — the MCP tool, the CLI
+/// verb and the digest that creates it must agree on one string.
+pub const HISTORY_SUFFIX: &str = "_git";
+
+/// `<plane>_git` — where a repository's history lands.
+pub fn history_plane_name(code_plane: &str) -> String {
+    format!("{code_plane}{HISTORY_SUFFIX}")
+}
+
+/// Commits shown when the caller names no limit.
+const HISTORY_COMMITS: usize = 15;
+/// Branches, tags and rebases shown before the listing is cut short.
+const HISTORY_REFS: usize = 12;
+
+fn prop_bool(props: &Properties, key: &str) -> bool {
+    matches!(
+        props.get(key).map(|d| &d.value),
+        Some(PropValue::Bool(true))
+    )
+}
+
+/// The date part of an ISO-8601 timestamp — `2026-08-25` out of
+/// `2026-08-25T16:29:01+08:00`. History is read a day at a time; the seconds
+/// are noise a reader pays for.
+fn day(props: &Properties, key: &str) -> String {
+    prop_str(props, key)
+        .map(|t| t.chars().take(10).collect())
+        .unwrap_or_default()
+}
+
+/// Orient a reader in a repository's history: where HEAD is, what the
+/// branches and tags point at, what was rebased, and the newest commits.
+///
+/// The counterpart of [`context`] for the history plane — one call that
+/// answers "what is this repository" rather than a schema an agent has to
+/// discover and then write a query against. Every listing states what it is a
+/// listing *of* (`newest 15 of 429`), because a truncated one that looked
+/// complete would be the one failure a reader cannot see.
+pub fn history(plane: &PlaneHandle<'_>, limit: Option<usize>) -> Result<String> {
+    // A label scan per kind, not a whole-plane scan: `Commit` is nearly the
+    // entire plane, and the refs — the part a reader looks at first — are a
+    // handful of nodes the label index finds directly.
+    let commits = plane.query().scan_label("Commit").nodes()?;
+    if commits.is_empty() {
+        let mut out = String::from("this plane holds no commits\n");
+        out.push_str(
+            "note: a repository's history lives in its own plane, named after \
+             the code plane with `_git` appended — `list_planes` shows \
+             which planes exist\n",
+        );
+        return Ok(out);
+    }
+    let branches = plane.query().scan_label("Branch").nodes()?;
+    let tags = plane.query().scan_label("Tag").nodes()?;
+    let rebases = plane.query().scan_label("Rebase").nodes()?;
+
+    let merges = commits
+        .iter()
+        .filter(|c| prop_bool(&c.properties, "is_merge"))
+        .count();
+    // `reachable` is absent when the run did not read the reflog; absent is
+    // not the same as false, so only an explicit `false` counts here.
+    let unreachable = commits
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.properties.get("reachable").map(|d| &d.value),
+                Some(PropValue::Bool(false))
+            )
+        })
+        .count();
+
+    let mut out = format!(
+        "{} commit(s), {merges} of them merges; {} branch(es), {} tag(s), {} rebase(s)\n",
+        commits.len(),
+        branches.len(),
+        tags.len(),
+        rebases.len()
+    );
+    if unreachable > 0 {
+        out.push_str(&format!(
+            "{unreachable} commit(s) no branch or tag can still reach — what a \
+             rewrite left behind, kept because nothing else remembers it\n"
+        ));
+    }
+
+    // Rendered as a block rather than line by line: the name column is as wide
+    // as the widest name actually present, so `origin/feat/preprocessor-plugins`
+    // does not push every sha beside it out of alignment.
+    let ref_block = |nodes: &[NodeRecord], name_prop: &str, target_prop: &str| -> String {
+        let rows: Vec<(bool, &str, String, String)> = nodes
+            .iter()
+            .map(|node| {
+                let p = &node.properties;
+                let target = prop_str(p, target_prop).unwrap_or_default();
+                (
+                    prop_bool(p, "is_head"),
+                    prop_str(p, name_prop).unwrap_or("<unnamed>"),
+                    target.chars().take(7).collect(),
+                    tip_subject(plane, target).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let width = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+        rows.iter()
+            .map(|(head, name, short, subject)| {
+                let pad = " ".repeat(width - name.chars().count());
+                let head = if *head { "*" } else { " " };
+                format!("  {head} {name}{pad}  {short}  {subject}\n")
+            })
+            .collect()
+    };
+
+    if !branches.is_empty() {
+        let mut sorted = branches.clone();
+        // Local branches first, then remote-tracking: a reader is asking about
+        // this checkout before they are asking about someone else's.
+        sorted.sort_by_key(|b| {
+            (
+                prop_bool(&b.properties, "remote"),
+                prop_str(&b.properties, "name").unwrap_or("").to_string(),
+            )
+        });
+        out.push_str(&format!(
+            "branches ({} shown of {}):\n",
+            sorted.len().min(HISTORY_REFS),
+            sorted.len()
+        ));
+        sorted.truncate(HISTORY_REFS);
+        out.push_str(&ref_block(&sorted, "name", "tip"));
+    }
+
+    if !tags.is_empty() {
+        let mut sorted = tags.clone();
+        sorted.sort_by(|a, b| {
+            prop_int(&b.properties, "tagged_ts")
+                .unwrap_or(0)
+                .cmp(&prop_int(&a.properties, "tagged_ts").unwrap_or(0))
+        });
+        out.push_str(&format!(
+            "tags (newest {} of {}):\n",
+            sorted.len().min(HISTORY_REFS),
+            sorted.len()
+        ));
+        sorted.truncate(HISTORY_REFS);
+        out.push_str(&ref_block(&sorted, "name", "target"));
+    }
+
+    if !rebases.is_empty() {
+        out.push_str(&format!("rebases ({}):\n", rebases.len()));
+        let mut sorted = rebases.clone();
+        sorted.sort_by(|a, b| {
+            prop_str(&b.properties, "finished_at")
+                .unwrap_or_default()
+                .cmp(prop_str(&a.properties, "finished_at").unwrap_or_default())
+        });
+        for r in sorted.iter().take(HISTORY_REFS) {
+            let p = &r.properties;
+            let short =
+                |key: &str| -> String { prop_str(p, key).unwrap_or("").chars().take(7).collect() };
+            out.push_str(&format!(
+                "    {:<24} {}  onto {}, {} commit(s), replaced {}{}\n",
+                prop_str(p, "branch").unwrap_or("<detached>"),
+                day(p, "finished_at"),
+                short("onto"),
+                prop_int(p, "steps").unwrap_or(0),
+                short("replaced"),
+                if prop_bool(p, "completed") {
+                    ""
+                } else {
+                    " — never finished"
+                },
+            ));
+        }
+        out.push_str(
+            "note: rebases come from this clone's reflog, which is local and \
+             expires (gc.reflogExpire, 90 days by default) — the commit graph \
+             records none, so an absent rebase means \"no record\", not \"did not \
+             happen\"\n",
+        );
+    }
+
+    let limit = limit.unwrap_or(HISTORY_COMMITS).max(1);
+    let mut newest = commits;
+    newest.sort_by(|a, b| {
+        prop_int(&b.properties, "committed_ts")
+            .unwrap_or(0)
+            .cmp(&prop_int(&a.properties, "committed_ts").unwrap_or(0))
+    });
+    out.push_str(&format!(
+        "commits (newest {} of {}):\n",
+        newest.len().min(limit),
+        newest.len()
+    ));
+    for c in newest.iter().take(limit) {
+        let p = &c.properties;
+        out.push_str(&format!(
+            "  {}  {}  {:<18} {}{}\n",
+            prop_str(p, "short").unwrap_or_default(),
+            day(p, "committed_at"),
+            prop_str(p, "author_name").unwrap_or_default(),
+            prop_str(p, "summary").unwrap_or_default(),
+            if prop_bool(p, "is_merge") {
+                "  [merge]"
+            } else {
+                ""
+            },
+        ));
+    }
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    Ok(out)
+}
+
+/// The first line of the commit a ref points at, when that commit is in this
+/// plane. A tip beyond a commit ceiling has none, and an empty subject says
+/// exactly that rather than inventing one.
+fn tip_subject(plane: &PlaneHandle<'_>, target: &str) -> Option<String> {
+    if target.is_empty() {
+        return None;
+    }
+    let node = plane.node_by_key(&format!("commit:{target}")).ok()??;
+    prop_str(&node.properties, "summary").map(str::to_string)
+}
+
 pub fn describe(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
@@ -604,6 +836,173 @@ mod tests {
         );
         assert!(out.contains("contains (600):"), "the true count is stated");
         assert!(out.contains("more"), "the elision names what it hides");
+    }
+
+    /// A history plane, small but shaped exactly like the one the `git`
+    /// plugin writes: two commits and a merge, a branch, a tag, a rebase.
+    fn history_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("repo_git", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let commit = |sha: &str, summary: &str, ts: i64, merge: bool, reachable: bool| {
+            let mut props = Properties::new();
+            props.insert("sha".into(), PropDesc::new(PropValue::Str(sha.into())));
+            props.insert(
+                "short".into(),
+                PropDesc::new(PropValue::Str(sha[..7].into())),
+            );
+            props.insert(
+                "summary".into(),
+                PropDesc::new(PropValue::Str(summary.into())),
+            );
+            props.insert(
+                "author_name".into(),
+                PropDesc::new(PropValue::Str("Ada".into())),
+            );
+            props.insert(
+                "committed_at".into(),
+                PropDesc::new(PropValue::Str(format!("2026-08-2{ts}T10:00:00+00:00"))),
+            );
+            props.insert("committed_ts".into(), PropDesc::new(PropValue::Int(ts)));
+            props.insert("is_merge".into(), PropDesc::new(PropValue::Bool(merge)));
+            props.insert(
+                "reachable".into(),
+                PropDesc::new(PropValue::Bool(reachable)),
+            );
+            props
+        };
+        for (sha, summary, ts, merge, reachable) in [
+            (
+                "aaaaaaa1111111111111111111111111111111111",
+                "root",
+                1,
+                false,
+                true,
+            ),
+            (
+                "bbbbbbb2222222222222222222222222222222222",
+                "a merge",
+                3,
+                true,
+                true,
+            ),
+            (
+                "ccccccc3333333333333333333333333333333333",
+                "rewritten away",
+                2,
+                false,
+                false,
+            ),
+        ] {
+            let labels: &[&str] = if merge {
+                &["Commit", "Merge"]
+            } else {
+                &["Commit"]
+            };
+            txn.create_node_with_key(
+                &format!("commit:{sha}"),
+                labels,
+                commit(sha, summary, ts, merge, reachable),
+            )
+            .unwrap();
+        }
+        let mut branch = Properties::new();
+        branch.insert("name".into(), PropDesc::new(PropValue::Str("main".into())));
+        branch.insert("is_head".into(), PropDesc::new(PropValue::Bool(true)));
+        branch.insert(
+            "tip".into(),
+            PropDesc::new(PropValue::Str(
+                "bbbbbbb2222222222222222222222222222222222".into(),
+            )),
+        );
+        txn.create_node_with_key("branch:refs/heads/main", &["Branch"], branch)
+            .unwrap();
+
+        let mut rebase = Properties::new();
+        rebase.insert(
+            "branch".into(),
+            PropDesc::new(PropValue::Str("feature".into())),
+        );
+        rebase.insert("steps".into(), PropDesc::new(PropValue::Int(2)));
+        rebase.insert("completed".into(), PropDesc::new(PropValue::Bool(true)));
+        rebase.insert(
+            "finished_at".into(),
+            PropDesc::new(PropValue::Str("2026-08-25T09:00:00+00:00".into())),
+        );
+        rebase.insert(
+            "onto".into(),
+            PropDesc::new(PropValue::Str(
+                "aaaaaaa1111111111111111111111111111111111".into(),
+            )),
+        );
+        txn.create_node_with_key("rebase:refs/heads/feature@2026-08-25", &["Rebase"], rebase)
+            .unwrap();
+        txn.commit().unwrap();
+        db
+    }
+
+    #[test]
+    fn history_orients_a_reader_newest_first() {
+        let db = history_plane();
+        let out = history(&db.plane("repo_git").unwrap(), None).unwrap();
+
+        assert!(out.starts_with("3 commit(s), 1 of them merges"), "{out}");
+        assert!(
+            out.contains("1 commit(s) no branch or tag can still reach"),
+            "what a rewrite left behind is said, not silently listed: {out}"
+        );
+        assert!(out.contains("* main"), "HEAD's branch is marked: {out}");
+        assert!(
+            out.contains("bbbbbbb  a merge"),
+            "a branch shows the subject of the commit it points at: {out}"
+        );
+        let commits: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("commits ("))
+            .skip(1)
+            .collect();
+        assert!(commits[0].contains("a merge"), "newest first: {commits:?}");
+        assert!(commits[0].contains("[merge]"));
+        assert!(commits[2].contains("root"), "oldest last: {commits:?}");
+    }
+
+    /// Every listing says what it is a listing *of*. A truncated one that
+    /// looked complete is the one failure a reader cannot see.
+    #[test]
+    fn history_states_what_it_left_out() {
+        let db = history_plane();
+        let out = history(&db.plane("repo_git").unwrap(), Some(1)).unwrap();
+        assert!(out.contains("commits (newest 1 of 3):"), "{out}");
+        assert_eq!(
+            out.matches("2026-08-2").count(),
+            2,
+            "one commit line and the rebase's date, and no more: {out}"
+        );
+    }
+
+    /// A rebase is the one thing here that is not in the commit graph, so the
+    /// answer carries the limits of where it came from.
+    #[test]
+    fn history_qualifies_what_it_knows_about_rebases() {
+        let db = history_plane();
+        let out = history(&db.plane("repo_git").unwrap(), None).unwrap();
+        assert!(out.contains("feature"), "{out}");
+        assert!(out.contains("onto aaaaaaa, 2 commit(s)"), "{out}");
+        assert!(
+            out.contains("reflog") && out.contains("expires"),
+            "the reflog's limits travel with the answer: {out}"
+        );
+    }
+
+    /// Asking the code plane for history is a wrong turn worth a signpost,
+    /// not an empty answer.
+    #[test]
+    fn a_plane_with_no_commits_says_where_history_lives() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Properties::new()).unwrap();
+        let out = history(&db.plane("code").unwrap(), None).unwrap();
+        assert!(out.contains("no commits"), "{out}");
+        assert!(out.contains("_git"), "it names where to look: {out}");
     }
 
     #[test]

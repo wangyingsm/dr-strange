@@ -75,3 +75,13 @@ dir = "logs"
 # be configured to do is the plugin's business, not the database's.
 # [plugins.rust]
 # include_source = true  # store each function's source under `_code`
+
+# The `git` plugin reads a repository's history into `<plane>_git` — commits,
+# branches, tags, merges, and the rebases only the reflog remembers. It is
+# dispatched by the source being a git checkout rather than by any extension.
+# [plugins.git]
+# max_commits = 20000    # newest first; 0 reads the whole history
+# reflog = true          # rebases, and the commits they left behind
+# remotes = true         # remote-tracking branches
+# tags = true
+# body = true            # keep each commit message's body, not just its first line

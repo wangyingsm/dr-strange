@@ -24,6 +24,89 @@ All notable changes to Dr Strange are documented here. The format is based on
   now names `[digest] embed_provider` and `embed_key_env`, and points at
   `grep` for the text search that needs no provider at all.
 
+## [2.2.0] - 2026-08-26
+
+### Added
+- **`drsg digest` now reads a repository's history, into a plane of its own.**
+  A checkout carries two sources of truth: the tree says what the code is, and
+  the repository says how it got there. Digesting a directory that turns out
+  to be a git checkout now also reads its **commits, branches, tags, merges
+  and rebases** into `<plane>_git`, beside the code plane — facts only, and
+  never a model call. The reading is done by a new sandboxed plugin, `git@1`,
+  in the extensions repository: it carries its own reader for git's object
+  store (loose objects, v2 pack indexes, both delta forms), refs and reflog,
+  so **no `git` binary is run** and none is required.
+
+  Two planes rather than one, because the two answer different questions and
+  have different lifetimes: a code plane is a picture of the tree *now* and is
+  rewritten whenever a file changes, while history only ever grows. Writing is
+  append-mostly and shaped by what can actually change — a commit is immutable,
+  so one already in the plane is left alone and its `PARENT` edges are never
+  rewritten; only a moving pointer (a branch, a tag, a rebase) is patched. A
+  second digest of an unchanged repository writes nothing at all.
+
+  `--no-git` turns the stage off; `--git-plane <name>` puts it somewhere else.
+  The history stage runs **before** anything that can reach for a model, so a
+  digest that dies on a missing API key does not take the repository's history
+  down with it. `[plugins.git]` carries the settings (`max_commits`, `reflog`,
+  `remotes`, `tags`, `body`).
+
+  What a `Rebase` node can and cannot claim is stated rather than implied: a
+  rebase leaves no trace in the commit graph — it writes new commits and moves
+  a ref — so the only record is the reflog, which is local to one clone and
+  expires (`gc.reflogExpire`, 90 days by default). Rebases are reconstructed
+  from it, the report says so, and an absent `Rebase` never means "no rebase
+  happened". The same reflog is why commits no ref can still reach are kept
+  and marked `reachable: false`: they are what a rewrite left behind.
+
+- **`drsg history`, and an MCP tool of the same name.** One verb that orients a
+  reader in a repository: where HEAD is, what the branches and tags point at,
+  which branches were rebased and what each replaced, and the newest commits —
+  as compact text, the way `context` answers "what is this symbol". Naming the
+  code plane finds the history beside it (`myrepo` → `myrepo_git`), because the
+  first is what a reader has in mind. Every listing says what it is a listing
+  *of* (`newest 15 of 429`): a truncated one that looked complete is the one
+  failure a reader cannot see.
+
+- **`serve watch` keeps the history plane current, so `drsg init` bootstraps
+  both.** History is read at startup and again on every HEAD move, beside the
+  code fold and sharing the plugins it already loaded. A commit that touched no
+  file the code plane holds — an empty one, or one that moved only something
+  ignored — still lands, because it moved a branch. `--no-git` turns it off, as
+  on `digest`. A tag or branch created *without* a commit reaches the plane on
+  the next HEAD move: the watcher wakes on HEAD, and polling every ref would
+  double its git calls for a rare case.
+
+- **The agent surface says the history plane exists.** `list_planes` now labels
+  each plane with what it holds and names its counterpart, and the MCP server's
+  instructions carry the history vocabulary (`Commit`/`Merge`, `Branch`, `Tag`,
+  `Rebase`; `PARENT` with `order`, `TIP`, `TAGS`, `ONTO`, `REPLACED`,
+  `PRODUCED`, `RESULT`, `ON`) along with the two things it must not
+  over-read — that a missing rebase is missing evidence rather than evidence of
+  absence, and that `reachable: false` marks what a rewrite left behind. An
+  agent can ask a question without first discovering the schema.
+
+- **The `git` plugin is in the official catalog**, pinned to `git-v1.0.0`
+  (`sha256:ce50d72f…`), so a bare `drsg plugin install` offers it beside the
+  eight language parsers.
+
+- **A plugin may be dispatched by the shape of the source, not only by a file
+  extension.** Routing everywhere else asks what a file is called; a
+  repository's history is not a file. A plugin named `git`, when installed, is
+  handed a host rooted at the repository's **git directory** and nothing else
+  — a *narrower* grant than the working tree every code plugin gets, and one
+  the tree's plugins never had: `.git` was always excluded from the ordinary
+  walk. Nothing is guessed — with no such plugin installed, a digest simply
+  does not read history and says so once.
+
+### Fixed
+- **Four log messages had lost their line continuations** and printed runs of
+  spaces mid-sentence (`"…from a different directory — file        attribution
+  will not line up"`). Three predate this release.
+
+- **A plugin that claims no file extension no longer prints `handles:` with
+  nothing after it** on install — it says how it is dispatched instead.
+
 ## [2.1.1] - 2026-08-25
 
 ### Changed

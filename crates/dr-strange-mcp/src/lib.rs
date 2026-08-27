@@ -589,16 +589,37 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
 }
 
 fn list_planes_logic(db: &Database) -> AnyResult<Value> {
+    let names: Vec<String> = db.planes()?.into_iter().map(|(_, name)| name).collect();
     let mut out = Vec::new();
     for (id, name) in db.planes()? {
         let plane = db.plane(&name)?;
         let cat = plane.catalog()?;
         let props = plane.properties()?;
-        out.push(jval!({
+        let mut row = jval!({
             "id": id.0, "name": name,
             "nodes": cat.node_count, "edges": cat.edge_count,
             "properties": json::properties_to_json(&props),
-        }));
+        });
+        // Which plane holds what, said rather than left to be inferred from a
+        // name. The pairing is not a guess: a digest of a git checkout writes
+        // the history beside the code plane under exactly this name, so both
+        // ends of it are the host's own doing.
+        let suffix = dr_strange_core::compact::HISTORY_SUFFIX;
+        let kind = match name.strip_suffix(suffix) {
+            Some(code) if names.iter().any(|n| n == code) => Some(format!(
+                "the commit history of plane `{code}` — commits, branches, \
+                 tags, merges and rebases; the `history` tool reads it"
+            )),
+            _ if names.iter().any(|n| n == &format!("{name}{suffix}")) => Some(format!(
+                "source code; this repository's history is in plane \
+                 `{name}{suffix}`"
+            )),
+            _ => None,
+        };
+        if let (Some(kind), Some(obj)) = (kind, row.as_object_mut()) {
+            obj.insert("holds".into(), Value::String(kind));
+        }
+        out.push(row);
     }
     Ok(Value::Array(out))
 }
@@ -649,6 +670,18 @@ struct ImpactReq {
     /// Hops of incoming structural edges to walk (default 3, max 6).
     #[serde(default)]
     depth: Option<usize>,
+}
+
+/// `history`'s request: which repository, and how much of it.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct HistoryReq {
+    /// The history plane, or the code plane beside it — naming `myrepo` finds
+    /// `myrepo_git`, because the first is what a reader has in mind.
+    #[serde(default = "default_plane")]
+    plane: String,
+    /// Commits to list, newest first (default 15).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// `snippet`'s request: one symbol's source.
@@ -1625,6 +1658,40 @@ impl DrStrange {
         .await
     }
 
+    #[tool(description = "A repository's history at a glance: where HEAD is, \
+        what the branches and tags point at, which branches were rebased \
+        (and what each replaced), and the newest commits — as compact text. \
+        Reads the `<plane>_git` plane a digest of a git checkout writes; \
+        naming the code plane finds it. Use this for when/who/why questions \
+        — when something changed, who changed it, what a release contains, \
+        whether history was rewritten — where `context` answers what the \
+        code is now. Rebases come from the reflog, which is local to one \
+        clone and expires, so the answer says what it can and cannot know.")]
+    async fn history(
+        &self,
+        Parameters(req): Parameters<HistoryReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("history", move |db| {
+            // Naming the code plane finds the history beside it; naming the
+            // history plane is taken at its word.
+            let history = dr_strange_core::compact::history_plane_name(&req.plane);
+            let plane = match db.plane(&history) {
+                Ok(p)
+                    if !req
+                        .plane
+                        .ends_with(dr_strange_core::compact::HISTORY_SUFFIX) =>
+                {
+                    p
+                }
+                _ => db.plane(&req.plane)?,
+            };
+            Ok(Value::String(dr_strange_core::compact::history(
+                &plane, req.limit,
+            )?))
+        })
+        .await
+    }
+
     #[tool(description = "One symbol's source text: from the graph when the \
         digest stored it, else read at the symbol's recorded file:line from \
         the tree that plane was parsed from (its `synced_root`), falling back \
@@ -1860,7 +1927,21 @@ impl ServerHandler for DrStrange {
              describe_plane (the soft-schema catalog), then get_node / \
              search (vector) / traverse / query to read, and write_nodes / \
              write_edges to write. Planes are isolated graph canvases; \
-             default 'startup'."
+             default 'startup'.\n\
+             A digested repository has two planes. `<name>` holds the code as \
+             it is now — ask `context`, `trace`, `impact`, `snippet`, `grep`. \
+             `<name>_git` holds the same repository's history — Commit (also \
+             Merge), Branch, Tag and Rebase nodes, joined by PARENT (with \
+             `order`, so a merge's first parent is the line it was made on), \
+             TIP, TAGS, ONTO, REPLACED, PRODUCED, RESULT and ON. Ask \
+             `history` for an overview, then `cypher`/`query`/`traverse` over \
+             that plane for anything specific. Use it for when/who/why: when \
+             a change landed, who made it, what a release contains, whether a \
+             branch was rebased and what it replaced. Two caveats it will \
+             repeat itself: rebases are reconstructed from the reflog, which \
+             is local to one clone and expires, so their absence is not \
+             evidence; and commits marked `reachable: false` are what a \
+             rewrite left behind."
                 .to_string(),
         );
         info

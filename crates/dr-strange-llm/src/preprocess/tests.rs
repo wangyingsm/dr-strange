@@ -855,3 +855,267 @@ fn folds_converge_with_full_rebuild() {
         "a fold-built plane must equal the digest-built plane"
     );
 }
+
+// ---- reading a repository's history (repo.rs) ----------------------------
+
+/// A stand-in for the `git` plugin. It asserts the one thing the host owns:
+/// that the view it is handed is rooted at the **git directory** — which the
+/// ordinary tree walk hides from every other handler — and it produces the
+/// same shapes the real plugin does.
+struct FakeGit;
+
+impl Preprocessor for FakeGit {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: REPO_PLUGIN.into(),
+            version: "1".into(),
+            extensions: Vec::new(),
+            logo: None,
+        }
+    }
+
+    fn preprocess(&self, _input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed> {
+        let head = String::from_utf8(host.read("HEAD")?).unwrap();
+        let listing = host.list("")?;
+        let mut out = Preprocessed::default();
+        out.report.notes.push(format!(
+            "HEAD said {head:?}; the git directory holds {}",
+            listing.join(", ")
+        ));
+        out.nodes.push(DigestNode {
+            key: "commit:aaa".into(),
+            label: "Commit".into(),
+            extra_labels: Vec::new(),
+            props: Default::default(),
+        });
+        out.nodes.push(DigestNode {
+            key: "branch:refs/heads/main".into(),
+            label: "Branch".into(),
+            extra_labels: Vec::new(),
+            props: Default::default(),
+        });
+        out.edges.push(DigestEdge {
+            src: "branch:refs/heads/main".into(),
+            dst: "commit:aaa".into(),
+            ty: "TIP".into(),
+            props: Default::default(),
+        });
+        Ok(out)
+    }
+}
+
+fn repo_tree(name: &str) -> Tree {
+    let tree = Tree::new(name);
+    tree.write("src/main.rs", "fn main() {}");
+    tree.write(".git/HEAD", "ref: refs/heads/main\n");
+    tree.write(".git/refs/heads/main", "aaa\n");
+    tree.write(".git/objects/aa/aaaa", "an object");
+    tree
+}
+
+/// The point of the whole arrangement: the history plugin sees the git
+/// directory — which no other handler can — and sees nothing else.
+#[test]
+fn the_history_plugin_is_rooted_at_the_git_directory() {
+    let tree = repo_tree("gitdir");
+    let plugins = Plugins::from_handlers(vec![Box::new(FakeGit)]);
+
+    let facts = route_repository(&tree.0, &plugins)
+        .unwrap()
+        .expect("a repository");
+    let said = facts.report.notes.join(" ");
+    assert!(said.contains("ref: refs/heads/main"), "{said}");
+    assert!(said.contains("refs/heads/main"), "{said}");
+    assert!(
+        said.contains("objects/aa/aaaa"),
+        "the object store is listed, though the ordinary walk hides it: {said}"
+    );
+    assert!(
+        !said.contains("main.rs"),
+        "and the working tree is not this plugin's business: {said}"
+    );
+
+    // Stamped like every other handler's output, through the same path.
+    let stamp = facts.nodes[0].props.get("_generated_by").map(|d| &d.value);
+    assert_eq!(
+        stamp,
+        Some(&PropValue::Str("git@1".into())),
+        "a parsed fact is separable from a model's guess"
+    );
+}
+
+/// The ordinary walk still hides `.git` from everything else — the grant runs
+/// one way only.
+#[test]
+fn the_tree_router_still_cannot_see_the_git_directory() {
+    let tree = repo_tree("gitdir-hidden");
+    let listed = tree.host().list("").unwrap();
+    assert!(listed.iter().any(|p| p.ends_with("main.rs")));
+    assert!(!listed.iter().any(|p| p.starts_with(".git")), "{listed:?}");
+}
+
+#[test]
+fn a_directory_with_no_repository_reads_no_history() {
+    let tree = Tree::new("norepo");
+    tree.write("a.rs", "fn main() {}");
+    let plugins = Plugins::from_handlers(vec![Box::new(FakeGit)]);
+    assert!(route_repository(&tree.0, &plugins).unwrap().is_none());
+    assert!(matches!(git_dir(&tree.0), GitDir::None));
+}
+
+/// A linked worktree's `.git` is a *file* pointing somewhere outside the
+/// directory being digested. Named rather than ignored: its history really is
+/// unreadable from here, and silence would read as "it has none".
+#[test]
+fn a_linked_worktree_says_why_its_history_is_out_of_reach() {
+    let tree = Tree::new("worktree");
+    tree.write(".git", "gitdir: /elsewhere/.git/worktrees/w\n");
+    match git_dir(&tree.0) {
+        GitDir::Elsewhere(why) => assert!(why.contains("worktree"), "{why}"),
+        _ => panic!("a `.git` file is not a git directory"),
+    }
+    let plugins = Plugins::from_handlers(vec![Box::new(FakeGit)]);
+    assert!(route_repository(&tree.0, &plugins).unwrap().is_none());
+}
+
+/// A repository with no history plugin installed is not an error: the digest
+/// that just ran is not diminished by it, and the caller says so once.
+#[test]
+fn a_repository_with_no_history_plugin_is_not_a_failure() {
+    let tree = repo_tree("noplugin");
+    assert!(route_repository(&tree.0, &probe()).unwrap().is_none());
+}
+
+#[test]
+fn the_history_plane_sits_beside_the_code_plane() {
+    assert_eq!(plane_name("dr-strange"), "dr-strange_git");
+}
+
+// ---- writing history -----------------------------------------------------
+
+fn history_facts(tip: &str, commits: &[&str]) -> Preprocessed {
+    let mut out = Preprocessed::default();
+    let stamped = |key: &str, label: &str, extra: &[(&str, PropValue)]| {
+        let mut props = Properties::new();
+        props.insert(
+            "_generated_by".into(),
+            PropDesc::new(PropValue::Str("git@1".into())),
+        );
+        for (k, v) in extra {
+            props.insert((*k).into(), PropDesc::new(v.clone()));
+        }
+        DigestNode {
+            key: key.into(),
+            label: label.into(),
+            extra_labels: Vec::new(),
+            props,
+        }
+    };
+    for (i, sha) in commits.iter().enumerate() {
+        out.nodes.push(stamped(
+            &format!("commit:{sha}"),
+            "Commit",
+            &[("sha", PropValue::Str((*sha).into()))],
+        ));
+        if let Some(parent) = commits.get(i + 1) {
+            out.edges.push(DigestEdge {
+                src: format!("commit:{sha}"),
+                dst: format!("commit:{parent}"),
+                ty: "PARENT".into(),
+                props: Properties::new(),
+            });
+        }
+    }
+    out.nodes.push(stamped(
+        "branch:refs/heads/main",
+        "Branch",
+        &[("tip", PropValue::Str(tip.into()))],
+    ));
+    out.edges.push(DigestEdge {
+        src: "branch:refs/heads/main".into(),
+        dst: format!("commit:{tip}"),
+        ty: "TIP".into(),
+        props: Properties::new(),
+    });
+    out
+}
+
+fn history_db() -> dr_strange_core::Database {
+    let db = dr_strange_core::Database::in_memory().unwrap();
+    db.create_plane("code_git", Properties::new()).unwrap();
+    db
+}
+
+#[test]
+fn history_is_written_once_and_re_reading_it_changes_nothing() {
+    let db = history_db();
+    let facts = history_facts("b", &["b", "a"]);
+
+    let first = write_history(&db, "code_git", &facts).unwrap();
+    assert_eq!(first.nodes_created, 3);
+    assert_eq!(first.edges_created, 2);
+
+    // The same repository, read again. A commit is immutable and a branch has
+    // not moved, so a second digest is not supposed to touch anything.
+    let again = write_history(&db, "code_git", &facts).unwrap();
+    assert_eq!(again.nodes_created, 0);
+    assert_eq!(again.nodes_patched, 0);
+    assert_eq!(again.edges_created, 0);
+    assert_eq!(again.edges_deleted, 0);
+    let plane = db.plane("code_git").unwrap();
+    assert_eq!(plane.catalog().unwrap().node_count, 3);
+}
+
+/// The one thing that does change between digests: a branch moves. Its
+/// property is rewritten and its single `TIP` is replaced — not accumulated.
+#[test]
+fn a_branch_that_moved_is_patched_and_its_tip_replaced() {
+    let db = history_db();
+    write_history(&db, "code_git", &history_facts("b", &["b", "a"])).unwrap();
+    let stats = write_history(&db, "code_git", &history_facts("c", &["c", "b", "a"])).unwrap();
+
+    assert_eq!(stats.nodes_created, 1, "the new commit");
+    assert_eq!(stats.nodes_patched, 1, "the branch");
+    assert_eq!(stats.edges_created, 2, "the new PARENT, and the moved TIP");
+    assert_eq!(stats.edges_deleted, 1, "the TIP it no longer has");
+
+    let plane = db.plane("code_git").unwrap();
+    let branch = plane
+        .node_by_key("branch:refs/heads/main")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        branch.properties.get("tip").map(|d| &d.value),
+        Some(&PropValue::Str("c".into()))
+    );
+    let tips: Vec<_> = plane
+        .neighbors(branch.id, dr_strange_core::Dir::Out, Some("TIP"))
+        .unwrap();
+    assert_eq!(tips.len(), 1, "one tip, not one per digest");
+}
+
+/// A key the plane holds on a node this plugin does not own — a model's, a
+/// document's — is left alone. Shadowing it would steal the key, and the
+/// count is reported rather than swallowed.
+#[test]
+fn a_key_owned_by_something_else_is_skipped_rather_than_stolen() {
+    let db = history_db();
+    let plane = db.plane("code_git").unwrap();
+    let mut txn = plane.write().unwrap();
+    txn.bulk_load(
+        vec![dr_strange_core::BulkNode {
+            external_key: Some("commit:b"),
+            labels: &["Idea"],
+            props: Properties::new(),
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    let stats = write_history(&db, "code_git", &history_facts("b", &["b", "a"])).unwrap();
+    assert_eq!(stats.nodes_skipped, 1);
+    assert_eq!(stats.nodes_created, 2, "the other commit and the branch");
+    let held = plane.node_by_key("commit:b").unwrap().unwrap();
+    assert_eq!(held.labels, vec!["Idea".to_string()], "untouched");
+}
