@@ -295,6 +295,57 @@ fn rejects_trailing_and_missing_clauses() {
     assert!(matches!(err("RETURN n"), ParseError::Syntax(_)));
 }
 
+/// Appendix B promises projections and aggregation are "a clear error, never
+/// a silent mis-compile". A position in the middle of the clause is not that
+/// error: `RETURN f.file, f.line, key(f)` stops the parse at the first dot and
+/// used to surface as "unexpected trailing input near `.file, …`", which reads
+/// like a typo in a query that has none. Each shape now names itself, and says
+/// what this subset takes instead — these queries arrive from agents, and the
+/// message is the only documentation they get.
+#[test]
+fn an_unsupported_return_says_which_shape_and_what_to_write() {
+    let cases = [
+        ("MATCH (f:Fn) RETURN f.file, f.line, key(f)", "projection"),
+        ("MATCH (f:Fn) RETURN f, key(f)", "column list"),
+        ("MATCH (f:Fn) RETURN key(f)", "key(…)"),
+        ("MATCH (f:Fn) RETURN count(f)", "count(…)"),
+        ("MATCH (f:Fn) RETURN f AS name", "aliasing"),
+    ];
+    for (query, shape) in cases {
+        let e = err(query);
+        assert!(
+            matches!(e, ParseError::Compile(_)),
+            "`{query}` is unsupported, not mistyped: {e}"
+        );
+        let said = e.to_string();
+        assert!(
+            said.contains(shape) && said.contains("RETURN takes one variable or `*`"),
+            "`{query}` should name the shape and the rule: {said}"
+        );
+    }
+    // The position survives, because a long query needs one.
+    assert!(
+        err("MATCH (f:Fn) RETURN f.file")
+            .to_string()
+            .contains(".file")
+    );
+}
+
+/// Trailing text that is *not* a RETURN this subset lacks stays a plain syntax
+/// error — including `AS OF` with an argument it cannot read, which is a
+/// broken clause rather than an alias.
+#[test]
+fn other_trailing_input_is_still_a_syntax_error() {
+    assert!(matches!(
+        err("MATCH (n) RETURN n AS OF yesterday"),
+        ParseError::Syntax(_)
+    ));
+    assert!(matches!(
+        err("MATCH (n) RETURN n LIMIT 5 EXTRA"),
+        ParseError::Syntax(_)
+    ));
+}
+
 #[test]
 fn rejects_contradictory_relationship_direction() {
     // `<-...->` has two arrowheads and is meaningless.
