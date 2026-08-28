@@ -23,6 +23,26 @@ All notable changes to Dr Strange are documented here. The format is based on
   so an operator who followed the hint got a server that would not start. It
   now names `[digest] embed_provider` and `embed_key_env`, and points at
   `grep` for the text search that needs no provider at all.
+- **One file a plugin cannot parse no longer refuses the whole repository.**
+  A chunk is one file, so a `parse` that traps is now counted and skipped —
+  named in the report, logged at `warn` with its backtrace — the way the
+  built-in reader has always counted a PNG it cannot convert. Found on a
+  real tree: the `go` plugin walks its printer down a `.pb.go` whose
+  generated `rawDesc` is a thousand-term string concatenation, overflows the
+  stack TinyGo linked it with, and traps. That one file refused the entire
+  digest, and under `serve watch` it refused every fold after it too — the
+  watcher stopped on the first rebuild and the plane stayed empty while the
+  server went on answering queries against it. Failing on *every* file is
+  still fatal: that is a plugin that does not work here, not a difficult
+  file, and quietly ingesting nothing would be worse than saying so.
+- **A trap now says what the trap was.** wasmtime puts the wasm backtrace in
+  the outer message and the code that names the fault in the cause, and the
+  host rendered only the outer one — so the log got twenty frames of
+  recursion and never the words "out of bounds memory access". The code now
+  leads the message, and a trap that reads as a guest running off its own
+  stack (a wrapped stack pointer, or one frame repeated all the way down)
+  says so, along with the fact that no host setting can raise a stack that
+  was fixed when the plugin was linked.
 
 ## [2.2.0] - 2026-08-26
 

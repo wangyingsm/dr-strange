@@ -4,7 +4,9 @@
 //! Modes: `ok` (a node per file), `escape` (reads outside the root and
 //! reports what the host said), `spin` (never terminates — fuel's job),
 //! `alloc` (allocates without bound — the memory limit's job), `clock` (reads
-//! the monotonic clock twice and reports the delta — zero when frozen).
+//! the monotonic clock twice and reports the delta — zero when frozen),
+//! `stack` (walks off its own stack, but only on the files named for it, so
+//! the host's "skip that one and keep the rest" is testable).
 
 wit_bindgen::generate!({
     path: "../../../wit",
@@ -67,6 +69,21 @@ impl Guest for Fixture {
                 };
                 Ok(names.join("\n").into_bytes())
             }
+            // What a real plugin does to generated source: recurse past the
+            // stack it was linked with. Only the files named `deep…` get it,
+            // so a test can watch one file be skipped while its neighbours
+            // land — which is the whole difference between a bad file and a
+            // bad plugin.
+            "stack" => {
+                let names = match subject {
+                    Input::Files(paths) => paths,
+                    Input::Document(doc) => vec![doc.name],
+                };
+                if names.iter().any(|n| n.contains("deep")) {
+                    std::hint::black_box(walk_off_the_stack(0));
+                }
+                Ok(names.join("\n").into_bytes())
+            }
             "escape" => {
                 // The interesting result is the host's refusal, verbatim.
                 match drsg::preprocess::host::read("../../../etc/passwd") {
@@ -117,7 +134,7 @@ impl Guest for Fixture {
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .collect();
         match mode(&options).as_str() {
-            "ok" => Ok(out(joined
+            "ok" | "stack" => Ok(out(joined
                 .join("\n")
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -130,6 +147,19 @@ impl Guest for Fixture {
             )])),
         }
     }
+}
+
+/// Frames the optimiser cannot fold away: each holds a page of its own, and
+/// the base case is a depth no run reaches — so this returns the way a real
+/// stack overflow does, which is never.
+fn walk_off_the_stack(depth: u64) -> u64 {
+    if depth == u64::MAX {
+        return 0;
+    }
+    let mut pad = [0u8; 1024];
+    pad[0] = depth as u8;
+    std::hint::black_box(&mut pad);
+    walk_off_the_stack(depth + 1).wrapping_add(u64::from(pad[0]))
 }
 
 /// `{"value": <text>}` with just enough escaping for the fixture's own output.
