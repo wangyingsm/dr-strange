@@ -4,7 +4,7 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.1] - 2026-08-28
 
 ### Changed
 - **The pinned `go` plugin moves to `go-v1.4.0`.** A generated `.pb.go` used
