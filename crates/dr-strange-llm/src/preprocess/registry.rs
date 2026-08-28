@@ -66,8 +66,8 @@ pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     OfficialPlugin {
         name: "go",
         claims: ".go",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.3.0/go.wasm",
-        sha256: "b01d8f3bac0136791839eba8a7d38c373679537a6c98fcf8647a8f9d0efe6440",
+        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.4.0/go.wasm",
+        sha256: "121f585f61730ebdae67b4b132c8e8ea07fb4a8db314a7eacb81868fa8c3ada7",
     },
     OfficialPlugin {
         name: "ts",

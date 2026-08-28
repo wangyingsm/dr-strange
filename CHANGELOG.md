@@ -6,6 +6,20 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- **The pinned `go` plugin moves to `go-v1.4.0`.** A generated `.pb.go` used
+  to refuse the whole repository it sat in: protoc-gen-go writes the
+  descriptor blob as one string concatenation — 955 terms in the tree this
+  came from — and the plugin rendered that back out of the AST to record it,
+  which recursed once per term and walked the guest's 64 KiB stack past zero.
+  It surfaced as an out-of-bounds memory access that never mentioned a stack.
+  The plugin now takes an initializer from the file by offset instead of
+  printing it, and caps it, so `value` is a bounded prefix rather than a
+  hundred kilobytes of escaped bytes; it is also linked with a 1 MiB stack,
+  which is what `go/parser` needs for deeply nested literals — that recursion
+  runs before the plugin's own code sees anything. Pins move with the host, so
+  the new artifact and its SHA-256 land here.
+
 ### Fixed
 - **A `RETURN` this subset does not have now says so.** Appendix B promises
   projections and aggregation are "a clear error, never a silent
