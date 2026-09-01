@@ -14,13 +14,17 @@
 //! [`resolve_bindings`]).
 
 use ahash::{AHashMap, AHashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cache::GraphReader;
 use crate::compute::expr::{self, BindingNeed, Expr};
-use crate::compute::plan::{Algo, LogicalPlan, NodeRef, SortKey, Source, Step};
+use crate::compute::plan::{
+    Algo, LogicalPlan, NodeRef, Projection, SortKey, Source, Step, TupleSortKey,
+};
 use crate::compute::{algo, hybrid};
 use crate::error::Error;
 use crate::error::Result;
@@ -741,16 +745,133 @@ fn filter_one(
 /// Evaluate `exprs` against one row — the projection primitive, shared by the
 /// `select` terminal and (from B1) the plan's projection tail, so a column
 /// means the same thing however the query asked for it.
-pub fn row_values(
+pub fn row_values<'e>(
     reader: &dyn GraphReader,
     row: &Row,
-    exprs: &[Expr],
+    exprs: impl IntoIterator<Item = &'e Expr>,
     need: &BindingNeed,
 ) -> Result<Vec<PropValue>> {
     let node = reader.node(row.head)?;
     let bound = resolve_bindings(reader, row, need)?;
     let ctx = row.ctx(node.as_deref(), bound.view());
-    Ok(exprs.iter().map(|e| expr::eval(e, &ctx)).collect())
+    Ok(exprs.into_iter().map(|e| expr::eval(e, &ctx)).collect())
+}
+
+/// A projected result: the columns a [`Projection`] named, and the value rows
+/// under them in the order the tail produced them.
+///
+/// Value rows, not node rows. Every cell is a [`PropValue`], so a table is
+/// self-contained — a surface renders it without reading the graph again, and
+/// it serializes as-is over the wire.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Table {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PropValue>>,
+}
+
+/// Run `plan` and project its rows into a [`Table`] (arch/03 §2's `Project`).
+///
+/// Materializing, where [`execute`] streams: a projection is a barrier.
+/// `DISTINCT` cannot pass a tuple without having seen every earlier one, and
+/// `ORDER BY` cannot yield the first before it has them all — after which
+/// `skip`/`limit` count *tuples*, so neither can run any earlier either.
+///
+/// A plan carrying no projection has no columns, so each of its rows projects
+/// to the empty tuple. Rows still count; ask [`execute`] for the nodes.
+///
+/// Bounded like any other query: this pulls through the guarded stream
+/// [`execute_with`] builds, so a runaway pipeline trips its deadline instead
+/// of filling this table.
+pub fn execute_table(
+    plan: &LogicalPlan,
+    reader: &dyn GraphReader,
+    deadline: Option<Instant>,
+) -> Result<Table> {
+    let empty = Projection::default();
+    let proj = plan.project.as_ref().unwrap_or(&empty);
+    let need = plan.binding_need();
+
+    let mut rows: Vec<Vec<PropValue>> = Vec::new();
+    let mut seen: BTreeSet<TupleKey> = BTreeSet::new();
+    for r in execute_with(plan, reader, deadline)? {
+        let row = r?;
+        let tuple = row_values(reader, &row, proj.items.iter().map(|i| &i.expr), &need)?;
+        // The clone buys the set its own copy of a *kept* tuple only; a
+        // duplicate is dropped without ever reaching `rows`.
+        if proj.distinct && !seen.insert(TupleKey(tuple.clone())) {
+            continue;
+        }
+        rows.push(tuple);
+    }
+    if !proj.order_by.is_empty() {
+        rows.sort_by(|a, b| cmp_columns(a, b, &proj.order_by));
+    }
+    if let Some(skip) = proj.skip {
+        rows.drain(..(skip as usize).min(rows.len()));
+    }
+    if let Some(limit) = proj.limit {
+        rows.truncate(limit as usize);
+    }
+    Ok(Table {
+        columns: proj.items.iter().map(|i| i.name.clone()).collect(),
+        rows,
+    })
+}
+
+/// A projected tuple used as a set key — what `DISTINCT` compares by.
+///
+/// `PropValue` can be neither `Hash` nor `Eq` (it holds floats), but
+/// [`expr::total_cmp`] is a genuine total order, so an ordered set is what
+/// holds tuples. Two tuples are the same when every column compares `Equal`
+/// under it — which folds `1` and `1.0` into one row, exactly as `=` already
+/// reads them.
+struct TupleKey(Vec<PropValue>);
+
+impl Ord for TupleKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (a, b) in self.0.iter().zip(&other.0) {
+            let ord = expr::total_cmp(a, b);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        self.0.len().cmp(&other.0.len())
+    }
+}
+
+impl PartialOrd for TupleKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TupleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for TupleKey {}
+
+/// Order two projected tuples by the tail's keys — [`cmp_keys`]'s twin for
+/// tuples, addressing columns by index rather than re-evaluating expressions.
+///
+/// A key naming a column the tuple hasn't got reads as `Null`, the same
+/// totality every other evaluation here has: an out-of-range `order_by` sorts
+/// rather than fails.
+fn cmp_columns(a: &[PropValue], b: &[PropValue], keys: &[TupleSortKey]) -> std::cmp::Ordering {
+    const NULL: PropValue = PropValue::Null;
+    for key in keys {
+        let ord = expr::total_cmp(
+            a.get(key.column).unwrap_or(&NULL),
+            b.get(key.column).unwrap_or(&NULL),
+        );
+        let ord = if key.descending { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Whether one row satisfies `pred`: read the current node, resolve whatever
@@ -823,7 +944,7 @@ mod tests {
     use super::*;
     use crate::cache::UncachedReader;
     use crate::compute::expr::{at_edge, at_node, edge_dir, edge_type, ep, has_label, p};
-    use crate::compute::plan::SortKey;
+    use crate::compute::plan::{ProjItem, SortKey};
     use crate::storage::engine::{StorageEngine, WriteTransaction};
     use crate::storage::graph;
     use crate::storage::memory::MemoryEngine;
@@ -851,6 +972,101 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap().head)
             .collect()
+    }
+
+    /// Runs `plan` through its projection tail and returns the table.
+    fn run_table(build: impl FnOnce(&mut dyn WriteTransaction), plan: &LogicalPlan) -> Table {
+        let eng = MemoryEngine::new();
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            build(&mut txn);
+            txn.commit().unwrap();
+        }
+        let txn = eng.begin_read().unwrap();
+        let reader = UncachedReader::new(&txn, PlaneId::STARTUP);
+        execute_table(plan, &reader, None).unwrap()
+    }
+
+    fn three_years(txn: &mut dyn WriteTransaction) {
+        for year in [2021, 2019, 2019] {
+            graph::create_node(
+                txn,
+                PlaneId::STARTUP,
+                &["Paper"],
+                &props(&[("year", PropValue::Int(year))]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_plan_without_a_projection_is_all_rows_and_no_columns() {
+        // Not an error and not nothing: the rows are still there, each one
+        // projecting to the empty tuple. `execute` is what reads their nodes.
+        let table = run_table(
+            three_years,
+            &LogicalPlan::new(Source::ScanLabel("Paper".into())),
+        );
+        assert!(table.columns.is_empty());
+        assert_eq!(table.rows, vec![vec![], vec![], vec![]]);
+    }
+
+    #[test]
+    fn projection_tail_distinct_orders_and_slices_tuples() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items: vec![ProjItem {
+                name: "year".into(),
+                expr: p("year"),
+            }],
+            distinct: true,
+            order_by: vec![TupleSortKey {
+                column: 0,
+                descending: true,
+            }],
+            skip: None,
+            limit: None,
+        });
+        // Three rows, two distinct years, newest first.
+        let table = run_table(three_years, &plan);
+        assert_eq!(table.columns, vec!["year"]);
+        assert_eq!(
+            table.rows,
+            vec![vec![PropValue::Int(2021)], vec![PropValue::Int(2019)]]
+        );
+
+        // SKIP/LIMIT count those tuples, after the ordering.
+        let proj = plan.project.as_mut().unwrap();
+        proj.skip = Some(1);
+        proj.limit = Some(5);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![PropValue::Int(2019)]]
+        );
+
+        // A skip past the end empties the table rather than panicking.
+        plan.project.as_mut().unwrap().skip = Some(99);
+        assert!(run_table(three_years, &plan).rows.is_empty());
+    }
+
+    #[test]
+    fn ordering_by_a_column_that_is_not_there_sorts_rather_than_fails() {
+        // Totality, as everywhere else here: an out-of-range column reads as
+        // Null for every tuple, so the ordering is simply a no-op.
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items: vec![ProjItem {
+                name: "year".into(),
+                expr: p("year"),
+            }],
+            order_by: vec![TupleSortKey {
+                column: 7,
+                descending: false,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(run_table(three_years, &plan).rows.len(), 3);
     }
 
     #[test]

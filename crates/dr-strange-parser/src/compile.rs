@@ -231,7 +231,11 @@ pub fn compile(
         steps.push(Step::Limit(l));
     }
 
-    Ok(LogicalPlan { source, steps })
+    Ok(LogicalPlan {
+        source,
+        steps,
+        project: None,
+    })
 }
 
 /// The vector property a `NEAR` clause searches when `ON <prop>` is omitted.

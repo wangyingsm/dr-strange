@@ -35,6 +35,7 @@ fn scan_label_only() {
         LogicalPlan {
             source: Source::ScanLabel("Person".into()),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -46,6 +47,7 @@ fn scan_all_star() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -57,6 +59,7 @@ fn where_pushdown_on_source() {
         LogicalPlan {
             source: Source::ScanLabel("Paper".into()),
             steps: vec![Step::Filter(p("year").ge(2020))],
+            project: None,
         }
     );
 }
@@ -88,6 +91,7 @@ fn where_pushes_to_the_right_slot() {
                 },
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -478,6 +482,7 @@ fn search_compiles_to_vector_topk() {
                 k: 5,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -495,6 +500,7 @@ fn search_defaults_metric_cosine_topk_10_and_no_label() {
                 k: 10,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -559,6 +565,7 @@ fn similarity_in_order_by_brute_force_rank() {
                 }]),
                 Step::Limit(10),
             ],
+            project: None,
         }
     );
 }
@@ -665,6 +672,7 @@ fn beam_after_match_compiles_to_expand_beam() {
                 // b's label → a HasLabel filter on the beam frontier.
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -806,6 +814,7 @@ fn key_equality_on_the_source_becomes_a_seek() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["paper-42".into()]),
             steps: vec![Step::Filter(has_label("Doc"))],
+            project: None,
         }
     );
 }
@@ -817,6 +826,7 @@ fn unlabelled_key_seek_has_no_residual_filter() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["paper-42".into()]),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -828,6 +838,7 @@ fn key_in_list_seeks_every_key() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["a".into(), "b".into(), "c".into()]),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -842,6 +853,7 @@ fn key_seek_keeps_the_other_conjuncts_as_filters() {
                 Step::Filter(has_label("Doc")),
                 Step::Filter(p("year").ge(2020)),
             ],
+            project: None,
         }
     );
 }
@@ -859,6 +871,7 @@ fn key_seek_anchors_a_traversal() {
                 },
                 Step::Filter(has_label("Person")),
             ],
+            project: None,
         }
     );
 }
@@ -878,6 +891,7 @@ fn key_on_a_later_variable_stays_a_filter() {
                 },
                 Step::Filter(external_key().eq("alan")),
             ],
+            project: None,
         }
     );
 }
@@ -902,6 +916,7 @@ fn key_is_usable_as_an_ordinary_term() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![Step::Filter(external_key().is_null().not())],
+            project: None,
         }
     );
 }
@@ -913,6 +928,7 @@ fn in_over_a_property_expands_to_equalities() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![Step::Filter(p("year").eq(2020).or(p("year").eq(2021)))],
+            project: None,
         }
     );
 }
@@ -994,6 +1010,7 @@ fn keyword_search_compiles_to_a_bm25_source() {
                 k: 5,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -1016,6 +1033,7 @@ fn keyword_search_defaults_topk_and_chains_a_typed_hop() {
                 },
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -1044,6 +1062,7 @@ fn vector_search_chains_a_typed_hop_too() {
                 dir: Dir::Out,
                 edge_type: Some("CITES".into()),
             }],
+            project: None,
         }
     );
 }
@@ -1087,13 +1106,14 @@ fn hybrid_all_three_channels() {
                 k: 7,
             })),
             steps: vec![],
+            project: None,
         }
     );
 }
 
 #[test]
 fn hybrid_defaults_and_channel_subset() {
-    let LogicalPlan { source, steps } =
+    let LogicalPlan { source, steps, .. } =
         plan(r#"HYBRID (d:Doc) KEYWORD ON body MATCHING "rust" RETURN d"#);
     assert!(steps.is_empty());
     let Source::Hybrid(spec) = source else {
@@ -1172,6 +1192,7 @@ fn call_pagerank_with_arguments() {
                 }]),
                 Step::Limit(10),
             ],
+            project: None,
         }
     );
 }

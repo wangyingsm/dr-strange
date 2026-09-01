@@ -9,8 +9,9 @@
 //! (arch/00 §2). The builder mirrors these operators one-to-one; there is no
 //! separate builder semantics.
 //!
-//! Not yet here (M3): the hybrid `VectorTopK`/`FrontierTopK`/`ExpandBeam`
-//! operators and `Project`/score-channel machinery.
+//! A plan may end in a **projection** ([`Projection`]) — arch/03 §2's
+//! `Project`, modelled as a tail rather than a step because it turns node
+//! rows into value rows and so nothing can follow it.
 
 use serde::{Deserialize, Serialize};
 
@@ -159,11 +160,61 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// A complete query: a source and its pipeline.
+/// One projected column: a name and the expression behind it.
+///
+/// The name is what the caller sees as a table header, so it carries the
+/// query's own wording — an alias when one was written, otherwise the item's
+/// source text (`n.name`, `type(r)`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjItem {
+    pub name: String,
+    pub expr: Expr,
+}
+
+/// Ordering over projected tuples, by **column index** rather than expression.
+///
+/// Once a plan projects, the node row is gone and a column is the only thing
+/// left to address — which is also why Cypher makes you order by an alias.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TupleSortKey {
+    pub column: usize,
+    pub descending: bool,
+}
+
+/// The terminal that turns node rows into value rows (arch/03 §2's `Project`).
+///
+/// A **tail**, not a [`Step`], because a projection ends the node-row stream:
+/// nothing downstream of it can expand or filter a node any more. Modelling it
+/// as a field makes "the projection is last" unrepresentable-otherwise instead
+/// of a rule the executor has to enforce, and it keeps `Step` homogeneous —
+/// every variant still means the same thing about the same kind of row.
+///
+/// `order_by`/`skip`/`limit` live here rather than as steps for the same
+/// reason: applied to tuples, they mean something different from the same
+/// operations applied to node rows, and a query that projects wants the tuple
+/// reading.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Projection {
+    /// Output columns, in order.
+    pub items: Vec<ProjItem>,
+    /// Deduplicate whole projected tuples (`RETURN DISTINCT n.file`), which is
+    /// a different question from [`Step::Distinct`]'s "by node id".
+    pub distinct: bool,
+    pub order_by: Vec<TupleSortKey>,
+    pub skip: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// A complete query: a source, its pipeline, and an optional projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogicalPlan {
     pub source: Source,
     pub steps: Vec<Step>,
+    /// `None` — the default, and what every plan written before this existed
+    /// deserializes to — means the query returns node records, exactly as it
+    /// always has. `Some` means it returns a table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Projection>,
 }
 
 impl LogicalPlan {
@@ -171,6 +222,7 @@ impl LogicalPlan {
         Self {
             source,
             steps: Vec::new(),
+            project: None,
         }
     }
 
@@ -198,6 +250,9 @@ impl LogicalPlan {
                 | Step::FrontierTopK { .. }
                 | Step::ExpandBeam { .. } => {}
             }
+        }
+        for item in self.project.iter().flat_map(|p| &p.items) {
+            need.add(&item.expr);
         }
         need
     }
@@ -254,10 +309,37 @@ mod tests {
                 Step::Skip(5),
                 Step::Limit(10),
             ],
+            project: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let back: LogicalPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn projection_tail_roundtrips_and_stays_off_the_wire_when_absent() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        // A plan that doesn't project doesn't mention a projection, so what
+        // rides over the wire is byte-for-byte the plan it always was.
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("project"), "{json}");
+        assert_eq!(plan, serde_json::from_str::<LogicalPlan>(&json).unwrap());
+
+        plan.project = Some(Projection {
+            items: vec![ProjItem {
+                name: "year".into(),
+                expr: p("year"),
+            }],
+            distinct: true,
+            order_by: vec![TupleSortKey {
+                column: 0,
+                descending: true,
+            }],
+            skip: Some(2),
+            limit: Some(5),
+        });
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(plan, serde_json::from_str::<LogicalPlan>(&json).unwrap());
     }
 
     #[test]
