@@ -16,9 +16,9 @@ use ahash::AHashMap;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp};
 use dr_strange_core::types::Dir;
 use dr_strange_core::{
-    Algo, Expr, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
-    LouvainOptions, NodeId, NodeRef, PageRankOptions, PropValue, SortKey, Source, Step,
-    VectorChannel,
+    Agg, Algo, Binding, Expr, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
+    LouvainOptions, NodeId, NodeRef, PageRankOptions, ProjExpr, ProjItem, Projection, PropValue,
+    SortKey, Source, Step, TupleSortKey, VectorChannel,
 };
 
 use crate::Embedder;
@@ -136,8 +136,17 @@ pub fn compile(
     }
 
     let mut steps: Vec<Step> = Vec::new();
+    let at_slot = |slot: usize| Scope {
+        var_slot: &var_slot,
+        current: slot,
+    };
     for e in slot_filters[0].drain(..) {
-        steps.push(Step::Filter(compile_expr(&e, embedder, params)?));
+        steps.push(Step::Filter(compile_expr(
+            &e,
+            embedder,
+            params,
+            &at_slot(0),
+        )?));
     }
 
     for idx in 1..nodes.len() {
@@ -181,61 +190,208 @@ pub fn compile(
             steps.push(Step::Filter(Expr::HasLabel(l.clone())));
         }
         for e in slot_filters[idx].drain(..) {
-            steps.push(Step::Filter(compile_expr(&e, embedder, params)?));
+            steps.push(Step::Filter(compile_expr(
+                &e,
+                embedder,
+                params,
+                &at_slot(idx),
+            )?));
         }
     }
 
-    // RETURN: the pipeline ends on the last pattern node, so only that variable
-    // (or `*`) can be returned without a projection/multi-binding model.
-    if let ReturnItem::Var(v) = &q.ret.item {
-        let slot = *var_slot
-            .get(v.as_str())
-            .ok_or_else(|| format!("RETURN refers to unknown variable `{v}`"))?;
-        if slot != last {
-            return Err(format!(
-                "RETURN must name the pattern's last variable; returning an earlier \
-                 variable (`{v}`) isn't supported yet"
-            ));
-        }
+    // RETURN decides what the query *is*: naming a node (`n`, `*`) keeps the
+    // rows themselves, anything else projects them into a table.
+    let scope = Scope {
+        var_slot: &var_slot,
+        current: last,
+    };
+    let node_rows = q
+        .ret
+        .items
+        .iter()
+        .any(|i| matches!(i, ReturnItem::Star | ReturnItem::Var(_)));
+    if node_rows && q.ret.items.len() > 1 {
+        return Err(
+            "RETURN mixes a node with columns of values; a node isn't a value, \
+                    so return its properties instead (`RETURN n.name, count(*)`)"
+                .to_string(),
+        );
     }
 
-    if q.ret.distinct {
-        steps.push(Step::Distinct);
-    }
-
-    if !q.order_by.is_empty() {
-        let mut keys = Vec::with_capacity(q.order_by.len());
-        for ok in &q.order_by {
-            for v in referenced_vars(&ok.expr) {
+    let project = match node_rows {
+        true => {
+            if let Some(ReturnItem::Var(v)) = q.ret.items.first() {
                 let slot = *var_slot
                     .get(v.as_str())
-                    .ok_or_else(|| format!("ORDER BY refers to unknown variable `{v}`"))?;
+                    .ok_or_else(|| format!("RETURN refers to unknown variable `{v}`"))?;
+                // The pipeline ends on the last pattern node, so returning the
+                // *rows* of an earlier one is the one thing a projection can't
+                // stand in for — it would have to un-expand them.
                 if slot != last {
-                    return Err(
-                        "ORDER BY may reference only the returned (last) variable".to_string()
-                    );
+                    return Err(format!(
+                        "RETURN must name the pattern's last variable; returning an earlier \
+                         variable (`{v}`) isn't supported yet — project its values instead \
+                         (`RETURN {v}.name`)"
+                    ));
                 }
             }
-            keys.push(SortKey {
-                expr: compile_expr(&ok.expr, embedder, params)?,
-                descending: ok.descending,
-            });
+            if q.ret.distinct {
+                steps.push(Step::Distinct);
+            }
+            if !q.order_by.is_empty() {
+                steps.push(Step::Sort(compile_sort(
+                    &q.order_by,
+                    &var_slot,
+                    last,
+                    embedder,
+                    params,
+                )?));
+            }
+            if let Some(s) = q.skip {
+                steps.push(Step::Skip(s));
+            }
+            if let Some(l) = q.limit {
+                steps.push(Step::Limit(l));
+            }
+            None
         }
-        steps.push(Step::Sort(keys));
-    }
-
-    if let Some(s) = q.skip {
-        steps.push(Step::Skip(s));
-    }
-    if let Some(l) = q.limit {
-        steps.push(Step::Limit(l));
-    }
+        false => {
+            let mut items = Vec::with_capacity(q.ret.items.len());
+            for item in &q.ret.items {
+                items.push(match item {
+                    ReturnItem::Value { expr, name } => {
+                        ProjItem::value(name.clone(), compile_expr(expr, embedder, params, &scope)?)
+                    }
+                    ReturnItem::Agg {
+                        func,
+                        arg,
+                        distinct,
+                        name,
+                    } => {
+                        let arg = arg
+                            .as_ref()
+                            .map(|e| compile_expr(e, embedder, params, &scope))
+                            .transpose()?;
+                        ProjItem::agg(
+                            name.clone(),
+                            Agg {
+                                func: *func,
+                                arg,
+                                distinct: *distinct,
+                            },
+                        )
+                    }
+                    // Excluded above: these are what `node_rows` matched on.
+                    ReturnItem::Star | ReturnItem::Var(_) => unreachable!("node RETURN"),
+                });
+            }
+            let order_by = order_columns(&q.order_by, &items, embedder, params, &scope)?;
+            Some(Projection {
+                items,
+                // Over tuples, not node ids: two nodes sharing a returned
+                // value are one row here.
+                distinct: q.ret.distinct,
+                order_by,
+                // On the tail, because they count what the projection
+                // produced — a LIMIT before an aggregate would change what
+                // the aggregate is over.
+                skip: q.skip,
+                limit: q.limit,
+            })
+        }
+    };
 
     Ok(LogicalPlan {
         source,
         steps,
-        project: None,
+        project,
     })
+}
+
+/// `ORDER BY` over node rows: keys evaluated on the row's current node, which
+/// is the only one a query returning nodes has ended on.
+fn compile_sort(
+    keys: &[OrderKey],
+    var_slot: &AHashMap<&str, usize>,
+    last: usize,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<Vec<SortKey>, String> {
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let SortTarget::Expr(e) = &key.target else {
+            return Err(format!(
+                "ORDER BY `{}`: a bare name orders by a RETURN alias, and this query \
+                 returns nodes rather than columns",
+                key.text
+            ));
+        };
+        for v in referenced_vars(e) {
+            let slot = *var_slot
+                .get(v.as_str())
+                .ok_or_else(|| format!("ORDER BY refers to unknown variable `{v}`"))?;
+            if slot != last {
+                return Err("ORDER BY may reference only the returned (last) variable".to_string());
+            }
+        }
+        out.push(SortKey {
+            expr: compile_expr(
+                e,
+                embedder,
+                params,
+                &Scope {
+                    var_slot,
+                    current: last,
+                },
+            )?,
+            descending: key.descending,
+        });
+    }
+    Ok(out)
+}
+
+/// `ORDER BY` over a projection: each key names one of the returned columns,
+/// since after a projection a column is all there is left to address.
+///
+/// Two ways to name one, in the order a reader would expect: by alias (or by
+/// the item's own text, which is what an unaliased column is called), then by
+/// the expression itself, so `RETURN n.year AS y ORDER BY n.year` finds the
+/// column it just described.
+fn order_columns(
+    keys: &[OrderKey],
+    items: &[ProjItem],
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+    scope: &Scope,
+) -> Result<Vec<TupleSortKey>, String> {
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let by_name = items.iter().position(|c| c.name == key.text);
+        let column = match (by_name, &key.target) {
+            (Some(i), _) => i,
+            (None, SortTarget::Expr(e)) => {
+                let compiled = compile_expr(e, embedder, params, scope)?;
+                items
+                    .iter()
+                    .position(|c| c.expr == ProjExpr::Value(compiled.clone()))
+                    .ok_or_else(|| unknown_column(&key.text, items))?
+            }
+            (None, SortTarget::Name(_)) => return Err(unknown_column(&key.text, items)),
+        };
+        out.push(TupleSortKey {
+            column,
+            descending: key.descending,
+        });
+    }
+    Ok(out)
+}
+
+fn unknown_column(text: &str, items: &[ProjItem]) -> String {
+    let names: Vec<&str> = items.iter().map(|c| c.name.as_str()).collect();
+    format!(
+        "ORDER BY `{text}` must name a returned column: {}",
+        names.join(", ")
+    )
 }
 
 /// The vector property a `NEAR` clause searches when `ON <prop>` is omitted.
@@ -622,23 +778,58 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
 /// Drop the variable qualifiers (the slot is already fixed by pushdown) and map
 /// straight onto core's `Expr`. Fallible only because `similarity`/`distance`
 /// may embed a text argument via `embedder`.
+/// Where an expression is evaluated: which pattern slot the row is on, and
+/// what each variable is bound to.
+///
+/// A qualifier naming the current slot compiles away — there, the variable
+/// *is* the row's current node. An earlier one becomes an [`Expr::At`], which
+/// reads that slot's binding out of the trail the row already carries. This
+/// is what lets a projection say `a.name, b.name` about two ends of a hop.
+struct Scope<'a, 'b> {
+    var_slot: &'a AHashMap<&'b str, usize>,
+    current: usize,
+}
+
+impl Scope<'_, '_> {
+    /// `inner`, read against whatever `var` names.
+    fn read(&self, var: &str, inner: Expr) -> Result<Expr, String> {
+        // An anonymous pattern node (`(:Paper)`) has no name to look up; it is
+        // always the slot its predicate was placed at.
+        if var.is_empty() {
+            return Ok(inner);
+        }
+        let slot = *self
+            .var_slot
+            .get(var)
+            .ok_or_else(|| format!("unknown variable `{var}`"))?;
+        Ok(match slot == self.current {
+            true => inner,
+            false => Expr::At {
+                binding: Binding::Node(slot as u32),
+                inner: Box::new(inner),
+            },
+        })
+    }
+}
+
 fn compile_expr(
     e: &PExpr,
     embedder: Option<&dyn Embedder>,
     params: &crate::Params,
+    scope: &Scope,
 ) -> Result<Expr, String> {
-    let sub = |x: &PExpr| compile_expr(x, embedder, params).map(Box::new);
+    let sub = |x: &PExpr| compile_expr(x, embedder, params, scope).map(Box::new);
     Ok(match e {
         PExpr::Lit(v) => Expr::Literal(v.clone()),
         PExpr::Param(name) => Expr::Literal(crate::resolve_param(params, name)?),
-        PExpr::Prop { key, .. } => Expr::Property(key.clone()),
-        PExpr::HasLabel { label, .. } => Expr::HasLabel(label.clone()),
-        PExpr::ExternalKey { .. } => Expr::ExternalKey,
+        PExpr::Prop { var, key } => scope.read(var, Expr::Property(key.clone()))?,
+        PExpr::HasLabel { var, label } => scope.read(var, Expr::HasLabel(label.clone()))?,
+        PExpr::ExternalKey { var } => scope.read(var, Expr::ExternalKey)?,
         // `x IN [a, b]` is sugar for `x = a OR x = b`; an empty list is
         // constantly false. (A source-anchored `key(n) IN […]` never reaches
         // here — it became a `SeekKeys` seek.)
         PExpr::In { lhs, list } => {
-            let lhs = compile_expr(lhs, embedder, params)?;
+            let lhs = compile_expr(lhs, embedder, params, scope)?;
             let mut out: Option<Expr> = None;
             for item in list {
                 let eq = Expr::Compare {
@@ -671,7 +862,7 @@ fn compile_expr(
         PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
         PExpr::Not(x) => Expr::Not(sub(x)?),
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).
-        PExpr::Neg(x) => match compile_expr(x, embedder, params)? {
+        PExpr::Neg(x) => match compile_expr(x, embedder, params, scope)? {
             Expr::Literal(PropValue::Int(n)) => Expr::Literal(PropValue::Int(-n)),
             Expr::Literal(PropValue::Float(f)) => Expr::Literal(PropValue::Float(-f)),
             other => Expr::Arith {
@@ -698,24 +889,30 @@ fn compile_expr(
         PExpr::Score => Expr::Score,
         PExpr::Hops => Expr::Hops,
         PExpr::Similarity {
+            var,
             property,
             query,
             metric,
-            ..
-        } => Expr::Similarity {
-            property: property.clone(),
-            query: resolve(query, embedder)?,
-            metric: *metric,
-        },
+        } => scope.read(
+            var,
+            Expr::Similarity {
+                property: property.clone(),
+                query: resolve(query, embedder)?,
+                metric: *metric,
+            },
+        )?,
         PExpr::Distance {
+            var,
             property,
             query,
             metric,
-            ..
-        } => Expr::Distance {
-            property: property.clone(),
-            query: resolve(query, embedder)?,
-            metric: *metric,
-        },
+        } => scope.read(
+            var,
+            Expr::Distance {
+                property: property.clone(),
+                query: resolve(query, embedder)?,
+                metric: *metric,
+            },
+        )?,
     })
 }

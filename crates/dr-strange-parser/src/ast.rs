@@ -5,6 +5,7 @@
 //! ([`crate::compile`]) is what decides *where* in the pipeline each predicate
 //! belongs and drops the qualifier when it lands on that variable's slot.
 
+use dr_strange_core::AggFunc;
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
@@ -180,22 +181,55 @@ pub struct VarLen {
     pub max: Option<u32>,
 }
 
+/// `RETURN [DISTINCT] <item> [, <item>]*`.
+///
+/// One item naming a node (`n`, `*`) means the query returns rows of nodes;
+/// anything else means it returns a table, and the two cannot be mixed —
+/// there is no value that is a node (see [`crate::compile`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub distinct: bool,
-    pub item: ReturnItem,
+    pub items: Vec<ReturnItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReturnItem {
+    /// `RETURN *` — the matching rows themselves.
     Star,
+    /// `RETURN n` — likewise, named by their variable.
     Var(String),
+    /// `RETURN n.year [AS y]` — a projected column.
+    Value { expr: PExpr, name: String },
+    /// `RETURN count(*) [AS n]` — a column folded over each group.
+    Agg {
+        func: AggFunc,
+        /// `None` for `count(*)`, which reads no value.
+        arg: Option<PExpr>,
+        distinct: bool,
+        name: String,
+    },
 }
 
+/// `ORDER BY <key> [ASC|DESC]`, with the key as the query wrote it — a
+/// projecting query orders by *column*, and `text` is what names one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
-    pub expr: PExpr,
+    pub target: SortTarget,
+    /// The key's source text, trimmed — how a `RETURN` item with no alias is
+    /// named, so `ORDER BY count(*)` can find the column it wrote.
+    pub text: String,
     pub descending: bool,
+}
+
+/// What an `ORDER BY` key names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortTarget {
+    /// An expression — `ORDER BY n.year DESC`.
+    Expr(PExpr),
+    /// A bare name, which only a projecting query can resolve: a `RETURN`
+    /// alias. (A bare variable is not an expression in this language, so
+    /// nothing else can be meant by it.)
+    Name(String),
 }
 
 /// A parsed expression. Mirrors core's `Expr` but with variable-qualified

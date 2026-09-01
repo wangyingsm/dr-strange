@@ -1500,10 +1500,20 @@ fn parse_stmt(
     dr_strange_parser::parse_statement_full(query, None, params).map_err(|e| anyhow!("{e}"))
 }
 
-/// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
-/// the similarity score when the plan produced one.
+/// Execute a `LogicalPlan` and print what it returns: each matched node as a
+/// JSON line, tagging the similarity score when the plan produced one — or,
+/// when the plan projects, the whole table as one object.
+///
+/// One object rather than a line per row, because a table's columns are part
+/// of its answer and the executor has already materialized it (a projection
+/// is a barrier), so there is nothing left to stream.
 fn run_plan(p: PlaneHandle<'_>, plan: LogicalPlan, out: &mut dyn Write) -> Result<()> {
-    for (node, score) in p.query_from_plan(plan).scored_nodes()? {
+    let q = p.query_from_plan(plan);
+    if q.plan().project.is_some() {
+        writeln!(out, "{}", jsonio::table_to_json(&q.table()?))?;
+        return Ok(());
+    }
+    for (node, score) in q.scored_nodes()? {
         let mut obj = jsonio::node_to_json(&node);
         if let (Some(s), Value::Object(map)) = (score, &mut obj) {
             map.insert("score".into(), json!(s));

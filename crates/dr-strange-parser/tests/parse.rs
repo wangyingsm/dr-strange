@@ -3,9 +3,9 @@
 //! Cypher construct maps onto the pipeline.
 
 use dr_strange_core::{
-    Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan, Metric,
-    NodeId, NodeRef, PropValue, SortKey, Source, Step, VectorChannel, distance, external_key,
-    has_label, hops, lit, p, score, similarity,
+    Agg, AggFunc, Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
+    Metric, NodeId, NodeRef, ProjItem, PropValue, SortKey, Source, Step, TupleSortKey,
+    VectorChannel, at_node, distance, external_key, has_label, hops, lit, p, score, similarity,
 };
 use dr_strange_parser::{
     Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
@@ -263,10 +263,96 @@ fn rejects_cross_variable_predicate() {
 
 #[test]
 fn rejects_returning_earlier_variable() {
-    assert!(matches!(
-        err("MATCH (p:Paper)-[:R]->(q) RETURN p"),
-        ParseError::Compile(_)
-    ));
+    // The rows themselves end on the last pattern node, so an earlier one
+    // can only come back as values — which the error says.
+    let said = err("MATCH (p:Paper)-[:R]->(q) RETURN p").to_string();
+    assert!(said.contains("RETURN p.name"), "{said}");
+}
+
+#[test]
+fn a_projection_reads_every_variable_the_row_passed_through() {
+    // What `RETURN p` cannot do, `RETURN p.year` can: the row's trail still
+    // holds the earlier binding, so the column addresses it with `At`.
+    let proj = plan("MATCH (p:Paper)-[:R]->(q) RETURN p.year, q.year")
+        .project
+        .expect("projected");
+    assert_eq!(
+        proj.items,
+        vec![
+            ProjItem::value("p.year", at_node(0, p("year"))),
+            // The last variable is the row's current node, so it needs no
+            // addressing at all.
+            ProjItem::value("q.year", p("year")),
+        ]
+    );
+}
+
+#[test]
+fn aggregates_compile_to_the_projection_tail() {
+    let proj = plan(
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) AS papers, \
+         collect(DISTINCT p.year) AS years ORDER BY papers DESC LIMIT 10",
+    )
+    .project
+    .expect("projected");
+    assert_eq!(
+        proj.items,
+        vec![
+            ProjItem::value("a.name", at_node(0, p("name"))),
+            ProjItem::agg("papers", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year")).distinct()),
+        ]
+    );
+    // ORDER BY names a column — here by its alias.
+    assert_eq!(
+        proj.order_by,
+        vec![TupleSortKey {
+            column: 1,
+            descending: true,
+        }]
+    );
+    assert_eq!(proj.limit, Some(10));
+}
+
+#[test]
+fn order_by_finds_a_column_by_alias_or_by_the_expression_it_returned() {
+    for query in [
+        "MATCH (n:Paper) RETURN n.year AS y ORDER BY y",
+        "MATCH (n:Paper) RETURN n.year AS y ORDER BY n.year",
+        "MATCH (n:Paper) RETURN n.year ORDER BY n.year",
+    ] {
+        let proj = plan(query).project.expect("projected");
+        assert_eq!(
+            proj.order_by,
+            vec![TupleSortKey {
+                column: 0,
+                descending: false,
+            }],
+            "{query}"
+        );
+    }
+    // And says which columns there were when it finds none.
+    let said = err("MATCH (n:Paper) RETURN n.year AS y ORDER BY z").to_string();
+    assert!(said.contains("must name a returned column: y"), "{said}");
+}
+
+#[test]
+fn distinct_skip_and_limit_move_to_the_tail_when_a_query_projects() {
+    // Over node rows these are steps; over tuples they mean something else,
+    // and a query that projects wants the tuple reading.
+    let projected = plan("MATCH (n:Paper) RETURN DISTINCT n.year SKIP 1 LIMIT 2");
+    assert!(projected.steps.is_empty(), "{:?}", projected.steps);
+    let proj = projected.project.expect("projected");
+    assert!(proj.distinct);
+    assert_eq!((proj.skip, proj.limit), (Some(1), Some(2)));
+
+    // Returning nodes keeps them where they were.
+    let nodes = plan("MATCH (n:Paper) RETURN DISTINCT n SKIP 1 LIMIT 2");
+    assert_eq!(
+        nodes.steps,
+        vec![Step::Distinct, Step::Skip(1), Step::Limit(2)]
+    );
+    assert!(nodes.project.is_none());
 }
 
 #[test]
@@ -299,40 +385,44 @@ fn rejects_trailing_and_missing_clauses() {
     assert!(matches!(err("RETURN n"), ParseError::Syntax(_)));
 }
 
-/// Appendix B promises projections and aggregation are "a clear error, never
-/// a silent mis-compile". A position in the middle of the clause is not that
-/// error: `RETURN f.file, f.line, key(f)` stops the parse at the first dot and
-/// used to surface as "unexpected trailing input near `.file, …`", which reads
-/// like a typo in a query that has none. Each shape now names itself, and says
-/// what this subset takes instead — these queries arrive from agents, and the
-/// message is the only documentation they get.
+/// The shapes that used to be "a clear error, never a silent mis-compile" —
+/// `RETURN f.file, f.line`, `key(f)`, `count(f)`, aliases — are the language
+/// now. What is left unsupported says which shape it is and what to write
+/// instead, because these queries arrive from agents and the message is the
+/// only documentation they get.
 #[test]
-fn an_unsupported_return_says_which_shape_and_what_to_write() {
-    let cases = [
-        ("MATCH (f:Fn) RETURN f.file, f.line, key(f)", "projection"),
-        ("MATCH (f:Fn) RETURN f, key(f)", "column list"),
-        ("MATCH (f:Fn) RETURN key(f)", "key(…)"),
-        ("MATCH (f:Fn) RETURN count(f)", "count(…)"),
-        ("MATCH (f:Fn) RETURN f AS name", "aliasing"),
-    ];
-    for (query, shape) in cases {
-        let e = err(query);
-        assert!(
-            matches!(e, ParseError::Compile(_)),
-            "`{query}` is unsupported, not mistyped: {e}"
-        );
-        let said = e.to_string();
-        assert!(
-            said.contains(shape) && said.contains("RETURN takes one variable or `*`"),
-            "`{query}` should name the shape and the rule: {said}"
-        );
-    }
-    // The position survives, because a long query needs one.
-    assert!(
-        err("MATCH (f:Fn) RETURN f.file")
-            .to_string()
-            .contains(".file")
+fn a_return_of_values_projects_them() {
+    let plan = plan("MATCH (f:Fn) RETURN f.file, f.line AS line, key(f)");
+    let proj = plan.project.expect("a RETURN of values projects");
+    assert_eq!(
+        proj.items,
+        vec![
+            // Unaliased columns are named as the query wrote them.
+            ProjItem::value("f.file", p("file")),
+            ProjItem::value("line", p("line")),
+            ProjItem::value("key(f)", external_key()),
+        ]
     );
+    assert!(!proj.distinct && proj.order_by.is_empty());
+}
+
+#[test]
+fn a_node_and_a_column_cannot_share_a_return() {
+    // A node is not a value, so there is no column it could be. Both halves
+    // are supported on their own, which is what the message has to say.
+    let said = err("MATCH (f:Fn) RETURN f, key(f)").to_string();
+    assert!(said.contains("node"), "{said}");
+    assert!(said.contains("RETURN n.name"), "{said}");
+}
+
+#[test]
+fn aliasing_a_returned_node_is_still_unsupported() {
+    // `RETURN f AS name` would have to name a record, and a record's name is
+    // not something the row model carries.
+    assert!(matches!(
+        err("MATCH (f:Fn) RETURN f AS name"),
+        ParseError::Syntax(_)
+    ));
 }
 
 /// Trailing text that is *not* a RETURN this subset lacks stays a plain syntax

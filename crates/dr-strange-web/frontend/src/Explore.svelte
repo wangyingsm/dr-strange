@@ -110,6 +110,7 @@
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
   let hyProvider = $state(loadPref('hyProvider', 'openai')) // embedding provider for the semantic channel
   let hyResults = $state(null) // ranked hits | null
+  let queryTable = $state(null) // { columns, rows } from a projecting query | null
 
   // A label's embedding property from the catalog (a Vector-typed prop). Semantic
   // is offered whenever one exists — a declared vector index only accelerates it;
@@ -554,6 +555,9 @@
     // (`hops()` is deliberately absent: it would shadow the GRAPH channel's
     // required HOPS keyword, which is typed far more often)
     'key()', 'score()', 'similarity(', 'distance(',
+    // the folds a RETURN may project with (`AS` is left out: two letters, and
+    // completing it would shadow the `AS OF` above)
+    'count(*)', 'collect(', 'sum(', 'avg(', 'min(', 'max(',
     // retrieval knobs: the vector/keyword seeds, the hybrid channels, the beam
     'NEAR', 'METRIC', 'TOPK', 'VECTOR', 'KEYWORD', 'GRAPH', 'HOPS', 'DECAY',
     'SEEDS', 'WEIGHT', 'CANDIDATES', 'WIDTH', 'DEPTH',
@@ -642,9 +646,21 @@
         return
       }
       plot.clear()
+      selected = null
+      // A projecting query (`RETURN n.name, count(*)`) answers with a table:
+      // there is no subgraph to plot, so the columns take the canvas' place.
+      if (out.columns) {
+        queryTable = out
+        legend = []
+        const rows = out.rows.length
+        status = `${rows} row${rows === 1 ? '' : 's'} · ${out.columns.length} column${
+          out.columns.length === 1 ? '' : 's'
+        }`
+        return
+      }
+      queryTable = null
       plot.addSubgraph(out)
       legend = plot.legendEntries()
-      selected = null
       status = `${out.count} nodes · ${out.edges.length} edges`
     } catch (e) {
       error = e.message
@@ -873,6 +889,10 @@
 
   // Format a channel's raw contribution for the results list (— when absent).
   const fmtCh = (v) => (v == null ? '—' : v.toFixed(2))
+
+  // A table cell: JSON null is an absent value, and a list or map shows as
+  // the JSON it is rather than `[object Object]`.
+  const cell = (v) => (v === null ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v))
 
   // ---- NL→plan ask (ROADMAP §3) -------------------------------------------
 
@@ -1663,6 +1683,27 @@
           </li>
         {/each}
       </ol>
+    </div>
+  {/if}
+
+  {#if queryTable}
+    <div class="hy-results query-table">
+      <header>
+        <span>Table · {queryTable.rows.length} rows</span>
+        <button class="close" onclick={() => (queryTable = null)} aria-label="Close">×</button>
+      </header>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>{#each queryTable.columns as c, i (`${c}:${i}`)}<th>{c}</th>{/each}</tr>
+          </thead>
+          <tbody>
+            {#each queryTable.rows as row, r (r)}
+              <tr>{#each row as v, i (i)}<td>{cell(v)}</td>{/each}</tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     </div>
   {/if}
 

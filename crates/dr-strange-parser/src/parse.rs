@@ -6,10 +6,11 @@ use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
-use nom::combinator::{cut, map, map_res, not, opt, recognize, value};
+use nom::combinator::{consumed, cut, map, map_res, not, opt, recognize, value, verify};
 use nom::multi::{many0, many1, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
 
+use dr_strange_core::AggFunc;
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
@@ -521,20 +522,108 @@ fn pattern(i: &str) -> IResult<&str, Pattern> {
 
 // ---- clauses --------------------------------------------------------------
 
-fn return_item(i: &str) -> IResult<&str, ReturnItem> {
-    alt((
-        map(symbol("*"), |_| ReturnItem::Star),
-        map(ident, ReturnItem::Var),
+/// The aggregate functions a `RETURN` item may name.
+fn agg_func(name: &str) -> Option<AggFunc> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "avg" => AggFunc::Avg,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "collect" => AggFunc::Collect,
+        _ => return None,
+    })
+}
+
+/// `count(*)` / `count(DISTINCT n.file)` / `sum(n.year)`. `*` is only
+/// `count`'s: every other fold needs a value to fold.
+fn agg_call(i: &str) -> IResult<&str, (AggFunc, Option<PExpr>, bool)> {
+    let (i, name) = ident(i)?;
+    let fail = || nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Tag));
+    let func = agg_func(&name).ok_or_else(fail)?;
+    let (i, _) = symbol("(")(i)?;
+    let (i, distinct) = opt(kw("distinct"))(i)?;
+    let (i, star) = opt(symbol("*"))(i)?;
+    let (i, arg) = match star {
+        Some(_) if func == AggFunc::Count => (i, None),
+        Some(_) => return Err(fail()),
+        None => {
+            let (i, e) = expr(i)?;
+            (i, Some(e))
+        }
+    };
+    let (i, _) = symbol(")")(i)?;
+    Ok((i, (func, arg, distinct.is_some())))
+}
+
+/// `AS <alias>`, which `AS OF` is not: the time-travel clause may follow a
+/// `RETURN` item, so an `of` here belongs to it and not to this item.
+fn alias(i: &str) -> IResult<&str, Option<String>> {
+    opt(preceded(
+        kw("as"),
+        verify(ident, |name: &String| !name.eq_ignore_ascii_case("of")),
     ))(i)
 }
 
+/// A column's header when the query gave it no alias: the item as written.
+fn as_written(text: &str) -> String {
+    text.trim().to_string()
+}
+
+fn return_item(i: &str) -> IResult<&str, ReturnItem> {
+    if let Ok((rest, _)) = symbol("*")(i) {
+        return Ok((rest, ReturnItem::Star));
+    }
+    // An aggregate before a plain expression, since `count(…)` is not one of
+    // the expression language's functions and would fail there.
+    if let Ok((rest, (text, (func, arg, distinct)))) = consumed(agg_call)(i) {
+        let (rest, alias) = alias(rest)?;
+        return Ok((
+            rest,
+            ReturnItem::Agg {
+                func,
+                arg,
+                distinct,
+                name: alias.unwrap_or_else(|| as_written(text)),
+            },
+        ));
+    }
+    if let Ok((rest, (text, expr))) = consumed(expr)(i) {
+        let (rest, alias) = alias(rest)?;
+        return Ok((
+            rest,
+            ReturnItem::Value {
+                expr,
+                name: alias.unwrap_or_else(|| as_written(text)),
+            },
+        ));
+    }
+    // A bare variable: the rows themselves, not a value of them.
+    map(ident, ReturnItem::Var)(i)
+}
+
+/// Words that end an `ORDER BY` key, so a bare name never swallows one.
+fn is_clause_word(word: &str) -> bool {
+    ["asc", "desc", "skip", "limit", "as"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w))
+}
+
 fn order_key(i: &str) -> IResult<&str, OrderKey> {
-    let (i, e) = expr(i)?;
+    let (i, (text, target)) = consumed(alt((
+        map(expr, SortTarget::Expr),
+        // A bare name is a RETURN alias — only a projecting query has one.
+        map(
+            verify(ident, |name: &String| !is_clause_word(name)),
+            SortTarget::Name,
+        ),
+    )))(i)?;
     let (i, dir) = opt(alt((map(kw("desc"), |_| true), map(kw("asc"), |_| false))))(i)?;
     Ok((
         i,
         OrderKey {
-            expr: e,
+            target,
+            text: as_written(text),
             descending: dir.unwrap_or(false),
         },
     ))
@@ -558,7 +647,7 @@ fn query_tail(i: &str) -> IResult<&str, Tail> {
     // and blaming the first token.
     let (i, _) = cut(kw("return"))(i)?;
     let (i, distinct) = opt(kw("distinct"))(i)?;
-    let (i, item) = return_item(i)?;
+    let (i, items) = separated_list1(symbol(","), return_item)(i)?;
     let (i, order_by) = opt(preceded(
         pair(kw("order"), kw("by")),
         separated_list1(symbol(","), order_key),
@@ -572,7 +661,7 @@ fn query_tail(i: &str) -> IResult<&str, Tail> {
             where_clause,
             Return {
                 distinct: distinct.is_some(),
-                item,
+                items,
             },
             order_by.unwrap_or_default(),
             skip,
