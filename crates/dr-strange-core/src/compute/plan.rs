@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compute::expr::Expr;
+use crate::compute::expr::{BindingNeed, Expr};
 use crate::compute::hybrid::HybridSpec;
 use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
@@ -176,6 +176,30 @@ impl LogicalPlan {
 
     pub fn push(&mut self, step: Step) {
         self.steps.push(step);
+    }
+
+    /// Which of a row's bindings this plan's expressions name (`Expr::At` and
+    /// the edge terms).
+    ///
+    /// Computed once per execution so the executor resolves only what is
+    /// asked for: a plan that never reaches past its current node reports
+    /// nothing to resolve, and rows cost exactly what they cost today.
+    pub fn binding_need(&self) -> BindingNeed {
+        let mut need = BindingNeed::default();
+        for step in &self.steps {
+            match step {
+                Step::Filter(e) => need.add(e),
+                Step::Sort(keys) => keys.iter().for_each(|k| need.add(&k.expr)),
+                Step::Expand { .. }
+                | Step::ExpandVar { .. }
+                | Step::Skip(_)
+                | Step::Limit(_)
+                | Step::Distinct
+                | Step::FrontierTopK { .. }
+                | Step::ExpandBeam { .. } => {}
+            }
+        }
+        need
     }
 }
 

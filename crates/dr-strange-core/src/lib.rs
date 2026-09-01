@@ -31,10 +31,11 @@ pub use api::{
     QueryBuilder, SnapshotStats, WriteTxn,
 };
 pub use compute::{
-    Algo, CatalogSnapshot, Connection, EdgeTypeStats, Expr, GraphChannel, HybridHit, HybridSpec,
-    HybridWeights, KeywordChannel, LabelStats, LogicalPlan, LouvainOptions, NodeRef,
-    PageRankOptions, Path, PropStats, Row, ShortestPathOptions, SortKey, Source, Step, ValueType,
-    VectorChannel, distance, external_key, has_label, hops, lit, p, score, similarity,
+    Algo, Binding, BindingNeed, CatalogSnapshot, Connection, EdgeTypeStats, Expr, GraphChannel,
+    HybridHit, HybridSpec, HybridWeights, KeywordChannel, LabelStats, LogicalPlan, LouvainOptions,
+    NodeRef, PageRankOptions, Path, PropStats, Row, ShortestPathOptions, SortKey, Source, Step,
+    ValueType, VectorChannel, at_edge, at_node, distance, edge_dir, edge_type, ep, external_key,
+    has_label, hops, lit, node_id, p, score, similarity,
 };
 pub use error::{Error, Result};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};

@@ -8,21 +8,24 @@
 //! pipeline over it is still lazy — arch/03 §2 "start scalar").
 //!
 //! Rows follow the linear-pipeline model (arch/03 §2): each row is a current
-//! node plus the trail of `(edge, node)` hops taken to reach it. `Filter`
-//! and `Sort` address the current node.
+//! node plus the trail of `(edge, node)` hops taken to reach it. `Filter` and
+//! `Sort` address the current node by default — and, through `Expr::At`, any
+//! earlier binding, which the trail was already carrying (see
+//! [`resolve_bindings`]).
 
 use ahash::{AHashMap, AHashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cache::GraphReader;
-use crate::compute::expr::{self, Expr};
+use crate::compute::expr::{self, BindingNeed, Expr};
 use crate::compute::plan::{Algo, LogicalPlan, NodeRef, SortKey, Source, Step};
 use crate::compute::{algo, hybrid};
 use crate::error::Error;
 use crate::error::Result;
 use crate::storage::vector::{Metric, top_k};
-use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
+use crate::types::{Dir, EdgeId, EdgeRecord, NodeId, NodeRecord, PropValue};
 
 /// One hop of a path — `(edge traversed, node reached)` plus a link to the
 /// previous hop. Rows that branch from a common prefix *share* that prefix by
@@ -43,6 +46,13 @@ struct TrailNode {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub head: NodeId,
+    /// The node the row started at — pattern slot 0.
+    ///
+    /// The trail records hop *destinations* only, so the source is the one
+    /// binding it cannot reconstruct. Held as a plain id (8 bytes, no
+    /// allocation) because every row needs it the moment a query names an
+    /// earlier variable.
+    pub origin: NodeId,
     /// Path back to the source as a shared cons-list; `None` at a source.
     /// Private: reach it through [`Row::hops`] / [`Row::path`] so the O(1)-step
     /// representation can change without touching callers.
@@ -57,6 +67,7 @@ impl Row {
     fn start(head: NodeId) -> Self {
         Row {
             head,
+            origin: head,
             trail: None,
             hops: 0,
             score: None,
@@ -67,6 +78,7 @@ impl Row {
     fn scored(head: NodeId, score: f32) -> Self {
         Row {
             head,
+            origin: head,
             trail: None,
             hops: 0,
             score: Some(score),
@@ -79,6 +91,7 @@ impl Row {
     fn step(&self, edge: EdgeId, node: NodeId) -> Self {
         Row {
             head: node,
+            origin: self.origin,
             trail: Some(Rc::new(TrailNode {
                 edge,
                 node,
@@ -114,13 +127,110 @@ impl Row {
         out
     }
 
-    fn ctx<'a>(&self, node: Option<&'a NodeRecord>) -> expr::EvalCtx<'a> {
+    fn ctx<'a>(
+        &self,
+        node: Option<&'a NodeRecord>,
+        bindings: expr::Bindings<'a>,
+    ) -> expr::EvalCtx<'a> {
         expr::EvalCtx {
             node,
             score: self.score,
             hops: self.hops as usize,
+            bindings,
+            ..Default::default()
         }
     }
+}
+
+/// One row's bindings, owned so an [`expr::Bindings`] can borrow them for the
+/// length of an evaluation. Empty — and free — for a plan that names none.
+#[derive(Default)]
+struct Resolved {
+    nodes: Vec<Option<Arc<NodeRecord>>>,
+    edges: Vec<Option<(Arc<EdgeRecord>, Dir)>>,
+    last: Option<(Arc<EdgeRecord>, Dir)>,
+}
+
+impl Resolved {
+    fn view(&self) -> expr::Bindings<'_> {
+        expr::Bindings {
+            nodes: &self.nodes,
+            edges: &self.edges,
+            edge: self.last.as_ref().map(|(e, d)| (&**e, *d)),
+        }
+    }
+}
+
+/// Load the bindings `need` asks for out of one row's trail.
+///
+/// Lookups, not traversal: the trail already holds every hop, so slot 0 is the
+/// row's origin, slot *i* the destination of hop *i-1*, and hop *i* the edge
+/// between them. Nothing is resolved for a plan that names no binding, which
+/// is the overwhelmingly common case.
+fn resolve_bindings(reader: &dyn GraphReader, row: &Row, need: &BindingNeed) -> Result<Resolved> {
+    let mut out = Resolved::default();
+    if !need.any() {
+        return Ok(out);
+    }
+    let path = row.path();
+    // Slot 0 is where the row started; every later slot is a hop's destination.
+    let node_at = |slot: usize| -> NodeId {
+        if slot == 0 {
+            row.origin
+        } else {
+            path[slot - 1].1
+        }
+    };
+
+    if let Some(max) = need.nodes {
+        for slot in 0..=max as usize {
+            // A slot past this row's length was never bound — a shorter walk
+            // through a variable-length hop, say. `None` reads as `Null`.
+            out.nodes.push(match slot <= path.len() {
+                true => reader.node(node_at(slot))?,
+                false => None,
+            });
+        }
+    }
+    if let Some(max) = need.edges {
+        for hop in 0..=max as usize {
+            out.edges.push(match path.get(hop) {
+                Some(&(edge, dst)) => load_edge(reader, edge, node_at(hop), dst)?,
+                None => None,
+            });
+        }
+    }
+    if need.last_edge
+        && let Some(hop) = path.len().checked_sub(1)
+    {
+        let (edge, dst) = path[hop];
+        out.last = load_edge(reader, edge, node_at(hop), dst)?;
+    }
+    Ok(out)
+}
+
+/// One hop's edge plus the direction the row actually walked it: `Out` when
+/// the edge runs from the hop's source to its destination, `In` when it runs
+/// the other way.
+///
+/// Deriving it here rather than recording it on every `step` keeps the hot
+/// expansion path free of state it almost never needs. The cost is one case
+/// the endpoints cannot settle — a self-loop satisfies both readings — which
+/// reports `Out`, as [`expr::Expr::EdgeDir`] documents.
+fn load_edge(
+    reader: &dyn GraphReader,
+    edge: EdgeId,
+    from: NodeId,
+    to: NodeId,
+) -> Result<Option<(Arc<EdgeRecord>, Dir)>> {
+    Ok(reader.edge(edge)?.map(|e| {
+        let dir = if e.src == from && e.dst == to {
+            Dir::Out
+        } else {
+            Dir::In
+        };
+        (e, dir)
+    }))
 }
 
 type RowIter<'r> = Box<dyn Iterator<Item = Result<Row>> + 'r>;
@@ -202,8 +312,10 @@ pub fn execute_with<'r>(
 ) -> Result<RowIter<'r>> {
     let source: RowIter<'r> = Box::new(source_rows(reader, &plan.source)?.into_iter().map(Ok));
     let mut iter = deadlined(source, deadline);
+    // Once per plan, not once per row: which bindings any expression names.
+    let need = plan.binding_need();
     for step in &plan.steps {
-        iter = apply_step(iter, step, reader)?;
+        iter = apply_step(iter, step, reader, need)?;
     }
     Ok(deadlined(iter, deadline))
 }
@@ -411,6 +523,7 @@ fn apply_step<'r>(
     iter: RowIter<'r>,
     step: &Step,
     reader: &'r dyn GraphReader,
+    need: BindingNeed,
 ) -> Result<RowIter<'r>> {
     Ok(match step {
         Step::Expand { dir, edge_type } => {
@@ -432,7 +545,7 @@ fn apply_step<'r>(
         }
         Step::Filter(expr) => {
             let pred = expr.clone();
-            Box::new(iter.filter_map(move |rr| filter_one(reader, rr, &pred)))
+            Box::new(iter.filter_map(move |rr| filter_one(reader, rr, &pred, &need)))
         }
         Step::Skip(n) => Box::new(iter.skip(*n as usize)),
         Step::Limit(n) => Box::new(iter.take(*n as usize)),
@@ -444,7 +557,7 @@ fn apply_step<'r>(
             }))
         }
         // Barrier: drain, sort, re-emit.
-        Step::Sort(keys) => Box::new(sort_rows(iter, keys, reader)?.into_iter().map(Ok)),
+        Step::Sort(keys) => Box::new(sort_rows(iter, keys, reader, &need)?.into_iter().map(Ok)),
         // Barrier: rank the whole frontier by similarity, keep top-k.
         Step::FrontierTopK {
             property,
@@ -608,31 +721,68 @@ fn expand_var(
     out
 }
 
-fn filter_one(reader: &dyn GraphReader, rr: Result<Row>, pred: &Expr) -> Option<Result<Row>> {
-    match rr {
+fn filter_one(
+    reader: &dyn GraphReader,
+    rr: Result<Row>,
+    pred: &Expr,
+    need: &BindingNeed,
+) -> Option<Result<Row>> {
+    let row = match rr {
+        Ok(r) => r,
+        Err(e) => return Some(Err(e)),
+    };
+    match matches_pred(reader, &row, pred, need) {
         Err(e) => Some(Err(e)),
-        Ok(row) => match reader.node(row.head) {
-            Err(e) => Some(Err(e)),
-            Ok(node) => {
-                let ctx = row.ctx(node.as_deref());
-                if expr::is_true(&expr::eval(pred, &ctx)) {
-                    Some(Ok(row))
-                } else {
-                    None
-                }
-            }
-        },
+        Ok(true) => Some(Ok(row)),
+        Ok(false) => None,
     }
 }
 
-fn sort_rows(iter: RowIter<'_>, keys: &[SortKey], reader: &dyn GraphReader) -> Result<Vec<Row>> {
+/// Evaluate `exprs` against one row — the projection primitive, shared by the
+/// `select` terminal and (from B1) the plan's projection tail, so a column
+/// means the same thing however the query asked for it.
+pub fn row_values(
+    reader: &dyn GraphReader,
+    row: &Row,
+    exprs: &[Expr],
+    need: &BindingNeed,
+) -> Result<Vec<PropValue>> {
+    let node = reader.node(row.head)?;
+    let bound = resolve_bindings(reader, row, need)?;
+    let ctx = row.ctx(node.as_deref(), bound.view());
+    Ok(exprs.iter().map(|e| expr::eval(e, &ctx)).collect())
+}
+
+/// Whether one row satisfies `pred`: read the current node, resolve whatever
+/// bindings the plan names, evaluate. Split out from [`filter_one`] so the two
+/// reads can fail with `?` while the caller still decides what a failing row
+/// means for the stream.
+fn matches_pred(
+    reader: &dyn GraphReader,
+    row: &Row,
+    pred: &Expr,
+    need: &BindingNeed,
+) -> Result<bool> {
+    let node = reader.node(row.head)?;
+    let bound = resolve_bindings(reader, row, need)?;
+    let ctx = row.ctx(node.as_deref(), bound.view());
+    Ok(expr::is_true(&expr::eval(pred, &ctx)))
+}
+
+fn sort_rows(
+    iter: RowIter<'_>,
+    keys: &[SortKey],
+    reader: &dyn GraphReader,
+    need: &BindingNeed,
+) -> Result<Vec<Row>> {
     // Decorate each row with its precomputed key values (one node lookup +
     // eval per row), sort, undecorate — so comparisons don't re-evaluate.
     let mut decorated: Vec<(Vec<PropValue>, Row)> = Vec::new();
     for rr in iter {
         let row = rr?;
         let node = reader.node(row.head)?;
-        let ctx = row.ctx(node.as_deref());
+        let bound = resolve_bindings(reader, &row, need)?;
+        let ctx = row.ctx(node.as_deref(), bound.view());
         let vals = keys.iter().map(|k| expr::eval(&k.expr, &ctx)).collect();
         decorated.push((vals, row));
     }
@@ -672,7 +822,7 @@ fn cmp_keys(a: &[PropValue], b: &[PropValue], keys: &[SortKey]) -> std::cmp::Ord
 mod tests {
     use super::*;
     use crate::cache::UncachedReader;
-    use crate::compute::expr::{has_label, p};
+    use crate::compute::expr::{at_edge, at_node, edge_dir, edge_type, ep, has_label, p};
     use crate::compute::plan::SortKey;
     use crate::storage::engine::{StorageEngine, WriteTransaction};
     use crate::storage::graph;
@@ -1009,5 +1159,118 @@ mod tests {
             &plan,
         );
         assert_eq!(ids.len(), 2);
+    }
+
+    // ---- bindings ---------------------------------------------------------
+
+    /// `a -CITES-> {b, c}`, where `a` and `b` share a file and `c` doesn't.
+    /// Two nodes' properties in one predicate is the shape the linear pipeline
+    /// used to reject outright.
+    fn cross_variable_graph(txn: &mut dyn WriteTransaction) {
+        let file = |f: &str| props(&[("file", PropValue::Str(f.into()))]);
+        let a = graph::create_node(txn, PlaneId::STARTUP, &["Root"], &file("exec.rs")).unwrap();
+        let b = graph::create_node(txn, PlaneId::STARTUP, &[], &file("exec.rs")).unwrap();
+        let c = graph::create_node(txn, PlaneId::STARTUP, &[], &file("plan.rs")).unwrap();
+        graph::create_edge(txn, PlaneId::STARTUP, a, b, "CITES", &Properties::new()).unwrap();
+        graph::create_edge(txn, PlaneId::STARTUP, a, c, "CITES", &Properties::new()).unwrap();
+    }
+
+    #[test]
+    fn a_filter_can_compare_two_pattern_variables() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Root".into()));
+        plan.push(Step::Expand {
+            dir: Dir::Out,
+            edge_type: Some("CITES".into()),
+        });
+        // slot 0 is the source `a`; the current node is `b`/`c`.
+        plan.push(Step::Filter(at_node(0, p("file")).eq(p("file"))));
+        assert_eq!(run(cross_variable_graph, &plan), vec![NodeId(2)]);
+    }
+
+    /// The source node is the one binding the trail cannot reconstruct — it
+    /// records hop destinations only — so `Row::origin` earns its 8 bytes.
+    #[test]
+    fn slot_zero_is_the_source_even_after_several_hops() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Root".into()));
+        for _ in 0..2 {
+            plan.push(Step::Expand {
+                dir: Dir::Out,
+                edge_type: None,
+            });
+        }
+        plan.push(Step::Filter(at_node(0, p("name")).eq("a")));
+        let ids = run(
+            |txn| {
+                let name = |n: &str| props(&[("name", PropValue::Str(n.into()))]);
+                let a = graph::create_node(txn, PlaneId::STARTUP, &["Root"], &name("a")).unwrap();
+                let b = graph::create_node(txn, PlaneId::STARTUP, &[], &name("b")).unwrap();
+                let c = graph::create_node(txn, PlaneId::STARTUP, &[], &name("c")).unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, a, b, "N", &Properties::new()).unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, b, c, "N", &Properties::new()).unwrap();
+            },
+            &plan,
+        );
+        assert_eq!(ids, vec![NodeId(3)]);
+    }
+
+    /// A `Both` expansion walks each edge in whichever direction reaches the
+    /// neighbour, and the resolver recovers which one from the endpoints.
+    #[test]
+    fn edge_terms_see_the_direction_the_row_actually_walked() {
+        let build = |txn: &mut dyn WriteTransaction| {
+            let mid =
+                graph::create_node(txn, PlaneId::STARTUP, &["Mid"], &Properties::new()).unwrap();
+            let up = graph::create_node(txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+            let down = graph::create_node(txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+            // mid -CALLS-> down, and up -CALLS-> mid
+            graph::create_edge(
+                txn,
+                PlaneId::STARTUP,
+                mid,
+                down,
+                "CALLS",
+                &props(&[("weight", PropValue::Int(7))]),
+            )
+            .unwrap();
+            graph::create_edge(txn, PlaneId::STARTUP, up, mid, "CALLS", &Properties::new())
+                .unwrap();
+        };
+
+        let both = |pred: Expr| {
+            let mut plan = LogicalPlan::new(Source::ScanLabel("Mid".into()));
+            plan.push(Step::Expand {
+                dir: Dir::Both,
+                edge_type: None,
+            });
+            plan.push(Step::Filter(pred));
+            plan
+        };
+
+        // Out of `mid` is the edge it is the src of — the one reaching `down`.
+        assert_eq!(run(build, &both(edge_dir().eq("OUT"))), vec![NodeId(3)]);
+        assert_eq!(run(build, &both(edge_dir().eq("IN"))), vec![NodeId(2)]);
+        // Type and edge properties come off the same resolved record.
+        assert_eq!(run(build, &both(edge_type().eq("CALLS"))).len(), 2);
+        assert_eq!(run(build, &both(ep("weight").eq(7))), vec![NodeId(3)]);
+        // A hop-qualified term addresses the same single hop here.
+        assert_eq!(
+            run(build, &both(at_edge(0, edge_dir()).eq("OUT"))),
+            vec![NodeId(3)]
+        );
+    }
+
+    /// Resolution is driven by what the plan names, so a query that reaches
+    /// past nothing must ask for nothing.
+    #[test]
+    fn a_plan_without_bindings_resolves_none() {
+        let mut plan = LogicalPlan::new(Source::ScanAll);
+        plan.push(Step::Filter(p("x").eq(1)));
+        assert!(!plan.binding_need().any());
+
+        plan.push(Step::Sort(vec![SortKey {
+            expr: at_node(1, p("x")),
+            descending: false,
+        }]));
+        assert_eq!(plan.binding_need().nodes, Some(1));
     }
 }

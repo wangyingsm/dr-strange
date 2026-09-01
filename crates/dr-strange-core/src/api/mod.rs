@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use crate::compute::catalog::{self, CatalogSnapshot, PlaneCounters};
 use crate::compute::exec;
-use crate::compute::expr::{self, Expr, score};
+use crate::compute::expr::{Expr, score};
 use crate::compute::hybrid::{
     self, GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, VectorChannel,
 };
@@ -2345,20 +2345,21 @@ impl<'db> QueryBuilder<'db> {
         })
     }
 
-    /// Evaluate `exprs` against each matching row's current node — one output
-    /// tuple per row (arch/03's projection, terminal form for v0).
+    /// Evaluate `exprs` against each matching row — one output tuple per row
+    /// (arch/03's projection, terminal form).
+    ///
+    /// The expressions see the row's current node and, through `Expr::At`, any
+    /// earlier pattern binding; the bindings they name are folded into the
+    /// plan's own so nothing is resolved that no column asked for.
     pub fn select(&self, exprs: &[Expr]) -> Result<Vec<Vec<PropValue>>> {
+        let mut need = self.plan.binding_need();
+        for e in exprs {
+            need.add(e);
+        }
         self.with_reader(|reader| {
             let mut out = Vec::new();
             for r in exec::execute_with(&self.plan, reader, self.plane.deadline)? {
-                let row = r?;
-                let node = reader.node(row.head)?;
-                let ctx = expr::EvalCtx {
-                    node: node.as_deref(),
-                    score: row.score,
-                    hops: row.hops(),
-                };
-                out.push(exprs.iter().map(|e| expr::eval(e, &ctx)).collect());
+                out.push(exec::row_values(reader, &r?, exprs, &need)?);
             }
             Ok(out)
         })

@@ -22,7 +22,10 @@ pub mod plan;
 pub use algo::{LouvainOptions, PageRankOptions, Path, ShortestPathOptions};
 pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};
 pub use exec::Row;
-pub use expr::{Expr, distance, external_key, has_label, hops, lit, p, score, similarity};
+pub use expr::{
+    Binding, BindingNeed, Expr, at_edge, at_node, distance, edge_dir, edge_type, ep, external_key,
+    has_label, hops, lit, node_id, p, score, similarity,
+};
 pub use hybrid::{
     GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, VectorChannel,
 };
