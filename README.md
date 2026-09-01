@@ -125,6 +125,17 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 `%LOCALAPPDATA%\Programs\drsg\bin` on Windows). On Windows the flags are
 `-Bin`, `-Version`, and `-Dir`.
 
+**Staying current.** `drsg update` asks GitHub for the latest release and, if
+this build is behind it, hands the process over to the installer above —
+pointed at the directory `drsg` is running from, so the copy on your `PATH` is
+replaced rather than joined by a second one. A build already current, or newer
+than the latest release, is told so and nothing is downloaded.
+
+```console
+$ drsg update
+drsg 2.2.1 is the latest release — nothing to do
+```
+
 Alternatives: the container image, `ghcr.io/wangyingsm/dr-strange:latest`, or the
 archives and checksums on the
 [releases page](https://github.com/wangyingsm/dr-strange/releases).

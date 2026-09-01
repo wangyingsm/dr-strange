@@ -76,6 +76,45 @@ it is not already present:
 $ export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### Upgrading
+
+`drsg update` resolves the newest release the way the installer does — through
+the redirect on `releases/latest`, rather than the API, which is rate-limited
+for unauthenticated callers — and compares it with the running build. When
+there is nothing to do it says so and stops:
+
+```console
+$ drsg update
+drsg 2.2.1 is the latest release — nothing to do
+```
+
+When there is, it prints the command it is about to run and then *becomes* it:
+the process is replaced by the same installer a first install runs, so the exit
+status is the installer's own and there is no parent left waiting in a binary
+that has just been overwritten.
+
+```console
+$ drsg update
+drsg 2.2.0 -> 2.2.1
+$ curl -fsSL .../install.sh | sh -s -- --bin drsg --dir '/home/me/.local/bin'
+Dr Strange v2.2.1 (x86_64-unknown-linux-gnu)
+  downloading dr-strange-v2.2.1-x86_64-unknown-linux-gnu.tar.gz
+  checksum verified
+  installed /home/me/.local/bin/drsg
+```
+
+The destination is the directory the running binary is in, not the installer's
+default — an upgrade must replace the copy on the `PATH`, not add a newer one
+somewhere else and leave the old one being run. `--dir` overrides it for a
+`drsg` installed somewhere unwritable, and `--bin all` updates `drsg-mcp`
+alongside it.
+
+A build *newer* than the latest release — from source, or from a branch ahead
+of the last tag — is told it is ahead and nothing is installed: `update` never
+moves backwards. On Windows nothing is run at all, because the running
+executable is locked against being overwritten; the command to paste into a
+fresh terminal is printed instead.
+
 The archives and their checksums may also be downloaded directly from the
 [releases page](https://github.com/wangyingsm/dr-strange/releases); the
 installers are a convenience over the same assets, and both scripts live in

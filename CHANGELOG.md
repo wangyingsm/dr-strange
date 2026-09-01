@@ -35,6 +35,25 @@ All notable changes to Dr Strange are documented here. The format is based on
   line when it is showing an older copy. Regenerated in every SDK.
 
 ### Added
+- **`drsg update`.** Asks GitHub for the newest release — through the
+  `releases/latest` redirect rather than the rate-limited API, as
+  `scripts/install.sh` does — and, when this build is behind it, `exec`s the
+  same `curl … | sh` a first install runs. It hands over rather than
+  reimplementing the download: the installer already gets the target triple,
+  the checksum and the atomic replace right, and a second installer would only
+  ever be exercised by people upgrading. `exec` rather than spawn because the
+  file this process was loaded from is about to be overwritten, and a parent
+  waiting to print "done" would be waiting inside it.
+
+  The installer is pointed at the directory the running binary is in, not its
+  own `~/.local/bin` default — an upgrade has to replace the copy on the
+  `PATH`, not add a newer one elsewhere and leave the old one being run.
+  `--dir` overrides it, `--bin all` takes `drsg-mcp` along. A build *newer*
+  than the latest release is told it is ahead and nothing is installed, so
+  `update` never moves anyone backwards; on Windows nothing runs at all,
+  because the executable is locked while running, and the command to paste is
+  printed instead.
+
 - **`drsg plugin install <name>`.** A bare word is now looked up in the
   official catalog — `drsg plugin install rust` — rather than read as a
   filename. Paths and URLs are unchanged, and the interactive chooser takes a

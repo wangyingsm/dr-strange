@@ -68,6 +68,40 @@ shell 配置：
 $ export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### 升级
+
+`drsg update` 用与安装脚本相同的方式解析最新发行版本——走 `releases/latest` 的
+重定向，而不是对未认证调用者有速率限制的 API——再与当前运行的构建比较。无事可做
+时它会明说并停下：
+
+```console
+$ drsg update
+drsg 2.2.1 is the latest release — nothing to do
+```
+
+确有新版本时，它会先打印即将执行的命令，然后**变成**它：进程被首次安装所用的同一
+个安装脚本替换，因此退出码就是安装脚本自己的退出码，也不会留下一个父进程等在一个
+刚刚被覆盖掉的二进制里。
+
+```console
+$ drsg update
+drsg 2.2.0 -> 2.2.1
+$ curl -fsSL .../install.sh | sh -s -- --bin drsg --dir '/home/me/.local/bin'
+Dr Strange v2.2.1 (x86_64-unknown-linux-gnu)
+  downloading dr-strange-v2.2.1-x86_64-unknown-linux-gnu.tar.gz
+  checksum verified
+  installed /home/me/.local/bin/drsg
+```
+
+安装目录取的是正在运行的这个二进制所在的目录，而不是安装脚本的默认值——升级必须
+替换 `PATH` 上的那一份，而不是在别处放一份更新的、让旧的继续被运行。若 `drsg`
+装在无写权限的位置，用 `--dir` 覆盖；`--bin all` 会连同 `drsg-mcp` 一起更新。
+
+比最新发行版本**更新**的构建——来自源码，或来自最后一个标签之后的分支——会被告知
+自己在前面，不会安装任何东西：`update` 从不回退。在 Windows 上则什么都不会运行，
+因为正在运行的可执行文件被锁定、无法被覆盖；它转而打印出可在新终端里粘贴执行的
+命令。
+
 归档包及其校验和也可以从[发行页](https://github.com/wangyingsm/dr-strange/releases)
 直接下载。安装脚本只是对同一批产物的便捷封装，两个脚本都放在
 [`scripts/`](https://github.com/wangyingsm/dr-strange/tree/master/scripts)，可以在

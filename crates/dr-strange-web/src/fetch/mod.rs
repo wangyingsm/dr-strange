@@ -187,6 +187,46 @@ pub fn fetch_bytes(url: &str, max_bytes: usize, allow: &[Prefix]) -> Result<Vec<
     Ok(bytes)
 }
 
+/// Ask a URL where it redirects to, without following it.
+///
+/// One use, and it shapes the whole function: `github.com/<repo>/releases/latest`
+/// answers with a `Location` naming the newest tag, which is how
+/// `scripts/install.sh` resolves a version and how `drsg update` learns whether
+/// there is one. Deliberately not the releases **API** — that is rate-limited
+/// for unauthenticated callers, and a version check that fails on a shared
+/// address is worse than no version check.
+///
+/// The initial request goes through the same guard as every other fetch. The
+/// redirect is *not* followed and nothing at it is read: the caller gets a
+/// string to parse, which is the only reason to ask.
+pub fn redirect_target(url: &str, allow: &[Prefix]) -> Result<String> {
+    let url = parse_url(url)?;
+    guard::precheck(&url, allow)?;
+
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .resolver(guard::PublicOnly {
+            allow: allow.to_vec(),
+        })
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+
+    // With no redirects allowed, ureq may hand a 3xx back either way depending
+    // on the status; both are the answer here, and only a transport failure is
+    // an error.
+    let response = match agent.request_url("GET", &url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => bail!("asking {url} where it redirects: {}", terse(&e)),
+    };
+
+    response
+        .header("location")
+        .map(str::to_string)
+        .with_context(|| format!("{url} answered {} with no Location", response.status()))
+}
+
 pub fn fetch_with_progress(
     root: &str,
     opts: &FetchOptions,

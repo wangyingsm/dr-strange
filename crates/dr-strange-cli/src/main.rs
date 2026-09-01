@@ -14,6 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod commands;
 mod config;
+mod update;
 
 use std::io::{self, BufReader, Write};
 use std::net::SocketAddr;
@@ -313,6 +314,23 @@ enum Command {
         /// Distance metric for the ensured indexes (`l2` is euclidean).
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
+    },
+    /// Update drsg in place: check GitHub for a newer release and, if there is
+    /// one, hand this process over to the installer.
+    ///
+    /// Nothing happens when this build is already the latest — or is *newer*
+    /// than the latest release, which a build from source usually is. The
+    /// installer is the same `curl … | sh` a first install runs, and it is
+    /// pointed at the directory this binary is running from, so an upgrade
+    /// replaces the copy on your `PATH` rather than adding a second one.
+    Update {
+        /// Which binary to update: `drsg`, `drsg-mcp`, or `all`.
+        #[arg(long, default_value = "drsg")]
+        bin: String,
+        /// Install into this directory instead of the one this binary is
+        /// running from — for a `drsg` in a location you cannot write to.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
     /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
     /// that turn source files into graph facts before any model reads them.
@@ -978,6 +996,17 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 embed_model.as_deref(),
                 out,
             )
+        }
+        Command::Update { bin, dir } => {
+            let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
+                .fetch
+                .allow_private
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|s| dr_strange_web::fetch::Prefix::parse(s))
+                .collect::<Result<_>>()?;
+            update::update(&allow, &bin, dir.as_deref(), out)
         }
         #[cfg(feature = "digest")]
         #[cfg(feature = "digest")]
