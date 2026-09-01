@@ -4,6 +4,52 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **The official plugin catalog is data, fetched, not a constant of the
+  binary.** It lived as a nine-entry `const` in `dr-strange-llm`: a release
+  URL and a pinned hash per plugin. That made every plugin release a change to
+  *this* repository — tag `rust-v1.4.2` in the extensions repo, then edit a
+  Rust file here, bump, ship — for a fact the host merely repeats, and the two
+  projects release apart on purpose. The list now lives beside the plugins as
+  [`catalog.json`](https://github.com/wangyingsm/dr-strange-extension/blob/master/catalog.json)
+  in the extensions repository, where the release workflow writes each new
+  version, URL and hash itself. A plugin release reaches every installed drsg
+  without a drsg release.
+
+  Moving the list out did not move the judgement out. Each entry now carries
+  `contract` (the WIT world it was built against, weighed against the one this
+  host speaks) and `min_drsg` (the oldest host it claims to work with), and its
+  `sha256` is verified on download before the bytes are looked at as a
+  component — the store's own pin, re-checked at every load, is unchanged.
+  Several entries may share a name, so a plugin can keep serving older hosts:
+  each host installs the newest entry it can run. An entry this build cannot
+  run is **listed with the reason, not hidden** — the wasm loader is the real
+  gate, and a plugin silently absent from the list is a support question.
+
+- **`plugin.catalog` returns `{stale, schema, source, plugins}`** instead of a
+  bare array, and each entry gained `version` and `compat`. The server caches
+  the catalog for an hour and falls back to the store's copy when the fetch
+  fails; `stale: true` says so, and the dashboard's Extensions panel prints a
+  line when it is showing an older copy. Regenerated in every SDK.
+
+### Added
+- **`drsg plugin install <name>`.** A bare word is now looked up in the
+  official catalog — `drsg plugin install rust` — rather than read as a
+  filename. Paths and URLs are unchanged, and the interactive chooser takes a
+  name as well as a number.
+- **`drsg plugin list --available`.** The catalog as a table, each entry tagged
+  `[installed]`/`[upgradable]` against the local store, with `--json` for
+  agents. The same information the interactive installer shows, without the
+  prompt.
+- **The catalog is cached beside the installed plugins**, so an offline
+  `drsg plugin install` still lists it and says how old the copy is. With no
+  cache and no network it fails naming the URL and the way around it — a path
+  or a URL needs no catalog. Nothing is vendored into the binary: a snapshot in
+  this tree is the thing being removed, and one that went stale silently would
+  be worse than an error that says so.
+
 ## [2.2.1] - 2026-08-28
 
 ### Changed

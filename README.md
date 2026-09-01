@@ -168,8 +168,8 @@ is the code as committed — and each answer opens by saying which commit
 (`synced: commit <sha>`).
 
 ```console
-# Install parser plugins: no argument opens an interactive chooser over the
-# official catalog (0 = all); or pass any .wasm path or URL directly.
+# Install parser plugins: a name from the official catalog, no argument for
+# an interactive chooser over it (0 = all), or any .wasm path or URL.
 $ drsg plugin install
 
 # Digest a repository into a plane named after it
@@ -275,17 +275,20 @@ commits (newest 15 of 429):
 
 `--no-git` turns the whole stage off, on `digest` and on `serve watch` alike.
 
-**Plugins.** `drsg plugin install` installs any parser plugin — a local
-`.wasm` file or a URL — validating it as a component and pinning its SHA-256,
-re-checked at every load. The no-argument form offers the official catalog:
-eight languages — Rust, Go, TypeScript/JavaScript, Python, Java, C, web
-(HTML/CSS) and TOML, plus `git` for a repository's history — each pinned to a
-release tag of the
+**Plugins.** `drsg plugin install` installs any parser plugin — an official
+plugin's name, a local `.wasm` file, or a URL — validating it as a component
+and pinning its SHA-256, re-checked at every load. The official catalog covers
+eight languages (Rust, Go, TypeScript/JavaScript, Python, Java, C, web
+(HTML/CSS), TOML) plus `git` for a repository's history, and lives as
+`catalog.json` in the
 [dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension)
-repository ([latest releases](https://github.com/wangyingsm/dr-strange-extension/releases)).
-The same repository carries the plugin SDKs: the parser contract is an open
-WIT interface, and a community parser built against it installs and runs in
-the same sandbox as an official one.
+repository rather than compiled into this binary — so a plugin release needs
+no drsg release. Each entry pins the artifact's hash, checked on download, and
+says which hosts it is for; one this build cannot run is listed with the
+reason rather than hidden. `drsg plugin list --available` prints the catalog
+tagged against what is installed. The same repository carries the plugin SDKs:
+the parser contract is an open WIT interface, and a community parser built
+against it installs and runs in the same sandbox as an official one.
 
 **How it compares.** In agent-task benchmarks against a ripgrep-driven
 workflow and two open-source code-graph MCP tools, drsg completed every task

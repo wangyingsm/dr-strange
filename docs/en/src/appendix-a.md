@@ -62,7 +62,7 @@ or an external key.
 ## Plugins
 
 - **`plugin.list`** · read — the installed preprocessor plugins, the same records `drsg plugin list --json` prints. Params: none.
-- **`plugin.catalog`** · read — the official catalog this build pins (release URLs + SHA-256 hashes); a constant of the binary, joinable against `plugin.list`. Params: none.
+- **`plugin.catalog`** · read — the official catalog, read from the extensions repository's `catalog.json` rather than compiled into the binary, so a plugin release needs no drsg release. Returns `{stale, schema, source, plugins}`; each entry carries `name`, `version`, `claims`, `url`, `sha256` and `compat` (`ok`, `needs_host`, `other_contract`), joinable against `plugin.list`. Cached for an hour; `stale: true` means the fetch failed and this is the last copy the server kept. Params: none.
 - **`plugin.install`** · write — download, validate, hash-pin and store a plugin from an `http(s)` URL (server-local paths are refused over RPC). Params: `url` string!.
 - **`plugin.remove`** · write — uninstall a plugin by name. Params: `name` string!.
 

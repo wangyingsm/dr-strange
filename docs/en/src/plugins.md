@@ -156,11 +156,37 @@ parser rather than reinventing one:
 Each releases at its own pace as a `<plugin>-vX.Y.Z` tag; CI builds the
 component and publishes `<plugin>.wasm` with its SHA-256 on the
 [releases page](https://github.com/wangyingsm/dr-strange-extension/releases).
-drsg's binary pins the catalog — release-tag URL plus hash, the versions
-known-good with that build's contract — and a bare `drsg plugin install` offers
-it interactively. Install pins the artifact's SHA-256; every later load
-re-checks it, so a file that changes on disk is refused rather than silently
-run. Installing a name again is the upgrade path.
+
+The list of those releases — `catalog.json` — lives in the extensions
+repository beside the plugins, not in this binary. That is the point: a
+catalog compiled into drsg would make every plugin release a drsg release, for
+a fact drsg only repeats. So `drsg plugin install` fetches it, and a plugin's
+name is enough to install it:
+
+```console
+$ drsg plugin install rust          # a name from the catalog
+$ drsg plugin install              # or the interactive list, 0 = all
+$ drsg plugin list --available     # the catalog, tagged against this store
+```
+
+Fetching the list does not mean trusting it blindly. Each entry pins the
+artifact's SHA-256, checked on download before the bytes are even looked at as
+a component; and each entry says which host it is for — `contract`, the WIT
+world it was built against, and `min_drsg`, the oldest host it claims to work
+with. An entry this build cannot honour is **listed with the reason, not
+hidden**: a plugin that silently vanishes from the list is a support question,
+while "needs drsg >= 3.0.0" is an answer. Several entries may share a name,
+which is how a plugin keeps serving older hosts — each host installs the
+newest entry it can run.
+
+Every successful fetch is cached beside the installed plugins, so an offline
+`drsg plugin install` still shows the list and says how old it is. With no
+cache and no network it fails naming the URL, because a plugin can still be
+installed without a catalog at all — a path or a URL needs no list.
+
+Install pins the artifact's SHA-256 in the store; every later load re-checks
+it, so a file that changes on disk is refused rather than silently run.
+Installing a name again is the upgrade path.
 
 ## What every official parser promises
 

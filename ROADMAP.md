@@ -953,6 +953,41 @@ on HEAD, and polling every ref would double its git calls for a rare case.
 And nothing yet **links the two planes**: a `Commit` to the symbols it changed
 would need tree diffing, which is a different order of cost and a decision of
 its own.
+
+### The catalog is data, and it lives with the plugins  *(shipped)*
+
+The official list started as a `const` here: nine entries, a release URL and a
+pinned hash each. It read as a compatibility statement — *these artifacts are
+known-good with this build's contract* — and that reading is what made it
+wrong. It meant every plugin release was a release of this repository too: tag
+`rust-v1.4.2` in the extensions repo, edit a Rust file here, bump, ship, for a
+fact the host only repeats. The two projects release at their own pace on
+purpose, which was the entire reason the plugins live apart; a list that
+forces them to move together undoes it.
+
+So the list moved to `catalog.json` beside the plugins, fetched over HTTPS and
+cached in the plugin store, and the extensions repo's release workflow writes
+each new version, URL and hash itself.
+
+*Three forks, settled.* **Where it is read from** — the extensions repo's
+default branch, so a release is a commit rather than a second publishing step.
+**What happens offline** — every fetch is cached and a failed one falls back to
+that copy saying how old it is; a cold cache with no network is an error naming
+the URL, because nothing else is honest and a path or URL still installs with
+no catalog at all. Nothing is vendored into the binary: a snapshot in this tree
+is the very thing being removed, and one that quietly went stale would be worse
+than an error that says so. **What replaces the compatibility statement** —
+each entry carries `contract` (the WIT world it was built against) and
+`min_drsg` (the oldest host it claims), and several entries may share a name so
+a plugin can keep serving older hosts. An entry this build cannot run is listed
+with the reason rather than filtered out: the wasm loader is the real gate, and
+a plugin that silently vanishes from the list is a support question.
+
+What did *not* move is the hash discipline. The catalog's `sha256` is checked
+on download before the bytes are treated as a component, and the store still
+pins what it installed and re-checks it at every load. Nothing compiles the
+file any more, so the extensions repo's CI took over that job: it validates
+every field and fetches each release's published checksum to confirm the pin.
 ---
 
 ## 12. Scoped identity — shared memory a team can actually run

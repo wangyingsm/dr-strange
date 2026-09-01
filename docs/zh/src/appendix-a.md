@@ -59,7 +59,7 @@
 ## 插件
 
 - **`plugin.list`** · read —— 已安装的预处理插件，与 `drsg plugin list --json` 输出同一种记录。参数：无。
-- **`plugin.catalog`** · read —— 此构建固定的官方目录（发布 URL + SHA-256），是二进制的常量，可与 `plugin.list` 关联比对。参数：无。
+- **`plugin.catalog`** · read —— 官方目录，读取自 extensions 仓库的 `catalog.json` 而非编译进二进制，因此插件发布不需要 drsg 发布。返回 `{stale, schema, source, plugins}`；每个条目带有 `name`、`version`、`claims`、`url`、`sha256` 与 `compat`（`ok`、`needs_host`、`other_contract`），可与 `plugin.list` 关联比对。缓存一小时；`stale: true` 表示抓取失败，返回的是服务端保留的最后一份副本。参数：无。
 - **`plugin.install`** · write —— 从 `http(s)` URL 下载、校验、固定哈希并存入插件（RPC 上拒绝服务器本地路径）。参数：`url` string!。
 - **`plugin.remove`** · write —— 按名称卸载插件。参数：`name` string!。
 

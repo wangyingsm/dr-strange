@@ -8,8 +8,8 @@ build a plugin of your own.
 Four commands take a repository to a queryable, commit-synced graph:
 
 ```console
-# Install parser plugins: no argument opens an interactive chooser over the
-# official catalog (0 = all); or pass any .wasm path or URL directly.
+# Install parser plugins: a name from the official catalog, no argument for
+# an interactive chooser over it (0 = all), or any .wasm path or URL.
 $ drsg plugin install
 
 # Digest a repository into a plane named after it

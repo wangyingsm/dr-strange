@@ -155,8 +155,8 @@ CALLS、REFERENCES、IMPORTS、EXTENDS 等），全程无需模型参与。`serv
 （`synced: commit <sha>`）。
 
 ```console
-# 安装解析器插件：不带参数时打开官方目录的交互式选择器（0 = 全部）；
-# 也可以直接给出任意 .wasm 路径或 URL。
+# 安装解析器插件：可以给出官方目录中的名字；不带参数时打开该目录的交互式
+# 选择器（0 = 全部）；也可以直接给出任意 .wasm 路径或 URL。
 $ drsg plugin install
 
 # 将一个代码仓库图化为一个以其命名的平面
@@ -202,14 +202,17 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `drsg history`（以及同名的 MCP 工具）把它读回来。`--no-git` 可关闭整个阶段，
 `digest` 与 `serve watch` 皆然。
 
-**插件。** `drsg plugin install` 可以安装任何解析器插件——本地 `.wasm` 文件或
-URL——安装时验证其为合法组件并固定其 SHA-256，之后每次加载都会复查。不带参数时
-列出官方目录：八种语言——Rust、Go、TypeScript/JavaScript、Python、Java、C、
-web（HTML/CSS）与 TOML——外加读取仓库历史的 `git`，逐一固定到
+**插件。** `drsg plugin install` 可以安装任何解析器插件——官方插件的名字、本地
+`.wasm` 文件或 URL——安装时验证其为合法组件并固定其 SHA-256，之后每次加载都会
+复查。官方目录覆盖八种语言（Rust、Go、TypeScript/JavaScript、Python、Java、C、
+web（HTML/CSS）、TOML）外加读取仓库历史的 `git`，它以 `catalog.json` 的形式放在
 [dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension)
-仓库的发布标签（[最新发布](https://github.com/wangyingsm/dr-strange-extension/releases)）。
-同一仓库也承载插件 SDK：解析器契约是一份公开的 WIT 接口，社区据此构建的解析器
-与官方插件以完全相同的方式安装、在完全相同的沙箱中运行。
+仓库（[最新发布](https://github.com/wangyingsm/dr-strange-extension/releases)），
+而非编译进这个二进制——因此插件发布不需要 drsg 发布。每个条目固定制品哈希并在下载
+时校验，同时说明自己面向哪些宿主；本构建无法运行的条目会连同原因一起列出，而不是
+被隐藏。`drsg plugin list --available` 会打印目录并标注本地安装状态。同一仓库也
+承载插件 SDK：解析器契约是一份公开的 WIT 接口，社区据此构建的解析器与官方插件以
+完全相同的方式安装、在完全相同的沙箱中运行。
 
 **对比表现。** 在与 ripgrep 工作流以及两款开源代码图 MCP 工具的智能体任务基准
 中，drsg 完成了每一种任务形态——调用者、影响面、调用链与复合审计——每项任务只需
