@@ -4,19 +4,46 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-- **`--no-default-features` builds the CLI again.** It had not compiled for
-  several releases: the `digest` feature gates `DigestArgs`, `commands::digest`
-  and `config::plugin_config`, but not the `Command::Digest` match arm that
-  calls them, nor two plugin-store helpers, nor a `PropDesc`/`PropValue` import
-  only gated code used. Gated now — and `[plugins]` in `drsg.toml` still
-  *parses* in a build with no plugin host, because one config file is shared by
-  every binary an operator runs and rejecting a section this build merely has
-  no use for would make that file un-shareable.
+## [2.3.0] - 2026-09-01
 
 ### Added
+
+- **`drsg update`.** Asks GitHub for the newest release — through the
+  `releases/latest` redirect rather than the rate-limited API, as
+  `scripts/install.sh` does — and, when this build is behind it, `exec`s the
+  same `curl … | sh` a first install runs. It hands over rather than
+  reimplementing the download: the installer already gets the target triple,
+  the checksum and the atomic replace right, and a second installer would only
+  ever be exercised by people upgrading. `exec` rather than spawn because the
+  file this process was loaded from is about to be overwritten, and a parent
+  waiting to print "done" would be waiting inside it.
+
+  The installer is pointed at the directory the running binary is in, not its
+  own `~/.local/bin` default — an upgrade has to replace the copy on the
+  `PATH`, not add a newer one elsewhere and leave the old one being run.
+  `--dir` overrides it, `--bin all` takes `drsg-mcp` along. A build *newer*
+  than the latest release is told it is ahead and nothing is installed, so
+  `update` never moves anyone backwards; on Windows nothing runs at all,
+  because the executable is locked while running, and the command to paste is
+  printed instead.
+
+- **`drsg plugin install <name>`.** A bare word is now looked up in the
+  official catalog — `drsg plugin install rust` — rather than read as a
+  filename. Paths and URLs are unchanged, and the interactive chooser takes a
+  name as well as a number.
+
+- **`drsg plugin list --available`.** The catalog as a table, each entry tagged
+  `[installed]`/`[upgradable]` against the local store, with `--json` for
+  agents. The same information the interactive installer shows, without the
+  prompt.
+
+- **The catalog is cached beside the installed plugins**, so an offline
+  `drsg plugin install` still lists it and says how old the copy is. With no
+  cache and no network it fails naming the URL and the way around it — a path
+  or a URL needs no catalog. Nothing is vendored into the binary: a snapshot in
+  this tree is the thing being removed, and one that went stale silently would
+  be worse than an error that says so.
+
 - **A `features` CI job, and `just gate-features` beside it.** The `rust` job
   builds exactly one configuration — all defaults — so everything this project
   documents as optional was unbuilt by CI, and a missing `#[cfg]` stayed
@@ -56,40 +83,15 @@ All notable changes to Dr Strange are documented here. The format is based on
   fails; `stale: true` says so, and the dashboard's Extensions panel prints a
   line when it is showing an older copy. Regenerated in every SDK.
 
-### Added
-- **`drsg update`.** Asks GitHub for the newest release — through the
-  `releases/latest` redirect rather than the rate-limited API, as
-  `scripts/install.sh` does — and, when this build is behind it, `exec`s the
-  same `curl … | sh` a first install runs. It hands over rather than
-  reimplementing the download: the installer already gets the target triple,
-  the checksum and the atomic replace right, and a second installer would only
-  ever be exercised by people upgrading. `exec` rather than spawn because the
-  file this process was loaded from is about to be overwritten, and a parent
-  waiting to print "done" would be waiting inside it.
-
-  The installer is pointed at the directory the running binary is in, not its
-  own `~/.local/bin` default — an upgrade has to replace the copy on the
-  `PATH`, not add a newer one elsewhere and leave the old one being run.
-  `--dir` overrides it, `--bin all` takes `drsg-mcp` along. A build *newer*
-  than the latest release is told it is ahead and nothing is installed, so
-  `update` never moves anyone backwards; on Windows nothing runs at all,
-  because the executable is locked while running, and the command to paste is
-  printed instead.
-
-- **`drsg plugin install <name>`.** A bare word is now looked up in the
-  official catalog — `drsg plugin install rust` — rather than read as a
-  filename. Paths and URLs are unchanged, and the interactive chooser takes a
-  name as well as a number.
-- **`drsg plugin list --available`.** The catalog as a table, each entry tagged
-  `[installed]`/`[upgradable]` against the local store, with `--json` for
-  agents. The same information the interactive installer shows, without the
-  prompt.
-- **The catalog is cached beside the installed plugins**, so an offline
-  `drsg plugin install` still lists it and says how old the copy is. With no
-  cache and no network it fails naming the URL and the way around it — a path
-  or a URL needs no catalog. Nothing is vendored into the binary: a snapshot in
-  this tree is the thing being removed, and one that went stale silently would
-  be worse than an error that says so.
+### Fixed
+- **`--no-default-features` builds the CLI again.** It had not compiled for
+  several releases: the `digest` feature gates `DigestArgs`, `commands::digest`
+  and `config::plugin_config`, but not the `Command::Digest` match arm that
+  calls them, nor two plugin-store helpers, nor a `PropDesc`/`PropValue` import
+  only gated code used. Gated now — and `[plugins]` in `drsg.toml` still
+  *parses* in a build with no plugin host, because one config file is shared by
+  every binary an operator runs and rejecting a section this build merely has
+  no use for would make that file un-shareable.
 
 ## [2.2.1] - 2026-08-28
 

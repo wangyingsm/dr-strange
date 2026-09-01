@@ -124,7 +124,7 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 
 ```console
 $ drsg update
-drsg 2.2.1 is the latest release — nothing to do
+drsg 2.3.0 is the latest release — nothing to do
 ```
 
 其他方式：容器镜像 `ghcr.io/wangyingsm/dr-strange:latest`，或
