@@ -15,7 +15,7 @@
 
 use ahash::{AHashMap, AHashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,7 +23,8 @@ use std::time::Instant;
 use crate::cache::GraphReader;
 use crate::compute::expr::{self, BindingNeed, Expr};
 use crate::compute::plan::{
-    Algo, LogicalPlan, NodeRef, Projection, SortKey, Source, Step, TupleSortKey,
+    Agg, AggFunc, Algo, LogicalPlan, NodeRef, ProjExpr, ProjItem, Projection, SortKey, Source,
+    Step, TupleSortKey,
 };
 use crate::compute::{algo, hybrid};
 use crate::error::Error;
@@ -772,9 +773,10 @@ pub struct Table {
 /// Run `plan` and project its rows into a [`Table`] (arch/03 §2's `Project`).
 ///
 /// Materializing, where [`execute`] streams: a projection is a barrier.
-/// `DISTINCT` cannot pass a tuple without having seen every earlier one, and
-/// `ORDER BY` cannot yield the first before it has them all — after which
-/// `skip`/`limit` count *tuples*, so neither can run any earlier either.
+/// `DISTINCT` cannot pass a tuple without having seen every earlier one,
+/// `ORDER BY` cannot yield the first before it has them all, an aggregate is
+/// not finished until the group is — and `skip`/`limit` count what those
+/// produced, so none of it can run any earlier.
 ///
 /// A plan carrying no projection has no columns, so each of its rows projects
 /// to the empty tuple. Rows still count; ask [`execute`] for the nodes.
@@ -790,19 +792,16 @@ pub fn execute_table(
     let empty = Projection::default();
     let proj = plan.project.as_ref().unwrap_or(&empty);
     let need = plan.binding_need();
+    let rows = execute_with(plan, reader, deadline)?;
 
-    let mut rows: Vec<Vec<PropValue>> = Vec::new();
-    let mut seen: BTreeSet<TupleKey> = BTreeSet::new();
-    for r in execute_with(plan, reader, deadline)? {
-        let row = r?;
-        let tuple = row_values(reader, &row, proj.items.iter().map(|i| &i.expr), &need)?;
-        // The clone buys the set its own copy of a *kept* tuple only; a
-        // duplicate is dropped without ever reaching `rows`.
-        if proj.distinct && !seen.insert(TupleKey(tuple.clone())) {
-            continue;
-        }
-        rows.push(tuple);
-    }
+    let mut rows = match proj
+        .items
+        .iter()
+        .any(|i| matches!(i.expr, ProjExpr::Agg(_)))
+    {
+        true => grouped_tuples(reader, rows, proj, &need)?,
+        false => row_tuples(reader, rows, proj, &need)?,
+    };
     if !proj.order_by.is_empty() {
         rows.sort_by(|a, b| cmp_columns(a, b, &proj.order_by));
     }
@@ -816,6 +815,292 @@ pub fn execute_table(
         columns: proj.items.iter().map(|i| i.name.clone()).collect(),
         rows,
     })
+}
+
+/// One tuple per row — the projection that doesn't aggregate.
+fn row_tuples(
+    reader: &dyn GraphReader,
+    rows: RowIter<'_>,
+    proj: &Projection,
+    need: &BindingNeed,
+) -> Result<Vec<Vec<PropValue>>> {
+    let exprs = value_exprs(proj);
+    let mut out: Vec<Vec<PropValue>> = Vec::new();
+    let mut seen: BTreeSet<TupleKey> = BTreeSet::new();
+    for r in rows {
+        let tuple = row_values(reader, &r?, exprs.iter().copied(), need)?;
+        // The clone buys the set its own copy of a *kept* tuple only; a
+        // duplicate is dropped without ever reaching `out`.
+        if proj.distinct && !seen.insert(TupleKey(tuple.clone())) {
+            continue;
+        }
+        out.push(tuple);
+    }
+    Ok(out)
+}
+
+/// One tuple per group — the projection that aggregates.
+///
+/// The group key is every non-aggregate column, which is Cypher's implicit
+/// `GROUP BY` and the only reading that cannot disagree with the query: a
+/// projection with no key column at all is one group over the whole stream,
+/// so `RETURN count(*)` answers with one number even when nothing matched.
+///
+/// Groups come out in first-appearance order — the pipeline's own order,
+/// which a `Sort` step upstream can therefore still steer. `ORDER BY` on the
+/// tail overrides it, as it does anywhere else.
+///
+/// [`Projection::distinct`] is not applied here: group keys are distinct by
+/// construction, and an aggregate column cannot make two of them collide.
+fn grouped_tuples(
+    reader: &dyn GraphReader,
+    rows: RowIter<'_>,
+    proj: &Projection,
+    need: &BindingNeed,
+) -> Result<Vec<Vec<PropValue>>> {
+    let exprs = value_exprs(proj);
+    // Where each item reads its per-row value from, once per plan: a key or an
+    // aggregate's argument indexes into the evaluated slice; `count(*)` reads
+    // nothing at all.
+    let slots: Vec<Option<usize>> = {
+        let mut next = 0;
+        proj.items
+            .iter()
+            .map(|item| match &item.expr {
+                ProjExpr::Value(_) | ProjExpr::Agg(Agg { arg: Some(_), .. }) => {
+                    next += 1;
+                    Some(next - 1)
+                }
+                ProjExpr::Agg(_) => None,
+            })
+            .collect()
+    };
+
+    let mut groups: Vec<Vec<Acc>> = Vec::new();
+    let mut at: BTreeMap<TupleKey, usize> = BTreeMap::new();
+    for r in rows {
+        let vals = row_values(reader, &r?, exprs.iter().copied(), need)?;
+        let key = TupleKey(
+            proj.items
+                .iter()
+                .zip(&slots)
+                .filter(|(item, _)| matches!(item.expr, ProjExpr::Value(_)))
+                .map(|(_, slot)| vals[slot.expect("a key column reads a value")].clone())
+                .collect(),
+        );
+        let group = match at.get(&key) {
+            Some(&i) => i,
+            None => {
+                groups.push(proj.items.iter().map(Acc::for_item).collect());
+                at.insert(key, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        for ((acc, item), slot) in groups[group].iter_mut().zip(&proj.items).zip(&slots) {
+            if matches!(item.expr, ProjExpr::Agg(_)) {
+                acc.take(slot.map(|i| &vals[i]));
+            }
+        }
+    }
+
+    // No rows and nothing to group by is still one group: `count(*)` over an
+    // empty match is 0, not silence. With a key column there is genuinely
+    // nothing to report — no key, no group.
+    if groups.is_empty()
+        && proj
+            .items
+            .iter()
+            .all(|i| matches!(i.expr, ProjExpr::Agg(_)))
+    {
+        groups.push(proj.items.iter().map(Acc::for_item).collect());
+        at.insert(TupleKey(Vec::new()), 0);
+    }
+
+    // Undo the map's ordering: `at` holds each key's group index, so walking
+    // the groups in index order is walking them in first-appearance order.
+    let mut keyed: Vec<(usize, Vec<PropValue>)> = at.into_iter().map(|(k, i)| (i, k.0)).collect();
+    keyed.sort_unstable_by_key(|(i, _)| *i);
+    Ok(keyed
+        .into_iter()
+        .zip(groups)
+        .map(|((_, key), accs)| {
+            let mut key = key.into_iter();
+            accs.into_iter()
+                .map(|acc| match acc {
+                    Acc::Key => key.next().unwrap_or(PropValue::Null),
+                    acc => acc.finish(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// Every expression a projection evaluates per row, in item order: a key
+/// column's, an aggregate's argument, and nothing for `count(*)`.
+fn value_exprs(proj: &Projection) -> Vec<&Expr> {
+    proj.items
+        .iter()
+        .filter_map(|item| match &item.expr {
+            ProjExpr::Value(e) => Some(e),
+            ProjExpr::Agg(agg) => agg.arg.as_ref(),
+        })
+        .collect()
+}
+
+/// One column's running state within a group.
+///
+/// `Key` is the non-aggregate column, which accumulates nothing — the group's
+/// key already holds its value, and carrying a placeholder here is what keeps
+/// a group's columns in the query's order without a second index.
+enum Acc {
+    Key,
+    Count(i64),
+    /// Kept exact while every value is an integer, and demoted to `f64` by the
+    /// first float — so a sum over ints is an `Int` and never silently rounds
+    /// past 2⁵³.
+    Sum {
+        ints: i64,
+        floats: f64,
+        floated: bool,
+    },
+    Avg {
+        total: f64,
+        n: u64,
+    },
+    Min(Option<PropValue>),
+    Max(Option<PropValue>),
+    Collect(Vec<PropValue>),
+    /// A `DISTINCT` aggregate: the values already folded, wrapping the fold
+    /// itself.
+    Distinct(BTreeSet<TupleKey>, Box<Acc>),
+}
+
+impl Acc {
+    fn for_item(item: &ProjItem) -> Acc {
+        let ProjExpr::Agg(agg) = &item.expr else {
+            return Acc::Key;
+        };
+        let acc = match agg.func {
+            AggFunc::Count => Acc::Count(0),
+            AggFunc::Sum => Acc::Sum {
+                ints: 0,
+                floats: 0.0,
+                floated: false,
+            },
+            AggFunc::Avg => Acc::Avg { total: 0.0, n: 0 },
+            AggFunc::Min => Acc::Min(None),
+            AggFunc::Max => Acc::Max(None),
+            AggFunc::Collect => Acc::Collect(Vec::new()),
+        };
+        // `count(*)` reads no value, so there is nothing for DISTINCT to be
+        // distinct about; it counts rows either way.
+        match agg.distinct && agg.arg.is_some() {
+            true => Acc::Distinct(BTreeSet::new(), Box::new(acc)),
+            false => acc,
+        }
+    }
+
+    /// Fold one row into this column. `value` is the row's value for the
+    /// aggregate's argument, or `None` for `count(*)`'s missing one — which
+    /// fold to perform is already in the variant.
+    ///
+    /// Null is skipped — a group is what its rows *have*, not what they lack —
+    /// except by `count(*)`, which is counting the rows themselves.
+    fn take(&mut self, value: Option<&PropValue>) {
+        if let Acc::Distinct(seen, inner) = self {
+            let Some(value) = value else { return };
+            if !seen.insert(TupleKey(vec![value.clone()])) {
+                return;
+            }
+            return inner.take(Some(value));
+        }
+        let value = match value {
+            // `count(*)`: no value to read, and the row still counts.
+            None => {
+                if let Acc::Count(n) = self {
+                    *n += 1;
+                }
+                return;
+            }
+            Some(PropValue::Null) => return,
+            Some(v) => v,
+        };
+        match self {
+            Acc::Key | Acc::Distinct(..) => {}
+            Acc::Count(n) => *n += 1,
+            Acc::Sum {
+                ints,
+                floats,
+                floated,
+            } => match value {
+                PropValue::Int(i) => *ints = ints.saturating_add(*i),
+                PropValue::Float(f) => {
+                    *floated = true;
+                    *floats += f;
+                }
+                // Not a number: skipped, like a null. A sum over a plane where
+                // one node stored its year as text still answers for the rest.
+                _ => {}
+            },
+            Acc::Avg { total, n } => {
+                if let Some(x) = numeric(value) {
+                    *total += x;
+                    *n += 1;
+                }
+            }
+            Acc::Min(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|b| expr::total_cmp(value, b).is_lt())
+                {
+                    *best = Some(value.clone());
+                }
+            }
+            Acc::Max(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|b| expr::total_cmp(value, b).is_gt())
+                {
+                    *best = Some(value.clone());
+                }
+            }
+            Acc::Collect(items) => items.push(value.clone()),
+        }
+    }
+
+    /// The group's value for this column.
+    fn finish(self) -> PropValue {
+        match self {
+            Acc::Key => PropValue::Null,
+            Acc::Count(n) => PropValue::Int(n),
+            Acc::Sum {
+                ints,
+                floats,
+                floated,
+            } => match floated {
+                true => PropValue::Float(ints as f64 + floats),
+                false => PropValue::Int(ints),
+            },
+            // The mean of nothing is unanswerable, where the sum of nothing is
+            // zero — the one place these two folds part ways.
+            Acc::Avg { total, n } => match n {
+                0 => PropValue::Null,
+                n => PropValue::Float(total / n as f64),
+            },
+            Acc::Min(v) | Acc::Max(v) => v.unwrap_or(PropValue::Null),
+            Acc::Collect(items) => PropValue::List(items),
+            Acc::Distinct(_, inner) => inner.finish(),
+        }
+    }
+}
+
+/// A value as an `f64` for the numeric folds, or `None` when it isn't one.
+fn numeric(value: &PropValue) -> Option<f64> {
+    match value {
+        PropValue::Int(i) => Some(*i as f64),
+        PropValue::Float(f) => Some(*f),
+        _ => None,
+    }
 }
 
 /// A projected tuple used as a set key — what `DISTINCT` compares by.
@@ -944,7 +1229,7 @@ mod tests {
     use super::*;
     use crate::cache::UncachedReader;
     use crate::compute::expr::{at_edge, at_node, edge_dir, edge_type, ep, has_label, p};
-    use crate::compute::plan::{ProjItem, SortKey};
+    use crate::compute::plan::{Agg, AggFunc, ProjItem, SortKey};
     use crate::storage::engine::{StorageEngine, WriteTransaction};
     use crate::storage::graph;
     use crate::storage::memory::MemoryEngine;
@@ -1016,10 +1301,7 @@ mod tests {
     fn projection_tail_distinct_orders_and_slices_tuples() {
         let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
         plan.project = Some(Projection {
-            items: vec![ProjItem {
-                name: "year".into(),
-                expr: p("year"),
-            }],
+            items: vec![ProjItem::value("year", p("year"))],
             distinct: true,
             order_by: vec![TupleSortKey {
                 column: 0,
@@ -1050,16 +1332,212 @@ mod tests {
         assert!(run_table(three_years, &plan).rows.is_empty());
     }
 
+    /// A projection of `items` over a graph of `Paper` nodes.
+    fn agg_plan(items: Vec<ProjItem>) -> LogicalPlan {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items,
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// Papers with the years given, `None` writing no year property at all.
+    fn papers(years: Vec<Option<PropValue>>) -> impl FnOnce(&mut dyn WriteTransaction) {
+        move |txn| {
+            for year in &years {
+                let props = match year {
+                    Some(v) => props(&[("year", v.clone())]),
+                    None => Properties::new(),
+                };
+                graph::create_node(txn, PlaneId::STARTUP, &["Paper"], &props).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn aggregates_group_by_every_column_that_is_not_one() {
+        // Three papers, two of them from 2019: grouping is by `year` alone,
+        // because that is the only column that isn't an aggregate.
+        let plan = agg_plan(vec![
+            ProjItem::value("year", p("year")),
+            ProjItem::agg("n", Agg::count()),
+        ]);
+        let table = run_table(three_years, &plan);
+        assert_eq!(table.columns, vec!["year", "n"]);
+        // First-appearance order: 2021 was written first.
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![PropValue::Int(2021), PropValue::Int(1)],
+                vec![PropValue::Int(2019), PropValue::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_aggregate_with_no_key_column_is_one_group_over_everything() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("n", Agg::count()),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year"))),
+            ProjItem::agg(
+                "distinct_years",
+                Agg::of(AggFunc::Count, p("year")).distinct(),
+            ),
+        ]);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![
+                PropValue::Int(3),
+                PropValue::Int(2021 + 2019 + 2019),
+                PropValue::Int(2),
+            ]]
+        );
+
+        // And it still answers over a match that found nothing — a count of
+        // no rows is 0, not an empty table.
+        assert_eq!(
+            run_table(|_| {}, &plan).rows,
+            vec![vec![
+                PropValue::Int(0),
+                PropValue::Int(0),
+                PropValue::Int(0)
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_group_is_what_its_rows_have_not_what_they_lack() {
+        // Two papers carry a year, one doesn't, one stored it as text.
+        let rows = papers(vec![
+            Some(PropValue::Int(2020)),
+            None,
+            Some(PropValue::Str("2019".into())),
+            Some(PropValue::Float(2022.0)),
+        ]);
+        let plan = agg_plan(vec![
+            ProjItem::agg("rows", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Count, p("year"))),
+            ProjItem::agg("avg", Agg::of(AggFunc::Avg, p("year"))),
+            ProjItem::agg("min", Agg::of(AggFunc::Min, p("year"))),
+            ProjItem::agg("collected", Agg::of(AggFunc::Collect, p("year"))),
+        ]);
+        let table = run_table(rows, &plan);
+        assert_eq!(
+            table.rows[0],
+            vec![
+                // `count(*)` counts rows, including the one with no year;
+                // `count(n.year)` counts the three that have one, text and all.
+                PropValue::Int(4),
+                PropValue::Int(3),
+                // The mean skips the value it cannot read, and reports the two
+                // it can, rather than failing the query over one odd node.
+                PropValue::Float(2021.0),
+                // Under the total order a string sorts past every number.
+                PropValue::Int(2020),
+                PropValue::List(vec![
+                    PropValue::Int(2020),
+                    PropValue::Str("2019".into()),
+                    PropValue::Float(2022.0),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn folds_over_nothing_answer_zero_or_null_and_each_is_the_honest_one() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("count", Agg::of(AggFunc::Count, p("year"))),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year"))),
+            ProjItem::agg("avg", Agg::of(AggFunc::Avg, p("year"))),
+            ProjItem::agg("min", Agg::of(AggFunc::Min, p("year"))),
+            ProjItem::agg("max", Agg::of(AggFunc::Max, p("year"))),
+            ProjItem::agg("collect", Agg::of(AggFunc::Collect, p("year"))),
+        ]);
+        // One row, no year on it: every fold sees nothing.
+        assert_eq!(
+            run_table(papers(vec![None]), &plan).rows,
+            vec![vec![
+                PropValue::Int(0),
+                PropValue::Int(0),
+                // A mean of nothing is unanswerable where a sum of nothing is
+                // zero; min/max likewise have nothing to name.
+                PropValue::Null,
+                PropValue::Null,
+                PropValue::Null,
+                PropValue::List(vec![]),
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_sum_stays_exact_until_a_float_joins_it() {
+        // Past 2⁵³ an f64 accumulator would round; the int path doesn't.
+        let big = 9_007_199_254_740_993;
+        let plan = agg_plan(vec![ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year")))]);
+        assert_eq!(
+            run_table(
+                papers(vec![Some(PropValue::Int(big)), Some(PropValue::Int(0))]),
+                &plan
+            )
+            .rows,
+            vec![vec![PropValue::Int(big)]]
+        );
+        // One float demotes the whole fold, which is the only way to add them.
+        assert_eq!(
+            run_table(
+                papers(vec![Some(PropValue::Int(1)), Some(PropValue::Float(0.5))]),
+                &plan
+            )
+            .rows,
+            vec![vec![PropValue::Float(1.5)]]
+        );
+    }
+
+    #[test]
+    fn distinct_inside_an_aggregate_folds_each_value_once() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year")).distinct()),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year")).distinct()),
+            // `count(*)` reads no value, so DISTINCT says nothing about it.
+            ProjItem::agg("rows", Agg::count().distinct()),
+        ]);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![
+                PropValue::List(vec![PropValue::Int(2021), PropValue::Int(2019)]),
+                PropValue::Int(2021 + 2019),
+                PropValue::Int(3),
+            ]]
+        );
+    }
+
+    #[test]
+    fn the_tail_orders_and_slices_groups_like_any_other_tuples() {
+        let mut plan = agg_plan(vec![
+            ProjItem::value("year", p("year")),
+            ProjItem::agg("n", Agg::count()),
+        ]);
+        let proj = plan.project.as_mut().unwrap();
+        proj.order_by = vec![TupleSortKey {
+            column: 1,
+            descending: true,
+        }];
+        proj.limit = Some(1);
+        // Ordering by the *aggregate* column: the busiest year, not the first.
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![PropValue::Int(2019), PropValue::Int(2)]]
+        );
+    }
+
     #[test]
     fn ordering_by_a_column_that_is_not_there_sorts_rather_than_fails() {
         // Totality, as everywhere else here: an out-of-range column reads as
         // Null for every tuple, so the ordering is simply a no-op.
         let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
         plan.project = Some(Projection {
-            items: vec![ProjItem {
-                name: "year".into(),
-                expr: p("year"),
-            }],
+            items: vec![ProjItem::value("year", p("year"))],
             order_by: vec![TupleSortKey {
                 column: 7,
                 descending: false,

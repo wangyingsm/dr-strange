@@ -3,8 +3,8 @@
 //! checking `Filter` against a naive model.
 
 use dr_strange_core::{
-    Database, Dir, NodeId, ProjItem, PropValue, Properties, SortKey, TupleSortKey, edge_type,
-    has_label, p,
+    Agg, AggFunc, Database, Dir, NodeId, ProjItem, PropValue, Properties, SortKey, TupleSortKey,
+    at_node, edge_type, external_key, has_label, p,
 };
 use proptest::prelude::*;
 
@@ -206,14 +206,8 @@ fn run_query_suite(db: &Database) {
         .query()
         .scan_label("Paper")
         .project([
-            ProjItem {
-                name: "year".into(),
-                expr: p("year"),
-            },
-            ProjItem {
-                name: "recent".into(),
-                expr: p("year").ge(2020),
-            },
+            ProjItem::value("year", p("year")),
+            ProjItem::value("recent", p("year").ge(2020)),
         ])
         .order_by_columns([TupleSortKey {
             column: 0,
@@ -282,10 +276,7 @@ fn projection_tail_operators_count_tuples_not_nodes() {
         .query()
         .seek_keys(["p1"])
         .expand_out("CITES")
-        .project([ProjItem {
-            name: "type(r)".into(),
-            expr: edge_type(),
-        }])
+        .project([ProjItem::value("type(r)", edge_type())])
         .project_distinct()
         .table()
         .unwrap();
@@ -296,10 +287,7 @@ fn projection_tail_operators_count_tuples_not_nodes() {
     let table = plane
         .query()
         .scan_label("Paper")
-        .project([ProjItem {
-            name: "y".into(),
-            expr: p("year"),
-        }])
+        .project([ProjItem::value("y", p("year"))])
         .order_by_columns([TupleSortKey {
             column: 0,
             descending: true,
@@ -309,6 +297,58 @@ fn projection_tail_operators_count_tuples_not_nodes() {
         .table()
         .unwrap();
     assert_eq!(table.rows, vec![vec![PropValue::Int(2020)]]);
+}
+
+#[test]
+fn aggregates_fold_the_rows_of_each_group() {
+    let db = Database::in_memory().unwrap();
+    build_fixture(&db);
+    let plane = db.plane("startup").unwrap();
+
+    // "How many papers does each paper cite, and which years?" — one query,
+    // grouped by a binding the row passed through rather than the node it
+    // ended on. p1 cites p2(2019) and p3(2021); p2 cites p3.
+    let table = plane
+        .query()
+        .scan_label("Paper")
+        .expand_out("CITES")
+        .project([
+            ProjItem::value("citer", at_node(0, external_key())),
+            ProjItem::agg("cites", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year"))),
+        ])
+        .order_by_columns([TupleSortKey {
+            column: 0,
+            descending: false,
+        }])
+        .table()
+        .unwrap();
+    assert_eq!(table.columns, vec!["citer", "cites", "years"]);
+    assert_eq!(
+        table.rows,
+        vec![
+            vec![
+                PropValue::Str("p1".into()),
+                PropValue::Int(2),
+                PropValue::List(vec![PropValue::Int(2019), PropValue::Int(2021)]),
+            ],
+            vec![
+                PropValue::Str("p2".into()),
+                PropValue::Int(1),
+                PropValue::List(vec![PropValue::Int(2021)]),
+            ],
+        ]
+    );
+
+    // Nothing to group by is one group over the whole match — and it answers
+    // even when the match is empty.
+    let table = plane
+        .query()
+        .scan_label("Ghost")
+        .project([ProjItem::agg("n", Agg::count())])
+        .table()
+        .unwrap();
+    assert_eq!(table.rows, vec![vec![PropValue::Int(0)]]);
 }
 
 #[test]
@@ -335,10 +375,7 @@ fn built_plan_is_serde_roundtrippable() {
         .filter(p("year").ge(2020))
         .sort_desc(p("year"))
         .limit(5)
-        .project([ProjItem {
-            name: "year".into(),
-            expr: p("year"),
-        }])
+        .project([ProjItem::value("year", p("year"))])
         .project_distinct()
         .order_by_columns([TupleSortKey {
             column: 0,

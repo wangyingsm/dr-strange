@@ -160,15 +160,120 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// One projected column: a name and the expression behind it.
+/// One projected column: a name and what it computes.
 ///
 /// The name is what the caller sees as a table header, so it carries the
 /// query's own wording — an alias when one was written, otherwise the item's
-/// source text (`n.name`, `type(r)`).
+/// source text (`n.name`, `count(*)`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjItem {
     pub name: String,
-    pub expr: Expr,
+    pub expr: ProjExpr,
+}
+
+impl ProjItem {
+    /// A column reading one value per row — `RETURN n.year`.
+    pub fn value(name: impl Into<String>, expr: Expr) -> Self {
+        Self {
+            name: name.into(),
+            expr: ProjExpr::Value(expr),
+        }
+    }
+
+    /// A column folding a group of rows into one value — `RETURN count(*)`.
+    pub fn agg(name: impl Into<String>, agg: Agg) -> Self {
+        Self {
+            name: name.into(),
+            expr: ProjExpr::Agg(agg),
+        }
+    }
+}
+
+/// What a projected column computes: a value per row, or an aggregate over a
+/// group of them.
+///
+/// Two cases rather than an [`Expr`] variant, because an aggregate is not a
+/// value a row has: it is a fold over rows, and it only means anything in a
+/// projection. Keeping it out of `Expr` is what makes `WHERE count(*) > 3`
+/// unwritable instead of silently `Null` — the same reason [`Projection`] is
+/// a tail rather than a [`Step`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ProjExpr {
+    /// One value per row — and, the moment any *other* column aggregates,
+    /// also a grouping key. Cypher's implicit `GROUP BY`: what a query lists
+    /// beside its aggregates is what it wants them broken down by, so making
+    /// it explicit would only add a way to disagree with itself.
+    Value(Expr),
+    Agg(Agg),
+}
+
+/// An aggregate over the rows of one group.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Agg {
+    pub func: AggFunc,
+    /// The expression folded, evaluated per row. `None` is `count(*)`: the
+    /// one aggregate that still has something to count — rows — when there is
+    /// no expression to read.
+    pub arg: Option<Expr>,
+    /// Fold each distinct value once — `count(DISTINCT n.file)`. Distinctness
+    /// is by the same total order [`Projection::distinct`] uses.
+    pub distinct: bool,
+}
+
+impl Agg {
+    /// `count(*)` — rows in the group, the one aggregate that counts rows
+    /// rather than values, so a row with nothing but nulls still counts.
+    pub fn count() -> Self {
+        Self {
+            func: AggFunc::Count,
+            arg: None,
+            distinct: false,
+        }
+    }
+
+    /// `func(expr)` — folded over the group's non-null values of `expr`.
+    pub fn of(func: AggFunc, expr: Expr) -> Self {
+        Self {
+            func,
+            arg: Some(expr),
+            distinct: false,
+        }
+    }
+
+    /// Fold each distinct value once. On `count(*)`, which reads no value,
+    /// this says nothing and changes nothing.
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+}
+
+/// Which fold an [`Agg`] performs.
+///
+/// Each is **total**, like every other evaluation here: nulls are skipped
+/// rather than poisoning the group, and a value the fold cannot use (a string
+/// under `sum`) is skipped the same way, so an aggregate over soft-schema
+/// data reports what it could read instead of failing the query. What each
+/// returns for a group that gave it nothing is the one place they differ, and
+/// each answer is the honest one — see [`crate::compute::exec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFunc {
+    /// How many — rows for `count(*)`, non-null values otherwise. `0` when
+    /// there were none, which is a real answer rather than an absent one.
+    Count,
+    /// Numeric total; `0` over nothing, for the same reason. Stays exact
+    /// (`Int`) while every value is an integer.
+    Sum,
+    /// Numeric mean as a `Float`, and `Null` over nothing — unlike a sum,
+    /// the mean of no values is not zero, it is unanswerable.
+    Avg,
+    /// Least value under the total order, `Null` over nothing.
+    Min,
+    /// Greatest value under the total order, `Null` over nothing.
+    Max,
+    /// Every non-null value as a `List`, in the order the rows arrived —
+    /// which is how a group keeps its members instead of just counting them.
+    Collect,
 }
 
 /// Ordering over projected tuples, by **column index** rather than expression.
@@ -252,7 +357,10 @@ impl LogicalPlan {
             }
         }
         for item in self.project.iter().flat_map(|p| &p.items) {
-            need.add(&item.expr);
+            match &item.expr {
+                ProjExpr::Value(e) => need.add(e),
+                ProjExpr::Agg(agg) => agg.arg.iter().for_each(|e| need.add(e)),
+            }
         }
         need
     }
@@ -326,10 +434,11 @@ mod tests {
         assert_eq!(plan, serde_json::from_str::<LogicalPlan>(&json).unwrap());
 
         plan.project = Some(Projection {
-            items: vec![ProjItem {
-                name: "year".into(),
-                expr: p("year"),
-            }],
+            items: vec![
+                ProjItem::value("year", p("year")),
+                ProjItem::agg("papers", Agg::count()),
+                ProjItem::agg("files", Agg::of(AggFunc::Collect, p("file")).distinct()),
+            ],
             distinct: true,
             order_by: vec![TupleSortKey {
                 column: 0,

@@ -30,5 +30,6 @@ pub use hybrid::{
     GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, VectorChannel,
 };
 pub use plan::{
-    Algo, LogicalPlan, NodeRef, ProjItem, Projection, SortKey, Source, Step, TupleSortKey,
+    Agg, AggFunc, Algo, LogicalPlan, NodeRef, ProjExpr, ProjItem, Projection, SortKey, Source,
+    Step, TupleSortKey,
 };

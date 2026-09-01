@@ -13,7 +13,9 @@ not the named-multi-variable form — though a row's *earlier* bindings are
 addressable (`Expr::At`), since the trail was carrying them all along.
 `Project` is both an API terminal (`select`) and a tail on the plan itself
 (`LogicalPlan::project`): a projection turns node rows into value rows, so it
-ends the pipeline rather than sitting inside it as a `Step`.
+ends the pipeline rather than sitting inside it as a `Step`. The tail also
+**aggregates** (`count`/`sum`/`avg`/`min`/`max`/`collect`), grouping by every
+column that isn't an aggregate — Cypher's implicit `GROUP BY`.
 
 **M3 landed** the AI-native surface: the hybrid operators of §4 —
 `Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed
