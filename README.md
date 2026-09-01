@@ -74,7 +74,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 | **Change feed** | subscribe to a plane and receive mutations live |
 | **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — 8 official languages, an SDK for community parsers |
 | **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
-| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
+| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet` — one round trip each |
 | **Backup / restore** | consistent, id-faithful whole-database snapshots |
 | **Read-only replicas** | `serve --follow` mirrors a running server for read-scaling across a cluster |
 | **Interfaces** | a web UI, six language SDKs, a CLI, and an MCP server speaking the agent verbs |
@@ -237,8 +237,8 @@ Once per repository, then again whenever the server is gone. Pinning `addr`
 and `token` under `[server]` in `drsg.toml` keeps the endpoint byte-identical
 across restarts even if the recorded port is taken by then.
 
-Seven verbs answer an agent's questions, one round trip each, as compact
-one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are
+Eight verbs answer an agent's questions, one round trip each, as compact
+one-fact-per-line text. All eight are MCP tools on `drsg serve`; six are
 also CLI subcommands (`grep` and `snippet` read the watched source tree, so
 they live with the server).
 
@@ -250,6 +250,7 @@ they live with the server).
 | `grep` | literal text over the watched source tree, bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
+| `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | one symbol's source text |
 | `history` | the repository behind the code: HEAD, branches, tags, rebases and the newest commits |
 

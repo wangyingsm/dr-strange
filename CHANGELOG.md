@@ -41,6 +41,25 @@ All notable changes to Dr Strange are documented here. The format is based on
   `sum` stays exact while every value is an integer and is demoted by the first
   float, so summing ids past 2⁵³ doesn't quietly round.
 
+- **`fathom` — an eighth agent verb: read one region of the graph closely.**
+  Everything within a few hops of a symbol, out and in, reported as the
+  region's *makeup* rather than a listing of it: node counts by label, edge
+  counts by type with each direction, how many nodes each hop added, and the
+  handful of symbols that hold the region together, ranked by their edges
+  *inside* it (a global degree would rank the plane's hubs, not this corner's).
+
+  It answers a question the other verbs don't: `context` describes one symbol
+  and `impact` names what reaches it, while this says what kind of place the
+  symbol sits in — a call-heavy corner of the parser, or a shallow leaf. On a
+  real Go repository, two hops around `main` comes back as five lines: 519
+  nodes, `CONTAINS 360 · CALLS 116 · IMPORTS 71`, and the five hubs.
+
+  Bounded twice, and it says which bound it hit — the depth asked for, or a
+  5,000-node budget past which a hub would otherwise pull in the plane. The
+  walk is breadth-first, so a truncated region is the *nearest* one, and every
+  count is exact over what was walked. `drsg fathom <name> [--depth]` and the
+  `fathom` MCP tool.
+
 - **`type(r)`, `direction(r)` and `id(n)`.** A row's edge and its internal id,
   readable in `WHERE`, `ORDER BY` and a projection. `direction(r)` is never
   `BOTH`: `BOTH` is what the *query* asked for, while a row always walked one

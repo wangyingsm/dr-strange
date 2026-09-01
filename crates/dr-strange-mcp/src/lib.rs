@@ -672,6 +672,17 @@ struct ImpactReq {
     depth: Option<usize>,
 }
 
+/// `fathom`'s request: one symbol and how wide a region around it.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FathomReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Hops to walk, out and in (default 2, max 6).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
 /// `history`'s request: which repository, and how much of it.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct HistoryReq {
@@ -1665,6 +1676,32 @@ impl DrStrange {
         .await
     }
 
+    #[tool(description = "Read one region of the graph closely: everything \
+        within `depth` hops of this symbol, out and in, reported as its \
+        makeup rather than a listing — node counts by label, edge counts by \
+        type with each direction, how many nodes each hop added, and the \
+        hubs that hold the region together (by their edges inside it). Use \
+        it to size up an unfamiliar corner before reading it: `context` \
+        answers about one symbol and `impact` names what reaches it, while \
+        this says what kind of place the symbol sits in. Fuzzy name; depth \
+        defaults to 2. The walk is bounded by depth and by a node budget, \
+        and the reply says which bound it hit — counts are always exact \
+        over what it walked.")]
+    async fn fathom(
+        &self,
+        Parameters(req): Parameters<FathomReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("fathom", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::fathom(
+                &plane,
+                &req.name,
+                req.depth.unwrap_or(2),
+            )?))
+        })
+        .await
+    }
+
     #[tool(description = "A repository's history at a glance: where HEAD is, \
         what the branches and tags point at, which branches were rebased \
         (and what each replaced), and the newest commits — as compact text. \
@@ -1942,7 +1979,8 @@ impl ServerHandler for DrStrange {
              write_edges to write. Planes are isolated graph canvases; \
              default 'startup'.\n\
              A digested repository has two planes. `<name>` holds the code as \
-             it is now — ask `context`, `trace`, `impact`, `snippet`, `grep`. \
+             it is now — ask `context`, `trace`, `impact`, `fathom`, \
+             `snippet`, `grep`. \
              `<name>_git` holds the same repository's history — Commit (also \
              Merge), Branch, Tag and Rebase nodes, joined by PARENT (with \
              `order`, so a merge's first parent is the line it was made on), \

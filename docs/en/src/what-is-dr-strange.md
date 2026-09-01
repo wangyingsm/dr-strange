@@ -89,7 +89,7 @@ for all of it.
 | **Change feed** | Subscribe to a plane and receive mutations live |
 | **Code digestion** | Sandboxed wasm parser plugins turn a repository into a resolved call graph (8 official languages) |
 | **Commit-synced watch** | `serve watch` folds every commit into the plane |
-| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
+| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet` — one round trip each |
 | **Backup / restore** | Consistent, id-faithful whole-database snapshots |
 | **Read-only replicas** | `serve --follow` mirrors a running server for read-scaling across a cluster |
 | **Interfaces** | Web UI, six language SDKs, a CLI, and an MCP server |
@@ -108,8 +108,9 @@ wasm parser plugins turn source files into a resolved call graph — symbols,
 callers with call sites, and every other structural edge — with no model in
 the loop, covering eight languages out of the box. `serve watch` keeps the
 resulting plane synced to the repository's own commit history, folding each
-commit's changes in as they land. Seven agent verbs — `context`, `search`,
-`describe`, `grep`, `trace`, `impact`, `snippet` — turn that graph into
+commit's changes in as they land. Eight agent verbs — `context`, `search`,
+`describe`, `grep`, `trace`, `impact`, `fathom`, `snippet` — turn that graph
+into
 single-round-trip answers for a coding agent, each one stating the bounds of
 what it found: candidates instead of a guessed match, an `UnresolvedRef`
 ledger entry instead of a silently wrong edge. `drsg init` bootstraps all of

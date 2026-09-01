@@ -26,7 +26,7 @@
 | `ask <问题> --plane` | 自然语言查询 |
 | `digest <文件\|目录\|url> --plane [--mode]` | 导入一篇文档、一个代码仓库，或一个页面及其链接 |
 | `search <查询> --plane` | 语义查找：嵌入查询文本，返回最近的节点 |
-| `context \| describe \| trace \| impact <名称> --plane` | 已图化代码平面上的智能体动词 |
+| `context \| describe \| trace \| impact \| fathom <名称> --plane` | 已图化代码平面上的智能体动词 |
 | `vectorize --plane` | 为一个平面的节点生成向量嵌入，以供相似度检索 |
 | `plugin install \| list \| remove` | 管理预处理插件（沙箱化的 wasm 解析器） |
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |

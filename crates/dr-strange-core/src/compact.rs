@@ -479,6 +479,201 @@ pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     Ok(out)
 }
 
+/// `fathom` — read one region of the graph closely and report what is in it:
+/// the makeup of everything within `depth` hops of a symbol, in both
+/// directions, rather than a listing of it.
+///
+/// The complement of [`impact`], which names the individual nodes that reach a
+/// symbol. Here the names are the *answer's* smallest part: a region of a few
+/// hundred nodes is a wall of lines and a paragraph of counts, and the counts
+/// are what say "this is a call-heavy corner of the parser, and these four
+/// symbols hold it together".
+///
+/// Bounded twice over, and it says which bound it hit. `depth` limits how far
+/// it walks, and [`FATHOM_BUDGET`] limits how much: a hub two hops from
+/// everything would otherwise pull in the plane. Every count is exact for what
+/// it walked — a budget stop truncates the *region*, never the tallies over it.
+pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let node = match resolve(plane, name)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(candidates(name, &hits)),
+        Resolved::None => return no_match(plane, name),
+    };
+    let depth = depth.clamp(1, 6);
+    let mut out = one_line(&node);
+    out.push('\n');
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+
+    // Walked breadth-first so a truncated region is the *nearest* one — the
+    // part of the graph the question was actually about.
+    let mut seen = BTreeSet::from([node.id]);
+    let mut per_level: Vec<usize> = Vec::new();
+    let mut labels: BTreeMap<String, usize> = BTreeMap::new();
+    let mut edges: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut degree: BTreeMap<crate::NodeId, usize> = BTreeMap::new();
+    let mut counted: BTreeSet<crate::EdgeId> = BTreeSet::new();
+    let mut frontier = vec![node.id];
+    let mut budget_hit = false;
+    tally_labels(&node, &mut labels);
+
+    for _ in 1..=depth {
+        let mut next = Vec::new();
+        for &id in &frontier {
+            for dir in [crate::Dir::Out, crate::Dir::In] {
+                for hop in plane.neighbors(id, dir, None)? {
+                    let Some(edge) = plane.edge(hop.edge)? else {
+                        continue;
+                    };
+                    // An edge is counted once, from whichever end reaches it
+                    // first — a hop walked from both ends is one edge, not two.
+                    if counted.insert(hop.edge) {
+                        let slot = edges.entry(edge.ty.clone()).or_default();
+                        match dir {
+                            crate::Dir::Out => slot.0 += 1,
+                            _ => slot.1 += 1,
+                        }
+                        *degree.entry(id).or_default() += 1;
+                        *degree.entry(hop.node).or_default() += 1;
+                    }
+                    if seen.len() >= FATHOM_BUDGET {
+                        budget_hit = true;
+                        continue;
+                    }
+                    if seen.insert(hop.node)
+                        && let Some(n) = plane.node(hop.node)?
+                    {
+                        tally_labels(&n, &mut labels);
+                        next.push(hop.node);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        per_level.push(next.len());
+        frontier = next;
+    }
+
+    let reached = per_level.len();
+    let region_edges: usize = counted.len();
+    out.push_str(&format!(
+        "region: {} hop{} out and in — {} nodes, {} edges\n",
+        reached,
+        if reached == 1 { "" } else { "s" },
+        seen.len(),
+        region_edges,
+    ));
+    out.push_str(&format!(
+        "per hop: {}\n",
+        per_level
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{}:{n}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
+    out.push_str(&format!(
+        "labels: {}\n",
+        ranked(
+            labels
+                .iter()
+                .map(|(l, n)| (format!("{l} {n}"), *n))
+                .collect(),
+            FATHOM_GROUPS
+        )
+    ));
+    out.push_str(&format!(
+        "edges: {}\n",
+        ranked(
+            edges
+                .iter()
+                .map(|(ty, (o, i))| (format!("{ty} {} ({o} out, {i} in)", o + i), o + i))
+                .collect(),
+            FATHOM_GROUPS
+        )
+    ));
+
+    // The hubs: what holds this region together, by degree *within it*. A
+    // symbol's global degree would rank the plane's hubs, not this corner's.
+    let mut hubs: Vec<(crate::NodeId, usize)> = degree.into_iter().collect();
+    hubs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+    if !hubs.is_empty() {
+        out.push_str("hubs (by edges inside the region):\n");
+        for (id, deg) in hubs.iter().take(FATHOM_HUBS) {
+            if let Some(n) = plane.node(*id)? {
+                out.push_str(&format!("  {deg:>4}  {}\n", one_line(&n)));
+            }
+        }
+    }
+
+    out.push_str(&match (budget_hit, reached < depth) {
+        // Which bound stopped it, in the terms the caller can act on.
+        (true, _) => format!(
+            "note: stopped at the {FATHOM_BUDGET}-node budget, so the region is the nearest \
+             part of a larger one; counts are exact over what was walked. Narrow it with a \
+             smaller depth.\n"
+        ),
+        (false, true) => format!(
+            "note: the region ends at {reached} hop{}, short of the {depth} asked for — \
+             nothing further connects.\n",
+            if reached == 1 { "" } else { "s" }
+        ),
+        (false, false) => format!("note: walked every edge type to depth {depth}.\n"),
+    });
+    Ok(out)
+}
+
+/// Nodes a single `fathom` walks before it stops and says so. A hub two hops
+/// from everything would otherwise pull in the plane, and a reply nobody can
+/// read is not an answer.
+const FATHOM_BUDGET: usize = 5_000;
+/// Label and edge-type groups named before the rest are summed as "others".
+const FATHOM_GROUPS: usize = 8;
+/// Hubs listed.
+const FATHOM_HUBS: usize = 5;
+
+fn tally_labels(n: &NodeRecord, out: &mut std::collections::BTreeMap<String, usize>) {
+    match n.labels.first() {
+        Some(l) => *out.entry(l.clone()).or_default() += 1,
+        None => *out.entry("<unlabelled>".to_string()).or_default() += 1,
+    }
+}
+
+/// Counted groups, biggest first, with the tail summed rather than dropped —
+/// so the parts add up to the total the caller was just given.
+///
+/// Each item is its own rendered text paired with the count it sorts and sums
+/// by, because a group's text is not always just "name count": an edge type
+/// carries its two directions as well.
+fn ranked(mut items: Vec<(String, usize)>, cap: usize) -> String {
+    if items.is_empty() {
+        return "none".to_string();
+    }
+    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let shown: Vec<&str> = items
+        .iter()
+        .take(cap)
+        .map(|(text, _)| text.as_str())
+        .collect();
+    let rest: usize = items.iter().skip(cap).map(|(_, n)| n).sum();
+    match rest {
+        0 => shown.join(" · "),
+        rest => {
+            let others = items.len() - cap;
+            format!(
+                "{} · {rest} more in {others} other{}",
+                shown.join(" · "),
+                if others == 1 { "" } else { "s" }
+            )
+        }
+    }
+}
+
 // ---- history (the git plane) ---------------------------------------------
 
 /// The suffix a repository's history plane takes, beside the code plane it
@@ -1151,6 +1346,90 @@ mod tests {
             out.contains("[CALLS]") && out.contains("[REFERENCES]"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn fathom_reports_a_regions_makeup_not_its_members() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let hub = txn
+            .create_node_with_key("m::hub", &["Function"], Properties::new())
+            .unwrap();
+        let types: Vec<_> = (0..3)
+            .map(|i| {
+                txn.create_node_with_key(&format!("m::T{i}"), &["Struct"], Properties::new())
+                    .unwrap()
+            })
+            .collect();
+        let callers: Vec<_> = (0..2)
+            .map(|i| {
+                txn.create_node_with_key(&format!("m::c{i}"), &["Function"], Properties::new())
+                    .unwrap()
+            })
+            .collect();
+        for t in &types {
+            txn.create_edge(hub, *t, "REFERENCES", Properties::new())
+                .unwrap();
+        }
+        for c in &callers {
+            txn.create_edge(*c, hub, "CALLS", Properties::new())
+                .unwrap();
+        }
+        // One node two hops out, so a depth of 1 genuinely stops short of it.
+        let far = txn
+            .create_node_with_key("m::far", &["Function"], Properties::new())
+            .unwrap();
+        txn.create_edge(far, callers[0], "CALLS", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let plane = db.plane("code").unwrap();
+
+        let out = fathom(&plane, "m::hub", 1).unwrap();
+        // The makeup: counts by label and by edge type, each with its direction.
+        assert!(
+            out.contains("region: 1 hop out and in — 6 nodes, 5 edges"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Function 3") && out.contains("Struct 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("REFERENCES 3 (3 out, 0 in)") && out.contains("CALLS 2 (0 out, 2 in)"),
+            "{out}"
+        );
+        // The seed holds this region together, and says by how much.
+        assert!(out.contains("hubs (by edges inside the region):"), "{out}");
+        let hub_line = out
+            .lines()
+            .find(|l| l.starts_with("  ") && l.contains("m::hub"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(hub_line.trim().starts_with('5'), "{out}");
+
+        // Two hops reaches the far node, and says it walked the whole depth.
+        let deeper = fathom(&plane, "m::hub", 2).unwrap();
+        assert!(deeper.contains("per hop: 1:5 · 2:1"), "{deeper}");
+        assert!(
+            deeper.contains("walked every edge type to depth 2"),
+            "{deeper}"
+        );
+
+        // Asked for more than there is, it says where the region actually ends
+        // rather than implying it looked that far.
+        let past = fathom(&plane, "m::hub", 5).unwrap();
+        assert!(
+            past.contains("region ends at 2 hops, short of the 5"),
+            "{past}"
+        );
+    }
+
+    #[test]
+    fn fathom_resolves_and_refuses_like_every_other_verb() {
+        let db = seeded();
+        let p = db.plane("code").unwrap();
+        assert!(fathom(&p, "go", 1).unwrap().contains("ambiguous"));
+        assert!(fathom(&p, "zzz", 1).unwrap().contains("no symbol"));
     }
 
     #[test]
