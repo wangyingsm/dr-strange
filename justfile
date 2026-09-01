@@ -125,7 +125,7 @@ drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "targe
 # change the other in the same commit.
 #
 # Everything CI runs, locally: run this before pushing.
-gate: gate-rust gate-frontend gate-docs gate-sdk
+gate: gate-rust gate-features gate-frontend gate-docs gate-sdk
     @echo "gate: every CI job passed locally"
 
 # The redb pass is the one an all-defaults `cargo test` never covers: the
@@ -138,6 +138,25 @@ gate-rust: _rust-matches-ci
     RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
     RUSTFLAGS="-D warnings" cargo test --workspace
     RUSTFLAGS="-D warnings" cargo test -p dr-strange-core --no-default-features --features redb-backend,json
+
+# gate-rust builds one configuration: all defaults. Everything this project
+# documents as optional is unbuilt by it, so a missing `#[cfg]` stays invisible
+# until someone tries the combination — which is how `--no-default-features` on
+# the CLI came to be broken for several releases with nothing going red.
+#
+# `--all-targets` because the tests are part of the configuration: a helper used
+# only by gated tests is dead code in the build without them. A storage backend
+# is not optional, only which one, so every line names one.
+#
+# CI's `features` job: every optional build still compiles.
+gate-features:
+    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-cli --no-default-features --features native-backend --all-targets
+    RUSTFLAGS="-D warnings" cargo test -p dr-strange-cli --no-default-features --features native-backend
+    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-cli --no-default-features --features redb-backend --all-targets
+    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-llm --no-default-features --all-targets
+    RUSTFLAGS="-D warnings" cargo test -p dr-strange-llm --no-default-features
+    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-mcp --no-default-features --features redb-backend --all-targets
+    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-web --no-default-features --features redb-backend --all-targets
 
 # `bun install` unfrozen, as CI does — the committed lock is a bun-canary
 # format a stable bun cannot parse frozen.

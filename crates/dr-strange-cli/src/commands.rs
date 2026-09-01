@@ -10,8 +10,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
     BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions,
+    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
 };
+// Only `vectorize` and the digest pipeline write property *descriptions*; the
+// rest of the CLI reads and writes plain values.
+#[cfg(feature = "digest")]
+use dr_strange_core::{PropDesc, PropValue};
 use serde_json::{Value, json};
 
 use dr_strange_core::json as jsonio;
@@ -861,6 +865,7 @@ fn parse_params(param: &[String]) -> Result<dr_strange_parser::Params> {
 /// directory's own name, so `drsg digest` in a checkout writes a plane named
 /// after the repo. Anything that doesn't yield one — a URL, a bare file, a
 /// nameless path like `/` — stays `startup`.
+#[cfg(feature = "digest")]
 pub fn default_plane(source: &str) -> String {
     std::fs::canonicalize(source)
         .ok()
@@ -2041,6 +2046,7 @@ fn installed_hashes(
 /// the stored hash matches the release artifact's, `[upgradable]` when a
 /// plugin of that name is installed but its bytes differ (an older release,
 /// or a local build), nothing when it is absent.
+#[cfg(feature = "digest")]
 fn official_status(
     installed: &std::collections::BTreeMap<String, String>,
     name: &str,
@@ -2250,6 +2256,7 @@ fn resolve_source(
 /// Installed plugins (other than `manifest`'s own name) that already claim
 /// any of its extensions — the head-on collision `install` must not create
 /// silently: the router routes each extension to exactly one handler.
+#[cfg(feature = "digest")]
 fn extension_conflicts(
     store: &dr_strange_llm::PluginStore,
     name: &str,
@@ -2267,6 +2274,7 @@ fn extension_conflicts(
     Ok(out)
 }
 
+#[cfg(feature = "digest")]
 fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::PluginStore> {
     match &cfg.store_dir {
         Some(dir) => dr_strange_llm::PluginStore::open(dir.clone()),
@@ -4052,6 +4060,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Only the `init`/plugin-store tests need one, and both need the plugin
+    /// host.
+    #[cfg(feature = "digest")]
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("drsg-cli-init-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -43,7 +43,14 @@ pub struct Config {
     pub fetch: FetchCfg,
     /// Preprocessor plugins (ROADMAP §11): sandbox budgets, and each plugin's
     /// own settings.
+    ///
+    /// Parsed even in a build with no plugin host, and unread there: one
+    /// `drsg.toml` is shared by every binary an operator runs, and a
+    /// `--no-default-features` build that *rejected* a `[plugins]` section
+    /// would make that file un-shareable over a section it merely has no use
+    /// for.
     #[serde(default)]
+    #[cfg_attr(not(feature = "digest"), allow(dead_code))]
     pub plugins: PluginsCfg,
 }
 
@@ -107,6 +114,9 @@ pub struct FetchCfg {
 /// per-plugin sub-tables, and what a plugin can be configured to do is the
 /// plugin's business, not this file's.
 #[derive(Debug, Default, Deserialize)]
+// Read by `plugin_config` below, which needs the plugin host; without it these
+// are parsed and ignored, on purpose — see `Config::plugins`.
+#[cfg_attr(not(feature = "digest"), allow(dead_code))]
 pub struct PluginsCfg {
     /// Instructions one sandbox call may execute. `0` disables the check for a
     /// trusted plugin on an input big enough to make the ceiling a nuisance.

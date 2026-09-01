@@ -49,6 +49,44 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  features:
+    name: Features — every optional build still compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `rust` job builds one configuration: all defaults. Every feature
+      # this project documents as optional is therefore unbuilt by CI, and a
+      # `#[cfg]` that should have been added is invisible until someone tries
+      # the combination — which is how `--no-default-features` on the CLI came
+      # to be broken for several releases with nothing going red.
+      #
+      # `--all-targets` because the tests are part of the configuration: a test
+      # helper used only by gated tests is dead code in the build without them.
+      #
+      # A storage backend is not optional, only which one — `--no-default-features`
+      # with neither leaves `Database` without an `open`, by design — so each
+      # line below names one.
+      - name: CLI without the digest pipeline (native backend)
+        run: |
+          cargo clippy -p dr-strange-cli --no-default-features --features native-backend --all-targets
+          cargo test -p dr-strange-cli --no-default-features --features native-backend
+      - name: CLI without the digest pipeline (redb backend)
+        run: cargo clippy -p dr-strange-cli --no-default-features --features redb-backend --all-targets
+      # The wasm plugin host ships on; `--no-default-features` drops the whole
+      # runtime, which is the build for anyone who does not want it.
+      - name: LLM crate without the plugin host
+        run: |
+          cargo clippy -p dr-strange-llm --no-default-features --all-targets
+          cargo test -p dr-strange-llm --no-default-features
+      - name: MCP server on the redb backend
+        run: cargo clippy -p dr-strange-mcp --no-default-features --features redb-backend --all-targets
+      - name: Web crate on the redb backend
+        run: cargo clippy -p dr-strange-web --no-default-features --features redb-backend --all-targets
+
   frontend:
     name: Frontend — lint + build + test
     runs-on: ubuntu-latest

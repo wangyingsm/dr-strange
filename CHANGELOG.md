@@ -6,6 +6,28 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **`--no-default-features` builds the CLI again.** It had not compiled for
+  several releases: the `digest` feature gates `DigestArgs`, `commands::digest`
+  and `config::plugin_config`, but not the `Command::Digest` match arm that
+  calls them, nor two plugin-store helpers, nor a `PropDesc`/`PropValue` import
+  only gated code used. Gated now — and `[plugins]` in `drsg.toml` still
+  *parses* in a build with no plugin host, because one config file is shared by
+  every binary an operator runs and rejecting a section this build merely has
+  no use for would make that file un-shareable.
+
+### Added
+- **A `features` CI job, and `just gate-features` beside it.** The `rust` job
+  builds exactly one configuration — all defaults — so everything this project
+  documents as optional was unbuilt by CI, and a missing `#[cfg]` stayed
+  invisible until someone tried the combination. That is precisely how the
+  breakage above survived several releases with nothing going red. The new job
+  builds the CLI without the digest pipeline on both backends, the LLM crate
+  without the wasm plugin host, and the MCP and web crates on the legacy
+  backend, `--all-targets` throughout: a test helper used only by gated tests
+  is dead code in the build without them, which is one of the errors this
+  found.
+
 ### Changed
 - **The official plugin catalog is data, fetched, not a constant of the
   binary.** It lived as a nine-entry `const` in `dr-strange-llm`: a release

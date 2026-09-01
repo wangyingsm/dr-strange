@@ -1030,6 +1030,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
             }
         }
+        #[cfg(feature = "digest")]
         Command::Digest {
             source,
             plane,
