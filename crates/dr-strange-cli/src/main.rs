@@ -450,22 +450,32 @@ enum ServeMode {
 #[cfg(feature = "digest")]
 #[derive(Subcommand)]
 enum PluginCmd {
-    /// Install a plugin from a local `.wasm` file or an `http(s)://` URL.
+    /// Install a plugin: an official plugin's name, a local `.wasm` file, or
+    /// an `http(s)://` URL.
     ///
-    /// The artifact is validated as a component, asked to describe itself, and
-    /// its SHA-256 pinned; every later load re-checks the hash, so a file that
-    /// changes on disk is refused rather than silently run. Installing a name
-    /// again is the upgrade path.
+    /// A name is looked up in the official catalog, which lives in the
+    /// extensions repository rather than in this binary — so a plugin release
+    /// needs no drsg release — and pins each artifact's SHA-256, checked on
+    /// download. The artifact is then validated as a component, asked to
+    /// describe itself, and its hash pinned in the store; every later load
+    /// re-checks it, so a file that changes on disk is refused rather than
+    /// silently run. Installing a name again is the upgrade path.
     Install {
-        /// Path to a `.wasm` component, or a URL to download one from.
-        /// **Omitted**: an interactive chooser lists the official plugins —
-        /// pick by number (`0` = all of them), paste a path/URL, or `q` to
-        /// cancel.
+        /// An official plugin's name (`rust`, `go`, `git`, …), a path to a
+        /// `.wasm` component, or a URL to download one from.
+        /// **Omitted**: an interactive chooser lists the official catalog —
+        /// pick by number (`0` = all of them), type a name, paste a path/URL,
+        /// or `q` to cancel.
         source: Option<String>,
     },
     /// List installed plugins as a table: name, version, extensions, hash,
     /// source.
     List {
+        /// List the official catalog instead of what is installed, each entry
+        /// tagged `[installed]`/`[upgradable]` against this store. Needs the
+        /// network; falls back to the cached catalog and says how old it is.
+        #[arg(long)]
+        available: bool,
         /// Print machine-readable JSON instead of the table — the same
         /// records `plugin.list` returns over RPC, so an agent can read
         /// them from either surface.
@@ -985,7 +995,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 PluginCmd::Install { source } => {
                     commands::plugin_install(&plugin_config, &allow, source.as_deref(), out)
                 }
-                PluginCmd::List { json } => commands::plugin_list(&plugin_config, json, out),
+                PluginCmd::List { available, json } => {
+                    commands::plugin_list(&plugin_config, &allow, available, json, out)
+                }
                 PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
             }
         }

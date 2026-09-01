@@ -16,7 +16,7 @@ struct json_object *drsg_db_catalog(drsg_client *c, drsg_error *err);
 /* Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
 struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err);
 
-/* The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+/* The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
 struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err);
 
 /* Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */

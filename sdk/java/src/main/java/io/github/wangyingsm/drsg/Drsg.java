@@ -94,11 +94,20 @@ public class Drsg extends Client {
             List<String> extensions) {
     }
 
-    public record PluginCatalogItem(
+    public record PluginCatalogResultPluginsItem(
             String name,
+            String version,
             String claims,
             String url,
-            String sha256) {
+            String sha256,
+            String compat) {
+    }
+
+    public record PluginCatalogResult(
+            boolean stale,
+            Long schema,
+            Map<String, Object> source,
+            List<PluginCatalogResultPluginsItem> plugins) {
     }
 
     public record PluginInstallResult(
@@ -887,9 +896,9 @@ public class Drsg extends Client {
         return call("plugin.list", null, new TypeReference<List<PluginListItem>>() {});
     }
 
-    /** The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
-    public List<PluginCatalogItem> pluginCatalog() throws DrsgException {
-        return call("plugin.catalog", null, new TypeReference<List<PluginCatalogItem>>() {});
+    /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
+    public PluginCatalogResult pluginCatalog() throws DrsgException {
+        return call("plugin.catalog", null, new TypeReference<PluginCatalogResult>() {});
     }
 
     /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */

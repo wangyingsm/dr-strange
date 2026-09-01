@@ -84,11 +84,20 @@ type PluginListItem struct {
 	Version    *string  `json:"version,omitempty"`
 }
 
-type PluginCatalogItem struct {
-	Claims string `json:"claims"`
-	Name   string `json:"name"`
-	Sha256 string `json:"sha256"`
-	URL    string `json:"url"`
+type PluginCatalogResultPluginsItem struct {
+	Claims  string `json:"claims"`
+	Compat  string `json:"compat"`
+	Name    string `json:"name"`
+	Sha256  string `json:"sha256"`
+	URL     string `json:"url"`
+	Version string `json:"version"`
+}
+
+type PluginCatalogResult struct {
+	Plugins []PluginCatalogResultPluginsItem `json:"plugins"`
+	Schema  *int64                           `json:"schema,omitempty"`
+	Source  map[string]any                   `json:"source,omitempty"`
+	Stale   bool                             `json:"stale"`
 }
 
 type PluginInstallResult struct {
@@ -385,9 +394,9 @@ func (c *Client) PluginList(ctx context.Context) ([]PluginListItem, error) {
 	return out, err
 }
 
-// PluginCatalog The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent.
-func (c *Client) PluginCatalog(ctx context.Context) ([]PluginCatalogItem, error) {
-	var out []PluginCatalogItem
+// PluginCatalog The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept.
+func (c *Client) PluginCatalog(ctx context.Context) (*PluginCatalogResult, error) {
+	var out *PluginCatalogResult
 	err := c.call(ctx, "plugin.catalog", nil, &out)
 	return out, err
 }

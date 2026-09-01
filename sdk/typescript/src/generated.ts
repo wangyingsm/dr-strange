@@ -95,9 +95,9 @@ export class Drsg extends Client {
     return this._call("plugin.list") as Promise<Array<{ name?: string; version?: string; file?: string; sha256?: string; source?: string; extensions?: Array<string> }>>;
   }
 
-  /** The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
-  pluginCatalog(): Promise<Array<{ name: string; claims: string; url: string; sha256: string }>> {
-    return this._call("plugin.catalog") as Promise<Array<{ name: string; claims: string; url: string; sha256: string }>>;
+  /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
+  pluginCatalog(): Promise<{ stale: boolean; schema?: number; source?: Record<string, unknown>; plugins: Array<{ name: string; version: string; claims: string; url: string; sha256: string; compat: string }> }> {
+    return this._call("plugin.catalog") as Promise<{ stale: boolean; schema?: number; source?: Record<string, unknown>; plugins: Array<{ name: string; version: string; claims: string; url: string; sha256: string; compat: string }> }>;
   }
 
   /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */

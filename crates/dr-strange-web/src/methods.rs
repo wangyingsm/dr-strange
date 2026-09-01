@@ -327,14 +327,84 @@ pub fn plugin_list(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     serde_json::to_value(plugins).map_err(|e| RpcError::server(e.to_string()))
 }
 
-/// `plugin.catalog` — the official plugins this build pins: release-tagged
-/// URLs and their artifact hashes. The pins are a compatibility statement
-/// (known-good with this build's contract), so the catalog is a constant of
-/// the binary, not a network lookup — the dashboard joins it against
-/// `plugin.list` to tag each entry installed/upgradable/absent.
+/// How long the dashboard's copy of the catalog may be reused before the
+/// server asks GitHub again.
+///
+/// The panel refreshes on every page load; the file behind it changes when
+/// someone cuts a plugin release. An hour is far below the first rate and far
+/// above the second, and the on-disk copy is shared with the CLI, so a
+/// `drsg plugin install` a moment ago already warmed it.
+const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `plugin.catalog` — the official plugins, read from the extensions
+/// repository's `catalog.json` rather than compiled into this binary, so a
+/// plugin release needs no drsg release (ROADMAP §11).
+///
+/// Each entry carries the version it was cut from, the artifact's SHA-256, and
+/// what it claims; entries this build cannot run are returned too, tagged with
+/// why, rather than filtered out. The dashboard joins the list against
+/// `plugin.list` to mark each one installed/upgradable/absent.
+///
+/// The answer says where it came from. `stale: true` means the fetch failed
+/// and this is the last copy the store kept — a catalog is only worth trusting
+/// as far as it says how current it is.
 pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
-    serde_json::to_value(dr_strange_llm::OFFICIAL_PLUGINS)
-        .map_err(|e| RpcError::server(e.to_string()))
+    let store = plugin_store()?;
+
+    // Whatever is on disk answers *now*, and the refresh happens behind the
+    // response. A panel must not sit on a request to GitHub: on a network
+    // where that host is slow or unreachable, a blocking fetch would stall
+    // the Extensions panel for the fetch timeout, once per TTL, to end up
+    // showing this same copy anyway.
+    if let Some((catalog, age)) = dr_strange_llm::cached_catalog(&store) {
+        let stale = age > CATALOG_TTL;
+        if stale {
+            std::thread::spawn(move || {
+                let Ok(store) = dr_strange_llm::PluginStore::open_default() else {
+                    return;
+                };
+                dr_strange_llm::refresh_cache(&store, |url| {
+                    crate::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, &[])
+                });
+            });
+        }
+        return catalog_value(&catalog, stale, age_note(age, stale));
+    }
+
+    // Nothing cached: this one request has to wait, because there is nothing
+    // else to show. No private-range allowances — a server following a
+    // redirect into its own network is exactly what the guard is for, and the
+    // catalog lives on the public internet.
+    let fetched = dr_strange_llm::load_catalog_within(&store, CATALOG_TTL, |url| {
+        crate::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, &[])
+    })
+    .map_err(plug)?;
+    let stale = fetched.source.is_stale();
+    let source = serde_json::to_value(&fetched.source).unwrap_or(Value::Null);
+    catalog_value(&fetched.catalog, stale, source)
+}
+
+/// Where a cached answer came from, in the shape `Source` serializes to.
+fn age_note(age: std::time::Duration, stale: bool) -> Value {
+    serde_json::json!({
+        "source": "cache",
+        "age": {"secs": age.as_secs(), "nanos": age.subsec_nanos()},
+        "why": if stale { Some("older than the server's cache window — a refresh is running") } else { None },
+    })
+}
+
+fn catalog_value(
+    catalog: &dr_strange_llm::Catalog,
+    stale: bool,
+    source: Value,
+) -> Result<Value, RpcError> {
+    serde_json::to_value(serde_json::json!({
+        "source": source,
+        "stale": stale,
+        "schema": catalog.schema,
+        "plugins": catalog.current(),
+    }))
+    .map_err(|e| RpcError::server(e.to_string()))
 }
 
 #[derive(Deserialize)]

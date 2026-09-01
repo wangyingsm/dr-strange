@@ -274,6 +274,18 @@ article.plugin-card {
   color: var(--warn, #d29922);
   border: 1px solid color-mix(in srgb, var(--warn, #d29922) 50%, transparent);
 }
+/* An entry this build cannot run: stated, not hidden — the panel would
+   otherwise just be missing a plugin the catalog promises. */
+.plugin-card .badge.warn {
+  color: var(--muted, #8b949e);
+  border: 1px solid var(--border);
+}
+/* The catalog could not be fetched and this is the server's last copy. */
+.catalog-note {
+  margin: -0.4rem 0 0.9rem;
+  font-size: 0.8rem;
+  color: var(--warn, #d29922);
+}
 .plugin-card .card-actions .install {
   display: inline-flex;
   align-items: center;

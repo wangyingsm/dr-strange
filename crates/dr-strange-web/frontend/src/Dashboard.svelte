@@ -16,20 +16,25 @@
   import extensionLogo from './assets/extension-logo.svg'
 
   let plugins = $state([]) // installed preprocessor plugins
-  let catalog = $state([]) // the official catalog this build pins
+  let catalog = $state([]) // the official catalog, as served by plugin.catalog
+  let catalogNote = $state(null) // set when the catalog is a stale cached copy
   let busy = $state({}) // plugin name -> true while an install/upgrade runs
   let vecBusy = $state({}) // plane name -> true while a vectorize runs
   let vecMsg = $state({}) // plane name -> last vectorize summary
   let installing = $state(false)
   let installUrl = $state('')
 
-  // The Extensions section pins every official plugin (catalog order) and
+  // The Extensions section lists every official plugin (catalog order) and
   // judges each against the store by hash: installed, upgradable, or absent.
+  //
+  // `compat` comes from the server, which knows what contract it speaks: an
+  // entry it cannot run is shown greyed rather than dropped, because a plugin
+  // silently missing from this panel is a support question.
   let officials = $derived(
     catalog.map((c) => {
       const inst = plugins.find((p) => p.name === c.name)
       const state = !inst ? 'absent' : inst.sha256 === c.sha256 ? 'installed' : 'upgradable'
-      return { ...c, inst, state }
+      return { ...c, inst, state, unsupported: c.compat && c.compat !== 'ok' }
     })
   )
   let thirdParty = $derived(plugins.filter((p) => !catalog.some((c) => c.name === p.name)))
@@ -203,7 +208,14 @@
     loadPlanes().catch((e) => (error = e.message))
     loadPlugins().catch((e) => (error = e.message))
     rpc('plugin.catalog')
-      .then((c) => (catalog = c))
+      .then((c) => {
+        catalog = c.plugins ?? []
+        // Only a *failed* fetch is worth a line; a copy served from the
+        // server's hour-long cache is current as far as anyone here cares.
+        catalogNote = c.stale
+          ? 'the catalog could not be reached — showing the last copy this server kept'
+          : null
+      })
       .catch((e) => (error = e.message))
     return liveStats(
       (s) => {
@@ -312,14 +324,18 @@
 </section>
 
 <h2>Extensions</h2>
+{#if catalogNote}
+  <p class="catalog-note">{catalogNote}</p>
+{/if}
 <section class="plugins">
   {#each officials as c (c.name)}
     <article class="card plugin-card">
       <img class="plugin-logo" src={logoSrc(c.inst?.logo)} alt="" />
       <h3>
-        {c.name}{#if c.inst}<span class="plugin-ver">@{c.inst.version}</span>{/if}
+        {c.name}<span class="plugin-ver">@{c.inst?.version ?? c.version}</span>
         {#if c.state === 'installed'}<span class="badge ok">installed</span>
         {:else if c.state === 'upgradable'}<span class="badge up">upgradable</span>{/if}
+        {#if c.unsupported}<span class="badge warn" title={c.compat === 'needs_host' ? `needs drsg >= ${c.min_drsg}` : `built against plugin contract ${c.contract}`}>unsupported</span>{/if}
       </h3>
       <p class="plugin-exts">{c.claims}</p>
       {#if c.inst}

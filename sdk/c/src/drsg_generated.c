@@ -37,7 +37,7 @@ struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent. */
+/* The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
 struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err) {
     struct json_object *p = NULL;
     struct json_object *result = NULL;

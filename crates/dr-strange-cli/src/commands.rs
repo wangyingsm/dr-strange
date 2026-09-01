@@ -2008,10 +2008,34 @@ fn load_plugins(args: &DigestArgs) -> Result<dr_strange_llm::Plugins> {
 #[cfg(feature = "digest")]
 const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
 
-/// The official catalog, shared with the dashboard's `plugin.catalog` —
-/// pinned release URLs and hashes, one source of truth in dr-strange-llm.
+/// The official catalog, fetched from the extensions repository and cached in
+/// the plugin store — the same list the dashboard's `plugin.catalog` serves.
+///
+/// The fetch goes through the ordinary network policy, as a plugin download
+/// does: this is a file from the internet deciding what this process will be
+/// asked to execute, and it gets no shortcut for being small.
 #[cfg(feature = "digest")]
-pub use dr_strange_llm::OFFICIAL_PLUGINS;
+fn official_catalog(
+    store: &dr_strange_llm::PluginStore,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+) -> Result<dr_strange_llm::Fetched> {
+    dr_strange_llm::load_catalog(store, |url| {
+        dr_strange_web::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, allow_private)
+    })
+}
+
+/// What each installed plugin hashes to, so a catalog entry can be tagged
+/// against the store without instantiating anything.
+#[cfg(feature = "digest")]
+fn installed_hashes(
+    store: &dr_strange_llm::PluginStore,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(store
+        .list()?
+        .into_iter()
+        .map(|p| (p.name, p.sha256))
+        .collect())
+}
 
 /// One catalog entry's status against the local store: `[installed]` when
 /// the stored hash matches the release artifact's, `[upgradable]` when a
@@ -2023,46 +2047,122 @@ fn official_status(
     release_sha: &str,
 ) -> &'static str {
     match installed.get(name) {
-        Some(have) if have == release_sha => "  [installed]",
-        Some(_) => "  [upgradable]",
+        Some(have) if have.eq_ignore_ascii_case(release_sha) => "[installed]",
+        Some(_) => "[upgradable]",
         None => "",
     }
 }
 
+/// The catalog as a table, tagged against the store — shared by the
+/// interactive chooser and `plugin list --available`, so the two cannot drift
+/// into describing the same list differently.
+///
+/// `numbered` is what makes it a menu rather than a report. An entry this
+/// build cannot run is printed either way, with the reason: hiding it would
+/// leave an operator wondering why the plugin the README promises is not
+/// there.
+#[cfg(feature = "digest")]
+fn print_catalog(
+    picks: &[dr_strange_llm::Pick<'_>],
+    installed: &std::collections::BTreeMap<String, String>,
+    numbered: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let ver_w = picks
+        .iter()
+        .map(|p| p.plugin.version.len())
+        .max()
+        .unwrap_or(0);
+    let claims_w = picks
+        .iter()
+        .map(|p| p.plugin.claims.len())
+        .max()
+        .unwrap_or(0);
+    let name_w = picks.iter().map(|p| p.plugin.name.len()).max().unwrap_or(0);
+    for (i, pick) in picks.iter().enumerate() {
+        let p = pick.plugin;
+        let lead = if numbered {
+            format!("  {}) ", i + 1)
+        } else {
+            "  ".to_string()
+        };
+        let mut tail = official_status(installed, &p.name, &p.sha256).to_string();
+        if let Some(why) = pick.compat.note() {
+            if !tail.is_empty() {
+                tail.push(' ');
+            }
+            tail.push_str(&format!("[unsupported: {why}]"));
+        }
+        // Trimmed, not padded to the last column: an entry with no tag would
+        // otherwise carry trailing spaces into whatever reads this.
+        let row = format!(
+            "{lead}{:name_w$}  {:ver_w$}  {:claims_w$}  {tail}",
+            p.name, p.version, p.claims
+        );
+        writeln!(out, "{}", row.trim_end())?;
+    }
+    Ok(())
+}
+
+/// Where a plugin about to be installed comes from.
+///
+/// The distinction is the hash. An operator's path or URL is trusted because
+/// they typed it, and the store pins whatever arrives; a catalog entry carries
+/// the hash the extensions repository published, so what arrives is checked
+/// against what was promised before anything is stored.
+#[cfg(feature = "digest")]
+enum PluginSource {
+    /// A local `.wasm` or an `http(s)://` URL, exactly as given.
+    Given(String),
+    /// An official plugin, with the catalog's pin.
+    Official(dr_strange_llm::OfficialPlugin),
+}
+
+#[cfg(feature = "digest")]
+impl PluginSource {
+    fn location(&self) -> &str {
+        match self {
+            PluginSource::Given(s) => s,
+            PluginSource::Official(p) => &p.url,
+        }
+    }
+}
+
 /// The interactive chooser behind bare `drsg plugin install`: the official
-/// catalog by number, `0` for all of it, a pasted path/URL, `q` to walk
-/// away. Returns the sources to install.
-fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> Result<Vec<String>> {
+/// catalog by number, `0` for all of it, a plugin's name, a pasted path/URL,
+/// `q` to walk away. Returns the sources to install.
+#[cfg(feature = "digest")]
+fn choose_plugins(
+    store: &dr_strange_llm::PluginStore,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    out: &mut dyn Write,
+) -> Result<Vec<PluginSource>> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "no source given and stdin is not a terminal — pass a path or URL, \
-             e.g. `drsg plugin install <file.wasm | url>`"
+            "no source given and stdin is not a terminal — pass a name, path or \
+             URL, e.g. `drsg plugin install <name | file.wasm | url>`"
         );
     }
-    let installed: std::collections::BTreeMap<String, String> = store
-        .list()?
-        .into_iter()
-        .map(|p| (p.name, p.sha256))
-        .collect();
-    let claims_w = OFFICIAL_PLUGINS
-        .iter()
-        .map(|p| p.claims.len())
-        .max()
-        .unwrap_or(0);
+    let installed = installed_hashes(store)?;
+    let fetched = official_catalog(store, allow_private)?;
+    let picks = fetched.catalog.current();
+
     writeln!(out, "official plugins:")?;
-    writeln!(out, "  0) all of the below")?;
-    for (i, p) in OFFICIAL_PLUGINS.iter().enumerate() {
+    if let Some(note) = fetched.source.note() {
+        writeln!(out, "  ({note})")?;
+    }
+    if fetched.catalog.from_the_future() {
         writeln!(
             out,
-            "  {}) {:5} {:claims_w$}{}",
-            i + 1,
-            p.name,
-            p.claims,
-            official_status(&installed, p.name, p.sha256)
+            "  (this catalog is schema {} — newer than this drsg reads; \
+             entries may say more than is shown)",
+            fetched.catalog.schema
         )?;
     }
-    write!(out, "install [number, path/URL, or q to cancel]: ")?;
+    writeln!(out, "  0) all of the below")?;
+    print_catalog(&picks, &installed, true, out)?;
+    write!(out, "install [number, name, path/URL, or q to cancel]: ")?;
     out.flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -2074,14 +2174,77 @@ fn choose_plugins(store: &dr_strange_llm::PluginStore, out: &mut dyn Write) -> R
     }
     if let Ok(n) = answer.parse::<usize>() {
         if n == 0 {
-            return Ok(OFFICIAL_PLUGINS.iter().map(|p| p.url.to_string()).collect());
+            // "All of the below" means all this host can run. An entry it
+            // cannot is skipped *by name*, so the count never silently
+            // disagrees with the list just printed.
+            let mut sources = Vec::new();
+            for pick in &picks {
+                if pick.compat.is_ok() {
+                    sources.push(PluginSource::Official(pick.plugin.clone()));
+                } else {
+                    writeln!(out, "skipping {} — unsupported here", pick.plugin.name)?;
+                }
+            }
+            return Ok(sources);
         }
-        if let Some(p) = OFFICIAL_PLUGINS.get(n - 1) {
-            return Ok(vec![p.url.to_string()]);
-        }
-        anyhow::bail!("no option {n} — pick 0..={}", OFFICIAL_PLUGINS.len());
+        return match picks.get(n - 1) {
+            Some(pick) => Ok(vec![PluginSource::Official(pick.plugin.clone())]),
+            None => anyhow::bail!("no option {n} — pick 0..={}", picks.len()),
+        };
     }
-    Ok(vec![answer.to_string()])
+    // A name from the list is the other thing an operator naturally types.
+    if let Some(pick) = fetched.catalog.best(answer) {
+        return Ok(vec![PluginSource::Official(pick.plugin.clone())]);
+    }
+    Ok(vec![PluginSource::Given(answer.to_string())])
+}
+
+/// Resolve one `drsg plugin install <arg>`: a path, a URL, or an official
+/// plugin's name.
+///
+/// A bare word is looked up in the catalog rather than read as a filename,
+/// because `drsg plugin install rust` is what an operator means by it — and a
+/// name that is in neither the catalog nor the filesystem is worth an error
+/// that lists what the catalog does have.
+#[cfg(feature = "digest")]
+fn resolve_source(
+    store: &dr_strange_llm::PluginStore,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    arg: &str,
+    out: &mut dyn Write,
+) -> Result<PluginSource> {
+    if arg.starts_with("http://") || arg.starts_with("https://") || Path::new(arg).exists() {
+        return Ok(PluginSource::Given(arg.to_string()));
+    }
+    let fetched = official_catalog(store, allow_private)?;
+    if let Some(note) = fetched.source.note() {
+        writeln!(out, "{note}")?;
+    }
+    match fetched.catalog.best(arg) {
+        Some(pick) => {
+            if let Some(why) = pick.compat.note() {
+                writeln!(
+                    out,
+                    "warning: {}@{} is unsupported here — {why}",
+                    pick.plugin.name, pick.plugin.version
+                )?;
+            }
+            Ok(PluginSource::Official(pick.plugin.clone()))
+        }
+        None => {
+            let known: Vec<&str> = fetched
+                .catalog
+                .current()
+                .iter()
+                .map(|p| p.plugin.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "`{arg}` is not a file, not a URL, and not in the official \
+                 catalog (which has: {})",
+                known.join(", ")
+            )
+        }
+    }
 }
 
 /// Installed plugins (other than `manifest`'s own name) that already claim
@@ -2125,9 +2288,10 @@ pub fn plugin_install(
     source: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let store = plugin_store(cfg)?;
     let sources = match source {
-        Some(s) => vec![s.to_string()],
-        None => choose_plugins(&plugin_store(cfg)?, out)?,
+        Some(s) => vec![resolve_source(&store, allow_private, s, out)?],
+        None => choose_plugins(&store, allow_private, out)?,
     };
     for source in &sources {
         install_one(cfg, allow_private, source, out)?;
@@ -2135,19 +2299,27 @@ pub fn plugin_install(
     Ok(())
 }
 
+#[cfg(feature = "digest")]
 fn install_one(
     cfg: &dr_strange_llm::PluginConfig,
     allow_private: &[dr_strange_web::fetch::Prefix],
-    source: &str,
+    source: &PluginSource,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let is_url = source.starts_with("http://") || source.starts_with("https://");
+    let location = source.location();
+    let is_url = location.starts_with("http://") || location.starts_with("https://");
     let bytes = if is_url {
-        writeln!(out, "downloading {source}")?;
-        dr_strange_web::fetch::fetch_bytes(source, PLUGIN_DOWNLOAD_CAP, allow_private)?
+        writeln!(out, "downloading {location}")?;
+        dr_strange_web::fetch::fetch_bytes(location, PLUGIN_DOWNLOAD_CAP, allow_private)?
     } else {
-        std::fs::read(source).with_context(|| format!("reading {source}"))?
+        std::fs::read(location).with_context(|| format!("reading {location}"))?
     };
+
+    // Before the bytes are looked at as a component, and long before they are
+    // stored: an official plugin has to be the artifact the catalog named.
+    if let PluginSource::Official(entry) = source {
+        entry.verify(&bytes)?;
+    }
 
     let store = plugin_store(cfg)?;
 
@@ -2217,7 +2389,7 @@ fn install_one(
         }
     }
 
-    let (entry, replaced) = store.install(&bytes, source)?;
+    let (entry, replaced) = store.install(&bytes, location)?;
     match replaced {
         Some(old) if old != entry.version => writeln!(
             out,
@@ -2261,12 +2433,52 @@ fn install_one(
     Ok(())
 }
 
+/// `plugin list --available`: the official catalog rather than the store —
+/// the same table the interactive installer shows, without the prompt, so the
+/// list is readable from a script and from a pipe.
 #[cfg(feature = "digest")]
-pub fn plugin_list(
+fn plugin_list_available(
     cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let store = plugin_store(cfg)?;
+    let fetched = official_catalog(&store, allow_private)?;
+    let picks = fetched.catalog.current();
+    if json {
+        // Shaped like `plugin.catalog` over RPC, staleness included: a script
+        // that reads this should be able to tell a live answer from a cached
+        // one without asking a second question.
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": fetched.source,
+                "stale": fetched.source.is_stale(),
+                "schema": fetched.catalog.schema,
+                "plugins": picks,
+            }))?
+        )?;
+        return Ok(());
+    }
+    if let Some(note) = fetched.source.note() {
+        writeln!(out, "{note}")?;
+    }
+    print_catalog(&picks, &installed_hashes(&store)?, false, out)
+}
+
+#[cfg(feature = "digest")]
+pub fn plugin_list(
+    cfg: &dr_strange_llm::PluginConfig,
+    allow_private: &[dr_strange_web::fetch::Prefix],
+    available: bool,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if available {
+        return plugin_list_available(cfg, allow_private, json, out);
+    }
     let store = plugin_store(cfg)?;
     let plugins = store.list()?;
     if json {
@@ -2278,7 +2490,8 @@ pub fn plugin_list(
     if plugins.is_empty() {
         writeln!(
             out,
-            "no plugins installed — `drsg plugin install <file.wasm | url>` adds one"
+            "no plugins installed — `drsg plugin install` offers the official \
+             catalog, or `drsg plugin install <name | file.wasm | url>` adds one"
         )?;
         return Ok(());
     }
@@ -3432,11 +3645,11 @@ mod tests {
         let (dir, cfg) = scratch_store("empty");
         // JSON stays machine-readable even when there is nothing to say —
         // an agent parsing it must never meet prose.
-        let json = cap(|o| plugin_list(&cfg, true, o));
+        let json = cap(|o| plugin_list(&cfg, &[], false, true, o));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, serde_json::json!([]));
         // The human shape says what to do next instead.
-        let table = cap(|o| plugin_list(&cfg, false, o));
+        let table = cap(|o| plugin_list(&cfg, &[], false, false, o));
         assert!(table.contains("no plugins installed"), "{table}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3452,7 +3665,7 @@ mod tests {
         assert!(out.contains("installed fixture@0"), "{out}");
         assert!(out.contains("handles: .fix"), "{out}");
 
-        let table = cap(|o| plugin_list(&cfg, false, o));
+        let table = cap(|o| plugin_list(&cfg, &[], false, false, o));
         assert!(
             table.contains("NAME") && table.contains("EXTENSIONS"),
             "{table}"
@@ -3464,7 +3677,7 @@ mod tests {
 
         // `--json` is the agent surface: the same records `plugin.list`
         // serves over RPC, parseable without scraping the table.
-        let json = cap(|o| plugin_list(&cfg, true, o));
+        let json = cap(|o| plugin_list(&cfg, &[], false, true, o));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed[0]["name"], "fixture");
         assert_eq!(parsed[0]["extensions"][0], "fix");
@@ -3745,31 +3958,69 @@ mod tests {
         ]
         .into();
         // Hash matches the release artifact → nothing to do.
-        assert_eq!(official_status(&installed, "rust", "aaaa"), "  [installed]");
+        assert_eq!(official_status(&installed, "rust", "aaaa"), "[installed]");
+        // A hash the catalog writes in a different case is the same hash.
+        assert_eq!(official_status(&installed, "rust", "AAAA"), "[installed]");
         // Same name, different bytes — an older release or a local build.
-        assert_eq!(official_status(&installed, "go", "cccc"), "  [upgradable]");
+        assert_eq!(official_status(&installed, "go", "cccc"), "[upgradable]");
         // Absent stays unmarked.
         assert_eq!(official_status(&installed, "ts", "dddd"), "");
     }
 
-    /// The pinned hashes must stay well-formed: a typo'd hash would tag a
-    /// correctly installed plugin `[upgradable]` forever.
+    /// The catalog is now data fetched from the extensions repository, so
+    /// "are the pinned hashes well-formed" is that repository's CI to answer
+    /// (`just check-catalog` there). What is still this binary's to get right
+    /// is how it *renders* what it was handed — including an entry it cannot
+    /// run, which must appear with its reason rather than quietly vanish.
     #[cfg(feature = "digest")]
     #[test]
-    fn every_official_entry_pins_a_plausible_sha256() {
-        for p in OFFICIAL_PLUGINS {
-            assert_eq!(p.sha256.len(), 64, "{}: not a sha256 hex digest", p.name);
-            assert!(
-                p.sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                "{}: non-hex in pinned hash",
-                p.name
-            );
-            assert!(
-                p.url.contains(&format!("/{}.wasm", p.name)),
-                "{}: url names a different artifact",
-                p.name
-            );
-        }
+    fn the_catalog_table_tags_each_entry_against_the_store() {
+        let catalog: dr_strange_llm::Catalog = serde_json::from_str(
+            r#"{"schema":1,"plugins":[
+                 {"name":"rust","version":"1.4.1","claims":".rs",
+                  "url":"https://example.invalid/rust.wasm","sha256":"aaaa"},
+                 {"name":"go","version":"1.4.0","claims":".go",
+                  "url":"https://example.invalid/go.wasm","sha256":"bbbb"},
+                 {"name":"ts","version":"1.3.0","claims":".ts",
+                  "url":"https://example.invalid/ts.wasm","sha256":"cccc"},
+                 {"name":"zig","version":"0.1.0","claims":".zig",
+                  "url":"https://example.invalid/zig.wasm","sha256":"dddd",
+                  "min_drsg":"99.0.0"}]}"#,
+        )
+        .unwrap();
+        let installed: std::collections::BTreeMap<String, String> = [
+            // Installed and current.
+            ("rust".to_string(), "aaaa".to_string()),
+            // Installed, but not these bytes.
+            ("go".to_string(), "0000".to_string()),
+        ]
+        .into();
+
+        let picks = catalog.current();
+        let mut buf: Vec<u8> = Vec::new();
+        print_catalog(&picks, &installed, true, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        let line = |name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name} in:\n{text}"))
+                .to_string()
+        };
+        assert!(line("rust").contains("1) "), "numbered: {text}");
+        assert!(line("rust").contains("[installed]"), "{text}");
+        assert!(line("go").contains("[upgradable]"), "{text}");
+        // Absent: neither tag.
+        assert!(!line("ts").contains('['), "{text}");
+        // Unrunnable here, listed anyway, with the reason and the floor.
+        let zig = line("zig");
+        assert!(zig.contains("unsupported"), "{zig}");
+        assert!(zig.contains("99.0.0"), "{zig}");
+
+        // Unnumbered is the `plugin list --available` rendering.
+        let mut plain: Vec<u8> = Vec::new();
+        print_catalog(&picks, &installed, false, &mut plain).unwrap();
+        assert!(!String::from_utf8(plain).unwrap().contains("1) "));
     }
 
     #[cfg(feature = "digest")]

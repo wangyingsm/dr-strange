@@ -36,86 +36,6 @@ use sha2::{Digest, Sha256};
 use super::Preprocessor;
 use super::wasm::{Limits, WasmPlugin};
 
-/// One entry of the official catalog: a release-tagged artifact and its
-/// pinned hash.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct OfficialPlugin {
-    pub name: &'static str,
-    /// The extensions it claims, as display text (`.rs`, `.ts .tsx …`).
-    pub claims: &'static str,
-    pub url: &'static str,
-    /// Hex SHA-256 of the artifact at `url`.
-    pub sha256: &'static str,
-}
-
-/// The official plugins — what the CLI's interactive installer offers and
-/// the dashboard pins. The URLs are pinned to release tags, and a tagged
-/// artifact never changes, so its SHA-256 is pinned right beside it: any
-/// surface can say "installed" or "upgradable" offline, by comparing
-/// against the local store. The pins are also a compatibility statement —
-/// these exact artifacts are known-good with this build's contract — so
-/// they move together with the host, in a release, when the extensions
-/// repository tags new versions.
-pub const OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
-    OfficialPlugin {
-        name: "rust",
-        claims: ".rs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm",
-        sha256: "8e3c32be0add9c720c7f641de89e14edff72600e24c20ba1e903fa9bb573b7ff",
-    },
-    OfficialPlugin {
-        name: "go",
-        claims: ".go",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.4.0/go.wasm",
-        sha256: "121f585f61730ebdae67b4b132c8e8ea07fb4a8db314a7eacb81868fa8c3ada7",
-    },
-    OfficialPlugin {
-        name: "ts",
-        claims: ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.3.0/ts.wasm",
-        sha256: "f9bcbeff9f244fd3abb9110d0c5c83974f3c40e509b8f1503e0c41350af42406",
-    },
-    OfficialPlugin {
-        name: "py",
-        claims: ".py .pyi .pyw",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.3.0/py.wasm",
-        sha256: "bcf0428bd5ba7ca99371ff9389db4d00cb0dd63a4edcf82e77b5dfa77fb88d0b",
-    },
-    OfficialPlugin {
-        name: "java",
-        claims: ".java",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.2.0/java.wasm",
-        sha256: "26876c3e293b7b43dd7b52a3397b7e5301bd4a9984c36bc862c2bfcbb0ece2a5",
-    },
-    OfficialPlugin {
-        name: "c",
-        claims: ".c .h",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.2.0/c.wasm",
-        sha256: "92a17ae63eb4cea544cfa42dd3bc4957393e381644ac41523294d42cd1dd1663",
-    },
-    OfficialPlugin {
-        name: "web",
-        claims: ".html .htm .css",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.1.0/web.wasm",
-        sha256: "3b475f37294e3235650e95e540d4ce7d0ae3a53ab96f757a457172ad436d26ae",
-    },
-    OfficialPlugin {
-        name: "toml",
-        claims: ".toml",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.2.0/toml.wasm",
-        sha256: "6af62778e48dc580a60762b6609134b36867b22d3123bdadcf611fb2ce22a9b8",
-    },
-    // The one entry whose `claims` is not a list of extensions, because its
-    // input is not a file: the host runs it on a directory that turns out to
-    // be a repository (`preprocess::repo`).
-    OfficialPlugin {
-        name: "git",
-        claims: "a repository's history",
-        url: "https://github.com/wangyingsm/dr-strange-extension/releases/download/git-v1.0.0/git.wasm",
-        sha256: "ce50d72fcfa5ad755b36a574c3cb4a37ede2837aa5ef579167b2aefdd0a3cd52",
-    },
-];
-
 /// One installed plugin, as `registry.toml` records it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstalledPlugin {
@@ -358,7 +278,7 @@ fn default_dir() -> Result<PathBuf> {
         .join("plugins"))
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(super) fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();

@@ -31,15 +31,21 @@ pub use digest::{
 pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{OpenAiProvider, build_provider};
+/// The official plugin catalog — data fetched from the extensions repository,
+/// not a constant of this binary.
+#[cfg(feature = "plugins")]
+pub use preprocess::{
+    CATALOG_DOWNLOAD_CAP, CATALOG_URL, CONTRACT_VERSION, Catalog, CatalogSource, Compat, Fetched,
+    HOST_VERSION, OfficialPlugin, Pick, cached_catalog, load_catalog, load_catalog_within,
+    refresh_cache,
+};
 pub use preprocess::{
     CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins,
     Preprocessed, Preprocessor, SyncStats, fold, git_dir, resync, route_document, route_paths,
     route_repository, route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
-pub use preprocess::{
-    InstalledPlugin, Limits, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore, WasmPlugin,
-};
+pub use preprocess::{InstalledPlugin, Limits, PluginStore, WasmPlugin};
 /// Reading a repository's history beside its code — see [`preprocess::repo`].
 pub use preprocess::{PLANE_SUFFIX as GIT_PLANE_SUFFIX, REPO_PLUGIN, plane_name as git_plane_name};
 pub use preprocess::{WriteStats as GitWriteStats, write_history};

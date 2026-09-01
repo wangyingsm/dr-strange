@@ -118,38 +118,69 @@
     },
     {
       "name": "plugin.catalog",
-      "summary": "The official plugin catalog this build pins: release-tagged URLs and their artifact SHA-256 hashes. A constant of the binary, not a network lookup — join against plugin.list to tag entries installed/upgradable/absent.",
+      "summary": "The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept.",
       "params": [],
       "result": {
         "name": "catalog",
         "schema": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "claims": {
-                "type": "string",
-                "description": "Claimed extensions as display text, e.g. \".ts .tsx\""
-              },
-              "url": {
-                "type": "string",
-                "description": "Release-tagged download URL; the artifact at it never changes"
-              },
-              "sha256": {
-                "type": "string",
-                "description": "Hex SHA-256 of the artifact at url"
-              }
+          "type": "object",
+          "properties": {
+            "stale": {
+              "type": "boolean",
+              "description": "True when the fetch failed and this is the store's cached copy"
             },
-            "required": [
-              "name",
-              "claims",
-              "url",
-              "sha256"
-            ]
-          }
+            "schema": {
+              "type": "integer",
+              "description": "The catalog file's own schema version"
+            },
+            "source": {
+              "type": "object",
+              "description": "Where this answer came from: {source:'network',url} or {source:'cache',age,why?}"
+            },
+            "plugins": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "type": "string",
+                    "description": "The plugin's own version, from the <name>-v<version> tag it was cut from"
+                  },
+                  "claims": {
+                    "type": "string",
+                    "description": "Claimed extensions as display text, e.g. \".ts .tsx\""
+                  },
+                  "url": {
+                    "type": "string",
+                    "description": "Release-tagged download URL; the artifact at it never changes"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "description": "Hex SHA-256 of the artifact at url, verified on download"
+                  },
+                  "compat": {
+                    "type": "string",
+                    "description": "'ok', 'needs_host' (min_drsg is newer than this build) or 'other_contract' (built against a plugin contract this host does not speak)"
+                  }
+                },
+                "required": [
+                  "name",
+                  "version",
+                  "claims",
+                  "url",
+                  "sha256",
+                  "compat"
+                ]
+              }
+            }
+          },
+          "required": [
+            "stale",
+            "plugins"
+          ]
         }
       }
     },

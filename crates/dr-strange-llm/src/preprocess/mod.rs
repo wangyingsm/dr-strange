@@ -40,6 +40,8 @@
 //! collection is what lets the work fan out without giving up the property the
 //! sorted walk exists for: re-ingesting a repository yields the same graph.
 
+#[cfg(feature = "plugins")]
+mod catalog;
 mod ground;
 #[cfg(feature = "plugins")]
 mod registry;
@@ -59,9 +61,15 @@ use rayon::prelude::*;
 
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
+#[cfg(feature = "plugins")]
+pub use catalog::{
+    CATALOG_DOWNLOAD_CAP, CATALOG_URL, CONTRACT_VERSION, Catalog, Compat, Fetched, HOST_VERSION,
+    OfficialPlugin, Pick, Source as CatalogSource, load_catalog, load_catalog_within,
+    read_cache as cached_catalog, refresh_cache,
+};
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
-pub use registry::{InstalledPlugin, OFFICIAL_PLUGINS, OfficialPlugin, PluginStore};
+pub use registry::{InstalledPlugin, PluginStore};
 pub use repo::{
     GitDir, PLANE_SUFFIX, REPO_PLUGIN, WriteStats, git_dir, plane_name, route_repository,
     write_history,
