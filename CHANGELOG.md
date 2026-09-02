@@ -4,6 +4,34 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`drsg-mcp` parses its arguments.** It had none: the first positional *was*
+  the database path, so `drsg-mcp --version` opened a database named
+  `--version` — and, since a missing path was created, left an empty one
+  behind. It now takes `--db <path>` (a bare path still works), prints
+  `--help` and `--version` and exits, and rejects any other dash-led word with
+  the usage instead of treating it as a filename.
+
+- **An absent database is an error, not a new one.** The server no longer
+  creates the path it was pointed at. An empty graph answers every question
+  with "nothing found", which is indistinguishable from a digest that went
+  wrong; the message now names the path and the two commands that build one
+  (`drsg digest … --apply`, `drsg init`).
+
+### Changed
+
+- **The docs say which server a repository should use.** `drsg init` — which
+  digests the repository, runs `drsg serve … watch`, and writes that URL to
+  `.mcp.json` — is the default path, because the plane then follows the
+  repository's commits and every agent host shares one instance. `drsg-mcp` is
+  the fallback for a host that speaks only stdio or a database nothing
+  watches. Pointing both at one database never worked (a database may be
+  opened directly by one process at a time) and now says so in the chapter,
+  the sample config, and the binary's own `--help`.
+
 ## [2.3.0] - 2026-09-01
 
 ### Added

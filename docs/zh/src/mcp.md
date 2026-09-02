@@ -28,12 +28,24 @@ $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scri
 PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
 ```
 
-它同样可以从源码构建：`cargo build --release -p dr-strange-mcp`。它以第一个参数
-作为数据库路径，其次读 `$DRSG_DB`，再退回到默认值 `graph.drsg`：
+它同样可以从源码构建：`cargo build --release -p dr-strange-mcp`。数据库以
+`--db <路径>` 指定，也可以直接作为一个裸参数给出；其次读 `$DRSG_DB`，再退回到默认
+值 `graph.drsg`。`--help` 与 `--version` 只打印信息随即退出：
 
 ```console
-$ drsg-mcp /path/to/graph.drsg
+$ drsg-mcp --db /path/to/graph.drsg
+$ drsg-mcp /path/to/graph.drsg          # 同样的意思，简写
 ```
+
+数据库必须已经存在——这个服务从不创建数据库。用 `drsg digest <目录> --apply --db
+<路径>` 建立，或在仓库中运行 `drsg init`。空数据库对任何问题都只会答「什么也没
+找到」，这和一次出了错的图化毫无区别；因此路径不存在时直接报错。
+
+**首选 `drsg init`。** 它会图化本仓库、在后台拉起一个 `drsg serve … watch`，并把
+该服务的 URL 写进项目的 `.mcp.json`——此后平面会跟随仓库的提交更新，而所有宿主共用
+这一个实例（见[下一节](#跨智能体共享drsg-serve-上的-mcp)）。`drsg-mcp` 是没有这样一个
+服务时的后备：只会说 stdio 的宿主，或者无人监视的数据库。把两者同时指向同一个数据库
+是行不通的，原因见下一段。
 
 它通常由宿主启动，而不是手动运行。宿主通过命令、参数与环境变量来配置它，图工具
 所需的 LLM 提供方密钥就放在环境变量里传入：

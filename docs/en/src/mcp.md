@@ -31,12 +31,27 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 ```
 
 It can equally be built from source with `cargo build --release -p
-dr-strange-mcp`. It takes the database path as its first argument, else
-`$DRSG_DB`, else `graph.drsg`:
+dr-strange-mcp`. It takes the database as `--db <path>` or as a bare argument,
+else `$DRSG_DB`, else `graph.drsg`; `--help` and `--version` print and exit:
 
 ```console
-$ drsg-mcp /path/to/graph.drsg
+$ drsg-mcp --db /path/to/graph.drsg
+$ drsg-mcp /path/to/graph.drsg          # the same thing, short
 ```
+
+The database must already exist — this server never creates one. Build it with
+`drsg digest <dir> --apply --db <path>`, or with `drsg init` in a repository. An
+empty database would answer every question with "nothing found", which reads
+exactly like a digest that went wrong, so a path that isn't there is an error
+instead.
+
+**Reach for `drsg init` first.** It digests the repository, starts a
+`drsg serve … watch` in the background, and writes that server's URL into the
+project's `.mcp.json` — the plane then follows the repository's commits, and
+every host shares the one instance (see [below](#sharing-across-agents-mcp-on-drsg-serve)).
+`drsg-mcp` is the fallback for when no such server runs: a host that speaks
+only stdio, or a database nothing is watching. Configuring both against one
+database does not work, for the reason the next paragraph gives.
 
 It is normally launched by the host rather than run by hand. A host configures it
 by command, arguments, and environment — the environment carries any LLM provider
