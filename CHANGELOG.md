@@ -46,7 +46,14 @@ All notable changes to Dr Strange are documented here. The format is based on
   region's *makeup* rather than a listing of it: node counts by label, edge
   counts by type with each direction, how many nodes each hop added, and the
   handful of symbols that hold the region together, ranked by their edges
-  *inside* it (a global degree would rank the plane's hubs, not this corner's).
+  *inside* it (a global degree would rank the plane's hubs, not this corner's)
+  and excluding the seed, which is the centre by construction.
+
+  The region is the induced subgraph: every edge between two of its nodes,
+  including edges among the nodes the last hop reached. Without that closing
+  pass a region's last layer looks edgeless — `fathom Ok --depth 1` over this
+  repository reported 211 edges and no hub above one edge, where the same
+  region actually holds 410 edges and a clear top five.
 
   It answers a question the other verbs don't: `context` describes one symbol
   and `impact` names what reaches it, while this says what kind of place the

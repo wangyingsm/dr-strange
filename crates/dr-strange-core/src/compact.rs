@@ -555,6 +555,30 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
         frontier = next;
     }
 
+    // Close the induced subgraph. A node is swept when it is *in* the frontier,
+    // so the last hop's nodes were only ever reached, never walked from, and
+    // an edge between two of them would go uncounted — leaving them all tied
+    // at one edge apiece and the tallies short. No node is added here: the
+    // region is what the walk found.
+    for &id in &frontier {
+        for dir in [crate::Dir::Out, crate::Dir::In] {
+            for hop in plane.neighbors(id, dir, None)? {
+                if !seen.contains(&hop.node) || !counted.insert(hop.edge) {
+                    continue;
+                }
+                if let Some(edge) = plane.edge(hop.edge)? {
+                    let slot = edges.entry(edge.ty.clone()).or_default();
+                    match dir {
+                        crate::Dir::Out => slot.0 += 1,
+                        _ => slot.1 += 1,
+                    }
+                    *degree.entry(id).or_default() += 1;
+                    *degree.entry(hop.node).or_default() += 1;
+                }
+            }
+        }
+    }
+
     let reached = per_level.len();
     let region_edges: usize = counted.len();
     out.push_str(&format!(
@@ -596,13 +620,35 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
 
     // Ranked by degree *within the region*: a global degree would rank the
     // plane's hubs, not this region's.
-    let mut hubs: Vec<(crate::NodeId, usize)> = degree.into_iter().collect();
+    //
+    // Without the seed, which is the centre by construction — at depth 1 every
+    // edge touches it, so ranking it first says nothing — and without the
+    // nodes holding a single edge, which hold nothing together.
+    let mut hubs: Vec<(crate::NodeId, usize)> = degree
+        .into_iter()
+        .filter(|&(id, deg)| id != node.id && deg > 1)
+        .collect();
     hubs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
-    if !hubs.is_empty() {
-        out.push_str("hubs (by edges inside the region):\n");
-        for (id, deg) in hubs.iter().take(FATHOM_HUBS) {
-            if let Some(n) = plane.node(*id)? {
-                out.push_str(&format!("  {deg:>4}  {}\n", one_line(&n)));
+    match hubs.first() {
+        None => out.push_str("hubs: none — every node here but the seed holds a single edge\n"),
+        Some(_) => {
+            out.push_str("hubs (by edges inside the region):\n");
+            for (id, deg) in hubs.iter().take(FATHOM_HUBS) {
+                if let Some(n) = plane.node(*id)? {
+                    out.push_str(&format!("  {deg:>4}  {}\n", one_line(&n)));
+                }
+            }
+            // A listing cut mid-tie names an arbitrary few of the tied: say how
+            // many share the last degree shown, so the cut is visible.
+            if let Some(&(_, cutoff)) = hubs.get(FATHOM_HUBS.saturating_sub(1)) {
+                let tied = hubs
+                    .iter()
+                    .skip(FATHOM_HUBS)
+                    .filter(|(_, d)| *d == cutoff)
+                    .count();
+                if tied > 0 {
+                    out.push_str(&format!("  … and {tied} more with {cutoff}\n"));
+                }
             }
         }
     }
@@ -1393,13 +1439,13 @@ mod tests {
             out.contains("REFERENCES 3 (3 out, 0 in)") && out.contains("CALLS 2 (0 out, 2 in)"),
             "{out}"
         );
-        // The seed holds the region together, and says by how much.
-        assert!(out.contains("hubs (by edges inside the region):"), "{out}");
-        let hub_line = out
-            .lines()
-            .find(|l| l.starts_with("  ") && l.contains("m::hub"))
-            .unwrap_or_else(|| panic!("{out}"));
-        assert!(hub_line.trim().starts_with('5'), "{out}");
+        // A star's centre is the seed, which the ranking leaves out: nothing
+        // else here holds more than one edge, and the reply says so rather
+        // than naming an arbitrary few of the tied.
+        assert!(
+            out.contains("hubs: none — every node here but the seed holds a single edge"),
+            "{out}"
+        );
 
         // Two hops reaches the far node, and says it walked the whole depth.
         let deeper = fathom(&plane, "m::hub", 2).unwrap();
@@ -1442,6 +1488,34 @@ mod tests {
         assert!(out.contains("<unlabelled> 1"), "{out}");
         // 12 nodes, 8 groups shown one each, 4 left across 4 groups.
         assert!(out.contains("· 4 more in 4 others"), "{out}");
+    }
+
+    #[test]
+    fn fathom_says_how_many_hubs_tie_with_the_last_one_listed() {
+        // A ring of eight around the seed: every ring node holds three edges
+        // (two neighbours and the seed), so the five listed are an arbitrary
+        // five of eight equals — which the reply has to say.
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let hub = txn
+            .create_node_with_key("m::hub", &["Function"], Properties::new())
+            .unwrap();
+        let ring: Vec<_> = (0..8)
+            .map(|i| {
+                txn.create_node_with_key(&format!("m::r{i}"), &["Function"], Properties::new())
+                    .unwrap()
+            })
+            .collect();
+        for (i, &n) in ring.iter().enumerate() {
+            txn.create_edge(hub, n, "CALLS", Properties::new()).unwrap();
+            txn.create_edge(n, ring[(i + 1) % ring.len()], "CALLS", Properties::new())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let out = fathom(&db.plane("code").unwrap(), "m::hub", 1).unwrap();
+        assert!(out.contains("… and 3 more with 3"), "{out}");
     }
 
     #[test]
