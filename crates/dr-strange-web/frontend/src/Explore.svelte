@@ -1,4 +1,5 @@
 <script>
+  import { ghost } from './cypher.js'
   import { onMount, onDestroy } from 'svelte'
   import { rpc, authHeaders, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
@@ -26,10 +27,13 @@
     asOf = $bindable(null),
     history = null,
     timeTravel = false,
+    // Hands a query to the Query view, for the one it cannot answer here: a
+    // projection has no subgraph to plot.
+    onOpenQuery = () => {},
   } = $props()
 
   let newPlaneOpen = $state(false) // new-plane popup open?
-  let tab = $state('filters') // active toolbar tab: filters | graphql | algorithms | hybrid
+  let tab = $state('filters') // active toolbar tab: filters | cypher | algorithms | hybrid
 
   let container // canvas div (bind:this)
   let plot = null
@@ -541,63 +545,9 @@
     }
   }
 
-  // Keyword autocomplete for the GraphQL/Cypher box: once the word being typed
-  // is ≥2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
-  // shown after the caret; Tab accepts it. Ordered shortest-prefix first, so
-  // MATCH is offered before MATCHING and the longer one is still reachable by
-  // typing one more character.
-  const CYPHER_KEYWORDS = [
-    // sources and the clauses that follow them
-    'MATCH', 'MATCHING', 'SEARCH', 'HYBRID', 'CALL', 'BEAM', 'WHERE', 'RETURN',
-    'DISTINCT', 'ORDER BY', 'SKIP', 'LIMIT', 'AS OF', 'TIME',
-    // expression terms — ahead of the knobs so `key(` wins over KEYWORD, which
-    // is only valid inside HYBRID
-    // (`hops()` is deliberately absent: it would shadow the GRAPH channel's
-    // required HOPS keyword, which is typed far more often)
-    'key()', 'score()', 'similarity(', 'distance(',
-    // the folds a RETURN may project with (`AS` is left out: two letters, and
-    // completing it would shadow the `AS OF` above)
-    'count(*)', 'collect(', 'sum(', 'avg(', 'min(', 'max(',
-    // retrieval knobs: the vector/keyword seeds, the hybrid channels, the beam
-    'NEAR', 'METRIC', 'TOPK', 'VECTOR', 'KEYWORD', 'GRAPH', 'HOPS', 'DECAY',
-    'SEEDS', 'WEIGHT', 'CANDIDATES', 'WIDTH', 'DEPTH',
-    // algorithm names for CALL — lower-case, as they read in a query (the
-    // compiler folds case, so an accepted completion parses either way)
-    'pagerank', 'components', 'shortest_path', 'louvain',
-    // writes
-    'CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'DETACH',
-    // operators
-    'AND', 'OR', 'NOT', 'ON', 'IN', 'IS', 'NULL', 'DESC',
-  ]
-
-  // True when the caret sits inside an unterminated string literal. The words
-  // typed there are data — a document's text, an entity's key — not syntax, so
-  // completing them to keywords is noise. The language has no escapes, so this
-  // scan is exact.
-  function inStringLiteral(s) {
-    let quote = null
-    for (const ch of s) {
-      if (quote) {
-        if (ch === quote) quote = null
-      } else if (ch === '"' || ch === "'") {
-        quote = ch
-      }
-    }
-    return quote !== null
-  }
-
-  let cypherGhost = $derived.by(() => {
-    if (inStringLiteral(cypher)) return ''
-    const m = cypher.match(/([A-Za-z]+)$/) // the word currently being typed
-    if (!m || m[1].length < 2) return ''
-    const up = m[1].toUpperCase()
-    // Case-insensitive match, but complete with the keyword's own casing, so
-    // the lower-case algorithm names stay lower-case.
-    const kw = CYPHER_KEYWORDS.find(
-      (k) => k.toUpperCase().startsWith(up) && k.length > up.length,
-    )
-    return kw ? kw.slice(m[1].length) : ''
-  })
+  // The greyed completion after the caret; Tab accepts it. Shared with the
+  // Query page, so the two boxes complete the same language.
+  const cypherGhost = $derived(ghost(cypher))
   function onCypherKey(e) {
     if (e.key === 'Enter') {
       runCypher()
@@ -647,15 +597,16 @@
       }
       plot.clear()
       selected = null
-      // A projecting query (`RETURN n.name, count(*)`) answers with a table:
-      // there is no subgraph to plot, so the columns take the canvas' place.
+      // A projecting query (`RETURN n.name, count(*)`) answers with a table,
+      // which has no subgraph to plot. Rather than render a table over the
+      // canvas, say so and offer the view built to read one.
       if (out.columns) {
         queryTable = out
         legend = []
         const rows = out.rows.length
         status = `${rows} row${rows === 1 ? '' : 's'} · ${out.columns.length} column${
           out.columns.length === 1 ? '' : 's'
-        }`
+        } — a table, not a subgraph`
         return
       }
       queryTable = null
@@ -889,10 +840,6 @@
 
   // Format a channel's raw contribution for the results list (— when absent).
   const fmtCh = (v) => (v == null ? '—' : v.toFixed(2))
-
-  // A table cell: JSON null is an absent value, and a list or map shows as
-  // the JSON it is rather than `[object Object]`.
-  const cell = (v) => (v === null ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v))
 
   // ---- NL→plan ask (ROADMAP §3) -------------------------------------------
 
@@ -1317,7 +1264,7 @@
 
 <div class="tool-tabs">
   <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}><Icon name="filters" /> Filters / Operations</button>
-  <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}><Icon name="graphql" /> GraphQL / Run</button>
+  <button class:active={tab === 'cypher'} onclick={() => (tab = 'cypher')}><Icon name="query" /> Cypher / Plot</button>
   <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}><Icon name="algorithms" /> Algorithms</button>
   <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}><Icon name="hybrid" /> Hybrid</button>
   <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}><Icon name="ask" /> Ask</button>
@@ -1359,7 +1306,7 @@
     <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
     <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
   </div>
-{:else if tab === 'graphql'}
+{:else if tab === 'cypher'}
   <div class="query-bar">
     <div class="cypher-wrap">
       {#if cypherGhost}
@@ -1687,23 +1634,16 @@
   {/if}
 
   {#if queryTable}
-    <div class="hy-results query-table">
+    <div class="hy-results query-handoff">
       <header>
         <span>Table · {queryTable.rows.length} rows</span>
         <button class="close" onclick={() => (queryTable = null)} aria-label="Close">×</button>
       </header>
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>{#each queryTable.columns as c, i (`${c}:${i}`)}<th>{c}</th>{/each}</tr>
-          </thead>
-          <tbody>
-            {#each queryTable.rows as row, r (r)}
-              <tr>{#each row as v, i (i)}<td>{cell(v)}</td>{/each}</tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+      <p>
+        This query returns columns, not nodes — there is nothing to plot. The
+        <b>Query</b> view reads a table: {queryTable.columns.join(' · ')}
+      </p>
+      <button class="open-query" onclick={() => onOpenQuery(cypher)}>Open in Query</button>
     </div>
   {/if}
 

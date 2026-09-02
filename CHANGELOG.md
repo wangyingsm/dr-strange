@@ -60,6 +60,23 @@ All notable changes to Dr Strange are documented here. The format is based on
   count is exact over what was walked. `drsg fathom <name> [--depth]` and the
   `fathom` MCP tool.
 
+- **A Query view in the dashboard.** A top-level view beside Dashboard,
+  Explore and AIgest: a multi-line editor (⌘/Ctrl+Enter runs, Tab accepts the
+  keyword completion) and the result rendered as what it is — a table for a
+  projection, with row/column counts, timing and a copy-as-TSV control; a
+  record listing for a query that returns nodes; change counts for a write.
+
+  The query surface used to be a tab inside the graph view, labelled "GraphQL
+  / Run" — for a language this project does not implement, one unlabelled
+  click from a view that opens on Filters. That tab is now **Cypher / Plot**,
+  which is what it does: it seeds the canvas from a query. Reading a result as
+  data is the new view's job, which is also where a *table* belongs — a
+  projection has no subgraph to draw.
+
+  Both boxes share one keyword list and one completion routine
+  (`frontend/src/cypher.js`), so the in-app hint for the language cannot drift
+  between them.
+
 - **`type(r)`, `direction(r)` and `id(n)`.** A row's edge and its internal id,
   readable in `WHERE`, `ORDER BY` and a projection. `direction(r)` is never
   `BOTH`: `BOTH` is what the *query* asked for, while a row always walked one

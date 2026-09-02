@@ -1068,25 +1068,29 @@ nav button.active {
   padding: 0;
   overflow-y: auto;
 }
-/* A projecting query's result. Wider than the ranked lists, because a table's
-   columns are the answer and wrapping them costs more than the canvas gains. */
-.query-table {
-  width: min(46rem, 70%);
+/* A projecting query, in the view that plots: the hand-off to the Query
+   view, not a second table renderer. */
+.query-handoff {
+  width: min(28rem, 50%);
+  bottom: auto;
+  padding-bottom: 0.6rem;
 }
-.query-table .table-scroll {
-  overflow: auto;
+.query-handoff p {
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--muted);
 }
-.query-table table {
-  border-collapse: collapse;
-  font-size: 0.78rem;
-  width: 100%;
-}
-.query-table th,
-.query-table td {
-  border-bottom: 1px solid var(--border);
-  padding: 0.3rem 0.6rem;
-  text-align: left;
-  white-space: nowrap;
+.query-handoff .open-query {
+  margin: 0 0.7rem;
+  font: 13px system-ui;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.3rem 0.9rem;
+  cursor: pointer;
 }
 .query-table th {
   color: var(--muted);
@@ -2442,3 +2446,215 @@ nav button,
   padding: 0 0.25rem;
   opacity: 0.8;
 }
+
+/* ---- Query page (a top-level view: an editor, then its result) ---------- */
+
+.query-page {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0 0.75rem 1rem;
+}
+.q-editor {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem;
+}
+/* The ghost is a copy of the text under the textarea, so the completion has
+   to sit at exactly the same place at every wrap point: same box, same
+   typography, same padding, and the textarea transparent above it. */
+.q-input-wrap {
+  position: relative;
+}
+.q-text,
+.q-ghost {
+  font: 13px/1.5 ui-monospace, monospace;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.q-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 7.5rem;
+  resize: vertical;
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border);
+  position: relative;
+}
+.q-text:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.q-ghost {
+  position: absolute;
+  inset: 0;
+  color: var(--muted);
+  pointer-events: none;
+  overflow: hidden;
+}
+.q-ghost .typed {
+  visibility: hidden;
+}
+.q-ghost .tab-key {
+  margin-left: 0.4rem;
+  padding: 0 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.7rem;
+}
+.q-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.q-actions .grow {
+  flex: 1;
+}
+.q-actions .run {
+  font: 14px system-ui;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.35rem 1.1rem;
+  cursor: pointer;
+}
+.q-actions .run:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.q-actions kbd {
+  font: 11px ui-monospace, monospace;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
+.q-actions select {
+  font: 13px system-ui;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.25rem 0.4rem;
+}
+.q-plane b {
+  color: var(--fg);
+}
+.q-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.q-examples button {
+  font: 12px system-ui;
+  color: var(--muted);
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  cursor: pointer;
+}
+.q-examples button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.q-error {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  font: 13px/1.5 ui-monospace, monospace;
+  color: var(--warn-fg);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-edge);
+  border-radius: 8px;
+  white-space: pre-wrap;
+}
+.q-result {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.q-result header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.q-result .q-note {
+  text-transform: none;
+  letter-spacing: normal;
+}
+.q-result .copy {
+  font: 11px system-ui;
+  text-transform: none;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+}
+.q-result .copy:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.q-scroll {
+  overflow: auto;
+  max-height: 60vh;
+}
+.q-result table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.8rem;
+}
+.q-result th,
+.q-result td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.35rem 0.7rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.q-result th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font-weight: 600;
+}
+.q-result td {
+  font-family: ui-monospace, monospace;
+}
+.q-result .q-props {
+  color: var(--muted);
+  max-width: 42rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.q-empty,
+.q-write {
+  margin: 0;
+  padding: 0.7rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.q-write {
+  color: var(--ok);
+  font-family: ui-monospace, monospace;
+}
+

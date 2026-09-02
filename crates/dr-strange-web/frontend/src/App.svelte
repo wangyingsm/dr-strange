@@ -4,6 +4,7 @@
   import { loadPref, savePref } from './prefs.js'
   import Dashboard from './Dashboard.svelte'
   import Explore from './Explore.svelte'
+  import Query from './Query.svelte'
   import Digest from './Digest.svelte'
   import Icon from './Icon.svelte'
 
@@ -18,6 +19,15 @@
   let embedProvider = $state(loadPref('embedProvider', 'openai'))
   let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
+  // A query handed over from Explore's plot box, because it answers with a
+  // table and there is nothing to plot: { text, nonce } → the Query view runs
+  // it. The nonce makes handing over the *same* query twice still count.
+  let handover = $state(null)
+
+  function openQuery(text) {
+    handover = { text, nonce: Date.now() }
+    view = 'query'
+  }
 
   // Time-travel (ROADMAP §4): an app-wide "viewing as of" cursor. `plane.history`
   // answers only on a native server, so a successful probe both proves the
@@ -232,6 +242,9 @@
     <button class:active={view === 'explore'} onclick={() => (view = 'explore')}>
       <Icon name="explore" /> Explore
     </button>
+    <button class:active={view === 'query'} onclick={() => (view = 'query')}>
+      <Icon name="query" /> Query
+    </button>
     <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
       <Icon name="aigest" /> AIgest
     </button>
@@ -243,7 +256,9 @@
 {#if view === 'dashboard'}
   <Dashboard {plane} {onPlaneCreated} {onPlaneDeleted} onSelectPlane={(name) => (plane = name)} />
 {:else if view === 'explore'}
-  <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} />
+  <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} onOpenQuery={openQuery} />
+{:else if view === 'query'}
+  <Query {plane} {handover} />
 {:else}
   <Digest {plane} {onPlaneCreated} />
 {/if}
