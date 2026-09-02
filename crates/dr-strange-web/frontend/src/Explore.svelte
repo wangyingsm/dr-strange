@@ -27,8 +27,7 @@
     asOf = $bindable(null),
     history = null,
     timeTravel = false,
-    // Hands a query to the Query view, for the one it cannot answer here: a
-    // projection has no subgraph to plot.
+    // Hands a query to the Query view: a projection has no subgraph to plot.
     onOpenQuery = () => {},
   } = $props()
 
@@ -546,7 +545,7 @@
   }
 
   // The greyed completion after the caret; Tab accepts it. Shared with the
-  // Query page, so the two boxes complete the same language.
+  // Query page.
   const cypherGhost = $derived(ghost(cypher))
   function onCypherKey(e) {
     if (e.key === 'Enter') {
@@ -597,9 +596,8 @@
       }
       plot.clear()
       selected = null
-      // A projecting query (`RETURN n.name, count(*)`) answers with a table,
-      // which has no subgraph to plot. Rather than render a table over the
-      // canvas, say so and offer the view built to read one.
+      // A projecting query answers with a table, which has no subgraph to
+      // plot: say so and offer the view that reads one.
       if (out.columns) {
         queryTable = out
         legend = []

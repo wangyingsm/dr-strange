@@ -535,8 +535,8 @@ fn agg_func(name: &str) -> Option<AggFunc> {
     })
 }
 
-/// `count(*)` / `count(DISTINCT n.file)` / `sum(n.year)`. `*` is only
-/// `count`'s: every other fold needs a value to fold.
+/// `count(*)` / `count(DISTINCT n.file)` / `sum(n.year)`. Only `count` takes
+/// `*`; every other fold reads a value.
 fn agg_call(i: &str) -> IResult<&str, (AggFunc, Option<PExpr>, bool)> {
     let (i, name) = ident(i)?;
     let fail = || nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Tag));
@@ -556,8 +556,8 @@ fn agg_call(i: &str) -> IResult<&str, (AggFunc, Option<PExpr>, bool)> {
     Ok((i, (func, arg, distinct.is_some())))
 }
 
-/// `AS <alias>`, which `AS OF` is not: the time-travel clause may follow a
-/// `RETURN` item, so an `of` here belongs to it and not to this item.
+/// `AS <alias>`. Not `AS OF`: that clause may follow a `RETURN` item, so an
+/// `of` here belongs to it.
 fn alias(i: &str) -> IResult<&str, Option<String>> {
     opt(preceded(
         kw("as"),
@@ -574,8 +574,8 @@ fn return_item(i: &str) -> IResult<&str, ReturnItem> {
     if let Ok((rest, _)) = symbol("*")(i) {
         return Ok((rest, ReturnItem::Star));
     }
-    // An aggregate before a plain expression, since `count(…)` is not one of
-    // the expression language's functions and would fail there.
+    // Before a plain expression: `count(…)` is not one of the expression
+    // language's functions.
     if let Ok((rest, (text, (func, arg, distinct)))) = consumed(agg_call)(i) {
         let (rest, alias) = alias(rest)?;
         return Ok((
@@ -598,7 +598,7 @@ fn return_item(i: &str) -> IResult<&str, ReturnItem> {
             },
         ));
     }
-    // A bare variable: the rows themselves, not a value of them.
+    // A bare variable: the rows themselves.
     map(ident, ReturnItem::Var)(i)
 }
 
@@ -612,7 +612,7 @@ fn is_clause_word(word: &str) -> bool {
 fn order_key(i: &str) -> IResult<&str, OrderKey> {
     let (i, (text, target)) = consumed(alt((
         map(expr, SortTarget::Expr),
-        // A bare name is a RETURN alias — only a projecting query has one.
+        // A bare name is a RETURN alias.
         map(
             verify(ident, |name: &String| !is_clause_word(name)),
             SortTarget::Name,

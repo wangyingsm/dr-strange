@@ -162,9 +162,8 @@ pub struct SortKey {
 
 /// One projected column: a name and what it computes.
 ///
-/// The name is what the caller sees as a table header, so it carries the
-/// query's own wording — an alias when one was written, otherwise the item's
-/// source text (`n.name`, `count(*)`).
+/// The name is the table header: the query's alias, or the item's source text
+/// (`n.name`, `count(*)`) when it wrote none.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjItem {
     pub name: String,
@@ -189,20 +188,17 @@ impl ProjItem {
     }
 }
 
-/// What a projected column computes: a value per row, or an aggregate over a
-/// group of them.
+/// What a projected column computes: a value per row, or a fold over a group
+/// of rows.
 ///
-/// Two cases rather than an [`Expr`] variant, because an aggregate is not a
-/// value a row has: it is a fold over rows, and it only means anything in a
-/// projection. Keeping it out of `Expr` is what makes `WHERE count(*) > 3`
-/// unwritable instead of silently `Null` — the same reason [`Projection`] is
-/// a tail rather than a [`Step`].
+/// Two cases rather than an [`Expr`] variant: an aggregate is a fold over
+/// rows, not a value a row has, and only a projection can evaluate one.
+/// Keeping it out of `Expr` makes `WHERE count(*) > 3` unwritable rather than
+/// silently `Null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ProjExpr {
-    /// One value per row — and, the moment any *other* column aggregates,
-    /// also a grouping key. Cypher's implicit `GROUP BY`: what a query lists
-    /// beside its aggregates is what it wants them broken down by, so making
-    /// it explicit would only add a way to disagree with itself.
+    /// One value per row, and a grouping key once any other column
+    /// aggregates — Cypher's implicit `GROUP BY`.
     Value(Expr),
     Agg(Agg),
 }
@@ -211,18 +207,17 @@ pub enum ProjExpr {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Agg {
     pub func: AggFunc,
-    /// The expression folded, evaluated per row. `None` is `count(*)`: the
-    /// one aggregate that still has something to count — rows — when there is
-    /// no expression to read.
+    /// The expression folded, evaluated per row. `None` is `count(*)`, which
+    /// counts rows and so needs none.
     pub arg: Option<Expr>,
-    /// Fold each distinct value once — `count(DISTINCT n.file)`. Distinctness
-    /// is by the same total order [`Projection::distinct`] uses.
+    /// Fold each distinct value once — `count(DISTINCT n.file)`, by the total
+    /// order [`Projection::distinct`] uses.
     pub distinct: bool,
 }
 
 impl Agg {
-    /// `count(*)` — rows in the group, the one aggregate that counts rows
-    /// rather than values, so a row with nothing but nulls still counts.
+    /// `count(*)` — rows in the group, including rows whose every value is
+    /// null.
     pub fn count() -> Self {
         Self {
             func: AggFunc::Count,
@@ -240,8 +235,8 @@ impl Agg {
         }
     }
 
-    /// Fold each distinct value once. On `count(*)`, which reads no value,
-    /// this says nothing and changes nothing.
+    /// Fold each distinct value once. No effect on `count(*)`, which reads
+    /// no value.
     pub fn distinct(mut self) -> Self {
         self.distinct = true;
         self
@@ -250,36 +245,29 @@ impl Agg {
 
 /// Which fold an [`Agg`] performs.
 ///
-/// Each is **total**, like every other evaluation here: nulls are skipped
-/// rather than poisoning the group, and a value the fold cannot use (a string
-/// under `sum`) is skipped the same way, so an aggregate over soft-schema
-/// data reports what it could read instead of failing the query. What each
-/// returns for a group that gave it nothing is the one place they differ, and
-/// each answer is the honest one — see [`crate::compute::exec`].
+/// All are total: a null, or a value the fold cannot use (a string under
+/// `sum`), is skipped rather than failing the query. They differ in what they
+/// return for a group that gave them nothing — see [`crate::compute::exec`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggFunc {
-    /// How many — rows for `count(*)`, non-null values otherwise. `0` when
-    /// there were none, which is a real answer rather than an absent one.
+    /// How many: rows for `count(*)`, non-null values otherwise. `0` over
+    /// nothing.
     Count,
-    /// Numeric total; `0` over nothing, for the same reason. Stays exact
-    /// (`Int`) while every value is an integer.
+    /// Numeric total; `0` over nothing. Stays `Int` while every value is one.
     Sum,
-    /// Numeric mean as a `Float`, and `Null` over nothing — unlike a sum,
-    /// the mean of no values is not zero, it is unanswerable.
+    /// Numeric mean as a `Float`; `Null` over nothing, since the mean of no
+    /// values is unanswerable rather than zero.
     Avg,
-    /// Least value under the total order, `Null` over nothing.
+    /// Least value under the total order; `Null` over nothing.
     Min,
-    /// Greatest value under the total order, `Null` over nothing.
+    /// Greatest value under the total order; `Null` over nothing.
     Max,
-    /// Every non-null value as a `List`, in the order the rows arrived —
-    /// which is how a group keeps its members instead of just counting them.
+    /// Every non-null value as a `List`, in row order.
     Collect,
 }
 
-/// Ordering over projected tuples, by **column index** rather than expression.
-///
-/// Once a plan projects, the node row is gone and a column is the only thing
-/// left to address — which is also why Cypher makes you order by an alias.
+/// Ordering over projected tuples, by **column index** rather than
+/// expression: after a projection a column is all there is to address.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TupleSortKey {
     pub column: usize,
@@ -288,16 +276,12 @@ pub struct TupleSortKey {
 
 /// The terminal that turns node rows into value rows (arch/03 §2's `Project`).
 ///
-/// A **tail**, not a [`Step`], because a projection ends the node-row stream:
-/// nothing downstream of it can expand or filter a node any more. Modelling it
-/// as a field makes "the projection is last" unrepresentable-otherwise instead
-/// of a rule the executor has to enforce, and it keeps `Step` homogeneous —
-/// every variant still means the same thing about the same kind of row.
+/// A **tail**, not a [`Step`]: nothing downstream of a projection can expand
+/// or filter a node, so as a field "the projection is last" is
+/// unrepresentable-otherwise rather than a rule the executor enforces.
 ///
-/// `order_by`/`skip`/`limit` live here rather than as steps for the same
-/// reason: applied to tuples, they mean something different from the same
-/// operations applied to node rows, and a query that projects wants the tuple
-/// reading.
+/// `order_by`/`skip`/`limit` are here for the same reason — over tuples they
+/// mean something different from the steps of the same name over node rows.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Projection {
     /// Output columns, in order.

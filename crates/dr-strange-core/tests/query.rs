@@ -201,7 +201,7 @@ fn run_query_suite(db: &Database) {
         ]
     );
 
-    // the projection tail returns a table — named columns of values, no nodes
+    // the projection tail: named columns of values, no nodes
     let table = plane
         .query()
         .scan_label("Paper")
@@ -270,8 +270,8 @@ fn projection_tail_operators_count_tuples_not_nodes() {
     build_fixture(&db);
     let plane = db.plane("startup").unwrap();
 
-    // DISTINCT over tuples is a different question from DISTINCT over node
-    // ids: p1's two citations are two node rows carrying one `CITES` tuple.
+    // DISTINCT over tuples, not node ids: p1's two citations are two node
+    // rows carrying one `CITES` tuple.
     let table = plane
         .query()
         .seek_keys(["p1"])
@@ -283,7 +283,7 @@ fn projection_tail_operators_count_tuples_not_nodes() {
     assert_eq!(table.columns, vec!["type(r)"]);
     assert_eq!(table.rows, vec![vec![PropValue::Str("CITES".into())]]);
 
-    // ORDER BY addresses a column, and SKIP/LIMIT count the tuples it ordered.
+    // ORDER BY addresses a column; SKIP/LIMIT count the tuples it ordered.
     let table = plane
         .query()
         .scan_label("Paper")
@@ -305,9 +305,8 @@ fn aggregates_fold_the_rows_of_each_group() {
     build_fixture(&db);
     let plane = db.plane("startup").unwrap();
 
-    // "How many papers does each paper cite, and which years?" — one query,
-    // grouped by a binding the row passed through rather than the node it
-    // ended on. p1 cites p2(2019) and p3(2021); p2 cites p3.
+    // Grouped by a binding the row passed through, not the node it ended on.
+    // p1 cites p2(2019) and p3(2021); p2 cites p3.
     let table = plane
         .query()
         .scan_label("Paper")
@@ -340,8 +339,7 @@ fn aggregates_fold_the_rows_of_each_group() {
         ]
     );
 
-    // Nothing to group by is one group over the whole match — and it answers
-    // even when the match is empty.
+    // Nothing to group by is one group over the whole match, empty or not.
     let table = plane
         .query()
         .scan_label("Ghost")

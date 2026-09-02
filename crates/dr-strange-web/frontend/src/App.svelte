@@ -19,9 +19,9 @@
   let embedProvider = $state(loadPref('embedProvider', 'openai'))
   let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
-  // A query handed over from Explore's plot box, because it answers with a
-  // table and there is nothing to plot: { text, nonce } → the Query view runs
-  // it. The nonce makes handing over the *same* query twice still count.
+  // A query handed over from Explore's plot box because it answers with a
+  // table: { text, nonce } → the Query view runs it. The nonce makes the same
+  // query hand over twice.
   let handover = $state(null)
 
   function openQuery(text) {

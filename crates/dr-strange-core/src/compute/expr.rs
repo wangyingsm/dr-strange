@@ -1262,6 +1262,16 @@ mod tests {
         bare.add(&edge_type().eq("CALLS"));
         assert!(bare.last_edge);
         assert_eq!(bare.nodes, None);
+
+        // The walk reaches through every operator that holds subexpressions,
+        // not only comparison: a binding named inside a string predicate, an
+        // `IN`, a negation or an `IS NULL` is still one the executor has to
+        // resolve.
+        let mut nested = BindingNeed::default();
+        nested.add(&at_node(3, p("file")).contains("src"));
+        nested.add(&at_node(4, p("tag")).is_in(p("tags")));
+        nested.add(&at_node(6, p("x")).is_null().not());
+        assert_eq!(nested.nodes, Some(6));
     }
 
     #[test]

@@ -870,8 +870,7 @@ fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
 }
 
 /// Render what a read query returns: a table when its plan projects, its
-/// nodes otherwise. The plan says which — a caller that asked for columns
-/// gets columns, and every other query answers exactly as it always has.
+/// nodes otherwise.
 fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> AnyResult<Value> {
     match q.plan().project.is_some() {
         true => Ok(json::table_to_json(&q.table()?)),

@@ -2247,50 +2247,47 @@ impl<'db> QueryBuilder<'db> {
 
     // ---- projection tail (return a table, not node rows) -----------------
 
-    /// Project each row to a tuple of named columns — the query's `RETURN
-    /// n.name, type(r)` (arch/03 §2's `Project`).
+    /// Project each row to a tuple of named columns — `RETURN n.name,
+    /// type(r)` (arch/03 §2's `Project`).
     ///
-    /// A tail, not a step: it ends the node-row stream, so the terminal that
-    /// reads it is [`table`](Self::table) rather than `nodes`/`ids`. The
-    /// columns see the row's current node and, through `Expr::At`, any earlier
-    /// pattern binding.
+    /// A tail, not a step: [`table`](Self::table) reads it, where `nodes`/`ids`
+    /// read node rows. Columns see the current node and, through `Expr::At`,
+    /// any earlier pattern binding.
     pub fn project(mut self, items: impl IntoIterator<Item = ProjItem>) -> Self {
         self.tail().items = items.into_iter().collect();
         self
     }
 
-    /// Deduplicate whole projected tuples — `RETURN DISTINCT n.file`, which
-    /// asks something different from [`distinct`](Self::distinct)'s "by node
-    /// id": two different nodes in the same file are one row here and two
-    /// rows there.
+    /// Deduplicate whole projected tuples — `RETURN DISTINCT n.file`. Two
+    /// nodes in one file are one row here, two under
+    /// [`distinct`](Self::distinct)'s node ids.
     pub fn project_distinct(mut self) -> Self {
         self.tail().distinct = true;
         self
     }
 
-    /// Order the projected tuples by column index, as Cypher orders by an
-    /// alias — once a plan projects, a column is all there is left to address.
+    /// Order the projected tuples by column index — after a projection, a
+    /// column is all there is to address.
     pub fn order_by_columns(mut self, keys: impl IntoIterator<Item = TupleSortKey>) -> Self {
         self.tail().order_by = keys.into_iter().collect();
         self
     }
 
-    /// Drop the first `n` *tuples* — after `DISTINCT` and the ordering above,
-    /// which is what makes it a different question from [`skip`](Self::skip).
+    /// Drop the first `n` *tuples*, after `DISTINCT` and the ordering above —
+    /// where [`skip`](Self::skip) drops node rows.
     pub fn project_skip(mut self, n: u64) -> Self {
         self.tail().skip = Some(n);
         self
     }
 
-    /// Keep at most `n` *tuples*, on the same footing as
-    /// [`project_skip`](Self::project_skip).
+    /// Keep at most `n` *tuples*, like [`project_skip`](Self::project_skip).
     pub fn project_limit(mut self, n: u64) -> Self {
         self.tail().limit = Some(n);
         self
     }
 
-    /// The projection tail, created empty on first use so the setters above
-    /// compose in any order.
+    /// The projection tail, created empty on first use so the setters compose
+    /// in any order.
     fn tail(&mut self) -> &mut Projection {
         self.plan.project.get_or_insert_with(Projection::default)
     }
@@ -2417,11 +2414,11 @@ impl<'db> QueryBuilder<'db> {
         })
     }
 
-    /// Run the plan through its projection tail and return the resulting
-    /// [`Table`] — the terminal for a query that [`project`](Self::project)ed.
+    /// Run the plan through its projection tail — the terminal for a query
+    /// that [`project`](Self::project)ed.
     ///
     /// A plan that never projected has no columns and yields one empty tuple
-    /// per matching row; [`nodes`](Self::nodes) is what reads those.
+    /// per row; [`nodes`](Self::nodes) reads those.
     pub fn table(&self) -> Result<Table> {
         self.with_reader(|reader| exec::execute_table(&self.plan, reader, self.plane.deadline))
     }

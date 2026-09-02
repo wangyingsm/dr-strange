@@ -3,9 +3,9 @@
   import { loadPref, savePref } from './prefs.js'
   import { cell, ghost, toTsv } from './cypher.js'
 
-  // `plane` is the app-wide current plane; a query names no plane of its own,
-  // so this is what it runs against. `handover` is a query Explore sent here
-  // because it answers with a table: { text, nonce }.
+  // `plane` is the app-wide current plane, which a query names none of its
+  // own. `handover` is a query Explore sent here because it answers with a
+  // table: { text, nonce }.
   let { plane, handover = null } = $props()
 
   // Providers with an embedding endpoint, for a text `SEARCH … NEAR "…"`
@@ -29,9 +29,8 @@
 
   const completion = $derived(ghost(text))
 
-  // A handover arrives already run once, in the view that couldn't show it, so
-  // running it again here is what the reader is waiting for. Keyed by nonce so
-  // the same query sent twice still lands.
+  // A handover ran once already, in the view that could not show it. Keyed by
+  // nonce so the same query sent twice still runs.
   let handled = $state(null)
   $effect(() => {
     if (handover && handover.nonce !== handled) {
@@ -41,10 +40,9 @@
     }
   })
 
-  // Ctrl/Cmd+Enter runs; plain Enter is a newline, because this is an editor
-  // and a query worth a page is a query worth several lines. Tab takes the
-  // completion when there is one, and otherwise leaves focus alone — a
-  // keyboard user must be able to get out of the box.
+  // Ctrl/Cmd+Enter runs; plain Enter is a newline. Tab takes the completion
+  // when there is one and otherwise moves focus, so a keyboard user can leave
+  // the box.
   function onKey(e) {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault()
@@ -65,8 +63,8 @@
     savePref('embedProvider', provider)
     const started = performance.now()
     try {
-      // The web-only POST /cypher endpoint (not an RPC method), so this is a
-      // raw fetch carrying the bearer token the RPC client would add.
+      // POST /cypher is web-only, not an RPC method: a raw fetch carrying the
+      // bearer token the RPC client would add.
       const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(provider)}`
       const res = await fetch(url, {
         method: 'POST',
@@ -76,8 +74,7 @@
       if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
       const out = await res.json()
       elapsed = Math.round(performance.now() - started)
-      // Three shapes, one endpoint: a projection answers with columns, a read
-      // with nodes, a write with counts.
+      // Three shapes from one endpoint: columns, nodes, or change counts.
       if (out.columns) result = { table: out }
       else if (out.write) result = { write: out }
       else result = { records: out }
@@ -96,12 +93,10 @@
     setTimeout(() => (copied = false), 1200)
   }
 
-  // A returned node shown as a row: its key, what it is, and the properties
-  // that fit. The plot is Explore's job — here the answer is the records.
+  // A returned node as a row: key, labels, and the properties that fit.
   //
   // Not named `props`: a local binding by that name makes `$props` read as a
-  // store subscription, which Svelte warns about and would eventually be a
-  // real bug rather than a warning.
+  // store subscription, which Svelte warns about.
   function propSummary(node) {
     return Object.entries(node.properties ?? {})
       .filter(([, v]) => v !== null && typeof v !== 'object')
@@ -126,8 +121,8 @@
 <section class="query-page">
   <div class="q-editor">
     <div class="q-input-wrap">
-      <!-- The ghost sits behind the textarea with identical typography, so
-           the completion lines up after the caret at any wrap point. -->
+      <!-- Behind the textarea with identical typography, so the completion
+           lines up after the caret at any wrap point. -->
       <div class="q-ghost" aria-hidden="true"><span class="typed">{text}</span>{completion}{#if completion}<span class="tab-key">Tab</span>{/if}</div>
       <textarea
         class="q-text"

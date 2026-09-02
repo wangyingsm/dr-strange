@@ -694,8 +694,7 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 /// Render what a read query returns: a table when its plan projects, its
-/// scored nodes otherwise. The plan is what says which, so a caller that
-/// asked for columns gets columns and every other query is unchanged.
+/// scored nodes otherwise.
 fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> Result<Value, RpcError> {
     match q.plan().project.is_some() {
         true => Ok(json::table_to_json(&app(q.table())?)),
@@ -818,8 +817,7 @@ pub fn cypher_subgraph(
         }
     };
 
-    // A query that projects answers with a table, and a table has no induced
-    // subgraph to plot — the columns are the answer.
+    // A projecting query has no induced subgraph to plot.
     let q = plane.query_from_plan(plan);
     if q.plan().project.is_some() {
         return Ok(json::table_to_json(&app(q.table())?));

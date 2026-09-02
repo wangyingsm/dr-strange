@@ -145,8 +145,7 @@ async fn serves_dashboard_and_rpc() {
     assert_eq!(cyv["count"], 1);
     assert_eq!(cyv["nodes"][0]["external_key"], "alice");
 
-    // A projecting query answers with a table instead of a subgraph — the
-    // columns are the answer, so there is nothing to plot.
+    // A projecting query answers with a table, not a subgraph.
     let table = client
         .post(format!("{base}/cypher?plane=startup"))
         .header("origin", &base)

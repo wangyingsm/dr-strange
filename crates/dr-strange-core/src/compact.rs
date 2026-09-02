@@ -479,20 +479,17 @@ pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     Ok(out)
 }
 
-/// `fathom` — read one region of the graph closely and report what is in it:
-/// the makeup of everything within `depth` hops of a symbol, in both
-/// directions, rather than a listing of it.
+/// `fathom` — the makeup of everything within `depth` hops of a symbol, both
+/// directions: counts by label and edge type, nodes added per hop, and the
+/// hubs holding the region together.
 ///
-/// The complement of [`impact`], which names the individual nodes that reach a
-/// symbol. Here the names are the *answer's* smallest part: a region of a few
-/// hundred nodes is a wall of lines and a paragraph of counts, and the counts
-/// are what say "this is a call-heavy corner of the parser, and these four
-/// symbols hold it together".
+/// The complement of [`impact`], which lists the nodes reaching a symbol. A
+/// region of a few hundred nodes is a wall of names; the counts are the
+/// answer.
 ///
-/// Bounded twice over, and it says which bound it hit. `depth` limits how far
-/// it walks, and [`FATHOM_BUDGET`] limits how much: a hub two hops from
-/// everything would otherwise pull in the plane. Every count is exact for what
-/// it walked — a budget stop truncates the *region*, never the tallies over it.
+/// Bounded by `depth` and by [`FATHOM_BUDGET`], and the reply says which bound
+/// stopped it. Counts are exact over what was walked — a budget stop truncates
+/// the region, not the tallies.
 pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<String> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -508,8 +505,7 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
         out.push_str(&note);
     }
 
-    // Walked breadth-first so a truncated region is the *nearest* one — the
-    // part of the graph the question was actually about.
+    // Breadth-first, so a truncated region is the nearest one.
     let mut seen = BTreeSet::from([node.id]);
     let mut per_level: Vec<usize> = Vec::new();
     let mut labels: BTreeMap<String, usize> = BTreeMap::new();
@@ -528,8 +524,8 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
                     let Some(edge) = plane.edge(hop.edge)? else {
                         continue;
                     };
-                    // An edge is counted once, from whichever end reaches it
-                    // first — a hop walked from both ends is one edge, not two.
+                    // Counted once, from whichever end reaches it first: a
+                    // hop walked from both ends is one edge.
                     if counted.insert(hop.edge) {
                         let slot = edges.entry(edge.ty.clone()).or_default();
                         match dir {
@@ -598,8 +594,8 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
         )
     ));
 
-    // The hubs: what holds this region together, by degree *within it*. A
-    // symbol's global degree would rank the plane's hubs, not this corner's.
+    // Ranked by degree *within the region*: a global degree would rank the
+    // plane's hubs, not this region's.
     let mut hubs: Vec<(crate::NodeId, usize)> = degree.into_iter().collect();
     hubs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
     if !hubs.is_empty() {
@@ -612,7 +608,7 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     }
 
     out.push_str(&match (budget_hit, reached < depth) {
-        // Which bound stopped it, in the terms the caller can act on.
+        // Which bound stopped the walk.
         (true, _) => format!(
             "note: stopped at the {FATHOM_BUDGET}-node budget, so the region is the nearest \
              part of a larger one; counts are exact over what was walked. Narrow it with a \
@@ -628,9 +624,8 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
     Ok(out)
 }
 
-/// Nodes a single `fathom` walks before it stops and says so. A hub two hops
-/// from everything would otherwise pull in the plane, and a reply nobody can
-/// read is not an answer.
+/// Nodes one `fathom` walks before stopping and saying so: a hub two hops
+/// from everything would otherwise pull in the plane.
 const FATHOM_BUDGET: usize = 5_000;
 /// Label and edge-type groups named before the rest are summed as "others".
 const FATHOM_GROUPS: usize = 8;
@@ -644,12 +639,11 @@ fn tally_labels(n: &NodeRecord, out: &mut std::collections::BTreeMap<String, usi
     }
 }
 
-/// Counted groups, biggest first, with the tail summed rather than dropped —
-/// so the parts add up to the total the caller was just given.
+/// Counted groups, biggest first, with the elided tail summed rather than
+/// dropped, so the parts add up to the total above them.
 ///
-/// Each item is its own rendered text paired with the count it sorts and sums
-/// by, because a group's text is not always just "name count": an edge type
-/// carries its two directions as well.
+/// Each item is its rendered text paired with the count it sorts and sums by:
+/// an edge type's text also carries its two directions.
 fn ranked(mut items: Vec<(String, usize)>, cap: usize) -> String {
     if items.is_empty() {
         return "none".to_string();
@@ -1376,7 +1370,7 @@ mod tests {
             txn.create_edge(*c, hub, "CALLS", Properties::new())
                 .unwrap();
         }
-        // One node two hops out, so a depth of 1 genuinely stops short of it.
+        // One node two hops out, which depth 1 stops short of.
         let far = txn
             .create_node_with_key("m::far", &["Function"], Properties::new())
             .unwrap();
@@ -1386,7 +1380,7 @@ mod tests {
         let plane = db.plane("code").unwrap();
 
         let out = fathom(&plane, "m::hub", 1).unwrap();
-        // The makeup: counts by label and by edge type, each with its direction.
+        // Counts by label and by edge type, each with its direction.
         assert!(
             out.contains("region: 1 hop out and in — 6 nodes, 5 edges"),
             "{out}"
@@ -1399,7 +1393,7 @@ mod tests {
             out.contains("REFERENCES 3 (3 out, 0 in)") && out.contains("CALLS 2 (0 out, 2 in)"),
             "{out}"
         );
-        // The seed holds this region together, and says by how much.
+        // The seed holds the region together, and says by how much.
         assert!(out.contains("hubs (by edges inside the region):"), "{out}");
         let hub_line = out
             .lines()
@@ -1415,13 +1409,65 @@ mod tests {
             "{deeper}"
         );
 
-        // Asked for more than there is, it says where the region actually ends
-        // rather than implying it looked that far.
+        // Asked for more hops than there are, it says where the region ends.
         let past = fathom(&plane, "m::hub", 5).unwrap();
         assert!(
             past.contains("region ends at 2 hops, short of the 5"),
             "{past}"
         );
+    }
+
+    #[test]
+    fn fathom_names_what_it_cannot_group_and_sums_the_tail_it_elides() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let hub = txn
+            .create_node_with_key("m::hub", &["Function"], Properties::new())
+            .unwrap();
+        // A node with no label at all — soft-schema data has them.
+        let bare = txn.create_node(&[], Properties::new()).unwrap();
+        txn.create_edge(hub, bare, "REFERENCES", Properties::new())
+            .unwrap();
+        // Ten label kinds, so the listing elides and accounts for the rest.
+        for i in 0..10 {
+            let n = txn
+                .create_node_with_key(&format!("m::n{i}"), &[&format!("L{i}")], Properties::new())
+                .unwrap();
+            txn.create_edge(hub, n, "CALLS", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let out = fathom(&db.plane("code").unwrap(), "m::hub", 1).unwrap();
+        assert!(out.contains("<unlabelled> 1"), "{out}");
+        // 12 nodes, 8 groups shown one each, 4 left across 4 groups.
+        assert!(out.contains("· 4 more in 4 others"), "{out}");
+    }
+
+    #[test]
+    fn fathom_stops_at_its_budget_and_says_which_bound_it_hit() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let hub = txn
+            .create_node_with_key("m::hub", &["Function"], Properties::new())
+            .unwrap();
+        // More nodes than the budget, so the budget is what stops the walk.
+        for i in 0..=FATHOM_BUDGET {
+            let n = txn
+                .create_node_with_key(&format!("m::n{i}"), &["Function"], Properties::new())
+                .unwrap();
+            txn.create_edge(hub, n, "CALLS", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let out = fathom(&db.plane("code").unwrap(), "m::hub", 3).unwrap();
+        assert!(
+            out.contains(&format!("stopped at the {FATHOM_BUDGET}-node budget")),
+            "{out}"
+        );
+        // The tallies still cover what it walked.
+        assert!(out.contains("CALLS"), "{out}");
     }
 
     #[test]

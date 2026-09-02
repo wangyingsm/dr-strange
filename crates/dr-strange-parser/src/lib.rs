@@ -43,15 +43,14 @@
 //!   external key `key(a)`, and the scoring terms `score()`, `hops()`,
 //!   `similarity(a.prop, "text"|[..][, metric])`, `distance(...)` (usable in
 //!   `ORDER BY` too — a brute-force rank).
-//! - `RETURN [DISTINCT] <var|*>` — the matching rows as node records — or a
-//!   **projection**: `RETURN a.name, count(*) AS n [AS <alias>], …`, where each
-//!   item becomes a column named by its alias or by the item as written, over
-//!   any variable the pattern bound (an earlier one compiles to `Expr::At`).
-//!   The folds are `count`/`sum`/`avg`/`min`/`max`/`collect`, each optionally
-//!   `DISTINCT`, grouped by every column that isn't one.
-//! - `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n` — over node rows these
-//!   are steps; over a projection they ride on the tail, and `ORDER BY` names a
-//!   returned column (by alias, or by the expression it returned).
+//! - `RETURN [DISTINCT] <var|*>` — node records — or a **projection**:
+//!   `RETURN a.name, count(*) AS n, …`, each item a column named by its alias
+//!   or its own text, over any variable the pattern bound (an earlier one
+//!   compiles to `Expr::At`). Folds: `count`/`sum`/`avg`/`min`/`max`/`collect`,
+//!   each optionally `DISTINCT`, grouped by every column that isn't one.
+//! - `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n` — steps over node rows;
+//!   on the projection tail otherwise, where `ORDER BY` names a returned column
+//!   (by alias, or by the expression it returned).
 //! - **`AS OF <seq|"RFC-3339"|TIME <ms>>`** — last clause; reads a past
 //!   snapshot (native backend). Not a plan node: it rides on [`ReadQuery`] for
 //!   the surface to apply with `PlaneHandle::as_of`.
@@ -83,7 +82,7 @@
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning the *rows* of a non-terminal variable (`RETURN p` after a hop);
 //!   its values project (`RETURN p.name`);
-//! - `WITH` pipelining — a projection is a tail, so nothing follows it;
+//! - `WITH` pipelining: a projection is a tail, so nothing follows it;
 //! - unbounded variable-length (`*`, `*n..`).
 
 mod ast;

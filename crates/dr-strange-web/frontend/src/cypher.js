@@ -1,7 +1,6 @@
 // The query language's editing aids, shared by the Query page and Explore's
-// plot box. One copy, because two would drift the moment the language grows a
-// keyword — and the completion list is the only in-app documentation of what
-// the box accepts.
+// plot box. One copy: two would drift the first time the language grows a
+// keyword, and this list is the only in-app account of what the box accepts.
 
 // Ordered shortest-prefix first, so MATCH is offered before MATCHING and the
 // longer one is still reachable by typing one more character.
@@ -30,10 +29,9 @@ export const KEYWORDS = [
 ]
 
 /**
- * True when the text ends inside an unterminated string literal. The words
- * typed there are data — a document's text, an entity's key — not syntax, so
- * completing them to keywords is noise. The language has no escapes, so this
- * scan is exact.
+ * True when the text ends inside an unterminated string literal. Words typed
+ * there are data, not syntax, so completing them is noise. The language has
+ * no escapes, so this scan is exact.
  */
 export function inStringLiteral(s) {
   let quote = null
@@ -48,12 +46,10 @@ export function inStringLiteral(s) {
 }
 
 /**
- * The greyed completion to show after the caret: the rest of the keyword the
- * word being typed is a prefix of, or '' when nothing is being typed, the word
- * is too short to guess from, or the caret is inside a string.
- *
- * Case-insensitive matching, but the keyword's own casing is what completes,
- * so the lower-case algorithm names stay lower-case.
+ * The greyed completion after the caret: the rest of the keyword the current
+ * word prefixes. '' when the word is under two characters or inside a string.
+ * Matching is case-insensitive; the keyword's own casing completes, so the
+ * lower-case algorithm names stay lower-case.
  */
 export function ghost(text) {
   if (inStringLiteral(text)) return ''
@@ -64,19 +60,16 @@ export function ghost(text) {
   return kw ? kw.slice(m[1].length) : ''
 }
 
-/**
- * A result cell as text: JSON null is an absent value, and a list or map shows
- * as the JSON it is rather than `[object Object]`.
- */
+/** A result cell as text: null is absence, a list or map shows as JSON. */
 export function cell(v) {
   if (v === null || v === undefined) return '—'
   return typeof v === 'object' ? JSON.stringify(v) : String(v)
 }
 
 /**
- * A projected table as tab-separated text, header included — what a clipboard
- * hands to a spreadsheet or a terminal. Tabs rather than commas: a cell may
- * hold a JSON list full of commas, and nothing here should need quoting rules.
+ * A projected table as tab-separated text, header included. Tabs rather than
+ * commas: a cell may hold a JSON list full of commas, and this needs no
+ * quoting rules.
  */
 export function toTsv({ columns, rows }) {
   const line = (cells) => cells.map((c) => cell(c).replace(/[\t\n]+/g, ' ')).join('\t')

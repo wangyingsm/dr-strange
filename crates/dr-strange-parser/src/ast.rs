@@ -183,9 +183,9 @@ pub struct VarLen {
 
 /// `RETURN [DISTINCT] <item> [, <item>]*`.
 ///
-/// One item naming a node (`n`, `*`) means the query returns rows of nodes;
-/// anything else means it returns a table, and the two cannot be mixed —
-/// there is no value that is a node (see [`crate::compile`]).
+/// An item naming a node (`n`, `*`) returns node rows; anything else returns
+/// a table. The two cannot be mixed: a node is not a value (see
+/// [`crate::compile`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub distinct: bool,
@@ -210,13 +210,13 @@ pub enum ReturnItem {
     },
 }
 
-/// `ORDER BY <key> [ASC|DESC]`, with the key as the query wrote it — a
-/// projecting query orders by *column*, and `text` is what names one.
+/// `ORDER BY <key> [ASC|DESC]`. A projecting query orders by column, which
+/// `text` is what names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
     pub target: SortTarget,
-    /// The key's source text, trimmed — how a `RETURN` item with no alias is
-    /// named, so `ORDER BY count(*)` can find the column it wrote.
+    /// The key's source text, trimmed: the name an unaliased `RETURN` item
+    /// takes, so `ORDER BY count(*)` finds its column.
     pub text: String,
     pub descending: bool,
 }
@@ -226,9 +226,8 @@ pub struct OrderKey {
 pub enum SortTarget {
     /// An expression — `ORDER BY n.year DESC`.
     Expr(PExpr),
-    /// A bare name, which only a projecting query can resolve: a `RETURN`
-    /// alias. (A bare variable is not an expression in this language, so
-    /// nothing else can be meant by it.)
+    /// A bare name: a `RETURN` alias, which only a projecting query has. A
+    /// bare variable is not an expression in this language.
     Name(String),
 }
 

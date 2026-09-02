@@ -263,16 +263,16 @@ fn rejects_cross_variable_predicate() {
 
 #[test]
 fn rejects_returning_earlier_variable() {
-    // The rows themselves end on the last pattern node, so an earlier one
-    // can only come back as values — which the error says.
+    // The rows end on the last pattern node, so an earlier one comes back
+    // only as values.
     let said = err("MATCH (p:Paper)-[:R]->(q) RETURN p").to_string();
     assert!(said.contains("RETURN p.name"), "{said}");
 }
 
 #[test]
 fn a_projection_reads_every_variable_the_row_passed_through() {
-    // What `RETURN p` cannot do, `RETURN p.year` can: the row's trail still
-    // holds the earlier binding, so the column addresses it with `At`.
+    // The row's trail still holds the earlier binding, so the column
+    // addresses it with `At`.
     let proj = plan("MATCH (p:Paper)-[:R]->(q) RETURN p.year, q.year")
         .project
         .expect("projected");
@@ -280,8 +280,7 @@ fn a_projection_reads_every_variable_the_row_passed_through() {
         proj.items,
         vec![
             ProjItem::value("p.year", at_node(0, p("year"))),
-            // The last variable is the row's current node, so it needs no
-            // addressing at all.
+            // The last variable is the current node: no addressing needed.
             ProjItem::value("q.year", p("year")),
         ]
     );
@@ -303,7 +302,7 @@ fn aggregates_compile_to_the_projection_tail() {
             ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year")).distinct()),
         ]
     );
-    // ORDER BY names a column — here by its alias.
+    // ORDER BY names a column, here by its alias.
     assert_eq!(
         proj.order_by,
         vec![TupleSortKey {
@@ -331,15 +330,14 @@ fn order_by_finds_a_column_by_alias_or_by_the_expression_it_returned() {
             "{query}"
         );
     }
-    // And says which columns there were when it finds none.
+    // And names the columns when it finds none.
     let said = err("MATCH (n:Paper) RETURN n.year AS y ORDER BY z").to_string();
     assert!(said.contains("must name a returned column: y"), "{said}");
 }
 
 #[test]
 fn distinct_skip_and_limit_move_to_the_tail_when_a_query_projects() {
-    // Over node rows these are steps; over tuples they mean something else,
-    // and a query that projects wants the tuple reading.
+    // Steps over node rows; on the tail over tuples.
     let projected = plan("MATCH (n:Paper) RETURN DISTINCT n.year SKIP 1 LIMIT 2");
     assert!(projected.steps.is_empty(), "{:?}", projected.steps);
     let proj = projected.project.expect("projected");
@@ -385,11 +383,10 @@ fn rejects_trailing_and_missing_clauses() {
     assert!(matches!(err("RETURN n"), ParseError::Syntax(_)));
 }
 
-/// The shapes that used to be "a clear error, never a silent mis-compile" —
-/// `RETURN f.file, f.line`, `key(f)`, `count(f)`, aliases — are the language
-/// now. What is left unsupported says which shape it is and what to write
-/// instead, because these queries arrive from agents and the message is the
-/// only documentation they get.
+/// The shapes that used to be rejected — `RETURN f.file, f.line`, `key(f)`,
+/// `count(f)`, aliases — are the language now. What is left unsupported names
+/// the shape and what to write instead: these queries arrive from agents, for
+/// which the message is the only documentation.
 #[test]
 fn a_return_of_values_projects_them() {
     let plan = plan("MATCH (f:Fn) RETURN f.file, f.line AS line, key(f)");
@@ -397,7 +394,7 @@ fn a_return_of_values_projects_them() {
     assert_eq!(
         proj.items,
         vec![
-            // Unaliased columns are named as the query wrote them.
+            // Unaliased columns take the query's own wording.
             ProjItem::value("f.file", p("file")),
             ProjItem::value("line", p("line")),
             ProjItem::value("key(f)", external_key()),
@@ -408,17 +405,27 @@ fn a_return_of_values_projects_them() {
 
 #[test]
 fn a_node_and_a_column_cannot_share_a_return() {
-    // A node is not a value, so there is no column it could be. Both halves
-    // are supported on their own, which is what the message has to say.
+    // A node is not a value, so there is no column it could be.
     let said = err("MATCH (f:Fn) RETURN f, key(f)").to_string();
     assert!(said.contains("node"), "{said}");
     assert!(said.contains("RETURN n.name"), "{said}");
 }
 
 #[test]
+fn only_count_takes_a_star_and_only_a_projection_orders_by_a_name() {
+    // `*` means the rows, which every other fold has no use for.
+    assert!(matches!(
+        err("MATCH (f:Fn) RETURN sum(*)"),
+        ParseError::Syntax(_)
+    ));
+    // A bare ORDER BY name is a RETURN alias, which a node query has none of.
+    let said = err("MATCH (f:Fn) RETURN f ORDER BY calls").to_string();
+    assert!(said.contains("alias") && said.contains("nodes"), "{said}");
+}
+
+#[test]
 fn aliasing_a_returned_node_is_still_unsupported() {
-    // `RETURN f AS name` would have to name a record, and a record's name is
-    // not something the row model carries.
+    // Naming a record is not something the row model carries.
     assert!(matches!(
         err("MATCH (f:Fn) RETURN f AS name"),
         ParseError::Syntax(_)

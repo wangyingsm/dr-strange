@@ -123,13 +123,12 @@ pub fn value_to_json(v: &PropValue) -> Value {
     }
 }
 
-/// A projected table as `{"columns": [...], "rows": [[...], ...]}`.
+/// A projected table as `{"columns": [...], "rows": [[...], ...]}` — one shape
+/// for every surface.
 ///
-/// One shape for every surface, and the columns ride with the rows because a
-/// table's headers are part of its answer — a bare array of arrays would make
-/// the caller re-read the query to know what it got. Rows stay arrays rather
-/// than objects: a query may return two columns with the same name, and an
-/// object would quietly keep one of them.
+/// The columns ride with the rows because a table's headers are part of its
+/// answer. Rows stay arrays rather than objects: two columns may share a name,
+/// and an object would keep one of them.
 pub fn table_to_json(table: &crate::Table) -> Value {
     json!({
         "columns": table.columns,

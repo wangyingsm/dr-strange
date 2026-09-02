@@ -288,12 +288,10 @@ pub fn compile(
             let order_by = order_columns(&q.order_by, &items, embedder, params, &scope)?;
             Some(Projection {
                 items,
-                // Over tuples, not node ids: two nodes sharing a returned
-                // value are one row here.
+                // Over tuples, not node ids.
                 distinct: q.ret.distinct,
                 order_by,
-                // On the tail, because they count what the projection
-                // produced — a LIMIT before an aggregate would change what
+                // On the tail: a LIMIT before an aggregate would change what
                 // the aggregate is over.
                 skip: q.skip,
                 limit: q.limit,
@@ -308,8 +306,7 @@ pub fn compile(
     })
 }
 
-/// `ORDER BY` over node rows: keys evaluated on the row's current node, which
-/// is the only one a query returning nodes has ended on.
+/// `ORDER BY` over node rows: keys evaluated on the row's current node.
 fn compile_sort(
     keys: &[OrderKey],
     var_slot: &AHashMap<&str, usize>,
@@ -350,13 +347,10 @@ fn compile_sort(
     Ok(out)
 }
 
-/// `ORDER BY` over a projection: each key names one of the returned columns,
-/// since after a projection a column is all there is left to address.
+/// `ORDER BY` over a projection: each key names one of the returned columns.
 ///
-/// Two ways to name one, in the order a reader would expect: by alias (or by
-/// the item's own text, which is what an unaliased column is called), then by
-/// the expression itself, so `RETURN n.year AS y ORDER BY n.year` finds the
-/// column it just described.
+/// By name first — an alias, or an unaliased item's own text — then by the
+/// expression, so `RETURN n.year AS y ORDER BY n.year` finds column `y`.
 fn order_columns(
     keys: &[OrderKey],
     items: &[ProjItem],
