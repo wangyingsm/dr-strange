@@ -1,40 +1,36 @@
 //! drsg-mcp — the [`dr_strange_mcp`] tool set served over stdio (arch/06).
 //!
-//! The **fallback** way to reach a graph, not the usual one. A repository
-//! prepared by `drsg init` runs `drsg serve … watch` and every host shares
-//! that one instance over its `/mcp` endpoint (ROADMAP §10), which is what
-//! keeps the plane synced to the repository's commits. A database may be
-//! opened directly by one process at a time, so this binary is for the case
-//! where no such server runs: a host that speaks only stdio, or a database
-//! nothing is watching.
+//! The fallback way to reach a graph. A repository prepared by `drsg init`
+//! runs `drsg serve … watch`, and every host shares that one instance over
+//! its `/mcp` endpoint (ROADMAP §10), which keeps the plane synced to the
+//! repository's commits. One process at a time may open a database directly,
+//! so this binary is for where no such server runs: a stdio-only host, or a
+//! database nothing watches.
 //!
-//! So it looks for that server before opening anything. When the nearest
-//! `.mcp.json` declares one and it answers, this process **relays** the
-//! host's session to it ([`dr_strange_mcp::relay`]) instead of contending for
-//! the database — the host ends up talking to the process that already holds
-//! it. Naming a database (`--db`, `$DRSG_DB`) skips the search: a caller who
-//! says which graph they want is not asking to be sent to another one.
+//! It looks for that server first. When the nearest `.mcp.json` declares one
+//! and it answers, this process relays the host's session to it
+//! ([`dr_strange_mcp::relay`]) instead of contending for the database. Naming
+//! a database (`--db`, `$DRSG_DB`) skips the search: a caller who says which
+//! graph they want is not asking to be sent to another.
 //!
-//! Failing that it embeds the database, talking to nothing — point it at a
-//! path and it works — but it will not *create* that path. A server that
-//! silently conjures an empty database answers every question with "nothing
-//! found", which reads exactly like a graph whose digest went wrong.
+//! Otherwise it embeds the database — but never creates it. An empty graph
+//! answers every question with "nothing found", which is what a digest that
+//! went wrong also looks like.
 
 /// mimalloc as the process allocator (see the drsg binary for the rationale;
 /// binaries choose the allocator, the core library never does).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dr_strange_core::Database;
 use dr_strange_mcp::{DrStrange, relay};
 use rmcp::ServiceExt;
 
-/// The database served when nothing names one — the path `drsg digest` and
-/// `drsg init` write by default, so standing in a prepared repository is
-/// enough.
+/// The database served when nothing names one: the path `drsg digest` and
+/// `drsg init` write by default.
 const DEFAULT_DB: &str = "graph.drsg";
 
 const USAGE: &str = "\
@@ -66,9 +62,8 @@ enum Args {
     Serve {
         db: PathBuf,
         /// Whether to look for a running server first. False once a caller
-        /// names a database: they are asking for *that* graph, and serving
-        /// another one because a nearby `.mcp.json` mentions it would be the
-        /// worst kind of helpful.
+        /// names a database: they asked for that graph, not for whichever one
+        /// a nearby `.mcp.json` mentions.
         discover: bool,
     },
     Help,
@@ -78,10 +73,9 @@ enum Args {
 /// Parse the arguments after the program name, with `$DRSG_DB` as the
 /// fallback the flags override.
 ///
-/// Every unrecognised dash-led word is an error rather than a path, which is
-/// the whole reason this exists: with the first argument taken as the
-/// database, `drsg-mcp --version` opened a database *named* `--version`, and
-/// created it.
+/// An unrecognised dash-led word is an error, not a path: with the first
+/// argument taken as the database, `drsg-mcp --version` opened a database
+/// named `--version`, and created it.
 fn parse<I: IntoIterator<Item = String>>(args: I, env_db: Option<String>) -> Result<Args, String> {
     let mut db: Option<String> = None;
     let mut args = args.into_iter();
@@ -113,9 +107,8 @@ fn parse<I: IntoIterator<Item = String>>(args: I, env_db: Option<String>) -> Res
     })
 }
 
-/// Record the database, refusing a second one: two paths mean the caller
-/// expects something this process cannot do, and serving whichever came last
-/// would hide that.
+/// Record the database, refusing a second: two paths ask for something this
+/// process cannot do, and serving the last would hide that.
 fn take(slot: &mut Option<String>, path: String) -> Result<(), String> {
     match slot {
         Some(first) => Err(format!(
@@ -152,10 +145,9 @@ async fn main() -> anyhow::Result<()> {
     // stdio JSON-RPC protocol. Hold the guard so the writer flushes on exit.
     let _log = dr_strange_log::init("drsg-mcp");
 
-    // Before opening anything: this repository may already be running the
-    // server that holds this database, and joining it is strictly better than
-    // losing a race for the file it has.
-    if discover && let Some(upstream) = declared_server().await {
+    // This repository may already run the server that holds this database.
+    let cwd = std::env::current_dir()?;
+    if discover && let Some(upstream) = declared_server(&cwd).await {
         tracing::info!(
             server = %upstream.name,
             url = %upstream.url,
@@ -165,17 +157,7 @@ async fn main() -> anyhow::Result<()> {
         return relay::relay(&upstream).await;
     }
 
-    // An absent database is a mistake to report, not one to paper over by
-    // creating it: an empty graph answers every question with "nothing
-    // found", which is indistinguishable from a digest that went wrong.
-    if !path.exists() {
-        anyhow::bail!(
-            "no database at `{}` — this server never creates one. Build it with \
-             `drsg digest <dir> --apply --db {0}`, or run `drsg init` in the repository \
-             (which also starts the shared server this binary is the fallback for).",
-            path.display()
-        );
-    }
+    require_existing(&path)?;
     let db = Arc::new(Database::open(&path)?);
     tracing::info!(db = %path.display(), "drsg-mcp: database opened; serving MCP over stdio");
 
@@ -189,14 +171,26 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The drsg server this directory's `.mcp.json` declares, if it is answering.
+/// Fail unless the database is already there: this server never creates one.
+/// An empty graph answers every question with "nothing found", which is what
+/// a digest that went wrong also looks like.
+fn require_existing(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path.exists(),
+        "no database at `{}` — this server never creates one. Build it with \
+         `drsg digest <dir> --apply --db {0}`, or run `drsg init` in the repository \
+         (which also starts the shared server this binary is the fallback for).",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The drsg server `from`'s nearest `.mcp.json` declares, if it is answering.
 ///
-/// Both halves are best-effort by design: no `.mcp.json`, no drsg entry in
-/// one, or nothing listening all mean "open the database yourself", which is
-/// what this binary did before it could relay at all.
-async fn declared_server() -> Option<relay::Upstream> {
-    let cwd = std::env::current_dir().ok()?;
-    let upstream = relay::discover(&cwd)?;
+/// Best-effort: no `.mcp.json`, no drsg entry in one, or nothing listening all
+/// mean "open the database yourself".
+async fn declared_server(from: &Path) -> Option<relay::Upstream> {
+    let upstream = relay::discover(from)?;
     match relay::alive(&upstream, relay::PROBE_TIMEOUT).await {
         true => Some(upstream),
         false => {
@@ -218,23 +212,46 @@ mod tests {
     }
 
     #[test]
+    fn a_database_that_is_not_there_is_an_error_not_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.drsg");
+        let err = require_existing(&missing).unwrap_err().to_string();
+        assert!(err.contains("never creates one"), "{err}");
+        assert!(err.contains("drsg init"), "{err}");
+        // What `drsg digest` / `drsg init` leave behind passes.
+        std::fs::create_dir(&missing).unwrap();
+        assert!(require_existing(&missing).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_declared_server_that_is_not_answering_is_not_used() {
+        // The stale case: a file naming a server nothing is running.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"drsg-watch":{"url":"http://127.0.0.1:1/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(declared_server(dir.path()).await.is_none());
+    }
+
+    #[test]
     fn a_flag_is_never_a_database() {
-        // The bug this parser exists for: both of these used to name a
-        // database, and opening one created it.
+        // Both of these used to name a database, and opening one created it.
         assert_eq!(parse_args(&["--help"]), Ok(Args::Help));
         assert_eq!(parse_args(&["-h"]), Ok(Args::Help));
         assert_eq!(parse_args(&["--version"]), Ok(Args::Version));
         assert_eq!(parse_args(&["-V"]), Ok(Args::Version));
         let err = parse_args(&["--plane", "code"]).unwrap_err();
         assert!(err.contains("unknown option `--plane`"), "{err}");
-        // …and the message says what the binary does take.
+        // …and the message says what it does take.
         assert!(err.contains("--db <path>"), "{err}");
     }
 
     #[test]
     fn the_database_is_named_by_flag_or_position() {
         let expect = |args: &[&str]| match parse_args(args) {
-            // Naming a database also turns the search off.
+            // Naming a database turns the search off.
             Ok(Args::Serve {
                 db,
                 discover: false,
@@ -244,7 +261,7 @@ mod tests {
         assert_eq!(expect(&["graph.drsg"]), PathBuf::from("graph.drsg"));
         assert_eq!(expect(&["--db", "a.drsg"]), PathBuf::from("a.drsg"));
         assert_eq!(expect(&["--db=a.drsg"]), PathBuf::from("a.drsg"));
-        // A path may look like anything as long as it isn't dash-led.
+        // A path may be anything not dash-led.
         assert_eq!(expect(&["/tmp/x y.drsg"]), PathBuf::from("/tmp/x y.drsg"));
 
         let err = parse_args(&["--db"]).unwrap_err();
@@ -264,14 +281,13 @@ mod tests {
                 discover,
             })
         };
-        // The environment names a database as surely as the flag does, so it
-        // switches the search off too.
+        // The environment names a database too, so it also stops the search.
         assert_eq!(parse(std::iter::empty(), env()), serve("env.drsg", false));
         assert_eq!(
             parse(["--db".to_string(), "flag.drsg".to_string()], env()),
             serve("flag.drsg", false)
         );
-        // Neither: the default path, and a look around first.
+        // Neither: the default path, and a look for a server first.
         assert_eq!(parse(std::iter::empty(), None), serve(DEFAULT_DB, true));
     }
 }

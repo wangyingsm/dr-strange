@@ -1,24 +1,21 @@
 //! Finding the `drsg serve … watch` a repository already runs, and standing
 //! in front of it.
 //!
-//! A database may be opened directly by one process at a time, so the two
-//! ways to reach a graph are in tension exactly where they are both most
-//! likely: inside a repository prepared by `drsg init`, whose watch server
-//! holds `./graph.drsg` while a host launches `drsg-mcp` in the same
-//! directory. The stdio server used to lose that race and exit, which
-//! reaches the host as a bare "connection closed".
+//! One process at a time may open a database directly, and inside a
+//! repository prepared by `drsg init` two want to: the watch server holds
+//! `./graph.drsg` while a host launches `drsg-mcp` in the same directory. The
+//! stdio server lost that race and exited, which reaches the host as a bare
+//! "connection closed".
 //!
-//! It doesn't have to be a race. `drsg init` writes the running server's URL
-//! into the repository's `.mcp.json`, so the address is *declared*: this
-//! module reads it, asks whether anything is answering there, and — when
-//! something is — relays the host's stdio session to it instead of opening
-//! the database at all. The host gets the tool set of the process that holds
-//! the database, with its plane synced to the repository's commits; nothing
-//! opens anything twice.
+//! `drsg init` writes the running server's URL into the repository's
+//! `.mcp.json`, so the address is declared. This module reads it, asks whether
+//! anything answers there, and if so relays the host's stdio session to it
+//! instead of opening the database — the host talks to the process that holds
+//! it, whose plane is synced to the repository's commits.
 //!
-//! A relay, not a second server: messages are forwarded as they are, in both
-//! directions, so whatever tools that server has are the tools the host sees,
-//! including ones this binary's own version has never heard of.
+//! A relay, not a second server: messages are forwarded unread in both
+//! directions, so the host sees that server's tools, including ones this
+//! binary has never heard of.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,27 +29,25 @@ use serde::Deserialize;
 /// The file `drsg init` writes, and every MCP host reads.
 const MCP_FILE: &str = ".mcp.json";
 
-/// The server name `drsg init` writes. Preferred over any other drsg-ish
-/// entry, since it is the one this project puts there itself.
+/// The server name `drsg init` writes, preferred over any other drsg-ish
+/// entry.
 const WATCH_SERVER: &str = "drsg-watch";
 
-/// How long the liveness probe waits. Short: a `.mcp.json` naming a server
-/// that died is the *common* case (the machine rebooted, the watch process
-/// was killed), and the cost of finding out must not be a host that sits
-/// there looking hung. A loopback server answers this route in microseconds.
+/// How long the liveness probe waits. Short, because a `.mcp.json` naming a
+/// server that died is the common case and a host must not sit there looking
+/// hung; a loopback server answers this route in microseconds.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// A drsg MCP server a repository declares in its `.mcp.json`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Upstream {
-    /// The entry's name — for the log line that says what was joined.
+    /// The entry's name, for the log line naming what was joined.
     pub name: String,
     pub url: String,
-    /// The `Authorization` header the entry carries, if any. `drsg init`
-    /// writes a bearer token, and the server refuses reads without it.
+    /// The `Authorization` header the entry carries. `drsg init` writes a
+    /// bearer token, without which the server refuses reads.
     pub auth: Option<String>,
-    /// The file this came from, so a surprising choice can be traced to the
-    /// thing that declared it.
+    /// The file this came from, so a surprising choice can be traced.
     pub source: PathBuf,
 }
 
@@ -64,8 +59,8 @@ struct McpFile {
 
 #[derive(Deserialize)]
 struct ServerEntry {
-    /// Present on an HTTP entry, absent on a stdio one — which is how the two
-    /// are told apart without trusting the optional `type` field.
+    /// Present on an HTTP entry, absent on a stdio one: how the two are told
+    /// apart without trusting the optional `type` field.
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
@@ -74,19 +69,17 @@ struct ServerEntry {
 
 /// The drsg server declared nearest to `start`, walking up.
 ///
-/// Up, because `drsg init` writes the file at the repository root while a
-/// host may launch its server from anywhere inside — the same walk git does
-/// to find its own directory. The first `.mcp.json` that names a drsg server
-/// wins; a file that names none stops the search, because it is the
-/// repository's answer and a parent's is not.
+/// Up, because `drsg init` writes the file at the repository root while a host
+/// may launch from anywhere inside. The nearest `.mcp.json` is the answer: one
+/// that names no drsg server stops the search rather than deferring to a
+/// parent's, which belongs to a different project.
 pub fn discover(start: &Path) -> Option<Upstream> {
     for dir in start.ancestors() {
         let path = dir.join(MCP_FILE);
         if !path.is_file() {
             continue;
         }
-        // A malformed file is not worth an error: this is a best-effort
-        // shortcut, and the embedded server behind it still works.
+        // A malformed file falls through to the embedded server.
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -98,10 +91,9 @@ pub fn discover(start: &Path) -> Option<Upstream> {
     None
 }
 
-/// The drsg entry among a file's servers: the one `drsg init` writes, else
-/// any other whose name says drsg (a hand-written entry, an older name).
-/// `BTreeMap` keeps that second choice deterministic rather than
-/// hash-ordered.
+/// The drsg entry among a file's servers: the one `drsg init` writes, else any
+/// other whose name says drsg. `BTreeMap` keeps that second choice
+/// deterministic.
 fn pick(file: McpFile, source: &Path) -> Option<Upstream> {
     let http = |name: &String, entry: &ServerEntry| {
         entry.url.as_ref().map(|url| Upstream {
@@ -126,12 +118,12 @@ fn pick(file: McpFile, source: &Path) -> Option<Upstream> {
         .find_map(|(name, entry)| http(name, entry))
 }
 
-/// `GET /health` on the same origin — the server's cheap, unauthenticated
-/// liveness route, which does no database work, so a probe cannot be starved
-/// by a busy server and needs no token to succeed.
+/// `GET /health` on the same origin — the server's unauthenticated liveness
+/// route, which does no database work, so a busy server cannot starve the
+/// probe and no token is needed.
 ///
-/// `None` when the URL is not one an origin can be taken from, which is
-/// itself a reason not to relay.
+/// `None` when the URL has no origin to take, which is itself a reason not to
+/// relay.
 pub fn health_url(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
@@ -143,9 +135,7 @@ pub fn health_url(url: &str) -> Option<String> {
 
 /// Whether something is answering at `upstream`.
 ///
-/// Deliberately not an MCP `initialize`: that would open a session on the
-/// server and abandon it, and it would make the probe cost grow with what
-/// the server has to say about itself.
+/// Not an MCP `initialize`: that would open a session and abandon it.
 pub async fn alive(upstream: &Upstream, timeout: Duration) -> bool {
     let Some(url) = health_url(&upstream.url) else {
         return false;
@@ -156,13 +146,29 @@ pub async fn alive(upstream: &Upstream, timeout: Duration) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
+/// The `Authorization` header to send, or `None` when the file's value cannot
+/// be one (a newline in it, say) and the session will have to go unauthorized.
+///
+/// Sent verbatim rather than through the transport's `auth_header`, which
+/// prepends `Bearer ` to whatever it is given: a `.mcp.json` carries the
+/// finished value (`drsg init` writes `Bearer <token>`), so prepending would
+/// send `Bearer Bearer …`. Verbatim also admits a scheme this code does not
+/// know.
+fn auth_header(value: &str) -> Option<reqwest::header::HeaderValue> {
+    match reqwest::header::HeaderValue::from_str(value) {
+        Ok(header) => Some(header),
+        Err(e) => {
+            tracing::warn!(error = %e, "ignoring an unusable Authorization header");
+            None
+        }
+    }
+}
+
 /// Serve the host over stdio, forwarding every message to `upstream`.
 ///
-/// Returns when either side closes: the host disconnecting (it is done with
-/// us) or the server going away (it was restarted or killed). Both mean this
-/// process is finished — a host that wants another session starts another
-/// process, which discovers the world as it is *then*, and embeds the
-/// database if the server really is gone.
+/// Returns when either side closes — the host disconnecting, or the server
+/// going away. A host that wants another session starts another process,
+/// which discovers the world as it is then.
 pub async fn relay(upstream: &Upstream) -> anyhow::Result<()> {
     let (stdin, stdout) = rmcp::transport::stdio();
     relay_over(
@@ -172,40 +178,25 @@ pub async fn relay(upstream: &Upstream) -> anyhow::Result<()> {
     .await
 }
 
-/// [`relay`] over any host transport, so the pump can be driven by a pipe in
-/// a test rather than by this process's own stdio.
+/// [`relay`] over any host transport, so a test can drive the pump over a
+/// pipe rather than this process's stdio.
 pub async fn relay_over<H>(mut host: H, upstream: &Upstream) -> anyhow::Result<()>
 where
     H: Transport<RoleServer>,
     H::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut config = StreamableHttpClientTransportConfig::with_uri(upstream.url.clone());
-    // The header goes through verbatim rather than through the transport's
-    // `auth_header`, which prepends `Bearer ` to whatever it is given: a
-    // `.mcp.json` carries the finished header value (`drsg init` writes
-    // `Bearer <token>`), and prepending would send `Bearer Bearer …`. Passing
-    // it as written also lets a scheme this code has never heard of work.
-    if let Some(auth) = &upstream.auth {
-        match reqwest::header::HeaderValue::from_str(auth) {
-            Ok(value) => {
-                config
-                    .custom_headers
-                    .insert(reqwest::header::AUTHORIZATION, value);
-            }
-            // A header value with a newline in it is not one to send; the
-            // server will refuse the session and say so, which is clearer
-            // than a request this process mangled on the way out.
-            Err(e) => tracing::warn!(error = %e, "ignoring an unusable Authorization header"),
-        }
+    if let Some(value) = upstream.auth.as_deref().and_then(auth_header) {
+        config
+            .custom_headers
+            .insert(reqwest::header::AUTHORIZATION, value);
     }
-    // The transport's own default client, rather than one built here: it
-    // disables idle connection pooling for a latency reason particular to
-    // this protocol, which a client of ours would silently undo.
+    // The transport's default client: it disables idle connection pooling for
+    // a latency reason particular to this protocol.
     let mut server = StreamableHttpClientTransport::from_config(config);
 
-    // A message-level pump, which is what makes this a relay rather than a
-    // reimplementation: neither side's content is inspected, so a tool added
-    // to the server tomorrow reaches the host through a binary built today.
+    // A message-level pump: neither side's content is inspected, so a tool
+    // added to the server reaches a host through a binary built before it.
     loop {
         tokio::select! {
             from_host = host.receive() => match from_host {
@@ -264,9 +255,8 @@ mod tests {
 
     #[test]
     fn a_file_that_names_no_drsg_server_is_the_answer_not_a_step() {
-        // The nearest file is the repository speaking. If it configures other
-        // servers and not this one, a parent directory's file is not a better
-        // answer — it is a different project's.
+        // The nearest file is this repository's answer; a parent's belongs to
+        // a different project.
         let root = tempfile::tempdir().unwrap();
         write(root.path(), WATCH);
         let inner = root.path().join("vendor/other");
@@ -281,8 +271,7 @@ mod tests {
     #[test]
     fn only_a_server_with_a_url_can_be_relayed_to() {
         let root = tempfile::tempdir().unwrap();
-        // A stdio drsg entry names no URL — there is nothing to forward to,
-        // and it is very likely this binary itself.
+        // A stdio entry names no URL to forward to, and is likely this binary.
         write(
             root.path(),
             r#"{"mcpServers": {"drsg": {"command": "drsg-mcp"}}}"#,
@@ -303,7 +292,7 @@ mod tests {
         let found = discover(root.path()).unwrap();
         assert_eq!((found.name.as_str(), found.auth), ("drsg-watch", None));
 
-        // Without it, a drsg-ish name still counts — someone wrote it by hand.
+        // Without it, a hand-written drsg-ish name still counts.
         let root = tempfile::tempdir().unwrap();
         write(
             root.path(),
@@ -337,10 +326,22 @@ mod tests {
         assert_eq!(health_url("http://"), None);
     }
 
+    #[test]
+    fn an_authorization_header_goes_through_as_written_or_not_at_all() {
+        assert_eq!(
+            auth_header("Bearer secret").unwrap().to_str().unwrap(),
+            "Bearer secret"
+        );
+        // Any scheme, since the file carries the finished value.
+        assert!(auth_header("Basic dXNlcjpwdw==").is_some());
+        // A newline cannot be a header value; the session goes unauthorized
+        // and the server says so, rather than this process mangling it.
+        assert!(auth_header("Bearer two\nlines").is_none());
+    }
+
     #[tokio::test]
     async fn nothing_answering_is_not_alive() {
-        // Port 1 on loopback: refused immediately, which is the path a stale
-        // `.mcp.json` takes.
+        // Port 1 on loopback: refused immediately, as a stale `.mcp.json` is.
         let upstream = Upstream {
             name: "drsg-watch".into(),
             url: "http://127.0.0.1:1/mcp".into(),
@@ -348,5 +349,13 @@ mod tests {
             source: PathBuf::from(MCP_FILE),
         };
         assert!(!alive(&upstream, Duration::from_millis(500)).await);
+
+        // A URL with no origin to probe is not alive either — there is
+        // nowhere to ask.
+        let unusable = Upstream {
+            url: "not a url".into(),
+            ..upstream
+        };
+        assert!(!alive(&unusable, Duration::from_millis(500)).await);
     }
 }
