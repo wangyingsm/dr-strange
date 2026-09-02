@@ -45,13 +45,20 @@ empty database would answer every question with "nothing found", which reads
 exactly like a digest that went wrong, so a path that isn't there is an error
 instead.
 
-**Reach for `drsg init` first.** It digests the repository, starts a
-`drsg serve … watch` in the background, and writes that server's URL into the
-project's `.mcp.json` — the plane then follows the repository's commits, and
-every host shares the one instance (see [below](#sharing-across-agents-mcp-on-drsg-serve)).
-`drsg-mcp` is the fallback for when no such server runs: a host that speaks
-only stdio, or a database nothing is watching. Configuring both against one
-database does not work, for the reason the next paragraph gives.
+**With no database named, it looks for a server first.** The nearest
+`.mcp.json` is read — walking up, as git finds its own directory — and if it
+declares a drsg server that answers, this process **relays** the host's
+session to it instead of opening anything. So in a repository prepared by
+`drsg init` (which digests the tree, starts a `drsg serve … watch`, and writes
+that server's URL into `.mcp.json`), a stdio-only host reaches the process that
+already holds the database, with a plane synced to the repository's commits.
+
+The relay forwards messages as they are, in both directions, so the host sees
+that server's tool set — including tools a newer server has and this binary has
+never heard of. Naming a database (`--db`, `$DRSG_DB`) skips the search: a
+caller who says which graph they want is not asking to be sent to another one.
+Nothing answering, no `.mcp.json`, or no drsg server in it, and the database is
+opened here as before.
 
 It is normally launched by the host rather than run by hand. A host configures it
 by command, arguments, and environment — the environment carries any LLM provider
@@ -83,10 +90,12 @@ given database directly — a `drsg-mcp`, a `drsg` command, or a `drsg serve`, b
 not two at once. This is enforced, not advisory: the second open fails with a
 clear error rather than corrupting the database.
 
-That matters for agent hosts, because each one spawns its own MCP server
-subprocess. Two editors open on the same project means two `drsg-mcp`
-processes, and the second will refuse to start. For that case — several
-agents that need to share one memory — see the next section.
+That is the rule the relay above exists to keep out of your way, and it still
+binds whenever the relay does not apply. Two editors open on the same project
+each spawn their own `drsg-mcp`: with a watch server running, both relay to it
+and share one database; with none, the first opens the file and the second
+refuses to start. For that second case — several agents that need to share one
+memory — see the next section.
 
 ## Sharing across agents: `/mcp` on `drsg serve`
 

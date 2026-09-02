@@ -1,8 +1,9 @@
 # MCP Service Layer
 
 **Status**: shipped — `drsg-mcp` stdio (M4), streamable HTTP on `drsg serve`
-(ROADMAP §10), `digest` tool live, agent verbs landed (§11) ·
-last revised 2026-08-18
+(ROADMAP §10), `digest` tool live, agent verbs landed (§11), stdio relays to a
+declared server when one is running ·
+last revised 2026-09-02
 
 **M4 landed** the `drsg-mcp` stdio server on the **official `rmcp` SDK**
 (resolving arch's hand-rolled-vs-SDK question toward the SDK: spec-correct
@@ -93,3 +94,9 @@ writing descriptions back; future sessions inherit them.
    Streamable HTTP landed as an endpoint on `drsg serve` rather than a client
    mode here (ROADMAP §10), because the tools must run in-process against the
    same `Database` to keep batch atomicity. Its security model is 08 §4.2.
+   `drsg-mcp` did gain a client *transport* — not a client mode: with no
+   database named it reads the repository's `.mcp.json`, and when the server
+   declared there answers it **relays** the stdio session to it verbatim
+   (`compact`-free, message level, so the host sees that server's tools).
+   The rule "one process opens a database directly" is unchanged; what
+   changed is that a host arriving second now joins rather than fails.

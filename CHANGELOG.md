@@ -21,6 +21,23 @@ All notable changes to Dr Strange are documented here. The format is based on
   wrong; the message now names the path and the two commands that build one
   (`drsg digest … --apply`, `drsg init`).
 
+- **`drsg-mcp` joins a running server instead of contending with it.** With no
+  database named, it reads the nearest `.mcp.json` — walking up, as git finds
+  its own directory — and if that file declares a drsg server which answers a
+  `GET /health`, it relays the host's stdio session there rather than opening
+  a database. In a repository prepared by `drsg init`, a stdio-only host now
+  reaches the `drsg serve … watch` that already holds the graph, with a plane
+  synced to the repository's commits — where before it lost the race for the
+  file and exited, which reaches the host as a bare "connection closed".
+
+  A relay, not a second server: JSON-RPC messages are forwarded as they are,
+  in both directions, so the host sees that server's tool set, including tools
+  a newer server has and the relaying binary has never heard of. Naming a
+  database (`--db`, `$DRSG_DB`) skips the search — a caller who says which
+  graph they want is not asking to be sent to another one — and no
+  `.mcp.json`, no drsg entry in it, or nothing listening all fall back to
+  opening the database here.
+
 ### Changed
 
 - **The docs say which server a repository should use.** `drsg init` — which
@@ -30,7 +47,8 @@ All notable changes to Dr Strange are documented here. The format is based on
   the fallback for a host that speaks only stdio or a database nothing
   watches. Pointing both at one database never worked (a database may be
   opened directly by one process at a time) and now says so in the chapter,
-  the sample config, and the binary's own `--help`.
+  the sample config, and the binary's own `--help` — which now also describe
+  the relay above.
 
 ## [2.3.0] - 2026-09-01
 

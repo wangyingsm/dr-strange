@@ -12,6 +12,12 @@
 //!
 //! The `digest` tool (LLM ingestion, arch/07) reads provider API keys from
 //! the server process's environment, never from params, regardless of host.
+//!
+//! [`relay`] is how the two hosts avoid contending: when a repository already
+//! runs the second one, `drsg-mcp` forwards to it rather than opening the
+//! same database, which one process at a time may do.
+
+pub mod relay;
 
 use std::sync::Arc;
 
