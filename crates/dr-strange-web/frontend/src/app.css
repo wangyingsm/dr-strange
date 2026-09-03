@@ -814,72 +814,6 @@ nav button.active {
   border-color: #16a34a;
 }
 
-/* ---- query-language bar (Explore) ---- */
-.query-bar {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-.query-bar .cypher {
-  flex: 1;
-  min-width: 0;
-  font: 13px/1.4 ui-monospace, monospace;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.4rem 0.6rem;
-}
-.query-bar .cypher:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.query-bar .embed-pick {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--muted);
-  white-space: nowrap;
-}
-.query-bar .embed-pick select {
-  font: 13px system-ui;
-  text-transform: none;
-  letter-spacing: normal;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.3rem 0.4rem;
-}
-.query-bar .run-btn {
-  font: 14px system-ui;
-  color: #fff;
-  background: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  padding: 0.4rem 1rem;
-  cursor: pointer;
-}
-.query-bar .run-btn:hover {
-  filter: brightness(1.08);
-}
-.query-bar .ghost {
-  font: 14px system-ui;
-  color: var(--muted);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.4rem 0.8rem;
-  cursor: pointer;
-}
-.query-bar .ghost:hover {
-  border-color: var(--accent);
-}
-
 /* ---- analyze bar (graph algorithms, ROADMAP §1) ---- */
 .algo-bar {
   display: flex;
@@ -1067,40 +1001,6 @@ nav button.active {
   margin: 0;
   padding: 0;
   overflow-y: auto;
-}
-/* A projecting query, in the view that plots: the hand-off to the Query
-   view, not a second table renderer. */
-.query-handoff {
-  width: min(28rem, 50%);
-  bottom: auto;
-  padding-bottom: 0.6rem;
-}
-.query-handoff p {
-  margin: 0;
-  padding: 0.6rem 0.7rem;
-  font-size: 0.82rem;
-  line-height: 1.5;
-  color: var(--muted);
-}
-.query-handoff .open-query {
-  margin: 0 0.7rem;
-  font: 13px system-ui;
-  color: #fff;
-  background: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  padding: 0.3rem 0.9rem;
-  cursor: pointer;
-}
-.query-table th {
-  color: var(--muted);
-  font-weight: 600;
-  position: sticky;
-  top: 0;
-  background: var(--panel);
-}
-.query-table td {
-  font-family: ui-monospace, monospace;
 }
 .hy-results li {
   border-bottom: 1px solid var(--border);
@@ -2407,46 +2307,6 @@ nav button,
   gap: 0.4rem;
 }
 
-/* ---- GraphQL keyword ghost hint ---- */
-.cypher-wrap {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-}
-.cypher-wrap .cypher {
-  width: 100%;
-  background: transparent;
-  position: relative;
-  z-index: 1;
-}
-.cypher-ghost {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  box-sizing: border-box;
-  font: 13px/1.4 ui-monospace, monospace; /* must match .cypher */
-  padding: 0.4rem 0.6rem; /* must match .cypher */
-  border: 1px solid transparent; /* match border metrics so text lines up */
-  border-radius: 8px;
-  background: var(--panel);
-  white-space: pre;
-  overflow: hidden;
-  color: var(--muted);
-  opacity: 0.75;
-  pointer-events: none;
-}
-.cypher-ghost .typed {
-  color: transparent; /* occupies the typed text's width, invisibly */
-}
-.cypher-ghost .tab-key {
-  margin-left: 0.5rem;
-  font: 10px system-ui;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 0 0.25rem;
-  opacity: 0.8;
-}
-
 /* ---- Query page (a top-level view: an editor, then its result) ---------- */
 
 .query-page {
@@ -2595,10 +2455,6 @@ nav button,
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
-}
-.q-result .q-note {
-  text-transform: none;
-  letter-spacing: normal;
 }
 .q-result .copy {
   font: 11px system-ui;

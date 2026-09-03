@@ -19,15 +19,6 @@
   let embedProvider = $state(loadPref('embedProvider', 'openai'))
   let results = $state(null) // { nodes, edges, mode, note, ... } | { error }
   let focus = $state(null) // { id, nonce } → Explore centers this node
-  // A query handed over from Explore's plot box because it answers with a
-  // table: { text, nonce } → the Query view runs it. The nonce makes the same
-  // query hand over twice.
-  let handover = $state(null)
-
-  function openQuery(text) {
-    handover = { text, nonce: Date.now() }
-    view = 'query'
-  }
 
   // Time-travel (ROADMAP §4): an app-wide "viewing as of" cursor. `plane.history`
   // answers only on a native server, so a successful probe both proves the
@@ -256,9 +247,9 @@
 {#if view === 'dashboard'}
   <Dashboard {plane} {onPlaneCreated} {onPlaneDeleted} onSelectPlane={(name) => (plane = name)} />
 {:else if view === 'explore'}
-  <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} onOpenQuery={openQuery} />
+  <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} />
 {:else if view === 'query'}
-  <Query {plane} {handover} />
+  <Query {plane} />
 {:else}
   <Digest {plane} {onPlaneCreated} />
 {/if}

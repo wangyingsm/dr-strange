@@ -75,14 +75,9 @@ All notable changes to Dr Strange are documented here. The format is based on
 
   The query surface used to be a tab inside the graph view, labelled "GraphQL
   / Run" — for a language this project does not implement, one unlabelled
-  click from a view that opens on Filters. That tab is now **Cypher / Plot**,
-  which is what it does: it seeds the canvas from a query. Reading a result as
-  data is the new view's job, which is also where a *table* belongs — a
-  projection has no subgraph to draw.
-
-  Both boxes share one keyword list and one completion routine
-  (`frontend/src/cypher.js`), so the in-app hint for the language cannot drift
-  between them.
+  click from a view that opens on Filters. That tab is gone: a query is
+  written in one place now, and Explore is the canvas — its remaining tabs
+  seed, overlay and search the graph rather than compose queries about it.
 
 - **`type(r)`, `direction(r)` and `id(n)`.** A row's edge and its internal id,
   readable in `WHERE`, `ORDER BY` and a projection. `direction(r)` is never

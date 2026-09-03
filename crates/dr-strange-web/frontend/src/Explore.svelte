@@ -1,7 +1,6 @@
 <script>
-  import { ghost } from './cypher.js'
   import { onMount, onDestroy } from 'svelte'
-  import { rpc, authHeaders, liveChanges } from './rpc.js'
+  import { rpc, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import { renderMarkdown } from './markdown.js'
@@ -9,7 +8,7 @@
   import Icon from './Icon.svelte'
 
   // Providers with an embedding endpoint (deepseek is chat-only, so excluded) —
-  // used to embed a text `SEARCH … NEAR "…"`.
+  // the semantic channel in Hybrid, and Ask's grounding.
   const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
   // Chat providers for NL→plan (`plane.ask`); deepseek is chat-capable.
   const CHAT_PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
@@ -27,12 +26,10 @@
     asOf = $bindable(null),
     history = null,
     timeTravel = false,
-    // Hands a query to the Query view: a projection has no subgraph to plot.
-    onOpenQuery = () => {},
   } = $props()
 
   let newPlaneOpen = $state(false) // new-plane popup open?
-  let tab = $state('filters') // active toolbar tab: filters | cypher | algorithms | hybrid
+  let tab = $state('filters') // active toolbar tab: filters | algorithms | hybrid
 
   let container // canvas div (bind:this)
   let plot = null
@@ -49,8 +46,6 @@
   let seedLimit = $state(SEED_STEPS[0])
   let seedTotal = $state(0)
   let hiddenLabels = $state(new Set()) // categories switched off from the legend
-  let cypher = $state('') // query-language text; '' = use the label seed
-  let embedProvider = $state(loadPref('embedProvider', 'openai')) // text SEARCH … NEAR provider
   let selected = $state(null) // { kind: 'node'|'edge', data }
   let legend = $state([])
   let status = $state('')
@@ -113,7 +108,6 @@
   let hyGraph = $state(false) // add the 1-hop graph-proximity channel
   let hyProvider = $state(loadPref('hyProvider', 'openai')) // embedding provider for the semantic channel
   let hyResults = $state(null) // ranked hits | null
-  let queryTable = $state(null) // { columns, rows } from a projecting query | null
 
   // A label's embedding property from the catalog (a Vector-typed prop). Semantic
   // is offered whenever one exists — a declared vector index only accelerates it;
@@ -253,7 +247,6 @@
 
   // Remember dropdown selections across reloads.
   $effect(() => {
-    savePref('embedProvider', embedProvider)
     savePref('spDir', spDir)
     savePref('hyProvider', hyProvider)
     savePref('askProvider', askProvider)
@@ -541,80 +534,6 @@
       }`
     } catch (e) {
       error = e.message
-    }
-  }
-
-  // The greyed completion after the caret; Tab accepts it. Shared with the
-  // Query page.
-  const cypherGhost = $derived(ghost(cypher))
-  function onCypherKey(e) {
-    if (e.key === 'Enter') {
-      runCypher()
-    } else if (e.key === 'Tab' && cypherGhost) {
-      e.preventDefault()
-      cypher = cypher + cypherGhost + ' '
-    }
-  }
-
-  // Run a query-language statement against the current plane. A read renders
-  // its result (nodes + induced edges) as a fresh subgraph; a write (CREATE, …)
-  // mutates and reports counts, then reloads the canvas. Empty query → fall
-  // back to the plain label seed. Hits the web-only POST /cypher endpoint (not
-  // an RPC method), so it uses a raw fetch with the bearer token.
-  async function runCypher() {
-    if (!cypher.trim()) {
-      await seed()
-      return
-    }
-    error = null
-    algoBusy = true
-    try {
-      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(embedProvider)}`
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: authHeaders({ 'content-type': 'text/plain' }),
-        body: cypher,
-      })
-      if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
-      const out = await res.json()
-      if (out.write) {
-        // A write mutated the plane — summarise the non-zero counts, then reseed
-        // so the canvas reflects the new graph.
-        const bits = [
-          [out.nodes_created, 'nodes created'],
-          [out.edges_created, 'edges created'],
-          [out.props_set, 'props set'],
-          [out.labels_set, 'labels set'],
-          [out.nodes_deleted, 'nodes deleted'],
-          [out.edges_deleted, 'edges deleted'],
-        ]
-          .filter(([n]) => n > 0)
-          .map(([n, label]) => `${n} ${label}`)
-        status = bits.length ? bits.join(' · ') : 'no changes'
-        await seed()
-        return
-      }
-      plot.clear()
-      selected = null
-      // A projecting query answers with a table, which has no subgraph to
-      // plot: say so and offer the view that reads one.
-      if (out.columns) {
-        queryTable = out
-        legend = []
-        const rows = out.rows.length
-        status = `${rows} row${rows === 1 ? '' : 's'} · ${out.columns.length} column${
-          out.columns.length === 1 ? '' : 's'
-        } — a table, not a subgraph`
-        return
-      }
-      queryTable = null
-      plot.addSubgraph(out)
-      legend = plot.legendEntries()
-      status = `${out.count} nodes · ${out.edges.length} edges`
-    } catch (e) {
-      error = e.message
-    } finally {
-      algoBusy = false
     }
   }
 
@@ -1262,7 +1181,6 @@
 
 <div class="tool-tabs">
   <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}><Icon name="filters" /> Filters / Operations</button>
-  <button class:active={tab === 'cypher'} onclick={() => (tab = 'cypher')}><Icon name="query" /> Cypher / Plot</button>
   <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}><Icon name="algorithms" /> Algorithms</button>
   <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}><Icon name="hybrid" /> Hybrid</button>
   <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}><Icon name="ask" /> Ask</button>
@@ -1303,29 +1221,6 @@
     <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
     <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
     <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
-  </div>
-{:else if tab === 'cypher'}
-  <div class="query-bar">
-    <div class="cypher-wrap">
-      {#if cypherGhost}
-        <div class="cypher-ghost"><span class="typed">{cypher}</span>{cypherGhost}<span class="tab-key">Tab</span></div>
-      {/if}
-      <input
-        type="text"
-        class="cypher"
-        placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) NEAR "some text" TOPK 10 RETURN n   ·   SEARCH (n:Label) ON body MATCHING "some words" RETURN n   ·   CALL pagerank() ON (n:Label) RETURN n ORDER BY score() DESC'}
-        bind:value={cypher}
-        onkeydown={onCypherKey}
-      />
-    </div>
-    <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
-      embed
-      <select bind:value={embedProvider}>
-        {#each EMBED_PROVIDERS as pv (pv)}<option value={pv}>{pv}</option>{/each}
-      </select>
-    </label>
-    <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
-    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear results and re-plot the original graph">Reset</button>
   </div>
 {:else if tab === 'algorithms'}
   <div class="algo-bar">
@@ -1628,20 +1523,6 @@
           </li>
         {/each}
       </ol>
-    </div>
-  {/if}
-
-  {#if queryTable}
-    <div class="hy-results query-handoff">
-      <header>
-        <span>Table · {queryTable.rows.length} rows</span>
-        <button class="close" onclick={() => (queryTable = null)} aria-label="Close">×</button>
-      </header>
-      <p>
-        This query returns columns, not nodes — there is nothing to plot. The
-        <b>Query</b> view reads a table: {queryTable.columns.join(' · ')}
-      </p>
-      <button class="open-query" onclick={() => onOpenQuery(cypher)}>Open in Query</button>
     </div>
   {/if}
 

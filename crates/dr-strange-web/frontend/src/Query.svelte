@@ -3,13 +3,11 @@
   import { loadPref, savePref } from './prefs.js'
   import { cell, ghost, toTsv } from './cypher.js'
 
-  // `plane` is the app-wide current plane, which a query names none of its
-  // own. `handover` is a query Explore sent here because it answers with a
-  // table: { text, nonce }.
-  let { plane, handover = null } = $props()
+  // `plane` is the app-wide current plane, which a query names none of its own.
+  let { plane } = $props()
 
   // Providers with an embedding endpoint, for a text `SEARCH … NEAR "…"`
-  // (deepseek is chat-only, so excluded) — the same list Explore offers.
+  // (deepseek is chat-only, so excluded) — the same list the header search offers.
   const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
 
   const EXAMPLES = [
@@ -28,17 +26,6 @@
   let copied = $state(false)
 
   const completion = $derived(ghost(text))
-
-  // A handover ran once already, in the view that could not show it. Keyed by
-  // nonce so the same query sent twice still runs.
-  let handled = $state(null)
-  $effect(() => {
-    if (handover && handover.nonce !== handled) {
-      handled = handover.nonce
-      text = handover.text
-      run()
-    }
-  })
 
   // Ctrl/Cmd+Enter runs; plain Enter is a newline. Tab takes the completion
   // when there is one and otherwise moves focus, so a keyboard user can leave
@@ -191,7 +178,6 @@
           {result.records.edges.length} edge{result.records.edges.length === 1 ? '' : 's'}
           {#if elapsed != null} · {elapsed} ms{/if}
         </span>
-        <span class="q-note">whole records — Explore plots the same query</span>
       </header>
       <div class="q-scroll">
         <table>

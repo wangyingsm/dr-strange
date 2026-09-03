@@ -1,6 +1,6 @@
-// The query language's editing aids, shared by the Query page and Explore's
-// plot box. One copy: two would drift the first time the language grows a
-// keyword, and this list is the only in-app account of what the box accepts.
+// The query language's editing aids, for the Query page. Kept beside the view
+// rather than inside it because this keyword list is the only in-app account of
+// what the box accepts, and it is tested on its own.
 
 // Ordered shortest-prefix first, so MATCH is offered before MATCHING and the
 // longer one is still reachable by typing one more character.
