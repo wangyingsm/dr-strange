@@ -113,6 +113,82 @@ async fn call(client: &Client, tool: &str, args: Value) -> Value {
     serde_json::from_str(text).unwrap()
 }
 
+/// `drsg-mcp`'s relay: a host speaking stdio reaches the database this
+/// running server holds, rather than opening one of its own.
+///
+/// The whole point of the shortcut, end to end — a `.mcp.json` naming this
+/// server, the liveness probe, and the message pump — proved the way it is
+/// actually used: an MCP client on one end of a pipe, the relay on the other,
+/// and a tool call that can only be answered by *this* server's data (the
+/// seeded `alice`, which a freshly opened database would not have).
+#[tokio::test]
+async fn the_stdio_relay_serves_the_running_servers_database() {
+    let addr = spawn_server();
+    wait_ready(addr).await;
+
+    // What `drsg init` writes, in a repository the relay then discovers from.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join(".mcp.json"),
+        json!({
+            "mcpServers": {
+                "drsg-watch": {
+                    "type": "http",
+                    "url": format!("http://{addr}/mcp"),
+                    "headers": { "Authorization": format!("Bearer {TOKEN}") },
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let upstream = dr_strange_mcp::relay::discover(repo.path()).expect("declared by .mcp.json");
+    assert!(
+        dr_strange_mcp::relay::alive(&upstream, Duration::from_secs(2)).await,
+        "the probe must find a server that is plainly answering",
+    );
+
+    // A pipe stands in for the host's stdio: the relay serves one end, an MCP
+    // client drives the other.
+    let (host_side, relay_side) = tokio::io::duplex(64 * 1024);
+    let relayed = tokio::spawn(async move {
+        let (rx, tx) = tokio::io::split(relay_side);
+        dr_strange_mcp::relay::relay_over(
+            rmcp::transport::async_rw::AsyncRwTransport::new_server(rx, tx),
+            &upstream,
+        )
+        .await
+    });
+
+    let (rx, tx) = tokio::io::split(host_side);
+    let client: Client = ClientInfo::default()
+        .serve(rmcp::transport::async_rw::AsyncRwTransport::new_client(
+            rx, tx,
+        ))
+        .await
+        .expect("the relay carries the initialize handshake");
+
+    // Tools are the upstream's, listed through the relay.
+    let tools = client.list_tools(Default::default()).await.unwrap();
+    assert!(
+        tools.tools.iter().any(|t| t.name == "get_node"),
+        "the server's own tool set reaches the host"
+    );
+
+    // And the data is the server's: `alice` exists only in the database this
+    // process seeded, never in one the relay could have opened itself.
+    let node = call(&client, "get_node", json!({ "key": "alice" })).await;
+    assert_eq!(node["external_key"], "alice");
+
+    // Closing the host ends the relay, which is how the process exits when a
+    // host disconnects.
+    client.cancel().await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), relayed)
+        .await
+        .expect("the relay outlived its host");
+    ended.unwrap().expect("the relay ended cleanly");
+}
+
 /// The agent verbs and the query tool over `/mcp`, in the shapes an agent
 /// gets them: `cypher` answers a projecting query with a table, and `fathom`
 /// answers with the compact text every agent verb speaks.

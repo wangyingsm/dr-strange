@@ -28,12 +28,30 @@ $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scri
 PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
 ```
 
-它同样可以从源码构建：`cargo build --release -p dr-strange-mcp`。它以第一个参数
-作为数据库路径，其次读 `$DRSG_DB`，再退回到默认值 `graph.drsg`：
+它同样可以从源码构建：`cargo build --release -p dr-strange-mcp`。数据库以
+`--db <路径>` 指定，也可以直接作为一个裸参数给出；其次读 `$DRSG_DB`，再退回到默认
+值 `graph.drsg`。`--help` 与 `--version` 只打印信息随即退出：
 
 ```console
-$ drsg-mcp /path/to/graph.drsg
+$ drsg-mcp --db /path/to/graph.drsg
+$ drsg-mcp /path/to/graph.drsg          # 同样的意思，简写
 ```
+
+数据库必须已经存在——这个服务从不创建数据库。用 `drsg digest <目录> --apply --db
+<路径>` 建立，或在仓库中运行 `drsg init`。空数据库对任何问题都只会答「什么也没
+找到」，这和一次出了错的图化毫无区别；因此路径不存在时直接报错。
+
+**未指名数据库时，它会先去找一个服务。** 它读取最近的 `.mcp.json`——像 git 找自己的
+目录那样逐级向上——若其中声明了一个 drsg 服务且该服务有应答，本进程便把宿主的会话
+**中继**过去，而不再打开任何数据库。于是在一个由 `drsg init` 准备好的仓库里（它图化
+源码树、拉起一个 `drsg serve … watch`，并把该服务的 URL 写进 `.mcp.json`），只会说
+stdio 的宿主同样能接到那个已经持有数据库的进程，其平面还跟随着仓库的提交（另见
+[下一节](#跨智能体共享drsg-serve-上的-mcp)）。
+
+中继按原样双向转发消息，因此宿主看到的是那个服务的工具集——包括较新的服务才有、而
+本二进制从未听说过的工具。指名了数据库（`--db`、`$DRSG_DB`）则跳过这次查找：既然
+调用者说明了想要哪张图，就不该被送去另一张。若无人应答、没有 `.mcp.json`，或其中
+并无 drsg 服务，就依旧在本进程里打开数据库。
 
 它通常由宿主启动，而不是手动运行。宿主通过命令、参数与环境变量来配置它，图工具
 所需的 LLM 提供方密钥就放在环境变量里传入：
@@ -62,9 +80,10 @@ $ drsg-mcp /path/to/graph.drsg
 一个 `drsg-mcp`、一条 `drsg` 命令，或一个 `drsg serve`，但不能两个同时打开。这
 一点是强制的，不只是建议——第二次打开会直接报错失败，而不会把数据库弄坏。
 
-这一点对智能体宿主尤为要紧，因为每个宿主都会各自派生自己的 MCP 服务子进程。同一
-个项目开着两个编辑器，就意味着两个 `drsg-mcp` 进程，后者会拒绝启动。若干智能体
-需要共享同一份记忆的场景，见下一节。
+上面的中继，正是为了让这条规则不再挡路而存在；而在中继不适用之处，它依旧生效。同一
+个项目开着两个编辑器，就会各自派生一个 `drsg-mcp`：有 watch 服务在跑时，两者都中继
+到它，共享同一个数据库；没有时，先来的打开文件，后到的拒绝启动。若干智能体需要共享
+同一份记忆的场景，见下一节。
 
 ## 跨智能体共享：`drsg serve` 上的 `/mcp`
 
