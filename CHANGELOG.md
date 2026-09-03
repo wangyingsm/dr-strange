@@ -4,6 +4,28 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A digest no longer dies on a provider's concurrency limit.** An account
+  that allows five simultaneous chat calls, asked for eight, answers `HTTP 429
+  — your current concurrency exceeds your concurrency limit`, and the run
+  ended there. The retry it already had was the wrong shape of answer: a 429 is
+  two complaints wearing one status code, and backing off answers *too fast*,
+  not *too many at once* — every worker that waited came back through the same
+  crowded doorway, in step with the others it was refused with, and the run
+  died with attempts to spare.
+
+  The provider now keeps a ceiling on what it holds in flight, learned from the
+  refusals themselves: the crowd is halved when the provider objects (once per
+  crowd, not once per member of it) and climbs back slowly while it doesn't,
+  never past the size that was refused. A run settles at whatever the account
+  actually allows, without an operator having to know the number. Waits carry
+  jitter for the same reason. If a run is still refused at every attempt, the
+  error now names the `concurrency` knob and the limit it got down to instead
+  of only quoting the provider.
+
 ## [2.3.0] - 2026-09-01
 
 ### Added
