@@ -3,9 +3,9 @@
 //! Cypher construct maps onto the pipeline.
 
 use dr_strange_core::{
-    Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan, Metric,
-    NodeId, NodeRef, PropValue, SortKey, Source, Step, VectorChannel, distance, external_key,
-    has_label, hops, lit, p, score, similarity,
+    Agg, AggFunc, Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
+    Metric, NodeId, NodeRef, ProjItem, PropValue, SortKey, Source, Step, TupleSortKey,
+    VectorChannel, at_node, distance, external_key, has_label, hops, lit, p, score, similarity,
 };
 use dr_strange_parser::{
     Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
@@ -35,6 +35,7 @@ fn scan_label_only() {
         LogicalPlan {
             source: Source::ScanLabel("Person".into()),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -46,6 +47,7 @@ fn scan_all_star() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -57,6 +59,7 @@ fn where_pushdown_on_source() {
         LogicalPlan {
             source: Source::ScanLabel("Paper".into()),
             steps: vec![Step::Filter(p("year").ge(2020))],
+            project: None,
         }
     );
 }
@@ -88,6 +91,7 @@ fn where_pushes_to_the_right_slot() {
                 },
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -259,10 +263,94 @@ fn rejects_cross_variable_predicate() {
 
 #[test]
 fn rejects_returning_earlier_variable() {
-    assert!(matches!(
-        err("MATCH (p:Paper)-[:R]->(q) RETURN p"),
-        ParseError::Compile(_)
-    ));
+    // The rows end on the last pattern node, so an earlier one comes back
+    // only as values.
+    let said = err("MATCH (p:Paper)-[:R]->(q) RETURN p").to_string();
+    assert!(said.contains("RETURN p.name"), "{said}");
+}
+
+#[test]
+fn a_projection_reads_every_variable_the_row_passed_through() {
+    // The row's trail still holds the earlier binding, so the column
+    // addresses it with `At`.
+    let proj = plan("MATCH (p:Paper)-[:R]->(q) RETURN p.year, q.year")
+        .project
+        .expect("projected");
+    assert_eq!(
+        proj.items,
+        vec![
+            ProjItem::value("p.year", at_node(0, p("year"))),
+            // The last variable is the current node: no addressing needed.
+            ProjItem::value("q.year", p("year")),
+        ]
+    );
+}
+
+#[test]
+fn aggregates_compile_to_the_projection_tail() {
+    let proj = plan(
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) AS papers, \
+         collect(DISTINCT p.year) AS years ORDER BY papers DESC LIMIT 10",
+    )
+    .project
+    .expect("projected");
+    assert_eq!(
+        proj.items,
+        vec![
+            ProjItem::value("a.name", at_node(0, p("name"))),
+            ProjItem::agg("papers", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year")).distinct()),
+        ]
+    );
+    // ORDER BY names a column, here by its alias.
+    assert_eq!(
+        proj.order_by,
+        vec![TupleSortKey {
+            column: 1,
+            descending: true,
+        }]
+    );
+    assert_eq!(proj.limit, Some(10));
+}
+
+#[test]
+fn order_by_finds_a_column_by_alias_or_by_the_expression_it_returned() {
+    for query in [
+        "MATCH (n:Paper) RETURN n.year AS y ORDER BY y",
+        "MATCH (n:Paper) RETURN n.year AS y ORDER BY n.year",
+        "MATCH (n:Paper) RETURN n.year ORDER BY n.year",
+    ] {
+        let proj = plan(query).project.expect("projected");
+        assert_eq!(
+            proj.order_by,
+            vec![TupleSortKey {
+                column: 0,
+                descending: false,
+            }],
+            "{query}"
+        );
+    }
+    // And names the columns when it finds none.
+    let said = err("MATCH (n:Paper) RETURN n.year AS y ORDER BY z").to_string();
+    assert!(said.contains("must name a returned column: y"), "{said}");
+}
+
+#[test]
+fn distinct_skip_and_limit_move_to_the_tail_when_a_query_projects() {
+    // Steps over node rows; on the tail over tuples.
+    let projected = plan("MATCH (n:Paper) RETURN DISTINCT n.year SKIP 1 LIMIT 2");
+    assert!(projected.steps.is_empty(), "{:?}", projected.steps);
+    let proj = projected.project.expect("projected");
+    assert!(proj.distinct);
+    assert_eq!((proj.skip, proj.limit), (Some(1), Some(2)));
+
+    // Returning nodes keeps them where they were.
+    let nodes = plan("MATCH (n:Paper) RETURN DISTINCT n SKIP 1 LIMIT 2");
+    assert_eq!(
+        nodes.steps,
+        vec![Step::Distinct, Step::Skip(1), Step::Limit(2)]
+    );
+    assert!(nodes.project.is_none());
 }
 
 #[test]
@@ -295,40 +383,53 @@ fn rejects_trailing_and_missing_clauses() {
     assert!(matches!(err("RETURN n"), ParseError::Syntax(_)));
 }
 
-/// Appendix B promises projections and aggregation are "a clear error, never
-/// a silent mis-compile". A position in the middle of the clause is not that
-/// error: `RETURN f.file, f.line, key(f)` stops the parse at the first dot and
-/// used to surface as "unexpected trailing input near `.file, …`", which reads
-/// like a typo in a query that has none. Each shape now names itself, and says
-/// what this subset takes instead — these queries arrive from agents, and the
-/// message is the only documentation they get.
+/// The shapes that used to be rejected — `RETURN f.file, f.line`, `key(f)`,
+/// `count(f)`, aliases — are the language now. What is left unsupported names
+/// the shape and what to write instead: these queries arrive from agents, for
+/// which the message is the only documentation.
 #[test]
-fn an_unsupported_return_says_which_shape_and_what_to_write() {
-    let cases = [
-        ("MATCH (f:Fn) RETURN f.file, f.line, key(f)", "projection"),
-        ("MATCH (f:Fn) RETURN f, key(f)", "column list"),
-        ("MATCH (f:Fn) RETURN key(f)", "key(…)"),
-        ("MATCH (f:Fn) RETURN count(f)", "count(…)"),
-        ("MATCH (f:Fn) RETURN f AS name", "aliasing"),
-    ];
-    for (query, shape) in cases {
-        let e = err(query);
-        assert!(
-            matches!(e, ParseError::Compile(_)),
-            "`{query}` is unsupported, not mistyped: {e}"
-        );
-        let said = e.to_string();
-        assert!(
-            said.contains(shape) && said.contains("RETURN takes one variable or `*`"),
-            "`{query}` should name the shape and the rule: {said}"
-        );
-    }
-    // The position survives, because a long query needs one.
-    assert!(
-        err("MATCH (f:Fn) RETURN f.file")
-            .to_string()
-            .contains(".file")
+fn a_return_of_values_projects_them() {
+    let plan = plan("MATCH (f:Fn) RETURN f.file, f.line AS line, key(f)");
+    let proj = plan.project.expect("a RETURN of values projects");
+    assert_eq!(
+        proj.items,
+        vec![
+            // Unaliased columns take the query's own wording.
+            ProjItem::value("f.file", p("file")),
+            ProjItem::value("line", p("line")),
+            ProjItem::value("key(f)", external_key()),
+        ]
     );
+    assert!(!proj.distinct && proj.order_by.is_empty());
+}
+
+#[test]
+fn a_node_and_a_column_cannot_share_a_return() {
+    // A node is not a value, so there is no column it could be.
+    let said = err("MATCH (f:Fn) RETURN f, key(f)").to_string();
+    assert!(said.contains("node"), "{said}");
+    assert!(said.contains("RETURN n.name"), "{said}");
+}
+
+#[test]
+fn only_count_takes_a_star_and_only_a_projection_orders_by_a_name() {
+    // `*` means the rows, which every other fold has no use for.
+    assert!(matches!(
+        err("MATCH (f:Fn) RETURN sum(*)"),
+        ParseError::Syntax(_)
+    ));
+    // A bare ORDER BY name is a RETURN alias, which a node query has none of.
+    let said = err("MATCH (f:Fn) RETURN f ORDER BY calls").to_string();
+    assert!(said.contains("alias") && said.contains("nodes"), "{said}");
+}
+
+#[test]
+fn aliasing_a_returned_node_is_still_unsupported() {
+    // Naming a record is not something the row model carries.
+    assert!(matches!(
+        err("MATCH (f:Fn) RETURN f AS name"),
+        ParseError::Syntax(_)
+    ));
 }
 
 /// Trailing text that is *not* a RETURN this subset lacks stays a plain syntax
@@ -478,6 +579,7 @@ fn search_compiles_to_vector_topk() {
                 k: 5,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -495,6 +597,7 @@ fn search_defaults_metric_cosine_topk_10_and_no_label() {
                 k: 10,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -559,6 +662,7 @@ fn similarity_in_order_by_brute_force_rank() {
                 }]),
                 Step::Limit(10),
             ],
+            project: None,
         }
     );
 }
@@ -665,6 +769,7 @@ fn beam_after_match_compiles_to_expand_beam() {
                 // b's label → a HasLabel filter on the beam frontier.
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -806,6 +911,7 @@ fn key_equality_on_the_source_becomes_a_seek() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["paper-42".into()]),
             steps: vec![Step::Filter(has_label("Doc"))],
+            project: None,
         }
     );
 }
@@ -817,6 +923,7 @@ fn unlabelled_key_seek_has_no_residual_filter() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["paper-42".into()]),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -828,6 +935,7 @@ fn key_in_list_seeks_every_key() {
         LogicalPlan {
             source: Source::SeekKeys(vec!["a".into(), "b".into(), "c".into()]),
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -842,6 +950,7 @@ fn key_seek_keeps_the_other_conjuncts_as_filters() {
                 Step::Filter(has_label("Doc")),
                 Step::Filter(p("year").ge(2020)),
             ],
+            project: None,
         }
     );
 }
@@ -859,6 +968,7 @@ fn key_seek_anchors_a_traversal() {
                 },
                 Step::Filter(has_label("Person")),
             ],
+            project: None,
         }
     );
 }
@@ -878,6 +988,7 @@ fn key_on_a_later_variable_stays_a_filter() {
                 },
                 Step::Filter(external_key().eq("alan")),
             ],
+            project: None,
         }
     );
 }
@@ -902,6 +1013,7 @@ fn key_is_usable_as_an_ordinary_term() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![Step::Filter(external_key().is_null().not())],
+            project: None,
         }
     );
 }
@@ -913,6 +1025,7 @@ fn in_over_a_property_expands_to_equalities() {
         LogicalPlan {
             source: Source::ScanAll,
             steps: vec![Step::Filter(p("year").eq(2020).or(p("year").eq(2021)))],
+            project: None,
         }
     );
 }
@@ -994,6 +1107,7 @@ fn keyword_search_compiles_to_a_bm25_source() {
                 k: 5,
             },
             steps: vec![],
+            project: None,
         }
     );
 }
@@ -1016,6 +1130,7 @@ fn keyword_search_defaults_topk_and_chains_a_typed_hop() {
                 },
                 Step::Filter(has_label("Paper")),
             ],
+            project: None,
         }
     );
 }
@@ -1044,6 +1159,7 @@ fn vector_search_chains_a_typed_hop_too() {
                 dir: Dir::Out,
                 edge_type: Some("CITES".into()),
             }],
+            project: None,
         }
     );
 }
@@ -1087,13 +1203,14 @@ fn hybrid_all_three_channels() {
                 k: 7,
             })),
             steps: vec![],
+            project: None,
         }
     );
 }
 
 #[test]
 fn hybrid_defaults_and_channel_subset() {
-    let LogicalPlan { source, steps } =
+    let LogicalPlan { source, steps, .. } =
         plan(r#"HYBRID (d:Doc) KEYWORD ON body MATCHING "rust" RETURN d"#);
     assert!(steps.is_empty());
     let Source::Hybrid(spec) = source else {
@@ -1172,6 +1289,7 @@ fn call_pagerank_with_arguments() {
                 }]),
                 Step::Limit(10),
             ],
+            project: None,
         }
     );
 }

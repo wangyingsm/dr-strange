@@ -123,6 +123,23 @@ pub fn value_to_json(v: &PropValue) -> Value {
     }
 }
 
+/// A projected table as `{"columns": [...], "rows": [[...], ...]}` — one shape
+/// for every surface.
+///
+/// The columns ride with the rows because a table's headers are part of its
+/// answer. Rows stay arrays rather than objects: two columns may share a name,
+/// and an object would keep one of them.
+pub fn table_to_json(table: &crate::Table) -> Value {
+    json!({
+        "columns": table.columns,
+        "rows": table
+            .rows
+            .iter()
+            .map(|row| Value::Array(row.iter().map(value_to_json).collect()))
+            .collect::<Vec<_>>(),
+    })
+}
+
 pub fn propdesc_to_json(p: &PropDesc) -> Value {
     match &p.description {
         Some(desc) => json!({ "$desc": desc, "$value": value_to_json(&p.value) }),

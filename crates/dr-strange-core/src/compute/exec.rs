@@ -8,21 +8,29 @@
 //! pipeline over it is still lazy — arch/03 §2 "start scalar").
 //!
 //! Rows follow the linear-pipeline model (arch/03 §2): each row is a current
-//! node plus the trail of `(edge, node)` hops taken to reach it. `Filter`
-//! and `Sort` address the current node.
+//! node plus the trail of `(edge, node)` hops taken to reach it. `Filter` and
+//! `Sort` address the current node by default — and, through `Expr::At`, any
+//! earlier binding, which the trail was already carrying (see
+//! [`resolve_bindings`]).
 
 use ahash::{AHashMap, AHashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cache::GraphReader;
-use crate::compute::expr::{self, Expr};
-use crate::compute::plan::{Algo, LogicalPlan, NodeRef, SortKey, Source, Step};
+use crate::compute::expr::{self, BindingNeed, Expr};
+use crate::compute::plan::{
+    Agg, AggFunc, Algo, LogicalPlan, NodeRef, ProjExpr, ProjItem, Projection, SortKey, Source,
+    Step, TupleSortKey,
+};
 use crate::compute::{algo, hybrid};
 use crate::error::Error;
 use crate::error::Result;
 use crate::storage::vector::{Metric, top_k};
-use crate::types::{Dir, EdgeId, NodeId, NodeRecord, PropValue};
+use crate::types::{Dir, EdgeId, EdgeRecord, NodeId, NodeRecord, PropValue};
 
 /// One hop of a path — `(edge traversed, node reached)` plus a link to the
 /// previous hop. Rows that branch from a common prefix *share* that prefix by
@@ -43,6 +51,13 @@ struct TrailNode {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub head: NodeId,
+    /// The node the row started at — pattern slot 0.
+    ///
+    /// The trail records hop *destinations* only, so the source is the one
+    /// binding it cannot reconstruct. Held as a plain id (8 bytes, no
+    /// allocation) because every row needs it the moment a query names an
+    /// earlier variable.
+    pub origin: NodeId,
     /// Path back to the source as a shared cons-list; `None` at a source.
     /// Private: reach it through [`Row::hops`] / [`Row::path`] so the O(1)-step
     /// representation can change without touching callers.
@@ -57,6 +72,7 @@ impl Row {
     fn start(head: NodeId) -> Self {
         Row {
             head,
+            origin: head,
             trail: None,
             hops: 0,
             score: None,
@@ -67,6 +83,7 @@ impl Row {
     fn scored(head: NodeId, score: f32) -> Self {
         Row {
             head,
+            origin: head,
             trail: None,
             hops: 0,
             score: Some(score),
@@ -79,6 +96,7 @@ impl Row {
     fn step(&self, edge: EdgeId, node: NodeId) -> Self {
         Row {
             head: node,
+            origin: self.origin,
             trail: Some(Rc::new(TrailNode {
                 edge,
                 node,
@@ -114,13 +132,110 @@ impl Row {
         out
     }
 
-    fn ctx<'a>(&self, node: Option<&'a NodeRecord>) -> expr::EvalCtx<'a> {
+    fn ctx<'a>(
+        &self,
+        node: Option<&'a NodeRecord>,
+        bindings: expr::Bindings<'a>,
+    ) -> expr::EvalCtx<'a> {
         expr::EvalCtx {
             node,
             score: self.score,
             hops: self.hops as usize,
+            bindings,
+            ..Default::default()
         }
     }
+}
+
+/// One row's bindings, owned so an [`expr::Bindings`] can borrow them for the
+/// length of an evaluation. Empty — and free — for a plan that names none.
+#[derive(Default)]
+struct Resolved {
+    nodes: Vec<Option<Arc<NodeRecord>>>,
+    edges: Vec<Option<(Arc<EdgeRecord>, Dir)>>,
+    last: Option<(Arc<EdgeRecord>, Dir)>,
+}
+
+impl Resolved {
+    fn view(&self) -> expr::Bindings<'_> {
+        expr::Bindings {
+            nodes: &self.nodes,
+            edges: &self.edges,
+            edge: self.last.as_ref().map(|(e, d)| (&**e, *d)),
+        }
+    }
+}
+
+/// Load the bindings `need` asks for out of one row's trail.
+///
+/// Lookups, not traversal: the trail already holds every hop, so slot 0 is the
+/// row's origin, slot *i* the destination of hop *i-1*, and hop *i* the edge
+/// between them. Nothing is resolved for a plan that names no binding, which
+/// is the overwhelmingly common case.
+fn resolve_bindings(reader: &dyn GraphReader, row: &Row, need: &BindingNeed) -> Result<Resolved> {
+    let mut out = Resolved::default();
+    if !need.any() {
+        return Ok(out);
+    }
+    let path = row.path();
+    // Slot 0 is where the row started; every later slot is a hop's destination.
+    let node_at = |slot: usize| -> NodeId {
+        if slot == 0 {
+            row.origin
+        } else {
+            path[slot - 1].1
+        }
+    };
+
+    if let Some(max) = need.nodes {
+        for slot in 0..=max as usize {
+            // A slot past this row's length was never bound — a shorter walk
+            // through a variable-length hop, say. `None` reads as `Null`.
+            out.nodes.push(match slot <= path.len() {
+                true => reader.node(node_at(slot))?,
+                false => None,
+            });
+        }
+    }
+    if let Some(max) = need.edges {
+        for hop in 0..=max as usize {
+            out.edges.push(match path.get(hop) {
+                Some(&(edge, dst)) => load_edge(reader, edge, node_at(hop), dst)?,
+                None => None,
+            });
+        }
+    }
+    if need.last_edge
+        && let Some(hop) = path.len().checked_sub(1)
+    {
+        let (edge, dst) = path[hop];
+        out.last = load_edge(reader, edge, node_at(hop), dst)?;
+    }
+    Ok(out)
+}
+
+/// One hop's edge plus the direction the row actually walked it: `Out` when
+/// the edge runs from the hop's source to its destination, `In` when it runs
+/// the other way.
+///
+/// Deriving it here rather than recording it on every `step` keeps the hot
+/// expansion path free of state it almost never needs. The cost is one case
+/// the endpoints cannot settle — a self-loop satisfies both readings — which
+/// reports `Out`, as [`expr::Expr::EdgeDir`] documents.
+fn load_edge(
+    reader: &dyn GraphReader,
+    edge: EdgeId,
+    from: NodeId,
+    to: NodeId,
+) -> Result<Option<(Arc<EdgeRecord>, Dir)>> {
+    Ok(reader.edge(edge)?.map(|e| {
+        let dir = if e.src == from && e.dst == to {
+            Dir::Out
+        } else {
+            Dir::In
+        };
+        (e, dir)
+    }))
 }
 
 type RowIter<'r> = Box<dyn Iterator<Item = Result<Row>> + 'r>;
@@ -202,8 +317,10 @@ pub fn execute_with<'r>(
 ) -> Result<RowIter<'r>> {
     let source: RowIter<'r> = Box::new(source_rows(reader, &plan.source)?.into_iter().map(Ok));
     let mut iter = deadlined(source, deadline);
+    // Once per plan, not once per row: which bindings any expression names.
+    let need = plan.binding_need();
     for step in &plan.steps {
-        iter = apply_step(iter, step, reader)?;
+        iter = apply_step(iter, step, reader, need)?;
     }
     Ok(deadlined(iter, deadline))
 }
@@ -411,6 +528,7 @@ fn apply_step<'r>(
     iter: RowIter<'r>,
     step: &Step,
     reader: &'r dyn GraphReader,
+    need: BindingNeed,
 ) -> Result<RowIter<'r>> {
     Ok(match step {
         Step::Expand { dir, edge_type } => {
@@ -432,7 +550,7 @@ fn apply_step<'r>(
         }
         Step::Filter(expr) => {
             let pred = expr.clone();
-            Box::new(iter.filter_map(move |rr| filter_one(reader, rr, &pred)))
+            Box::new(iter.filter_map(move |rr| filter_one(reader, rr, &pred, &need)))
         }
         Step::Skip(n) => Box::new(iter.skip(*n as usize)),
         Step::Limit(n) => Box::new(iter.take(*n as usize)),
@@ -444,7 +562,7 @@ fn apply_step<'r>(
             }))
         }
         // Barrier: drain, sort, re-emit.
-        Step::Sort(keys) => Box::new(sort_rows(iter, keys, reader)?.into_iter().map(Ok)),
+        Step::Sort(keys) => Box::new(sort_rows(iter, keys, reader, &need)?.into_iter().map(Ok)),
         // Barrier: rank the whole frontier by similarity, keep top-k.
         Step::FrontierTopK {
             property,
@@ -608,31 +726,455 @@ fn expand_var(
     out
 }
 
-fn filter_one(reader: &dyn GraphReader, rr: Result<Row>, pred: &Expr) -> Option<Result<Row>> {
-    match rr {
+fn filter_one(
+    reader: &dyn GraphReader,
+    rr: Result<Row>,
+    pred: &Expr,
+    need: &BindingNeed,
+) -> Option<Result<Row>> {
+    let row = match rr {
+        Ok(r) => r,
+        Err(e) => return Some(Err(e)),
+    };
+    match matches_pred(reader, &row, pred, need) {
         Err(e) => Some(Err(e)),
-        Ok(row) => match reader.node(row.head) {
-            Err(e) => Some(Err(e)),
-            Ok(node) => {
-                let ctx = row.ctx(node.as_deref());
-                if expr::is_true(&expr::eval(pred, &ctx)) {
-                    Some(Ok(row))
-                } else {
-                    None
-                }
-            }
-        },
+        Ok(true) => Some(Ok(row)),
+        Ok(false) => None,
     }
 }
 
-fn sort_rows(iter: RowIter<'_>, keys: &[SortKey], reader: &dyn GraphReader) -> Result<Vec<Row>> {
+/// Evaluate `exprs` against one row — the projection primitive, shared by the
+/// `select` terminal and (from B1) the plan's projection tail, so a column
+/// means the same thing however the query asked for it.
+pub fn row_values<'e>(
+    reader: &dyn GraphReader,
+    row: &Row,
+    exprs: impl IntoIterator<Item = &'e Expr>,
+    need: &BindingNeed,
+) -> Result<Vec<PropValue>> {
+    let node = reader.node(row.head)?;
+    let bound = resolve_bindings(reader, row, need)?;
+    let ctx = row.ctx(node.as_deref(), bound.view());
+    Ok(exprs.into_iter().map(|e| expr::eval(e, &ctx)).collect())
+}
+
+/// A projected result: the columns a [`Projection`] named and the value rows
+/// under them, in the order the tail produced them.
+///
+/// Every cell is a [`PropValue`], so a surface renders a table without reading
+/// the graph again and it serializes as-is over the wire.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Table {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PropValue>>,
+}
+
+/// Run `plan` and project its rows into a [`Table`] (arch/03 §2's `Project`).
+///
+/// Materializes, where [`execute`] streams: `DISTINCT` needs every earlier
+/// tuple, `ORDER BY` needs them all, an aggregate is unfinished until its
+/// group is, and `skip`/`limit` count what those produced.
+///
+/// A plan with no projection has no columns, so each row projects to the
+/// empty tuple; [`execute`] is what reads their nodes.
+///
+/// Pulls through the deadline-guarded stream [`execute_with`] builds, so a
+/// runaway pipeline trips its budget rather than filling this table.
+pub fn execute_table(
+    plan: &LogicalPlan,
+    reader: &dyn GraphReader,
+    deadline: Option<Instant>,
+) -> Result<Table> {
+    let empty = Projection::default();
+    let proj = plan.project.as_ref().unwrap_or(&empty);
+    let need = plan.binding_need();
+    let rows = execute_with(plan, reader, deadline)?;
+
+    let mut rows = match proj
+        .items
+        .iter()
+        .any(|i| matches!(i.expr, ProjExpr::Agg(_)))
+    {
+        true => grouped_tuples(reader, rows, proj, &need)?,
+        false => row_tuples(reader, rows, proj, &need)?,
+    };
+    if !proj.order_by.is_empty() {
+        rows.sort_by(|a, b| cmp_columns(a, b, &proj.order_by));
+    }
+    if let Some(skip) = proj.skip {
+        rows.drain(..(skip as usize).min(rows.len()));
+    }
+    if let Some(limit) = proj.limit {
+        rows.truncate(limit as usize);
+    }
+    Ok(Table {
+        columns: proj.items.iter().map(|i| i.name.clone()).collect(),
+        rows,
+    })
+}
+
+/// One tuple per row — the projection that doesn't aggregate.
+fn row_tuples(
+    reader: &dyn GraphReader,
+    rows: RowIter<'_>,
+    proj: &Projection,
+    need: &BindingNeed,
+) -> Result<Vec<Vec<PropValue>>> {
+    let exprs = value_exprs(proj);
+    let mut out: Vec<Vec<PropValue>> = Vec::new();
+    let mut seen: BTreeSet<TupleKey> = BTreeSet::new();
+    for r in rows {
+        let tuple = row_values(reader, &r?, exprs.iter().copied(), need)?;
+        // Cloned only for a tuple that is kept; a duplicate never reaches
+        // `out`.
+        if proj.distinct && !seen.insert(TupleKey(tuple.clone())) {
+            continue;
+        }
+        out.push(tuple);
+    }
+    Ok(out)
+}
+
+/// One tuple per group — the projection that aggregates.
+///
+/// The group key is every non-aggregate column (Cypher's implicit `GROUP
+/// BY`). No key column at all is one group over the whole stream, so
+/// `RETURN count(*)` answers with one number even over no rows.
+///
+/// Groups come out in first-appearance order, so an upstream `Sort` still
+/// steers them; `ORDER BY` on the tail overrides it.
+///
+/// [`Projection::distinct`] is not applied here: group keys are distinct by
+/// construction.
+fn grouped_tuples(
+    reader: &dyn GraphReader,
+    rows: RowIter<'_>,
+    proj: &Projection,
+    need: &BindingNeed,
+) -> Result<Vec<Vec<PropValue>>> {
+    let exprs = value_exprs(proj);
+    // Where each item reads its per-row value, computed once per plan: an
+    // index into the evaluated slice, or `None` for `count(*)`.
+    let slots: Vec<Option<usize>> = {
+        let mut next = 0;
+        proj.items
+            .iter()
+            .map(|item| match &item.expr {
+                ProjExpr::Value(_) | ProjExpr::Agg(Agg { arg: Some(_), .. }) => {
+                    next += 1;
+                    Some(next - 1)
+                }
+                ProjExpr::Agg(_) => None,
+            })
+            .collect()
+    };
+
+    let mut groups: Vec<Vec<Acc>> = Vec::new();
+    let mut at: BTreeMap<TupleKey, usize> = BTreeMap::new();
+    for r in rows {
+        let vals = row_values(reader, &r?, exprs.iter().copied(), need)?;
+        let key = TupleKey(
+            proj.items
+                .iter()
+                .zip(&slots)
+                .filter(|(item, _)| matches!(item.expr, ProjExpr::Value(_)))
+                .map(|(_, slot)| vals[slot.expect("a key column reads a value")].clone())
+                .collect(),
+        );
+        let group = match at.get(&key) {
+            Some(&i) => i,
+            None => {
+                groups.push(proj.items.iter().map(Acc::for_item).collect());
+                at.insert(key, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        for ((acc, item), slot) in groups[group].iter_mut().zip(&proj.items).zip(&slots) {
+            if matches!(item.expr, ProjExpr::Agg(_)) {
+                acc.take(slot.map(|i| &vals[i]));
+            }
+        }
+    }
+
+    // No rows and no key column is still one group: `count(*)` over an empty
+    // match is 0, not silence. With a key column there is no key, so no group.
+    if groups.is_empty()
+        && proj
+            .items
+            .iter()
+            .all(|i| matches!(i.expr, ProjExpr::Agg(_)))
+    {
+        groups.push(proj.items.iter().map(Acc::for_item).collect());
+        at.insert(TupleKey(Vec::new()), 0);
+    }
+
+    // `at` holds each key's group index, so walking groups in index order is
+    // first-appearance order.
+    let mut keyed: Vec<(usize, Vec<PropValue>)> = at.into_iter().map(|(k, i)| (i, k.0)).collect();
+    keyed.sort_unstable_by_key(|(i, _)| *i);
+    Ok(keyed
+        .into_iter()
+        .zip(groups)
+        .map(|((_, key), accs)| {
+            let mut key = key.into_iter();
+            accs.into_iter()
+                .map(|acc| match acc {
+                    Acc::Key => key.next().unwrap_or(PropValue::Null),
+                    acc => acc.finish(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// Every expression a projection evaluates per row, in item order: a key
+/// column's or an aggregate's argument. `count(*)` contributes none.
+fn value_exprs(proj: &Projection) -> Vec<&Expr> {
+    proj.items
+        .iter()
+        .filter_map(|item| match &item.expr {
+            ProjExpr::Value(e) => Some(e),
+            ProjExpr::Agg(agg) => agg.arg.as_ref(),
+        })
+        .collect()
+}
+
+/// One column's running state within a group.
+///
+/// `Key` is the non-aggregate column: it accumulates nothing (the group key
+/// holds its value) and is a placeholder that keeps the columns in query
+/// order without a second index.
+enum Acc {
+    Key,
+    Count(i64),
+    /// Exact while every value is an integer, demoted to `f64` by the first
+    /// float, so an integer sum never rounds past 2⁵³.
+    Sum {
+        ints: i64,
+        floats: f64,
+        floated: bool,
+    },
+    Avg {
+        total: f64,
+        n: u64,
+    },
+    Min(Option<PropValue>),
+    Max(Option<PropValue>),
+    Collect(Vec<PropValue>),
+    /// A `DISTINCT` aggregate: the values already folded, around the fold.
+    Distinct(BTreeSet<TupleKey>, Box<Acc>),
+}
+
+impl Acc {
+    fn for_item(item: &ProjItem) -> Acc {
+        let ProjExpr::Agg(agg) = &item.expr else {
+            return Acc::Key;
+        };
+        let acc = match agg.func {
+            AggFunc::Count => Acc::Count(0),
+            AggFunc::Sum => Acc::Sum {
+                ints: 0,
+                floats: 0.0,
+                floated: false,
+            },
+            AggFunc::Avg => Acc::Avg { total: 0.0, n: 0 },
+            AggFunc::Min => Acc::Min(None),
+            AggFunc::Max => Acc::Max(None),
+            AggFunc::Collect => Acc::Collect(Vec::new()),
+        };
+        // `count(*)` reads no value, so there is nothing for DISTINCT to be
+        // distinct about; it counts rows either way.
+        match agg.distinct && agg.arg.is_some() {
+            true => Acc::Distinct(BTreeSet::new(), Box::new(acc)),
+            false => acc,
+        }
+    }
+
+    /// Fold one row into this column. `value` is the row's value for the
+    /// aggregate's argument, or `None` for `count(*)`.
+    ///
+    /// Null is skipped, except by `count(*)`, which counts rows.
+    fn take(&mut self, value: Option<&PropValue>) {
+        if let Acc::Distinct(seen, inner) = self {
+            let Some(value) = value else { return };
+            if !seen.insert(TupleKey(vec![value.clone()])) {
+                return;
+            }
+            return inner.take(Some(value));
+        }
+        let value = match value {
+            // `count(*)`: no value to read, and the row still counts.
+            None => {
+                if let Acc::Count(n) = self {
+                    *n += 1;
+                }
+                return;
+            }
+            Some(PropValue::Null) => return,
+            Some(v) => v,
+        };
+        match self {
+            Acc::Key | Acc::Distinct(..) => {}
+            Acc::Count(n) => *n += 1,
+            Acc::Sum {
+                ints,
+                floats,
+                floated,
+            } => match value {
+                PropValue::Int(i) => *ints = ints.saturating_add(*i),
+                PropValue::Float(f) => {
+                    *floated = true;
+                    *floats += f;
+                }
+                // Not a number: skipped like a null, so one text-valued node
+                // does not cost the sum every other row.
+                _ => {}
+            },
+            Acc::Avg { total, n } => {
+                if let Some(x) = numeric(value) {
+                    *total += x;
+                    *n += 1;
+                }
+            }
+            Acc::Min(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|b| expr::total_cmp(value, b).is_lt())
+                {
+                    *best = Some(value.clone());
+                }
+            }
+            Acc::Max(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|b| expr::total_cmp(value, b).is_gt())
+                {
+                    *best = Some(value.clone());
+                }
+            }
+            Acc::Collect(items) => items.push(value.clone()),
+        }
+    }
+
+    /// The group's value for this column.
+    fn finish(self) -> PropValue {
+        match self {
+            Acc::Key => PropValue::Null,
+            Acc::Count(n) => PropValue::Int(n),
+            Acc::Sum {
+                ints,
+                floats,
+                floated,
+            } => match floated {
+                true => PropValue::Float(ints as f64 + floats),
+                false => PropValue::Int(ints),
+            },
+            // The mean of nothing is unanswerable; the sum of nothing is 0.
+            Acc::Avg { total, n } => match n {
+                0 => PropValue::Null,
+                n => PropValue::Float(total / n as f64),
+            },
+            Acc::Min(v) | Acc::Max(v) => v.unwrap_or(PropValue::Null),
+            Acc::Collect(items) => PropValue::List(items),
+            Acc::Distinct(_, inner) => inner.finish(),
+        }
+    }
+}
+
+/// A value as an `f64` for the numeric folds, or `None` when it isn't one.
+fn numeric(value: &PropValue) -> Option<f64> {
+    match value {
+        PropValue::Int(i) => Some(*i as f64),
+        PropValue::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// A projected tuple used as a set key — what `DISTINCT` and grouping compare
+/// by.
+///
+/// `PropValue` is neither `Hash` nor `Eq` (it holds floats), while
+/// [`expr::total_cmp`] is a total order, so tuples live in an ordered set.
+/// Two tuples match when every column compares `Equal` under it, which folds
+/// `1` and `1.0` together as `=` does.
+struct TupleKey(Vec<PropValue>);
+
+impl Ord for TupleKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (a, b) in self.0.iter().zip(&other.0) {
+            let ord = expr::total_cmp(a, b);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        self.0.len().cmp(&other.0.len())
+    }
+}
+
+impl PartialOrd for TupleKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TupleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for TupleKey {}
+
+/// Order two projected tuples by the tail's keys — [`cmp_keys`] for tuples,
+/// addressing columns by index rather than re-evaluating expressions.
+///
+/// A key naming a column the tuple hasn't got reads as `Null`, so an
+/// out-of-range `order_by` sorts rather than fails.
+fn cmp_columns(a: &[PropValue], b: &[PropValue], keys: &[TupleSortKey]) -> std::cmp::Ordering {
+    const NULL: PropValue = PropValue::Null;
+    for key in keys {
+        let ord = expr::total_cmp(
+            a.get(key.column).unwrap_or(&NULL),
+            b.get(key.column).unwrap_or(&NULL),
+        );
+        let ord = if key.descending { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Whether one row satisfies `pred`: read the current node, resolve whatever
+/// bindings the plan names, evaluate. Split out from [`filter_one`] so the two
+/// reads can fail with `?` while the caller still decides what a failing row
+/// means for the stream.
+fn matches_pred(
+    reader: &dyn GraphReader,
+    row: &Row,
+    pred: &Expr,
+    need: &BindingNeed,
+) -> Result<bool> {
+    let node = reader.node(row.head)?;
+    let bound = resolve_bindings(reader, row, need)?;
+    let ctx = row.ctx(node.as_deref(), bound.view());
+    Ok(expr::is_true(&expr::eval(pred, &ctx)))
+}
+
+fn sort_rows(
+    iter: RowIter<'_>,
+    keys: &[SortKey],
+    reader: &dyn GraphReader,
+    need: &BindingNeed,
+) -> Result<Vec<Row>> {
     // Decorate each row with its precomputed key values (one node lookup +
     // eval per row), sort, undecorate — so comparisons don't re-evaluate.
     let mut decorated: Vec<(Vec<PropValue>, Row)> = Vec::new();
     for rr in iter {
         let row = rr?;
         let node = reader.node(row.head)?;
-        let ctx = row.ctx(node.as_deref());
+        let bound = resolve_bindings(reader, &row, need)?;
+        let ctx = row.ctx(node.as_deref(), bound.view());
         let vals = keys.iter().map(|k| expr::eval(&k.expr, &ctx)).collect();
         decorated.push((vals, row));
     }
@@ -672,8 +1214,8 @@ fn cmp_keys(a: &[PropValue], b: &[PropValue], keys: &[SortKey]) -> std::cmp::Ord
 mod tests {
     use super::*;
     use crate::cache::UncachedReader;
-    use crate::compute::expr::{has_label, p};
-    use crate::compute::plan::SortKey;
+    use crate::compute::expr::{at_edge, at_node, edge_dir, edge_type, ep, has_label, p};
+    use crate::compute::plan::{Agg, AggFunc, ProjItem, SortKey};
     use crate::storage::engine::{StorageEngine, WriteTransaction};
     use crate::storage::graph;
     use crate::storage::memory::MemoryEngine;
@@ -701,6 +1243,295 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap().head)
             .collect()
+    }
+
+    /// Runs `plan` through its projection tail and returns the table.
+    fn run_table(build: impl FnOnce(&mut dyn WriteTransaction), plan: &LogicalPlan) -> Table {
+        let eng = MemoryEngine::new();
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            build(&mut txn);
+            txn.commit().unwrap();
+        }
+        let txn = eng.begin_read().unwrap();
+        let reader = UncachedReader::new(&txn, PlaneId::STARTUP);
+        execute_table(plan, &reader, None).unwrap()
+    }
+
+    fn three_years(txn: &mut dyn WriteTransaction) {
+        for year in [2021, 2019, 2019] {
+            graph::create_node(
+                txn,
+                PlaneId::STARTUP,
+                &["Paper"],
+                &props(&[("year", PropValue::Int(year))]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_plan_without_a_projection_is_all_rows_and_no_columns() {
+        // The rows are still there, each projecting to the empty tuple.
+        let table = run_table(
+            three_years,
+            &LogicalPlan::new(Source::ScanLabel("Paper".into())),
+        );
+        assert!(table.columns.is_empty());
+        assert_eq!(table.rows, vec![vec![], vec![], vec![]]);
+    }
+
+    #[test]
+    fn projection_tail_distinct_orders_and_slices_tuples() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items: vec![ProjItem::value("year", p("year"))],
+            distinct: true,
+            order_by: vec![TupleSortKey {
+                column: 0,
+                descending: true,
+            }],
+            skip: None,
+            limit: None,
+        });
+        // Three rows, two distinct years, newest first.
+        let table = run_table(three_years, &plan);
+        assert_eq!(table.columns, vec!["year"]);
+        assert_eq!(
+            table.rows,
+            vec![vec![PropValue::Int(2021)], vec![PropValue::Int(2019)]]
+        );
+
+        // SKIP/LIMIT count those tuples, after the ordering.
+        let proj = plan.project.as_mut().unwrap();
+        proj.skip = Some(1);
+        proj.limit = Some(5);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![PropValue::Int(2019)]]
+        );
+
+        // A skip past the end empties the table.
+        plan.project.as_mut().unwrap().skip = Some(99);
+        assert!(run_table(three_years, &plan).rows.is_empty());
+    }
+
+    /// A projection of `items` over a graph of `Paper` nodes.
+    fn agg_plan(items: Vec<ProjItem>) -> LogicalPlan {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items,
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// Papers with the years given, `None` writing no year property at all.
+    fn papers(years: Vec<Option<PropValue>>) -> impl FnOnce(&mut dyn WriteTransaction) {
+        move |txn| {
+            for year in &years {
+                let props = match year {
+                    Some(v) => props(&[("year", v.clone())]),
+                    None => Properties::new(),
+                };
+                graph::create_node(txn, PlaneId::STARTUP, &["Paper"], &props).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn aggregates_group_by_every_column_that_is_not_one() {
+        // Three papers, two from 2019; `year` is the only non-aggregate
+        // column, so it is the group key.
+        let plan = agg_plan(vec![
+            ProjItem::value("year", p("year")),
+            ProjItem::agg("n", Agg::count()),
+        ]);
+        let table = run_table(three_years, &plan);
+        assert_eq!(table.columns, vec!["year", "n"]);
+        // First-appearance order: 2021 was written first.
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![PropValue::Int(2021), PropValue::Int(1)],
+                vec![PropValue::Int(2019), PropValue::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_aggregate_with_no_key_column_is_one_group_over_everything() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("n", Agg::count()),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year"))),
+            ProjItem::agg(
+                "distinct_years",
+                Agg::of(AggFunc::Count, p("year")).distinct(),
+            ),
+        ]);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![
+                PropValue::Int(3),
+                PropValue::Int(2021 + 2019 + 2019),
+                PropValue::Int(2),
+            ]]
+        );
+
+        // And over a match that found nothing: 0, not an empty table.
+        assert_eq!(
+            run_table(|_| {}, &plan).rows,
+            vec![vec![
+                PropValue::Int(0),
+                PropValue::Int(0),
+                PropValue::Int(0)
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_group_is_what_its_rows_have_not_what_they_lack() {
+        // Two papers carry a year, one doesn't, one stored it as text.
+        let rows = papers(vec![
+            Some(PropValue::Int(2020)),
+            None,
+            Some(PropValue::Str("2019".into())),
+            Some(PropValue::Float(2022.0)),
+        ]);
+        let plan = agg_plan(vec![
+            ProjItem::agg("rows", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Count, p("year"))),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year"))),
+            ProjItem::agg("avg", Agg::of(AggFunc::Avg, p("year"))),
+            ProjItem::agg("min", Agg::of(AggFunc::Min, p("year"))),
+            ProjItem::agg("max", Agg::of(AggFunc::Max, p("year"))),
+            ProjItem::agg("collected", Agg::of(AggFunc::Collect, p("year"))),
+        ]);
+        let table = run_table(rows, &plan);
+        assert_eq!(
+            table.rows[0],
+            vec![
+                // `count(*)` counts rows, including the one with no year;
+                // `count(n.year)` counts the three that have one, text and all.
+                PropValue::Int(4),
+                PropValue::Int(3),
+                // Sum and mean skip the value they cannot read.
+                PropValue::Float(2020.0 + 2022.0),
+                PropValue::Float(2021.0),
+                // Min and max span every non-null value; under the total
+                // order a string sorts past every number.
+                PropValue::Int(2020),
+                PropValue::Str("2019".into()),
+                PropValue::List(vec![
+                    PropValue::Int(2020),
+                    PropValue::Str("2019".into()),
+                    PropValue::Float(2022.0),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn folds_over_nothing_answer_zero_or_null_and_each_is_the_honest_one() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("count", Agg::of(AggFunc::Count, p("year"))),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year"))),
+            ProjItem::agg("avg", Agg::of(AggFunc::Avg, p("year"))),
+            ProjItem::agg("min", Agg::of(AggFunc::Min, p("year"))),
+            ProjItem::agg("max", Agg::of(AggFunc::Max, p("year"))),
+            ProjItem::agg("collect", Agg::of(AggFunc::Collect, p("year"))),
+        ]);
+        // One row with no year: every fold sees nothing.
+        assert_eq!(
+            run_table(papers(vec![None]), &plan).rows,
+            vec![vec![
+                PropValue::Int(0),
+                PropValue::Int(0),
+                // The mean of nothing is unanswerable; the sum is 0.
+                PropValue::Null,
+                PropValue::Null,
+                PropValue::Null,
+                PropValue::List(vec![]),
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_sum_stays_exact_until_a_float_joins_it() {
+        // An f64 accumulator would round past 2⁵³.
+        let big = 9_007_199_254_740_993;
+        let plan = agg_plan(vec![ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year")))]);
+        assert_eq!(
+            run_table(
+                papers(vec![Some(PropValue::Int(big)), Some(PropValue::Int(0))]),
+                &plan
+            )
+            .rows,
+            vec![vec![PropValue::Int(big)]]
+        );
+        // One float demotes the whole fold.
+        assert_eq!(
+            run_table(
+                papers(vec![Some(PropValue::Int(1)), Some(PropValue::Float(0.5))]),
+                &plan
+            )
+            .rows,
+            vec![vec![PropValue::Float(1.5)]]
+        );
+    }
+
+    #[test]
+    fn distinct_inside_an_aggregate_folds_each_value_once() {
+        let plan = agg_plan(vec![
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year")).distinct()),
+            ProjItem::agg("sum", Agg::of(AggFunc::Sum, p("year")).distinct()),
+            // `count(*)` reads no value, so DISTINCT says nothing about it.
+            ProjItem::agg("rows", Agg::count().distinct()),
+        ]);
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![
+                PropValue::List(vec![PropValue::Int(2021), PropValue::Int(2019)]),
+                PropValue::Int(2021 + 2019),
+                PropValue::Int(3),
+            ]]
+        );
+    }
+
+    #[test]
+    fn the_tail_orders_and_slices_groups_like_any_other_tuples() {
+        let mut plan = agg_plan(vec![
+            ProjItem::value("year", p("year")),
+            ProjItem::agg("n", Agg::count()),
+        ]);
+        let proj = plan.project.as_mut().unwrap();
+        proj.order_by = vec![TupleSortKey {
+            column: 1,
+            descending: true,
+        }];
+        proj.limit = Some(1);
+        // Ordered by the aggregate column: the busiest year, not the first.
+        assert_eq!(
+            run_table(three_years, &plan).rows,
+            vec![vec![PropValue::Int(2019), PropValue::Int(2)]]
+        );
+    }
+
+    #[test]
+    fn ordering_by_a_column_that_is_not_there_sorts_rather_than_fails() {
+        // An out-of-range column reads Null for every tuple, so the ordering
+        // is a no-op.
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        plan.project = Some(Projection {
+            items: vec![ProjItem::value("year", p("year"))],
+            order_by: vec![TupleSortKey {
+                column: 7,
+                descending: false,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(run_table(three_years, &plan).rows.len(), 3);
     }
 
     #[test]
@@ -1009,5 +1840,161 @@ mod tests {
             &plan,
         );
         assert_eq!(ids.len(), 2);
+    }
+
+    // ---- bindings ---------------------------------------------------------
+
+    /// `a -CITES-> {b, c}`, where `a` and `b` share a file and `c` doesn't.
+    /// Two nodes' properties in one predicate is the shape the linear pipeline
+    /// used to reject outright.
+    fn cross_variable_graph(txn: &mut dyn WriteTransaction) {
+        let file = |f: &str| props(&[("file", PropValue::Str(f.into()))]);
+        let a = graph::create_node(txn, PlaneId::STARTUP, &["Root"], &file("exec.rs")).unwrap();
+        let b = graph::create_node(txn, PlaneId::STARTUP, &[], &file("exec.rs")).unwrap();
+        let c = graph::create_node(txn, PlaneId::STARTUP, &[], &file("plan.rs")).unwrap();
+        graph::create_edge(txn, PlaneId::STARTUP, a, b, "CITES", &Properties::new()).unwrap();
+        graph::create_edge(txn, PlaneId::STARTUP, a, c, "CITES", &Properties::new()).unwrap();
+    }
+
+    #[test]
+    fn a_filter_can_compare_two_pattern_variables() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Root".into()));
+        plan.push(Step::Expand {
+            dir: Dir::Out,
+            edge_type: Some("CITES".into()),
+        });
+        // slot 0 is the source `a`; the current node is `b`/`c`.
+        plan.push(Step::Filter(at_node(0, p("file")).eq(p("file"))));
+        assert_eq!(run(cross_variable_graph, &plan), vec![NodeId(2)]);
+    }
+
+    /// The source node is the one binding the trail cannot reconstruct — it
+    /// records hop destinations only — so `Row::origin` earns its 8 bytes.
+    #[test]
+    fn slot_zero_is_the_source_even_after_several_hops() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Root".into()));
+        for _ in 0..2 {
+            plan.push(Step::Expand {
+                dir: Dir::Out,
+                edge_type: None,
+            });
+        }
+        plan.push(Step::Filter(at_node(0, p("name")).eq("a")));
+        let ids = run(
+            |txn| {
+                let name = |n: &str| props(&[("name", PropValue::Str(n.into()))]);
+                let a = graph::create_node(txn, PlaneId::STARTUP, &["Root"], &name("a")).unwrap();
+                let b = graph::create_node(txn, PlaneId::STARTUP, &[], &name("b")).unwrap();
+                let c = graph::create_node(txn, PlaneId::STARTUP, &[], &name("c")).unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, a, b, "N", &Properties::new()).unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, b, c, "N", &Properties::new()).unwrap();
+            },
+            &plan,
+        );
+        assert_eq!(ids, vec![NodeId(3)]);
+    }
+
+    /// A `Both` expansion walks each edge in whichever direction reaches the
+    /// neighbour, and the resolver recovers which one from the endpoints.
+    #[test]
+    fn edge_terms_see_the_direction_the_row_actually_walked() {
+        let build = |txn: &mut dyn WriteTransaction| {
+            let mid =
+                graph::create_node(txn, PlaneId::STARTUP, &["Mid"], &Properties::new()).unwrap();
+            let up = graph::create_node(txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+            let down = graph::create_node(txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+            // mid -CALLS-> down, and up -CALLS-> mid
+            graph::create_edge(
+                txn,
+                PlaneId::STARTUP,
+                mid,
+                down,
+                "CALLS",
+                &props(&[("weight", PropValue::Int(7))]),
+            )
+            .unwrap();
+            graph::create_edge(txn, PlaneId::STARTUP, up, mid, "CALLS", &Properties::new())
+                .unwrap();
+        };
+
+        let both = |pred: Expr| {
+            let mut plan = LogicalPlan::new(Source::ScanLabel("Mid".into()));
+            plan.push(Step::Expand {
+                dir: Dir::Both,
+                edge_type: None,
+            });
+            plan.push(Step::Filter(pred));
+            plan
+        };
+
+        // Out of `mid` is the edge it is the src of — the one reaching `down`.
+        assert_eq!(run(build, &both(edge_dir().eq("OUT"))), vec![NodeId(3)]);
+        assert_eq!(run(build, &both(edge_dir().eq("IN"))), vec![NodeId(2)]);
+        // Type and edge properties come off the same resolved record.
+        assert_eq!(run(build, &both(edge_type().eq("CALLS"))).len(), 2);
+        assert_eq!(run(build, &both(ep("weight").eq(7))), vec![NodeId(3)]);
+        // A hop-qualified term addresses the same single hop here.
+        assert_eq!(
+            run(build, &both(at_edge(0, edge_dir()).eq("OUT"))),
+            vec![NodeId(3)]
+        );
+    }
+
+    /// Resolution is driven by what the plan names, so a query that reaches
+    /// past nothing must ask for nothing.
+    #[test]
+    fn a_slot_the_row_never_bound_reads_as_null() {
+        // Variable-length expansion emits walks of different lengths, so slot
+        // 2 is a binding the one-hop rows do not have. It reads Null, like a
+        // missing property.
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Root".into()));
+        plan.push(Step::ExpandVar {
+            dir: Dir::Out,
+            edge_type: Some("CITES".into()),
+            min: 1,
+            max: 2,
+        });
+        plan.push(Step::Filter(at_node(2, p("year")).is_null()));
+        let ids = run(
+            |txn| {
+                let a = graph::create_node(txn, PlaneId::STARTUP, &["Root"], &Properties::new())
+                    .unwrap();
+                let b = graph::create_node(
+                    txn,
+                    PlaneId::STARTUP,
+                    &["Paper"],
+                    &props(&[("year", PropValue::Int(2020))]),
+                )
+                .unwrap();
+                let c = graph::create_node(
+                    txn,
+                    PlaneId::STARTUP,
+                    &["Paper"],
+                    &props(&[("year", PropValue::Int(2021))]),
+                )
+                .unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, a, b, "CITES", &Properties::new())
+                    .unwrap();
+                graph::create_edge(txn, PlaneId::STARTUP, b, c, "CITES", &Properties::new())
+                    .unwrap();
+            },
+            &plan,
+        );
+        // The one-hop row (a→b) has no slot 2 and passes; the two-hop row
+        // (a→b→c) has one carrying 2021 and does not.
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn a_plan_without_bindings_resolves_none() {
+        let mut plan = LogicalPlan::new(Source::ScanAll);
+        plan.push(Step::Filter(p("x").eq(1)));
+        assert!(!plan.binding_need().any());
+
+        plan.push(Step::Sort(vec![SortKey {
+            expr: at_node(1, p("x")),
+            descending: false,
+        }]));
+        assert_eq!(plan.binding_need().nodes, Some(1));
     }
 }

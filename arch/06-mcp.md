@@ -30,7 +30,7 @@ then narrow, then act:
 
 | Tool | Purpose |
 |---|---|
-| `context` · `describe` · `search` · `grep` · `trace` · `impact` · `snippet` | the seven agent verbs over a digested code plane — one round trip each, compact one-fact-per-line text, ambiguity returns candidates, call listings state their lower bound. `context` is the primary verb; `grep` and `snippet` read the watched source tree |
+| `context` · `describe` · `search` · `grep` · `trace` · `impact` · `fathom` · `snippet` | the eight agent verbs over a digested code plane — one round trip each, compact one-fact-per-line text, ambiguity returns candidates, call listings state their lower bound. `context` is the primary verb; `grep` and `snippet` read the watched source tree |
 | `list_planes` | planes with names, descriptions, sizes — "which canvas?" |
 | `describe_plane` | per-plane catalog: labels, properties with **dominant descriptions**, edge-type connectivity, vector indexes, counts |
 | `get_node` | one record, properties **with descriptions**, adjacency summary (per-type counts, not the edges themselves) |

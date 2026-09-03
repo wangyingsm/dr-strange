@@ -9,8 +9,13 @@
 `LogicalPlan`, a total `Expr` evaluator, and a pull-based executor over
 `GraphReader` (`compute::{plan, expr, exec}`). The **row model is the linear
 pipeline** of §2 (a current node + trail + an optional `f32` score channel),
-not the named-multi-variable form. `Project` is a v0 API terminal
-(`select`), not a plan `Step`.
+not the named-multi-variable form — though a row's *earlier* bindings are
+addressable (`Expr::At`), since the trail was carrying them all along.
+`Project` is both an API terminal (`select`) and a tail on the plan itself
+(`LogicalPlan::project`): a projection turns node rows into value rows, so it
+ends the pipeline rather than sitting inside it as a `Step`. The tail also
+**aggregates** (`count`/`sum`/`avg`/`min`/`max`/`collect`), grouping by every
+column that isn't an aggregate — Cypher's implicit `GROUP BY`.
 
 **M3 landed** the AI-native surface: the hybrid operators of §4 —
 `Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed

@@ -672,6 +672,17 @@ struct ImpactReq {
     depth: Option<usize>,
 }
 
+/// `fathom`'s request: one symbol and how wide a region around it.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FathomReq {
+    #[serde(default = "default_plane")]
+    plane: String,
+    name: String,
+    /// Hops to walk, out and in (default 2, max 6).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
 /// `history`'s request: which repository, and how much of it.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct HistoryReq {
@@ -855,8 +866,16 @@ fn traverse_logic(db: &Database, req: Traverse) -> AnyResult<Value> {
 
 fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
     let plan: LogicalPlan = serde_json::from_value(req.plan)?;
-    let rows = db.plane(&req.plane)?.query_from_plan(plan).scored_nodes()?;
-    Ok(scored_rows(&rows))
+    read_result(db.plane(&req.plane)?.query_from_plan(plan))
+}
+
+/// Render what a read query returns: a table when its plan projects, its
+/// nodes otherwise.
+fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> AnyResult<Value> {
+    match q.plan().project.is_some() {
+        true => Ok(json::table_to_json(&q.table()?)),
+        false => Ok(scored_rows(&q.scored_nodes()?)),
+    }
 }
 
 /// Default result cap for the whole-graph algorithms (they can produce a row
@@ -1121,11 +1140,9 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
     })?;
     let plane = db.plane(&req.plane)?;
     match stmt {
-        dr_strange_parser::Statement::Read(read) => Ok(scored_rows(
-            &pin(plane, read.as_of)?
-                .query_from_plan(read.plan)
-                .scored_nodes()?,
-        )),
+        dr_strange_parser::Statement::Read(read) => {
+            read_result(pin(plane, read.as_of)?.query_from_plan(read.plan))
+        }
         dr_strange_parser::Statement::Write(w) => {
             let s = w.apply(&plane).map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(jval!({
@@ -1658,6 +1675,32 @@ impl DrStrange {
         .await
     }
 
+    #[tool(description = "Read one region of the graph closely: everything \
+        within `depth` hops of this symbol, out and in, reported as its \
+        makeup rather than a listing — node counts by label, edge counts by \
+        type with each direction, how many nodes each hop added, and the \
+        hubs that hold the region together (by their edges inside it). Use \
+        it to size up an unfamiliar corner before reading it: `context` \
+        answers about one symbol and `impact` names what reaches it, while \
+        this says what kind of place the symbol sits in. Fuzzy name; depth \
+        defaults to 2. The walk is bounded by depth and by a node budget, \
+        and the reply says which bound it hit — counts are always exact \
+        over what it walked.")]
+    async fn fathom(
+        &self,
+        Parameters(req): Parameters<FathomReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.blocking("fathom", move |db| {
+            let plane = db.plane(&req.plane)?;
+            Ok(Value::String(dr_strange_core::compact::fathom(
+                &plane,
+                &req.name,
+                req.depth.unwrap_or(2),
+            )?))
+        })
+        .await
+    }
+
     #[tool(description = "A repository's history at a glance: where HEAD is, \
         what the branches and tags point at, which branches were rebased \
         (and what each replaced), and the newest commits — as compact text. \
@@ -1802,15 +1845,21 @@ impl DrStrange {
         CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \
         algorithms. Then BEAM similarity traversal, WHERE (property/label \
         tests, key(n) for a node's external key, x IN [a,b]), \
-        RETURN [DISTINCT] <var>|* — one variable, the pattern's last, and \
-        whole records come back, so there is no column list, projection \
-        (`RETURN f.file`), alias or aggregate; ORDER BY/SKIP/LIMIT take \
-        expressions (`ORDER BY f.line`), and a trailing \
-        AS OF <seq|\"RFC-3339\"|TIME ms> to read a past snapshot. \
+        RETURN [DISTINCT] <var>|* — the pattern's last variable, whole \
+        records — or a projection: `RETURN f.file, count(*) AS calls` reads \
+        any bound variable, takes AS aliases, and folds with \
+        count/sum/avg/min/max/collect (each optionally DISTINCT), grouped by \
+        every column that is not a fold; a projected query answers with \
+        {columns, rows} instead of nodes. ORDER BY/SKIP/LIMIT take \
+        expressions (`ORDER BY f.line`) and, when the query projects, name a \
+        returned column (`ORDER BY calls DESC`); a trailing \
+        AS OF <seq|\"RFC-3339\"|TIME ms> reads a past snapshot. \
         Writes (CREATE/MERGE/SET/REMOVE/DELETE) mutate the plane and return \
         change-counts. Examples: \
         `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`; \
         `MATCH (n)-[:KNOWS]->(m) WHERE key(n) = \"alice\" RETURN m`; \
+        `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) AS calls \
+        ORDER BY calls DESC LIMIT 10`; \
         `SEARCH (d:Doc) ON body MATCHING \"graph database\" TOPK 5 RETURN d`; \
         `CALL pagerank() ON (n:Paper) RETURN n ORDER BY score() DESC LIMIT 10`; \
         `CREATE (a:Person {key:\"alice\", age:30})-[:KNOWS]->(b:Person {key:\"bob\"})`.")]
@@ -1929,7 +1978,8 @@ impl ServerHandler for DrStrange {
              write_edges to write. Planes are isolated graph canvases; \
              default 'startup'.\n\
              A digested repository has two planes. `<name>` holds the code as \
-             it is now — ask `context`, `trace`, `impact`, `snippet`, `grep`. \
+             it is now — ask `context`, `trace`, `impact`, `fathom`, \
+             `snippet`, `grep`. \
              `<name>_git` holds the same repository's history — Commit (also \
              Merge), Branch, Tag and Rebase nodes, joined by PARENT (with \
              `order`, so a merge's first parent is the line it was made on), \

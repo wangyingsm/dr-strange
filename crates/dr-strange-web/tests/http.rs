@@ -145,6 +145,19 @@ async fn serves_dashboard_and_rpc() {
     assert_eq!(cyv["count"], 1);
     assert_eq!(cyv["nodes"][0]["external_key"], "alice");
 
+    // A projecting query answers with a table, not a subgraph.
+    let table = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body("MATCH (n:Person) RETURN key(n) AS who, count(*) AS n")
+        .send()
+        .await
+        .unwrap();
+    assert!(table.status().is_success());
+    let tv: Value = table.json().await.unwrap();
+    assert_eq!(tv["columns"], serde_json::json!(["who", "n"]));
+    assert_eq!(tv["rows"], serde_json::json!([["alice", 1]]));
+
     // A malformed query is a 400 with the parser's message, not a panic.
     let bad = client
         .post(format!("{base}/cypher?plane=startup"))

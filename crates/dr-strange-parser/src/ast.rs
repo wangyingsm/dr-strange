@@ -5,6 +5,7 @@
 //! ([`crate::compile`]) is what decides *where* in the pipeline each predicate
 //! belongs and drops the qualifier when it lands on that variable's slot.
 
+use dr_strange_core::AggFunc;
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
@@ -180,22 +181,54 @@ pub struct VarLen {
     pub max: Option<u32>,
 }
 
+/// `RETURN [DISTINCT] <item> [, <item>]*`.
+///
+/// An item naming a node (`n`, `*`) returns node rows; anything else returns
+/// a table. The two cannot be mixed: a node is not a value (see
+/// [`crate::compile`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub distinct: bool,
-    pub item: ReturnItem,
+    pub items: Vec<ReturnItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReturnItem {
+    /// `RETURN *` — the matching rows themselves.
     Star,
+    /// `RETURN n` — likewise, named by their variable.
     Var(String),
+    /// `RETURN n.year [AS y]` — a projected column.
+    Value { expr: PExpr, name: String },
+    /// `RETURN count(*) [AS n]` — a column folded over each group.
+    Agg {
+        func: AggFunc,
+        /// `None` for `count(*)`, which reads no value.
+        arg: Option<PExpr>,
+        distinct: bool,
+        name: String,
+    },
 }
 
+/// `ORDER BY <key> [ASC|DESC]`. A projecting query orders by column, which
+/// `text` is what names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
-    pub expr: PExpr,
+    pub target: SortTarget,
+    /// The key's source text, trimmed: the name an unaliased `RETURN` item
+    /// takes, so `ORDER BY count(*)` finds its column.
+    pub text: String,
     pub descending: bool,
+}
+
+/// What an `ORDER BY` key names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortTarget {
+    /// An expression — `ORDER BY n.year DESC`.
+    Expr(PExpr),
+    /// A bare name: a `RETURN` alias, which only a projecting query has. A
+    /// bare variable is not an expression in this language.
+    Name(String),
 }
 
 /// A parsed expression. Mirrors core's `Expr` but with variable-qualified

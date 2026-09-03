@@ -690,10 +690,16 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: RunPlan = params(p)?;
     let plan: LogicalPlan =
         serde_json::from_value(req.plan).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    let rows = app(plane_at(ctx, &req.plane, &req.at)?
-        .query_from_plan(plan)
-        .scored_nodes())?;
-    Ok(scored_rows(&rows))
+    read_result(plane_at(ctx, &req.plane, &req.at)?.query_from_plan(plan))
+}
+
+/// Render what a read query returns: a table when its plan projects, its
+/// scored nodes otherwise.
+fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> Result<Value, RpcError> {
+    match q.plan().project.is_some() {
+        true => Ok(json::table_to_json(&app(q.table())?)),
+        false => Ok(scored_rows(&app(q.scored_nodes())?)),
+    }
 }
 
 /// Adapts an LLM provider to the parser's `Embedder` seam, so a
@@ -811,7 +817,12 @@ pub fn cypher_subgraph(
         }
     };
 
-    let rows = app(plane.query_from_plan(plan).scored_nodes())?;
+    // A projecting query has no induced subgraph to plot.
+    let q = plane.query_from_plan(plan);
+    if q.plan().project.is_some() {
+        return Ok(json::table_to_json(&app(q.table())?));
+    }
+    let rows = app(q.scored_nodes())?;
 
     let set: std::collections::BTreeSet<u64> = rows.iter().map(|(n, _)| n.id.0).collect();
     let nodes: Vec<Value> = rows

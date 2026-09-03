@@ -78,7 +78,7 @@ SEARCH (d:Doc) ON embedding NEAR "how does time-travel work" TOPK 5 RETURN d
 | **变更流** | 订阅一个平面，实时接收其变更 |
 | **代码图化** | 沙箱化的 wasm 解析器插件将代码仓库转化为已解析的调用图（官方支持 8 种语言） |
 | **提交同步监视** | `serve watch` 将每次提交折叠进平面 |
-| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`，每个问题一次往返 |
+| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet`，每个问题一次往返 |
 | **备份 / 恢复** | 一致、保 id 的整库快照 |
 | **只读副本** | `serve --follow` 镜像一个正在运行的服务，用于跨集群扩展读取 |
 | **访问方式** | Web 界面、六种语言 SDK、命令行，以及 MCP 服务 |
@@ -94,8 +94,8 @@ v1.0 是一个完整的、嵌入式的、AI 原生的图数据库，具备上述
 v2.0 把代码仓库自身的源码树也变成了一种图。沙箱化的 wasm 解析器插件把源文件解析
 为一张已解析的调用图，包含符号、带调用位置的调用者，以及其它每一种结构性边，全程
 无需模型参与，开箱即支持八种语言。`serve watch` 让生成的平面随代码仓库自身的提交
-历史保持同步，每次提交落地就把这次的变更折叠进图中。七个智能体动词——`context`、
-`search`、`describe`、`grep`、`trace`、`impact`、`snippet`——把这张图变成编码
+历史保持同步，每次提交落地就把这次的变更折叠进图中。八个智能体动词——`context`、
+`search`、`describe`、`grep`、`trace`、`impact`、`fathom`、`snippet`——把这张图变成编码
 智能体一次往返即可拿到的答案，每一个都会说明自己结果的边界：给出候选清单而不是
 猜一个匹配，用 `UnresolvedRef` 台账条目代替一条悄悄出错的边。`drsg init` 把这
 一切合并成一条命令，一次做完图化、监视，以及为当前使用的宿主工具写入 MCP 配置。

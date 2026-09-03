@@ -4,6 +4,7 @@
   import { loadPref, savePref } from './prefs.js'
   import Dashboard from './Dashboard.svelte'
   import Explore from './Explore.svelte'
+  import Query from './Query.svelte'
   import Digest from './Digest.svelte'
   import Icon from './Icon.svelte'
 
@@ -232,6 +233,9 @@
     <button class:active={view === 'explore'} onclick={() => (view = 'explore')}>
       <Icon name="explore" /> Explore
     </button>
+    <button class:active={view === 'query'} onclick={() => (view = 'query')}>
+      <Icon name="query" /> Query
+    </button>
     <button class:active={view === 'digest'} onclick={() => (view = 'digest')}>
       <Icon name="aigest" /> AIgest
     </button>
@@ -244,6 +248,8 @@
   <Dashboard {plane} {onPlaneCreated} {onPlaneDeleted} onSelectPlane={(name) => (plane = name)} />
 {:else if view === 'explore'}
   <Explore {plane} {focus} {onPlaneCreated} bind:asOf {history} {timeTravel} />
+{:else if view === 'query'}
+  <Query {plane} />
 {:else}
   <Digest {plane} {onPlaneCreated} />
 {/if}

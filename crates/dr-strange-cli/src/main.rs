@@ -172,6 +172,16 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// Read one region closely: what is within a few hops of this symbol, by
+    /// label and edge type, with the hubs that hold it together.
+    Fathom {
+        name: String,
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Hops to walk, out and in (max 6).
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+    },
     /// A repository's history at a glance: where HEAD is, what the branches
     /// and tags point at, what was rebased, and the newest commits. Reads the
     /// `_git` plane a digest of a git checkout writes — naming the code plane
@@ -762,6 +772,16 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 out,
                 "{}",
                 dr_strange_core::compact::impact(&p, &name, depth)?
+            )?;
+            Ok(())
+        }
+        Command::Fathom { name, plane, depth } => {
+            let db = commands::open(&cli.db)?;
+            let p = db.plane(&plane)?;
+            write!(
+                out,
+                "{}",
+                dr_strange_core::compact::fathom(&p, &name, depth)?
             )?;
             Ok(())
         }

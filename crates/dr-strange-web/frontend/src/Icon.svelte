@@ -9,12 +9,12 @@
       '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
     explore:
       '<circle cx="6" cy="7" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="12" cy="18" r="2.5"/><line x1="8.2" y1="8.2" x2="9.9" y2="16"/><line x1="15.8" y1="9" x2="13.5" y2="16.4"/><line x1="8.4" y1="7.4" x2="15.6" y2="7.7"/>',
+    query:
+      '<path d="M4 6h16"/><path d="M4 11h10"/><path d="M4 16h6"/><circle cx="17" cy="16" r="3.2"/><line x1="19.4" y1="18.4" x2="21.5" y2="20.5"/>',
     aigest:
       '<path d="M11 3l1.4 5.6L18 10l-5.6 1.4L11 17l-1.4-5.6L4 10l5.6-1.4z"/><path d="M18 14l.5 2 2 .5-2 .5-.5 2-.5-2-2-.5 2-.5z"/>',
     // explore tabs
     filters: '<path d="M3 5h18l-7 8.5V20l-4 1v-7.5z"/>',
-    graphql:
-      '<polyline points="4 6 8.5 12 4 18"/><line x1="11.5" y1="18" x2="20" y2="18"/>',
     algorithms: '<polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/>',
     hybrid:
       '<path d="M12 2 3 6.5l9 4.5 9-4.5z"/><path d="M3 12l9 4.5 9-4.5"/><path d="M3 17l9 4.5 9-4.5"/>',

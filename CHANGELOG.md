@@ -25,6 +25,100 @@ All notable changes to Dr Strange are documented here. The format is based on
   jitter for the same reason. If a run is still refused at every attempt, the
   error now names the `concurrency` knob and the limit it got down to instead
   of only quoting the provider.
+### Added
+
+- **A query can answer with a table.** `RETURN a.name, count(*) AS papers
+  ORDER BY papers DESC LIMIT 10` now compiles, runs, and comes back as columns
+  and rows — from the MCP verbs, the RPC, `POST /cypher`, the CLI, and as a
+  table panel in the dashboard. `RETURN n` and `RETURN *` are untouched: they
+  hand back whole records exactly as before, and a plan that doesn't project
+  serializes byte-for-byte as the plan it always was.
+
+  Each `RETURN` item becomes a column, named by its `AS` alias or by the item
+  as the query wrote it. A column may read any variable the pattern bound, not
+  only the last — `RETURN a.name, p.year` across a hop — because a row is a
+  current node *plus the trail that reached it*, and the new `Expr::At` term
+  names a binding out of that trail. The roadmap had deferred all of this as
+  "the most invasive change … it needs the multi-binding row model": the linear
+  pipeline turned out to have been carrying every binding all along, and what
+  was missing was only a term that names one.
+
+- **Aggregates:** `count`, `sum`, `avg`, `min`, `max` and `collect`, each
+  optionally `DISTINCT`, grouped by every column that is *not* an aggregate —
+  Cypher's implicit `GROUP BY`, so what a query lists beside its aggregates is
+  what it is broken down by. `count(*)` counts rows; the rest read a value.
+
+  Every fold is total, like the rest of evaluation: nulls are skipped, and so
+  is a value the fold cannot use — a year one node stored as text doesn't fail
+  the query, it just isn't in the average, which is what an aggregate over
+  soft-schema data has to do to be worth having. Over a group that gave it
+  nothing, `count` and `sum` are `0`, `avg`/`min`/`max` are `null` (the mean of
+  no values is unanswerable, not zero) and `collect` is the empty list. A
+  projection with no grouping key is one group over the whole match, so
+  `RETURN count(*)` answers `0` rather than nothing when nothing matched.
+
+  `sum` stays exact while every value is an integer and is demoted by the first
+  float, so summing ids past 2⁵³ doesn't quietly round.
+
+- **`fathom` — an eighth agent verb: read one region of the graph closely.**
+  Everything within a few hops of a symbol, out and in, reported as the
+  region's *makeup* rather than a listing of it: node counts by label, edge
+  counts by type with each direction, how many nodes each hop added, and the
+  handful of symbols that hold the region together, ranked by their edges
+  *inside* it (a global degree would rank the plane's hubs, not this corner's)
+  and excluding the seed, which is the centre by construction.
+
+  The region is the induced subgraph: every edge between two of its nodes,
+  including edges among the nodes the last hop reached. Without that closing
+  pass a region's last layer looks edgeless — `fathom Ok --depth 1` over this
+  repository reported 211 edges and no hub above one edge, where the same
+  region actually holds 410 edges and a clear top five.
+
+  It answers a question the other verbs don't: `context` describes one symbol
+  and `impact` names what reaches it, while this says what kind of place the
+  symbol sits in — a call-heavy corner of the parser, or a shallow leaf. On a
+  real Go repository, two hops around `main` comes back as five lines: 519
+  nodes, `CONTAINS 360 · CALLS 116 · IMPORTS 71`, and the five hubs.
+
+  Bounded twice, and it says which bound it hit — the depth asked for, or a
+  5,000-node budget past which a hub would otherwise pull in the plane. The
+  walk is breadth-first, so a truncated region is the *nearest* one, and every
+  count is exact over what was walked. `drsg fathom <name> [--depth]` and the
+  `fathom` MCP tool.
+
+- **A Query view in the dashboard.** A top-level view beside Dashboard,
+  Explore and AIgest: a multi-line editor (⌘/Ctrl+Enter runs, Tab accepts the
+  keyword completion) and the result rendered as what it is — a table for a
+  projection, with row/column counts, timing and a copy-as-TSV control; a
+  record listing for a query that returns nodes; change counts for a write.
+
+  The query surface used to be a tab inside the graph view, labelled "GraphQL
+  / Run" — for a language this project does not implement, one unlabelled
+  click from a view that opens on Filters. That tab is gone: a query is
+  written in one place now, and Explore is the canvas — its remaining tabs
+  seed, overlay and search the graph rather than compose queries about it.
+
+- **`type(r)`, `direction(r)` and `id(n)`.** A row's edge and its internal id,
+  readable in `WHERE`, `ORDER BY` and a projection. `direction(r)` is never
+  `BOTH`: `BOTH` is what the *query* asked for, while a row always walked one
+  concrete way. `id(n)` makes a node a grouping key even when it carries no
+  projectable property and no external key, which most digested nodes don't.
+
+### Changed
+
+- **`DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` mean tuples in a projecting
+  query.** `RETURN DISTINCT n.file` compares whole projected rows (two nodes in
+  one file are one row), `ORDER BY` names a returned column — by alias, or by
+  the expression it returned — and the slice counts what the projection
+  produced, which is the only reading that can follow an aggregate. Over
+  `RETURN n` all four keep their node meaning, unchanged.
+
+- **A `RETURN` this language lacked no longer explains that it lacks it.** The
+  errors that used to name projections, aliases and aggregates as unsupported
+  shapes described most of what now works, so they are gone. What is still
+  unsupported says so precisely: a node cannot share a `RETURN` with columns
+  (it is not a value — return its properties), and returning the *rows* of an
+  earlier variable still can't be done, though its values project.
 
 ## [2.3.0] - 2026-09-01
 
