@@ -107,6 +107,6 @@ if (($userPath -split ';') -notcontains $Dir) {
 foreach ($b in $bins) {
     switch ($b) {
         'drsg' { Write-Host 'Run: drsg --db graph.drsg serve' }
-        'drsg-mcp' { Write-Host 'Run: drsg-mcp C:\path\to\graph.drsg  (normally launched by an MCP host)' }
+        'drsg-mcp' { Write-Host 'Run: drsg-mcp --db C:\path\to\graph.drsg  (normally launched by an MCP host; no argument in a repository prepared by drsg init)' }
     }
 }

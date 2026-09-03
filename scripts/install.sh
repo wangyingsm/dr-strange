@@ -154,6 +154,6 @@ esac
 for b in $BINS; do
     case $b in
         drsg) info "Run: drsg --db graph.drsg serve" ;;
-        drsg-mcp) info "Run: drsg-mcp /path/to/graph.drsg  (normally launched by an MCP host)" ;;
+        drsg-mcp) info "Run: drsg-mcp --db /path/to/graph.drsg  (normally launched by an MCP host; no argument in a repository prepared by drsg init)" ;;
     esac
 done

@@ -69,7 +69,7 @@ keys the graph tools need:
   "mcpServers": {
     "dr-strange": {
       "command": "drsg-mcp",
-      "args": ["/path/to/graph.drsg"],
+      "args": ["--db", "/path/to/graph.drsg"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "DEEPSEEK_API_KEY": "...",

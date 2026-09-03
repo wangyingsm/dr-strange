@@ -61,7 +61,7 @@ stdio 的宿主同样能接到那个已经持有数据库的进程，其平面�
   "mcpServers": {
     "dr-strange": {
       "command": "drsg-mcp",
-      "args": ["/path/to/graph.drsg"],
+      "args": ["--db", "/path/to/graph.drsg"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "DEEPSEEK_API_KEY": "...",
