@@ -9,12 +9,13 @@
 //! (arch/00 §2). The builder mirrors these operators one-to-one; there is no
 //! separate builder semantics.
 //!
-//! Not yet here (M3): the hybrid `VectorTopK`/`FrontierTopK`/`ExpandBeam`
-//! operators and `Project`/score-channel machinery.
+//! A plan may end in a **projection** ([`Projection`]) — arch/03 §2's
+//! `Project`, modelled as a tail rather than a step because it turns node
+//! rows into value rows and so nothing can follow it.
 
 use serde::{Deserialize, Serialize};
 
-use crate::compute::expr::Expr;
+use crate::compute::expr::{BindingNeed, Expr};
 use crate::compute::hybrid::HybridSpec;
 use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
@@ -159,11 +160,150 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// A complete query: a source and its pipeline.
+/// One projected column: a name and what it computes.
+///
+/// The name is the table header: the query's alias, or the item's source text
+/// (`n.name`, `count(*)`) when it wrote none.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjItem {
+    pub name: String,
+    pub expr: ProjExpr,
+}
+
+impl ProjItem {
+    /// A column reading one value per row — `RETURN n.year`.
+    pub fn value(name: impl Into<String>, expr: Expr) -> Self {
+        Self {
+            name: name.into(),
+            expr: ProjExpr::Value(expr),
+        }
+    }
+
+    /// A column folding a group of rows into one value — `RETURN count(*)`.
+    pub fn agg(name: impl Into<String>, agg: Agg) -> Self {
+        Self {
+            name: name.into(),
+            expr: ProjExpr::Agg(agg),
+        }
+    }
+}
+
+/// What a projected column computes: a value per row, or a fold over a group
+/// of rows.
+///
+/// Two cases rather than an [`Expr`] variant: an aggregate is a fold over
+/// rows, not a value a row has, and only a projection can evaluate one.
+/// Keeping it out of `Expr` makes `WHERE count(*) > 3` unwritable rather than
+/// silently `Null`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ProjExpr {
+    /// One value per row, and a grouping key once any other column
+    /// aggregates — Cypher's implicit `GROUP BY`.
+    Value(Expr),
+    Agg(Agg),
+}
+
+/// An aggregate over the rows of one group.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Agg {
+    pub func: AggFunc,
+    /// The expression folded, evaluated per row. `None` is `count(*)`, which
+    /// counts rows and so needs none.
+    pub arg: Option<Expr>,
+    /// Fold each distinct value once — `count(DISTINCT n.file)`, by the total
+    /// order [`Projection::distinct`] uses.
+    pub distinct: bool,
+}
+
+impl Agg {
+    /// `count(*)` — rows in the group, including rows whose every value is
+    /// null.
+    pub fn count() -> Self {
+        Self {
+            func: AggFunc::Count,
+            arg: None,
+            distinct: false,
+        }
+    }
+
+    /// `func(expr)` — folded over the group's non-null values of `expr`.
+    pub fn of(func: AggFunc, expr: Expr) -> Self {
+        Self {
+            func,
+            arg: Some(expr),
+            distinct: false,
+        }
+    }
+
+    /// Fold each distinct value once. No effect on `count(*)`, which reads
+    /// no value.
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+}
+
+/// Which fold an [`Agg`] performs.
+///
+/// All are total: a null, or a value the fold cannot use (a string under
+/// `sum`), is skipped rather than failing the query. They differ in what they
+/// return for a group that gave them nothing — see [`crate::compute::exec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFunc {
+    /// How many: rows for `count(*)`, non-null values otherwise. `0` over
+    /// nothing.
+    Count,
+    /// Numeric total; `0` over nothing. Stays `Int` while every value is one.
+    Sum,
+    /// Numeric mean as a `Float`; `Null` over nothing, since the mean of no
+    /// values is unanswerable rather than zero.
+    Avg,
+    /// Least value under the total order; `Null` over nothing.
+    Min,
+    /// Greatest value under the total order; `Null` over nothing.
+    Max,
+    /// Every non-null value as a `List`, in row order.
+    Collect,
+}
+
+/// Ordering over projected tuples, by **column index** rather than
+/// expression: after a projection a column is all there is to address.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TupleSortKey {
+    pub column: usize,
+    pub descending: bool,
+}
+
+/// The terminal that turns node rows into value rows (arch/03 §2's `Project`).
+///
+/// A **tail**, not a [`Step`]: nothing downstream of a projection can expand
+/// or filter a node, so as a field "the projection is last" is
+/// unrepresentable-otherwise rather than a rule the executor enforces.
+///
+/// `order_by`/`skip`/`limit` are here for the same reason — over tuples they
+/// mean something different from the steps of the same name over node rows.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Projection {
+    /// Output columns, in order.
+    pub items: Vec<ProjItem>,
+    /// Deduplicate whole projected tuples (`RETURN DISTINCT n.file`), which is
+    /// a different question from [`Step::Distinct`]'s "by node id".
+    pub distinct: bool,
+    pub order_by: Vec<TupleSortKey>,
+    pub skip: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// A complete query: a source, its pipeline, and an optional projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogicalPlan {
     pub source: Source,
     pub steps: Vec<Step>,
+    /// `None` — the default, and what every plan written before this existed
+    /// deserializes to — means the query returns node records, exactly as it
+    /// always has. `Some` means it returns a table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Projection>,
 }
 
 impl LogicalPlan {
@@ -171,11 +311,42 @@ impl LogicalPlan {
         Self {
             source,
             steps: Vec::new(),
+            project: None,
         }
     }
 
     pub fn push(&mut self, step: Step) {
         self.steps.push(step);
+    }
+
+    /// Which of a row's bindings this plan's expressions name (`Expr::At` and
+    /// the edge terms).
+    ///
+    /// Computed once per execution so the executor resolves only what is
+    /// asked for: a plan that never reaches past its current node reports
+    /// nothing to resolve, and rows cost exactly what they cost today.
+    pub fn binding_need(&self) -> BindingNeed {
+        let mut need = BindingNeed::default();
+        for step in &self.steps {
+            match step {
+                Step::Filter(e) => need.add(e),
+                Step::Sort(keys) => keys.iter().for_each(|k| need.add(&k.expr)),
+                Step::Expand { .. }
+                | Step::ExpandVar { .. }
+                | Step::Skip(_)
+                | Step::Limit(_)
+                | Step::Distinct
+                | Step::FrontierTopK { .. }
+                | Step::ExpandBeam { .. } => {}
+            }
+        }
+        for item in self.project.iter().flat_map(|p| &p.items) {
+            match &item.expr {
+                ProjExpr::Value(e) => need.add(e),
+                ProjExpr::Agg(agg) => agg.arg.iter().for_each(|e| need.add(e)),
+            }
+        }
+        need
     }
 }
 
@@ -230,10 +401,38 @@ mod tests {
                 Step::Skip(5),
                 Step::Limit(10),
             ],
+            project: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let back: LogicalPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn projection_tail_roundtrips_and_stays_off_the_wire_when_absent() {
+        let mut plan = LogicalPlan::new(Source::ScanLabel("Paper".into()));
+        // A plan that doesn't project doesn't mention a projection, so what
+        // rides over the wire is byte-for-byte the plan it always was.
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("project"), "{json}");
+        assert_eq!(plan, serde_json::from_str::<LogicalPlan>(&json).unwrap());
+
+        plan.project = Some(Projection {
+            items: vec![
+                ProjItem::value("year", p("year")),
+                ProjItem::agg("papers", Agg::count()),
+                ProjItem::agg("files", Agg::of(AggFunc::Collect, p("file")).distinct()),
+            ],
+            distinct: true,
+            order_by: vec![TupleSortKey {
+                column: 0,
+                descending: true,
+            }],
+            skip: Some(2),
+            limit: Some(5),
+        });
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(plan, serde_json::from_str::<LogicalPlan>(&json).unwrap());
     }
 
     #[test]

@@ -9,16 +9,20 @@
 //! absent or differently typed per node) queryable without per-row error
 //! handling.
 //!
-//! v0 evaluates against a single "current node" (the linear-pipeline row
-//! model, arch/03 §2); edge-property and multi-variable access arrive with
-//! the richer binding model later.
+//! Evaluation addresses the row's **current node** by default, and any earlier
+//! pattern binding through [`Expr::At`]. The linear pipeline never stopped
+//! carrying those bindings — a row is a current node plus the trail of hops
+//! that reached it (arch/03 §2), so the node at pattern slot *i* and the edge
+//! of hop *i* are already in every row. `At` is the term that names them; the
+//! executor resolves only the slots a plan actually mentions.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::storage::vector::Metric;
-use crate::types::{NodeRecord, PropValue};
+use crate::types::{Dir, EdgeRecord, NodeRecord, PropValue};
 
 /// A predicate or scalar over the row's current node.
 ///
@@ -34,6 +38,39 @@ pub enum Expr {
     Literal(PropValue),
     /// True iff the current node carries `label`.
     HasLabel(String),
+    /// The current node's internal id as an `Int` — the query language's
+    /// `id(n)`. Unlike [`Expr::ExternalKey`] every node has one, so this is
+    /// what makes a node usable as a grouping key when it carries no
+    /// projectable property.
+    NodeId,
+    /// Evaluate `inner` against an earlier binding of the row instead of its
+    /// current node — the query language's `a.name` where `a` is not the
+    /// pattern's last variable.
+    ///
+    /// A [`Binding::Node`] swaps the node `inner` reads; a [`Binding::Edge`]
+    /// swaps the edge, so `At { Edge(0), EdgeType }` is "the type of the first
+    /// hop's relationship". Nests: the swap applies to the whole subtree.
+    /// Total like everything else here — an out-of-range or unresolved binding
+    /// makes `inner` read against nothing, which yields `Null`.
+    At {
+        binding: Binding,
+        inner: Box<Expr>,
+    },
+    /// The traversed edge's type name as a `Str` — `type(r)`. Bare, it is the
+    /// edge the row arrived on; wrapped in [`Expr::At`] it is that hop's.
+    EdgeType,
+    /// Which way the row actually traversed the edge — `"OUT"` or `"IN"` —
+    /// the query language's `direction(r)`.
+    ///
+    /// Never `"BOTH"`: `Both` is what the *query* asked for, while a row
+    /// always took one concrete direction. Grouping a `-[r]-` pattern by
+    /// direction therefore yields the two concrete groups, which is the
+    /// question worth asking. The one indistinguishable case is a self-loop,
+    /// where both readings are true and the row reports `"OUT"`.
+    EdgeDir,
+    /// The traversed edge's value for a property key (`Null` if absent) —
+    /// `r.weight`.
+    EdgeProperty(String),
     /// The current node's caller-supplied external key as a `Str` (`Null` if
     /// the node was created without one). The query language's `key(n)`; an
     /// equality on it at the source compiles to a `SeekKeys` seek instead.
@@ -106,6 +143,20 @@ pub enum Expr {
         needle: Box<Expr>,
         haystack: Box<Expr>,
     },
+}
+
+/// Which of a row's bindings an [`Expr::At`] addresses.
+///
+/// Both index the pattern in path order, the same order the compiler already
+/// assigns slots in when it pushes filters down: node 0 is the source, node
+/// *i* is current right after the *i*-th hop, and edge *i* is the relationship
+/// of that hop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Binding {
+    /// The node at a pattern slot; 0 is the source.
+    Node(u32),
+    /// The relationship of a hop; 0 is the first.
+    Edge(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +332,44 @@ pub fn external_key() -> Expr {
     Expr::ExternalKey
 }
 
+/// The current node's internal id — the query language's `id(n)`.
+pub fn node_id() -> Expr {
+    Expr::NodeId
+}
+
+/// The traversed edge's type name — `type(r)`.
+pub fn edge_type() -> Expr {
+    Expr::EdgeType
+}
+
+/// Which way the row traversed the edge, `"OUT"` or `"IN"` — `direction(r)`.
+pub fn edge_dir() -> Expr {
+    Expr::EdgeDir
+}
+
+/// An edge property reference: `ep("weight").gt(0.5)`.
+pub fn ep(key: impl Into<String>) -> Expr {
+    Expr::EdgeProperty(key.into())
+}
+
+/// Read `inner` against the node bound at pattern slot `slot`:
+/// `at_node(0, p("name"))` is the source node's name.
+pub fn at_node(slot: u32, inner: Expr) -> Expr {
+    Expr::At {
+        binding: Binding::Node(slot),
+        inner: Box::new(inner),
+    }
+}
+
+/// Read `inner` against the relationship of hop `hop`:
+/// `at_edge(0, edge_type())` is the first hop's edge type.
+pub fn at_edge(hop: u32, inner: Expr) -> Expr {
+    Expr::At {
+        binding: Binding::Edge(hop),
+        inner: Box::new(inner),
+    }
+}
+
 /// The row's similarity score channel (arch/03 §4.5).
 pub fn score() -> Expr {
     Expr::Score
@@ -313,24 +402,133 @@ pub fn similarity(property: impl Into<String>, query: impl Into<Vec<f32>>, metri
 
 // ---- evaluation ----------------------------------------------------------
 
+/// A row's resolved pattern bindings — what [`Expr::At`] addresses.
+///
+/// Sparse on purpose: the executor resolves only the slots the plan actually
+/// mentions (see `plan::referenced_bindings`), so a query that never names an
+/// earlier variable pays nothing. An index the plan didn't ask for, or a hop
+/// the row never took, reads as `None` and evaluates to `Null`.
+#[derive(Clone, Copy, Default)]
+pub struct Bindings<'a> {
+    /// Node per pattern slot, slot 0 being the source.
+    pub nodes: &'a [Option<Arc<NodeRecord>>],
+    /// Relationship per hop, with the direction the row actually traversed it.
+    pub edges: &'a [Option<(Arc<EdgeRecord>, Dir)>],
+    /// The edge the row arrived on — what a bare [`Expr::EdgeType`] reads.
+    pub edge: Option<(&'a EdgeRecord, Dir)>,
+}
+
+impl<'a> Bindings<'a> {
+    fn node(self, slot: u32) -> Option<&'a NodeRecord> {
+        // `self` by value so the `'a` in the field survives: reborrowing
+        // through `&self` would shorten it to this call.
+        self.nodes.get(slot as usize)?.as_deref()
+    }
+
+    fn edge_at(self, hop: u32) -> Option<(&'a EdgeRecord, Dir)> {
+        let (edge, dir) = self.edges.get(hop as usize)?.as_ref()?;
+        Some((edge, *dir))
+    }
+}
+
+/// Which bindings a plan's expressions actually name.
+///
+/// High-water marks rather than a set, because a pattern's slots are dense:
+/// naming slot 3 means the walk that reaches it already passed through 0..3,
+/// so resolving up to the maximum costs nothing extra and keeps the resolved
+/// vectors directly indexable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BindingNeed {
+    /// Highest node slot named, if any.
+    pub nodes: Option<u32>,
+    /// Highest hop named, if any.
+    pub edges: Option<u32>,
+    /// A bare edge term — the edge the row arrived on.
+    pub last_edge: bool,
+}
+
+impl BindingNeed {
+    /// Whether anything needs resolving at all. The common query names no
+    /// binding, and then a row pays nothing.
+    pub fn any(&self) -> bool {
+        self.nodes.is_some() || self.edges.is_some() || self.last_edge
+    }
+
+    /// Fold in every binding `expr` names.
+    pub fn add(&mut self, expr: &Expr) {
+        self.walk(expr, false);
+    }
+
+    /// `in_edge_swap` tracks whether an enclosing `At { Edge(_), .. }` already
+    /// bound the edge channel — inside one, a bare `type(r)` is that hop's,
+    /// not the row's last, so it must not force the last-edge lookup.
+    fn walk(&mut self, expr: &Expr, in_edge_swap: bool) {
+        let bump = |slot: &mut Option<u32>, v: u32| *slot = Some(slot.map_or(v, |m| m.max(v)));
+        match expr {
+            Expr::At { binding, inner } => match binding {
+                Binding::Node(slot) => {
+                    bump(&mut self.nodes, *slot);
+                    self.walk(inner, in_edge_swap);
+                }
+                Binding::Edge(hop) => {
+                    bump(&mut self.edges, *hop);
+                    self.walk(inner, true);
+                }
+            },
+            Expr::EdgeType | Expr::EdgeDir | Expr::EdgeProperty(_) => {
+                if !in_edge_swap {
+                    self.last_edge = true;
+                }
+            }
+            Expr::IsNull(e) | Expr::Not(e) => self.walk(e, in_edge_swap),
+            Expr::Compare { lhs, rhs, .. }
+            | Expr::Logic { lhs, rhs, .. }
+            | Expr::Arith { lhs, rhs, .. }
+            | Expr::StringMatch { lhs, rhs, .. } => {
+                self.walk(lhs, in_edge_swap);
+                self.walk(rhs, in_edge_swap);
+            }
+            Expr::In { needle, haystack } => {
+                self.walk(needle, in_edge_swap);
+                self.walk(haystack, in_edge_swap);
+            }
+            // Leaves that read the current node or the row's channels.
+            Expr::Property(_)
+            | Expr::Literal(_)
+            | Expr::HasLabel(_)
+            | Expr::NodeId
+            | Expr::ExternalKey
+            | Expr::Score
+            | Expr::Hops
+            | Expr::Distance { .. }
+            | Expr::Similarity { .. } => {}
+        }
+    }
+}
+
 /// What an `Expr` is evaluated against: the current node (or `None` if the
-/// row points at a missing node), the row's score channel, and its hop
-/// count. The linear-pipeline row's world (arch/03 §2).
-#[derive(Clone, Copy)]
+/// row points at a missing node), the row's score channel, its hop count, and
+/// the earlier bindings [`Expr::At`] can reach (arch/03 §2).
+///
+/// `#[non_exhaustive]`: the row's addressable world keeps growing, so a
+/// downstream constructor goes through [`EvalCtx::node`] or `..Default`
+/// rather than listing every field.
+#[derive(Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct EvalCtx<'a> {
     pub node: Option<&'a NodeRecord>,
     pub score: Option<f32>,
     pub hops: usize,
+    pub bindings: Bindings<'a>,
 }
 
 impl<'a> EvalCtx<'a> {
-    /// Context for a bare node with no score/hops (filters over a plain scan,
-    /// projection helpers, tests).
+    /// Context for a bare node with no score/hops/bindings (filters over a
+    /// plain scan, projection helpers, tests).
     pub fn node(node: Option<&'a NodeRecord>) -> Self {
         Self {
             node,
-            score: None,
-            hops: 0,
+            ..Default::default()
         }
     }
 
@@ -359,6 +557,48 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
             .node
             .and_then(|n| n.external_key.clone())
             .map(PropValue::Str)
+            .unwrap_or(PropValue::Null),
+        Expr::NodeId => ctx
+            .node
+            .map(|n| PropValue::Int(n.id.0 as i64))
+            .unwrap_or(PropValue::Null),
+        Expr::At { binding, inner } => {
+            // Swap only the channel the binding names, so the rest of the
+            // row's world (score, hops, the other bindings) stays addressable
+            // inside the subtree.
+            let mut sub = *ctx;
+            match binding {
+                Binding::Node(slot) => sub.node = ctx.bindings.node(*slot),
+                Binding::Edge(hop) => sub.bindings.edge = ctx.bindings.edge_at(*hop),
+            }
+            eval(inner, &sub)
+        }
+        Expr::EdgeType => ctx
+            .bindings
+            .edge
+            .map(|(e, _)| PropValue::Str(e.ty.clone()))
+            .unwrap_or(PropValue::Null),
+        Expr::EdgeDir => ctx
+            .bindings
+            .edge
+            .map(|(_, dir)| {
+                PropValue::Str(
+                    match dir {
+                        Dir::In => "IN",
+                        // A row's traversal is concrete; `Both` never reaches
+                        // here (see `Expr::EdgeDir`), and a resolver that
+                        // could not tell a self-loop apart reports `Out`.
+                        _ => "OUT",
+                    }
+                    .to_string(),
+                )
+            })
+            .unwrap_or(PropValue::Null),
+        Expr::EdgeProperty(key) => ctx
+            .bindings
+            .edge
+            .and_then(|(e, _)| e.properties.get(key))
+            .map(|p| p.value.clone())
             .unwrap_or(PropValue::Null),
         Expr::Score => ctx
             .score
@@ -911,6 +1151,140 @@ mod tests {
         assert_eq!(e, back);
     }
 
+    // ---- bindings ---------------------------------------------------------
+
+    fn edge(ty: &str, src: u64, dst: u64, props: &[(&str, PropValue)]) -> EdgeRecord {
+        EdgeRecord {
+            id: crate::types::EdgeId(1),
+            plane: PlaneId::STARTUP,
+            src: crate::types::NodeId(src),
+            dst: crate::types::NodeId(dst),
+            ty: ty.to_string(),
+            properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), PropDesc::new(v.clone())))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn at_reads_an_earlier_slot_not_the_current_node() {
+        let head = node(&["Function"], &[("name", PropValue::Str("callee".into()))]);
+        let src = node(&["Function"], &[("name", PropValue::Str("caller".into()))]);
+        let bound = [Some(Arc::new(src))];
+        let ctx = EvalCtx {
+            node: Some(&head),
+            bindings: Bindings {
+                nodes: &bound,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(eval(&p("name"), &ctx), PropValue::Str("callee".into()));
+        assert_eq!(
+            eval(&at_node(0, p("name")), &ctx),
+            PropValue::Str("caller".into())
+        );
+        // The swap is scoped to the subtree: the outer term still reads the
+        // current node, so a cross-variable comparison means what it says.
+        assert!(is_true(&eval(&at_node(0, p("name")).ne(p("name")), &ctx)));
+    }
+
+    /// The whole point of `At` being total: a slot the row never bound reads
+    /// as `Null` rather than failing the query, exactly like a missing
+    /// property does.
+    #[test]
+    fn an_unbound_slot_is_null() {
+        let n = node(&[], &[("x", PropValue::Int(1))]);
+        let ctx = EvalCtx::node(Some(&n));
+        assert_eq!(eval(&at_node(3, p("x")), &ctx), PropValue::Null);
+        assert_eq!(eval(&edge_type(), &ctx), PropValue::Null);
+        assert_eq!(eval(&edge_dir(), &ctx), PropValue::Null);
+        assert_eq!(eval(&ep("weight"), &ctx), PropValue::Null);
+    }
+
+    #[test]
+    fn edge_terms_read_the_arrival_edge_and_a_named_hop() {
+        let n = node(&[], &[]);
+        let first = edge("IMPORTS", 1, 2, &[("weight", PropValue::Int(3))]);
+        let last = edge("CALLS", 9, 2, &[]);
+        let hops_bound = [Some((Arc::new(first), Dir::Out))];
+        let ctx = EvalCtx {
+            node: Some(&n),
+            bindings: Bindings {
+                edges: &hops_bound,
+                edge: Some((&last, Dir::In)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Bare terms are the edge the row arrived on …
+        assert_eq!(eval(&edge_type(), &ctx), PropValue::Str("CALLS".into()));
+        assert_eq!(eval(&edge_dir(), &ctx), PropValue::Str("IN".into()));
+        // … and `At` names a specific hop instead.
+        assert_eq!(
+            eval(&at_edge(0, edge_type()), &ctx),
+            PropValue::Str("IMPORTS".into())
+        );
+        assert_eq!(
+            eval(&at_edge(0, edge_dir()), &ctx),
+            PropValue::Str("OUT".into())
+        );
+        assert_eq!(eval(&at_edge(0, ep("weight")), &ctx), PropValue::Int(3));
+    }
+
+    #[test]
+    fn node_id_is_always_available_as_a_grouping_key() {
+        let n = node(&[], &[]);
+        assert_eq!(ev(&node_id(), Some(&n)), PropValue::Int(1));
+        assert_eq!(ev(&node_id(), None), PropValue::Null);
+        // …unlike the external key, which most nodes never carry.
+        assert_eq!(ev(&external_key(), Some(&n)), PropValue::Null);
+    }
+
+    /// The executor resolves only what a plan names, so this walk is what
+    /// keeps an ordinary query paying nothing for the feature.
+    #[test]
+    fn binding_need_collects_high_water_marks() {
+        let mut need = BindingNeed::default();
+        assert!(!need.any());
+        need.add(&p("x").eq(1));
+        assert!(!need.any(), "a plain property names no binding");
+
+        need.add(&at_node(2, p("a")).eq(at_node(5, p("b"))));
+        assert_eq!(need.nodes, Some(5));
+        need.add(&at_edge(1, ep("w")).gt(0));
+        assert_eq!(need.edges, Some(1));
+        assert!(!need.last_edge, "a hop-qualified edge term is not the last");
+
+        // A bare edge term, though, is the row's arrival edge.
+        let mut bare = BindingNeed::default();
+        bare.add(&edge_type().eq("CALLS"));
+        assert!(bare.last_edge);
+        assert_eq!(bare.nodes, None);
+
+        // The walk reaches through every operator that holds subexpressions,
+        // not only comparison: a binding named inside a string predicate, an
+        // `IN`, a negation or an `IS NULL` is still one the executor has to
+        // resolve.
+        let mut nested = BindingNeed::default();
+        nested.add(&at_node(3, p("file")).contains("src"));
+        nested.add(&at_node(4, p("tag")).is_in(p("tags")));
+        nested.add(&at_node(6, p("x")).is_null().not());
+        assert_eq!(nested.nodes, Some(6));
+    }
+
+    #[test]
+    fn binding_terms_serde_roundtrip() {
+        let e = at_node(0, p("name"))
+            .ne(p("name"))
+            .and(at_edge(1, edge_dir()).eq("OUT"))
+            .and(edge_type().eq("CALLS"))
+            .and(node_id().gt(0));
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(e, serde_json::from_str::<Expr>(&json).unwrap());
+    }
+
     #[test]
     fn score_and_hops_read_the_row_channel() {
         let n = node(&[], &[]);
@@ -918,6 +1292,7 @@ mod tests {
             node: Some(&n),
             score: Some(0.75),
             hops: 2,
+            ..Default::default()
         };
         assert_eq!(eval(&score(), &ctx), PropValue::Float(0.75));
         assert_eq!(eval(&hops(), &ctx), PropValue::Int(2));
@@ -926,6 +1301,7 @@ mod tests {
             node: Some(&n),
             score: None,
             hops: 0,
+            ..Default::default()
         };
         assert_eq!(eval(&score(), &none), PropValue::Null);
     }
@@ -954,6 +1330,7 @@ mod tests {
             node: Some(&n),
             score: Some(1.0),
             hops: 2,
+            ..Default::default()
         };
         let fused = score().mul(lit(0.7)).add(lit(0.3).div(hops()));
         // 0.7*1.0 + 0.3/2 = 0.85

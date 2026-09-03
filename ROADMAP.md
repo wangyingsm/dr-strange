@@ -227,7 +227,7 @@ a dedicated `SEEK` clause; `CALL name(args) ON (v:Label)` over a bespoke clause;
 per-channel `WEIGHT` on `HYBRID`; `AS OF` last, so every existing query keeps
 its exact prefix. Algorithm results ride the score channel — rank for PageRank,
 path position for shortest path, a dense community index for components/Louvain
-(aggregation & projection stay deferred, see Low priority). One hybrid engine
+(aggregation & projection landed later, in §13). One hybrid engine
 now backs both `plane.hybrid()` and `Source::Hybrid`. `AS OF` is not a plan
 node — it addresses the plane handle — so it rides on `ReadQuery` beside the
 plan for a surface to apply. The keyword / hybrid / algorithm / temporal forms
@@ -1051,15 +1051,58 @@ and revocation are `Access::Admin` RPC methods plus a dashboard view.
 
 ---
 
+## 13. Projections & aggregation — a query that answers with a table  *(shipped)*
+
+**Status.** ✅ Shipped (2026-09-02). A read can now return values rather than
+records: `RETURN a.name, count(*) AS papers ORDER BY papers DESC LIMIT 10`
+answers with columns and rows, on every surface.
+
+- **A projection tail on the plan** (`LogicalPlan::project`) — named columns,
+  each an expression or an aggregate, with its own `distinct`, `order_by` (by
+  column index), `skip` and `limit`. `Option`, skipped when empty, so a plan
+  that doesn't project serializes byte-for-byte as before.
+- **Aggregates** — `count`/`sum`/`avg`/`min`/`max`/`collect`, each optionally
+  `DISTINCT`, grouped by every column that isn't one (Cypher's implicit
+  `GROUP BY`).
+- **Earlier bindings are addressable** (`Expr::At`) — a row is a current node
+  plus the trail that reached it, so `RETURN a.name, b.name` reads both ends of
+  a hop, and `type(r)`/`direction(r)`/`id(n)` read the edge and the node id.
+- **Every surface renders it the same way** — `{columns, rows}` from the MCP
+  verbs, the RPC, `POST /cypher` and the CLI; a table panel in the dashboard.
+
+**Fork settled — why this was "the most invasive change", and wasn't.** The
+deferral rested on needing "a multi-binding row model … which ripples to every
+surface". The linear pipeline turned out to have been carrying every binding
+all along: a row *is* a path. What was missing was a term that names one, and
+`Expr::At` is that term — resolution is pull, so a query naming no binding pays
+exactly what it paid before.
+
+The projection is a **tail**, not a `Step`, because it turns node rows into
+value rows: nothing can expand or filter a node after it, and as a field that
+is unrepresentable-otherwise rather than a rule the executor enforces. An
+aggregate is likewise its own case in a column rather than an `Expr` variant —
+it is a fold over rows, not a value a row has, which is what keeps
+`WHERE count(*) > 3` unwritable instead of silently `Null`.
+
+Every fold is total, like the rest of evaluation: nulls and values a fold
+cannot use are skipped, so an aggregate over soft-schema data answers instead
+of failing. `count`/`sum` over nothing are 0 and `avg`/`min`/`max` are Null,
+because the mean of no values is unanswerable rather than zero.
+
+**Follow-ups.** `WITH`-pipelining (a second pipeline over a projection's
+output); cross-variable `WHERE` (`p.year < q.year`), which the same `Expr::At`
+now makes expressible and only pushdown *placement* still holds back.
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.
 
-- **Aggregation & projections in the query language** (`count/sum/avg/collect`,
-  `GROUP BY`, `WITH`-pipelining, `RETURN a.name, count(*)`). Foundational for
-  analytics but the most invasive change — it needs the multi-binding row model
-  (a path/row result contract instead of the current single-current-node
-  model), which ripples to every surface. Deferred deliberately.
+- ~~**Aggregation & projections in the query language**~~ — shipped, see §13.
+  What is still deferred from that entry is **`WITH`-pipelining**: a projection
+  is a tail, so a second pipeline over its output would be a genuinely new
+  shape rather than another clause.
 
 - **Constraints / schema validation** (uniqueness, required properties,
   edge-cardinality enforcement). The soft-schema catalog *observes* structure

@@ -42,6 +42,13 @@ Steps:
 | `Sort(keys)` | order rows |
 | `Skip(n)` / `Limit(n)` | offset / bound the result |
 
+A plan may end in a **projection**: a list of named columns, each either an
+expression evaluated per row or an aggregate folded over a group of rows, with
+its own `distinct`, `order_by` (by column index), `skip` and `limit`. It is a
+tail rather than a step because it turns node rows into value rows — nothing
+can expand or filter a node after it. A plan without one returns nodes, exactly
+as it always has.
+
 The plan is serializable. `MATCH (:Person)-[:KNOWS]->(q) RETURN q LIMIT 50`
 corresponds to:
 
@@ -136,6 +143,58 @@ MATCH (n)-[:CITES]->(p:Paper)
 WHERE key(n) = "paper-42"
 RETURN p
 ```
+
+### Projections and aggregation
+
+`RETURN n` (or `*`) hands back whole records — nodes with their properties. Any
+other `RETURN` **projects**: each item becomes a column, named by its `AS` alias
+or, without one, by the item as written.
+
+```text
+MATCH (f:Fn) RETURN f.file, f.line AS line, key(f)
+```
+
+Because a row carries the whole path that produced it, a column may read any
+variable the pattern bound, not only the last:
+
+```text
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, p.year
+```
+
+An **aggregate** folds a group of rows into one value: `count`, `sum`, `avg`,
+`min`, `max`, and `collect` (which keeps the group's values as a list). The
+grouping key is every column that is *not* an aggregate — Cypher's implicit
+`GROUP BY`, so what a query lists beside its aggregates is what it is broken
+down by:
+
+```text
+MATCH (a:Author)-[:WROTE]->(p:Paper)
+RETURN a.name, count(*) AS papers, collect(DISTINCT p.year) AS years
+ORDER BY papers DESC
+LIMIT 10
+```
+
+`count(*)` counts rows; every other fold reads a value and skips the rows whose
+value is null — or is something the fold cannot use, such as a year one node
+stored as text, which is what keeps an aggregate over soft-schema data
+answering rather than failing. Over a group that gave it nothing, `count` and
+`sum` are `0`, `avg`, `min` and `max` are `null` (the mean of no values is
+unanswerable, not zero), and `collect` is the empty list. A projection with no
+grouping key at all is one group over the whole match, so `RETURN count(*)`
+answers `0` rather than nothing when the match found nothing.
+
+In a projecting query, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` apply to the
+projected rows: `DISTINCT` compares whole tuples (two nodes sharing a file are
+one row), and `ORDER BY` names a column — by its alias, or by the expression it
+returned.
+
+```text
+MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+```
+
+A node cannot share a `RETURN` with columns, since a node is not a value:
+return its properties instead. Every surface renders a projected result the
+same way — as `columns` and `rows` rather than nodes and edges.
 
 ## Writes
 

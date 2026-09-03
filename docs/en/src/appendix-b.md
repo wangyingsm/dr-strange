@@ -81,17 +81,34 @@ bound. `var-len` must have an upper bound (`*1..3`, `*2`, `*..4`); an unbounded
 
 ```text
 where          ::= 'WHERE' expr
-return         ::= 'RETURN' [ 'DISTINCT' ] ( ident | '*' )
+return         ::= 'RETURN' [ 'DISTINCT' ] return-item { ',' return-item }
+return-item    ::= ident | '*'                (* the rows themselves *)
+                 | ( expr | aggregate ) [ 'AS' ident ]
+aggregate      ::= 'count' '(' '*' ')'
+                 | agg-func '(' [ 'DISTINCT' ] expr ')'
+agg-func       ::= 'count' | 'sum' | 'avg' | 'min' | 'max' | 'collect'
 order-by       ::= 'ORDER' 'BY' order-key { ',' order-key }
-order-key      ::= expr [ 'ASC' | 'DESC' ]
+order-key      ::= ( expr | ident ) [ 'ASC' | 'DESC' ]
 skip           ::= 'SKIP' uint
 limit          ::= 'LIMIT' uint
 as-of          ::= 'AS' 'OF' ( uint | string | 'TIME' int )
 ```
 
-`RETURN` names the pattern's **last** variable, or `*`. `AS OF` is last: a bare
-integer is a commit sequence, a quoted string an RFC-3339 instant, and `TIME`
-takes unix-epoch milliseconds.
+`RETURN n` or `RETURN *` hands back whole records and must name the pattern's
+**last** variable. Any other item **projects**: it becomes a column named by
+its `AS` alias or, without one, by the item as written, and it may read any
+variable the pattern bound. A node cannot share a `RETURN` with columns — it is
+not a value.
+
+An `aggregate` folds each group; the grouping key is every column that is not
+one. Folds skip nulls and values they cannot use; over nothing, `count` and
+`sum` are `0`, `avg`/`min`/`max` are `null`, and `collect` is the empty list.
+
+In a projecting query `DISTINCT` compares whole projected rows, `ORDER BY`
+names one of the returned columns (by alias, or by the expression it returned),
+and `SKIP`/`LIMIT` count projected rows. Over `RETURN n` all four keep their
+node reading. `AS OF` is last: a bare integer is a commit sequence, a quoted
+string an RFC-3339 instant, and `TIME` takes unix-epoch milliseconds.
 
 ## Expressions
 
@@ -220,10 +237,10 @@ argument name is an error, never a silently ignored setting.
 
 Each of these is a clear error, never a silent mis-compile:
 
-- projections and aggregation — `RETURN a.name, count(*)`, `GROUP BY`, `WITH`
-  pipelining. The row model carries one current node, so these need a
-  multi-binding row contract (a deliberate deferral).
-- returning or ordering by any variable but the pattern's last.
+- `WITH` pipelining — a projection is a tail, so nothing follows it.
+- returning the *rows* of any variable but the pattern's last (`RETURN p` after
+  a hop); its values project fine (`RETURN p.name`).
+- ordering a non-projecting query by any variable but the pattern's last.
 - predicates spanning two variables — `WHERE p.year < q.year`.
 - reusing a pattern variable, which would express a graph constraint.
 - branching patterns — one linear path per statement.

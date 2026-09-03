@@ -76,16 +76,31 @@ var-len        ::= '*' [ uint ] [ '..' [ uint ] ]
 
 ```text
 where          ::= 'WHERE' expr
-return         ::= 'RETURN' [ 'DISTINCT' ] ( ident | '*' )
+return         ::= 'RETURN' [ 'DISTINCT' ] return-item { ',' return-item }
+return-item    ::= ident | '*'                (* 行本身 *)
+                 | ( expr | aggregate ) [ 'AS' ident ]
+aggregate      ::= 'count' '(' '*' ')'
+                 | agg-func '(' [ 'DISTINCT' ] expr ')'
+agg-func       ::= 'count' | 'sum' | 'avg' | 'min' | 'max' | 'collect'
 order-by       ::= 'ORDER' 'BY' order-key { ',' order-key }
-order-key      ::= expr [ 'ASC' | 'DESC' ]
+order-key      ::= ( expr | ident ) [ 'ASC' | 'DESC' ]
 skip           ::= 'SKIP' uint
 limit          ::= 'LIMIT' uint
 as-of          ::= 'AS' 'OF' ( uint | string | 'TIME' int )
 ```
 
-`RETURN` 只能指名模式中的**最后**一个变量，或 `*`。`AS OF` 位于最后：裸整数为提交
-序号，带引号的字符串为一个 RFC-3339 时刻，`TIME` 后接 unix 纪元毫秒数。
+`RETURN n` 或 `RETURN *` 交回完整记录，且只能指名模式中的**最后**一个变量。其余任
+何一项都是**投影**：它成为一列，列名取 `AS` 别名，未写别名时取该项的原文；它可以读
+取模式所绑定的任一变量。节点不能与列同处一个 `RETURN`——节点不是值。
+
+`aggregate` 在每个组上折叠；分组键是所有不是聚合的列。折叠会跳过 null，也跳过它无
+法采用的值；当一组什么也没提供时，`count` 与 `sum` 为 `0`，`avg`/`min`/`max` 为
+`null`，`collect` 为空列表。
+
+在投影查询中，`DISTINCT` 比较整个投影行，`ORDER BY` 指名所返回的某一列（用别名，或
+用它所返回的那个表达式），`SKIP`/`LIMIT` 计的是投影行。而在 `RETURN n` 之下，这四者
+仍取各自的节点语义。`AS OF` 位于最后：裸整数为提交序号，带引号的字符串为一个
+RFC-3339 时刻，`TIME` 后接 unix 纪元毫秒数。
 
 ## 表达式
 
@@ -210,9 +225,10 @@ CALL 'shortest_path' ( from: key-or-id , to: key-or-id [ , dir: string ]
 
 以下每一项都会明确报错，而绝不会被静默地错误编译：
 
-- 投影与聚合，例如 `RETURN a.name, count(*)`、`GROUP BY`、`WITH` 流水化。行模型
-  只携带一个当前节点，这类功能需要一套多绑定的行契约才能支持，目前是刻意推迟的。
-- 返回或排序依据模式中最后一个变量之外的任何变量。
+- `WITH` 流水化——投影是尾部，其后不再接任何子句。
+- 返回模式中最后一个变量之外的任何变量的**行**（一次跳跃之后的 `RETURN p`）；它的
+  值仍可投影（`RETURN p.name`）。
+- 非投影查询按模式中最后一个变量之外的变量排序。
 - 跨越两个变量的谓词——`WHERE p.year < q.year`。
 - 复用模式变量，那将表达一个图约束。
 - 分支模式——每条语句只允许一条线性路径。

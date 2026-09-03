@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
-  import { rpc, authHeaders, liveChanges } from './rpc.js'
+  import { rpc, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import { renderMarkdown } from './markdown.js'
@@ -8,7 +8,7 @@
   import Icon from './Icon.svelte'
 
   // Providers with an embedding endpoint (deepseek is chat-only, so excluded) —
-  // used to embed a text `SEARCH … NEAR "…"`.
+  // the semantic channel in Hybrid, and Ask's grounding.
   const EMBED_PROVIDERS = ['openai', 'qwen', 'ollama']
   // Chat providers for NL→plan (`plane.ask`); deepseek is chat-capable.
   const CHAT_PROVIDERS = ['openai', 'deepseek', 'qwen', 'ollama']
@@ -29,7 +29,7 @@
   } = $props()
 
   let newPlaneOpen = $state(false) // new-plane popup open?
-  let tab = $state('filters') // active toolbar tab: filters | graphql | algorithms | hybrid
+  let tab = $state('filters') // active toolbar tab: filters | algorithms | hybrid
 
   let container // canvas div (bind:this)
   let plot = null
@@ -46,8 +46,6 @@
   let seedLimit = $state(SEED_STEPS[0])
   let seedTotal = $state(0)
   let hiddenLabels = $state(new Set()) // categories switched off from the legend
-  let cypher = $state('') // query-language text; '' = use the label seed
-  let embedProvider = $state(loadPref('embedProvider', 'openai')) // text SEARCH … NEAR provider
   let selected = $state(null) // { kind: 'node'|'edge', data }
   let legend = $state([])
   let status = $state('')
@@ -249,7 +247,6 @@
 
   // Remember dropdown selections across reloads.
   $effect(() => {
-    savePref('embedProvider', embedProvider)
     savePref('spDir', spDir)
     savePref('hyProvider', hyProvider)
     savePref('askProvider', askProvider)
@@ -537,119 +534,6 @@
       }`
     } catch (e) {
       error = e.message
-    }
-  }
-
-  // Keyword autocomplete for the GraphQL/Cypher box: once the word being typed
-  // is ≥2 chars and prefixes a keyword, `cypherGhost` is the greyed completion
-  // shown after the caret; Tab accepts it. Ordered shortest-prefix first, so
-  // MATCH is offered before MATCHING and the longer one is still reachable by
-  // typing one more character.
-  const CYPHER_KEYWORDS = [
-    // sources and the clauses that follow them
-    'MATCH', 'MATCHING', 'SEARCH', 'HYBRID', 'CALL', 'BEAM', 'WHERE', 'RETURN',
-    'DISTINCT', 'ORDER BY', 'SKIP', 'LIMIT', 'AS OF', 'TIME',
-    // expression terms — ahead of the knobs so `key(` wins over KEYWORD, which
-    // is only valid inside HYBRID
-    // (`hops()` is deliberately absent: it would shadow the GRAPH channel's
-    // required HOPS keyword, which is typed far more often)
-    'key()', 'score()', 'similarity(', 'distance(',
-    // retrieval knobs: the vector/keyword seeds, the hybrid channels, the beam
-    'NEAR', 'METRIC', 'TOPK', 'VECTOR', 'KEYWORD', 'GRAPH', 'HOPS', 'DECAY',
-    'SEEDS', 'WEIGHT', 'CANDIDATES', 'WIDTH', 'DEPTH',
-    // algorithm names for CALL — lower-case, as they read in a query (the
-    // compiler folds case, so an accepted completion parses either way)
-    'pagerank', 'components', 'shortest_path', 'louvain',
-    // writes
-    'CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'DETACH',
-    // operators
-    'AND', 'OR', 'NOT', 'ON', 'IN', 'IS', 'NULL', 'DESC',
-  ]
-
-  // True when the caret sits inside an unterminated string literal. The words
-  // typed there are data — a document's text, an entity's key — not syntax, so
-  // completing them to keywords is noise. The language has no escapes, so this
-  // scan is exact.
-  function inStringLiteral(s) {
-    let quote = null
-    for (const ch of s) {
-      if (quote) {
-        if (ch === quote) quote = null
-      } else if (ch === '"' || ch === "'") {
-        quote = ch
-      }
-    }
-    return quote !== null
-  }
-
-  let cypherGhost = $derived.by(() => {
-    if (inStringLiteral(cypher)) return ''
-    const m = cypher.match(/([A-Za-z]+)$/) // the word currently being typed
-    if (!m || m[1].length < 2) return ''
-    const up = m[1].toUpperCase()
-    // Case-insensitive match, but complete with the keyword's own casing, so
-    // the lower-case algorithm names stay lower-case.
-    const kw = CYPHER_KEYWORDS.find(
-      (k) => k.toUpperCase().startsWith(up) && k.length > up.length,
-    )
-    return kw ? kw.slice(m[1].length) : ''
-  })
-  function onCypherKey(e) {
-    if (e.key === 'Enter') {
-      runCypher()
-    } else if (e.key === 'Tab' && cypherGhost) {
-      e.preventDefault()
-      cypher = cypher + cypherGhost + ' '
-    }
-  }
-
-  // Run a query-language statement against the current plane. A read renders
-  // its result (nodes + induced edges) as a fresh subgraph; a write (CREATE, …)
-  // mutates and reports counts, then reloads the canvas. Empty query → fall
-  // back to the plain label seed. Hits the web-only POST /cypher endpoint (not
-  // an RPC method), so it uses a raw fetch with the bearer token.
-  async function runCypher() {
-    if (!cypher.trim()) {
-      await seed()
-      return
-    }
-    error = null
-    algoBusy = true
-    try {
-      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(embedProvider)}`
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: authHeaders({ 'content-type': 'text/plain' }),
-        body: cypher,
-      })
-      if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
-      const out = await res.json()
-      if (out.write) {
-        // A write mutated the plane — summarise the non-zero counts, then reseed
-        // so the canvas reflects the new graph.
-        const bits = [
-          [out.nodes_created, 'nodes created'],
-          [out.edges_created, 'edges created'],
-          [out.props_set, 'props set'],
-          [out.labels_set, 'labels set'],
-          [out.nodes_deleted, 'nodes deleted'],
-          [out.edges_deleted, 'edges deleted'],
-        ]
-          .filter(([n]) => n > 0)
-          .map(([n, label]) => `${n} ${label}`)
-        status = bits.length ? bits.join(' · ') : 'no changes'
-        await seed()
-        return
-      }
-      plot.clear()
-      plot.addSubgraph(out)
-      legend = plot.legendEntries()
-      selected = null
-      status = `${out.count} nodes · ${out.edges.length} edges`
-    } catch (e) {
-      error = e.message
-    } finally {
-      algoBusy = false
     }
   }
 
@@ -1297,7 +1181,6 @@
 
 <div class="tool-tabs">
   <button class:active={tab === 'filters'} onclick={() => (tab = 'filters')}><Icon name="filters" /> Filters / Operations</button>
-  <button class:active={tab === 'graphql'} onclick={() => (tab = 'graphql')}><Icon name="graphql" /> GraphQL / Run</button>
   <button class:active={tab === 'algorithms'} onclick={() => (tab = 'algorithms')}><Icon name="algorithms" /> Algorithms</button>
   <button class:active={tab === 'hybrid'} onclick={() => (tab = 'hybrid')}><Icon name="hybrid" /> Hybrid</button>
   <button class:active={tab === 'ask'} onclick={() => (tab = 'ask')}><Icon name="ask" /> Ask</button>
@@ -1338,29 +1221,6 @@
     <button class="new-node-btn" onclick={() => openCreate('node')} title="Create a node">New Node</button>
     <button class="new-edge-btn" onclick={() => openCreate('edge')} title="Create an edge">New Edge</button>
     <button class="new-plane-btn" onclick={() => (newPlaneOpen = true)} title="Create a new plane">New Plane</button>
-  </div>
-{:else if tab === 'graphql'}
-  <div class="query-bar">
-    <div class="cypher-wrap">
-      {#if cypherGhost}
-        <div class="cypher-ghost"><span class="typed">{cypher}</span>{cypherGhost}<span class="tab-key">Tab</span></div>
-      {/if}
-      <input
-        type="text"
-        class="cypher"
-        placeholder={'MATCH (n:Label) WHERE n.p > 1 RETURN n LIMIT 50   ·   SEARCH (n:Label) NEAR "some text" TOPK 10 RETURN n   ·   SEARCH (n:Label) ON body MATCHING "some words" RETURN n   ·   CALL pagerank() ON (n:Label) RETURN n ORDER BY score() DESC'}
-        bind:value={cypher}
-        onkeydown={onCypherKey}
-      />
-    </div>
-    <label class="embed-pick" title={'Embedding provider for a text SEARCH … NEAR "…" (must match how the plane was embedded)'}>
-      embed
-      <select bind:value={embedProvider}>
-        {#each EMBED_PROVIDERS as pv (pv)}<option value={pv}>{pv}</option>{/each}
-      </select>
-    </label>
-    <button class="run-btn" onclick={runCypher} title="Run this query and plot the result">Run</button>
-    <button class="ghost" onclick={resetView} disabled={algoBusy} title="Clear results and re-plot the original graph">Reset</button>
   </div>
 {:else if tab === 'algorithms'}
   <div class="algo-bar">

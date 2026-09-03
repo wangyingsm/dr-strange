@@ -556,6 +556,7 @@ mod tests {
                 },
                 Step::Distinct,
             ],
+            project: None,
         }
     }
 
