@@ -4,6 +4,38 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`cypher` on MCP is positioned as the escape hatch, and priced like one.**
+  Its description now opens with the pecking order — `context`, `trace`,
+  `impact`, `fathom` first on a code plane; `cypher` for aggregations, history
+  over a `<name>_git` plane, `AS OF` snapshots, and shapes no verb anticipated —
+  and carries the intent plus two examples instead of the whole grammar, which
+  every `tools/list` was re-sending to every agent on every turn. The grammar
+  moved to where it is needed: a statement that fails to parse comes back with
+  the forms of the clauses it reached for (a broken `SEARCH` gets the `SEARCH`
+  forms and the `RETURN` tail; a broken `CREATE` gets the writes), so a retry
+  is informed rather than guessed.
+
+- **Writes through `cypher` are refused on a mirrored plane.** A plane that
+  `digest` or `serve watch` keeps in step with a source tree records the commit
+  it reflects; `CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE` there are refused with
+  the reason — the next fold reconciles the plane against the tree, overwriting
+  edits to parser-owned nodes and re-creating deletions, so the write would be
+  undone without a trace. `write_nodes` / `write_edges` still work on such a
+  plane (a fold leaves nodes it does not own alone), and a plane of the agent's
+  own takes every statement. The MCP chapter's tool table had listed `cypher`
+  as read-only while its description advertised writes; it now says read /
+  write, and the safety section says where writes are refused.
+
+- **`RETURN n` on a mirrored plane answers in compact text.** The same
+  one-line-per-node rendering every agent verb speaks — a count, the synced
+  commit, then key, label, site and score — rather than a JSON record apiece;
+  `context` on any key expands it. Projections stay tables everywhere, and a
+  plane the agent built for itself keeps returning records.
+
 ## [2.4.0] - 2026-09-03
 
 ### Added

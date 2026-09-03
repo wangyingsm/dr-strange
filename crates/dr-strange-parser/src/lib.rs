@@ -87,6 +87,7 @@
 
 mod ast;
 mod compile;
+mod hint;
 mod parse;
 mod write;
 
@@ -95,6 +96,7 @@ use ahash::AHashMap;
 use dr_strange_core::{LogicalPlan, PropValue};
 
 pub use ast::AsOfSpec;
+pub use hint::grammar_hint;
 pub use write::{WriteStatement, WriteSummary};
 
 /// Values for `$name` placeholders in a query, supplied by the caller and

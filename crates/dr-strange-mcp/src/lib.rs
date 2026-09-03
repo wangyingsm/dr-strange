@@ -877,6 +877,20 @@ fn query_logic(db: &Database, req: Query) -> AnyResult<Value> {
 
 /// Render what a read query returns: a table when its plan projects, its
 /// nodes otherwise.
+/// The commit a plane mirrors, when `digest` or `serve watch` stamped one.
+/// Such a plane is reconciled against its source tree on every fold, which
+/// is what makes it both the plane to answer in compact text and the plane
+/// to refuse ad-hoc writes on.
+fn mirrored_commit(plane: &PlaneHandle<'_>) -> AnyResult<Option<String>> {
+    Ok(plane
+        .properties()?
+        .get("synced_commit")
+        .and_then(|d| match &d.value {
+            PropValue::Str(commit) => Some(commit.clone()),
+            _ => None,
+        }))
+}
+
 fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> AnyResult<Value> {
     match q.plan().project.is_some() {
         true => Ok(json::table_to_json(&q.table()?)),
@@ -1140,16 +1154,53 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
             .map(|e| e as &dyn dr_strange_parser::Embedder),
         &params,
     )
-    .map_err(|e| match &why_no_embedder {
-        Some(cause) => anyhow::anyhow!("{e} — embedding provider '{provider}': {cause}"),
-        None => anyhow::anyhow!("{e}"),
+    .map_err(|e| {
+        // The grammar travels with the failure, not with the tool listing:
+        // an agent reads it at the one moment it needs it, and only the
+        // clauses its statement reached for.
+        let hint = dr_strange_parser::grammar_hint(&req.query);
+        match &why_no_embedder {
+            Some(cause) => {
+                anyhow::anyhow!("{e} — embedding provider '{provider}': {cause}\n\n{hint}")
+            }
+            None => anyhow::anyhow!("{e}\n\n{hint}"),
+        }
     })?;
     let plane = db.plane(&req.plane)?;
     match stmt {
         dr_strange_parser::Statement::Read(read) => {
-            read_result(pin(plane, read.as_of)?.query_from_plan(read.plan))
+            let pinned = pin(plane, read.as_of)?;
+            let q = pinned.query_from_plan(read.plan);
+            if q.plan().project.is_some() {
+                return Ok(json::table_to_json(&q.table()?));
+            }
+            let rows = q.scored_nodes()?;
+            // A digested plane answers in the compact text every agent verb
+            // speaks — a line per node, `context` on any key expands it —
+            // rather than a JSON record apiece. Planes an agent built for
+            // itself keep the records: those are its own shapes to read.
+            match mirrored_commit(&pinned)? {
+                Some(_) => Ok(Value::String(dr_strange_core::compact::records(
+                    &pinned, &rows,
+                )?)),
+                None => Ok(scored_rows(&rows)),
+            }
         }
         dr_strange_parser::Statement::Write(w) => {
+            if let Some(commit) = mirrored_commit(&plane)? {
+                anyhow::bail!(
+                    "plane `{}` mirrors a source tree (synced at commit {}); \
+                     CREATE/MERGE/SET/REMOVE/DELETE are refused on it. The next \
+                     digest or watch fold reconciles the plane against the tree: \
+                     edits to parser-owned nodes are overwritten and deletions \
+                     re-created, so a cypher write here is silently undone. \
+                     Annotate it with write_nodes/write_edges — nodes they add \
+                     are not parser-owned and a fold leaves them alone — or \
+                     write to a plane of your own (create_plane).",
+                    req.plane,
+                    &commit[..12.min(commit.len())]
+                );
+            }
             let s = w.apply(&plane).map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(jval!({
                 "nodes_created": s.nodes_created,
@@ -1835,40 +1886,24 @@ impl DrStrange {
         self.blocking("ask", move |db| ask_logic(db, req)).await
     }
 
-    #[tool(description = "Run a statement in the openCypher-subset query \
-        language — the whole engine through one surface, and the preferred \
-        alternative to the raw `query` plan. Reads return the matching node \
-        records; score() carries the seed's relevance or an algorithm's \
-        per-node result. Every source binds one node pattern and may continue \
-        with a typed hop (put hops in the pattern, before WHERE): \
-        MATCH one linear path (labels, ->/<-/-, bounded *m..n); \
-        SEARCH (v:L) [ON prop] NEAR \"text\"|[..] [METRIC m] [TOPK k] — vector \
-        top-k, where ON defaults to the `embedding` property; \
-        SEARCH (v:L) ON prop MATCHING \"text\" [TOPK k] — BM25 keyword \
-        search (label and ON both required); HYBRID (v:L) [VECTOR [ON p] NEAR q [WEIGHT w]] \
-        [KEYWORD ON p MATCHING \"text\" [WEIGHT w]] [GRAPH HOPS h [DECAY d] \
-        [WEIGHT w]] [CANDIDATES n] [TOPK k] — fused retrieval; \
-        CALL pagerank|components|shortest_path|louvain(args) ON (v[:L]) — graph \
-        algorithms. Then BEAM similarity traversal, WHERE (property/label \
-        tests, key(n) for a node's external key, x IN [a,b]), \
-        RETURN [DISTINCT] <var>|* — the pattern's last variable, whole \
-        records — or a projection: `RETURN f.file, count(*) AS calls` reads \
-        any bound variable, takes AS aliases, and folds with \
-        count/sum/avg/min/max/collect (each optionally DISTINCT), grouped by \
-        every column that is not a fold; a projected query answers with \
-        {columns, rows} instead of nodes. ORDER BY/SKIP/LIMIT take \
-        expressions (`ORDER BY f.line`) and, when the query projects, name a \
-        returned column (`ORDER BY calls DESC`); a trailing \
-        AS OF <seq|\"RFC-3339\"|TIME ms> reads a past snapshot. \
-        Writes (CREATE/MERGE/SET/REMOVE/DELETE) mutate the plane and return \
-        change-counts. Examples: \
-        `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`; \
-        `MATCH (n)-[:KNOWS]->(m) WHERE key(n) = \"alice\" RETURN m`; \
-        `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) AS calls \
-        ORDER BY calls DESC LIMIT 10`; \
-        `SEARCH (d:Doc) ON body MATCHING \"graph database\" TOPK 5 RETURN d`; \
-        `CALL pagerank() ON (n:Paper) RETURN n ORDER BY score() DESC LIMIT 10`; \
-        `CREATE (a:Person {key:\"alice\", age:30})-[:KNOWS]->(b:Person {key:\"bob\"})`.")]
+    #[tool(description = "Run an openCypher-subset statement — the way to ask \
+        what no named verb anticipated. On a code plane reach for `context`, \
+        `trace`, `impact` and `fathom` first; come here for aggregations \
+        (`RETURN f.file, count(*) AS calls`), history questions over a \
+        `<name>_git` plane, `AS OF` snapshots, and shapes of your own. \
+        Sources: MATCH one linear path; SEARCH (vector NEAR / BM25 MATCHING); \
+        HYBRID; CALL pagerank|components|shortest_path|louvain. Then WHERE, \
+        RETURN var|* (records; compact text on a digested plane) or a \
+        projection with count/sum/avg/min/max/collect (grouped implicitly, \
+        answered as {columns, rows}), ORDER BY/SKIP/LIMIT, a trailing AS OF. \
+        A statement that fails to parse comes back with the grammar of the \
+        clause it broke on — no need to guess twice. Writes \
+        (CREATE/MERGE/SET/REMOVE/DELETE) mutate a plane of your own and are \
+        refused on a plane that mirrors a source tree, where the next fold \
+        would undo them; annotate those with write_nodes/write_edges. \
+        Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
+        RETURN f`; `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) \
+        AS calls ORDER BY calls DESC LIMIT 10`.")]
     async fn cypher(
         &self,
         Parameters(req): Parameters<Cypher>,
@@ -2499,6 +2534,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(n.labels.iter().any(|l| l == "Person"));
+    }
+
+    /// Stamp the fixture's plane as a digest would: it now mirrors a commit.
+    fn mirrored(db: &Database) {
+        let plane = db.plane("startup").unwrap();
+        let mut props = plane.properties().unwrap();
+        props.insert(
+            "synced_commit".into(),
+            PropDesc::new(PropValue::Str("0123456789abcdef0123".into())),
+        );
+        plane.set_properties(props).unwrap();
+    }
+
+    /// The grammar rides on the failure, and only the part the statement
+    /// reached for — so the listing can stay short and the retry informed.
+    #[test]
+    fn cypher_parse_error_carries_the_grammar_it_needed() {
+        let db = fixture();
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({"query": "SEARCH (d:Doc) NEAR 'x' RETURN"})).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("syntax error"), "{err}");
+        assert!(err.contains("grammar:"), "{err}");
+        assert!(err.contains("SEARCH (v:Label) [ON prop] NEAR"), "{err}");
+        assert!(
+            !err.contains("HYBRID (v:Label)"),
+            "not the whole language: {err}"
+        );
+    }
+
+    /// A plane a digest keeps in step with a tree is not the agent's to
+    /// rewrite by hand: the fold would undo it. `write_nodes` still works
+    /// there, since a fold leaves nodes it does not own alone.
+    #[test]
+    fn cypher_refuses_writes_on_a_mirrored_plane() {
+        let db = fixture();
+        mirrored(&db);
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({"query": r#"CREATE (a:Person {key:"x"})"#})).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mirrors a source tree"), "{err}");
+        assert!(err.contains("commit 0123456789ab"), "{err}");
+        assert!(err.contains("write_nodes"), "{err}");
+        assert!(
+            db.plane("startup")
+                .unwrap()
+                .node_by_key("x")
+                .unwrap()
+                .is_none(),
+            "the refused write must not have landed"
+        );
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"nodes": [{"external_key": "note", "labels": ["Note"]}]})).unwrap(),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// `RETURN n` on a mirrored plane answers in the compact text the agent
+    /// verbs speak; the same query on a plane the agent built keeps records.
+    #[test]
+    fn cypher_answers_a_mirrored_plane_in_compact_text() {
+        let db = fixture();
+        let query =
+            || from_value(jval!({"query": "MATCH (n:Doc) RETURN n ORDER BY n.year"})).unwrap();
+        let records = cypher_logic(&db, query()).unwrap();
+        assert_eq!(records[0]["external_key"], jval!("d0"));
+
+        mirrored(&db);
+        let text = cypher_logic(&db, query()).unwrap();
+        let text = text.as_str().expect("compact text on a mirrored plane");
+        assert!(
+            text.starts_with("2 nodes\nsynced: commit 0123456789ab\n"),
+            "{text}"
+        );
+        assert!(text.contains("d0  Doc\n"), "{text}");
+        assert!(text.contains("d1  Doc\n"), "{text}");
+
+        // A projection is a table on either kind of plane.
+        let table = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN count(*) AS docs"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(table["rows"], jval!([[2]]));
     }
 
     #[test]

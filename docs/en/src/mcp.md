@@ -217,7 +217,7 @@ wait, it does not turn it away.
 | `snippet` | read | one symbol's source text |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
-| `cypher` | read | run an openCypher-subset statement |
+| `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated |
 | `algo` | read | a graph algorithm (pagerank / components / shortest_path / louvain) |
 | `hybrid` | read | fused vector + keyword + graph-proximity search |
 | `ask` | read | a natural-language question, compiled to a plan and run |
@@ -246,6 +246,21 @@ ingestion surface. Each is grounded in the plane's soft schema, which
 - **Destructive writes are guarded.** `drop_plane` requires an explicit
   confirmation flag, and `digest` defaults to a dry run that returns the proposed
   nodes and edges for inspection rather than writing them.
+- **A mirrored plane is not rewritten by hand.** A plane that `digest` or
+  `serve watch` keeps in step with a source tree records the commit it
+  reflects, and `cypher` refuses `CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE` on
+  it: the next fold reconciles the plane against the tree, overwriting edits
+  to parser-owned nodes and re-creating deletions, so such a write would be
+  undone without a trace. `write_nodes` / `write_edges` still work there — a
+  fold leaves nodes it does not own alone — and a plane of the agent's own
+  takes every statement.
+
+On those same mirrored planes `cypher` answers a `RETURN n` in the compact
+text the agent verbs speak — a count, the synced commit, one line per node —
+rather than a JSON record apiece; a projection is a table everywhere. And a
+statement that fails to parse comes back with the grammar of the clauses it
+reached for, so the tool listing carries the intent and two examples rather
+than the whole language on every turn.
 
 ## Example: an agent workflow
 

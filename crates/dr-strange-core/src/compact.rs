@@ -1186,6 +1186,26 @@ fn describe_record(_plane: &PlaneHandle<'_>, node: &NodeRecord) -> Result<String
     Ok(out)
 }
 
+/// A query's node records as an agent reads them: a count, the plane's
+/// freshness, then one line per node — key, label, site, and the score when
+/// the query ranked. What `RETURN n` answers with on a digested plane, so a
+/// `cypher` result costs what a `context` listing costs rather than a JSON
+/// record per node; `context` on any key here expands it.
+pub fn records(plane: &PlaneHandle<'_>, rows: &[(NodeRecord, Option<f32>)]) -> Result<String> {
+    let mut out = format!("{} nodes\n", rows.len());
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    for (node, score) in rows {
+        out.push_str(&one_line(node));
+        if let Some(score) = score {
+            out.push_str(&format!("  score {score:.3}"));
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1250,20 @@ mod tests {
         let _ = g;
         txn.commit().unwrap();
         db
+    }
+
+    #[test]
+    fn records_render_a_line_per_node_with_count_and_score() {
+        let db = seeded();
+        let plane = db.plane("code").unwrap();
+        let go = plane.node_by_key("m::api::go").unwrap().unwrap();
+        let run = plane.node_by_key("m::api::run").unwrap().unwrap();
+        let out = records(&plane, &[(go, Some(0.5)), (run, None)]).unwrap();
+        assert_eq!(
+            out,
+            "2 nodes\nm::api::go  Function  src/api.rs:10  score 0.500\nm::api::run  Function  src/api.rs:40\n"
+        );
+        assert_eq!(records(&plane, &[]).unwrap(), "0 nodes\n");
     }
 
     #[test]
