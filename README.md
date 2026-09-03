@@ -47,16 +47,24 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 
 <table>
   <tr>
-    <td width="50%"><a href="screenshots/00.jpg"><img src="screenshots/00.jpg" width="100%" alt="Dashboard — live statistics, planes, and installed parser plugins"></a><br><sub><b>Dashboard</b> — live statistics, plane management, and the installed parser plugins</sub></td>
-    <td width="50%"><a href="screenshots/01.jpg"><img src="screenshots/01.jpg" width="100%" alt="Explore — interactive graph with a node inspector"></a><br><sub><b>Explore</b> — interactive graph with a node inspector</sub></td>
+    <td width="50%"><a href="screenshots/00.png"><img src="screenshots/00.png" width="100%" alt="Dashboard — live counts, planes, and installed parser plugins"></a><br><sub><b>Dashboard</b> — live counts across every plane, plane management, and the installed parser plugins</sub></td>
+    <td width="50%"><a href="screenshots/01.png"><img src="screenshots/01.png" width="100%" alt="Explore — interactive graph with a node inspector"></a><br><sub><b>Explore</b> — the graph as it stands, with one node open: file, line, signature, and the plugin that asserted it</sub></td>
   </tr>
   <tr>
-    <td width="50%"><a href="screenshots/02.jpg"><img src="screenshots/02.jpg" width="100%" alt="Algorithms — shortest path on the graph"></a><br><sub><b>Algorithms</b> — PageRank, communities, and shortest path</sub></td>
-    <td width="50%"><a href="screenshots/03.jpg"><img src="screenshots/03.jpg" width="100%" alt="AIgest — LLM document ingestion into entities and relations"></a><br><sub><b>AIgest</b> — LLM document ingestion into entities &amp; relations</sub></td>
+    <td width="50%"><a href="screenshots/08.png"><img src="screenshots/08.png" width="100%" alt="Query — a projecting query returned as a table"></a><br><sub><b>Query</b> — a projection comes back as a table — row and column counts, timing, and copy-as-TSV</sub></td>
+    <td width="50%"><a href="screenshots/09.png"><img src="screenshots/09.png" width="100%" alt="AIgest — LLM ingestion of a crawled URL into entities and relations"></a><br><sub><b>AIgest</b> — documents or a crawled URL turned into entities &amp; relations, previewed before anything is written</sub></td>
   </tr>
   <tr>
-    <td width="50%"><a href="screenshots/04.jpg"><img src="screenshots/04.jpg" width="100%" alt="Explore — a module's import neighborhood on a digested code plane"></a><br><sub><b>Code graph</b> — one module's import neighborhood on a digested plane</sub></td>
-    <td width="50%"><a href="screenshots/05.jpg"><img src="screenshots/05.jpg" width="100%" alt="Explore — a whole code plane, every fact carrying file, line, and its generating plugin"></a><br><sub><b>Code plane</b> — the whole graph at once; each fact carries file, line, signature, and the plugin that parsed it</sub></td>
+    <td width="50%"><a href="screenshots/02.png"><img src="screenshots/02.png" width="100%" alt="Algorithms — PageRank over a code plane"></a><br><sub><b>PageRank</b> — importance as size and colour, over the whole plane</sub></td>
+    <td width="50%"><a href="screenshots/03.png"><img src="screenshots/03.png" width="100%" alt="Algorithms — Louvain communities coloured on the graph"></a><br><sub><b>Communities</b> — Louvain groups, one colour each</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="screenshots/04.png"><img src="screenshots/04.png" width="100%" alt="Algorithms — shortest path between two symbols"></a><br><sub><b>Shortest path</b> — the route between two symbols, its hops and cost, drawn over the neighbourhood it crosses</sub></td>
+    <td width="50%"><a href="screenshots/05.png"><img src="screenshots/05.png" width="100%" alt="Hybrid — fused vector, keyword and graph-proximity search"></a><br><sub><b>Hybrid</b> — fused vector + keyword + graph-proximity search, each hit showing what every channel contributed</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="screenshots/06.png"><img src="screenshots/06.png" width="100%" alt="Ask — a natural-language question turned into a plan and plotted"></a><br><sub><b>Ask</b> — a plain-language question turned into a read-only plan, shown and then run</sub></td>
+    <td width="50%"><a href="screenshots/07.png"><img src="screenshots/07.png" width="100%" alt="Time-travel — the graph as of an earlier commit"></a><br><sub><b>Time-travel</b> — the same plane as of an earlier commit, on a slider over its history</sub></td>
   </tr>
 </table>
 
@@ -74,7 +82,7 @@ agent's long-term memory, Dr Strange aims to be the single store for all of it.
 | **Change feed** | subscribe to a plane and receive mutations live |
 | **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — 8 official languages, an SDK for community parsers |
 | **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
-| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet` — one round trip each |
+| **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet` — one round trip each |
 | **Backup / restore** | consistent, id-faithful whole-database snapshots |
 | **Read-only replicas** | `serve --follow` mirrors a running server for read-scaling across a cluster |
 | **Interfaces** | a web UI, six language SDKs, a CLI, and an MCP server speaking the agent verbs |
@@ -237,8 +245,8 @@ Once per repository, then again whenever the server is gone. Pinning `addr`
 and `token` under `[server]` in `drsg.toml` keeps the endpoint byte-identical
 across restarts even if the recorded port is taken by then.
 
-Seven verbs answer an agent's questions, one round trip each, as compact
-one-fact-per-line text. All seven are MCP tools on `drsg serve`; five are
+Eight verbs answer an agent's questions, one round trip each, as compact
+one-fact-per-line text. All eight are MCP tools on `drsg serve`; six are
 also CLI subcommands (`grep` and `snippet` read the watched source tree, so
 they live with the server).
 
@@ -250,6 +258,7 @@ they live with the server).
 | `grep` | literal text over the watched source tree, bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
+| `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | one symbol's source text |
 | `history` | the repository behind the code: HEAD, branches, tags, rebases and the newest commits |
 

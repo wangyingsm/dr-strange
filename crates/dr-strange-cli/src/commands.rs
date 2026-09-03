@@ -1500,10 +1500,19 @@ fn parse_stmt(
     dr_strange_parser::parse_statement_full(query, None, params).map_err(|e| anyhow!("{e}"))
 }
 
-/// Execute a `LogicalPlan` and print each matched node as a JSON line, tagging
-/// the similarity score when the plan produced one.
+/// Execute a `LogicalPlan` and print what it returns: each matched node as a
+/// JSON line, tagged with its similarity score when the plan produced one, or
+/// the whole table as one object when the plan projects.
+///
+/// One object rather than a line per row: a table's columns are part of its
+/// answer, and a projection is a barrier, so nothing is left to stream.
 fn run_plan(p: PlaneHandle<'_>, plan: LogicalPlan, out: &mut dyn Write) -> Result<()> {
-    for (node, score) in p.query_from_plan(plan).scored_nodes()? {
+    let q = p.query_from_plan(plan);
+    if q.plan().project.is_some() {
+        writeln!(out, "{}", jsonio::table_to_json(&q.table()?))?;
+        return Ok(());
+    }
+    for (node, score) in q.scored_nodes()? {
         let mut obj = jsonio::node_to_json(&node);
         if let (Some(s), Value::Object(map)) = (score, &mut obj) {
             map.insert("score".into(), json!(s));
@@ -3545,6 +3554,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("embedding provider"), "{err}");
+    }
+
+    /// A projecting query prints the table, not the nodes: one JSON object
+    /// carrying the columns beside the rows.
+    #[test]
+    fn cypher_projection_prints_one_table() {
+        let db = loaded();
+        let out = cap(|o| {
+            cypher(
+                &db,
+                "startup",
+                "MATCH (n:Paper) RETURN n.year AS year, count(*) AS papers ORDER BY year",
+                None,
+                &[],
+                o,
+            )
+        });
+        assert_eq!(out.lines().count(), 1, "one object, not a line per row");
+        let table: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(table["columns"], json!(["year", "papers"]));
+        assert_eq!(table["rows"], json!([[2020, 1], [2021, 1]]));
     }
 
     #[test]

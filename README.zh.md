@@ -70,7 +70,7 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **变更流** | 订阅某个平面并实时接收其变更 |
 | **代码图化** | 沙箱化的 wasm 解析器插件将代码仓库转化为已解析的调用图——官方支持 8 种语言，并提供社区解析器 SDK |
 | **提交同步监视** | `serve watch` 将每次提交折叠进平面，结果与全量重新消化收敛一致 |
-| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `snippet`——每个问题一次往返 |
+| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet`——每个问题一次往返 |
 | **备份 / 恢复** | 一致且保留 id 的全库快照 |
 | **接口** | Web 控制台、六种语言 SDK、命令行工具，以及提供智能体工具的 MCP 服务器 |
 
@@ -182,8 +182,8 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` 跳过向量嵌入——解析无需任何模型。之后运行 `drsg vectorize` 即可让
 平面支持语义检索。
 
-七个动词回答智能体的问题，每个都在一次往返内完成，输出均为紧凑的每行一条事实的
-文本。七个动词全部是 `drsg serve` 上的 MCP 工具；其中五个同时是 CLI 子命令
+八个动词回答智能体的问题，每个都在一次往返内完成，输出均为紧凑的每行一条事实的
+文本。八个动词全部是 `drsg serve` 上的 MCP 工具；其中六个同时是 CLI 子命令
 （`grep` 与 `snippet` 需要读取被监视的源码树，因此只随服务端提供）。
 
 | 动词 | 它回答的问题 |
@@ -194,6 +194,7 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 | `grep` | 在被监视的源码树上做字面文本检索，有界且带计数 |
 | `trace` | 一个符号如何到达另一个：图中记录的最短调用路径 |
 | `impact` | 影响范围：所有能到达该符号的东西，按距离分组 |
+| `fathom` | 一个符号身处怎样的地方：几跳之内的区域，按标签与边类型计数，并给出枢纽 |
 | `snippet` | 一个符号的源码文本 |
 | `history` | 代码背后的仓库：HEAD、分支、标签、变基与最新的提交 |
 

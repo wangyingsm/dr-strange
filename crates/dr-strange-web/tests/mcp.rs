@@ -187,6 +187,51 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
         .await
         .expect("the relay outlived its host");
     ended.unwrap().expect("the relay ended cleanly");
+/// The agent verbs and the query tool over `/mcp`, in the shapes an agent
+/// gets them: `cypher` answers a projecting query with a table, and `fathom`
+/// answers with the compact text every agent verb speaks.
+#[tokio::test]
+async fn tools_answer_in_the_shape_the_question_asked_for() {
+    let addr = spawn_server();
+    wait_ready(addr).await;
+    let client = connect(addr, TOKEN).await.unwrap();
+
+    // A projection: columns and rows, not nodes.
+    let table = call(
+        &client,
+        "cypher",
+        json!({ "query": "MATCH (n:Person) RETURN key(n) AS who, count(*) AS n" }),
+    )
+    .await;
+    assert_eq!(table["columns"], json!(["who", "n"]));
+    assert_eq!(table["rows"], json!([["alice", 1]]));
+
+    // The same tool without a projection still answers with records.
+    let nodes = call(
+        &client,
+        "cypher",
+        json!({ "query": "MATCH (n:Person) RETURN n" }),
+    )
+    .await;
+    assert_eq!(nodes[0]["external_key"], "alice");
+
+    // `fathom` reports the region's makeup — here a lone node, which it says
+    // rather than implying it looked further.
+    // No depth: the tool's default, what an agent naming only a symbol gets.
+    let region = call(&client, "fathom", json!({ "name": "alice" })).await;
+    let text = region.as_str().expect("fathom answers with text");
+    assert!(
+        text.contains("region: 0 hops out and in — 1 nodes, 0 edges"),
+        "{text}"
+    );
+    assert!(text.contains("Person 1"), "{text}");
+    assert!(text.contains("nothing further connects"), "{text}");
+    assert!(
+        text.contains("short of the 2"),
+        "depth defaults to 2: {text}"
+    );
+
+    client.cancel().await.unwrap();
 }
 
 /// A valid token but a non-loopback `Host`: refused by the transport's

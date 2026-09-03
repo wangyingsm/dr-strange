@@ -40,6 +40,11 @@ Dr Strange 中的每一次读与写，都作为一个**逻辑计划**执行：�
 | `Sort(keys)` | 对行排序 |
 | `Skip(n)` / `Limit(n)` | 偏移 / 限量结果 |
 
+计划还可以以一个**投影（projection）**收尾：一组具名的列，每一列要么是逐行求值的
+表达式，要么是在一组行上折叠出的聚合；投影自带 `distinct`、`order_by`（按列序号）、
+`skip` 与 `limit`。它是尾部而非步骤，因为它把节点行变成了值行——其后再没有节点可供
+扩展或过滤。不带投影的计划仍旧返回节点，与一直以来完全一致。
+
 计划是可序列化的。`MATCH (:Person)-[:KNOWS]->(q) RETURN q LIMIT 50` 对应于：
 
 ```json
@@ -125,6 +130,51 @@ MATCH (n)-[:CITES]->(p:Paper)
 WHERE key(n) = "paper-42"
 RETURN p
 ```
+
+### 投影与聚合
+
+`RETURN n`（或 `*`）交回完整记录，即带着属性的节点。其余任何形式的 `RETURN` 都是
+**投影**：每一项成为一列，列名取 `AS` 别名；未写别名时，就取该项在查询中的原文。
+
+```text
+MATCH (f:Fn) RETURN f.file, f.line AS line, key(f)
+```
+
+由于每一行都携带着产生它的整条路径，一列可以读取模式所绑定的任一变量，而不限于最
+后一个：
+
+```text
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, p.year
+```
+
+**聚合**把一组行折叠成一个值：`count`、`sum`、`avg`、`min`、`max`，以及 `collect`
+（把该组的各个值收进一个列表）。分组键是所有*不是*聚合的列——即 Cypher 的隐式
+`GROUP BY`：查询在聚合旁边列出什么，就是按什么拆分：
+
+```text
+MATCH (a:Author)-[:WROTE]->(p:Paper)
+RETURN a.name, count(*) AS papers, collect(DISTINCT p.year) AS years
+ORDER BY papers DESC
+LIMIT 10
+```
+
+`count(*)` 计的是行数；其余每一种折叠都读取一个值，并跳过取值为 null 的行——也跳过
+该折叠无法采用的值，例如某个节点把年份存成了文本。正是这一点，让软模式数据上的聚合
+给得出答案，而不是让整条查询失败。若一组什么也没提供，`count` 与 `sum` 为 `0`，
+`avg`、`min`、`max` 为 `null`（零个值的均值是无从作答，而非零），`collect` 则是空
+列表。完全没有分组键的投影，就是整个匹配构成的一个组：因此匹配一无所获时，
+`RETURN count(*)` 答的是 `0`，而不是没有行。
+
+在投影查询中，`DISTINCT`、`ORDER BY`、`SKIP` 与 `LIMIT` 作用于投影后的行：
+`DISTINCT` 比较的是整个元组（同处一个文件的两个节点在这里是一行），`ORDER BY` 指名
+的是一列——用它的别名，或用它所返回的那个表达式。
+
+```text
+MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+```
+
+节点不能与列同处一个 `RETURN`，因为节点不是值：改为返回它的属性。各个界面渲染投影
+结果的方式是一致的——给出 `columns` 与 `rows`，而非节点与边。
 
 ## 写操作
 

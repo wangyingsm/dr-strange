@@ -70,9 +70,6 @@ it), and the legend maps colors to labels.
 The toolbar tabs:
 
 - **Filters / Operations** — seed the canvas from a label (or the whole plane).
-- **GraphQL / Run** — a query box for the Cypher subset ([Chapter
-  4](./query-language.md)); a keyword ghost-hint completes clause keywords as you
-  type, accepted with Tab. Reads plot their result; writes mutate and reload.
 - **Algorithms** — run PageRank, connected components, shortest path, or Louvain
   and overlay the result on the current graph (scores as node size/color,
   components/communities as color groups).
@@ -82,6 +79,30 @@ The toolbar tabs:
   control) and its connected result is plotted.
 - **Time-travel** — a slider over commit history (see below).
 - **Live** — the change feed (see below).
+
+## Query
+
+A view of its own, beside Dashboard and Explore, and the one place a query is
+written: Explore draws the graph, this view asks it questions and reads the
+answers ([Chapter 4](./query-language.md)).
+
+The editor is several lines, since a query worth a page is rarely one: **⌘/Ctrl
++ Enter** runs it, plain Enter is a newline, and Tab accepts a keyword
+completion ghost-hint as you type. Example queries sit under the editor as
+starting points, and the text survives a reload.
+
+The result takes the shape the query asked for:
+
+- a **projection** (`RETURN n.file, count(*) AS n`) comes back as a table, with
+  its row and column counts, the time it took, and a **copy** control that puts
+  the whole thing on the clipboard as tab-separated text — header included, so
+  it pastes into a spreadsheet;
+- a query returning **whole records** (`RETURN n`) lists them by key, labels and
+  the properties that fit;
+- a **write** reports its change counts.
+
+A query that cannot compile shows the parser's own message, which names the
+construct rather than a character position.
 
 ## Search
 

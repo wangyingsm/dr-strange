@@ -2,7 +2,10 @@
 //! arch/04 §3) on both backends, plus a plan serde round-trip and a proptest
 //! checking `Filter` against a naive model.
 
-use dr_strange_core::{Database, Dir, NodeId, PropValue, Properties, SortKey, has_label, p};
+use dr_strange_core::{
+    Agg, AggFunc, Database, Dir, NodeId, ProjItem, PropValue, Properties, SortKey, TupleSortKey,
+    at_node, edge_type, external_key, has_label, p,
+};
 use proptest::prelude::*;
 
 fn prop_i(v: i64) -> Properties {
@@ -198,6 +201,30 @@ fn run_query_suite(db: &Database) {
         ]
     );
 
+    // the projection tail: named columns of values, no nodes
+    let table = plane
+        .query()
+        .scan_label("Paper")
+        .project([
+            ProjItem::value("year", p("year")),
+            ProjItem::value("recent", p("year").ge(2020)),
+        ])
+        .order_by_columns([TupleSortKey {
+            column: 0,
+            descending: false,
+        }])
+        .table()
+        .unwrap();
+    assert_eq!(table.columns, vec!["year", "recent"]);
+    assert_eq!(
+        table.rows,
+        vec![
+            vec![PropValue::Int(2019), PropValue::Bool(false)],
+            vec![PropValue::Int(2020), PropValue::Bool(true)],
+            vec![PropValue::Int(2021), PropValue::Bool(true)],
+        ]
+    );
+
     // multi-key sort composes (explicit SortKey list)
     let by_label_then_year = plane
         .query()
@@ -238,6 +265,91 @@ fn subgraph_returns_source_and_traversed_edges() {
 }
 
 #[test]
+fn projection_tail_operators_count_tuples_not_nodes() {
+    let db = Database::in_memory().unwrap();
+    build_fixture(&db);
+    let plane = db.plane("startup").unwrap();
+
+    // DISTINCT over tuples, not node ids: p1's two citations are two node
+    // rows carrying one `CITES` tuple.
+    let table = plane
+        .query()
+        .seek_keys(["p1"])
+        .expand_out("CITES")
+        .project([ProjItem::value("type(r)", edge_type())])
+        .project_distinct()
+        .table()
+        .unwrap();
+    assert_eq!(table.columns, vec!["type(r)"]);
+    assert_eq!(table.rows, vec![vec![PropValue::Str("CITES".into())]]);
+
+    // ORDER BY addresses a column; SKIP/LIMIT count the tuples it ordered.
+    let table = plane
+        .query()
+        .scan_label("Paper")
+        .project([ProjItem::value("y", p("year"))])
+        .order_by_columns([TupleSortKey {
+            column: 0,
+            descending: true,
+        }])
+        .project_skip(1)
+        .project_limit(1)
+        .table()
+        .unwrap();
+    assert_eq!(table.rows, vec![vec![PropValue::Int(2020)]]);
+}
+
+#[test]
+fn aggregates_fold_the_rows_of_each_group() {
+    let db = Database::in_memory().unwrap();
+    build_fixture(&db);
+    let plane = db.plane("startup").unwrap();
+
+    // Grouped by a binding the row passed through, not the node it ended on.
+    // p1 cites p2(2019) and p3(2021); p2 cites p3.
+    let table = plane
+        .query()
+        .scan_label("Paper")
+        .expand_out("CITES")
+        .project([
+            ProjItem::value("citer", at_node(0, external_key())),
+            ProjItem::agg("cites", Agg::count()),
+            ProjItem::agg("years", Agg::of(AggFunc::Collect, p("year"))),
+        ])
+        .order_by_columns([TupleSortKey {
+            column: 0,
+            descending: false,
+        }])
+        .table()
+        .unwrap();
+    assert_eq!(table.columns, vec!["citer", "cites", "years"]);
+    assert_eq!(
+        table.rows,
+        vec![
+            vec![
+                PropValue::Str("p1".into()),
+                PropValue::Int(2),
+                PropValue::List(vec![PropValue::Int(2019), PropValue::Int(2021)]),
+            ],
+            vec![
+                PropValue::Str("p2".into()),
+                PropValue::Int(1),
+                PropValue::List(vec![PropValue::Int(2021)]),
+            ],
+        ]
+    );
+
+    // Nothing to group by is one group over the whole match, empty or not.
+    let table = plane
+        .query()
+        .scan_label("Ghost")
+        .project([ProjItem::agg("n", Agg::count())])
+        .table()
+        .unwrap();
+    assert_eq!(table.rows, vec![vec![PropValue::Int(0)]]);
+}
+
+#[test]
 fn query_suite_memory() {
     run_query_suite(&Database::in_memory().unwrap());
 }
@@ -260,7 +372,14 @@ fn built_plan_is_serde_roundtrippable() {
         .expand_out("CITES")
         .filter(p("year").ge(2020))
         .sort_desc(p("year"))
-        .limit(5);
+        .limit(5)
+        .project([ProjItem::value("year", p("year"))])
+        .project_distinct()
+        .order_by_columns([TupleSortKey {
+            column: 0,
+            descending: true,
+        }])
+        .project_limit(3);
     let json = serde_json::to_string(q.plan()).unwrap();
     let back: dr_strange_core::LogicalPlan = serde_json::from_str(&json).unwrap();
     assert_eq!(q.plan(), &back);

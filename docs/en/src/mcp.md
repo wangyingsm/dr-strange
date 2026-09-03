@@ -213,6 +213,7 @@ wait, it does not turn it away.
 | `grep` | read | literal text search over the watched source tree |
 | `trace` | read | the shortest recorded call path between two symbols |
 | `impact` | read | everything reaching a symbol, grouped by distance |
+| `fathom` | read | the makeup of the region around a symbol — labels, edge types, hubs |
 | `snippet` | read | one symbol's source text |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |

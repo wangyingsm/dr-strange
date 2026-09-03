@@ -30,7 +30,7 @@ access, and the CLI for offline operations.
 | `ask <question> --plane` | natural-language query |
 | `digest <file\|dir\|url> --plane [--mode]` | ingest a document, a repository, or a page and its links |
 | `search <query> --plane` | semantic lookup: embeds the query, returns the nearest nodes |
-| `context \| describe \| trace \| impact <name> --plane` | the agent verbs over a digested code plane |
+| `context \| describe \| trace \| impact \| fathom <name> --plane` | the agent verbs over a digested code plane |
 | `vectorize --plane` | embed a plane's nodes for similarity search |
 | `plugin install \| list \| remove` | manage preprocessor plugins (sandboxed wasm parsers) |
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |

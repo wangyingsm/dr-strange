@@ -126,7 +126,7 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
                 where_clause: m.where_clause,
                 ret: Return {
                     distinct: false,
-                    item: ReturnItem::Star,
+                    items: vec![ReturnItem::Star],
                 },
                 order_by: Vec::new(),
                 skip: None,

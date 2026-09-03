@@ -78,7 +78,7 @@ open files, read, infer who calls what, repeat. A digested plane has already
 done that work, once, with a parser — so structural questions become **one
 round trip** instead of a search-and-read loop.
 
-Seven verbs carry the workload, identical over MCP
+Eight verbs carry the workload, identical over MCP
 ([Chapter 8](./mcp.md)) and the CLI ([Chapter 7](./embedded-cli.md); `grep`
 and `snippet` read the watched source tree, so they live with the server):
 
@@ -90,6 +90,7 @@ and `snippet` read the watched source tree, so they live with the server):
 | `grep` | literal text over the watched source tree, bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
+| `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | one symbol's source text |
 
 Every answer is compact one-fact-per-line text, sized for a model's context

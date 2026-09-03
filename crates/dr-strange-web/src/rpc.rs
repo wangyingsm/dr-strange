@@ -447,6 +447,41 @@ mod tests {
         assert_eq!(resp["result"]["labels"][0], "Person");
     }
 
+    /// `plane.query` runs the plan it is given, projection and all: one that
+    /// projects answers with columns and rows rather than nodes.
+    #[test]
+    fn plane_query_returns_a_table_when_the_plan_projects() {
+        let db = seeded();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.query","params":{"plane":"startup","plan":{
+                 "source":{"ScanLabel":"Person"},
+                 "steps":[],
+                 "project":{"items":[
+                     {"name":"who","expr":{"Value":"ExternalKey"}},
+                     {"name":"n","expr":{"Agg":{"func":"Count","arg":null,"distinct":false}}}
+                 ],"distinct":false,"order_by":[],"skip":null,"limit":null}
+               }},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["columns"], serde_json::json!(["who", "n"]));
+        assert_eq!(resp["result"]["rows"], serde_json::json!([["alice", 1]]));
+    }
+
+    /// Without a projection the same method answers as before: the branch is
+    /// a fork in the reply, not a change of contract.
+    #[test]
+    fn plane_query_without_a_projection_still_returns_nodes() {
+        let db = seeded();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.query","params":{"plane":"startup",
+                 "plan":{"source":{"ScanLabel":"Person"},"steps":[]}},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"][0]["external_key"], "alice");
+    }
+
     #[test]
     fn node_get_without_selector_is_invalid_params() {
         let db = seeded();
