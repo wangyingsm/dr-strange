@@ -8,6 +8,7 @@
 //! from different providers (e.g. DeepSeek chat + Qwen embeddings): build two
 //! instances and pass each to the role it serves.
 
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -53,6 +54,142 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 /// time and money to be told the same thing.
 fn worth_retrying(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
+}
+
+/// Clean requests a throttled provider must serve before it is allowed one
+/// more in flight. Deliberately slow: climbing back costs a refusal every time
+/// it overshoots, and a digest run would rather be a little under the limit
+/// than repeatedly at it.
+const CLIMB_AFTER: u32 = 24;
+
+/// How many requests this provider keeps in flight, learned from the provider's
+/// own refusals.
+///
+/// A 429 is two different complaints wearing one status code. *Too fast* is
+/// answered by waiting, which [`backoff`] does. *Too many at once* is not: every
+/// worker that waits comes back through the same crowded doorway, in step with
+/// the others it was refused with, and the run dies with attempts to spare —
+/// which is exactly what an eight-worker digest does to an account whose
+/// concurrency limit is five.
+///
+/// So the ceiling drops when the provider objects and climbs back when it stops
+/// objecting. A run settles at whatever the account actually allows, without an
+/// operator having to know the number or an unrelated default having to guess
+/// it.
+struct Throttle {
+    gate: Mutex<Gate>,
+    room: Condvar,
+}
+
+struct Gate {
+    /// Requests allowed in flight. [`usize::MAX`] until the provider objects:
+    /// an account that never refuses is never held back.
+    limit: usize,
+    in_flight: usize,
+    /// Bumped on every cut, and stamped on each permit. One refusal per crowd,
+    /// not one per member of it — eight workers refused together would
+    /// otherwise cut the limit eight times over.
+    epoch: u64,
+    /// The most the limit may climb back to. Never the crowd size that was
+    /// refused: that number is known to be too many.
+    ceiling: usize,
+    /// Clean requests since the last cut.
+    ok: u32,
+}
+
+/// A request's place in flight, counted while it is out and returned on drop.
+struct Permit<'a> {
+    throttle: &'a Throttle,
+    epoch: u64,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut gate = self.throttle.gate.lock().unwrap();
+        gate.in_flight -= 1;
+        drop(gate);
+        self.throttle.room.notify_one();
+    }
+}
+
+impl Throttle {
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(Gate {
+                limit: usize::MAX,
+                in_flight: 0,
+                epoch: 0,
+                ceiling: usize::MAX,
+                ok: 0,
+            }),
+            room: Condvar::new(),
+        }
+    }
+
+    /// Wait for room, then take it.
+    fn enter(&self) -> Permit<'_> {
+        let mut gate = self.gate.lock().unwrap();
+        while gate.in_flight >= gate.limit {
+            gate = self.room.wait(gate).unwrap();
+        }
+        gate.in_flight += 1;
+        Permit {
+            throttle: self,
+            epoch: gate.epoch,
+        }
+    }
+
+    /// The provider refused this request for crowding: halve what is allowed.
+    ///
+    /// The crowd size is observed rather than parsed — providers word the
+    /// refusal differently and some do not name a number at all, but every one
+    /// of them refuses while this many requests are out.
+    fn refused(&self, permit: &Permit<'_>) {
+        let mut gate = self.gate.lock().unwrap();
+        if permit.epoch != gate.epoch {
+            return; // already cut for the crowd this request was part of
+        }
+        let crowd = gate.limit.min(gate.in_flight).max(1);
+        gate.limit = (crowd / 2).max(1);
+        gate.ceiling = gate.ceiling.min(crowd.saturating_sub(1)).max(1);
+        gate.epoch += 1;
+        gate.ok = 0;
+    }
+
+    /// The provider served this request: earn back a slot, eventually.
+    fn allowed(&self) {
+        let mut gate = self.gate.lock().unwrap();
+        if gate.limit >= gate.ceiling {
+            return; // never throttled, or already back at the ceiling
+        }
+        gate.ok += 1;
+        if gate.ok >= CLIMB_AFTER {
+            gate.ok = 0;
+            gate.limit += 1;
+            drop(gate);
+            self.room.notify_one();
+        }
+    }
+
+    /// What is allowed in flight right now — `None` while nothing has been
+    /// refused. For tests and for the log line that reports a cut.
+    #[cfg(test)]
+    fn limit(&self) -> Option<usize> {
+        let limit = self.gate.lock().unwrap().limit;
+        (limit != usize::MAX).then_some(limit)
+    }
+}
+
+/// A little noise on every wait, so a crowd refused together does not return
+/// together — the retry schedule is deterministic, and workers that started as
+/// one batch would otherwise stay in step through every attempt.
+fn jittered(wait: Duration) -> Duration {
+    let spread = (wait.as_millis() as u64 / 4).max(1);
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    wait + Duration::from_millis(noise % spread)
 }
 
 /// How long to wait before try number `attempt` (2 for the first retry).
@@ -142,6 +279,10 @@ pub struct OpenAiProvider {
     /// "none" disables them. `None` (the default) sends nothing, keeping
     /// behavior unchanged for providers that don't need it.
     reasoning_effort: Option<String>,
+    /// In-flight ceiling, learned from the provider's refusals. Shared by every
+    /// thread holding this instance, which is how a digest run's workers come
+    /// to agree on a limit none of them was told.
+    throttle: Throttle,
 }
 
 impl OpenAiProvider {
@@ -157,6 +298,7 @@ impl OpenAiProvider {
             embed_batch: 256,
             missing_key_env: None,
             reasoning_effort: None,
+            throttle: Throttle::new(),
         }
     }
 
@@ -204,17 +346,37 @@ impl OpenAiProvider {
             if !self.api_key.is_empty() {
                 req = req.set("Authorization", &format!("Bearer {}", self.api_key));
             }
+            // Held across the send only: a request waiting out its backoff is
+            // not in flight, and holding its slot would keep the crowd that
+            // caused the refusal at full size.
+            let permit = self.throttle.enter();
             // Cloned per attempt: sending consumes the body.
             let (reason, wait) = match req.send_json(body.clone()) {
                 Ok(resp) => {
+                    self.throttle.allowed();
                     return resp
                         .into_json::<Value>()
                         .context("decoding provider response");
                 }
                 Err(ureq::Error::Status(code, resp)) => {
+                    if code == 429 {
+                        self.throttle.refused(&permit);
+                    }
                     if !worth_retrying(code) || attempt == MAX_ATTEMPTS {
                         // Surface the provider's error body — the useful part.
                         let detail = resp.into_string().unwrap_or_default();
+                        if code == 429 {
+                            bail!(
+                                "{path} → HTTP {code}: {}\n\
+                                 refused on all {MAX_ATTEMPTS} attempts, down to \
+                                 {} request(s) in flight — the account allows less \
+                                 than this run asks for. Lower `concurrency` \
+                                 (`--concurrency`, `[digest] concurrency`, or the \
+                                 `concurrency` field on `digest.run`).",
+                                detail.trim(),
+                                self.throttle.gate.lock().unwrap().limit,
+                            )
+                        }
                         bail!("{path} → HTTP {code}: {}", detail.trim())
                     }
                     // A provider that says how long to wait knows better than
@@ -238,11 +400,14 @@ impl OpenAiProvider {
                     (e.to_string(), backoff(attempt + 1))
                 }
             };
+            drop(permit);
+            let wait = jittered(wait);
             tracing::warn!(
                 path,
                 attempt,
                 of = MAX_ATTEMPTS,
                 retry_in_ms = wait.as_millis() as u64,
+                in_flight_limit = self.throttle.gate.lock().unwrap().limit,
                 reason,
                 "provider request failed; retrying",
             );
@@ -512,6 +677,136 @@ mod tests {
 
     fn provider(base_url: String) -> OpenAiProvider {
         OpenAiProvider::new(base_url, String::new(), "m")
+    }
+
+    /// A server that answers everything but refuses with 429 whenever more than
+    /// `allowed` requests are in flight at once — an account's concurrency
+    /// limit, which is the one refusal waiting cannot fix. Returns its base URL
+    /// and a count of the refusals it issued.
+    fn crowded_server(allowed: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refusals);
+        std::thread::spawn(move || {
+            let live = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let live = Arc::clone(&live);
+                let refusals = Arc::clone(&counted);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(&stream);
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if len > 0 {
+                        std::io::Read::read_exact(&mut reader, &mut vec![0u8; len]).ok();
+                    }
+                    // Counted while the request is being served, so requests
+                    // that overlap are seen to overlap.
+                    let crowd = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    std::thread::sleep(Duration::from_millis(30));
+                    let (status, body) = if crowd > allowed {
+                        refusals.fetch_add(1, Ordering::SeqCst);
+                        (
+                            429,
+                            "{\"error\":{\"message\":\"Too many requests. Your current concurrency exceeds your concurrency limit.\"}}",
+                        )
+                    } else {
+                        (200, "{\"ok\":true}")
+                    };
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    let mut stream = &stream;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (url, refusals)
+    }
+
+    /// The bug this fixes: eight workers against an account that allows three.
+    /// Backing off answers *too fast*; it does not answer *too many at once*,
+    /// because every worker that waits returns to the same crowded doorway.
+    ///
+    /// What is pinned here is the learning — without it the provider ends the
+    /// run having drawn no conclusion from a wall of refusals, whatever luck
+    /// the retry schedule had — and that the work still finishes.
+    #[test]
+    fn a_crowding_refusal_shrinks_what_is_kept_in_flight() {
+        const WORKERS: usize = 8;
+        const EACH: usize = 4; // several apiece, so the crowd is sustained
+        let (url, refusals) = crowded_server(3);
+        let p = provider(url);
+        std::thread::scope(|s| {
+            for _ in 0..WORKERS {
+                s.spawn(|| {
+                    for _ in 0..EACH {
+                        p.post("x", json!({}))
+                            .expect("a crowded provider must still finish the work");
+                    }
+                });
+            }
+        });
+        assert!(
+            refusals.load(Ordering::SeqCst) > 0,
+            "the server must actually have been crowded, or this proves nothing"
+        );
+        let limit = p
+            .throttle
+            .limit()
+            .expect("a refusal must leave a learned ceiling");
+        assert!(
+            limit < WORKERS,
+            "the provider must keep fewer in flight than the crowd it was refused for, got {limit}"
+        );
+    }
+
+    #[test]
+    fn a_crowd_is_cut_once_and_climbs_back_no_further_than_it_should() {
+        let t = Throttle::new();
+        assert_eq!(t.limit(), None, "nothing is held back until something is");
+
+        let (a, b, c, d) = (t.enter(), t.enter(), t.enter(), t.enter());
+        t.refused(&a);
+        assert_eq!(t.limit(), Some(2), "four in flight, refused → half of them");
+        // The other three of that crowd are refused too; one refusal is what
+        // the crowd earns, not one per member.
+        t.refused(&b);
+        t.refused(&c);
+        t.refused(&d);
+        assert_eq!(t.limit(), Some(2));
+        drop((a, b, c, d));
+
+        // The climb back is earned, slowly, and stops below the crowd size that
+        // was refused — that number is known to be too many.
+        for _ in 0..CLIMB_AFTER * 4 {
+            t.allowed();
+        }
+        assert_eq!(t.limit(), Some(3), "climbs to the ceiling and no further");
+    }
+
+    #[test]
+    fn a_wait_is_jittered_so_a_crowd_does_not_return_in_step() {
+        let base = Duration::from_millis(800);
+        // Never shorter than asked, never more than a quarter longer.
+        for _ in 0..50 {
+            let w = jittered(base);
+            assert!(w >= base && w < base + base / 4, "{w:?}");
+        }
+        // A wait too short to divide still returns something valid.
+        assert!(jittered(Duration::from_millis(1)) >= Duration::from_millis(1));
     }
 
     #[test]
