@@ -187,6 +187,8 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
         .await
         .expect("the relay outlived its host");
     ended.unwrap().expect("the relay ended cleanly");
+}
+
 /// The agent verbs and the query tool over `/mcp`, in the shapes an agent
 /// gets them: `cypher` answers a projecting query with a table, and `fathom`
 /// answers with the compact text every agent verb speaks.
