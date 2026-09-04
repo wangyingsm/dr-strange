@@ -410,7 +410,12 @@ async fn completes_a_query_against_the_planes_own_shape() {
 
     let c = complete("MATCH (n:Person) ").await;
     assert_eq!(c["best"], "-[:KNOWS]->(m:Person)");
-    assert_eq!(c["about"], "what leaves a Person");
+    assert_eq!(c["about"], "what a Person connects to");
+
+    // Half a hop is completed with the punctuation it is still missing.
+    let c = complete("MATCH (n:Person)<-").await;
+    assert_eq!(c["best"], "[:KNOWS]-(m:Person)");
+    assert_eq!(c["about"], "what reaches a Person");
 
     // A property the plane actually holds, on the label the variable was
     // declared with.
@@ -435,6 +440,12 @@ async fn completes_a_query_against_the_planes_own_shape() {
         .map(|s| s["text"].as_str().unwrap())
         .collect();
     assert!(texts.contains(&"(n:Robot)"), "{texts:?}");
+
+    // A label that starts with a vowel is read out with the article that
+    // fits it.
+    cypher(r#"CREATE (i:Item {key:"i1"})"#).await;
+    let c = complete("MATCH (n:Item) ").await;
+    assert_eq!(c["about"], "what an Item connects to");
 
     // A plane that does not exist is a mistake worth reporting, not an empty
     // list.

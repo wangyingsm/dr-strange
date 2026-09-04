@@ -677,15 +677,17 @@ fn expects_about(e: &Expect) -> String {
         Expect::Node { .. } => "a node to match".into(),
         Expect::NodeVar { .. } => "a name for this node".into(),
         Expect::Label | Expect::NodeEnd => "which label".into(),
-        Expect::Hop { from: Some(l), .. } => format!("what leaves a {l}"),
-        Expect::Hop { from: None, .. } => "what leaves this node".into(),
+        // Both directions are offered here, so neither verb would do.
+        Expect::Hop { from: Some(l), .. } => format!("what {} connects to", a(l)),
+        Expect::Hop { from: None, .. } => "what this node connects to".into(),
         Expect::EdgeType {
             from: Some(l),
             incoming,
             ..
         } => format!(
-            "what {} a {l}",
-            if *incoming { "reaches" } else { "leaves" }
+            "what {} {}",
+            if *incoming { "reaches" } else { "leaves" },
+            a(l)
         ),
         Expect::EdgeType { from: None, .. } => "which edge type".into(),
         Expect::RelEnd { ranged: true, .. } => "how many hops".into(),
@@ -695,12 +697,22 @@ fn expects_about(e: &Expect) -> String {
         Expect::Property {
             var,
             label: Some(l),
-        } => format!("properties of {var}, a {l}"),
+        } => format!("properties of {var}, {}", a(l)),
         Expect::Property { var, label: None } => format!("properties of {var}"),
         Expect::Value => "a value only you know".into(),
         Expect::Clause => "what comes after".into(),
         Expect::Nothing => "inside a string".into(),
     }
+}
+
+/// A label with its article: `a Function`, `an UnresolvedRef`. By the sound
+/// of the first letter, which for a type name is near enough its spelling.
+fn a(label: &str) -> String {
+    let vowel = label
+        .chars()
+        .next()
+        .is_some_and(|c| "aeiouAEIOU".contains(c));
+    format!("{} {label}", if vowel { "an" } else { "a" })
 }
 
 fn kind_tag(k: Kind) -> &'static str {

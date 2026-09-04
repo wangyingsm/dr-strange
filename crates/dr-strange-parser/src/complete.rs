@@ -86,11 +86,15 @@ pub enum Expect {
         var: String,
         bound: usize,
     },
-    /// An edge type, after `-[:`.
+    /// An edge type — anywhere from just after the arrow to just after the
+    /// `:`. `lead` is the punctuation that still has to be written before the
+    /// type: `[:` right after the arrow, `:` right after the bracket, and
+    /// nothing once the colon is there.
     EdgeType {
         from: Option<String>,
         var: String,
         incoming: bool,
+        lead: &'static str,
     },
     /// The end of a relationship: `]`, or the bounds of a `*` range —
     /// `ranged` when a `*` has been written and is still waiting for them.
@@ -426,6 +430,11 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
             from: s.from.clone(),
             var: s.next_var(),
             incoming: s.incoming,
+            lead: match s.pos {
+                Pos::RelOpen => "[:",
+                Pos::RelVar | Pos::RelColon => ":",
+                _ => "",
+            },
         },
         Pos::RelClose => Expect::RelEnd {
             incoming: s.incoming,
@@ -590,7 +599,16 @@ fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Sugg
             from,
             var,
             incoming,
-        } => edge_types(word, vocab, from.as_deref(), var, *incoming),
+            lead,
+        } => {
+            // A word typed where the bracket has not been opened yet is not
+            // the start of a type — there is nowhere for it to go — so
+            // nothing completes it.
+            if lead.starts_with('[') && !word.is_empty() {
+                return Vec::new();
+            }
+            edge_types(word, vocab, from.as_deref(), var, *incoming, lead)
+        }
         Expect::RelEnd { .. } | Expect::Arrow { .. } if loose => Vec::new(),
         Expect::RelEnd { incoming, ranged } => {
             let close = if *incoming { "]-" } else { "]->" };
@@ -750,20 +768,30 @@ fn node_ends(word: &str, vocab: &Vocab) -> Vec<Suggestion> {
 }
 
 /// Edge types leaving (or, `incoming`, entering) a label, most edges first,
-/// written as the whole hop: the type, the bracket that closes it, and the
-/// node it lands on — labelled with where such edges most often land.
+/// written as the whole rest of the hop: whatever punctuation is still owed
+/// before the type, the type, the bracket that closes it, and the node it
+/// lands on — labelled with where such edges most often land.
 fn edge_types(
     word: &str,
     vocab: &Vocab,
     from: Option<&str>,
     var: &str,
     incoming: bool,
+    lead: &str,
 ) -> Vec<Suggestion> {
+    // With punctuation still owed, the word before the caret is not part of
+    // the type's name — it is the relationship's own variable, `-[r` — so the
+    // type is written whole after it rather than completed from it.
+    let typed = if lead.is_empty() { word } else { "" };
     ranked_edges(vocab, from, incoming)
         .iter()
-        .filter(|(e, _, _)| starts_with(&e.name, word))
+        .filter(|(e, _, _)| starts_with(&e.name, typed))
         .map(|(e, count, dst)| Suggestion {
-            insert: format!("{}{}", &e.name[word.len()..], hop_tail(*dst, var, incoming)),
+            insert: format!(
+                "{lead}{}{}",
+                &e.name[typed.len()..],
+                hop_tail(*dst, var, incoming)
+            ),
             text: e.name.clone(),
             detail: Some(edge_detail(*count, *dst)),
             kind: Kind::EdgeType,
@@ -774,6 +802,12 @@ fn edge_types(
 /// After a closed node: the hop that leaves it, and the clauses that would end
 /// the pattern instead.
 ///
+/// Both directions, ranked together, because plenty of labels are only ever
+/// arrived at — an `UnresolvedRef` is called and calls nothing — and offering
+/// such a node no hop at all is offering it nothing it wants. With no label
+/// to go on there is no direction to tell apart either, so an unlabelled node
+/// gets the outgoing form alone rather than each type twice.
+///
 /// The hop comes first while the pattern is one node long, because one more
 /// hop is the reason to be writing a pattern at all; past that the reverse is
 /// true, since a two-hop pattern is already a question and a third hop is
@@ -781,19 +815,28 @@ fn edge_types(
 fn hops(word: &str, vocab: &Vocab, from: Option<&str>, var: &str, bound: usize) -> Vec<Suggestion> {
     let mut shapes = Vec::new();
     if word.is_empty() {
-        shapes.extend(
-            ranked_edges(vocab, from, false)
-                .iter()
-                .map(|(e, count, dst)| {
-                    let text = format!("-[:{}{}", e.name, hop_tail(*dst, var, false));
-                    Suggestion {
-                        insert: text.clone(),
-                        text,
-                        detail: Some(edge_detail(*count, *dst)),
-                        kind: Kind::Snippet,
-                    }
-                }),
-        );
+        let out = ranked_edges(vocab, from, false)
+            .into_iter()
+            .map(|(e, count, dst)| (e, count, dst, false));
+        let back = from
+            .map(|_| ranked_edges(vocab, from, true))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(e, count, dst)| (e, count, dst, true));
+        let mut both: Vec<_> = out.chain(back).collect();
+        both.sort_by_key(|(e, count, _, incoming)| {
+            (std::cmp::Reverse(*count), *incoming, e.name.clone())
+        });
+        shapes.extend(both.iter().map(|(e, count, dst, incoming)| {
+            let arrow = if *incoming { "<-" } else { "-" };
+            let text = format!("{arrow}[:{}{}", e.name, hop_tail(*dst, var, *incoming));
+            Suggestion {
+                insert: text.clone(),
+                text,
+                detail: Some(edge_detail(*count, *dst)),
+                kind: Kind::Snippet,
+            }
+        }));
     }
     let mut clauses = keywords(AFTER_PATTERN, word);
     if bound > 1 {

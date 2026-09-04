@@ -28,6 +28,8 @@ fn code() -> Vocab {
                 2909,
                 &["file", "line", "signature", "doc_comment", "visibility"],
             ),
+            // Everything outside the tree: called, imported, never calling.
+            label("External", 1197, &[]),
             label("Method", 994, &["file", "line", "receiver", "signature"]),
             label("Struct", 504, &["file", "line", "fields"]),
             label("Module", 192, &["path", "imports", "doc_comment"]),
@@ -112,7 +114,13 @@ fn match_offers_a_whole_node_of_the_commonest_label() {
     assert_eq!(best("match "), "(n:Function)");
     assert_eq!(
         texts("MATCH "),
-        ["(n:Function)", "(n:Method)", "(n:Struct)", "(n:Module)"],
+        [
+            "(n:Function)",
+            "(n:External)",
+            "(n:Method)",
+            "(n:Struct)",
+            "(n:Module)"
+        ],
         "most nodes first"
     );
     let c = complete("MATCH ", &code());
@@ -225,7 +233,14 @@ fn a_named_node_offers_its_label_or_its_close() {
     assert_eq!(best("MATCH (n "), ":Function)");
     assert_eq!(
         texts("MATCH (n "),
-        [":Function)", ":Method)", ":Struct)", ":Module)", ")"],
+        [
+            ":Function)",
+            ":External)",
+            ":Method)",
+            ":Struct)",
+            ":Module)",
+            ")"
+        ],
         "every label, then the node that names none"
     );
 }
@@ -366,6 +381,16 @@ fn what_the_caret_sits_at_is_said_plainly() {
             from: Some("Function".into()),
             var: "m".into(),
             incoming: false,
+            lead: "",
+        }
+    );
+    assert_eq!(
+        at("MATCH (n:Function)<-"),
+        Expect::EdgeType {
+            from: Some("Function".into()),
+            var: "m".into(),
+            incoming: true,
+            lead: "[:",
         }
     );
     // Mid-word, the caret is still choosing a type; a `*` ends the word and
@@ -487,4 +512,77 @@ fn a_spliced_completion_fits_the_grammar() {
             parse(&query).err()
         );
     }
+}
+
+/// A hop is completed from however much of it is written, punctuation and
+/// all: the bracket has to be opened when the arrow is all there is, and the
+/// colon when the bracket is.
+#[test]
+fn a_hop_is_completed_from_however_much_of_it_is_written() {
+    assert_eq!(best("MATCH (n:Function)-"), "[:CALLS]->(m:Function)");
+    assert_eq!(best("MATCH (n:Function)<-"), "[:CALLS]-(m:Function)");
+    assert_eq!(best("MATCH (n:Function)-["), ":CALLS]->(m:Function)");
+    assert_eq!(best("MATCH (n:Function)<-["), ":CALLS]-(m:Function)");
+    // `-[r` names the relationship; the type follows that name rather than
+    // completing it.
+    assert_eq!(best("MATCH (n:Function)-[r"), ":CALLS]->(m:Function)");
+    assert_eq!(best("MATCH (n:Function)-[:"), "CALLS]->(m:Function)");
+
+    // And each one parses, spliced in exactly where it was offered.
+    let vocab = code();
+    for prefix in [
+        "MATCH (n:Function)-",
+        "MATCH (n:Function)<-",
+        "MATCH (n:Function)-[",
+        "MATCH (n:Function)<-[",
+        "MATCH (n:Function)-[r",
+        "MATCH (n:Function)-[:",
+    ] {
+        let insert = complete(prefix, &vocab).best.expect(prefix);
+        let query = format!("{prefix}{insert} RETURN *");
+        assert!(
+            parse(&query).is_ok(),
+            "`{query}`: {:?}",
+            parse(&query).err()
+        );
+    }
+}
+
+/// A word where no bracket has been opened is not the start of a type: there
+/// is nowhere for it to go.
+#[test]
+fn a_word_with_no_bracket_to_go_in_completes_to_nothing() {
+    assert!(complete("MATCH (n:Function)<-C", &code()).best.is_none());
+}
+
+/// Plenty of labels are only ever arrived at: an `External` is called and
+/// calls nothing. Offering such a node no hop at all would offer it nothing
+/// it wants, so both directions are ranked together.
+#[test]
+fn a_node_that_is_only_ever_arrived_at_is_offered_the_way_in() {
+    assert_eq!(best("MATCH (n:External) "), "<-[:CALLS]-(m:Function)");
+    let query = format!(
+        "MATCH (n:External) {} RETURN *",
+        best("MATCH (n:External) ")
+    );
+    assert!(
+        parse(&query).is_ok(),
+        "`{query}`: {:?}",
+        parse(&query).err()
+    );
+
+    // A Function is both, and the commoner direction leads.
+    assert_eq!(
+        texts("MATCH (n:Function) ")[..2],
+        ["-[:CALLS]->(m:Function)", "<-[:CALLS]-(m:Function)"]
+    );
+
+    // An unlabelled node has no direction to tell apart, so it is not shown
+    // each type twice.
+    let out = texts("MATCH (n) ");
+    assert_eq!(
+        out.iter().filter(|t| t.contains("CALLS")).count(),
+        1,
+        "{out:?}"
+    );
 }
