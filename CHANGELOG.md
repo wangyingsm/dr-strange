@@ -6,6 +6,49 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`grep` can do what the shell `rg` could, and says where each hit lives.**
+  The MCP verb takes `regex: true` (Rust syntax — alternation, anchors,
+  classes), `path` to scope a search to a directory, a file or an extension,
+  and `context: n` for surrounding lines, printed the way `rg -C` prints them
+  (`-` on context lines, `--` between groups). Each hit is followed by the
+  symbol it falls inside — `in crate::module::fn` — read off the plane parsed
+  from that tree, so the next call is `context` or `snippet` on that key
+  rather than a `sed -n` on the file. Those three gaps were, measured over a
+  long session with the graph attached, most of the reasons an agent reached
+  past the verb for a shell command.
+- **`snippet` reads a range of a file, and every answer says what to call
+  next.** `snippet src/lib.rs:120-180` reads those lines — the `sed -n` that
+  a `grep` hit or a body longer than one answer used to send an agent to the
+  shell for — and says which symbol the range opens in. A symbol answer now
+  ends with the `context` call that expands it, an answer that stops short
+  of a body says the exact range that reads on, an ambiguous name comes
+  back with the candidates rather than a count, and a miss points at `grep`
+  and at the range form instead of leaving the agent to guess. The per-call
+  cap rose from 200 lines to 400.
+- **The server says what it stands in for.** Its MCP instructions — the text
+  every host puts in the agent's system prompt — now open with the rule:
+  while the server is connected, `context`, `snippet`, `grep` and `search`
+  replace `rg`, `grep`, `cat`, `sed -n` and reading files for code, and a
+  shell search is for what no plane holds. The `grep`, `snippet` and
+  `context` descriptions say the same in the words an agent is already
+  thinking when it reaches for the shell, and `list_planes` reports
+  `source_tree` per plane — attached, readable, or absent here — so an agent
+  learns whether the verbs can read the source before it tries a shell.
+- **`drsg init` installs Claude Code hooks that redirect shell searches to
+  the graph.** In the repository's `.claude/settings.local.json` (the
+  per-user file), with the scripts beside the plugin store: a `SessionStart`
+  hook that puts the rule — drsg first for every code question, shell last —
+  in the agent's context where it survives a resume and a compaction, and a
+  `PreToolUse` hook on `Bash` that meets an `rg`, `grep`, `cat` or `sed -n`
+  on code with the verb that answers instead. `DRSG_RAW=1 <command>` runs
+  any command untouched. A config tells an agent where the graph is; these
+  tell it when to use it — measured over a long session, the config alone
+  did not. Written only when Claude Code shows itself (`.claude/` in the
+  repository, or `~/.claude`), idempotent, and other people's hooks in the
+  file are left as they are.
+
 ### Changed
 
 - **`drsg serve` keeps 20 commits of history, not all of it.** Time-travel

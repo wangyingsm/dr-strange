@@ -34,6 +34,23 @@ TOOL_PREFIX = re.compile(r"^mcp__drsg[\w-]*__(?P<verb>.+)$")
 # figure it produces is only ever shown with a `~`.
 CHARS_PER_TOKEN = 4
 
+# A Bash call that searched or read code the graph could have answered: the
+# first word of the command line, past env assignments and an `rtk` prefix.
+# Counted beside the graph calls, because the number that says whether the
+# graph is earning its place is not how often it was asked but how often it
+# was *not* asked when it could have been. `DRSG_RAW=1` marks a deliberate
+# shell command and is not counted; neither is a write (`>`/heredoc).
+SHELL_READ = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:rtk\s+)?(?:\S*/)?"
+    r"(?:rg|grep|egrep|fgrep|ugrep|ug|ag|ack|cat|head|tail|bat|less|more|sed\s+-[a-zA-Z]*n)\b"
+)
+
+
+def is_shell_read(command: str) -> bool:
+    if "DRSG_RAW=1" in command or ">" in command or "<<" in command:
+        return False
+    return bool(SHELL_READ.match(command))
+
 
 def read_hook_input() -> dict:
     try:
@@ -127,6 +144,8 @@ class Tally:
         self.tokens_cache_read = 0
         self.tokens_out = 0
         self.requests = 0
+        # Shell searches and reads on code — see `is_shell_read`.
+        self.shell_reads = 0
 
     @property
     def total_calls(self) -> int:
@@ -176,6 +195,12 @@ def scan(transcript: Path, since_line: int) -> tuple[Tally, Tally, int]:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_use":
+                    if block.get("name") == "Bash":
+                        command = (block.get("input") or {}).get("command") or ""
+                        if isinstance(command, str) and is_shell_read(command):
+                            for tally in tallies:
+                                tally.shell_reads += 1
+                        continue
                     match = TOOL_PREFIX.match(block.get("name") or "")
                     if not match:
                         continue
@@ -210,25 +235,38 @@ def approx_tokens(chars: int) -> str:
 def render(session: Tally, turn: Tally, tracked: bool) -> str:
     # Without a watermark this is the session's first report, and the turn *is*
     # the session so far — printing both would print the same figure twice.
+    def shell(tally: Tally) -> str:
+        return f", shell search/read ×{tally.shell_reads}" if tally.shell_reads else ""
+
     if not tracked:
         head = None
     elif turn.total_calls:
         head = (
             f"turn: {turn.total_calls} call"
             f"{'' if turn.total_calls == 1 else 's'} ({turn.verbs()}), "
-            f"~{approx_tokens(turn.result_chars)} tok returned"
+            f"~{approx_tokens(turn.result_chars)} tok returned{shell(turn)}"
         )
     else:
-        head = "turn: no calls"
+        head = f"turn: no calls{shell(turn)}"
 
     if session.total_calls:
         tail = (
             f"session: {session.total_calls} call"
             f"{'' if session.total_calls == 1 else 's'} ({session.verbs()}), "
-            f"~{approx_tokens(session.result_chars)} tok returned"
+            f"~{approx_tokens(session.result_chars)} tok returned{shell(session)}"
         )
     else:
-        tail = "session: the code graph has not been asked anything yet"
+        tail = f"session: the code graph has not been asked anything yet{shell(session)}"
+
+    # The nudge: said only when the shell was reached for more than the
+    # graph was, this turn — the one comparison that names the habit.
+    scope = turn if tracked else session
+    nudge = None
+    if scope.shell_reads and scope.shell_reads > scope.total_calls:
+        nudge = (
+            "the shell was searched or read more than the graph was asked — "
+            "grep/snippet/context answer these with the tree attached"
+        )
 
     io = (
         f"model I/O {human(session.tokens_new_in)} new in, "
@@ -236,7 +274,7 @@ def render(session: Tally, turn: Tally, tracked: bool) -> str:
         f"{human(session.tokens_cache_read)} cache reads over "
         f"{session.requests} request{'' if session.requests == 1 else 's'}"
     )
-    parts = [p for p in (head, tail, io) if p]
+    parts = [p for p in (head, tail, nudge, io) if p]
     return "drsg MCP — " + " · ".join(parts)
 
 

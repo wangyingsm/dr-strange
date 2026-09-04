@@ -210,11 +210,11 @@ wait, it does not turn it away.
 | `search` | read | semantic lookup — embeds the query, returns the *k* nearest nodes |
 | `context` | read | one symbol's whole neighborhood on a digested code plane — the primary agent verb |
 | `describe` | read | one symbol's properties, the lightweight node-only view |
-| `grep` | read | literal text search over the watched source tree |
+| `grep` | read | text search over the watched source tree — literal or regex, scoped by `path`, with context lines; each hit names the symbol it falls in |
 | `trace` | read | the shortest recorded call path between two symbols |
 | `impact` | read | everything reaching a symbol, grouped by distance |
 | `fathom` | read | the makeup of the region around a symbol — labels, edge types, hubs |
-| `snippet` | read | one symbol's source text |
+| `snippet` | read | a symbol's source text, or a range of a file (`path:start-end`); says which symbol a range opens in and how to read on |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
 | `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated |

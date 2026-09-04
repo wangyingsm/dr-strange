@@ -34,10 +34,23 @@ matching MCP config for Cursor, OpenCode, Gemini CLI, or Codex CLI, but only
 for a tool whose own marker (a directory it creates, or a config file it
 already owns) is already present in the repository.
 
+For Claude Code it also installs two hooks, in the repository's
+`.claude/settings.local.json` (the per-user file, so nothing lands in the
+tree a team shares) with the scripts beside the plugin store. A config tells
+an agent where the graph is; the hooks tell it *when* to use it. The
+`SessionStart` hook puts the rule in the agent's context — drsg first for
+every code question, shell last — where it survives a resume and a
+compaction. The `PreToolUse` hook meets an `rg`, `grep`, `cat` or `sed -n`
+on code with the verb that answers instead, and `DRSG_RAW=1 <command>` runs
+any command untouched, for the file no plane holds. The other hosts have no
+hooks; they get the same rule from the server's own MCP instructions, which
+every host places in the system prompt.
+
 ```console
 $ drsg init
 plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
   + wrote ./.mcp.json
+  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
 ```
 
@@ -87,11 +100,11 @@ and `snippet` read the watched source tree, so they live with the server):
 | `context` | everything about one symbol — definition, callers with call sites, callees, references — the primary verb |
 | `search` | "I don't know the name": semantic top-k over the plane's embeddings |
 | `describe` | one symbol's properties — the lightweight node-only view |
-| `grep` | literal text over the watched source tree, bounded and counted |
+| `grep` | text over the watched source tree — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
-| `snippet` | one symbol's source text |
+| `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 
 Every answer is compact one-fact-per-line text, sized for a model's context
 window rather than a terminal, and `context` keeps itself within a fixed

@@ -256,11 +256,11 @@ they live with the server).
 | `context` | everything about one symbol — definition, callers with call sites, callees, references — the primary verb |
 | `search` | "I don't know the name": semantic top-k over the plane's embeddings |
 | `describe` | one symbol's properties — the lightweight node-only view |
-| `grep` | literal text over the watched source tree, bounded and counted |
+| `grep` | text over the watched source tree — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
-| `snippet` | one symbol's source text |
+| `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 | `history` | the repository behind the code: HEAD, branches, tags, rebases and the newest commits |
 
 Two disciplines run through every tool. An ambiguous name is never

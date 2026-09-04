@@ -594,8 +594,12 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
     )
 }
 
-fn list_planes_logic(db: &Database) -> AnyResult<Value> {
+/// `list_planes`' body. `watched` is the tree this server has attached (the
+/// `serve watch` directory or `[server] source_root`), which is what `grep`
+/// reads; `snippet` reads any plane's own `synced_root`.
+fn list_planes_logic(db: &Database, watched: Option<&std::path::Path>) -> AnyResult<Value> {
     let names: Vec<String> = db.planes()?.into_iter().map(|(_, name)| name).collect();
+    let watched = watched.map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()));
     let mut out = Vec::new();
     for (id, name) in db.planes()? {
         let plane = db.plane(&name)?;
@@ -606,6 +610,31 @@ fn list_planes_logic(db: &Database) -> AnyResult<Value> {
             "nodes": cat.node_count, "edges": cat.edge_count,
             "properties": json::properties_to_json(&props),
         });
+        // Whether the source behind this plane can be read from here — the
+        // fact that decides between `snippet`/`grep` and a shell command, so
+        // it is stated per plane rather than left to be tried.
+        if let Some(dr_strange_core::PropValue::Str(root)) =
+            props.get("synced_root").map(|d| &d.value)
+        {
+            let dir = std::path::Path::new(root);
+            let tree = if !dir.is_dir() {
+                "not readable from this server — the directory is absent here; \
+                 `context`/`describe` still answer from the graph"
+            } else if watched.as_deref()
+                == Some(
+                    dir.canonicalize()
+                        .unwrap_or_else(|_| dir.to_path_buf())
+                        .as_path(),
+                )
+            {
+                "attached — `grep` searches it and `snippet` reads it"
+            } else {
+                "readable — `snippet` reads it; `grep` searches only the tree this server watches"
+            };
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("source_tree".into(), Value::String(tree.into()));
+            }
+        }
         // Which plane holds what, said rather than left to be inferred from a
         // name. The pairing is not a guess: a digest of a git checkout writes
         // the history beside the code plane under exactly this name, so both
@@ -643,17 +672,36 @@ struct SymbolReq {
     name: String,
 }
 
-/// `grep`'s request: literal text over the attached source tree.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// `grep`'s request: text over the attached source tree.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct GrepReq {
-    /// Literal text to find (no regex — what you type is what is matched).
+    /// What to find. Literal text unless `regex` is set — then Rust regex
+    /// syntax, so `foo|bar`, `^pub fn \w+`, `set_\w+\(` all work.
     pattern: String,
+    /// Treat `pattern` as a regular expression (default false).
+    #[serde(default)]
+    regex: Option<bool>,
     /// Case-insensitive matching (default false).
     #[serde(default)]
     ignore_case: Option<bool>,
+    /// Only files under this directory or at this file (`crates/dr-strange-web`,
+    /// `src/lib.rs`), or with this extension when it starts with a dot (`.rs`).
+    /// Relative to the tree's root.
+    #[serde(default)]
+    path: Option<String>,
+    /// Lines of surrounding source to show before and after each hit (default
+    /// 0, capped at 10). Context lines carry `-` after the line number where
+    /// hits carry `:`, as `rg -C` prints them.
+    #[serde(default)]
+    context: Option<usize>,
     /// Max matching lines returned (default 50, capped at 200).
     #[serde(default)]
     max_results: Option<usize>,
+    /// The plane whose symbols the hits are placed in — each hit names the
+    /// symbol it falls inside, the key `context`/`snippet` take next. Unset,
+    /// the plane parsed from this tree (its `synced_root`) is used.
+    #[serde(default)]
+    plane: Option<String>,
 }
 
 /// `trace`'s request: two symbols, fuzzy like everywhere else.
@@ -706,8 +754,13 @@ struct HistoryReq {
 struct SnippetReq {
     #[serde(default = "default_plane")]
     plane: String,
+    /// A symbol (fuzzy: an exact key, a `::name`/`.name` suffix, or a
+    /// substring) — or a file range, `path:line` / `path:start-end`, relative
+    /// to the tree's root, for the lines around a `grep` hit or the rest of a
+    /// long body.
     name: String,
-    /// Lines of source returned from the declaration down (default 40).
+    /// Lines of source returned from the declaration down (default 40,
+    /// capped at 400). The answer says how to read on when it stops short.
     #[serde(default)]
     lines: Option<usize>,
 }
@@ -726,7 +779,143 @@ struct SearchReq {
 
 /// Bounded literal search under `root`: build dirs and binaries skipped,
 /// results and line lengths capped, paths relative to the root.
-fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
+/// How `grep` matches a line: the literal text, or a compiled regex.
+enum Matcher {
+    Literal { needle: String, fold: bool },
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    fn new(req: &GrepReq) -> anyhow::Result<Self> {
+        if req.pattern.trim().is_empty() {
+            anyhow::bail!("an empty pattern matches everything and helps no one");
+        }
+        let fold = req.ignore_case.unwrap_or(false);
+        if req.regex.unwrap_or(false) {
+            let re = regex::RegexBuilder::new(&req.pattern)
+                .case_insensitive(fold)
+                .build()
+                .map_err(|e| anyhow::anyhow!("`{}` is not a valid regex: {e}", req.pattern))?;
+            return Ok(Self::Regex(re));
+        }
+        Ok(Self::Literal {
+            needle: if fold {
+                req.pattern.to_lowercase()
+            } else {
+                req.pattern.clone()
+            },
+            fold,
+        })
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(line),
+            Self::Literal { needle, fold: true } => line.to_lowercase().contains(needle.as_str()),
+            Self::Literal {
+                needle,
+                fold: false,
+            } => line.contains(needle.as_str()),
+        }
+    }
+}
+
+/// `grep`'s `path`: a directory or file under the root, or an extension when
+/// it starts with a dot. `rel` is root-relative with `/` separators.
+fn path_admits(filter: Option<&str>, rel: &str) -> bool {
+    match filter.map(|f| f.trim_matches('/')) {
+        None | Some("") => true,
+        Some(ext) if ext.starts_with('.') && !ext.contains('/') => rel.ends_with(ext),
+        Some(prefix) => rel == prefix || rel.starts_with(&format!("{prefix}/")),
+    }
+}
+
+/// Whether a directory at `rel` can hold anything `path_admits` — so a scoped
+/// grep walks only the branch it was pointed at.
+fn dir_worth_entering(filter: Option<&str>, rel: &str) -> bool {
+    match filter.map(|f| f.trim_matches('/')) {
+        None | Some("") => true,
+        Some(ext) if ext.starts_with('.') && !ext.contains('/') => true,
+        Some(prefix) => {
+            rel == prefix
+                || rel.starts_with(&format!("{prefix}/"))
+                || prefix.starts_with(&format!("{rel}/"))
+        }
+    }
+}
+
+/// Where a line sits in the graph: `file → [(line, key)]`, sorted by line,
+/// from every node of the plane that records a `file` and a `line`. Built once
+/// per `grep` from the plane the tree was parsed into, so each hit can name
+/// the symbol it falls in — the key `context`/`snippet` take next, which is
+/// what turns a text hit into a graph question instead of a `sed`.
+struct SymbolIndex {
+    by_file: std::collections::HashMap<String, Vec<(usize, String)>>,
+}
+
+impl SymbolIndex {
+    fn from_plane(plane: &dr_strange_core::PlaneHandle<'_>) -> anyhow::Result<Self> {
+        let mut by_file: std::collections::HashMap<String, Vec<(usize, String)>> =
+            std::collections::HashMap::new();
+        for n in plane.query().scan_all().nodes()? {
+            let Some(key) = n.external_key.as_deref() else {
+                continue;
+            };
+            let file = match n.properties.get("file").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Str(f)) => f.clone(),
+                _ => continue,
+            };
+            let line = match n.properties.get("line").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Int(l)) if *l > 0 => *l as usize,
+                _ => continue,
+            };
+            by_file
+                .entry(file)
+                .or_default()
+                .push((line, key.to_string()));
+        }
+        for lines in by_file.values_mut() {
+            lines.sort();
+        }
+        Ok(Self { by_file })
+    }
+
+    /// The symbol declared closest above `line` in `file`. A declaration's
+    /// extent is not recorded, so a line past a short symbol's end still
+    /// names that symbol — near enough to be the next call, and said as
+    /// "in", not "is".
+    fn enclosing(&self, file: &str, line: usize) -> Option<&str> {
+        let declared = self.by_file.get(file)?;
+        let after = declared.partition_point(|(l, _)| *l <= line);
+        after.checked_sub(1).map(|i| declared[i].1.as_str())
+    }
+}
+
+/// The plane whose facts were parsed from `root` — the one whose
+/// `synced_root` is this directory — if any plane records that.
+fn plane_for_root<'a>(
+    db: &'a Database,
+    root: &std::path::Path,
+) -> anyhow::Result<Option<dr_strange_core::PlaneHandle<'a>>> {
+    let wanted = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for (_, name) in db.planes()? {
+        let plane = db.plane(&name)?;
+        let recorded = match plane.properties()?.get("synced_root").map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::Str(r)) => std::path::PathBuf::from(r),
+            _ => continue,
+        };
+        if recorded.canonicalize().unwrap_or(recorded) == wanted {
+            return Ok(Some(plane));
+        }
+    }
+    Ok(None)
+}
+
+fn grep_tree(
+    root: &std::path::Path,
+    req: &GrepReq,
+    symbols: Option<&SymbolIndex>,
+) -> anyhow::Result<String> {
     const SKIP_DIRS: &[&str] = &[
         ".git",
         "target",
@@ -741,19 +930,28 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
     const MAX_FILE: u64 = 2 * 1024 * 1024;
     const MAX_LINE: usize = 300;
     let cap = req.max_results.unwrap_or(50).clamp(1, 200);
-    let fold = req.ignore_case.unwrap_or(false);
-    let needle = if fold {
-        req.pattern.to_lowercase()
-    } else {
-        req.pattern.clone()
+    let around = req.context.unwrap_or(0).min(10);
+    let matcher = Matcher::new(req)?;
+    let filter = req.path.as_deref();
+
+    // One line as `grep` prints it: trimmed, and cut at a width past which a
+    // minified or generated line says nothing more.
+    let clip = |line: &str| -> String {
+        let mut shown = line.trim_end();
+        if shown.len() > MAX_LINE {
+            let mut end = MAX_LINE;
+            while !shown.is_char_boundary(end) {
+                end -= 1;
+            }
+            shown = &shown[..end];
+        }
+        shown.to_string()
     };
-    if needle.trim().is_empty() {
-        anyhow::bail!("an empty pattern matches everything and helps no one");
-    }
 
     let mut out = String::new();
     let mut hits = 0usize;
     let mut capped = false;
+    let mut named_any = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -765,13 +963,21 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             let Ok(meta) = entry.metadata() else { continue };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
             if meta.is_dir() {
-                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                if !name.starts_with('.')
+                    && !SKIP_DIRS.contains(&name.as_str())
+                    && dir_worth_entering(filter, &rel)
+                {
                     stack.push(path);
                 }
                 continue;
             }
-            if meta.len() > MAX_FILE {
+            if !path_admits(filter, &rel) || meta.len() > MAX_FILE {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
@@ -781,34 +987,52 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
                 continue; // binary
             }
             let text = String::from_utf8_lossy(&bytes);
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            for (i, line) in text.lines().enumerate() {
-                let hay = if fold {
-                    std::borrow::Cow::Owned(line.to_lowercase())
-                } else {
-                    std::borrow::Cow::Borrowed(line)
-                };
-                if !hay.contains(needle.as_str()) {
+            let lines: Vec<&str> = text.lines().collect();
+
+            // Hits first, then the printing, so context around one hit never
+            // repeats a line another hit already showed.
+            let mut matched: Vec<usize> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if !matcher.is_match(line) {
                     continue;
                 }
                 if hits == cap {
                     capped = true;
                     break;
                 }
-                let mut shown = line.trim_end();
-                if shown.len() > MAX_LINE {
-                    let mut end = MAX_LINE;
-                    while !shown.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    shown = &shown[..end];
-                }
-                out.push_str(&format!("{rel}:{}: {shown}\n", i + 1));
+                matched.push(i);
                 hits += 1;
+            }
+            let mut printed_through: Option<usize> = None; // last line index shown
+            let mut last_symbol: Option<&str> = None;
+            for &i in &matched {
+                let start = i.saturating_sub(around);
+                let end = (i + around).min(lines.len().saturating_sub(1));
+                let from = match printed_through {
+                    Some(p) if p + 1 >= start => p + 1,
+                    Some(_) => {
+                        // A gap between context groups, as `rg -C` marks it;
+                        // plain hits are one line each and need no marker.
+                        if around > 0 {
+                            out.push_str("--\n");
+                        }
+                        start
+                    }
+                    None => start,
+                };
+                for (j, line) in lines.iter().enumerate().take(end + 1).skip(from) {
+                    let sep = if j == i { ':' } else { '-' };
+                    out.push_str(&format!("{rel}:{}{sep} {}\n", j + 1, clip(line)));
+                    if j == i
+                        && let Some(key) = symbols.and_then(|s| s.enclosing(&rel, i + 1))
+                        && last_symbol != Some(key)
+                    {
+                        out.push_str(&format!("    in {key}\n"));
+                        last_symbol = Some(key);
+                        named_any = true;
+                    }
+                }
+                printed_through = Some(end.max(printed_through.unwrap_or(0)));
             }
             if capped {
                 break;
@@ -820,10 +1044,18 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
     }
     if hits == 0 {
         out.push_str("no matches\n");
+        if let Some(f) = filter {
+            out.push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+        }
     } else if capped {
         out.push_str(&format!(
-            "… capped at {cap} matches — narrow the pattern or raise max_results\n"
+            "… capped at {cap} matches — narrow the pattern (or `path`) or raise max_results\n"
         ));
+    }
+    if named_any {
+        out.push_str(
+            "context <key> expands any symbol named above; snippet <key> shows its source\n",
+        );
     }
     Ok(out)
 }
@@ -1525,30 +1757,133 @@ fn digest_logic(
 
 /// `snippet`'s body. `fallback_root` is the tree the process was started with,
 /// used only when the plane does not record one of its own.
+/// Most lines one `snippet` answer carries. Past this a body is read in
+/// ranges, which the answer spells out.
+const SNIPPET_CAP: usize = 400;
+
+/// `snippet`'s range form: `path:line` or `path:start-end`. A path is told
+/// from a symbol by looking like one — a separator or an extension, and no
+/// `::` — so `src/lib.rs:12` is a range and `a::b` never is.
+fn parse_range(name: &str) -> Option<(&str, usize, usize)> {
+    let (path, span) = name.rsplit_once(':')?;
+    if path.is_empty() || path.contains("::") || !(path.contains('/') || path.contains('.')) {
+        return None;
+    }
+    let (start, end) = match span.split_once('-') {
+        Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
+        None => {
+            let line: usize = span.parse().ok()?;
+            (line, line)
+        }
+    };
+    (start >= 1 && end >= start).then_some((path, start, end))
+}
+
+/// Lines `start..=end` of `file` under `root`, numbered, with the symbol the
+/// range opens in when the plane knows one — so a range read is still
+/// anchored to a key `context` can take.
+fn read_range(
+    root: &std::path::Path,
+    file: &str,
+    start: usize,
+    end: usize,
+    symbols: Option<&SymbolIndex>,
+) -> AnyResult<String> {
+    let text = std::fs::read_to_string(root.join(file))
+        .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+    let total = text.lines().count();
+    if start > total {
+        anyhow::bail!("{file} has {total} lines; line {start} is past its end");
+    }
+    let end = end.min(total).min(start + SNIPPET_CAP - 1);
+    let slice: Vec<&str> = text.lines().skip(start - 1).take(end + 1 - start).collect();
+    let mut out = format!("{file}:{start}-{end} ({} lines of {total})\n", slice.len());
+    if let Some(key) = symbols.and_then(|s| s.enclosing(file, start)) {
+        out.push_str(&format!("in {key}\n"));
+    }
+    for (i, l) in slice.iter().enumerate() {
+        out.push_str(&format!("{:>5} | {l}\n", start + i));
+    }
+    if end < total {
+        out.push_str(&format!(
+            "… {file} continues to line {total}; snippet {file}:{}-{} reads on\n",
+            end + 1,
+            (end + SNIPPET_CAP).min(total)
+        ));
+    }
+    Ok(out)
+}
+
+/// `snippet`'s body. `fallback_root` is the tree the process was started with,
+/// used only when the plane does not record one of its own.
 fn snippet_logic(
     db: &Database,
     fallback_root: Option<&std::path::Path>,
     req: SnippetReq,
 ) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
+    // `file` is relative to whatever directory *this plane* was parsed from,
+    // which the digest records on the plane as `synced_root`. The process's own
+    // tree is only a fallback: once a server holds a second code plane, using it
+    // reads another repository's file at the same relative path — a plausible
+    // answer with no error, which is worse than failing.
+    let plane_root = plane.properties().ok().and_then(|props| {
+        match props.get("synced_root").map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
+            _ => None,
+        }
+    });
+    let root = plane_root.as_deref().or(fallback_root);
+    let no_tree = || {
+        anyhow::anyhow!(
+            "no stored source, and no source tree for this plane — the plane \
+             records no `synced_root` and none is attached to this server; \
+             digest with include_source, or attach the tree (`serve watch` \
+             does; [server] source_root otherwise)"
+        )
+    };
+
+    if let Some((file, start, end)) = parse_range(&req.name) {
+        let root = root.ok_or_else(no_tree)?;
+        let symbols = SymbolIndex::from_plane(&plane)?;
+        return Ok(Value::String(read_range(
+            root,
+            file,
+            start,
+            end,
+            Some(&symbols),
+        )?));
+    }
+
     let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
         dr_strange_core::compact::Resolved::One(n) => n,
         dr_strange_core::compact::Resolved::Many(hits) => {
             anyhow::bail!(
-                "`{}` is ambiguous — {} matches; use an exact key",
-                req.name,
-                hits.len()
+                "{}",
+                dr_strange_core::compact::candidates(&req.name, &hits).trim_end()
             );
         }
         dr_strange_core::compact::Resolved::None => {
-            anyhow::bail!("no symbol matches `{}` in this plane", req.name);
+            anyhow::bail!(
+                "no symbol matches `{}` in this plane — `grep` finds the text and \
+                 names the symbol it sits in; `snippet <path>:<line>[-<end>]` \
+                 reads a range of a file",
+                req.name
+            );
         }
     };
+    let key = node.external_key.clone().unwrap_or_default();
+    let next_call = format!("context {key} — callers, callees and every other edge\n");
     // The digest's own copy first — exact by construction.
     if let Some(dr_strange_core::PropValue::Str(src)) =
         node.properties.get("source").map(|d| &d.value)
     {
-        return Ok(Value::String(src.clone()));
+        let mut out = src.clone();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&next_call);
+        return Ok(Value::String(out));
     }
     let file =
         ["file", "path"]
@@ -1561,36 +1896,28 @@ fn snippet_logic(
         Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
         _ => None,
     };
-    // `file` is relative to whatever directory *this plane* was parsed from,
-    // which the digest records on the plane as `synced_root`. The process's own
-    // tree is only a fallback: once a server holds a second code plane, using it
-    // reads another repository's file at the same relative path — a plausible
-    // answer with no error, which is worse than failing.
-    let plane_root = plane.properties().ok().and_then(|props| {
-        match props.get("synced_root").map(|d| &d.value) {
-            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
-            _ => None,
-        }
-    });
-    let (Some(root), Some(file), Some(line)) =
-        (plane_root.as_deref().or(fallback_root), file, line)
-    else {
-        anyhow::bail!(
-            "no stored source, and no source tree for this plane — the plane \
-             records no `synced_root` and none is attached to this server; \
-             digest with include_source, or attach the tree (`serve watch` \
-             does; [server] source_root otherwise)"
-        );
+    let (Some(root), Some(file), Some(line)) = (root, file, line) else {
+        return Err(no_tree());
     };
     let text = std::fs::read_to_string(root.join(&file))
         .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
-    let want = req.lines.unwrap_or(40).clamp(1, 200);
+    let want = req.lines.unwrap_or(40).clamp(1, SNIPPET_CAP);
     let start = line.saturating_sub(1);
+    let total = text.lines().count();
     let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
     let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
     for (i, l) in slice.iter().enumerate() {
         out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
     }
+    let shown_through = start + slice.len();
+    if shown_through < total {
+        out.push_str(&format!(
+            "… continues; snippet {file}:{}-{} reads on (or raise `lines`)\n",
+            shown_through + 1,
+            (shown_through + want).min(total)
+        ));
+    }
+    out.push_str(&next_call);
     Ok(Value::String(out))
 }
 
@@ -1601,11 +1928,17 @@ impl DrStrange {
     #[tool(description = "List all planes with their node/edge counts and \
         properties — including `synced_root` (the canonical source \
         directory) and `synced_commit` when the plane was created by \
-        `digest`/`serve watch`. Match `synced_root` against the caller's \
-        cwd to find the right plane instead of relying on any tool's \
-        default.")]
+        `digest`/`serve watch`, and `source_tree`: whether that directory is \
+        readable here, so `snippet` reads it and (when it is the tree this \
+        server watches) `grep` searches it. Match `synced_root` against the \
+        caller's cwd to find the right plane instead of relying on any \
+        tool's default.")]
     async fn list_planes(&self) -> Result<CallToolResult, McpError> {
-        self.blocking("list_planes", list_planes_logic).await
+        let root = self.source_root.clone();
+        self.blocking("list_planes", move |db| {
+            list_planes_logic(db, root.as_deref())
+        })
+        .await
     }
 
     #[tool(description = "The soft-schema catalog for a plane: labels, property \
@@ -1624,7 +1957,10 @@ impl DrStrange {
         other edge, as compact text. Accepts a fuzzy name (exact key, \
         `::name`/`.name` suffix, or substring); ambiguity returns the \
         candidates. Use this first for any what-is/who-calls/what-calls \
-        question.")]
+        question, before opening the file: it answers what a grep-then-read \
+        loop reconstructs, in one call, and `snippet` gives the body when \
+        the text itself is needed. On a module or file node it lists what \
+        the file defines.")]
     async fn context(
         &self,
         Parameters(req): Parameters<SymbolReq>,
@@ -1678,13 +2014,18 @@ impl DrStrange {
         .await
     }
 
-    #[tool(description = "Literal text search over the source tree behind \
-        the graph (the watched directory). One matching line per result, \
-        `file:line: text`. For log messages, config values, comments — \
-        anything the graph deliberately does not model. No regex.")]
+    #[tool(description = "Text search over the source tree behind the graph — \
+        use this instead of a shell `rg`/`grep`: the tree is attached, and \
+        each hit names the symbol it falls in, so the next call is `context` \
+        or `snippet` on that key rather than a `sed`. `file:line: text` per \
+        hit; `regex: true` for Rust regex syntax, `path` to scope to a \
+        directory, file or `.ext`, `context: n` for surrounding lines (`-` \
+        marks them, as `rg -C`). For log messages, config values, comments — \
+        anything the graph does not model — and for finding where to point \
+        `context` when the name is only half known.")]
     async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
         let root = self.source_root.clone();
-        self.blocking("grep", move |_db| {
+        self.blocking("grep", move |db| {
             let Some(root) = root else {
                 anyhow::bail!(
                     "no source tree attached to this server — `serve watch` \
@@ -1692,7 +2033,15 @@ impl DrStrange {
                      so run grep locally instead"
                 );
             };
-            Ok(Value::String(grep_tree(&root, &req)?))
+            // The plane the hits are placed in: the one asked for, else the
+            // one parsed from this very tree. None is fine — hits still come
+            // back, only without a symbol beside them.
+            let plane = match &req.plane {
+                Some(name) => Some(db.plane(name)?),
+                None => plane_for_root(db, &root)?,
+            };
+            let symbols = plane.as_ref().map(SymbolIndex::from_plane).transpose()?;
+            Ok(Value::String(grep_tree(&root, &req, symbols.as_ref())?))
         })
         .await
     }
@@ -1792,10 +2141,14 @@ impl DrStrange {
         .await
     }
 
-    #[tool(description = "One symbol's source text: from the graph when the \
-        digest stored it, else read at the symbol's recorded file:line from \
-        the tree that plane was parsed from (its `synced_root`), falling back \
-        to the tree attached to this server. Fuzzy name.")]
+    #[tool(description = "Source text — use this instead of `cat`, `sed -n` or \
+        reading a file to see a function. A symbol by fuzzy name gives its \
+        body from the declaration down (from the graph when the digest \
+        stored it, else read at its recorded file:line from the tree the \
+        plane was parsed from), ending with the `context` call that expands \
+        it; `path:line` or `path:start-end` gives a range of a file, for the \
+        lines around a `grep` hit or the rest of a long body, and says which \
+        symbol it opens in. An answer that stops short says how to read on.")]
     async fn snippet(
         &self,
         Parameters(req): Parameters<SnippetReq>,
@@ -2018,6 +2371,17 @@ impl ServerHandler for DrStrange {
              search (vector) / traverse / query to read, and write_nodes / \
              write_edges to write. Planes are isolated graph canvases; \
              default 'startup'.\n\
+             While this server is connected it stands in for `rg`, `grep`, \
+             `cat`, `sed -n` and reading files to find or read code: \
+             `context <name>` for what a symbol is and who calls it, \
+             `snippet <name>` or `snippet <path>:<start>-<end>` to read \
+             source, `grep <text>` (regex, path scope, context lines) to \
+             find text — each hit names the symbol it sits in — and \
+             `search` when only the meaning is known. Every answer says the \
+             next call to make. A shell search is for what no plane holds: \
+             `list_planes` says which plane a directory was parsed into and \
+             whether its tree is attached, and a verb that cannot answer \
+             (no tree, no such symbol) says so and what to do instead.\n\
              A digested repository has two planes. `<name>` holds the code as \
              it is now — ask `context`, `trace`, `impact`, `fathom`, \
              `snippet`, `grep`. \
@@ -2269,8 +2633,12 @@ mod tests {
     #[test]
     fn list_and_describe() {
         let db = fixture();
-        let planes = list_planes_logic(&db).unwrap();
+        let planes = list_planes_logic(&db, None).unwrap();
         assert_eq!(planes[0]["nodes"], jval!(2));
+        assert!(
+            planes[0].get("source_tree").is_none(),
+            "a plane with no recorded root says nothing about a tree"
+        );
         assert_eq!(planes[0]["edges"], jval!(1));
         let cat = describe_plane_logic(&db, from_value(jval!({})).unwrap()).unwrap();
         assert_eq!(cat["labels"]["Doc"]["count"], jval!(2));
@@ -2293,11 +2661,62 @@ mod tests {
         );
         plane.set_properties(props).unwrap();
 
-        let planes = list_planes_logic(&db).unwrap();
+        let planes = list_planes_logic(&db, None).unwrap();
         assert_eq!(
             planes[0]["properties"]["synced_root"]["$value"],
             jval!("/home/wangying/workspace/dr-strange")
         );
+    }
+
+    /// Beside `synced_root`, whether that tree can be read from here — the
+    /// fact that decides between `snippet`/`grep` and a shell command.
+    #[test]
+    fn list_planes_says_whether_the_tree_is_readable_and_attached() {
+        let dir = std::env::temp_dir().join(format!("drsg-planes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = fixture();
+        let plane = db.plane("startup").unwrap();
+        let root = |p: &str| {
+            let mut props = plane.properties().unwrap();
+            props.insert(
+                "synced_root".into(),
+                PropDesc::described(
+                    "directory the facts were parsed from",
+                    PropValue::Str(p.into()),
+                ),
+            );
+            plane.set_properties(props).unwrap();
+        };
+        let tree = |watched: Option<&std::path::Path>| {
+            list_planes_logic(&db, watched).unwrap()[0]["source_tree"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        root(dir.to_str().unwrap());
+        assert!(
+            tree(Some(&dir)).starts_with("attached"),
+            "{}",
+            tree(Some(&dir))
+        );
+        assert!(tree(None).starts_with("readable"), "{}", tree(None));
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            tree(Some(&other)).starts_with("readable"),
+            "{}",
+            tree(Some(&other))
+        );
+
+        root("/nonexistent/drsg-planes-test");
+        assert!(
+            tree(Some(&dir)).starts_with("not readable"),
+            "{}",
+            tree(Some(&dir))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Gemini's tool-schema converter rejects a *bare boolean* where a Schema
@@ -2671,27 +3090,40 @@ mod grep_tests {
     fn req(pattern: &str) -> GrepReq {
         GrepReq {
             pattern: pattern.into(),
-            ignore_case: None,
-            max_results: None,
+            ..Default::default()
         }
+    }
+
+    /// A small tree: two Rust functions, a Python file, a doc, a build
+    /// directory and a binary.
+    fn tree(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("drsg-grep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "fn main() {\n    // needle here\n}\nfn other() {\n    let needle = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/b.py"), "needle = 1\n").unwrap();
+        std::fs::write(dir.join("docs/c.md"), "needle prose\n").unwrap();
+        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+        dir
     }
 
     #[test]
     fn finds_lines_skips_build_dirs_and_binaries() {
-        let dir = std::env::temp_dir().join(format!("drsg-grep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::create_dir_all(dir.join("target")).unwrap();
-        std::fs::write(dir.join("src/a.rs"), "fn main() {\n    // needle here\n}\n").unwrap();
-        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
-        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+        let dir = tree("basic");
 
-        let out = grep_tree(&dir, &req("needle")).unwrap();
+        let out = grep_tree(&dir, &req("needle"), None).unwrap();
         assert!(out.contains("src/a.rs:2:"), "{out}");
         assert!(!out.contains("target/"), "build dirs are skipped: {out}");
         assert!(!out.contains("blob.bin"), "binaries are skipped: {out}");
 
-        let none = grep_tree(&dir, &req("absent-text")).unwrap();
+        let none = grep_tree(&dir, &req("absent-text"), None).unwrap();
         assert!(none.contains("no matches"));
 
         let folded = grep_tree(
@@ -2700,16 +3132,186 @@ mod grep_tests {
                 pattern: "NEEDLE".into(),
                 ignore_case: Some(true),
                 max_results: Some(1),
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
         assert!(folded.contains("src/a.rs:2:"), "{folded}");
+        assert!(folded.contains("capped at 1"), "{folded}");
 
         assert!(
-            grep_tree(&dir, &req("  ")).is_err(),
+            grep_tree(&dir, &req("  "), None).is_err(),
             "empty pattern refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regex_path_scope_and_context_lines() {
+        let dir = tree("regex");
+
+        // A regex: two declarations, and nothing from the Python file.
+        let fns = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: r"^fn \w+\(".into(),
+                regex: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(fns.contains("src/a.rs:1: fn main()"), "{fns}");
+        assert!(fns.contains("src/a.rs:4: fn other()"), "{fns}");
+        assert!(!fns.contains("b.py"), "{fns}");
+        // The same text is not a regex unless asked.
+        let literal = grep_tree(&dir, &req(r"^fn \w+\("), None).unwrap();
+        assert!(literal.contains("no matches"), "{literal}");
+        let bad = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "(".into(),
+                regex: Some(true),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(bad.is_err(), "an invalid regex is an error, not a literal");
+
+        // Scope: by extension, by directory, by file.
+        let py = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some(".py".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(py.contains("src/b.py:1:") && !py.contains("a.rs"), "{py}");
+        let docs = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("docs/".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            docs.contains("docs/c.md:1:") && !docs.contains("src/"),
+            "{docs}"
+        );
+        let file = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            file.contains("src/a.rs:2:") && !file.contains("b.py"),
+            "{file}"
+        );
+        let elsewhere = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("nowhere".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(elsewhere.contains("searched only `nowhere`"), "{elsewhere}");
+
+        // Context: the neighbours carry `-`, the hit `:`, and two hits close
+        // together share their overlap rather than printing it twice.
+        let around = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                context: Some(1),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let expected = "src/a.rs:1- fn main() {\n\
+                        src/a.rs:2:     // needle here\n\
+                        src/a.rs:3- }\n\
+                        src/a.rs:4- fn other() {\n\
+                        src/a.rs:5:     let needle = 1;\n\
+                        src/a.rs:6- }\n";
+        assert_eq!(around, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hits_name_the_symbol_they_fall_in() {
+        let dir = tree("symbols");
+        let symbols = SymbolIndex {
+            by_file: [(
+                "src/a.rs".to_string(),
+                vec![(1, "a::main".to_string()), (4, "a::other".to_string())],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let out = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                ..Default::default()
+            },
+            Some(&symbols),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "src/a.rs:2:     // needle here\n    in a::main\n\
+             src/a.rs:5:     let needle = 1;\n    in a::other\n\
+             context <key> expands any symbol named above; snippet <key> shows its source\n"
+        );
+        // A line above every declaration belongs to nothing.
+        assert_eq!(symbols.enclosing("src/a.rs", 0), None);
+        assert_eq!(symbols.enclosing("src/a.rs", 3), Some("a::main"));
+        assert_eq!(symbols.enclosing("src/none.rs", 3), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_index_reads_file_and_line_off_the_plane() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("p", dr_strange_core::Properties::new())
+            .unwrap();
+        write_nodes_logic(
+            &db,
+            serde_json::from_value(jval!({"plane": "p", "nodes": [
+                {"external_key": "m::f", "labels": ["Function"],
+                 "properties": {"file": "src/m.rs", "line": 10}},
+                {"external_key": "m::g", "labels": ["Function"],
+                 "properties": {"file": "src/m.rs", "line": 30}},
+                {"external_key": "loose", "labels": ["Note"], "properties": {}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let plane = db.plane("p").unwrap();
+        let index = SymbolIndex::from_plane(&plane).unwrap();
+        assert_eq!(index.enclosing("src/m.rs", 12), Some("m::f"));
+        assert_eq!(index.enclosing("src/m.rs", 30), Some("m::g"));
+        assert_eq!(index.enclosing("src/m.rs", 9), None);
     }
 }
 
@@ -2821,5 +3423,133 @@ mod snippet_tests {
             .is_err()
         );
         let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    fn ask(
+        db: &Database,
+        root: &std::path::Path,
+        plane: &str,
+        name: &str,
+        lines: Option<usize>,
+    ) -> AnyResult<String> {
+        snippet_logic(
+            db,
+            Some(root),
+            from_value(jval!({"plane": plane, "name": name, "lines": lines})).unwrap(),
+        )
+        .map(|v| v.as_str().unwrap().to_string())
+    }
+
+    /// A symbol answer ends by naming the call that expands it, and one that
+    /// stops short of the body's end says how to read on.
+    #[test]
+    fn a_symbol_answer_points_at_context_and_at_the_rest() {
+        let (a, _b) = two_repos("hint");
+        std::fs::write(
+            a.join("src/lib.rs"),
+            (1..=12).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+
+        let out = ask(&db, &a, "p", "f", Some(5)).unwrap();
+        assert!(out.starts_with("src/lib.rs:1 (5 lines)\n"), "{out}");
+        assert!(out.contains("    5 | line 5\n"), "{out}");
+        assert!(
+            out.contains("snippet src/lib.rs:6-10 reads on"),
+            "the rest is one call away: {out}"
+        );
+        assert!(
+            out.ends_with("context f — callers, callees and every other edge\n"),
+            "{out}"
+        );
+
+        // Asking for more than there is: no continuation line.
+        let whole = ask(&db, &a, "p", "f", Some(50)).unwrap();
+        assert!(!whole.contains("reads on"), "{whole}");
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    /// `path:line` and `path:start-end` read a file directly, anchored to the
+    /// symbol the range opens in.
+    #[test]
+    fn a_range_reads_the_file_and_names_the_symbol_it_opens_in() {
+        let (a, _b) = two_repos("range");
+        std::fs::write(
+            a.join("src/lib.rs"),
+            (1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+
+        let out = ask(&db, &a, "p", "src/lib.rs:3-5", None).unwrap();
+        assert_eq!(
+            out,
+            "src/lib.rs:3-5 (3 lines of 20)\nin f\n    3 | line 3\n    4 | line 4\n    5 | line 5\n\
+             … src/lib.rs continues to line 20; snippet src/lib.rs:6-20 reads on\n"
+        );
+        let one = ask(&db, &a, "p", "src/lib.rs:20", None).unwrap();
+        assert!(
+            one.starts_with("src/lib.rs:20-20 (1 lines of 20)\n"),
+            "{one}"
+        );
+        assert!(!one.contains("reads on"), "{one}");
+        let past = ask(&db, &a, "p", "src/lib.rs:21", None);
+        assert!(past.is_err(), "a line past the end is an error");
+        // A range through a file the plane knows nothing about still reads.
+        std::fs::write(a.join("notes.md"), "a\nb\n").unwrap();
+        let notes = ask(&db, &a, "p", "notes.md:1-2", None).unwrap();
+        assert!(
+            notes.starts_with("notes.md:1-2 (2 lines of 2)\n    1 | a\n"),
+            "{notes}"
+        );
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn a_miss_points_at_grep_and_ambiguity_lists_the_candidates() {
+        let (a, _b) = two_repos("miss");
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"plane": "p", "nodes": [
+                {"external_key": "x::f", "labels": ["Function"],
+                 "properties": {"file": "src/lib.rs", "line": 1}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let miss = ask(&db, &a, "p", "nothing_here", None)
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("`grep` finds the text"), "{miss}");
+        assert!(miss.contains("snippet <path>:<line>"), "{miss}");
+
+        // `f` is exact for the key `f`; `::f` as a suffix is not ambiguous
+        // either — but a substring that hits both is, and both are named.
+        let both = ask(&db, &a, "p", "f", None);
+        assert!(both.is_ok(), "an exact key wins outright");
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn a_range_is_told_from_a_symbol_by_its_shape() {
+        assert_eq!(parse_range("src/lib.rs:12"), Some(("src/lib.rs", 12, 12)));
+        assert_eq!(parse_range("src/lib.rs:3-5"), Some(("src/lib.rs", 3, 5)));
+        assert_eq!(parse_range("README.md:1"), Some(("README.md", 1, 1)));
+        assert_eq!(parse_range("a::b"), None);
+        assert_eq!(parse_range("a::b:3"), None);
+        assert_eq!(
+            parse_range("plain:3"),
+            None,
+            "no separator, no extension: a name"
+        );
+        assert_eq!(parse_range("src/lib.rs:0"), None, "lines start at 1");
+        assert_eq!(parse_range("src/lib.rs:5-3"), None, "backwards");
     }
 }
