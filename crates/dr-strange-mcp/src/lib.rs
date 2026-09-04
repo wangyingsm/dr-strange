@@ -1399,23 +1399,22 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
         }
     })?;
     let plane = db.plane(&req.plane)?;
-    match stmt {
+    let answer = match stmt {
         dr_strange_parser::Statement::Read(read) => {
             let pinned = pin(plane, read.as_of)?;
             let q = pinned.query_from_plan(read.plan);
             if q.plan().project.is_some() {
-                return Ok(json::table_to_json(&q.table()?));
-            }
-            let rows = q.scored_nodes()?;
-            // A digested plane answers in the compact text every agent verb
-            // speaks — a line per node, `context` on any key expands it —
-            // rather than a JSON record apiece. Planes an agent built for
-            // itself keep the records: those are its own shapes to read.
-            match mirrored_commit(&pinned)? {
-                Some(_) => Ok(Value::String(dr_strange_core::compact::records(
-                    &pinned, &rows,
-                )?)),
-                None => Ok(scored_rows(&rows)),
+                json::table_to_json(&q.table()?)
+            } else {
+                let rows = q.scored_nodes()?;
+                // A digested plane answers in the compact text every agent verb
+                // speaks — a line per node, `context` on any key expands it —
+                // rather than a JSON record apiece. Planes an agent built for
+                // itself keep the records: those are its own shapes to read.
+                match mirrored_commit(&pinned)? {
+                    Some(_) => Value::String(dr_strange_core::compact::records(&pinned, &rows)?),
+                    None => scored_rows(&rows),
+                }
             }
         }
         dr_strange_parser::Statement::Write(w) => {
@@ -1434,16 +1433,24 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
                 );
             }
             let s = w.apply(&plane).map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(jval!({
+            jval!({
                 "nodes_created": s.nodes_created,
                 "edges_created": s.edges_created,
                 "props_set": s.props_set,
                 "labels_set": s.labels_set,
                 "nodes_deleted": s.nodes_deleted,
                 "edges_deleted": s.edges_deleted,
-            }))
+            })
         }
+    };
+    // An agent's query is a query the database ran, and the history is of what
+    // it ran — the same list the dashboard offers back and `drsg queries`
+    // prints. Recorded here, after the answer: what failed is not history.
+    // Failing to record is not a reason to fail the query that succeeded.
+    if let Err(e) = db.record_query(&req.plane, &req.query, Database::DEFAULT_HISTORY) {
+        tracing::debug!(error = %e, "could not record the query");
     }
+    Ok(answer)
 }
 
 /// The property an auto-generated embedding is written to — the same one
