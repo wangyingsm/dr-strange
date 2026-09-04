@@ -27,6 +27,15 @@ All notable changes to Dr Strange are documented here. The format is based on
   back with the candidates rather than a count, and a miss points at `grep`
   and at the range form instead of leaving the agent to guess. The per-call
   cap rose from 200 lines to 400.
+- **The server says what it stands in for.** Its MCP instructions — the text
+  every host puts in the agent's system prompt — now open with the rule:
+  while the server is connected, `context`, `snippet`, `grep` and `search`
+  replace `rg`, `grep`, `cat`, `sed -n` and reading files for code, and a
+  shell search is for what no plane holds. The `grep`, `snippet` and
+  `context` descriptions say the same in the words an agent is already
+  thinking when it reaches for the shell, and `list_planes` reports
+  `source_tree` per plane — attached, readable, or absent here — so an agent
+  learns whether the verbs can read the source before it tries a shell.
 
 ### Changed
 

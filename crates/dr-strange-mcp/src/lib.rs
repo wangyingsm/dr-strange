@@ -594,8 +594,12 @@ fn scored_rows(rows: &[(dr_strange_core::NodeRecord, Option<f32>)]) -> Value {
     )
 }
 
-fn list_planes_logic(db: &Database) -> AnyResult<Value> {
+/// `list_planes`' body. `watched` is the tree this server has attached (the
+/// `serve watch` directory or `[server] source_root`), which is what `grep`
+/// reads; `snippet` reads any plane's own `synced_root`.
+fn list_planes_logic(db: &Database, watched: Option<&std::path::Path>) -> AnyResult<Value> {
     let names: Vec<String> = db.planes()?.into_iter().map(|(_, name)| name).collect();
+    let watched = watched.map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()));
     let mut out = Vec::new();
     for (id, name) in db.planes()? {
         let plane = db.plane(&name)?;
@@ -606,6 +610,31 @@ fn list_planes_logic(db: &Database) -> AnyResult<Value> {
             "nodes": cat.node_count, "edges": cat.edge_count,
             "properties": json::properties_to_json(&props),
         });
+        // Whether the source behind this plane can be read from here — the
+        // fact that decides between `snippet`/`grep` and a shell command, so
+        // it is stated per plane rather than left to be tried.
+        if let Some(dr_strange_core::PropValue::Str(root)) =
+            props.get("synced_root").map(|d| &d.value)
+        {
+            let dir = std::path::Path::new(root);
+            let tree = if !dir.is_dir() {
+                "not readable from this server — the directory is absent here; \
+                 `context`/`describe` still answer from the graph"
+            } else if watched.as_deref()
+                == Some(
+                    dir.canonicalize()
+                        .unwrap_or_else(|_| dir.to_path_buf())
+                        .as_path(),
+                )
+            {
+                "attached — `grep` searches it and `snippet` reads it"
+            } else {
+                "readable — `snippet` reads it; `grep` searches only the tree this server watches"
+            };
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("source_tree".into(), Value::String(tree.into()));
+            }
+        }
         // Which plane holds what, said rather than left to be inferred from a
         // name. The pairing is not a guess: a digest of a git checkout writes
         // the history beside the code plane under exactly this name, so both
@@ -1899,11 +1928,17 @@ impl DrStrange {
     #[tool(description = "List all planes with their node/edge counts and \
         properties — including `synced_root` (the canonical source \
         directory) and `synced_commit` when the plane was created by \
-        `digest`/`serve watch`. Match `synced_root` against the caller's \
-        cwd to find the right plane instead of relying on any tool's \
-        default.")]
+        `digest`/`serve watch`, and `source_tree`: whether that directory is \
+        readable here, so `snippet` reads it and (when it is the tree this \
+        server watches) `grep` searches it. Match `synced_root` against the \
+        caller's cwd to find the right plane instead of relying on any \
+        tool's default.")]
     async fn list_planes(&self) -> Result<CallToolResult, McpError> {
-        self.blocking("list_planes", list_planes_logic).await
+        let root = self.source_root.clone();
+        self.blocking("list_planes", move |db| {
+            list_planes_logic(db, root.as_deref())
+        })
+        .await
     }
 
     #[tool(description = "The soft-schema catalog for a plane: labels, property \
@@ -1922,7 +1957,10 @@ impl DrStrange {
         other edge, as compact text. Accepts a fuzzy name (exact key, \
         `::name`/`.name` suffix, or substring); ambiguity returns the \
         candidates. Use this first for any what-is/who-calls/what-calls \
-        question.")]
+        question, before opening the file: it answers what a grep-then-read \
+        loop reconstructs, in one call, and `snippet` gives the body when \
+        the text itself is needed. On a module or file node it lists what \
+        the file defines.")]
     async fn context(
         &self,
         Parameters(req): Parameters<SymbolReq>,
@@ -2333,6 +2371,17 @@ impl ServerHandler for DrStrange {
              search (vector) / traverse / query to read, and write_nodes / \
              write_edges to write. Planes are isolated graph canvases; \
              default 'startup'.\n\
+             While this server is connected it stands in for `rg`, `grep`, \
+             `cat`, `sed -n` and reading files to find or read code: \
+             `context <name>` for what a symbol is and who calls it, \
+             `snippet <name>` or `snippet <path>:<start>-<end>` to read \
+             source, `grep <text>` (regex, path scope, context lines) to \
+             find text — each hit names the symbol it sits in — and \
+             `search` when only the meaning is known. Every answer says the \
+             next call to make. A shell search is for what no plane holds: \
+             `list_planes` says which plane a directory was parsed into and \
+             whether its tree is attached, and a verb that cannot answer \
+             (no tree, no such symbol) says so and what to do instead.\n\
              A digested repository has two planes. `<name>` holds the code as \
              it is now — ask `context`, `trace`, `impact`, `fathom`, \
              `snippet`, `grep`. \
@@ -2584,8 +2633,12 @@ mod tests {
     #[test]
     fn list_and_describe() {
         let db = fixture();
-        let planes = list_planes_logic(&db).unwrap();
+        let planes = list_planes_logic(&db, None).unwrap();
         assert_eq!(planes[0]["nodes"], jval!(2));
+        assert!(
+            planes[0].get("source_tree").is_none(),
+            "a plane with no recorded root says nothing about a tree"
+        );
         assert_eq!(planes[0]["edges"], jval!(1));
         let cat = describe_plane_logic(&db, from_value(jval!({})).unwrap()).unwrap();
         assert_eq!(cat["labels"]["Doc"]["count"], jval!(2));
@@ -2608,11 +2661,62 @@ mod tests {
         );
         plane.set_properties(props).unwrap();
 
-        let planes = list_planes_logic(&db).unwrap();
+        let planes = list_planes_logic(&db, None).unwrap();
         assert_eq!(
             planes[0]["properties"]["synced_root"]["$value"],
             jval!("/home/wangying/workspace/dr-strange")
         );
+    }
+
+    /// Beside `synced_root`, whether that tree can be read from here — the
+    /// fact that decides between `snippet`/`grep` and a shell command.
+    #[test]
+    fn list_planes_says_whether_the_tree_is_readable_and_attached() {
+        let dir = std::env::temp_dir().join(format!("drsg-planes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = fixture();
+        let plane = db.plane("startup").unwrap();
+        let root = |p: &str| {
+            let mut props = plane.properties().unwrap();
+            props.insert(
+                "synced_root".into(),
+                PropDesc::described(
+                    "directory the facts were parsed from",
+                    PropValue::Str(p.into()),
+                ),
+            );
+            plane.set_properties(props).unwrap();
+        };
+        let tree = |watched: Option<&std::path::Path>| {
+            list_planes_logic(&db, watched).unwrap()[0]["source_tree"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        root(dir.to_str().unwrap());
+        assert!(
+            tree(Some(&dir)).starts_with("attached"),
+            "{}",
+            tree(Some(&dir))
+        );
+        assert!(tree(None).starts_with("readable"), "{}", tree(None));
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            tree(Some(&other)).starts_with("readable"),
+            "{}",
+            tree(Some(&other))
+        );
+
+        root("/nonexistent/drsg-planes-test");
+        assert!(
+            tree(Some(&dir)).starts_with("not readable"),
+            "{}",
+            tree(Some(&dir))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Gemini's tool-schema converter rejects a *bare boolean* where a Schema
