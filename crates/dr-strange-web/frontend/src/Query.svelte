@@ -1,7 +1,8 @@
 <script>
-  import { authHeaders } from './rpc.js'
+  import { authHeaders, rpc } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { accept, cell, ghost, toTsv } from './cypher.js'
+  import { formatVector, unwrapVector, vectorDims } from './vectors.js'
 
   // `plane` is the app-wide current plane, which a query names none of its own.
   let { plane } = $props()
@@ -161,7 +162,9 @@
     setTimeout(() => (copied = false), 1200)
   }
 
-  // A returned node as a row: key, labels, and the properties that fit.
+  // A returned node's properties, as many as fit in a row. A vector is one of
+  // them — it arrives as a marker, so it reads as a button carrying its
+  // dimension rather than as prose about being omitted.
   //
   // Not named `props`: a local binding by that name makes `$props` read as a
   // store subscription, which Svelte warns about.
@@ -169,8 +172,25 @@
     return Object.entries(node.properties ?? {})
       .filter(([, v]) => v !== null && typeof v !== 'object')
       .slice(0, 4)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(' · ')
+      .map(([k, v]) => ({ k, v, dims: vectorDims(v) }))
+  }
+
+  // The floats behind a marker, fetched for the one node whose button was
+  // pressed — `lean: false` is the only way to them, and one node at a time is
+  // the whole point of asking.
+  let vectorView = $state(null) // { k, dims, values, error } | null
+
+  async function showVector(node, k, dims) {
+    vectorView = { k, dims, values: null }
+    try {
+      const whole = await rpc('node.get', { plane, id: node.id, lean: false })
+      const values = unwrapVector(whole?.properties?.[k])
+      if (!values) throw new Error('no vector came back')
+      // A later click may have moved on; only the open one is ours to fill.
+      if (vectorView?.k === k) vectorView = { k, dims: values.length, values }
+    } catch (e) {
+      if (vectorView?.k === k) vectorView = { k, dims, values: null, error: e.message }
+    }
   }
 
   const changes = (w) =>
@@ -291,7 +311,18 @@
               <tr>
                 <td>{n.external_key ?? `#${n.id}`}</td>
                 <td>{(n.labels ?? []).join(', ')}</td>
-                <td class="q-props">{propSummary(n)}</td>
+                <td class="q-props">
+                  {#each propSummary(n) as pe, i (pe.k)}
+                    {#if i > 0}<span class="q-prop-sep"> · </span>{/if}
+                    {#if pe.dims}
+                      <button class="vec-btn" onclick={() => showVector(n, pe.k, pe.dims)}>
+                        {pe.k} ({pe.dims} dims)
+                      </button>
+                    {:else}
+                      <span>{pe.k}: {pe.v}</span>
+                    {/if}
+                  {/each}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -305,6 +336,24 @@
     <div class="q-result">
       <header><span>Write{#if elapsed != null} · {elapsed} ms{/if}</span></header>
       <p class="q-write">{changes(result.write).join(' · ') || 'no changes'}</p>
+    </div>
+  {/if}
+
+  {#if vectorView}
+    <!-- The same popup the Explore inspector opens: a thousand floats read as
+         a grid, and only ever for the node whose button was pressed. -->
+    <div class="modal-backdrop">
+      <div class="modal">
+        <header>
+          <span>{vectorView.k} · {vectorView.dims} dims</span>
+          <button class="close" onclick={() => (vectorView = null)} aria-label="Close">×</button>
+        </header>
+        {#if vectorView.values}
+          <pre class="floats">{formatVector(vectorView.values)}</pre>
+        {:else}
+          <pre class="floats">{vectorView.error ?? 'fetching…'}</pre>
+        {/if}
+      </div>
     </div>
   {/if}
 </section>

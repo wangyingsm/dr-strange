@@ -2455,6 +2455,11 @@ nav button,
   color: var(--muted);
 }
 
+/* Between two properties in a result row. */
+.q-prop-sep {
+  color: var(--muted);
+}
+
 .q-examples {
   display: flex;
   flex-wrap: wrap;

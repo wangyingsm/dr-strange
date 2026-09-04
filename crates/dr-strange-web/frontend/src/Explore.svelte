@@ -4,6 +4,7 @@
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import { renderMarkdown } from './markdown.js'
+  import { formatVector, unwrapVector, vectorDims } from './vectors.js'
   import CreatePlane from './CreatePlane.svelte'
   import Icon from './Icon.svelte'
 
@@ -317,22 +318,6 @@
   }
 
   // A numeric array = an embedding vector; render a button, not 128+ floats.
-  // A vector arrives as a marker — `$vector(1024 dims, omitted)` — because a
-  // thousand floats per node is a hundred megabytes nobody draws. The
-  // dimension is in the marker; the values are one call away, on the click
-  // that asks for them. A literal array still counts, for a caller that
-  // opted out of lean.
-  const VECTOR_MARKER = /^\$vector\((\d+) dims, omitted\)$/
-  function vectorDims(v) {
-    if (Array.isArray(v)) {
-      return v.length > 0 && v.every((x) => typeof x === 'number') ? v.length : null
-    }
-    if (typeof v === 'string') {
-      const m = v.match(VECTOR_MARKER)
-      return m ? Number(m[1]) : null
-    }
-    return null
-  }
   const isVector = (v) => vectorDims(v) !== null
 
   // ---- properties that name other nodes -----------------------------------
@@ -396,15 +381,6 @@
   })
 
   // Pretty grid: fixed-width columns of 6 values, index-addressable via rows.
-  function formatVector(v) {
-    const cols = 6
-    const rows = []
-    for (let i = 0; i < v.length; i += cols) {
-      rows.push(v.slice(i, i + cols).map((x) => x.toFixed(5).padStart(10)).join(' '))
-    }
-    return rows.join('\n')
-  }
-
   async function loadCatalog() {
     try {
       const cat = await rpc('plane.catalog', { plane })
@@ -889,10 +865,8 @@
     try {
       if (selected?.kind !== 'node') throw new Error('only a node carries one')
       const whole = await rpc('node.get', { plane, id: selected.data.id, lean: false })
-      const raw = whole?.properties?.[k]
-      const unwrapped = raw && typeof raw === 'object' && '$value' in raw ? raw.$value : raw
-      const values = Array.isArray(unwrapped?.$vector) ? unwrapped.$vector : unwrapped
-      if (!Array.isArray(values)) throw new Error('no vector came back')
+      const values = unwrapVector(whole?.properties?.[k])
+      if (!values) throw new Error('no vector came back')
       // A later click may have moved on; only the open one is ours to fill.
       if (vectorView?.k === k) vectorView = { k, dims: values.length, values }
     } catch (e) {
