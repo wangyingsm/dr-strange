@@ -58,7 +58,10 @@ tracing.workspace = true
 # `parallel-compilation` is the one addition back: compiling the installed
 # components dominates `Plugins::load` — measured 13.7s for six, and single-
 # threaded to the millisecond (13.5s user of 13.8s wall) — and every load pays
-# it again. It only pulls in rayon, which this crate already depends on.
+# it again. It only pulls in rayon, which this crate already depends on. The
+# parallelism is bounded, though: each compile worker holds ~30 MiB, so the
+# host compiles on a pool of its own (`wasm::COMPILE_THREADS`) rather than on
+# every core the machine has.
 wasmtime = { version = "47", default-features = false, features = [
     "runtime",
     "component-model",

@@ -133,6 +133,40 @@ impl Default for Limits {
     }
 }
 
+/// Threads a compile may use. Cranelift compiles a component's functions in
+/// parallel on rayon's *current* pool, and each worker holds its own
+/// in-flight state: measured on the eight official plugins (12.7 MiB of
+/// wasm), peak resident memory was ~30 MiB per worker — 186 MiB on one
+/// thread, 1.04 GiB on the 32 the global pool offers here. Four keeps a load
+/// near 300 MiB and still several times faster than serial.
+const COMPILE_THREADS: usize = 4;
+
+/// Compile `bytes` on a pool of at most [`COMPILE_THREADS`] threads that
+/// lives only for this call.
+///
+/// A pool of its own rather than the global one, for two reasons. The bound:
+/// the global pool is sized to the machine, and the memory above scales with
+/// it. The lifetime: rayon's global workers never exit, and an idle thread
+/// keeps whatever its allocator heap freed but never purged — the compile's
+/// working set stayed resident in `drsg serve` for the life of the process
+/// until the workers were made to end with the work.
+fn compile_component(engine: &Engine, bytes: &[u8]) -> Result<Component> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, COMPILE_THREADS);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("drsg-wasm-compile-{i}"))
+        .build()
+        .context("starting the wasm compile pool")?;
+    let compiled = pool.install(|| Component::new(engine, bytes));
+    drop(pool);
+    compiled.map_err(wt).context(
+        "this file is not a WebAssembly component — a plugin must be a \
+         component, not a core module",
+    )
+}
+
 /// Interfaces whose mere presence in a component is a refusal.
 ///
 /// Sockets only, and deliberately no longer `wasi:filesystem`. Refusing the
@@ -196,10 +230,7 @@ impl WasmPlugin {
         let engine = Engine::new(&config)
             .map_err(wt)
             .context("starting the wasm engine")?;
-        let component = Component::new(&engine, bytes).map_err(wt).context(
-            "this file is not a WebAssembly component — a plugin must be a \
-             component, not a core module",
-        )?;
+        let component = compile_component(&engine, bytes)?;
 
         refuse_forbidden_imports(&engine, &component)?;
 

@@ -17,6 +17,13 @@ All notable changes to Dr Strange are documented here. The format is based on
   175 MiB for a graph whose current state is a fraction of that. `[server]
   retain_commits` sets the window; `0` keeps everything, as before. The
   library default (`Database::set_retention`) is unchanged.
+- **Plugins compile on four threads, not every core.** Loading the installed
+  parser plugins compiled them on rayon's global pool — one worker per core,
+  each holding ~30 MiB of compiler state — and those workers, being global,
+  never exited, so their freed memory stayed resident in `drsg serve` for the
+  life of the process. Measured here: a digest of a 42-node crate peaked at
+  1.04 GiB on 32 cores, 285 MiB on four. Compilation now runs on a pool of at
+  most four threads that ends with the load.
 - **Compaction moves surviving versions instead of cloning them.** The native
   engine's compaction merged every run into one map and then copied each
   surviving key and value into a second — two copies of the whole store at the
