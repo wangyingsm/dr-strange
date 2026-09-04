@@ -17,6 +17,15 @@ All notable changes to Dr Strange are documented here. The format is based on
   175 MiB for a graph whose current state is a fraction of that. `[server]
   retain_commits` sets the window; `0` keeps everything, as before. The
   library default (`Database::set_retention`) is unchanged.
+- **Plugins are compiled once, at install.** `drsg plugin install` now keeps
+  the compiled form beside the wasm in the store, pinned by its own SHA-256
+  in `registry.toml`, and a load deserializes it in milliseconds instead of
+  compiling — which was seconds of CPU and hundreds of MiB for the official
+  parsers, paid on every `digest` and on every commit `serve watch` folded.
+  A store from an earlier release, or a `drsg update` that changed the
+  runtime, compiles on the first load and stores the result for the next.
+  With `[plugins] fuel = 0` every load still compiles: the artifact is
+  metered, and an unmetered engine cannot run it.
 - **Plugins compile on four threads, not every core.** Loading the installed
   parser plugins compiled them on rayon's global pool — one worker per core,
   each holding ~30 MiB of compiler state — and those workers, being global,

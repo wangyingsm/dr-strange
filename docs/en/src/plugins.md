@@ -188,6 +188,14 @@ Install pins the artifact's SHA-256 in the store; every later load re-checks
 it, so a file that changes on disk is refused rather than silently run.
 Installing a name again is the upgrade path.
 
+Install also compiles the plugin once and keeps the compiled form beside the
+wasm, pinned by a hash of its own. A load — every `digest`, every commit
+`serve watch` folds — deserializes that in milliseconds instead of compiling,
+which is seconds of CPU and hundreds of MiB for the official parsers. The
+compiled form belongs to the drsg build that made it: after `drsg update`, or
+in a store from before it existed, the first load compiles as before and
+stores the result for the next one.
+
 ## What every official parser promises
 
 The eight parsers are one family, built to one discipline:
