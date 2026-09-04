@@ -370,8 +370,16 @@ fn router(
         // schema / SDKs) as a web-only surface, like /export.
         .route("/cypher", post(cypher_http))
         .route("/cypher/complete", post(complete_http))
-        .route("/cypher/history", get(history_http))
-        .route("/cypher/history/{id}", get(history_one_http))
+        // GET and POST alike. GET is the shape a script or a curl reaches
+        // for; POST is the only one the browser UI can authorize itself
+        // with, since this server sends `Referrer-Policy: no-referrer` and a
+        // same-origin GET therefore arrives with no proof of where it came
+        // from at all. Same handler, same answer.
+        .route("/cypher/history", get(history_http).post(history_http))
+        .route(
+            "/cypher/history/{id}",
+            get(history_one_http).post(history_one_http),
+        )
         // Unauthenticated liveness probe for load balancers / orchestrators.
         .route("/health", get(health))
         // `.layer` after `.fallback` so the SPA (served by the fallback) is

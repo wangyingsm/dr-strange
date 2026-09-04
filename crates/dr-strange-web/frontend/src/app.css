@@ -2353,6 +2353,101 @@ nav button,
   gap: 0.75rem;
   padding: 0 0.75rem 1rem;
 }
+/* The box and what has already been asked, side by side: the editor takes the
+   room it needs and the history is a fixed column beside it, because a list of
+   one-line queries does not get more readable by being wider. Under 900px they
+   stack — a phone has one column of anything. */
+.q-compose {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+.q-compose > .q-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.q-history {
+  flex: 0 0 15rem;
+  max-height: 22rem;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem;
+}
+.q-history > header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 0.15rem 0.4rem;
+}
+.q-hist-n {
+  font: 11px ui-monospace, monospace;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.35rem;
+}
+.q-history ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.q-history li + li {
+  border-top: 1px solid var(--border);
+}
+.q-history li button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.35rem 0.3rem;
+  cursor: pointer;
+  color: inherit;
+}
+.q-history li button:hover {
+  background: var(--hover, rgba(127, 127, 127, 0.12));
+}
+.q-hist-q {
+  display: block;
+  font: 12px ui-monospace, monospace;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-hist-meta {
+  display: flex;
+  gap: 0.35rem;
+  font-size: 0.68rem;
+  color: var(--muted);
+  margin-top: 0.1rem;
+}
+.q-hist-plane {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
+.q-hist-none {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin: 0.3rem 0.15rem;
+}
+@media (max-width: 900px) {
+  .q-compose {
+    flex-direction: column;
+  }
+  .q-history {
+    flex: 1 1 auto;
+    align-self: stretch;
+    max-height: 14rem;
+  }
+}
 .q-editor {
   background: var(--panel);
   border: 1px solid var(--border);

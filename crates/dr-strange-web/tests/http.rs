@@ -790,6 +790,29 @@ async fn the_history_holds_the_queries_that_ran() {
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 
+    // The browser UI asks by POST, because this server sends
+    // `Referrer-Policy: no-referrer` and a same-origin GET therefore carries
+    // neither `Origin` nor `Referer` — no proof of where it came from, and so
+    // no way to be recognized as the local UI. Same path, same answer.
+    let posted: Value = client
+        .post(format!("{base}/cypher/history"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(posted, Value::Array(rows.clone()));
+
+    // No claim of an origin is a refusal, not a pass.
+    let anonymous = client
+        .get(format!("{base}/cypher/history"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
     // And a caller can ask for just the top of it.
     let recent: Value = client
         .get(format!("{base}/cypher/history?limit=1"))

@@ -5,6 +5,7 @@
   import { formatVector, unwrapVector, vectorDims } from './vectors.js'
   import { labelColor } from './labels.js'
   import { highlightJson } from './json.js'
+  import { ago } from './ago.js'
 
   // `plane` is the app-wide current plane, which a query names none of its own.
   let { plane } = $props()
@@ -50,6 +51,49 @@
   // same number the first time a pattern matched four thousand functions.
   const PAGE = 200
   let offset = $state(0)
+
+  // Queries that have run, newest first — the database's own record, not this
+  // tab's. A query worth writing is worth running again, and the box opens
+  // empty (see `text`), so the list beside it is where a reader finds their
+  // way back to what they wrote.
+  let history = $state([])
+  let historyError = $state(null)
+
+  async function loadHistory() {
+    try {
+      // POST, not GET: this server sends `Referrer-Policy: no-referrer`, so a
+      // same-origin GET carries neither `Origin` nor `Referer` and the page
+      // cannot show it is the local UI. The endpoint answers to both.
+      const res = await fetch('/cypher/history', {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      if (!res.ok) throw new Error(`history unavailable (${res.status})`)
+      history = await res.json()
+      historyError = null
+    } catch (e) {
+      history = []
+      historyError = e.message
+    }
+  }
+
+  // Once, on mount: the list is of what ran, and running is what refreshes it.
+  $effect(() => {
+    loadHistory()
+  })
+
+  /** Put a saved query in the box, caret at its end, ready to run or edit. */
+  function recall(saved) {
+    text = saved.query
+    caret = saved.query.length
+    queueMicrotask(() => {
+      box?.focus()
+      box?.setSelectionRange(caret, caret)
+    })
+  }
+
+  // A query written across several lines still occupies one row of the list.
+  const oneLine = (q) => q.replace(/\s+/g, ' ').trim()
 
   // What a completion is for: the query up to the caret.
   const prefix = $derived(text.slice(0, caret))
@@ -174,6 +218,10 @@
       if (out.columns) result = { table: out }
       else if (out.write) result = { write: out }
       else result = { records: out }
+      // It ran, so the server has just recorded it. Paging through the same
+      // answer re-records nothing new — a repeat restamps its entry rather
+      // than adding a second copy — so this stays a refresh, not a growth.
+      loadHistory()
     } catch (e) {
       error = e.message
       result = null
@@ -290,6 +338,7 @@
 </script>
 
 <section class="query-page">
+  <div class="q-compose">
   <div class="q-editor">
     <div class="q-input-wrap">
       <!-- Behind the textarea with identical typography, so the completion
@@ -342,6 +391,36 @@
         <button onclick={() => (text = body)} title={body}>{label}</button>
       {/each}
     </div>
+  </div>
+
+  <!-- What has run, newest first. Click one to put it back in the box; the
+       plane is shown only when it is not the one currently selected, which is
+       the case where running it unchanged would answer a different question. -->
+  <aside class="q-history">
+    <header>
+      <span>History</span>
+      {#if history.length}<span class="q-hist-n">{history.length}</span>{/if}
+    </header>
+    {#if historyError}
+      <p class="q-hist-none">{historyError}</p>
+    {:else if !history.length}
+      <p class="q-hist-none">Nothing yet. A query that runs is kept here.</p>
+    {:else}
+      <ul>
+        {#each history as h (h.id)}
+          <li>
+            <button onclick={() => recall(h)} title={h.query}>
+              <span class="q-hist-q">{oneLine(h.query)}</span>
+              <span class="q-hist-meta">
+                <span>{ago(h.at)}</span>
+                {#if h.plane !== plane}<span class="q-hist-plane">{h.plane}</span>{/if}
+              </span>
+            </button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </aside>
   </div>
 
   {#if error}
