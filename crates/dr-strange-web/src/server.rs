@@ -735,6 +735,11 @@ struct CypherQuery {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Vector properties and columns as markers rather than floats — the
+    /// default, and what makes an answer readable. `lean=false` is how the
+    /// dashboard's "1024 dims" button asks for the one row behind it.
+    #[serde(default)]
+    lean: Option<bool>,
 }
 
 /// Rows per page when the dashboard does not say otherwise.
@@ -757,7 +762,7 @@ const PAGE: usize = 200;
 /// levels anyway; the browser UI is write-capable). Runs on a blocking task; a
 /// parse/compile error comes back as 400 with the message.
 ///
-/// Nodes come back **lean** — a vector property is the marker
+/// Nodes come back **lean** by default — a vector property is the marker
 /// `$vector(N dims, omitted)` rather than N floats. The dashboard renders no
 /// embeddings anywhere, and shipping them is not a rounding error: a query
 /// matching twelve hundred vectorized nodes answered in 35.9 MB, of which
@@ -795,7 +800,7 @@ async fn cypher_http(
                 &query,
                 &embed,
                 &Default::default(),
-                true,
+                q.lean.unwrap_or(true),
                 methods::Page {
                     offset: q.offset.unwrap_or(0),
                     limit: Some(q.limit.unwrap_or(PAGE)),

@@ -512,6 +512,28 @@ async fn a_query_result_elides_the_vectors_nobody_renders() {
     );
     assert_eq!(projected["rows"][0][2], "a doc", "the rest is untouched");
 
+    // And the button on that cell asks the same query back for its one row,
+    // with the vectors left in — the only way to an embedding a projection
+    // gives no node to ask about.
+    let one: Value = client
+        .post(format!(
+            "{base}/cypher?plane=startup&offset=0&limit=1&lean=false"
+        ))
+        .header("origin", &base)
+        .body("MATCH (n:Doc) RETURN key(n), n.embedding, n.title")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        one["rows"][0][1]["$vector"],
+        json!([1.0, 2.0, 3.0]),
+        "asked for, the column is its floats"
+    );
+    assert_eq!(one["rows"].as_array().unwrap().len(), 1, "one row, not all");
+
     // Every other read says the same, unasked.
     let got = rpc(
         &client,

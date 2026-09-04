@@ -137,6 +137,25 @@
     return runAt(0)
   }
 
+  // POST /cypher is web-only, not an RPC method: a raw fetch carrying the
+  // bearer token the RPC client would add.
+  async function ask_cypher({ offset: at, limit, lean }) {
+    const params = new URLSearchParams({
+      plane,
+      embed: provider,
+      offset: String(at),
+      limit: String(limit),
+    })
+    if (lean === false) params.set('lean', 'false')
+    const res = await fetch(`/cypher?${params}`, {
+      method: 'POST',
+      headers: authHeaders({ 'content-type': 'text/plain' }),
+      body: text.trim(),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
+    return res.json()
+  }
+
   async function runAt(at) {
     const query = text.trim()
     if (!query || busy) return
@@ -147,16 +166,7 @@
     savePref('embedProvider', provider)
     const started = performance.now()
     try {
-      // POST /cypher is web-only, not an RPC method: a raw fetch carrying the
-      // bearer token the RPC client would add.
-      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(provider)}&offset=${at}&limit=${PAGE}`
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: authHeaders({ 'content-type': 'text/plain' }),
-        body: query,
-      })
-      if (!res.ok) throw new Error((await res.text()) || `query failed (${res.status})`)
-      const out = await res.json()
+      const out = await ask_cypher({ offset: at, limit: PAGE })
       elapsed = Math.round(performance.now() - started)
       // Three shapes from one endpoint: columns, nodes, or change counts.
       if (out.columns) result = { table: out }
@@ -208,22 +218,49 @@
   // The whole property map of one node, JSON and all.
   let propsView = $state(null)
 
-  // The floats behind a marker, fetched for the one node whose button was
-  // pressed — `lean: false` is the only way to them, and one node at a time is
+  // The floats behind a marker, fetched for the one row whose button was
+  // pressed. `lean: false` is the only way to them, and one row at a time is
   // the whole point of asking.
-  let vectorView = $state(null) // { k, dims, values, error } | null
+  //
+  // `token` says which button opened this: a later click supersedes an earlier
+  // one, and a slow answer to a question nobody is asking any more is dropped
+  // rather than shown.
+  let vectorView = $state(null) // { title, dims, values, error, token } | null
 
-  async function showVector(node, k, dims) {
-    vectorView = { k, dims, values: null }
+  async function fetching(token, title, dims, get) {
+    vectorView = { token, title, dims, values: null }
     try {
-      const whole = await rpc('node.get', { plane, id: node.id, lean: false })
-      const values = unwrapVector(whole?.properties?.[k])
+      const values = await get()
       if (!values) throw new Error('no vector came back')
-      // A later click may have moved on; only the open one is ours to fill.
-      if (vectorView?.k === k) vectorView = { k, dims: values.length, values }
+      if (vectorView?.token === token) {
+        vectorView = { token, title, dims: values.length, values }
+      }
     } catch (e) {
-      if (vectorView?.k === k) vectorView = { k, dims, values: null, error: e.message }
+      if (vectorView?.token === token) {
+        vectorView = { token, title, dims, values: null, error: e.message }
+      }
     }
+  }
+
+  /** A node's embedding, by id — the records table. */
+  function showVector(node, k, dims) {
+    return fetching(`node:${node.id}:${k}`, k, dims, async () => {
+      const whole = await rpc('node.get', { plane, id: node.id, lean: false })
+      return unwrapVector(whole?.properties?.[k])
+    })
+  }
+
+  /** A projected column's embedding — the table of a `RETURN m.embedding`.
+   *
+   * A projection carries no node to ask about, so the question is put the way
+   * it was first asked: the same query, at that one row, with the vectors
+   * left in. */
+  function showCellVector(r, col, dims) {
+    const at = offset + r
+    return fetching(`row:${at}:${col}`, result?.table?.columns[col] ?? 'vector', dims, async () => {
+      const out = await ask_cypher({ offset: at, limit: 1, lean: false })
+      return unwrapVector(out?.rows?.[0]?.[col])
+    })
   }
 
   // What the header says about a paged answer: which rows these are, of how
@@ -332,7 +369,17 @@
           </thead>
           <tbody>
             {#each result.table.rows as row, r (r)}
-              <tr>{#each row as v, i (i)}<td>{cell(v)}</td>{/each}</tr>
+              <tr>
+                {#each row as v, i (i)}
+                  <td>
+                    {#if vectorDims(v)}
+                      <button class="vec-btn" onclick={() => showCellVector(r, i, vectorDims(v))}>
+                        {vectorDims(v)} dims
+                      </button>
+                    {:else}{cell(v)}{/if}
+                  </td>
+                {/each}
+              </tr>
             {/each}
           </tbody>
         </table>
@@ -428,7 +475,7 @@
     <div class="modal-backdrop">
       <div class="modal">
         <header>
-          <span>{vectorView.k} · {vectorView.dims} dims</span>
+          <span>{vectorView.title} · {vectorView.dims} dims</span>
           <button class="close" onclick={() => (vectorView = null)} aria-label="Close">×</button>
         </header>
         {#if vectorView.values}
