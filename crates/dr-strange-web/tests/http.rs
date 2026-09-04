@@ -84,7 +84,11 @@ async fn serves_dashboard_and_rpc() {
     // /health is an unauthenticated liveness probe — no Origin, no token.
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert!(health.status().is_success());
-    assert_eq!(health.json::<Value>().await.unwrap()["status"], "ok");
+    let health = health.json::<Value>().await.unwrap();
+    assert_eq!(health["status"], "ok");
+    // It also says which process answered, which is how `drsg init --rebuild`
+    // finds the server holding this repository's database.
+    assert_eq!(health["pid"], std::process::id());
 
     // JSON-RPC: db.stats reflects the seeded node.
     let stats = rpc(&client, &base, "db.stats", Value::Null).await;

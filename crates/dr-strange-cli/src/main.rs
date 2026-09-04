@@ -71,6 +71,16 @@ enum Command {
         /// previous run recorded in `.mcp.json`, then a fresh random one.
         #[arg(long)]
         token: Option<String>,
+        /// Drop the plane and fold the whole tree again, instead of resuming
+        /// from where it left off.
+        ///
+        /// What to reach for after upgrading a language plugin: the parser
+        /// decides what the tree means, so a new one only shows up in a plane
+        /// that has been read again. A server already running for this
+        /// repository is stopped first and comes back on the same address and
+        /// token, so agents' configs keep working.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Create a new database.
     #[cfg(not(feature = "digest"))]
@@ -688,6 +698,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             addr,
             token,
+            rebuild,
         } => {
             // Both fall back to `drsg.toml`'s `[server]`, the same way
             // `serve` reads them — pinning an address and token there is what
@@ -698,7 +709,16 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             // history will be read — the answer depends on what is installed,
             // and a promise it cannot keep would be worse than silence.
             let plugin_config = config::plugin_config(cfg)?;
-            commands::init_bootstrap(&cli.db, dir, plane, addr, token, &plugin_config, out)
+            commands::init_bootstrap(
+                &cli.db,
+                dir,
+                plane,
+                addr,
+                token,
+                rebuild,
+                &plugin_config,
+                out,
+            )
         }
         #[cfg(not(feature = "digest"))]
         Command::Init => commands::init(&cli.db, out),

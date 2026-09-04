@@ -134,6 +134,13 @@ const GITIGNORE_PATTERNS: &[&str] = &[
 ///   resumes from its sync point instead of re-parsing the tree.
 /// * **nothing recorded** — a first run: pick a free port and a fresh token,
 ///   and build the plane from scratch.
+///
+/// `rebuild` overrides all three: the plane is dropped and folded from the
+/// whole tree whatever state it was in. A server already serving this
+/// repository is stopped first — it holds the database, and it is also the
+/// process holding the *old* copy of every plugin, which is the usual reason
+/// to want this: a parser that has been upgraded changes what the tree means,
+/// and nothing short of re-reading it says so.
 #[cfg(feature = "digest")]
 #[allow(clippy::too_many_arguments)]
 pub fn init_bootstrap(
@@ -142,6 +149,7 @@ pub fn init_bootstrap(
     plane: Option<String>,
     addr: Option<std::net::SocketAddr>,
     token: Option<String>,
+    rebuild: bool,
     plugin_config: &dr_strange_llm::PluginConfig,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -156,11 +164,33 @@ pub fn init_bootstrap(
 
     // What a previous run left behind, and whether it is still answering.
     let recorded = recorded_endpoint(&dir);
-    let live = recorded
+    let answered = recorded
         .as_ref()
-        .filter(|(recorded_addr, _)| health_ok(*recorded_addr, INIT_HEALTH_CHECK_TIMEOUT));
+        .and_then(|(a, t)| health_probe(*a, INIT_HEALTH_CHECK_TIMEOUT).map(|pid| (*a, t, pid)));
 
-    if let Some((live_addr, live_token)) = live {
+    // A rebuild wants the database, which that server is holding. Stop it here,
+    // before anything opens the file; the respawn below comes back on the same
+    // address and token, so every agent's config stays valid across it.
+    if let Some((live_addr, _, pid)) = &answered
+        && rebuild
+    {
+        let Some(pid) = pid else {
+            bail!(
+                "drsg is serving {} at http://{live_addr}/mcp but does not say which process it \
+                 is, so --rebuild cannot stop it. Stop that server and run this again.",
+                dir.display()
+            );
+        };
+        writeln!(
+            out,
+            "stopping serve watch pid {pid} — the plane is about to be rebuilt"
+        )?;
+        stop_server(*pid, *live_addr)?;
+    }
+
+    let live = (!rebuild).then_some(()).and(answered.as_ref());
+
+    if let Some((live_addr, live_token, _)) = live {
         // An explicit address asks for something this cannot deliver: the
         // running server holds the database, so a second one cannot bind.
         // Say that instead of pretending the flag was honoured.
@@ -174,7 +204,7 @@ pub fn init_bootstrap(
                 db_path.display()
             );
         }
-        let (live_addr, live_token) = (*live_addr, live_token.clone());
+        let (live_addr, live_token) = (*live_addr, (*live_token).clone());
         writeln!(
             out,
             "drsg is already serving {} at http://{live_addr}/mcp — reusing it, the plane is \
@@ -190,7 +220,7 @@ pub fn init_bootstrap(
     // A recorded endpoint that stopped answering is the one worth restoring
     // verbatim: agents already hold that URL and token. An explicit flag
     // still wins over it.
-    let (addr, token, force) = match recorded {
+    let (addr, token, mut force) = match recorded {
         Some((recorded_addr, recorded_token)) => (
             match addr {
                 Some(explicit) => explicit,
@@ -224,6 +254,8 @@ pub fn init_bootstrap(
             true,
         ),
     };
+    // Whatever the plane's state, `--rebuild` re-reads the tree.
+    force |= rebuild;
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
 
     let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
@@ -277,7 +309,11 @@ pub fn init_bootstrap(
         bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
     }
 
-    let what = if force { "bootstrapped" } else { "restarted" };
+    let what = match (rebuild, force) {
+        (true, _) => "rebuilt",
+        (false, true) => "bootstrapped",
+        (false, false) => "restarted",
+    };
     writeln!(
         out,
         "plane '{plane_name}' {what} — serve watch pid {pid}, http://{addr}/mcp"
@@ -424,15 +460,18 @@ fn recorded_endpoint(dir: &Path) -> Option<(std::net::SocketAddr, String)> {
     Some((addr, token))
 }
 
-/// Whether a drsg server is answering on `addr` — `GET /health`, which the
-/// server leaves unauthenticated precisely for probes like this one.
+/// Whether a drsg server is answering on `addr`, and which process it is —
+/// `GET /health`, which the server leaves unauthenticated precisely for probes
+/// like this one. `Some(pid)` when one answered and said, `Some(None)` when it
+/// answered without saying (a server older than the field), `None` when
+/// nothing did.
 ///
 /// An HTTP round trip rather than a bare TCP connect, because the recorded
 /// port is an arbitrary one the OS handed out: after a reboot some unrelated
 /// process may well hold it, and accepting a connection from *that* would
 /// make `init` report a healthy drsg that does not exist.
 #[cfg(feature = "digest")]
-fn health_ok(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+fn health_probe(addr: std::net::SocketAddr, timeout: std::time::Duration) -> Option<Option<u32>> {
     use std::io::{Read, Write as _};
 
     let probe = || -> std::io::Result<String> {
@@ -449,10 +488,85 @@ fn health_ok(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
         sock.take(4096).read_to_end(&mut body)?;
         Ok(String::from_utf8_lossy(&body).into_owned())
     };
-    match probe() {
-        Ok(resp) => resp.starts_with("HTTP/1.1 200") && resp.contains("\"status\":\"ok\""),
-        Err(_) => false,
+    read_health(&probe().ok()?)
+}
+
+/// What a `GET /health` response says, given the raw bytes off the socket.
+///
+/// Split out from the round trip so it can be read against fixed text: what
+/// is worth testing here is which answers count as drsg, and a test that has
+/// to bind a port to ask that is a test racing every other test for the same
+/// ephemeral ports.
+#[cfg(feature = "digest")]
+fn read_health(resp: &str) -> Option<Option<u32>> {
+    if !(resp.starts_with("HTTP/1.1 200") && resp.contains("\"status\":\"ok\"")) {
+        return None;
     }
+    // The body is the tail of what was read, and small; parse it as JSON if it
+    // is there, and treat anything unexpected as a server that did not say.
+    let pid = resp
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body.trim()).ok())
+        .and_then(|v| v.get("pid")?.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    Some(pid)
+}
+
+/// How long to wait for a server told to stop to actually let go of its port.
+#[cfg(feature = "digest")]
+const INIT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask process `pid` to stop, and wait for it to release `addr`.
+///
+/// A polite signal, not a kill: the server closes its database on the way out,
+/// and a rebuild that began by corrupting what it is about to re-read would be
+/// a poor trade. Waiting on the port rather than on the process is what a
+/// caller actually needs to know — the next server has to bind it, and the
+/// database lock goes at the same moment.
+#[cfg(feature = "digest")]
+fn stop_server(pid: u32, addr: std::net::SocketAddr) -> Result<()> {
+    terminate(pid)?;
+    let deadline = std::time::Instant::now() + INIT_STOP_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if addr_bindable(addr) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    bail!(
+        "drsg (pid {pid}) was asked to stop but still holds {addr} after {}s",
+        INIT_STOP_TIMEOUT.as_secs()
+    )
+}
+
+#[cfg(all(feature = "digest", unix))]
+fn terminate(pid: u32) -> Result<()> {
+    // SAFETY: `kill` reads no memory and affects only the named process; an
+    // invalid pid is reported as ESRCH rather than being undefined.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("sending SIGTERM to pid {pid}"));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "digest", windows))]
+fn terminate(pid: u32) -> Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("running taskkill on pid {pid}"))?;
+    if !status.success() {
+        bail!("taskkill could not stop pid {pid}");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "digest", not(any(unix, windows))))]
+fn terminate(pid: u32) -> Result<()> {
+    bail!("stopping pid {pid} is not supported on this platform — stop it by hand")
 }
 
 /// Whether `addr` is free for the spawned server to bind. Racy by nature —
@@ -4457,7 +4571,7 @@ mod tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_addr = dead.local_addr().unwrap();
         drop(dead);
-        assert!(!health_ok(dead_addr, quick));
+        assert!(health_probe(dead_addr, quick).is_none());
 
         // A listener that accepts and answers, but is not drsg.
         let stranger = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4469,8 +4583,40 @@ mod tests {
                 let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
             }
         });
-        assert!(!health_ok(stranger_addr, quick), "200 OK is not enough");
+        assert!(
+            health_probe(stranger_addr, quick).is_none(),
+            "200 OK is not enough"
+        );
         t.join().unwrap();
+    }
+
+    /// `--rebuild` has to stop the server holding the database, and the only
+    /// portable way to learn which process that is, is to ask it. A server
+    /// that answers without saying is not an error — it is one from before
+    /// the field existed, and `init` says so rather than killing a guess.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn health_reports_which_process_answered() {
+        let ok = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        assert_eq!(
+            read_health(&ok(r#"{"status":"ok","pid":4242}"#)),
+            Some(Some(4242))
+        );
+        assert_eq!(
+            read_health(&ok(r#"{"status":"ok"}"#)),
+            Some(None),
+            "a server from before the field is answering, not misbehaving"
+        );
+        // Not drsg, whatever it is.
+        assert_eq!(read_health(&ok("hi")), None);
+        assert_eq!(read_health("HTTP/1.1 404 Not Found\r\n\r\n"), None);
+        assert_eq!(read_health(""), None);
     }
 
     #[cfg(feature = "digest")]

@@ -71,7 +71,23 @@ plane 'myrepo' restarted — serve watch pid 51002, http://127.0.0.1:51900/mcp
 端口并明确说明。想让端点彻底固定下来，就在 `drsg.toml` 的 `[server]` 下写死 `addr`
 与 `token`。
 
-所以：每个仓库运行一次，此后只要服务没了就再运行一次。
+**`--rebuild` 会丢弃平面并重新读取整棵源码树。** 一个源文件意味着什么，是由解析器
+插件决定的；因此升级过的插件只有在平面重新经它折叠之后才会体现出来——续跑的平面对
+那些此前已经看过的文件，保留的仍是旧解析器的理解。`--rebuild` 会先停掉持有数据库的
+服务进程（它同时也持有每个插件的旧副本），从整棵树重建，然后在同一地址、同一令牌上
+回来，因此任何智能体的配置都不会在脚下发生变化：
+
+```console
+$ drsg plugin install rust        # 更新版本的解析器
+$ drsg init --rebuild
+stopping serve watch pid 51002 — the plane is about to be rebuilt
+plane 'myrepo' rebuilt — serve watch pid 51188, http://127.0.0.1:51900/mcp
+```
+
+一如既往，只重建事实：嵌入向量会在下一次 `drsg digest` 时回来。
+
+所以：每个仓库运行一次，此后只要服务没了就再运行一次；而当某个插件改变了源码树的
+含义时，就带上 `--rebuild` 再运行一次。
 
 ## 事实为智能体带来什么
 

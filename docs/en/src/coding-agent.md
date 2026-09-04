@@ -82,7 +82,25 @@ generated afresh — and if that recorded port has since been taken by another
 process, `init` moves to a free one and says so. Pinning `addr` and `token`
 under `[server]` in `drsg.toml` fixes the endpoint outright.
 
-So: once per repository, then again whenever the server is gone.
+**`--rebuild` drops the plane and reads the tree again.** The parser plugins
+decide what a source file means, so an upgraded plugin only shows up in a
+plane that has been folded through the new one — a resumed plane keeps
+whatever the old parser made of the files it had already seen. `--rebuild`
+stops the server that holds the database (it also holds the old copy of every
+plugin), rebuilds from the whole tree, and comes back on the same address and
+token, so no agent's configuration changes underneath it:
+
+```console
+$ drsg plugin install rust        # a newer parser
+$ drsg init --rebuild
+stopping serve watch pid 51002 — the plane is about to be rebuilt
+plane 'myrepo' rebuilt — serve watch pid 51188, http://127.0.0.1:51900/mcp
+```
+
+Facts only, as ever: embeddings come back on the next `drsg digest`.
+
+So: once per repository, then again whenever the server is gone, and with
+`--rebuild` when a plugin has changed what the tree means.
 
 ## What the facts buy an agent
 

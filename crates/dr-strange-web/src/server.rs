@@ -392,8 +392,19 @@ fn router(
 
 /// `GET /health` — a cheap, unauthenticated liveness check. Deliberately does
 /// no database work so a probe can't be starved by a busy server.
+///
+/// It also says which process answered. `drsg init --rebuild` needs to stop
+/// the server holding this repository's database before it can rebuild the
+/// plane, and the process that owns a port is the one thing a caller cannot
+/// work out portably from outside. A pid is not a credential and says nothing
+/// about the graph, so it belongs on the probe that is already unauthenticated
+/// rather than behind the token.
 async fn health() -> Response {
-    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "pid": std::process::id() })),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
