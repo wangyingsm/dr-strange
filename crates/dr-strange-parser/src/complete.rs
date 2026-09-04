@@ -338,6 +338,9 @@ struct Scan {
     label: Option<String>,
     /// The relationship being read is written `<-`.
     incoming: bool,
+    /// The punctuation still owed before its type — see [`Expect::EdgeType`].
+    /// A lone `<` owes its hyphen as well as the bracket.
+    owed: &'static str,
     /// A `*` has been written in it, and whether its bounds followed.
     star: Option<bool>,
     /// The variable a `.` was written after.
@@ -409,6 +412,7 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
         var: None,
         label: None,
         incoming: false,
+        owed: "[:",
         star: None,
         term: None,
     };
@@ -431,7 +435,7 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
             var: s.next_var(),
             incoming: s.incoming,
             lead: match s.pos {
-                Pos::RelOpen => "[:",
+                Pos::RelOpen => s.owed,
                 Pos::RelVar | Pos::RelColon => ":",
                 _ => "",
             },
@@ -499,6 +503,8 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
         (Pos::Hop, Tok::Punct(p)) if p.starts_with('-') || p.starts_with('<') => {
             s.incoming = p.starts_with('<');
             s.star = None;
+            // `<` on its own is half an arrow: the hyphen is owed too.
+            s.owed = if *p == "<" { "-[:" } else { "[:" };
             // `-->` and `--` are a whole relationship in one token: nothing
             // bracketed follows them.
             s.pos = if *p == "--" || *p == "-->" || *p == "<--" {
@@ -604,7 +610,7 @@ fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Sugg
             // A word typed where the bracket has not been opened yet is not
             // the start of a type — there is nowhere for it to go — so
             // nothing completes it.
-            if lead.starts_with('[') && !word.is_empty() {
+            if lead.contains('[') && !word.is_empty() {
                 return Vec::new();
             }
             edge_types(word, vocab, from.as_deref(), var, *incoming, lead)

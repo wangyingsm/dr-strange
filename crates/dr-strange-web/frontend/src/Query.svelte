@@ -22,10 +22,12 @@
   // character is being typed was never worth making.
   const IDLE_MS = 1000
 
-  // Empty on a first visit: the box opens with the placeholder's hint, not a
-  // statement written for one plane's labels that would fail on most others.
-  // What the user last ran is restored, since that was their own choice.
-  let text = $state(loadPref('queryText', ''))
+  // The box opens empty, every time: a query is written for one plane's
+  // labels and would fail on most others, so a statement waiting in the box
+  // is a statement someone has to read and delete before they can start. The
+  // placeholder says the shape instead, and the examples below write a real
+  // one on request.
+  let text = $state('')
   // Where the caret is, and the textarea itself — a completion is for the
   // text *before* the caret, and accepting one has to put the caret after it.
   let caret = $state(text.length)
@@ -126,7 +128,6 @@
     busy = true
     error = null
     copied = false
-    savePref('queryText', text)
     savePref('embedProvider', provider)
     const started = performance.now()
     try {

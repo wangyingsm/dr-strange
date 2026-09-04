@@ -521,6 +521,8 @@ fn a_spliced_completion_fits_the_grammar() {
 fn a_hop_is_completed_from_however_much_of_it_is_written() {
     assert_eq!(best("MATCH (n:Function)-"), "[:CALLS]->(m:Function)");
     assert_eq!(best("MATCH (n:Function)<-"), "[:CALLS]-(m:Function)");
+    // `<` on its own is half an arrow: the hyphen is owed too.
+    assert_eq!(best("MATCH (n:Function)<"), "-[:CALLS]-(m:Function)");
     assert_eq!(best("MATCH (n:Function)-["), ":CALLS]->(m:Function)");
     assert_eq!(best("MATCH (n:Function)<-["), ":CALLS]-(m:Function)");
     // `-[r` names the relationship; the type follows that name rather than
@@ -532,6 +534,7 @@ fn a_hop_is_completed_from_however_much_of_it_is_written() {
     let vocab = code();
     for prefix in [
         "MATCH (n:Function)-",
+        "MATCH (n:Function)<",
         "MATCH (n:Function)<-",
         "MATCH (n:Function)-[",
         "MATCH (n:Function)<-[",
@@ -553,6 +556,7 @@ fn a_hop_is_completed_from_however_much_of_it_is_written() {
 #[test]
 fn a_word_with_no_bracket_to_go_in_completes_to_nothing() {
     assert!(complete("MATCH (n:Function)<-C", &code()).best.is_none());
+    assert!(complete("MATCH (n:Function)<C", &code()).best.is_none());
 }
 
 /// Plenty of labels are only ever arrived at: an `External` is called and
