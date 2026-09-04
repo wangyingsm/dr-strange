@@ -17,6 +17,11 @@ All notable changes to Dr Strange are documented here. The format is based on
   175 MiB for a graph whose current state is a fraction of that. `[server]
   retain_commits` sets the window; `0` keeps everything, as before. The
   library default (`Database::set_retention`) is unchanged.
+- **`serve watch` keeps its plugins loaded across commits.** The watcher
+  loaded the plugin store afresh on every commit, so that a `drsg plugin
+  install` in between was picked up without a restart. It still is: the
+  loaded set is kept, and reloaded only when the store's registry changed
+  since the last load — which every install and remove does.
 - **Plugins are compiled once, at install.** `drsg plugin install` now keeps
   the compiled form beside the wasm in the store, pinned by its own SHA-256
   in `registry.toml`, and a load deserializes it in milliseconds instead of

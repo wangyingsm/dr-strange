@@ -86,6 +86,14 @@ pub struct InstalledPlugin {
     pub compiled_sha256: Option<String>,
 }
 
+/// What [`PluginStore::stamp`] saw: the registry's length and modification
+/// time. Equal stamps mean the store has not changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct RegistryFile {
     #[serde(default, rename = "plugin")]
@@ -112,6 +120,26 @@ impl PluginStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The registry as it stands: enough to tell a store that changed from
+    /// one that did not, without parsing it. Every install and remove
+    /// rewrites `registry.toml` (write-then-rename, so a new inode and a new
+    /// modification time), which is what a long-lived process watches to know
+    /// when its loaded plugins are behind the store.
+    pub fn stamp(&self) -> Result<StoreStamp> {
+        let path = self.dir.join("registry.toml");
+        match std::fs::metadata(&path) {
+            Ok(meta) => Ok(StoreStamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreStamp {
+                len: 0,
+                modified: None,
+            }),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 
     /// Validate, hash, store, record. Returns the new entry and, when a plugin

@@ -118,6 +118,38 @@ fn fuel_off_compiles_and_leaves_the_artifact_alone() {
 }
 
 #[test]
+fn live_plugins_reload_only_when_the_store_changes() {
+    use dr_strange_llm::preprocess::{LivePlugins, PluginConfig};
+
+    let (dir, store) = fresh_store("live");
+    store.install(&fixture_bytes(), "fixture").unwrap();
+    let mut live = LivePlugins::new(PluginConfig {
+        store_dir: Some(dir.clone()),
+        ..Default::default()
+    });
+
+    assert_eq!(live.current().unwrap().manifests().len(), 1);
+    assert_eq!(live.loads(), 1);
+    // Nothing moved: answered from memory.
+    live.current().unwrap();
+    live.current().unwrap();
+    assert_eq!(live.loads(), 1);
+
+    // An install rewrites the registry: the next call loads again — and a
+    // remove likewise, leaving nothing to route to.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    store.install(&fixture_bytes(), "fixture again").unwrap();
+    assert_eq!(live.current().unwrap().manifests().len(), 1);
+    assert_eq!(live.loads(), 2);
+    let name = store.list().unwrap().remove(0).name;
+    store.remove(&name).unwrap();
+    assert!(live.current().unwrap().manifests().is_empty());
+    assert_eq!(live.loads(), 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn remove_takes_the_artifact_with_the_wasm() {
     let (dir, store) = fresh_store("remove");
     let (entry, _) = store.install(&fixture_bytes(), "fixture").unwrap();

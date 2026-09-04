@@ -69,7 +69,7 @@ pub use catalog::{
 };
 pub use ground::{FactsAndPlane, fold, stamp_run};
 #[cfg(feature = "plugins")]
-pub use registry::{InstalledPlugin, PluginStore};
+pub use registry::{InstalledPlugin, PluginStore, StoreStamp};
 pub use repo::{
     GitDir, PLANE_SUFFIX, REPO_PLUGIN, WriteStats, git_dir, plane_name, route_repository,
     write_history,
@@ -444,10 +444,7 @@ impl Plugins {
     #[cfg(feature = "plugins")]
     pub fn load(config: &PluginConfig) -> Result<Self> {
         let mut plugins = Self::with_options(&config.options);
-        let store = match &config.store_dir {
-            Some(dir) => PluginStore::open(dir.clone())?,
-            None => PluginStore::open_default()?,
-        };
+        let store = Self::store(config)?;
         let mut limits = Limits::default();
         match config.fuel {
             Some(0) => limits.fuel = None,
@@ -463,9 +460,79 @@ impl Plugins {
         Ok(plugins)
     }
 
+    /// The store `config` names, or the per-user default.
+    #[cfg(feature = "plugins")]
+    fn store(config: &PluginConfig) -> Result<PluginStore> {
+        match &config.store_dir {
+            Some(dir) => PluginStore::open(dir.clone()),
+            None => PluginStore::open_default(),
+        }
+    }
+
     /// What is available, for `--handler` errors and for `plugin list`.
     pub fn manifests(&self) -> Vec<Manifest> {
         self.handlers.iter().map(|p| p.manifest()).collect()
+    }
+}
+
+/// The plugins a long-lived process keeps loaded, reloaded only when the
+/// store changes underneath them.
+///
+/// `serve watch` used to call [`Plugins::load`] on every commit so that a
+/// `drsg plugin install` between commits was picked up without a restart —
+/// at the price of a full load per commit, which compiled every plugin
+/// before compiled artifacts existed and still reads and verifies each one
+/// now. This keeps the property and drops the price: [`current`] compares
+/// the store's [stamp](PluginStore::stamp) with the one the last load saw,
+/// and loads again only when it moved.
+///
+/// [`current`]: Self::current
+#[cfg(feature = "plugins")]
+pub struct LivePlugins {
+    config: PluginConfig,
+    loaded: Option<(StoreStamp, Plugins)>,
+    loads: usize,
+}
+
+#[cfg(feature = "plugins")]
+impl LivePlugins {
+    /// Nothing loaded yet; the first [`current`](Self::current) loads.
+    pub fn new(config: PluginConfig) -> Self {
+        Self {
+            config,
+            loaded: None,
+            loads: 0,
+        }
+    }
+
+    /// The plugins as the store stands now: the ones already loaded when
+    /// nothing changed since, a fresh load otherwise. A load that fails
+    /// leaves the previous plugins in place, so a half-written store is an
+    /// error for this call rather than a watcher left with nothing.
+    pub fn current(&mut self) -> Result<&Plugins> {
+        let store = Plugins::store(&self.config)?;
+        let stamp = store.stamp()?;
+        let fresh = matches!(&self.loaded, Some((seen, _)) if *seen == stamp);
+        if !fresh {
+            let plugins = Plugins::load(&self.config)?;
+            // Stamped after the load: a load may itself rewrite the registry
+            // (recording a compiled artifact), and that is not a change worth
+            // loading again for.
+            let stamp = store.stamp()?;
+            self.loaded = Some((stamp, plugins));
+            self.loads += 1;
+        }
+        Ok(&self
+            .loaded
+            .as_ref()
+            .expect("loaded just above, or already")
+            .1)
+    }
+
+    /// How many times the store has been loaded — for a caller (or a test)
+    /// that wants to know a call was answered from memory.
+    pub fn loads(&self) -> usize {
+        self.loads
     }
 }
 

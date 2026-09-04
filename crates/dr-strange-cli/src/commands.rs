@@ -1022,6 +1022,12 @@ fn watch_loop(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| dir.display().to_string());
 
+    // The plugins, loaded once and kept: every fold below asks `live` for
+    // them, and it reloads only when the store changed — so a `drsg plugin
+    // install` between commits is still picked up without a restart, but a
+    // commit no longer pays for a load.
+    let mut live = dr_strange_llm::LivePlugins::new(plugin_config.clone());
+
     // Where to start folding from — and, when the repository cannot say,
     // what to do instead of giving up. A brand-new project has no commit to
     // anchor on: `git rev-parse HEAD` fails both in a repository whose first
@@ -1029,20 +1035,14 @@ fn watch_loop(
     // all. Neither is a reason to leave the tree unparsed.
     let (mut head, bootstrapped) = match git_head(dir) {
         Ok(head) => (head, false),
-        Err(e) => match bootstrap_unborn(
-            db,
-            dir,
-            plane_name,
-            plugin_config,
-            &source,
-            &e,
-            &revectorize,
-        )? {
-            Some(first) => (first, true),
-            // Not a repository: the plane is built and current as of the
-            // scan, but no commit will ever arrive to fold into it.
-            None => return Ok(()),
-        },
+        Err(e) => {
+            match bootstrap_unborn(db, dir, plane_name, &mut live, &source, &e, &revectorize)? {
+                Some(first) => (first, true),
+                // Not a repository: the plane is built and current as of the
+                // scan, but no commit will ever arrive to fold into it.
+                None => return Ok(()),
+            }
+        }
     };
 
     if bootstrapped {
@@ -1057,7 +1057,7 @@ fn watch_loop(
             plane = plane_name,
             "--force: rebuilding the plane from the tree"
         );
-        let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, &source, &head)?;
+        let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, &source, &head)?;
         record_sync_point(db, plane_name, dir)?;
         tracing::info!(
             commit = %&head[..12.min(head.len())],
@@ -1119,11 +1119,10 @@ fn watch_loop(
         }
     }
     // History, once, before serving: a plane bootstrapped by `drsg init` has
-    // never seen a digest, so this is where it first gains one. Loading the
-    // plugins here costs a compile the folds below pay anyway.
+    // never seen a digest, so this is where it first gains one.
     if git {
-        match dr_strange_llm::Plugins::load(plugin_config) {
-            Ok(plugins) => fold_history(db, dir, plane_name, &plugins, "startup"),
+        match live.current() {
+            Ok(plugins) => fold_history(db, dir, plane_name, plugins, "startup"),
             Err(e) => tracing::warn!(
                 error = format!("{e:#}"),
                 "loading plugins for the history plane failed"
@@ -1162,22 +1161,21 @@ fn watch_loop(
             if !touches_code && !git {
                 return Ok(false);
             }
-            // Reloaded each commit so a `drsg plugin install` between commits
-            // is picked up without restarting the server.
-            let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
+            // From memory unless the store changed since the last load.
+            let plugins = live.current()?;
             // History first, and regardless of the delta: a commit is a fact
             // about the repository even when it touched no file the code plane
             // holds — an empty commit, or one that moved only something
             // ignored, still moved a branch.
             if git {
-                fold_history(db, dir, plane_name, &plugins, "commit");
+                fold_history(db, dir, plane_name, plugins, "commit");
             }
             if !touches_code {
                 return Ok(false);
             }
             let host = dr_strange_llm::LocalFiles::new(dir)?;
             let stats =
-                dr_strange_llm::sync_paths(db, plane_name, &host, &delta, &plugins, &source, &now)?;
+                dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, &source, &now)?;
             tracing::info!(
                 commit = %&now[..12.min(now.len())],
                 changed = delta.changed.len(),
@@ -1285,13 +1283,12 @@ fn rebuild_from_tree(
     db: &Database,
     dir: &Path,
     plane_name: &str,
-    plugin_config: &dr_strange_llm::PluginConfig,
+    plugins: &dr_strange_llm::Plugins,
     source: &str,
     run_id: &str,
 ) -> Result<dr_strange_llm::SyncStats> {
-    let plugins = dr_strange_llm::Plugins::load(plugin_config)?;
     let host = dr_strange_llm::LocalFiles::new(dir)?;
-    dr_strange_llm::resync(db, plane_name, &host, &plugins, source, run_id)
+    dr_strange_llm::resync(db, plane_name, &host, plugins, source, run_id)
 }
 
 /// Start watching a directory that has no HEAD to anchor on.
@@ -1309,7 +1306,7 @@ fn bootstrap_unborn(
     db: &Database,
     dir: &Path,
     plane_name: &str,
-    plugin_config: &dr_strange_llm::PluginConfig,
+    live: &mut dr_strange_llm::LivePlugins,
     source: &str,
     why: &anyhow::Error,
     revectorize: &dyn Fn(&str),
@@ -1321,7 +1318,7 @@ fn bootstrap_unborn(
         reason = format!("{why:#}"),
         "no commit to anchor on — building the plane from the working tree"
     );
-    let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, source, UNBORN_RUN_ID)?;
+    let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, source, UNBORN_RUN_ID)?;
     tracing::info!(
         nodes_loaded = stats.nodes_loaded,
         edges_written = stats.edges_written,
@@ -1347,7 +1344,7 @@ fn bootstrap_unborn(
     };
     // Rebuild rather than fold: there is no earlier commit to diff the first
     // one against, and the tree may have changed since the scan above.
-    let stats = rebuild_from_tree(db, dir, plane_name, plugin_config, source, &first)?;
+    let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, source, &first)?;
     record_sync_point(db, plane_name, dir)?;
     tracing::info!(
         commit = %&first[..12.min(first.len())],

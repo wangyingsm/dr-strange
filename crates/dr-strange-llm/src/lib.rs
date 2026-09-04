@@ -45,7 +45,7 @@ pub use preprocess::{
     route_repository, route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
-pub use preprocess::{InstalledPlugin, Limits, PluginStore, WasmPlugin};
+pub use preprocess::{InstalledPlugin, Limits, LivePlugins, PluginStore, StoreStamp, WasmPlugin};
 /// Reading a repository's history beside its code — see [`preprocess::repo`].
 pub use preprocess::{PLANE_SUFFIX as GIT_PLANE_SUFFIX, REPO_PLUGIN, plane_name as git_plane_name};
 pub use preprocess::{WriteStats as GitWriteStats, write_history};
