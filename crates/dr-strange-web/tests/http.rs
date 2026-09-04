@@ -458,3 +458,38 @@ async fn completes_a_query_against_the_planes_own_shape() {
         .unwrap();
     assert_eq!(res.status(), 400);
 }
+
+/// A query result carries no embeddings: the dashboard renders none, and a
+/// plane whose nodes each hold a thousand floats answers a three-thousand-node
+/// query in tens of megabytes of numbers nobody reads.
+#[tokio::test]
+async fn a_query_result_elides_the_vectors_nobody_renders() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    rpc(
+        &client,
+        &base,
+        "node.create",
+        json!({ "plane": "startup", "key": "vec", "labels": ["Doc"],
+                "properties": { "title": "a doc", "embedding": { "$vector": [1.0, 2.0, 3.0] } } }),
+    )
+    .await;
+
+    let res = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body("MATCH (n:Doc) RETURN n")
+        .send()
+        .await
+        .unwrap();
+    let out: Value = res.json().await.unwrap();
+    let props = &out["nodes"][0]["properties"];
+    assert_eq!(
+        props["embedding"], "$vector(3 dims, omitted)",
+        "the vector is a marker, not its floats: {props}"
+    );
+    assert_eq!(props["title"], "a doc", "everything else is untouched");
+}

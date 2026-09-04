@@ -738,6 +738,14 @@ struct CypherQuery {
 /// authorization even for a read query (the single-token model collapses the
 /// levels anyway; the browser UI is write-capable). Runs on a blocking task; a
 /// parse/compile error comes back as 400 with the message.
+///
+/// Nodes come back **lean** — a vector property is the marker
+/// `$vector(N dims, omitted)` rather than N floats. The dashboard renders no
+/// embeddings anywhere, and shipping them is not a rounding error: a query
+/// matching twelve hundred vectorized nodes answered in 35.9 MB, of which
+/// 34 MB were floats no one reads, and the browser spent minutes parsing
+/// them. The same query lean is 1.6 MB. `plane.cypher` keeps the choice for
+/// callers that want the vectors themselves.
 async fn cypher_http(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -769,7 +777,7 @@ async fn cypher_http(
                 &query,
                 &embed,
                 &Default::default(),
-                false,
+                true,
             )
         }
     })
