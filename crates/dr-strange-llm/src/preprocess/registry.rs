@@ -12,6 +12,8 @@
 //! sha256 = "9f86d081…"
 //! source = "/home/me/build/drsg_plugin_toml.wasm"
 //! extensions = ["toml"]
+//! compiled = "toml-1.cwasm"
+//! compiled_sha256 = "2c26b46b…"
 //! ```
 //!
 //! ## Identity is the hash
@@ -26,6 +28,25 @@
 //! import a forbidden interface, and must describe themselves — all the checks
 //! [`WasmPlugin::from_bytes`] performs — so nothing unloadable ever enters the
 //! store to fail later at digest time.
+//!
+//! ## Compiled once
+//!
+//! Compiling a component is the expensive half of a load — seconds of CPU and
+//! hundreds of MiB for the official parsers — and a load happens on every
+//! `digest` and on every commit `serve watch` folds. So install also stores
+//! the **compiled form** beside the wasm (`compiled`), pinned by its own
+//! hash, and a load deserializes that in milliseconds. The pin is what makes
+//! deserializing safe: a compiled artifact is native code, so it is trusted
+//! only as far as the registry this store wrote can vouch for it, the same
+//! way the wasm is.
+//!
+//! The artifact is tied to the wasmtime build that made it. After a `drsg
+//! update`, or in a store from before artifacts existed, a load compiles
+//! from the wasm as before and writes the artifact for the next one — a
+//! warning if that write fails, never an error, since the plugin loaded
+//! either way. With fuel metering turned off (`[plugins] fuel = 0`) the
+//! artifact does not apply — it is compiled metered — and every load
+//! compiles.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +75,23 @@ pub struct InstalledPlugin {
     /// instantiating the component. Absent means the UI's default mark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<String>,
+    /// The compiled form of `file`, relative to the store directory — what a
+    /// load deserializes instead of compiling. Absent on a record from before
+    /// artifacts existed, or when writing it failed; the next load fills it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<String>,
+    /// Hex SHA-256 of `compiled`, pinned when it was written; a load re-checks
+    /// it before deserializing, since that runs the bytes as native code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled_sha256: Option<String>,
+}
+
+/// What [`PluginStore::stamp`] saw: the registry's length and modification
+/// time. Equal stamps mean the store has not changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -82,6 +120,26 @@ impl PluginStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The registry as it stands: enough to tell a store that changed from
+    /// one that did not, without parsing it. Every install and remove
+    /// rewrites `registry.toml` (write-then-rename, so a new inode and a new
+    /// modification time), which is what a long-lived process watches to know
+    /// when its loaded plugins are behind the store.
+    pub fn stamp(&self) -> Result<StoreStamp> {
+        let path = self.dir.join("registry.toml");
+        match std::fs::metadata(&path) {
+            Ok(meta) => Ok(StoreStamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreStamp {
+                len: 0,
+                modified: None,
+            }),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 
     /// Validate, hash, store, record. Returns the new entry and, when a plugin
@@ -120,6 +178,22 @@ impl PluginStore {
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("moving the plugin into {}", path.display()))?;
 
+        // The compiled form beside it. Best-effort: the plugin is installed
+        // either way, and a load that finds no artifact compiles and writes
+        // one itself.
+        let (compiled, compiled_sha256) =
+            match self.write_artifact(&manifest.name, &manifest.version, &plugin) {
+                Ok((file, sha256)) => (Some(file), Some(sha256)),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %manifest.name,
+                        error = format!("{e:#}"),
+                        "storing the compiled plugin failed; it will be compiled at load"
+                    );
+                    (None, None)
+                }
+            };
+
         let entry = InstalledPlugin {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
@@ -128,6 +202,8 @@ impl PluginStore {
             source: source.to_string(),
             extensions: manifest.extensions.clone(),
             logo: manifest.logo.clone(),
+            compiled,
+            compiled_sha256,
         };
 
         let mut registry = self.read()?;
@@ -138,6 +214,12 @@ impl PluginStore {
                 // would otherwise linger as an orphan nothing points at.
                 if old.file != existing.file {
                     let _ = std::fs::remove_file(self.dir.join(&old.file));
+                }
+                if let Some(stale) = old
+                    .compiled
+                    .filter(|c| Some(c) != existing.compiled.as_ref())
+                {
+                    let _ = std::fs::remove_file(self.dir.join(stale));
                 }
                 Some(old.version)
             }
@@ -175,6 +257,9 @@ impl PluginStore {
         let entry = registry.plugins.remove(idx);
         self.write(&registry)?;
         let _ = std::fs::remove_file(self.dir.join(&entry.file));
+        if let Some(compiled) = &entry.compiled {
+            let _ = std::fs::remove_file(self.dir.join(compiled));
+        }
         Ok(entry)
     }
 
@@ -184,24 +269,43 @@ impl PluginStore {
     /// A failure is an error naming the plugin, never a silent skip: the
     /// operator installed it, so a digest quietly running without it would be
     /// the worst of the options.
+    ///
+    /// A plugin that had to be compiled (no artifact, a stale one, or one from
+    /// another build) gets its artifact written and recorded here, so the
+    /// next load deserializes. Recording it is best-effort: the plugins are
+    /// loaded either way, and a store that cannot be written right now just
+    /// compiles again next time.
     pub fn load_all(
         &self,
         options: &BTreeMap<String, Vec<(String, String)>>,
         limits: &Limits,
     ) -> Result<Vec<WasmPlugin>> {
-        self.read()?
-            .plugins
-            .iter()
-            .map(|entry| self.load_one(entry, options, limits))
-            .collect()
+        let mut registry = self.read()?;
+        let mut out = Vec::with_capacity(registry.plugins.len());
+        let mut recompiled = false;
+        for entry in &mut registry.plugins {
+            let (plugin, compiled_now) = self.load_one(entry, options, limits)?;
+            recompiled |= compiled_now;
+            out.push(plugin);
+        }
+        if recompiled && let Err(e) = self.write(&registry) {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "recording the compiled plugins failed; the next load compiles them again"
+            );
+        }
+        Ok(out)
     }
 
+    /// One plugin, from its artifact when there is a usable one and from the
+    /// wasm otherwise. The flag says the wasm was compiled and `entry` now
+    /// names a fresh artifact the caller should record.
     fn load_one(
         &self,
-        entry: &InstalledPlugin,
+        entry: &mut InstalledPlugin,
         options: &BTreeMap<String, Vec<(String, String)>>,
         limits: &Limits,
-    ) -> Result<WasmPlugin> {
+    ) -> Result<(WasmPlugin, bool)> {
         let path = self.dir.join(&entry.file);
         let bytes = std::fs::read(&path).with_context(|| {
             format!(
@@ -226,8 +330,31 @@ impl PluginStore {
         }
 
         let opts = options.get(&entry.name).cloned().unwrap_or_default();
-        let plugin = WasmPlugin::from_bytes(&bytes, opts, limits.clone())
-            .with_context(|| format!("loading plugin `{}`", entry.name))?;
+        let mut recompiled = false;
+        let plugin = match self.load_precompiled(entry, opts.clone(), limits) {
+            Some(plugin) => plugin,
+            None => {
+                let plugin = WasmPlugin::from_bytes(&bytes, opts, limits.clone())
+                    .with_context(|| format!("loading plugin `{}`", entry.name))?;
+                // Metered only: an unmetered engine cannot load the artifact,
+                // and one written from it could not be loaded by a metered one.
+                if limits.fuel.is_some() {
+                    match self.write_artifact(&entry.name, &entry.version, &plugin) {
+                        Ok((file, sha256)) => {
+                            entry.compiled = Some(file);
+                            entry.compiled_sha256 = Some(sha256);
+                            recompiled = true;
+                        }
+                        Err(e) => tracing::warn!(
+                            plugin = %entry.name,
+                            error = format!("{e:#}"),
+                            "storing the compiled plugin failed; it will be compiled on every load"
+                        ),
+                    }
+                }
+                plugin
+            }
+        };
 
         // The component's own answer outranks the record. A name mismatch is
         // an integrity failure; extensions merely drifted are taken from the
@@ -241,7 +368,79 @@ impl PluginStore {
                 manifest.name
             );
         }
-        Ok(plugin)
+        Ok((plugin, recompiled))
+    }
+
+    /// The plugin from its recorded artifact, or `None` with the reason logged
+    /// when the wasm has to be compiled instead: no artifact recorded, the
+    /// file gone, its hash off the pin, or wasmtime refusing it (another
+    /// build made it). Fuel off means no artifact applies — see
+    /// [`WasmPlugin::from_precompiled`].
+    fn load_precompiled(
+        &self,
+        entry: &InstalledPlugin,
+        opts: Vec<(String, String)>,
+        limits: &Limits,
+    ) -> Option<WasmPlugin> {
+        // Artifacts are metered; an unmetered engine cannot load one.
+        limits.fuel?;
+        let (file, pinned) = match (&entry.compiled, &entry.compiled_sha256) {
+            (Some(file), Some(pinned)) => (file, pinned),
+            _ => return None,
+        };
+        let path = self.dir.join(file);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::info!(
+                    plugin = %entry.name,
+                    path = %path.display(),
+                    error = %e,
+                    "the compiled plugin is unreadable; compiling from the wasm"
+                );
+                return None;
+            }
+        };
+        if hex_sha256(&bytes) != *pinned {
+            // Derived data, so rebuilt rather than refused — but said out
+            // loud, because an artifact that changed by itself is worth a look.
+            tracing::warn!(
+                plugin = %entry.name,
+                path = %path.display(),
+                "the compiled plugin changed on disk since it was written; compiling from the wasm and replacing it"
+            );
+            return None;
+        }
+        match WasmPlugin::from_precompiled(&bytes, opts, limits.clone()) {
+            Ok(plugin) => Some(plugin),
+            Err(e) => {
+                tracing::info!(
+                    plugin = %entry.name,
+                    error = format!("{e:#}"),
+                    "the compiled plugin is from another drsg build; compiling from the wasm and replacing it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Write `plugin`'s compiled form beside its wasm — write-then-rename, as
+    /// the wasm itself — and return what the registry records for it:
+    /// `(file, sha256)`.
+    fn write_artifact(
+        &self,
+        name: &str,
+        version: &str,
+        plugin: &WasmPlugin,
+    ) -> Result<(String, String)> {
+        let bytes = plugin.serialize()?;
+        let file = format!("{name}-{version}.cwasm");
+        let path = self.dir.join(&file);
+        let tmp = self.dir.join(format!(".{file}.tmp"));
+        std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("moving the compiled plugin into {}", path.display()))?;
+        Ok((file, hex_sha256(&bytes)))
     }
 
     fn read(&self) -> Result<RegistryFile> {

@@ -133,6 +133,54 @@ impl Default for Limits {
     }
 }
 
+/// Threads a compile may use. Cranelift compiles a component's functions in
+/// parallel on rayon's *current* pool, and each worker holds its own
+/// in-flight state: measured on the eight official plugins (12.7 MiB of
+/// wasm), peak resident memory was ~30 MiB per worker — 186 MiB on one
+/// thread, 1.04 GiB on the 32 the global pool offers here. Four keeps a load
+/// near 300 MiB and still several times faster than serial.
+const COMPILE_THREADS: usize = 4;
+
+/// The engine every plugin runs under. One place, because a precompiled
+/// artifact loads only into an engine configured exactly as the one that
+/// compiled it.
+fn engine(fuel: bool) -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    // Fuel is why a runaway plugin is *interrupted* rather than left to
+    // spin, and it is deterministic in a way epoch interruption is not.
+    config.consume_fuel(fuel);
+    Engine::new(&config)
+        .map_err(wt)
+        .context("starting the wasm engine")
+}
+
+/// Compile `bytes` on a pool of at most [`COMPILE_THREADS`] threads that
+/// lives only for this call.
+///
+/// A pool of its own rather than the global one, for two reasons. The bound:
+/// the global pool is sized to the machine, and the memory above scales with
+/// it. The lifetime: rayon's global workers never exit, and an idle thread
+/// keeps whatever its allocator heap freed but never purged — the compile's
+/// working set stayed resident in `drsg serve` for the life of the process
+/// until the workers were made to end with the work.
+fn compile_component(engine: &Engine, bytes: &[u8]) -> Result<Component> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, COMPILE_THREADS);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("drsg-wasm-compile-{i}"))
+        .build()
+        .context("starting the wasm compile pool")?;
+    let compiled = pool.install(|| Component::new(engine, bytes));
+    drop(pool);
+    compiled.map_err(wt).context(
+        "this file is not a WebAssembly component — a plugin must be a \
+         component, not a core module",
+    )
+}
+
 /// Interfaces whose mere presence in a component is a refusal.
 ///
 /// Sockets only, and deliberately no longer `wasi:filesystem`. Refusing the
@@ -187,20 +235,72 @@ impl WasmPlugin {
         options: Vec<(String, String)>,
         limits: Limits,
     ) -> Result<Self> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        // Fuel is why a runaway plugin is *interrupted* rather than left to
-        // spin, and it is deterministic in a way epoch interruption is not.
-        config.consume_fuel(limits.fuel.is_some());
+        let engine = engine(limits.fuel.is_some())?;
+        let component = compile_component(&engine, bytes)?;
+        Self::finish(engine, component, options, limits)
+    }
 
-        let engine = Engine::new(&config)
+    /// Load a plugin from the compiled form [`Self::serialize`] produced —
+    /// milliseconds and a few MiB, where compiling is seconds and hundreds.
+    ///
+    /// Only an artifact of this same wasmtime build and configuration loads;
+    /// wasmtime checks that and refuses anything else, and the caller then
+    /// compiles from the wasm instead. Fuel must be on: the artifact is
+    /// compiled with metering, which is part of that configuration.
+    ///
+    /// # Trust
+    ///
+    /// `Component::deserialize` trusts its bytes — a forged artifact is
+    /// native code running as this process, outside the sandbox. The store
+    /// is what makes the call safe: it wrote the artifact itself, from a
+    /// component it had just verified, and pinned the artifact's SHA-256 in
+    /// the registry beside the wasm's; a load hashes the bytes against that
+    /// pin before they reach here, exactly as the wasm itself is checked.
+    pub fn from_precompiled(
+        artifact: &[u8],
+        options: Vec<(String, String)>,
+        limits: Limits,
+    ) -> Result<Self> {
+        if limits.fuel.is_none() {
+            bail!(
+                "a precompiled plugin is fuel-metered; with fuel off it has to be compiled from the wasm"
+            );
+        }
+        let engine = engine(true)?;
+        // SAFETY: the bytes come from `serialize` on this same build and were
+        // verified against the hash pinned when they were written (see the
+        // doc comment); the plugin store is the only caller.
+        let component = unsafe { Component::deserialize(&engine, artifact) }
             .map_err(wt)
-            .context("starting the wasm engine")?;
-        let component = Component::new(&engine, bytes).map_err(wt).context(
-            "this file is not a WebAssembly component — a plugin must be a \
-             component, not a core module",
-        )?;
+            .context(
+                "this precompiled plugin was not produced by this drsg build, or is damaged",
+            )?;
+        Self::finish(engine, component, options, limits)
+    }
 
+    /// The compiled form of this plugin, for [`Self::from_precompiled`].
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        if self.limits.fuel.is_none() {
+            bail!(
+                "only a fuel-metered plugin can be serialized — the artifact must match the engine every load uses"
+            );
+        }
+        self.instance_pre
+            .instance_pre()
+            .component()
+            .serialize()
+            .map_err(wt)
+            .context("serializing the compiled plugin")
+    }
+
+    /// Everything after the component exists: the import policy, one linking,
+    /// and the component's own account of itself.
+    fn finish(
+        engine: Engine,
+        component: Component,
+        options: Vec<(String, String)>,
+        limits: Limits,
+    ) -> Result<Self> {
         refuse_forbidden_imports(&engine, &component)?;
 
         // Link once. Instantiation from a pre-linked component is cheap; the

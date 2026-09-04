@@ -4,6 +4,46 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`drsg serve` keeps 20 commits of history, not all of it.** Time-travel
+  (`AS OF`, the dashboard's slider) reaches 20 commits back by default;
+  versions older than that are reclaimed at compaction. A watched repository
+  rewrites a node — embedding and all — every time its file changes, and with
+  unbounded history every rewrite stayed on disk and was re-read by every
+  compaction: this repository's own database held 402 commits of history in
+  175 MiB for a graph whose current state is a fraction of that. `[server]
+  retain_commits` sets the window; `0` keeps everything, as before. The
+  library default (`Database::set_retention`) is unchanged.
+- **`serve watch` keeps its plugins loaded across commits.** The watcher
+  loaded the plugin store afresh on every commit, so that a `drsg plugin
+  install` in between was picked up without a restart. It still is: the
+  loaded set is kept, and reloaded only when the store's registry changed
+  since the last load — which every install and remove does.
+- **Plugins are compiled once, at install.** `drsg plugin install` now keeps
+  the compiled form beside the wasm in the store, pinned by its own SHA-256
+  in `registry.toml`, and a load deserializes it in milliseconds instead of
+  compiling — which was seconds of CPU and hundreds of MiB for the official
+  parsers, paid on every `digest` and on every commit `serve watch` folded.
+  A store from an earlier release, or a `drsg update` that changed the
+  runtime, compiles on the first load and stores the result for the next.
+  With `[plugins] fuel = 0` every load still compiles: the artifact is
+  metered, and an unmetered engine cannot run it.
+- **Plugins compile on four threads, not every core.** Loading the installed
+  parser plugins compiled them on rayon's global pool — one worker per core,
+  each holding ~30 MiB of compiler state — and those workers, being global,
+  never exited, so their freed memory stayed resident in `drsg serve` for the
+  life of the process. Measured here: a digest of a 42-node crate peaked at
+  1.04 GiB on 32 cores, 285 MiB on four. Compilation now runs on a pool of at
+  most four threads that ends with the load.
+- **Compaction moves surviving versions instead of cloning them.** The native
+  engine's compaction merged every run into one map and then copied each
+  surviving key and value into a second — two copies of the whole store at the
+  peak, measured at ~400 MiB over a 175 MiB database. The garbage-collecting
+  pass now takes ownership of what it keeps, so the peak is near one copy.
+
 ## [2.4.2] - 2026-09-04
 
 ### Changed

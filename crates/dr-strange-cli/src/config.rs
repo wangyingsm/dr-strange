@@ -184,6 +184,11 @@ pub struct ServerCfg {
     /// How long one request's queries may run before stopping with a retryable
     /// timeout. `0` runs to completion; omitted means 60s.
     pub query_timeout_secs: Option<u64>,
+    /// How many commits of history stay reachable by time-travel; versions
+    /// older than that are reclaimed at compaction. `0` keeps every version
+    /// ever written (disk and compaction work then grow with the server's
+    /// life); omitted means 20.
+    pub retain_commits: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
     /// TLS certificate/key; when present, `serve` speaks HTTPS.
@@ -279,6 +284,10 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     if let Some(secs) = cfg.server.query_timeout_secs {
         opts.query_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
+    if let Some(commits) = cfg.server.retain_commits {
+        // 0 means "keep everything", the engine's own encoding of unbounded.
+        opts.retain_commits = (commits > 0).then_some(commits);
+    }
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {
             cert: tls.cert.clone(),
@@ -332,6 +341,7 @@ mod tests {
             addr = "0.0.0.0:9000"
             token = "secret"
             max_concurrent = 32
+            retain_commits = 5
             allowed_origins = ["https://a.example", "https://b.example"]
 
             [logging]
@@ -353,6 +363,7 @@ mod tests {
         assert_eq!(cfg.server.addr.unwrap().to_string(), "0.0.0.0:9000");
         assert_eq!(cfg.server.token.as_deref(), Some("secret"));
         assert_eq!(cfg.server.max_concurrent, Some(32));
+        assert_eq!(cfg.server.retain_commits, Some(5));
         assert_eq!(cfg.server.allowed_origins.as_ref().unwrap().len(), 2);
         assert_eq!(cfg.logging.dir.as_deref(), Some(Path::new("/var/log/drsg")));
         assert_eq!(
@@ -415,5 +426,18 @@ mod tests {
     #[test]
     fn no_tls_section_means_plain_http() {
         assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
+    }
+
+    #[test]
+    fn retain_commits_absent_is_the_default_and_zero_is_unbounded() {
+        let absent = serve_options(&parse("[server]\n"), None);
+        assert_eq!(
+            absent.retain_commits,
+            Some(dr_strange_web::DEFAULT_RETAIN_COMMITS)
+        );
+        let set = serve_options(&parse("[server]\nretain_commits = 7\n"), None);
+        assert_eq!(set.retain_commits, Some(7));
+        let unbounded = serve_options(&parse("[server]\nretain_commits = 0\n"), None);
+        assert_eq!(unbounded.retain_commits, None);
     }
 }

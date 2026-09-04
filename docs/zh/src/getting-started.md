@@ -219,6 +219,7 @@ $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 addr = "0.0.0.0:7700"                       # 监听地址（命令行 --addr 覆盖此项）
 token = "please-change-me"                  # 共享 API 令牌（→ DRSG_TOKEN）
 max_concurrent = 256                        # 并发请求上限
+retain_commits = 20                         # 时间旅行可回溯的提交数；更早的版本在压缩时回收（0 表示全部保留）
 source_root = "/srv/myrepo"                 # grep/snippet 智能体工具读取的源码树（serve watch 会用 --dir 设置它）
 allowed_origins = ["https://app.example.com"]  # 额外允许的浏览器来源
 
