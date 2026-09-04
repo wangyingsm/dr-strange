@@ -2630,6 +2630,10 @@ nav button,
 .q-labels {
   display: flex;
   flex-wrap: wrap;
+  /* Centred, not stretched: the cell is taller than a chip now that every row
+     is one height, and a flex line stretches its items to fill by default —
+     which would draw each pill as tall as the row it sits in. */
+  align-items: center;
   gap: 0.25rem;
 }
 .q-chip {
@@ -2744,7 +2748,13 @@ nav button,
   max-height: 60vh;
 }
 .q-result table {
-  border-collapse: collapse;
+  /* Separate, not collapsed. A collapsed rule between two rows is one edge
+     shared by the cells either side of it, and it is rasterized per cell — so
+     when the edge falls on a half pixel, some columns round it up and some
+     down and the line comes out stepped. Given its own border, every cell in
+     a row draws on the same scanline. */
+  border-collapse: separate;
+  border-spacing: 0;
   width: 100%;
   font-size: 0.8rem;
 }
@@ -2765,12 +2775,24 @@ nav button,
 .q-result td {
   font-family: ui-monospace, monospace;
 }
+/* One height for every row, said once rather than left to what the cells
+   happen to hold. A cell may hold a line of text, a label chip or a button,
+   and those are three different natural heights, none of them a whole number
+   of pixels; a row that takes the tallest of them lands on a fraction and
+   rounds it differently from the row above. The vertical room goes on the
+   cell, and the contents sit in the middle of it. */
+.q-result tbody td {
+  height: 2.25rem;
+  padding-top: 0;
+  padding-bottom: 0;
+  vertical-align: middle;
+}
 /* The brief clips; the button that opens the whole map never does. */
 .q-result .q-props {
   color: var(--muted);
   max-width: 42rem;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 0.4rem;
 }
 .q-brief {

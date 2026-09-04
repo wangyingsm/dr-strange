@@ -505,10 +505,16 @@
             {#each result.records.nodes as n, r (r)}
               <tr>
                 <td>{n.external_key ?? `#${n.id}`}</td>
-                <td class="q-labels">
-                  {#each n.labels ?? [] as l (l)}
-                    <span class="q-chip" style="--chip: {labelColor(l)}">{l}</span>
-                  {/each}
+                <td>
+                  <!-- The flex box is inside the cell, never the cell itself:
+                       `display: flex` on a `td` takes it out of table layout,
+                       so the row stops sizing it and its rule is drawn short
+                       of the rules either side of it. -->
+                  <div class="q-labels">
+                    {#each n.labels ?? [] as l (l)}
+                      <span class="q-chip" style="--chip: {labelColor(l)}">{l}</span>
+                    {/each}
+                  </div>
                 </td>
                 <td class="q-vec">
                   {#if vectorOf(n)}
@@ -520,15 +526,17 @@
                     <span class="q-none">—</span>
                   {/if}
                 </td>
-                <td class="q-props">
-                  <span class="q-brief">{brief(n)}</span>
-                  <button
-                    class="q-expand"
-                    onclick={() => (propsView = n)}
-                    title="Show every property"
-                  >
-                    <span class="q-braces" aria-hidden="true">{'{ }'}</span> expand
-                  </button>
+                <td>
+                  <div class="q-props">
+                    <span class="q-brief">{brief(n)}</span>
+                    <button
+                      class="q-expand"
+                      onclick={() => (propsView = n)}
+                      title="Show every property"
+                    >
+                      <span class="q-braces" aria-hidden="true">{'{ }'}</span> expand
+                    </button>
+                  </div>
                 </td>
               </tr>
             {/each}
