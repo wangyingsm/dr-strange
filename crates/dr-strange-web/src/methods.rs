@@ -992,7 +992,43 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         req.embed.as_deref().unwrap_or("openai"),
         &params,
         req.lean,
+        // An SDK caller asked for a query, not for a screenful of it.
+        Page::all(),
     )
+}
+
+/// One page of a result: where to start, and how many rows to carry.
+///
+/// A query says how many rows there are; a reader looks at a screenful. The
+/// two were the same number until a pattern over a real codebase answered with
+/// four thousand functions and every one of them carrying its own source —
+/// eleven megabytes to ship, parse and lay out, for a table nobody scrolls to
+/// the end of.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Page {
+    pub offset: usize,
+    /// `None` takes everything from `offset` on, which is what a caller that
+    /// asked for no page gets.
+    pub limit: Option<usize>,
+}
+
+impl Page {
+    /// Everything, from the top — what a caller that never asked for a page
+    /// has always received.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    fn of<T>(self, rows: Vec<T>) -> Vec<T> {
+        let mut rows = rows;
+        if self.offset > 0 {
+            rows.drain(..self.offset.min(rows.len()));
+        }
+        if let Some(limit) = self.limit {
+            rows.truncate(limit);
+        }
+        rows
+    }
 }
 
 /// Compile an openCypher-subset query (via dr-strange-parser) to a
@@ -1008,6 +1044,7 @@ pub fn cypher_subgraph(
     embed_provider: &str,
     params: &dr_strange_parser::Params,
     lean: bool,
+    page: Page,
 ) -> Result<Value, RpcError> {
     let embedder = make_embedder(embed_provider);
     let stmt = dr_strange_parser::parse_statement_full(
@@ -1042,9 +1079,22 @@ pub fn cypher_subgraph(
     // A projecting query has no induced subgraph to plot.
     let q = plane.query_from_plan(plan);
     if q.plan().project.is_some() {
-        return Ok(json::table_to_json(&app(q.table())?));
+        let table = app(q.table())?;
+        let total = table.rows.len();
+        let mut out = json::table_to_json(&table);
+        if let Value::Object(map) = &mut out {
+            let rows = map.get_mut("rows").and_then(Value::as_array_mut);
+            if let Some(rows) = rows {
+                *rows = page.of(std::mem::take(rows));
+            }
+            map.insert("total".into(), jval!(total));
+            map.insert("offset".into(), jval!(page.offset));
+        }
+        return Ok(out);
     }
-    let rows = app(q.scored_nodes())?;
+    let all = app(q.scored_nodes())?;
+    let total = all.len();
+    let rows = page.of(all);
 
     let set: std::collections::BTreeSet<u64> = rows.iter().map(|(n, _)| n.id.0).collect();
     let nodes: Vec<Value> = rows
@@ -1077,7 +1127,13 @@ pub fn cypher_subgraph(
         }
     }
 
-    Ok(jval!({ "nodes": nodes, "edges": edges, "count": set.len() }))
+    Ok(jval!({
+        "nodes": nodes,
+        "edges": edges,
+        "count": set.len(),
+        "total": total,
+        "offset": page.offset,
+    }))
 }
 
 // ---- graph-plot subgraph methods (chunk 2, arch/08 §2.2) ------------------

@@ -521,3 +521,85 @@ async fn a_query_result_elides_the_vectors_nobody_renders() {
         "asked for, the embedding is itself"
     );
 }
+
+/// A query answers with as many rows as it matches; the page shows a
+/// screenful, and says what it is a screenful of.
+#[tokio::test]
+async fn a_query_result_comes_a_page_at_a_time() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    for i in 0..7 {
+        rpc(
+            &client,
+            &base,
+            "node.create",
+            json!({ "plane": "startup", "key": format!("d{i}"), "labels": ["Doc"],
+                    "properties": { "n": i } }),
+        )
+        .await;
+    }
+
+    let page = |offset: usize, limit: usize| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!(
+                    "{base}/cypher?plane=startup&offset={offset}&limit={limit}"
+                ))
+                .header("origin", &base)
+                .body("MATCH (n:Doc) RETURN n")
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = page(0, 3).await;
+    assert_eq!(
+        first["nodes"].as_array().unwrap().len(),
+        3,
+        "a page of three"
+    );
+    assert_eq!(first["total"], 7, "of seven");
+    assert_eq!(first["offset"], 0);
+
+    let last = page(6, 3).await;
+    assert_eq!(
+        last["nodes"].as_array().unwrap().len(),
+        1,
+        "the tail is what is left, not an error"
+    );
+    assert_eq!(last["total"], 7);
+    assert_eq!(last["offset"], 6);
+
+    // Past the end is an empty page, not a failure.
+    let beyond = page(99, 3).await;
+    assert_eq!(beyond["nodes"].as_array().unwrap().len(), 0);
+    assert_eq!(beyond["total"], 7);
+
+    // A projection pages the same way, and still says how many rows there were.
+    let table: Value = client
+        .post(format!("{base}/cypher?plane=startup&offset=2&limit=2"))
+        .header("origin", &base)
+        .body("MATCH (n:Doc) RETURN n.n AS n ORDER BY n.n")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        table["rows"],
+        json!([[2], [3]]),
+        "the third and fourth rows"
+    );
+    assert_eq!(table["total"], 7);
+    assert_eq!(table["offset"], 2);
+}

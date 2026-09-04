@@ -729,12 +729,30 @@ struct CypherQuery {
     /// the server env supplies the key. Defaults to `openai`.
     #[serde(default)]
     embed: Option<String>,
+    /// The page to return: where to start, and how many rows. The dashboard
+    /// shows a screenful at a time — see [`PAGE`].
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
+
+/// Rows per page when the dashboard does not say otherwise.
+///
+/// A query answers with as many rows as it matches; a reader looks at a
+/// screenful. The two were the same number until a pattern over a real
+/// codebase answered with four thousand functions, each carrying its own
+/// source — eleven megabytes to ship, parse and lay out, for a table nobody
+/// scrolls to the end of. The count of what matched is still returned whole,
+/// so the page says what it is a page of.
+const PAGE: usize = 200;
 
 /// `POST /cypher?plane=startup` — the query text in the body, run against the
 /// plane. A read returns `{nodes, edges, count}` (the result set + induced
 /// edges) for the plot; a write (`CREATE`, …) mutates and returns its
-/// change-counts. **Write-gated**: the language can mutate, so this needs write
+/// change-counts. A read is **paged**: `offset` and `limit` (200 by default)
+/// say which rows come back, and `total` says how many there were.
+/// **Write-gated**: the language can mutate, so this needs write
 /// authorization even for a read query (the single-token model collapses the
 /// levels anyway; the browser UI is write-capable). Runs on a blocking task; a
 /// parse/compile error comes back as 400 with the message.
@@ -763,8 +781,8 @@ async fn cypher_http(
         Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
     };
-    let plane = q.plane;
-    let embed = q.embed.unwrap_or_else(|| "openai".to_string());
+    let plane = q.plane.clone();
+    let embed = q.embed.clone().unwrap_or_else(|| "openai".to_string());
 
     let built = tokio::task::spawn_blocking({
         let state = state.clone();
@@ -778,6 +796,10 @@ async fn cypher_http(
                 &embed,
                 &Default::default(),
                 true,
+                methods::Page {
+                    offset: q.offset.unwrap_or(0),
+                    limit: Some(q.limit.unwrap_or(PAGE)),
+                },
             )
         }
     })

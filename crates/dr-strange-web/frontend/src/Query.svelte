@@ -42,6 +42,11 @@
   let result = $state(null) // { table } | { records } | { write } | null
   let elapsed = $state(null) // ms of the last run, so a slow query says so
   let copied = $state(false)
+  // Which page of the answer is on screen. A query says how many rows it
+  // matched; a reader looks at a screenful, and the two stopped being the
+  // same number the first time a pattern matched four thousand functions.
+  const PAGE = 200
+  let offset = $state(0)
 
   // What a completion is for: the query up to the caret.
   const prefix = $derived(text.slice(0, caret))
@@ -123,9 +128,15 @@
     }
   }
 
-  async function run() {
+  /** Run from the top — what the Run button and ⌘/Ctrl+Enter do. */
+  function run() {
+    return runAt(0)
+  }
+
+  async function runAt(at) {
     const query = text.trim()
     if (!query || busy) return
+    offset = at
     busy = true
     error = null
     copied = false
@@ -134,7 +145,7 @@
     try {
       // POST /cypher is web-only, not an RPC method: a raw fetch carrying the
       // bearer token the RPC client would add.
-      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(provider)}`
+      const url = `/cypher?plane=${encodeURIComponent(plane)}&embed=${encodeURIComponent(provider)}&offset=${at}&limit=${PAGE}`
       const res = await fetch(url, {
         method: 'POST',
         headers: authHeaders({ 'content-type': 'text/plain' }),
@@ -192,6 +203,17 @@
       if (vectorView?.k === k) vectorView = { k, dims, values: null, error: e.message }
     }
   }
+
+  // What the header says about a paged answer: which rows these are, of how
+  // many there were.
+  // Rows on this page, not distinct nodes: a pattern can reach one node by
+  // several paths, and the page is of rows.
+  const shown = $derived(result?.table?.rows.length ?? result?.records?.nodes.length ?? 0)
+  const total = $derived(result?.table?.total ?? result?.records?.total ?? shown)
+  const pageOf = $derived(
+    total > shown ? `${offset + 1}–${offset + shown} of ${total}` : `${total}`,
+  )
+  const morePages = $derived(offset + shown < total)
 
   const changes = (w) =>
     [
@@ -272,11 +294,17 @@
     <div class="q-result">
       <header>
         <span>
-          {result.table.rows.length} row{result.table.rows.length === 1 ? '' : 's'} ·
+          {pageOf} row{total === 1 ? '' : 's'} ·
           {result.table.columns.length} column{result.table.columns.length === 1 ? '' : 's'}
           {#if elapsed != null} · {elapsed} ms{/if}
         </span>
-        <button class="copy" onclick={copy}>{copied ? 'copied' : 'copy'}</button>
+        <span class="q-pager">
+          {#if offset > 0 || morePages}
+            <button onclick={() => runAt(Math.max(0, offset - PAGE))} disabled={busy || offset === 0}>‹ prev</button>
+            <button onclick={() => runAt(offset + PAGE)} disabled={busy || !morePages}>next ›</button>
+          {/if}
+          <button class="copy" onclick={copy}>{copied ? 'copied' : 'copy'}</button>
+        </span>
       </header>
       <div class="q-scroll">
         <table>
@@ -298,10 +326,16 @@
     <div class="q-result">
       <header>
         <span>
-          {result.records.count} node{result.records.count === 1 ? '' : 's'} ·
+          {pageOf} node{total === 1 ? '' : 's'} ·
           {result.records.edges.length} edge{result.records.edges.length === 1 ? '' : 's'}
           {#if elapsed != null} · {elapsed} ms{/if}
         </span>
+        {#if offset > 0 || morePages}
+          <span class="q-pager">
+            <button onclick={() => runAt(Math.max(0, offset - PAGE))} disabled={busy || offset === 0}>‹ prev</button>
+            <button onclick={() => runAt(offset + PAGE)} disabled={busy || !morePages}>next ›</button>
+          </span>
+        {/if}
       </header>
       <div class="q-scroll">
         <table>

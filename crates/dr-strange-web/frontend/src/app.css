@@ -2455,6 +2455,30 @@ nav button,
   color: var(--muted);
 }
 
+/* Which rows are on screen, and how to reach the rest. */
+.q-pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.q-pager button {
+  font: 12px system-ui;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+}
+.q-pager button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.q-pager button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Between two properties in a result row. */
 .q-prop-sep {
   color: var(--muted);
