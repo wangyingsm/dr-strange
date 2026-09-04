@@ -1287,6 +1287,7 @@ dependencies = [
  "dr-strange-parser",
  "ego-tree",
  "futures-util",
+ "libc",
  "mime_guess",
  "postcard",
  "reqwest 0.12.28",
@@ -1305,6 +1306,7 @@ dependencies = [
  "tracing",
  "ureq",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

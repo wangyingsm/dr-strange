@@ -294,15 +294,57 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 }
 
 /// The process's resident set, in bytes — what the whole server holds right
-/// now, plugins and page cache of the database included. Read from
-/// `/proc/self/status`, so Linux only; anywhere else it is `None`, which the
-/// dashboard shows as a dash rather than a zero that would read as a
-/// measurement.
+/// now, plugins and page cache of the database included. Read the way each
+/// platform reports it: Linux from `/proc/self/status`, macOS from
+/// `proc_pidinfo`, Windows from `GetProcessMemoryInfo` (the working set,
+/// which is the figure Task Manager shows). Anywhere else it is `None`,
+/// which the dashboard shows as a dash rather than a zero that would read as
+/// a measurement.
 fn resident_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes into `info`, a
+        // plain C struct of exactly that size, and returns how many it wrote;
+        // anything short of the whole struct is treated as no answer.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&mut info as *mut libc::proc_taskinfo).cast::<libc::c_void>(),
+                size,
+            )
+        };
+        (got == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        counters.cb = cb;
+        // SAFETY: the current process's pseudo-handle needs no closing, and
+        // `counters` is a plain C struct whose `cb` states its size, which is
+        // all `GetProcessMemoryInfo` reads before writing into it.
+        let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) };
+        (ok != 0).then_some(counters.WorkingSetSize as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        None
+    }
 }
 
 /// Bytes the database occupies on disk. The native backend's "path" is a
