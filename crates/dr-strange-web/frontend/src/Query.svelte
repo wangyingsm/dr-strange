@@ -33,7 +33,9 @@
   let text = $state('')
   // Where the caret is, and the textarea itself — a completion is for the
   // text *before* the caret, and accepting one has to put the caret after it.
-  let caret = $state(text.length)
+  // It starts at the top because the box does; `track` reads it back from the
+  // DOM after anything that could move it.
+  let caret = $state(0)
   let box = $state(null)
   // The server's last answer: `{ prefix, plane, best, about, suggestions }`.
   let guess = $state(null)
