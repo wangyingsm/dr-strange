@@ -853,6 +853,24 @@ pub async fn run(
     if opts.follow.is_some() && !cfg!(feature = "native-backend") {
         anyhow::bail!("serve --follow requires the native-backend feature");
     }
+    // History retention (see `ServeOptions::retain_commits`): bound how far
+    // back time-travel reaches, so a long-lived server's store stays near the
+    // size of what it holds now. Native-only — the other engines keep no
+    // versions to bound. Set before the replica path too: a follower applies
+    // its master's commits through the same engine and compacts the same way.
+    #[cfg(feature = "native-backend")]
+    {
+        db.set_retention(opts.retain_commits);
+        match opts.retain_commits {
+            Some(n) => tracing::info!(
+                commits = n,
+                "history retention: time-travel reaches this many commits back; older versions are reclaimed at compaction"
+            ),
+            None => tracing::info!(
+                "history retention: unbounded — every version ever written stays on disk and in every compaction"
+            ),
+        }
+    }
 
     // `serve --follow`: bootstrap from the master before this server ever
     // answers a request — an empty database serving reads would just be

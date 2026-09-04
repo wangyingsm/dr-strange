@@ -243,6 +243,7 @@ if present. Unknown keys are rejected.
 addr = "0.0.0.0:7700"                       # bind address (CLI --addr overrides)
 token = "please-change-me"                  # shared API token (→ DRSG_TOKEN)
 max_concurrent = 256                        # ceiling on in-flight requests
+retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all)
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins
 

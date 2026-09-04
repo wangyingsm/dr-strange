@@ -8,6 +8,15 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ### Changed
 
+- **`drsg serve` keeps 20 commits of history, not all of it.** Time-travel
+  (`AS OF`, the dashboard's slider) reaches 20 commits back by default;
+  versions older than that are reclaimed at compaction. A watched repository
+  rewrites a node — embedding and all — every time its file changes, and with
+  unbounded history every rewrite stayed on disk and was re-read by every
+  compaction: this repository's own database held 402 commits of history in
+  175 MiB for a graph whose current state is a fraction of that. `[server]
+  retain_commits` sets the window; `0` keeps everything, as before. The
+  library default (`Database::set_retention`) is unchanged.
 - **Compaction moves surviving versions instead of cloning them.** The native
   engine's compaction merged every run into one map and then copied each
   surviving key and value into a second — two copies of the whole store at the

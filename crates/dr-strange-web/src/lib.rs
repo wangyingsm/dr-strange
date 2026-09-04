@@ -81,6 +81,18 @@ pub struct ServeOptions {
     /// query is someone else's, and since `/mcp` shipped an agent's runaway
     /// `MATCH` had nothing bounding it at all.
     pub query_timeout: Option<Duration>,
+    /// How many commits back time-travel (`AS OF`) can reach; versions older
+    /// than that are reclaimed at compaction. `None` keeps every version ever
+    /// written.
+    ///
+    /// Bounded here, unlike an embedded `Database`, because a server lives
+    /// long: `serve watch` rewrites a node — embedding and all — every time
+    /// its file changes, and with unbounded history each rewrite stays on disk
+    /// forever and is re-read by every compaction. Measured on this
+    /// repository's own database: 402 commits of history made a 175 MiB
+    /// store of a graph whose current state is a fraction of that, and each
+    /// compaction walked all of it.
+    pub retain_commits: Option<u64>,
     /// When set, `/mcp`'s `write_nodes` embeds the nodes it writes —
     /// `(preset-or-url, model, key-env)`. Configured by the operator rather
     /// than asked for per call, so an agent cannot write silently unsearchable
@@ -179,6 +191,7 @@ impl Default for ServeOptions {
             fetch: FetchDefaults::default(),
             write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
             query_timeout: Some(DEFAULT_QUERY_TIMEOUT),
+            retain_commits: Some(DEFAULT_RETAIN_COMMITS),
             embed_provider: None,
             source_root: None,
             on_start: None,
@@ -194,6 +207,11 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Long enough that an ordinary import or digest is waited out, short enough
 /// that a client learns the writer is busy rather than hanging on it.
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Enough history for the dashboard's time slider and an agent's "what did
+/// this look like before that change" to have somewhere to go, while keeping
+/// the store close to the size of what it currently holds.
+pub const DEFAULT_RETAIN_COMMITS: u64 = 20;
 
 /// Serves `db` (whose file lives at `db_path`, if on disk) per `opts` until a
 /// shutdown signal (Ctrl-C / SIGTERM) — or, in `--follow` mode, until the

@@ -141,7 +141,11 @@ time slider.
 
 **Forks settled.** Native MVCC only (redb/memory reject AS OF); both seq and
 timestamp addressing (commit-time stamped in Meta on every write); retention
-default unbounded with an opt-in commit-count window bounding compaction GC.
+default unbounded in the library, with a commit-count window bounding
+compaction GC — `drsg serve` sets that window to 20 commits (`[server]
+retain_commits`, 0 for unbounded), because a watched repository rewrites
+nodes on every commit and unbounded history made the store, and every
+compaction over it, grow for as long as the server lived.
 
 ---
 

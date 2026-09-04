@@ -25,6 +25,13 @@ write_timeout_secs = 30
 # indefinitely. Cooperative and row-paced: it stops work that flows, not a graph
 # algorithm mid-iteration. Default 60. Set 0 to run to completion.
 query_timeout_secs = 60
+# How many commits of history stay reachable by time-travel (AS OF, the
+# dashboard's time slider). Versions older than that are reclaimed at
+# compaction, which keeps the store near the size of what it holds now — a
+# watched repository rewrites a node, embedding and all, every time its file
+# changes. Default 20. Set 0 to keep every version ever written; disk and
+# compaction work then grow for as long as the server lives.
+retain_commits = 20
 # Extra browser origins allowed past the CSRF guard (→ DRSG_ALLOWED_ORIGINS).
 allowed_origins = ["https://app.example.com"]
 
