@@ -94,6 +94,24 @@ $ drsg --db graph.drsg query - --plane social < plan.json
 $ drsg --db graph.drsg catalog --plane social
 ```
 
+每一条成功执行的查询都会被记录下来——无论它来自 CLI、仪表盘，还是通过 MCP 发起的
+智能体。`queries` 按时间倒序列出已执行的查询，每行包含 id、时间、平面以及折叠为单行
+的查询文本；带上 id 则单独打印该条查询的原文。`cypher --history` 会重新执行一条已
+记录的查询，并默认使用它当初所针对的平面，除非 `--plane` 另有指定：
+
+```console
+$ drsg --db graph.drsg queries --limit 5
+4	2026-09-05 08:14:02Z	social	MATCH (p:Person) WHERE p.age >= $min RETURN p
+3	2026-09-05 08:11:47Z	social	MATCH (p:Person) RETURN count(*) AS people
+
+$ drsg --db graph.drsg queries 3 > last.cypher
+$ drsg --db graph.drsg cypher --history 3
+```
+
+历史记录有容量上限——默认为两百条——新记录到来时最旧的一条会被清除。重新执行最近
+一条已记录的查询只会更新它的时间戳，而不会再添加一份副本。请注意 `drsg history`
+是另一条命令：它列出的是某个仓库的提交历史。
+
 ## 图算法
 
 ```console

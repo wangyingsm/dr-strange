@@ -104,6 +104,26 @@ $ drsg --db graph.drsg query - --plane social < plan.json
 $ drsg --db graph.drsg catalog --plane social
 ```
 
+Every query that runs — from the CLI, the dashboard, or an agent over MCP — is
+recorded. `queries` lists what has run, newest first, as id, time, plane and
+the query folded onto one line; with an id it prints that one query's text
+alone. `cypher --history` runs a recorded query again, against the plane it was
+written for unless `--plane` says otherwise:
+
+```console
+$ drsg --db graph.drsg queries --limit 5
+4	2026-09-05 08:14:02Z	social	MATCH (p:Person) WHERE p.age >= $min RETURN p
+3	2026-09-05 08:11:47Z	social	MATCH (p:Person) RETURN count(*) AS people
+
+$ drsg --db graph.drsg queries 3 > last.cypher
+$ drsg --db graph.drsg cypher --history 3
+```
+
+The history is capped — two hundred entries by default — and the oldest is
+dropped as a new one arrives. Re-running the query most recently recorded
+restamps its entry rather than adding a second copy. Note that `drsg history`
+is a different command: that one is a repository's commits.
+
 ## Graph algorithms
 
 ```console
