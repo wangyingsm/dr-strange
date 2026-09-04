@@ -92,7 +92,11 @@ pub fn resolve(plane: &PlaneHandle<'_>, name: &str) -> Result<Resolved> {
     })
 }
 
-fn candidates(name: &str, hits: &[NodeRecord]) -> String {
+/// The one-call reply to an ambiguous name: the candidates, one per line, so
+/// the exact-key retry costs one call. Public because every verb that
+/// resolves a name — in this crate and in the MCP layer — answers ambiguity
+/// the same way.
+pub fn candidates(name: &str, hits: &[NodeRecord]) -> String {
     let mut out = format!(
         "`{name}` is ambiguous — {} matches; call again with an exact key:\n",
         hits.len()

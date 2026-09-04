@@ -260,7 +260,7 @@ they live with the server).
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
-| `snippet` | one symbol's source text |
+| `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 | `history` | the repository behind the code: HEAD, branches, tags, rebases and the newest commits |
 
 Two disciplines run through every tool. An ambiguous name is never

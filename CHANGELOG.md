@@ -18,6 +18,15 @@ All notable changes to Dr Strange are documented here. The format is based on
   rather than a `sed -n` on the file. Those three gaps were, measured over a
   long session with the graph attached, most of the reasons an agent reached
   past the verb for a shell command.
+- **`snippet` reads a range of a file, and every answer says what to call
+  next.** `snippet src/lib.rs:120-180` reads those lines — the `sed -n` that
+  a `grep` hit or a body longer than one answer used to send an agent to the
+  shell for — and says which symbol the range opens in. A symbol answer now
+  ends with the `context` call that expands it, an answer that stops short
+  of a body says the exact range that reads on, an ambiguous name comes
+  back with the candidates rather than a count, and a miss points at `grep`
+  and at the range form instead of leaving the agent to guess. The per-call
+  cap rose from 200 lines to 400.
 
 ### Changed
 

@@ -195,7 +195,7 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 | `trace` | 一个符号如何到达另一个：图中记录的最短调用路径 |
 | `impact` | 影响范围：所有能到达该符号的东西，按距离分组 |
 | `fathom` | 一个符号身处怎样的地方：几跳之内的区域，按标签与边类型计数，并给出枢纽 |
-| `snippet` | 一个符号的源码文本 |
+| `snippet` | 一个符号的源码文本，或文件的某个行区间（`path:start-end`）——智能体不再需要的那条 `sed -n` |
 | `history` | 代码背后的仓库：HEAD、分支、标签、变基与最新的提交 |
 
 两条纪律贯穿整套工具。歧义的名字从不猜测：回答是一份候选清单，由调用方挑选。

@@ -91,7 +91,7 @@ and `snippet` read the watched source tree, so they live with the server):
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
-| `snippet` | one symbol's source text |
+| `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 
 Every answer is compact one-fact-per-line text, sized for a model's context
 window rather than a terminal, and `context` keeps itself within a fixed

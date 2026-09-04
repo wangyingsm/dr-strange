@@ -725,8 +725,13 @@ struct HistoryReq {
 struct SnippetReq {
     #[serde(default = "default_plane")]
     plane: String,
+    /// A symbol (fuzzy: an exact key, a `::name`/`.name` suffix, or a
+    /// substring) — or a file range, `path:line` / `path:start-end`, relative
+    /// to the tree's root, for the lines around a `grep` hit or the rest of a
+    /// long body.
     name: String,
-    /// Lines of source returned from the declaration down (default 40).
+    /// Lines of source returned from the declaration down (default 40,
+    /// capped at 400). The answer says how to read on when it stops short.
     #[serde(default)]
     lines: Option<usize>,
 }
@@ -1723,30 +1728,133 @@ fn digest_logic(
 
 /// `snippet`'s body. `fallback_root` is the tree the process was started with,
 /// used only when the plane does not record one of its own.
+/// Most lines one `snippet` answer carries. Past this a body is read in
+/// ranges, which the answer spells out.
+const SNIPPET_CAP: usize = 400;
+
+/// `snippet`'s range form: `path:line` or `path:start-end`. A path is told
+/// from a symbol by looking like one — a separator or an extension, and no
+/// `::` — so `src/lib.rs:12` is a range and `a::b` never is.
+fn parse_range(name: &str) -> Option<(&str, usize, usize)> {
+    let (path, span) = name.rsplit_once(':')?;
+    if path.is_empty() || path.contains("::") || !(path.contains('/') || path.contains('.')) {
+        return None;
+    }
+    let (start, end) = match span.split_once('-') {
+        Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
+        None => {
+            let line: usize = span.parse().ok()?;
+            (line, line)
+        }
+    };
+    (start >= 1 && end >= start).then_some((path, start, end))
+}
+
+/// Lines `start..=end` of `file` under `root`, numbered, with the symbol the
+/// range opens in when the plane knows one — so a range read is still
+/// anchored to a key `context` can take.
+fn read_range(
+    root: &std::path::Path,
+    file: &str,
+    start: usize,
+    end: usize,
+    symbols: Option<&SymbolIndex>,
+) -> AnyResult<String> {
+    let text = std::fs::read_to_string(root.join(file))
+        .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+    let total = text.lines().count();
+    if start > total {
+        anyhow::bail!("{file} has {total} lines; line {start} is past its end");
+    }
+    let end = end.min(total).min(start + SNIPPET_CAP - 1);
+    let slice: Vec<&str> = text.lines().skip(start - 1).take(end + 1 - start).collect();
+    let mut out = format!("{file}:{start}-{end} ({} lines of {total})\n", slice.len());
+    if let Some(key) = symbols.and_then(|s| s.enclosing(file, start)) {
+        out.push_str(&format!("in {key}\n"));
+    }
+    for (i, l) in slice.iter().enumerate() {
+        out.push_str(&format!("{:>5} | {l}\n", start + i));
+    }
+    if end < total {
+        out.push_str(&format!(
+            "… {file} continues to line {total}; snippet {file}:{}-{} reads on\n",
+            end + 1,
+            (end + SNIPPET_CAP).min(total)
+        ));
+    }
+    Ok(out)
+}
+
+/// `snippet`'s body. `fallback_root` is the tree the process was started with,
+/// used only when the plane does not record one of its own.
 fn snippet_logic(
     db: &Database,
     fallback_root: Option<&std::path::Path>,
     req: SnippetReq,
 ) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
+    // `file` is relative to whatever directory *this plane* was parsed from,
+    // which the digest records on the plane as `synced_root`. The process's own
+    // tree is only a fallback: once a server holds a second code plane, using it
+    // reads another repository's file at the same relative path — a plausible
+    // answer with no error, which is worse than failing.
+    let plane_root = plane.properties().ok().and_then(|props| {
+        match props.get("synced_root").map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
+            _ => None,
+        }
+    });
+    let root = plane_root.as_deref().or(fallback_root);
+    let no_tree = || {
+        anyhow::anyhow!(
+            "no stored source, and no source tree for this plane — the plane \
+             records no `synced_root` and none is attached to this server; \
+             digest with include_source, or attach the tree (`serve watch` \
+             does; [server] source_root otherwise)"
+        )
+    };
+
+    if let Some((file, start, end)) = parse_range(&req.name) {
+        let root = root.ok_or_else(no_tree)?;
+        let symbols = SymbolIndex::from_plane(&plane)?;
+        return Ok(Value::String(read_range(
+            root,
+            file,
+            start,
+            end,
+            Some(&symbols),
+        )?));
+    }
+
     let node = match dr_strange_core::compact::resolve(&plane, &req.name)? {
         dr_strange_core::compact::Resolved::One(n) => n,
         dr_strange_core::compact::Resolved::Many(hits) => {
             anyhow::bail!(
-                "`{}` is ambiguous — {} matches; use an exact key",
-                req.name,
-                hits.len()
+                "{}",
+                dr_strange_core::compact::candidates(&req.name, &hits).trim_end()
             );
         }
         dr_strange_core::compact::Resolved::None => {
-            anyhow::bail!("no symbol matches `{}` in this plane", req.name);
+            anyhow::bail!(
+                "no symbol matches `{}` in this plane — `grep` finds the text and \
+                 names the symbol it sits in; `snippet <path>:<line>[-<end>]` \
+                 reads a range of a file",
+                req.name
+            );
         }
     };
+    let key = node.external_key.clone().unwrap_or_default();
+    let next_call = format!("context {key} — callers, callees and every other edge\n");
     // The digest's own copy first — exact by construction.
     if let Some(dr_strange_core::PropValue::Str(src)) =
         node.properties.get("source").map(|d| &d.value)
     {
-        return Ok(Value::String(src.clone()));
+        let mut out = src.clone();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&next_call);
+        return Ok(Value::String(out));
     }
     let file =
         ["file", "path"]
@@ -1759,36 +1867,28 @@ fn snippet_logic(
         Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
         _ => None,
     };
-    // `file` is relative to whatever directory *this plane* was parsed from,
-    // which the digest records on the plane as `synced_root`. The process's own
-    // tree is only a fallback: once a server holds a second code plane, using it
-    // reads another repository's file at the same relative path — a plausible
-    // answer with no error, which is worse than failing.
-    let plane_root = plane.properties().ok().and_then(|props| {
-        match props.get("synced_root").map(|d| &d.value) {
-            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
-            _ => None,
-        }
-    });
-    let (Some(root), Some(file), Some(line)) =
-        (plane_root.as_deref().or(fallback_root), file, line)
-    else {
-        anyhow::bail!(
-            "no stored source, and no source tree for this plane — the plane \
-             records no `synced_root` and none is attached to this server; \
-             digest with include_source, or attach the tree (`serve watch` \
-             does; [server] source_root otherwise)"
-        );
+    let (Some(root), Some(file), Some(line)) = (root, file, line) else {
+        return Err(no_tree());
     };
     let text = std::fs::read_to_string(root.join(&file))
         .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
-    let want = req.lines.unwrap_or(40).clamp(1, 200);
+    let want = req.lines.unwrap_or(40).clamp(1, SNIPPET_CAP);
     let start = line.saturating_sub(1);
+    let total = text.lines().count();
     let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
     let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
     for (i, l) in slice.iter().enumerate() {
         out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
     }
+    let shown_through = start + slice.len();
+    if shown_through < total {
+        out.push_str(&format!(
+            "… continues; snippet {file}:{}-{} reads on (or raise `lines`)\n",
+            shown_through + 1,
+            (shown_through + want).min(total)
+        ));
+    }
+    out.push_str(&next_call);
     Ok(Value::String(out))
 }
 
@@ -2003,10 +2103,14 @@ impl DrStrange {
         .await
     }
 
-    #[tool(description = "One symbol's source text: from the graph when the \
-        digest stored it, else read at the symbol's recorded file:line from \
-        the tree that plane was parsed from (its `synced_root`), falling back \
-        to the tree attached to this server. Fuzzy name.")]
+    #[tool(description = "Source text — use this instead of `cat`, `sed -n` or \
+        reading a file to see a function. A symbol by fuzzy name gives its \
+        body from the declaration down (from the graph when the digest \
+        stored it, else read at its recorded file:line from the tree the \
+        plane was parsed from), ending with the `context` call that expands \
+        it; `path:line` or `path:start-end` gives a range of a file, for the \
+        lines around a `grep` hit or the rest of a long body, and says which \
+        symbol it opens in. An answer that stops short says how to read on.")]
     async fn snippet(
         &self,
         Parameters(req): Parameters<SnippetReq>,
@@ -3215,5 +3319,133 @@ mod snippet_tests {
             .is_err()
         );
         let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    fn ask(
+        db: &Database,
+        root: &std::path::Path,
+        plane: &str,
+        name: &str,
+        lines: Option<usize>,
+    ) -> AnyResult<String> {
+        snippet_logic(
+            db,
+            Some(root),
+            from_value(jval!({"plane": plane, "name": name, "lines": lines})).unwrap(),
+        )
+        .map(|v| v.as_str().unwrap().to_string())
+    }
+
+    /// A symbol answer ends by naming the call that expands it, and one that
+    /// stops short of the body's end says how to read on.
+    #[test]
+    fn a_symbol_answer_points_at_context_and_at_the_rest() {
+        let (a, _b) = two_repos("hint");
+        std::fs::write(
+            a.join("src/lib.rs"),
+            (1..=12).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+
+        let out = ask(&db, &a, "p", "f", Some(5)).unwrap();
+        assert!(out.starts_with("src/lib.rs:1 (5 lines)\n"), "{out}");
+        assert!(out.contains("    5 | line 5\n"), "{out}");
+        assert!(
+            out.contains("snippet src/lib.rs:6-10 reads on"),
+            "the rest is one call away: {out}"
+        );
+        assert!(
+            out.ends_with("context f — callers, callees and every other edge\n"),
+            "{out}"
+        );
+
+        // Asking for more than there is: no continuation line.
+        let whole = ask(&db, &a, "p", "f", Some(50)).unwrap();
+        assert!(!whole.contains("reads on"), "{whole}");
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    /// `path:line` and `path:start-end` read a file directly, anchored to the
+    /// symbol the range opens in.
+    #[test]
+    fn a_range_reads_the_file_and_names_the_symbol_it_opens_in() {
+        let (a, _b) = two_repos("range");
+        std::fs::write(
+            a.join("src/lib.rs"),
+            (1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+
+        let out = ask(&db, &a, "p", "src/lib.rs:3-5", None).unwrap();
+        assert_eq!(
+            out,
+            "src/lib.rs:3-5 (3 lines of 20)\nin f\n    3 | line 3\n    4 | line 4\n    5 | line 5\n\
+             … src/lib.rs continues to line 20; snippet src/lib.rs:6-20 reads on\n"
+        );
+        let one = ask(&db, &a, "p", "src/lib.rs:20", None).unwrap();
+        assert!(
+            one.starts_with("src/lib.rs:20-20 (1 lines of 20)\n"),
+            "{one}"
+        );
+        assert!(!one.contains("reads on"), "{one}");
+        let past = ask(&db, &a, "p", "src/lib.rs:21", None);
+        assert!(past.is_err(), "a line past the end is an error");
+        // A range through a file the plane knows nothing about still reads.
+        std::fs::write(a.join("notes.md"), "a\nb\n").unwrap();
+        let notes = ask(&db, &a, "p", "notes.md:1-2", None).unwrap();
+        assert!(
+            notes.starts_with("notes.md:1-2 (2 lines of 2)\n    1 | a\n"),
+            "{notes}"
+        );
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn a_miss_points_at_grep_and_ambiguity_lists_the_candidates() {
+        let (a, _b) = two_repos("miss");
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"plane": "p", "nodes": [
+                {"external_key": "x::f", "labels": ["Function"],
+                 "properties": {"file": "src/lib.rs", "line": 1}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let miss = ask(&db, &a, "p", "nothing_here", None)
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("`grep` finds the text"), "{miss}");
+        assert!(miss.contains("snippet <path>:<line>"), "{miss}");
+
+        // `f` is exact for the key `f`; `::f` as a suffix is not ambiguous
+        // either — but a substring that hits both is, and both are named.
+        let both = ask(&db, &a, "p", "f", None);
+        assert!(both.is_ok(), "an exact key wins outright");
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn a_range_is_told_from_a_symbol_by_its_shape() {
+        assert_eq!(parse_range("src/lib.rs:12"), Some(("src/lib.rs", 12, 12)));
+        assert_eq!(parse_range("src/lib.rs:3-5"), Some(("src/lib.rs", 3, 5)));
+        assert_eq!(parse_range("README.md:1"), Some(("README.md", 1, 1)));
+        assert_eq!(parse_range("a::b"), None);
+        assert_eq!(parse_range("a::b:3"), None);
+        assert_eq!(
+            parse_range("plain:3"),
+            None,
+            "no separator, no extension: a name"
+        );
+        assert_eq!(parse_range("src/lib.rs:0"), None, "lines start at 1");
+        assert_eq!(parse_range("src/lib.rs:5-3"), None, "backwards");
     }
 }
