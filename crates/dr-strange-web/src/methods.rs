@@ -685,6 +685,7 @@ fn expects_tag(e: &Expect) -> &'static str {
         Expect::Property { .. } => "property",
         Expect::Value => "value",
         Expect::SortKey { .. } => "sort-key",
+        Expect::Argument { .. } => "argument",
         Expect::Clause { .. } => "clause",
         Expect::Nothing => "nothing",
     }
@@ -722,6 +723,7 @@ fn expects_about(e: &Expect) -> String {
         Expect::Property { var, label: None } => format!("properties of {var}"),
         Expect::Value => "a value only you know".into(),
         Expect::SortKey { .. } => "what to sort on".into(),
+        Expect::Argument { .. } => "what the call takes".into(),
         Expect::Clause { .. } => "what comes after".into(),
         Expect::Nothing => "inside a string".into(),
     }

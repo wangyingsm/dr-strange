@@ -111,6 +111,8 @@ pub enum Expect {
     Value,
     /// The key a `ORDER BY` sorts on.
     SortKey { vars: Vec<String> },
+    /// What a call takes: `key(` wants a variable, `collect(` a value of one.
+    Argument { vars: Vec<String> },
     /// A clause that may follow a complete one — `ORDER BY`, `LIMIT`,
     /// `AS OF`. `done` are the ones already written, which cannot come again.
     Clause { done: Vec<String> },
@@ -319,6 +321,8 @@ enum Pos {
     Projection,
     /// After a variable in a clause: `.`, an operator, `AS`, `,`.
     Term,
+    /// Inside a call's brackets: `key(`, `count(`, `collect(`.
+    Call,
     /// After `n.`: a property name.
     Property(String),
     /// After a comparison operator.
@@ -466,6 +470,7 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
         },
         Pos::Value => Expect::Value,
         Pos::Sort => Expect::SortKey { vars: s.names() },
+        Pos::Call => Expect::Argument { vars: s.names() },
         Pos::Term | Pos::Clause => Expect::Clause {
             done: s.done.clone(),
         },
@@ -561,6 +566,16 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
             s.pos = Pos::Property(s.term.clone().unwrap_or_default());
         }
         (Pos::Property(_), Tok::Word(_)) => s.pos = Pos::Term,
+        // `key(`, `count(`, `collect(` — what follows the bracket is a term of
+        // its own, and the name before it was the call's, not a variable's:
+        // without this, the `.` in `collect(m.file)` would be read as a
+        // property of `collect`.
+        (Pos::Term, Tok::Punct("(")) => s.pos = Pos::Call,
+        (Pos::Call, Tok::Word(w)) => {
+            s.term = Some((*w).to_string());
+            s.pos = Pos::Term;
+        }
+        (Pos::Call, Tok::Punct("*")) => s.pos = Pos::Term,
         (Pos::Term, Tok::Punct(p)) if is_comparison(p) => s.pos = Pos::Value,
         (Pos::Term, Tok::Punct(",")) => s.pos = Pos::Projection,
         (Pos::Value, Tok::Str | Tok::Num) => s.pos = Pos::Clause,
@@ -668,15 +683,24 @@ fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Sugg
             // `RETURN p.name`).
             let terminal: Vec<String> = vars.iter().rev().cloned().collect();
             let mut out = variables(&terminal, word);
+            out.extend(keys_of(&terminal, word));
             out.extend(keywords(FOLDS, word));
             out
+        }
+        // A sort is by a value, and the value a node is usually sorted by is
+        // the name it goes under.
+        Expect::SortKey { vars } => {
+            let terminal: Vec<String> = vars.iter().rev().cloned().collect();
+            let mut out = keys_of(&terminal, word);
+            out.extend(variables(&terminal, word));
+            out.extend(keywords(FOLDS, word));
+            out
+        }
+        Expect::Argument { vars } => {
+            let terminal: Vec<String> = vars.iter().rev().cloned().collect();
+            variables(&terminal, word)
         }
         Expect::Property { label, .. } => properties(word, vocab, label.as_deref()),
-        Expect::SortKey { vars } => {
-            let mut out = variables(vars, word);
-            out.extend(keywords(FOLDS, word));
-            out
-        }
         Expect::Clause { done } => keywords(TAIL, word)
             .into_iter()
             .filter(|s| !done.iter().any(|d| d.eq_ignore_ascii_case(&s.text)))
@@ -727,6 +751,21 @@ fn fit_case(keyword: &str, word: &str) -> String {
     } else {
         keyword.to_string()
     }
+}
+
+/// `key(n)` for each bound variable: the external key is what a node is called,
+/// and a table of nodes is nearly always a table of what they are called.
+fn keys_of(vars: &[String], word: &str) -> Vec<Suggestion> {
+    vars.iter()
+        .map(|v| format!("key({v})"))
+        .filter(|k| starts_with(k, word))
+        .map(|k| Suggestion {
+            insert: k[word.len()..].to_string(),
+            text: k,
+            detail: Some("what it is called".to_string()),
+            kind: Kind::Snippet,
+        })
+        .collect()
 }
 
 /// The variables the pattern bound, which is what a predicate or a projection

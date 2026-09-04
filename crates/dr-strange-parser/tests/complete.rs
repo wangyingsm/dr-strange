@@ -645,7 +645,7 @@ fn a_finished_query_is_not_offered_the_same_clause_again() {
     assert_eq!(best("MATCH (n:Function) RETURN n "), "ORDER BY");
     assert_eq!(
         best("MATCH (n:Function) RETURN n ORDER BY "),
-        "n",
+        "key(n)",
         "a key to sort on"
     );
     let after = texts("MATCH (n:Function) RETURN n ORDER BY n ");
@@ -653,4 +653,86 @@ fn a_finished_query_is_not_offered_the_same_clause_again() {
     assert_eq!(after.first().map(String::as_str), Some("LIMIT"));
     let after = texts("MATCH (n:Function) RETURN n ORDER BY n LIMIT 10 ");
     assert!(!after.contains(&"LIMIT".to_string()), "{after:?}");
+}
+
+/// What a projection is actually written with: the variable, what it is
+/// called, and the folds — in that order, because a table of nodes is nearly
+/// always a table of their names.
+#[test]
+fn a_projection_offers_the_key_of_each_variable() {
+    assert_eq!(
+        texts("MATCH (n:Function)-[:CALLS]->(m:Function) RETURN ")[..4],
+        ["m", "n", "key(m)", "key(n)"]
+    );
+    assert_eq!(best("MATCH (n:Function) RETURN key"), "(n)");
+    assert!(texts("MATCH (n:Function) RETURN ").contains(&"count(*)".to_string()));
+}
+
+/// A sort is by a value, and the value a node is sorted by is its key.
+#[test]
+fn a_sort_key_leads_with_the_key() {
+    assert_eq!(
+        best("MATCH (n:Function)-[:CALLS]->(m:Function) RETURN key(m) ORDER BY "),
+        "key(m)"
+    );
+}
+
+/// A call has an inside: what goes in it is a variable, and the name before
+/// the bracket was the call's own.
+#[test]
+fn a_call_takes_the_bound_variables() {
+    let c = complete(
+        "MATCH (n:Function)-[:CALLS]->(m:Function) RETURN key(",
+        &code(),
+    );
+    assert_eq!(
+        c.expects,
+        Expect::Argument {
+            vars: vec!["n".into(), "m".into()]
+        }
+    );
+    assert_eq!(c.best.as_deref(), Some("m"), "the terminal one first");
+
+    // And the property after it belongs to the variable, not to the call:
+    // `collect(m.` is a property of `m`.
+    assert_eq!(
+        complete("MATCH (n:Function) RETURN collect(n.", &code()).expects,
+        Expect::Property {
+            var: "n".into(),
+            label: Some("Function".into()),
+        }
+    );
+    assert_eq!(best("MATCH (n:Function) RETURN collect(n."), "file");
+}
+
+/// The whole of the query that was reported, typed from nothing: every stage
+/// of it is a completion away.
+#[test]
+fn the_shape_of_a_real_query_is_reachable() {
+    let steps = [
+        ("", "MATCH"),
+        ("MATCH ", "(n:Function)"),
+        ("MATCH (n:Function)<", "-[:CALLS]-(m:Function)"),
+        ("MATCH (n:Function)<-[:CALLS]-(m:Function) ", "RETURN"),
+        ("MATCH (n:Function)<-[:CALLS]-(m:Function) RETURN ", "m"),
+        (
+            "MATCH (n:Function)<-[:CALLS]-(m:Function) RETURN key(m), m.",
+            "file",
+        ),
+        (
+            "MATCH (n:Function)<-[:CALLS]-(m:Function) RETURN key(m), m.file ",
+            "ORDER BY",
+        ),
+        (
+            "MATCH (n:Function)<-[:CALLS]-(m:Function) RETURN key(m), m.file ORDER BY ",
+            "key(m)",
+        ),
+    ];
+    for (prefix, want) in steps {
+        assert_eq!(best(prefix), want, "at `{prefix}`");
+    }
+    assert!(
+        parse("MATCH (n:Function)<-[:CALLS]-(m:Function) RETURN key(m), m.file ORDER BY key(m)")
+            .is_ok()
+    );
 }
