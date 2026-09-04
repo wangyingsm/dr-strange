@@ -36,6 +36,18 @@ All notable changes to Dr Strange are documented here. The format is based on
   thinking when it reaches for the shell, and `list_planes` reports
   `source_tree` per plane — attached, readable, or absent here — so an agent
   learns whether the verbs can read the source before it tries a shell.
+- **`drsg init` installs Claude Code hooks that redirect shell searches to
+  the graph.** In the repository's `.claude/settings.local.json` (the
+  per-user file), with the scripts beside the plugin store: a `SessionStart`
+  hook that puts the rule — drsg first for every code question, shell last —
+  in the agent's context where it survives a resume and a compaction, and a
+  `PreToolUse` hook on `Bash` that meets an `rg`, `grep`, `cat` or `sed -n`
+  on code with the verb that answers instead. `DRSG_RAW=1 <command>` runs
+  any command untouched. A config tells an agent where the graph is; these
+  tell it when to use it — measured over a long session, the config alone
+  did not. Written only when Claude Code shows itself (`.claude/` in the
+  repository, or `~/.claude`), idempotent, and other people's hooks in the
+  file are left as they are.
 
 ### Changed
 

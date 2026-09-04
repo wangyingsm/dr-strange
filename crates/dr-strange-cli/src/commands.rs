@@ -347,6 +347,14 @@ fn write_agent_configs(
 ) -> Result<()> {
     write_mcp_json_entry(dir, addr, token)?;
     writeln!(out, "  + wrote {}", dir.join(".mcp.json").display())?;
+    if probe_and_write_claude_hooks(dir, &default_hooks_dir()?, user_has_claude_code())? {
+        writeln!(
+            out,
+            "  + Claude Code: hooks in {} — a shell search or read on code is \
+             redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)",
+            dir.join(".claude/settings.local.json").display()
+        )?;
+    }
 
     // Beyond Claude Code's `.mcp.json`, only add a file for an agent whose
     // own marker (a directory it creates, or a config file it already owns)
@@ -694,6 +702,157 @@ fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool
     let rendered = toml::to_string_pretty(&root)?;
     std::fs::write(&path, rendered).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
+}
+
+/// The hook scripts `init` installs for Claude Code, carried in the binary
+/// and written afresh on every `init` — a newer drsg brings newer hooks —
+/// into the per-user data directory, never into the repository.
+///
+/// The MCP config tells an agent where the graph is; these tell it *when*
+/// to use it. `drsg-shell-guard` is a `PreToolUse` hook on `Bash` that meets
+/// an `rg`/`grep`/`cat`/`sed -n` on code with the verb that answers instead
+/// (`DRSG_RAW=1 <command>` runs it anyway); `drsg-session-brief` is a
+/// `SessionStart` hook that puts the same rule in the agent's context, where
+/// it survives a resume, a clear and a compaction. Claude Code is the host
+/// with hooks; the other hosts get the rule from the server's own MCP
+/// instructions, which every host places in the system prompt.
+#[cfg(feature = "digest")]
+const CLAUDE_HOOKS: &[(&str, &str)] = &[
+    (
+        "drsg-shell-guard",
+        include_str!("../hooks/drsg-shell-guard"),
+    ),
+    (
+        "drsg-session-brief",
+        include_str!("../hooks/drsg-session-brief"),
+    ),
+];
+
+/// `$XDG_DATA_HOME/drsg/hooks`, or `~/.local/share/drsg/hooks` — beside the
+/// plugin store.
+#[cfg(feature = "digest")]
+fn default_hooks_dir() -> Result<std::path::PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Ok(std::path::PathBuf::from(xdg).join("drsg").join("hooks"));
+    }
+    let home = std::env::home_dir()
+        .context("neither $XDG_DATA_HOME nor a home directory — set XDG_DATA_HOME")?;
+    Ok(home.join(".local").join("share").join("drsg").join("hooks"))
+}
+
+/// Whether this user runs Claude Code at all: its per-user directory exists.
+#[cfg(feature = "digest")]
+fn user_has_claude_code() -> bool {
+    std::env::home_dir().is_some_and(|h| h.join(".claude").is_dir())
+}
+
+/// Claude Code's hooks, in the repository's `.claude/settings.local.json` —
+/// the per-user, uncommitted settings file, so nothing lands in the tree a
+/// team shares. Written when Claude Code shows itself: a `.claude/` in the
+/// repository, or (`user_has_claude`) the user's own `~/.claude`. Idempotent:
+/// an entry already pointing at a script of ours is repointed, not repeated.
+#[cfg(feature = "digest")]
+fn probe_and_write_claude_hooks(
+    dir: &Path,
+    hooks_dir: &Path,
+    user_has_claude: bool,
+) -> Result<bool> {
+    if !dir.join(".claude").is_dir() && !user_has_claude {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(hooks_dir)
+        .with_context(|| format!("creating {}", hooks_dir.display()))?;
+    let mut scripts = Vec::with_capacity(CLAUDE_HOOKS.len());
+    for (name, body) in CLAUDE_HOOKS {
+        let path = hooks_dir.join(name);
+        write_executable(&path, body)?;
+        scripts.push(path);
+    }
+    let settings_dir = dir.join(".claude");
+    std::fs::create_dir_all(&settings_dir)
+        .with_context(|| format!("creating {}", settings_dir.display()))?;
+    let settings = settings_dir.join("settings.local.json");
+    upsert_claude_hook(&settings, "PreToolUse", Some("Bash"), &scripts[0])?;
+    upsert_claude_hook(&settings, "SessionStart", None, &scripts[1])?;
+    Ok(true)
+}
+
+/// Write-then-rename, executable — a hook the host runs must never be seen
+/// half-written.
+#[cfg(feature = "digest")]
+fn write_executable(path: &Path, body: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("marking {} executable", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))
+}
+
+/// Upsert one hook command under `hooks.<event>` of a Claude Code settings
+/// file. An entry whose command already ends in this script's name is
+/// repointed (the data directory may have moved); otherwise one is added,
+/// with `matcher` when the event takes one. Every other key is untouched,
+/// and a file that is not there yet is created.
+#[cfg(feature = "digest")]
+fn upsert_claude_hook(
+    path: &Path,
+    event: &str,
+    matcher: Option<&str>,
+    script: &Path,
+) -> Result<()> {
+    let mut root: Value = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("{} exists but is not valid JSON", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} does not contain a JSON object", path.display()))?;
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}'s 'hooks' key is not an object", path.display()))?;
+    let entries = hooks
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("{}'s 'hooks.{event}' is not a list", path.display()))?;
+    let name = script
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let command = script.display().to_string();
+    let mut found = false;
+    for entry in entries.iter_mut() {
+        let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for hook in list.iter_mut() {
+            let ours = hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.ends_with(&name));
+            if ours {
+                hook["command"] = Value::String(command.clone());
+                found = true;
+            }
+        }
+    }
+    if !found {
+        let mut entry = json!({ "hooks": [{ "type": "command", "command": command }] });
+        if let Some(m) = matcher {
+            entry["matcher"] = Value::String(m.to_string());
+        }
+        entries.push(entry);
+    }
+    let pretty = serde_json::to_string_pretty(&root)?;
+    std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
 }
 
 /// `drsg history` — a repository's history at a glance.
@@ -4255,6 +4414,159 @@ mod tests {
         assert!(!dir.join(".opencode.json").exists());
         assert!(!dir.join(".gemini").exists());
         assert!(!dir.join(".codex").exists());
+        assert!(!probe_and_write_claude_hooks(&dir, &dir.join("hooks"), false).unwrap());
+        assert!(!dir.join(".claude").exists());
+        assert!(!dir.join("hooks").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn claude_hooks_are_installed_once_and_repointed_not_repeated() {
+        let dir = scratch_dir("claude-hooks");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let hooks = dir.join("data").join("hooks");
+
+        assert!(probe_and_write_claude_hooks(&dir, &hooks, false).unwrap());
+        for (name, _) in CLAUDE_HOOKS {
+            let script = hooks.join(name);
+            assert!(script.is_file(), "{name} written");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_ne!(
+                    std::fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+                    0,
+                    "{name} executable"
+                );
+            }
+        }
+        let settings = dir.join(".claude/settings.local.json");
+        let read = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+        let v = read();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            hooks.join("drsg-shell-guard").display().to_string()
+        );
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(v["hooks"]["SessionStart"][0].get("matcher").is_none());
+
+        // Again, from a moved data directory: repointed, and still one each.
+        let moved = dir.join("elsewhere").join("hooks");
+        assert!(probe_and_write_claude_hooks(&dir, &moved, true).unwrap());
+        let v = read();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            moved.join("drsg-shell-guard").display().to_string()
+        );
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+
+        // Someone else's hooks and settings survive untouched.
+        std::fs::write(
+            &settings,
+            r#"{"permissions": {"allow": ["Bash(git:*)"]}, "hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "/x/lint"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(probe_and_write_claude_hooks(&dir, &hooks, true).unwrap());
+        let v = read();
+        assert_eq!(v["permissions"]["allow"][0], "Bash(git:*)");
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/x/lint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard blocks a shell search or read on code and lets everything
+    /// else through, by the host's exit-code protocol. Runs the real script,
+    /// so it needs bash and a JSON parser (jq or python3) — skipped without.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_shell_guard_redirects_searches_and_reads_and_nothing_else() {
+        let has = |tool: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !has("bash") || !(has("jq") || has("python3")) {
+            eprintln!("bash and jq/python3 are needed to run the guard — skipping");
+            return;
+        }
+        let dir = scratch_dir("guard");
+        let script = dir.join("drsg-shell-guard");
+        write_executable(&script, CLAUDE_HOOKS[0].1).unwrap();
+        let run = |command: &str| -> (i32, String) {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("bash")
+                .arg(&script)
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let input = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        for blocked in [
+            "rg 'fn main' crates/",
+            "grep -rn needle src",
+            "cat src/lib.rs",
+            "sed -n '10,40p' src/lib.rs",
+            "head -50 src/lib.rs",
+            "RUST_LOG=debug rg needle",
+            "rtk grep needle src",
+            "/usr/bin/grep needle x",
+            "rg needle | head",
+        ] {
+            let (code, err) = run(blocked);
+            assert_eq!(code, 2, "`{blocked}` should be redirected");
+            assert!(err.contains("snippet(name | path:start-end)"), "{err}");
+            assert!(err.contains("DRSG_RAW=1"), "{err}");
+        }
+        for allowed in [
+            "git status",
+            "cargo test -p x",
+            "DRSG_RAW=1 rg needle src",
+            "cat > out.txt <<'EOF'\nhello\nEOF",
+            "sed -i 's/a/b/' src/lib.rs",
+            "echo hi | grep h",
+            "ls -la",
+        ] {
+            let (code, _) = run(allowed);
+            assert_eq!(code, 0, "`{allowed}` should pass");
+        }
+        // Unparseable input is let through, never blocked.
+        let mut child = std::process::Command::new("bash")
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            child.stdin.take().unwrap().write_all(b"not json").unwrap();
+        }
+        assert_eq!(child.wait().unwrap().code(), Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

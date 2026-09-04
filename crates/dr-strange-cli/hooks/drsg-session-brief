@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# drsg-session-brief — a Claude Code SessionStart hook installed by `drsg init`.
+# What it prints lands in the agent's context at the start of every session
+# (and after a resume, a clear or a compaction), so the rule survives the
+# system prompt being rebuilt.
+cat <<'BRIEF'
+drsg: this repository's code graph and source tree are attached to the drsg-watch MCP server.
+1. Once, before the first code question: list_planes, and pick the plane whose synced_root is this directory — pass that plane on every call (the default "startup" is usually empty).
+2. Every code question goes to drsg first: context <name> (what a symbol is, who calls it, what it calls), snippet <name> or snippet <path>:<start>-<end> (source text), grep <text> with regex/path/context (find text; each hit names its symbol), search <words> (by meaning). Every answer ends by naming the next call.
+3. Shell rg/grep/cat/sed -n on code is the last resort — for a file no plane holds, or when the plane says it has no source tree — and a hook redirects it; DRSG_RAW=1 <command> runs it anyway.
+BRIEF

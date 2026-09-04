@@ -31,10 +31,20 @@ OpenCode、Gemini CLI 或 Codex CLI 各自写入一份匹配的 MCP 配置——
 自己的标记（它会创建的目录，或者已经拥有的配置文件）已经出现在这个仓库里，才会
 写入。
 
+对 Claude Code，它还会安装两个钩子：写在仓库的 `.claude/settings.local.json`
+（每个用户自己的文件，不会进入团队共享的代码树）里，脚本放在插件库旁边。配置
+告诉智能体图在哪里；钩子告诉它*何时*去用。`SessionStart` 钩子把规则放进智能体
+的上下文——每个代码问题先问 drsg，shell 是最后手段——恢复会话和压缩上下文之后
+它仍然在。`PreToolUse` 钩子在智能体对代码执行 `rg`、`grep`、`cat` 或 `sed -n`
+的那一刻，改为指出能回答这个问题的动词；`DRSG_RAW=1 <command>` 可以原样执行任何
+命令，留给没有任何平面覆盖的文件。其他宿主没有钩子机制，它们从服务端自身的 MCP
+instructions 里得到同一条规则——每个宿主都会把它放进系统提示。
+
 ```console
 $ drsg init
 plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
   + wrote ./.mcp.json
+  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
 ```
 

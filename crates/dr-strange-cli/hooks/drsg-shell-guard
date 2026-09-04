@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# drsg-shell-guard — a Claude Code PreToolUse hook (matcher: Bash), installed
+# by `drsg init` and pointed at from the repository's .claude/settings.local.json.
+#
+# A repository that ran `drsg init` has its graph and its source tree attached
+# to the drsg-watch MCP server, whose verbs read and search them: grep (text,
+# regex, path scope, context lines — each hit placed in its symbol), snippet
+# (a symbol's body, or any file's line range), context (what a symbol is and
+# who calls it), search (by meaning). Given both, an agent still reaches for
+# `rg` and `sed -n` out of habit; this hook meets that habit at the moment of
+# the call and names the verb that answers instead. It is a redirect, not a
+# wall: `DRSG_RAW=1 <command>` runs any command untouched, for the file no
+# plane holds or the one case where the shell really is the tool.
+#
+# Blocks by the documented protocol — exit 2, the reason on stderr, which the
+# host feeds back to the model. Anything it cannot parse it lets through: a
+# hook that fails closed would cost far more than the habit it exists to break.
+set -u
+
+INPUT=$(cat)
+if command -v jq >/dev/null 2>&1; then
+  CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+elif command -v python3 >/dev/null 2>&1; then
+  CMD=$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+try:
+    print((json.load(sys.stdin).get("tool_input") or {}).get("command", ""))
+except Exception:
+    pass' 2>/dev/null)
+else
+  exit 0
+fi
+[ -z "${CMD:-}" ] && exit 0
+
+# The escape hatch, anywhere in the command line.
+case "$CMD" in *DRSG_RAW=1*) exit 0 ;; esac
+# A redirection or a heredoc is a write, not a read — `cat > file <<EOF`.
+case "$CMD" in *'>'*|*'<<'*) exit 0 ;; esac
+
+# The first word of the first command: past leading env assignments and an
+# `rtk` prefix, up to whitespace or a pipe.
+first=$(printf '%s' "$CMD" | sed -E \
+  -e 's/^[[:space:]]*//' \
+  -e 's/^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*//' \
+  -e 's/^rtk[[:space:]]+//' \
+  -e 's/^([^[:space:]|;&]+).*/\1/')
+first=${first##*/}
+
+case "$first" in
+  rg|grep|egrep|fgrep|ugrep|ug|ag|ack|cat|head|tail|less|more|bat) ;;
+  sed) case "$CMD" in *'sed -n'*|*'sed -En'*|*'sed -ne'*) ;; *) exit 0 ;; esac ;;
+  *) exit 0 ;;
+esac
+
+cat >&2 <<'MSG'
+drsg: this repository's graph and source tree are attached to the drsg-watch MCP server, which reads and searches them — use its tools instead of the shell:
+  grep(pattern, path?, regex?, context?)   find text; each hit names the symbol it is in
+  snippet(name | path:start-end)            a symbol's body, or a range of any file
+  context(name)                             what a symbol is, who calls it, what it calls
+  search(query)                             find by meaning when no name is known
+For a file no plane holds, or when the shell command is really the tool, run it as: DRSG_RAW=1 <command>
+MSG
+exit 2
