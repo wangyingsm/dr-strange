@@ -3,6 +3,7 @@
   import { loadPref, savePref } from './prefs.js'
   import { accept, cell, ghost, toTsv } from './cypher.js'
   import { formatVector, unwrapVector, vectorDims } from './vectors.js'
+  import { labelColor } from './labels.js'
 
   // `plane` is the app-wide current plane, which a query names none of its own.
   let { plane } = $props()
@@ -33,7 +34,6 @@
   // text *before* the caret, and accepting one has to put the caret after it.
   let caret = $state(text.length)
   let box = $state(null)
-  let focused = $state(false)
   // The server's last answer: `{ prefix, plane, best, about, suggestions }`.
   let guess = $state(null)
   let provider = $state(loadPref('embedProvider', 'openai'))
@@ -62,7 +62,10 @@
   // keyword ghost fills the second before it answers, so the box is never
   // dead while a key is still warm.
   const completion = $derived(!atEnd ? '' : remote ? (remote.best ?? '') : ghost(prefix))
-  const suggestions = $derived(focused && remote ? remote.suggestions : [])
+  // Not gated on focus: the row holds its line whether or not it has anything
+  // in it, because a line that comes and goes moves the Run button out from
+  // under the cursor about to click it.
+  const suggestions = $derived(remote?.suggestions ?? [])
 
   // Ask on a pause, and only about what is actually typed now.
   let timer
@@ -173,18 +176,36 @@
     setTimeout(() => (copied = false), 1200)
   }
 
-  // A returned node's properties, as many as fit in a row. A vector is one of
-  // them — it arrives as a marker, so it reads as a button carrying its
-  // dimension rather than as prose about being omitted.
+  // The node's embedding, if it has one: which property, and how big. Its own
+  // column, because every node in a digested plane has one and it says the
+  // same thing on every row — down a column it is a glance, in the middle of
+  // the properties it is noise.
   //
   // Not named `props`: a local binding by that name makes `$props` read as a
   // store subscription, which Svelte warns about.
-  function propSummary(node) {
-    return Object.entries(node.properties ?? {})
-      .filter(([, v]) => v !== null && typeof v !== 'object')
-      .slice(0, 4)
-      .map(([k, v]) => ({ k, v, dims: vectorDims(v) }))
+  function vectorOf(node) {
+    for (const [k, v] of Object.entries(node.properties ?? {})) {
+      const dims = vectorDims(v)
+      if (dims) return { k, dims }
+    }
+    return null
   }
+
+  // The rest, briefly: enough to tell two rows apart. Provenance (`_`-prefixed)
+  // and the embedding are left out — the first is retrieval's business, the
+  // second has its own column — and everything is in the popup anyway.
+  function brief(node) {
+    return Object.entries(node.properties ?? {})
+      .filter(([k, v]) => v !== null && typeof v !== 'object' && !k.startsWith('_') && !vectorDims(v))
+      .slice(0, 3)
+      .map(([k, v]) => `${k}: ${clip(String(v))}`)
+      .join(' · ')
+  }
+
+  const clip = (s) => (s.length > 48 ? `${s.slice(0, 47)}…` : s)
+
+  // The whole property map of one node, JSON and all.
+  let propsView = $state(null)
 
   // The floats behind a marker, fetched for the one node whose button was
   // pressed — `lean: false` is the only way to them, and one node at a time is
@@ -242,22 +263,19 @@
         oninput={track}
         onkeyup={track}
         onclick={track}
-        onfocus={(e) => {
-          focused = true
-          track(e)
-        }}
-        onblur={() => (focused = false)}
+        onfocus={track}
         spellcheck="false"
         rows="6"
         placeholder="MATCH (n:Label)-[:TYPE]->(m) WHERE n.name = &quot;…&quot; RETURN n.name, count(*) AS c"
         aria-label="Query"
       ></textarea>
     </div>
-    {#if suggestions.length}
-      <!-- What this plane would make of the caret: the candidates, each with
-           the count that ranked it. `mousedown` is swallowed so clicking one
-           does not blur the box out from under the click. -->
-      <div class="q-suggest">
+    <!-- What this plane would make of the caret: the candidates, each with the
+         count that ranked it. The row is always here, holding its line even
+         when empty; `mousedown` is swallowed so clicking one does not blur the
+         box out from under the click. -->
+    <div class="q-suggest">
+      {#if suggestions.length}
         <span class="q-suggest-about">{remote.about}</span>
         {#each suggestions as s (s.text + s.insert)}
           <button class="q-sug" onmousedown={(e) => e.preventDefault()} onclick={() => apply(s.insert)}>
@@ -265,8 +283,8 @@
             {#if s.detail}<span class="q-sug-detail">{s.detail}</span>{/if}
           </button>
         {/each}
-      </div>
-    {/if}
+      {/if}
+    </div>
     <div class="q-actions">
       <button class="run" onclick={run} disabled={busy}>{busy ? 'Running…' : 'Run'}</button>
       <span class="hint"><kbd>⌘</kbd>/<kbd>Ctrl</kbd>+<kbd>Enter</kbd></span>
@@ -339,25 +357,35 @@
       </header>
       <div class="q-scroll">
         <table>
-          <thead><tr><th>key</th><th>labels</th><th>properties</th></tr></thead>
+          <thead>
+            <tr>
+              <th>key</th><th>labels</th><th>embedding</th><th>properties</th>
+            </tr>
+          </thead>
           <tbody>
             <!-- Keyed by position, not by id: the server sends each node once,
                  and a table that wedges when it does not is a worse table. -->
             {#each result.records.nodes as n, r (r)}
               <tr>
                 <td>{n.external_key ?? `#${n.id}`}</td>
-                <td>{(n.labels ?? []).join(', ')}</td>
-                <td class="q-props">
-                  {#each propSummary(n) as pe, i (pe.k)}
-                    {#if i > 0}<span class="q-prop-sep"> · </span>{/if}
-                    {#if pe.dims}
-                      <button class="vec-btn" onclick={() => showVector(n, pe.k, pe.dims)}>
-                        {pe.k} ({pe.dims} dims)
-                      </button>
-                    {:else}
-                      <span>{pe.k}: {pe.v}</span>
-                    {/if}
+                <td class="q-labels">
+                  {#each n.labels ?? [] as l (l)}
+                    <span class="q-chip" style="--chip: {labelColor(l)}">{l}</span>
                   {/each}
+                </td>
+                <td class="q-vec">
+                  {#if vectorOf(n)}
+                    {@const vec = vectorOf(n)}
+                    <button class="vec-btn" onclick={() => showVector(n, vec.k, vec.dims)}>
+                      {vec.dims} dims
+                    </button>
+                  {:else}
+                    <span class="q-none">—</span>
+                  {/if}
+                </td>
+                <td class="q-props">
+                  <span class="q-brief">{brief(n)}</span>
+                  <button class="q-expand" onclick={() => (propsView = n)}>expand</button>
                 </td>
               </tr>
             {/each}
@@ -372,6 +400,18 @@
     <div class="q-result">
       <header><span>Write{#if elapsed != null} · {elapsed} ms{/if}</span></header>
       <p class="q-write">{changes(result.write).join(' · ') || 'no changes'}</p>
+    </div>
+  {/if}
+
+  {#if propsView}
+    <div class="modal-backdrop">
+      <div class="modal">
+        <header>
+          <span>{propsView.external_key ?? `#${propsView.id}`} · properties</span>
+          <button class="close" onclick={() => (propsView = null)} aria-label="Close">×</button>
+        </header>
+        <pre class="floats">{JSON.stringify(propsView.properties ?? {}, null, 2)}</pre>
+      </div>
     </div>
   {/if}
 

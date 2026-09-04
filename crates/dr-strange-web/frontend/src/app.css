@@ -2420,12 +2420,16 @@ nav button,
 }
 /* What the plane says could come next: a row of candidates under the box,
    each carrying the count that ranked it. */
+/* The row holds its line whether or not it has anything to say: a hint that
+   appears and disappears moves everything under it, and the Run button was
+   sliding out from under the cursor about to click it. */
 .q-suggest {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem;
   margin-top: 0.5rem;
+  min-height: 1.5rem;
 }
 .q-suggest-about {
   font: 11px system-ui;
@@ -2479,9 +2483,43 @@ nav button,
   cursor: default;
 }
 
-/* Between two properties in a result row. */
-.q-prop-sep {
+/* A label wears its own colour, the same one the plot gives it. */
+.q-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.q-chip {
+  font: 11px system-ui;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  color: var(--chip);
+  border: 1px solid color-mix(in srgb, var(--chip) 45%, transparent);
+  background: color-mix(in srgb, var(--chip) 12%, transparent);
+  white-space: nowrap;
+}
+
+/* The embedding's own column: one glance down it says which rows carry one. */
+.q-vec {
+  white-space: nowrap;
+}
+.q-none {
   color: var(--muted);
+}
+
+/* The rest of the properties, briefly, with the whole map a click away. */
+.q-expand {
+  font: 11px system-ui;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 0.35rem;
+  cursor: pointer;
+}
+.q-expand:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .q-examples {
@@ -2571,11 +2609,23 @@ nav button,
 .q-result td {
   font-family: ui-monospace, monospace;
 }
+/* The brief clips; the button that opens the whole map never does. */
 .q-result .q-props {
   color: var(--muted);
   max-width: 42rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+.q-brief {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-expand {
+  flex: none;
 }
 .q-empty,
 .q-write {

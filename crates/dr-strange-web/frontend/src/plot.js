@@ -17,6 +17,7 @@ import {
   sectorLeaves,
   weightByImportance,
 } from './layout.js'
+import { PALETTE } from './labels.js'
 
 const DEFAULT_CURVATURE = 0.25 // gentle arc for a solitary edge
 
@@ -29,13 +30,9 @@ function curveFor(index, maxIndex) {
   return (maxCurvature * index) / maxIndex
 }
 
-// Categorical palette; labels are assigned colors in first-seen order so the
-// legend stays stable within a session.
-const PALETTE = [
-  '#7c3aed', '#2563eb', '#059669', '#d97706', '#dc2626',
-  '#0891b2', '#db2777', '#65a30d', '#9333ea', '#0d9488',
-]
-
+// Labels take colours in first-seen order, so this session's legend stays put
+// while a plot is explored. (A table has no legend to anchor it and colours by
+// name instead — same palette, see `labels.js`.)
 function colorFor(label, legend) {
   const key = label || '(none)'
   if (!legend.has(key)) legend.set(key, PALETTE[legend.size % PALETTE.length])
