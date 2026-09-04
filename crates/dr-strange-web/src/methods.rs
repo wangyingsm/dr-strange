@@ -1092,7 +1092,22 @@ pub fn cypher_subgraph(
         }
         return Ok(out);
     }
-    let all = app(q.scored_nodes())?;
+    // A subgraph has each node once. A pattern reaches the same function
+    // through every call that lands on it — two thousand matches over nine
+    // hundred functions — and the answer to `RETURN m` as a *subgraph* is the
+    // functions, in the order the query first reached them. (A caller who
+    // wants the matches themselves projects: `RETURN key(m)` is a table, and
+    // a table has rows.)
+    //
+    // Reported distinct all along — `count` was the size of this set — while
+    // the list beside it carried the duplicates. On a keyed table that is not
+    // untidy but fatal: repeated keys abort the render, and the page sits on
+    // "Running…" with no result and no error.
+    let mut seen = std::collections::BTreeSet::new();
+    let all: Vec<_> = app(q.scored_nodes())?
+        .into_iter()
+        .filter(|(n, _)| seen.insert(n.id.0))
+        .collect();
     let total = all.len();
     let rows = page.of(all);
 

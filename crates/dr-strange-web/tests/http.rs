@@ -603,3 +603,49 @@ async fn a_query_result_comes_a_page_at_a_time() {
     assert_eq!(table["total"], 7);
     assert_eq!(table["offset"], 2);
 }
+
+/// A pattern reaches the same node through every path that lands on it. The
+/// answer is a subgraph, so the node comes once — and the table that renders
+/// it is keyed, so a repeat is not untidy but fatal: the render aborts and the
+/// page sits on "Running…" with no result and no error.
+#[tokio::test]
+async fn a_node_reached_many_ways_comes_back_once() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    // One function, called by three unresolved references.
+    let cypher = |query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let res = client
+                .post(format!("{base}/cypher?plane=startup"))
+                .header("origin", &base)
+                .body(query)
+                .send()
+                .await
+                .unwrap();
+            assert!(res.status().is_success(), "{query}: {}", res.status());
+            res.json::<Value>().await.unwrap()
+        }
+    };
+    cypher(r#"CREATE (f:Function {key:"f"})"#).await;
+    for u in ["u1", "u2", "u3"] {
+        let q = format!(r#"MATCH (f:Function) CREATE (f)-[:CALLS]->(u:Ref {{key:"{u}"}})"#);
+        client
+            .post(format!("{base}/cypher?plane=startup"))
+            .header("origin", &base)
+            .body(q)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let out = cypher("MATCH (n:Ref)<-[:CALLS]-(m:Function) RETURN m").await;
+    let nodes = out["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "three matches, one function: {nodes:?}");
+    assert_eq!(out["total"], 1, "and the count paging reports is of nodes");
+    assert_eq!(out["count"], 1);
+}

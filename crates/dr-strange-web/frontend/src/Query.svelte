@@ -341,7 +341,9 @@
         <table>
           <thead><tr><th>key</th><th>labels</th><th>properties</th></tr></thead>
           <tbody>
-            {#each result.records.nodes as n (n.id)}
+            <!-- Keyed by position, not by id: the server sends each node once,
+                 and a table that wedges when it does not is a worse table. -->
+            {#each result.records.nodes as n, r (r)}
               <tr>
                 <td>{n.external_key ?? `#${n.id}`}</td>
                 <td>{(n.labels ?? []).join(', ')}</td>
