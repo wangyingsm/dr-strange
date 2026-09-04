@@ -972,15 +972,88 @@ pub fn cypher(
     let params = parse_params(param)?;
     match parse_stmt(query, embed, &params)? {
         dr_strange_parser::Statement::Read(read) => {
-            run_plan(pin(plane(db, plane_name)?, read.as_of)?, read.plan, out)
+            run_plan(pin(plane(db, plane_name)?, read.as_of)?, read.plan, out)?;
         }
         dr_strange_parser::Statement::Write(w) => {
             let p = plane(db, plane_name)?;
             let summary = w.apply(&p).map_err(|e| anyhow!("{e}"))?;
             writeln!(out, "{}", write_summary_line(&summary))?;
-            Ok(())
         }
     }
+    // Only now, with the rows out or the write applied: a history is of what
+    // ran. Failing to record one is not a reason to fail the query that did.
+    if let Err(e) = db.record_query(plane_name, query, Database::DEFAULT_HISTORY) {
+        tracing::debug!(error = %e, "could not record the query");
+    }
+    Ok(())
+}
+
+/// `drsg queries` — the queries that ran, newest first, or one of them whole.
+///
+/// Not `drsg history`, which is a repository's commits: this is the database's
+/// own record of what was asked of it.
+///
+/// The listing is one entry per line (tab-separated, like `plane list`), so a
+/// query written across several lines is folded onto one; `drsg queries <id>`
+/// prints that one back exactly as it was written, which is what to pipe into
+/// an editor or into `drsg cypher -`.
+pub fn queries(
+    db: &Database,
+    id: Option<u64>,
+    limit: Option<usize>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if let Some(id) = id {
+        let saved = db
+            .recorded_query(id)?
+            .ok_or_else(|| anyhow!("no query #{id} in the history"))?;
+        writeln!(out, "{}", saved.query)?;
+        return Ok(());
+    }
+    for r in db.query_history(limit.unwrap_or(Database::DEFAULT_HISTORY))? {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}",
+            r.id,
+            stamp(r.at),
+            r.plane,
+            one_line(&r.query)
+        )?;
+    }
+    Ok(())
+}
+
+/// A query folded onto one line: runs of whitespace become single spaces, so
+/// a multi-line query still occupies one row of a listing.
+fn one_line(query: &str) -> String {
+    query.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Epoch milliseconds as `YYYY-MM-DD hh:mm:ssZ`.
+///
+/// UTC, and spelled out rather than pulled from a date crate: the CLI has no
+/// datetime dependency and one timestamp is not worth acquiring one.
+fn stamp(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    let (h, min, s) = (tod / 3600, (tod / 60) % 60, tod % 60);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}Z")
+}
+
+/// Days since 1970-01-01 → a proleptic Gregorian date. Howard Hinnant's
+/// `civil_from_days`, the inverse of the parser's date-literal arithmetic.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// A human-readable one-liner of a write's effect — the non-zero counts.

@@ -108,10 +108,17 @@ enum Command {
     },
     /// Run a query in the openCypher-subset language (compiled to a plan).
     Cypher {
-        /// The query text, or `-` to read it from stdin.
-        query: String,
-        #[arg(long, default_value = "startup")]
-        plane: String,
+        /// The query text, or `-` to read it from stdin. Omit it when
+        /// `--history` names one to run again.
+        query: Option<String>,
+        /// Run a query from the history instead, by its id (see `drsg
+        /// history`). **Omitted**: run the query given on the command line.
+        #[arg(long, value_name = "ID")]
+        history: Option<u64>,
+        /// **Omitted**: `startup`, or — with `--history` — the plane the
+        /// saved query ran against.
+        #[arg(long)]
+        plane: Option<String>,
         /// Embedding provider (preset or base URL) for a text
         /// `SEARCH … NEAR "…"`; the key comes from the environment. Omit for
         /// MATCH / literal-vector queries. Requires the `digest` build feature.
@@ -121,6 +128,19 @@ enum Command {
         /// `--param min=18 --param who='"Alice"'`.
         #[arg(long = "param", value_name = "NAME=JSON")]
         param: Vec<String>,
+    },
+    /// The Cypher queries that have run, newest first — id, when, plane and
+    /// text. (`drsg history` is the other one: a repository's commits.)
+    ///
+    /// With an id, print that one query's text alone, which is what to pipe
+    /// into an editor. `drsg cypher --history <id>` runs it again.
+    Queries {
+        /// **Omitted**: list them.
+        id: Option<u64>,
+        /// How many to list. **Omitted**: all of them, which is capped
+        /// anyway.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// One symbol's whole neighborhood in one call: definition, signature,
     /// doc, fields, callers with call sites, callees, containment and every
@@ -719,17 +739,37 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         }
         Command::Cypher {
             query,
+            history,
             plane,
             embed,
             param,
         } => {
             let db = commands::open(&cli.db)?;
-            let query = if query == "-" {
-                io::read_to_string(io::stdin())?
-            } else {
-                query
+            // A saved query brings its own plane with it: it was written
+            // against one, and re-running it against `startup` would be
+            // running a different query. An explicit `--plane` still wins.
+            let (query, ran_against) = match (history, query) {
+                (Some(_), Some(_)) => bail!("give a query or `--history`, not both"),
+                (None, None) => {
+                    bail!("give a query, `-` to read one from stdin, or `--history <id>`")
+                }
+                (Some(id), None) => {
+                    let Some(saved) = db.recorded_query(id)? else {
+                        bail!("no query #{id} in the history — `drsg history` lists them");
+                    };
+                    (saved.query, Some(saved.plane))
+                }
+                (None, Some(q)) if q == "-" => (io::read_to_string(io::stdin())?, None),
+                (None, Some(q)) => (q, None),
             };
+            let plane = plane
+                .or(ran_against)
+                .unwrap_or_else(|| "startup".to_string());
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
+        }
+        Command::Queries { id, limit } => {
+            let db = commands::open(&cli.db)?;
+            commands::queries(&db, id, limit, out)
         }
         Command::Context { name, plane } => {
             let db = commands::open(&cli.db)?;
