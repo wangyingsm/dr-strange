@@ -65,9 +65,15 @@ pub enum Standing {
     Ahead { latest: String },
 }
 
+/// The MCP server's binary, looked for beside this one when no `--bin` was
+/// given: an install that has both should not be left half-upgraded.
+const MCP_BIN: &str = "drsg-mcp";
+
+/// `bin` is what `--bin` asked for; `None` means nothing was asked, and the
+/// choice is made by what is installed beside this binary (see [`choose_bin`]).
 pub fn update(
     allow_private: &[dr_strange_web::fetch::Prefix],
-    bin: &str,
+    bin: Option<&str>,
     dir: Option<&Path>,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -89,8 +95,34 @@ pub fn update(
         }
         Standing::Behind { latest } => {
             writeln!(out, "drsg {CURRENT} -> {latest}")?;
-            install(bin, dir, out)
+            let dir = match dir {
+                Some(d) => d.to_path_buf(),
+                None => install_dir()?,
+            };
+            let bin = match bin {
+                Some(asked) => asked.to_string(),
+                None => choose_bin(&dir, out)?,
+            };
+            install(&bin, &dir, out)
         }
+    }
+}
+
+/// What to update when nobody said: `drsg`, and `drsg-mcp` with it when the
+/// two are installed side by side.
+///
+/// The two binaries are one release. An agent host that launches the
+/// `drsg-mcp` next to an upgraded `drsg` would otherwise keep speaking last
+/// release's tool set against this release's server — and nothing would say
+/// so, since each binary is individually fine. Naming `--bin` explicitly still
+/// means exactly what it names.
+fn choose_bin(dir: &Path, out: &mut dyn Write) -> Result<String> {
+    let mcp = dir.join(MCP_BIN);
+    if mcp.is_file() {
+        writeln!(out, "{} is beside it — updating both", mcp.display())?;
+        Ok("all".to_string())
+    } else {
+        Ok("drsg".to_string())
     }
 }
 
@@ -169,13 +201,8 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Hand this process over to the installer.
-fn install(bin: &str, dir: Option<&Path>, out: &mut dyn Write) -> Result<()> {
-    let dir = match dir {
-        Some(d) => d.to_path_buf(),
-        None => install_dir()?,
-    };
-
-    let command = installer_command(bin, &dir)?;
+fn install(bin: &str, dir: &Path, out: &mut dyn Write) -> Result<()> {
+    let command = installer_command(bin, dir)?;
     // Printed before the handover, because after it this process is gone: if
     // the installer fails, or the network dies mid-download, the line above
     // the wreckage is the command to retry by hand.
@@ -334,6 +361,32 @@ mod tests {
                 latest: "2.2.1".into()
             }
         );
+    }
+
+    /// An install that has both binaries is upgraded as one; an install that
+    /// has only `drsg` is not made to download a server it never had.
+    #[test]
+    fn a_drsg_mcp_beside_this_binary_is_updated_with_it() {
+        let dir = std::env::temp_dir().join(format!("drsg-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(choose_bin(&dir, &mut out).unwrap(), "drsg");
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+        std::fs::write(dir.join(MCP_BIN), b"").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(choose_bin(&dir, &mut out).unwrap(), "all");
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("drsg-mcp is beside it"), "{said}");
+
+        // A directory of that name is not the binary.
+        std::fs::remove_file(dir.join(MCP_BIN)).unwrap();
+        std::fs::create_dir(dir.join(MCP_BIN)).unwrap();
+        assert_eq!(choose_bin(&dir, &mut Vec::new()).unwrap(), "drsg");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4,6 +4,19 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`drsg update` updates the `drsg-mcp` beside it.** With no `--bin` given,
+  the command now looks in the directory it is about to install into and, when
+  a `drsg-mcp` is there, hands the installer `--bin all` rather than `--bin
+  drsg` — saying so on the line before the handover. The two binaries are one
+  release, and an install with both was previously left half-upgraded: an
+  agent host launching last release's server against this release's `drsg`,
+  with nothing to say so, since each binary is individually fine. `--bin`
+  still means exactly what it names.
+
 ## [2.4.1] - 2026-09-04
 
 ### Changed

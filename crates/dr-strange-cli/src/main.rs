@@ -332,11 +332,14 @@ enum Command {
     /// than the latest release, which a build from source usually is. The
     /// installer is the same `curl … | sh` a first install runs, and it is
     /// pointed at the directory this binary is running from, so an upgrade
-    /// replaces the copy on your `PATH` rather than adding a second one.
+    /// replaces the copy on your `PATH` rather than adding a second one. A
+    /// `drsg-mcp` installed beside it is updated with it.
     Update {
-        /// Which binary to update: `drsg`, `drsg-mcp`, or `all`.
-        #[arg(long, default_value = "drsg")]
-        bin: String,
+        /// Which binary to update: `drsg`, `drsg-mcp`, or `all`. Unset, it
+        /// is `drsg` — and `all` when a `drsg-mcp` sits beside it, so the
+        /// two never drift apart.
+        #[arg(long)]
+        bin: Option<String>,
         /// Install into this directory instead of the one this binary is
         /// running from — for a `drsg` in a location you cannot write to.
         #[arg(long)]
@@ -1026,7 +1029,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 .iter()
                 .map(|s| dr_strange_web::fetch::Prefix::parse(s))
                 .collect::<Result<_>>()?;
-            update::update(&allow, &bin, dir.as_deref(), out)
+            update::update(&allow, bin.as_deref(), dir.as_deref(), out)
         }
         #[cfg(feature = "digest")]
         #[cfg(feature = "digest")]

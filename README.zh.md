@@ -119,8 +119,8 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 
 **保持最新。** `drsg update` 会向 GitHub 询问最新发行版本；若当前构建落后，就把
 进程交给上面那个安装脚本——并指向 `drsg` 自身所在的目录，因此升级替换的是你
-`PATH` 上的那一份，而不是在别处多出第二份。已是最新、或比最新发行版本还新的构建，
-会被如实告知，不下载任何东西。
+`PATH` 上的那一份，而不是在别处多出第二份。同一目录下的 `drsg-mcp` 会随之一并
+更新。已是最新、或比最新发行版本还新的构建，会被如实告知，不下载任何东西。
 
 ```console
 $ drsg update

@@ -136,8 +136,9 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 **Staying current.** `drsg update` asks GitHub for the latest release and, if
 this build is behind it, hands the process over to the installer above —
 pointed at the directory `drsg` is running from, so the copy on your `PATH` is
-replaced rather than joined by a second one. A build already current, or newer
-than the latest release, is told so and nothing is downloaded.
+replaced rather than joined by a second one. A `drsg-mcp` in that directory is
+updated with it. A build already current, or newer than the latest release, is
+told so and nothing is downloaded.
 
 ```console
 $ drsg update

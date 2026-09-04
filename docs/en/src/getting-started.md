@@ -106,8 +106,11 @@ Dr Strange v2.4.1 (x86_64-unknown-linux-gnu)
 The destination is the directory the running binary is in, not the installer's
 default — an upgrade must replace the copy on the `PATH`, not add a newer one
 somewhere else and leave the old one being run. `--dir` overrides it for a
-`drsg` installed somewhere unwritable, and `--bin all` updates `drsg-mcp`
-alongside it.
+`drsg` installed somewhere unwritable. A `drsg-mcp` in that same directory is
+updated alongside `drsg` without being asked — the two binaries are one
+release, and an agent host launching last release's server against this
+release's `drsg` would have nothing to tell it so. `--bin` names exactly what
+to update when that is not wanted: `drsg`, `drsg-mcp`, or `all`.
 
 A build *newer* than the latest release — from source, or from a branch ahead
 of the last tag — is told it is ahead and nothing is installed: `update` never
