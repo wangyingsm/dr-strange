@@ -299,7 +299,7 @@ fn a_string_literal_is_data_not_syntax() {
     assert!(c.best.is_none());
     // Closed again, the query goes on as before.
     let c = complete(r#"MATCH (n:Function) WHERE n.file = "exec.rs" "#, &code());
-    assert_eq!(c.expects, Expect::Clause);
+    assert_eq!(c.expects, Expect::Clause { done: vec![] });
 }
 
 /// The right-hand side of a comparison is the author's alone: no count in any
@@ -419,7 +419,10 @@ fn what_the_caret_sits_at_is_said_plainly() {
             vars: vec!["n".into()]
         }
     );
-    assert_eq!(at("MATCH (n:Function) RETURN n "), Expect::Clause);
+    assert_eq!(
+        at("MATCH (n:Function) RETURN n "),
+        Expect::Clause { done: vec![] }
+    );
 }
 
 /// A plane with three hundred labels has no useful three-hundredth
@@ -589,4 +592,65 @@ fn a_node_that_is_only_ever_arrived_at_is_offered_the_way_in() {
         1,
         "{out:?}"
     );
+}
+
+/// The property both reported bugs broke: a query cut short anywhere is a
+/// query the completion can finish.
+///
+/// Each was a truncation — `<` and `<-` of a `<-[:CALLS]-` — offered a
+/// completion that assumed punctuation nobody had typed. So: cut a known-good
+/// query at every character, accept the best guess over and over as an editor
+/// does, and require what comes out to parse.
+///
+/// A truncation that offers *nothing* is skipped rather than failed: the two
+/// places that happens are inside a variable's name, which is the author's to
+/// finish and no vocabulary can guess.
+#[test]
+fn any_truncation_of_a_query_can_be_finished_from_where_it_was_cut() {
+    let vocab = code();
+    for whole in [
+        "MATCH (n:Function)-[:CALLS]->(m:Function) RETURN m",
+        "MATCH (n:Struct)<-[:CONTAINS]-(m:Module) RETURN m",
+        "MATCH (n:Module)-[:IMPORTS]->(m:Struct) RETURN m",
+    ] {
+        for cut in 0..=whole.len() {
+            let start = &whole[..cut];
+            if complete(start, &vocab).best.is_none() {
+                continue;
+            }
+            let mut text = start.to_string();
+            let mut steps = 0;
+            while parse(text.trim()).is_err() {
+                let Some(insert) = complete(&text, &vocab).best else {
+                    break;
+                };
+                text.push_str(&insert);
+                text.push(' ');
+                steps += 1;
+                assert!(steps < 10, "from `{start}`: no end in sight at `{text}`");
+            }
+            assert!(
+                parse(text.trim()).is_ok(),
+                "from `{start}`: `{text}` does not parse — {:?}",
+                parse(text.trim()).err()
+            );
+        }
+    }
+}
+
+/// A tail clause comes once — a query has one `LIMIT` — and what `ORDER BY`
+/// sorts on is a key, not another `ORDER BY`.
+#[test]
+fn a_finished_query_is_not_offered_the_same_clause_again() {
+    assert_eq!(best("MATCH (n:Function) RETURN n "), "ORDER BY");
+    assert_eq!(
+        best("MATCH (n:Function) RETURN n ORDER BY "),
+        "n",
+        "a key to sort on"
+    );
+    let after = texts("MATCH (n:Function) RETURN n ORDER BY n ");
+    assert!(!after.contains(&"ORDER BY".to_string()), "{after:?}");
+    assert_eq!(after.first().map(String::as_str), Some("LIMIT"));
+    let after = texts("MATCH (n:Function) RETURN n ORDER BY n LIMIT 10 ");
+    assert!(!after.contains(&"LIMIT".to_string()), "{after:?}");
 }

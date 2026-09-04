@@ -109,8 +109,11 @@ pub enum Expect {
     Property { var: String, label: Option<String> },
     /// The right-hand side of a comparison — a value only the author knows.
     Value,
-    /// A clause that may follow a complete one — `ORDER BY`, `LIMIT`, `AS OF`.
-    Clause,
+    /// The key a `ORDER BY` sorts on.
+    SortKey { vars: Vec<String> },
+    /// A clause that may follow a complete one — `ORDER BY`, `LIMIT`,
+    /// `AS OF`. `done` are the ones already written, which cannot come again.
+    Clause { done: Vec<String> },
     /// Nothing worth guessing at: inside a string literal, where the words
     /// typed are data rather than syntax.
     Nothing,
@@ -320,6 +323,8 @@ enum Pos {
     Property(String),
     /// After a comparison operator.
     Value,
+    /// After `ORDER BY`: the key to sort on.
+    Sort,
     /// After a complete clause: `ORDER BY`, `SKIP`, `LIMIT`, `AS OF`.
     Clause,
 }
@@ -345,6 +350,8 @@ struct Scan {
     star: Option<bool>,
     /// The variable a `.` was written after.
     term: Option<String>,
+    /// The tail clauses already written — a query has one `LIMIT`.
+    done: Vec<String>,
 }
 
 impl Scan {
@@ -394,7 +401,10 @@ fn clause_keyword(word: &str) -> Option<&'static str> {
         "MERGE" => "MERGE",
         "SET" | "REMOVE" | "DELETE" => "SET",
         "AND" | "OR" | "NOT" => "AND",
-        "ORDER" | "BY" | "SKIP" | "LIMIT" | "DETACH" | "DISTINCT" | "AS" | "OF" => "TAIL",
+        "BY" => "BY",
+        "DISTINCT" => "RETURN",
+        "SKIP" | "LIMIT" => "COUNT",
+        "ORDER" | "DETACH" | "AS" | "OF" => "TAIL",
         _ => return None,
     })
 }
@@ -415,6 +425,7 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
         owed: "[:",
         star: None,
         term: None,
+        done: Vec::new(),
     };
     for tok in tokens {
         step(&mut s, tok);
@@ -454,7 +465,10 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
             var: var.clone(),
         },
         Pos::Value => Expect::Value,
-        Pos::Term | Pos::Clause => Expect::Clause,
+        Pos::Sort => Expect::SortKey { vars: s.names() },
+        Pos::Term | Pos::Clause => Expect::Clause {
+            done: s.done.clone(),
+        },
     }
 }
 
@@ -462,10 +476,22 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
     if let Tok::Word(w) = tok
         && let Some(kw) = clause_keyword(w)
     {
+        // A tail clause comes once: a query has one `LIMIT`, and offering a
+        // second is offering a syntax error.
+        let written = w.to_ascii_uppercase();
+        if let Some((tail, _)) = TAIL
+            .iter()
+            .find(|(t, _)| t.split(' ').next() == Some(written.as_str()))
+        {
+            s.done.push((*tail).to_string());
+        }
         s.pos = match kw {
             "WHERE" | "AND" | "SET" => Pos::Predicate,
             "RETURN" => Pos::Projection,
             "CREATE" | "MERGE" => Pos::NodeOpen,
+            "BY" => Pos::Sort,
+            // `SKIP 10` — a number nobody but the author knows.
+            "COUNT" => Pos::Value,
             _ => Pos::Clause,
         };
         return;
@@ -527,7 +553,7 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
         (Pos::Arrow, Tok::Punct(_)) => s.pos = Pos::NodeOpen,
 
         // ---- clauses -----------------------------------------------------------
-        (Pos::Predicate | Pos::Projection | Pos::Value | Pos::Clause, Tok::Word(w)) => {
+        (Pos::Predicate | Pos::Projection | Pos::Value | Pos::Clause | Pos::Sort, Tok::Word(w)) => {
             s.term = Some((*w).to_string());
             s.pos = Pos::Term;
         }
@@ -646,7 +672,15 @@ fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Sugg
             out
         }
         Expect::Property { label, .. } => properties(word, vocab, label.as_deref()),
-        Expect::Clause => keywords(TAIL, word),
+        Expect::SortKey { vars } => {
+            let mut out = variables(vars, word);
+            out.extend(keywords(FOLDS, word));
+            out
+        }
+        Expect::Clause { done } => keywords(TAIL, word)
+            .into_iter()
+            .filter(|s| !done.iter().any(|d| d.eq_ignore_ascii_case(&s.text)))
+            .collect(),
     }
 }
 

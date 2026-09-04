@@ -664,7 +664,8 @@ fn expects_tag(e: &Expect) -> &'static str {
         Expect::Projection { .. } => "projection",
         Expect::Property { .. } => "property",
         Expect::Value => "value",
-        Expect::Clause => "clause",
+        Expect::SortKey { .. } => "sort-key",
+        Expect::Clause { .. } => "clause",
         Expect::Nothing => "nothing",
     }
 }
@@ -700,7 +701,8 @@ fn expects_about(e: &Expect) -> String {
         } => format!("properties of {var}, {}", a(l)),
         Expect::Property { var, label: None } => format!("properties of {var}"),
         Expect::Value => "a value only you know".into(),
-        Expect::Clause => "what comes after".into(),
+        Expect::SortKey { .. } => "what to sort on".into(),
+        Expect::Clause { .. } => "what comes after".into(),
         Expect::Nothing => "inside a string".into(),
     }
 }
