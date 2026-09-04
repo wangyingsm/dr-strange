@@ -1634,6 +1634,35 @@ button.swatch.off::before {
 .modal .close:hover {
   color: var(--fg);
 }
+/* JSON in GitHub's colours (Primer), so the popup reads like the file the
+   property came from. */
+.j-code .j-key {
+  color: #0550ae;
+}
+.j-code .j-str {
+  color: #0a3069;
+}
+.j-code .j-num {
+  color: #953800;
+}
+.j-code .j-lit {
+  color: #cf222e;
+}
+@media (prefers-color-scheme: dark) {
+  .j-code .j-key {
+    color: #79c0ff;
+  }
+  .j-code .j-str {
+    color: #a5d6ff;
+  }
+  .j-code .j-num {
+    color: #ffa657;
+  }
+  .j-code .j-lit {
+    color: #ff7b72;
+  }
+}
+
 .modal .floats {
   margin: 0;
   padding: 0.8rem 0.9rem;
@@ -2507,19 +2536,32 @@ nav button,
   color: var(--muted);
 }
 
-/* The rest of the properties, briefly, with the whole map a click away. */
+/* The rest of the properties, briefly, with the whole map a click away. The
+   button wears the accent rather than the border colour: it is the one thing
+   in the row worth pressing, and a grey outline said otherwise. */
 .q-expand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.25rem;
   font: 11px system-ui;
-  color: var(--muted);
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0 0.35rem;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
 }
 .q-expand:hover {
-  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
   border-color: var(--accent);
+}
+.q-braces {
+  font-family: ui-monospace, monospace;
+  font-size: 0.95em;
+  opacity: 0.75;
 }
 
 .q-examples {

@@ -4,6 +4,7 @@
   import { accept, cell, ghost, toTsv } from './cypher.js'
   import { formatVector, unwrapVector, vectorDims } from './vectors.js'
   import { labelColor } from './labels.js'
+  import { highlightJson } from './json.js'
 
   // `plane` is the app-wide current plane, which a query names none of its own.
   let { plane } = $props()
@@ -385,7 +386,13 @@
                 </td>
                 <td class="q-props">
                   <span class="q-brief">{brief(n)}</span>
-                  <button class="q-expand" onclick={() => (propsView = n)}>expand</button>
+                  <button
+                    class="q-expand"
+                    onclick={() => (propsView = n)}
+                    title="Show every property"
+                  >
+                    <span class="q-braces" aria-hidden="true">{'{ }'}</span> expand
+                  </button>
                 </td>
               </tr>
             {/each}
@@ -410,7 +417,7 @@
           <span>{propsView.external_key ?? `#${propsView.id}`} · properties</span>
           <button class="close" onclick={() => (propsView = null)} aria-label="Close">×</button>
         </header>
-        <pre class="floats">{JSON.stringify(propsView.properties ?? {}, null, 2)}</pre>
+        <pre class="floats j-code">{@html highlightJson(propsView.properties ?? {})}</pre>
       </div>
     </div>
   {/if}
