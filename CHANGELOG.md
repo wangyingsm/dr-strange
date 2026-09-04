@@ -6,6 +6,19 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`grep` can do what the shell `rg` could, and says where each hit lives.**
+  The MCP verb takes `regex: true` (Rust syntax — alternation, anchors,
+  classes), `path` to scope a search to a directory, a file or an extension,
+  and `context: n` for surrounding lines, printed the way `rg -C` prints them
+  (`-` on context lines, `--` between groups). Each hit is followed by the
+  symbol it falls inside — `in crate::module::fn` — read off the plane parsed
+  from that tree, so the next call is `context` or `snippet` on that key
+  rather than a `sed -n` on the file. Those three gaps were, measured over a
+  long session with the graph attached, most of the reasons an agent reached
+  past the verb for a shell command.
+
 ### Changed
 
 - **`drsg serve` keeps 20 commits of history, not all of it.** Time-travel

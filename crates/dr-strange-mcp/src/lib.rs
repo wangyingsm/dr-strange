@@ -643,17 +643,36 @@ struct SymbolReq {
     name: String,
 }
 
-/// `grep`'s request: literal text over the attached source tree.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// `grep`'s request: text over the attached source tree.
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct GrepReq {
-    /// Literal text to find (no regex — what you type is what is matched).
+    /// What to find. Literal text unless `regex` is set — then Rust regex
+    /// syntax, so `foo|bar`, `^pub fn \w+`, `set_\w+\(` all work.
     pattern: String,
+    /// Treat `pattern` as a regular expression (default false).
+    #[serde(default)]
+    regex: Option<bool>,
     /// Case-insensitive matching (default false).
     #[serde(default)]
     ignore_case: Option<bool>,
+    /// Only files under this directory or at this file (`crates/dr-strange-web`,
+    /// `src/lib.rs`), or with this extension when it starts with a dot (`.rs`).
+    /// Relative to the tree's root.
+    #[serde(default)]
+    path: Option<String>,
+    /// Lines of surrounding source to show before and after each hit (default
+    /// 0, capped at 10). Context lines carry `-` after the line number where
+    /// hits carry `:`, as `rg -C` prints them.
+    #[serde(default)]
+    context: Option<usize>,
     /// Max matching lines returned (default 50, capped at 200).
     #[serde(default)]
     max_results: Option<usize>,
+    /// The plane whose symbols the hits are placed in — each hit names the
+    /// symbol it falls inside, the key `context`/`snippet` take next. Unset,
+    /// the plane parsed from this tree (its `synced_root`) is used.
+    #[serde(default)]
+    plane: Option<String>,
 }
 
 /// `trace`'s request: two symbols, fuzzy like everywhere else.
@@ -726,7 +745,143 @@ struct SearchReq {
 
 /// Bounded literal search under `root`: build dirs and binaries skipped,
 /// results and line lengths capped, paths relative to the root.
-fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
+/// How `grep` matches a line: the literal text, or a compiled regex.
+enum Matcher {
+    Literal { needle: String, fold: bool },
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    fn new(req: &GrepReq) -> anyhow::Result<Self> {
+        if req.pattern.trim().is_empty() {
+            anyhow::bail!("an empty pattern matches everything and helps no one");
+        }
+        let fold = req.ignore_case.unwrap_or(false);
+        if req.regex.unwrap_or(false) {
+            let re = regex::RegexBuilder::new(&req.pattern)
+                .case_insensitive(fold)
+                .build()
+                .map_err(|e| anyhow::anyhow!("`{}` is not a valid regex: {e}", req.pattern))?;
+            return Ok(Self::Regex(re));
+        }
+        Ok(Self::Literal {
+            needle: if fold {
+                req.pattern.to_lowercase()
+            } else {
+                req.pattern.clone()
+            },
+            fold,
+        })
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(line),
+            Self::Literal { needle, fold: true } => line.to_lowercase().contains(needle.as_str()),
+            Self::Literal {
+                needle,
+                fold: false,
+            } => line.contains(needle.as_str()),
+        }
+    }
+}
+
+/// `grep`'s `path`: a directory or file under the root, or an extension when
+/// it starts with a dot. `rel` is root-relative with `/` separators.
+fn path_admits(filter: Option<&str>, rel: &str) -> bool {
+    match filter.map(|f| f.trim_matches('/')) {
+        None | Some("") => true,
+        Some(ext) if ext.starts_with('.') && !ext.contains('/') => rel.ends_with(ext),
+        Some(prefix) => rel == prefix || rel.starts_with(&format!("{prefix}/")),
+    }
+}
+
+/// Whether a directory at `rel` can hold anything `path_admits` — so a scoped
+/// grep walks only the branch it was pointed at.
+fn dir_worth_entering(filter: Option<&str>, rel: &str) -> bool {
+    match filter.map(|f| f.trim_matches('/')) {
+        None | Some("") => true,
+        Some(ext) if ext.starts_with('.') && !ext.contains('/') => true,
+        Some(prefix) => {
+            rel == prefix
+                || rel.starts_with(&format!("{prefix}/"))
+                || prefix.starts_with(&format!("{rel}/"))
+        }
+    }
+}
+
+/// Where a line sits in the graph: `file → [(line, key)]`, sorted by line,
+/// from every node of the plane that records a `file` and a `line`. Built once
+/// per `grep` from the plane the tree was parsed into, so each hit can name
+/// the symbol it falls in — the key `context`/`snippet` take next, which is
+/// what turns a text hit into a graph question instead of a `sed`.
+struct SymbolIndex {
+    by_file: std::collections::HashMap<String, Vec<(usize, String)>>,
+}
+
+impl SymbolIndex {
+    fn from_plane(plane: &dr_strange_core::PlaneHandle<'_>) -> anyhow::Result<Self> {
+        let mut by_file: std::collections::HashMap<String, Vec<(usize, String)>> =
+            std::collections::HashMap::new();
+        for n in plane.query().scan_all().nodes()? {
+            let Some(key) = n.external_key.as_deref() else {
+                continue;
+            };
+            let file = match n.properties.get("file").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Str(f)) => f.clone(),
+                _ => continue,
+            };
+            let line = match n.properties.get("line").map(|d| &d.value) {
+                Some(dr_strange_core::PropValue::Int(l)) if *l > 0 => *l as usize,
+                _ => continue,
+            };
+            by_file
+                .entry(file)
+                .or_default()
+                .push((line, key.to_string()));
+        }
+        for lines in by_file.values_mut() {
+            lines.sort();
+        }
+        Ok(Self { by_file })
+    }
+
+    /// The symbol declared closest above `line` in `file`. A declaration's
+    /// extent is not recorded, so a line past a short symbol's end still
+    /// names that symbol — near enough to be the next call, and said as
+    /// "in", not "is".
+    fn enclosing(&self, file: &str, line: usize) -> Option<&str> {
+        let declared = self.by_file.get(file)?;
+        let after = declared.partition_point(|(l, _)| *l <= line);
+        after.checked_sub(1).map(|i| declared[i].1.as_str())
+    }
+}
+
+/// The plane whose facts were parsed from `root` — the one whose
+/// `synced_root` is this directory — if any plane records that.
+fn plane_for_root<'a>(
+    db: &'a Database,
+    root: &std::path::Path,
+) -> anyhow::Result<Option<dr_strange_core::PlaneHandle<'a>>> {
+    let wanted = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for (_, name) in db.planes()? {
+        let plane = db.plane(&name)?;
+        let recorded = match plane.properties()?.get("synced_root").map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::Str(r)) => std::path::PathBuf::from(r),
+            _ => continue,
+        };
+        if recorded.canonicalize().unwrap_or(recorded) == wanted {
+            return Ok(Some(plane));
+        }
+    }
+    Ok(None)
+}
+
+fn grep_tree(
+    root: &std::path::Path,
+    req: &GrepReq,
+    symbols: Option<&SymbolIndex>,
+) -> anyhow::Result<String> {
     const SKIP_DIRS: &[&str] = &[
         ".git",
         "target",
@@ -741,19 +896,28 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
     const MAX_FILE: u64 = 2 * 1024 * 1024;
     const MAX_LINE: usize = 300;
     let cap = req.max_results.unwrap_or(50).clamp(1, 200);
-    let fold = req.ignore_case.unwrap_or(false);
-    let needle = if fold {
-        req.pattern.to_lowercase()
-    } else {
-        req.pattern.clone()
+    let around = req.context.unwrap_or(0).min(10);
+    let matcher = Matcher::new(req)?;
+    let filter = req.path.as_deref();
+
+    // One line as `grep` prints it: trimmed, and cut at a width past which a
+    // minified or generated line says nothing more.
+    let clip = |line: &str| -> String {
+        let mut shown = line.trim_end();
+        if shown.len() > MAX_LINE {
+            let mut end = MAX_LINE;
+            while !shown.is_char_boundary(end) {
+                end -= 1;
+            }
+            shown = &shown[..end];
+        }
+        shown.to_string()
     };
-    if needle.trim().is_empty() {
-        anyhow::bail!("an empty pattern matches everything and helps no one");
-    }
 
     let mut out = String::new();
     let mut hits = 0usize;
     let mut capped = false;
+    let mut named_any = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -765,13 +929,21 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             let Ok(meta) = entry.metadata() else { continue };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
             if meta.is_dir() {
-                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                if !name.starts_with('.')
+                    && !SKIP_DIRS.contains(&name.as_str())
+                    && dir_worth_entering(filter, &rel)
+                {
                     stack.push(path);
                 }
                 continue;
             }
-            if meta.len() > MAX_FILE {
+            if !path_admits(filter, &rel) || meta.len() > MAX_FILE {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
@@ -781,34 +953,52 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
                 continue; // binary
             }
             let text = String::from_utf8_lossy(&bytes);
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            for (i, line) in text.lines().enumerate() {
-                let hay = if fold {
-                    std::borrow::Cow::Owned(line.to_lowercase())
-                } else {
-                    std::borrow::Cow::Borrowed(line)
-                };
-                if !hay.contains(needle.as_str()) {
+            let lines: Vec<&str> = text.lines().collect();
+
+            // Hits first, then the printing, so context around one hit never
+            // repeats a line another hit already showed.
+            let mut matched: Vec<usize> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if !matcher.is_match(line) {
                     continue;
                 }
                 if hits == cap {
                     capped = true;
                     break;
                 }
-                let mut shown = line.trim_end();
-                if shown.len() > MAX_LINE {
-                    let mut end = MAX_LINE;
-                    while !shown.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    shown = &shown[..end];
-                }
-                out.push_str(&format!("{rel}:{}: {shown}\n", i + 1));
+                matched.push(i);
                 hits += 1;
+            }
+            let mut printed_through: Option<usize> = None; // last line index shown
+            let mut last_symbol: Option<&str> = None;
+            for &i in &matched {
+                let start = i.saturating_sub(around);
+                let end = (i + around).min(lines.len().saturating_sub(1));
+                let from = match printed_through {
+                    Some(p) if p + 1 >= start => p + 1,
+                    Some(_) => {
+                        // A gap between context groups, as `rg -C` marks it;
+                        // plain hits are one line each and need no marker.
+                        if around > 0 {
+                            out.push_str("--\n");
+                        }
+                        start
+                    }
+                    None => start,
+                };
+                for (j, line) in lines.iter().enumerate().take(end + 1).skip(from) {
+                    let sep = if j == i { ':' } else { '-' };
+                    out.push_str(&format!("{rel}:{}{sep} {}\n", j + 1, clip(line)));
+                    if j == i
+                        && let Some(key) = symbols.and_then(|s| s.enclosing(&rel, i + 1))
+                        && last_symbol != Some(key)
+                    {
+                        out.push_str(&format!("    in {key}\n"));
+                        last_symbol = Some(key);
+                        named_any = true;
+                    }
+                }
+                printed_through = Some(end.max(printed_through.unwrap_or(0)));
             }
             if capped {
                 break;
@@ -820,10 +1010,18 @@ fn grep_tree(root: &std::path::Path, req: &GrepReq) -> anyhow::Result<String> {
     }
     if hits == 0 {
         out.push_str("no matches\n");
+        if let Some(f) = filter {
+            out.push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+        }
     } else if capped {
         out.push_str(&format!(
-            "… capped at {cap} matches — narrow the pattern or raise max_results\n"
+            "… capped at {cap} matches — narrow the pattern (or `path`) or raise max_results\n"
         ));
+    }
+    if named_any {
+        out.push_str(
+            "context <key> expands any symbol named above; snippet <key> shows its source\n",
+        );
     }
     Ok(out)
 }
@@ -1678,13 +1876,18 @@ impl DrStrange {
         .await
     }
 
-    #[tool(description = "Literal text search over the source tree behind \
-        the graph (the watched directory). One matching line per result, \
-        `file:line: text`. For log messages, config values, comments — \
-        anything the graph deliberately does not model. No regex.")]
+    #[tool(description = "Text search over the source tree behind the graph — \
+        use this instead of a shell `rg`/`grep`: the tree is attached, and \
+        each hit names the symbol it falls in, so the next call is `context` \
+        or `snippet` on that key rather than a `sed`. `file:line: text` per \
+        hit; `regex: true` for Rust regex syntax, `path` to scope to a \
+        directory, file or `.ext`, `context: n` for surrounding lines (`-` \
+        marks them, as `rg -C`). For log messages, config values, comments — \
+        anything the graph does not model — and for finding where to point \
+        `context` when the name is only half known.")]
     async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
         let root = self.source_root.clone();
-        self.blocking("grep", move |_db| {
+        self.blocking("grep", move |db| {
             let Some(root) = root else {
                 anyhow::bail!(
                     "no source tree attached to this server — `serve watch` \
@@ -1692,7 +1895,15 @@ impl DrStrange {
                      so run grep locally instead"
                 );
             };
-            Ok(Value::String(grep_tree(&root, &req)?))
+            // The plane the hits are placed in: the one asked for, else the
+            // one parsed from this very tree. None is fine — hits still come
+            // back, only without a symbol beside them.
+            let plane = match &req.plane {
+                Some(name) => Some(db.plane(name)?),
+                None => plane_for_root(db, &root)?,
+            };
+            let symbols = plane.as_ref().map(SymbolIndex::from_plane).transpose()?;
+            Ok(Value::String(grep_tree(&root, &req, symbols.as_ref())?))
         })
         .await
     }
@@ -2671,27 +2882,40 @@ mod grep_tests {
     fn req(pattern: &str) -> GrepReq {
         GrepReq {
             pattern: pattern.into(),
-            ignore_case: None,
-            max_results: None,
+            ..Default::default()
         }
+    }
+
+    /// A small tree: two Rust functions, a Python file, a doc, a build
+    /// directory and a binary.
+    fn tree(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("drsg-grep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "fn main() {\n    // needle here\n}\nfn other() {\n    let needle = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/b.py"), "needle = 1\n").unwrap();
+        std::fs::write(dir.join("docs/c.md"), "needle prose\n").unwrap();
+        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+        dir
     }
 
     #[test]
     fn finds_lines_skips_build_dirs_and_binaries() {
-        let dir = std::env::temp_dir().join(format!("drsg-grep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::create_dir_all(dir.join("target")).unwrap();
-        std::fs::write(dir.join("src/a.rs"), "fn main() {\n    // needle here\n}\n").unwrap();
-        std::fs::write(dir.join("target/b.rs"), "// needle in build output\n").unwrap();
-        std::fs::write(dir.join("blob.bin"), b"nee\0dle").unwrap();
+        let dir = tree("basic");
 
-        let out = grep_tree(&dir, &req("needle")).unwrap();
+        let out = grep_tree(&dir, &req("needle"), None).unwrap();
         assert!(out.contains("src/a.rs:2:"), "{out}");
         assert!(!out.contains("target/"), "build dirs are skipped: {out}");
         assert!(!out.contains("blob.bin"), "binaries are skipped: {out}");
 
-        let none = grep_tree(&dir, &req("absent-text")).unwrap();
+        let none = grep_tree(&dir, &req("absent-text"), None).unwrap();
         assert!(none.contains("no matches"));
 
         let folded = grep_tree(
@@ -2700,16 +2924,186 @@ mod grep_tests {
                 pattern: "NEEDLE".into(),
                 ignore_case: Some(true),
                 max_results: Some(1),
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
         assert!(folded.contains("src/a.rs:2:"), "{folded}");
+        assert!(folded.contains("capped at 1"), "{folded}");
 
         assert!(
-            grep_tree(&dir, &req("  ")).is_err(),
+            grep_tree(&dir, &req("  "), None).is_err(),
             "empty pattern refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regex_path_scope_and_context_lines() {
+        let dir = tree("regex");
+
+        // A regex: two declarations, and nothing from the Python file.
+        let fns = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: r"^fn \w+\(".into(),
+                regex: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(fns.contains("src/a.rs:1: fn main()"), "{fns}");
+        assert!(fns.contains("src/a.rs:4: fn other()"), "{fns}");
+        assert!(!fns.contains("b.py"), "{fns}");
+        // The same text is not a regex unless asked.
+        let literal = grep_tree(&dir, &req(r"^fn \w+\("), None).unwrap();
+        assert!(literal.contains("no matches"), "{literal}");
+        let bad = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "(".into(),
+                regex: Some(true),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(bad.is_err(), "an invalid regex is an error, not a literal");
+
+        // Scope: by extension, by directory, by file.
+        let py = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some(".py".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(py.contains("src/b.py:1:") && !py.contains("a.rs"), "{py}");
+        let docs = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("docs/".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            docs.contains("docs/c.md:1:") && !docs.contains("src/"),
+            "{docs}"
+        );
+        let file = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            file.contains("src/a.rs:2:") && !file.contains("b.py"),
+            "{file}"
+        );
+        let elsewhere = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("nowhere".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(elsewhere.contains("searched only `nowhere`"), "{elsewhere}");
+
+        // Context: the neighbours carry `-`, the hit `:`, and two hits close
+        // together share their overlap rather than printing it twice.
+        let around = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                context: Some(1),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let expected = "src/a.rs:1- fn main() {\n\
+                        src/a.rs:2:     // needle here\n\
+                        src/a.rs:3- }\n\
+                        src/a.rs:4- fn other() {\n\
+                        src/a.rs:5:     let needle = 1;\n\
+                        src/a.rs:6- }\n";
+        assert_eq!(around, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hits_name_the_symbol_they_fall_in() {
+        let dir = tree("symbols");
+        let symbols = SymbolIndex {
+            by_file: [(
+                "src/a.rs".to_string(),
+                vec![(1, "a::main".to_string()), (4, "a::other".to_string())],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let out = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                path: Some("src/a.rs".into()),
+                ..Default::default()
+            },
+            Some(&symbols),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "src/a.rs:2:     // needle here\n    in a::main\n\
+             src/a.rs:5:     let needle = 1;\n    in a::other\n\
+             context <key> expands any symbol named above; snippet <key> shows its source\n"
+        );
+        // A line above every declaration belongs to nothing.
+        assert_eq!(symbols.enclosing("src/a.rs", 0), None);
+        assert_eq!(symbols.enclosing("src/a.rs", 3), Some("a::main"));
+        assert_eq!(symbols.enclosing("src/none.rs", 3), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_index_reads_file_and_line_off_the_plane() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("p", dr_strange_core::Properties::new())
+            .unwrap();
+        write_nodes_logic(
+            &db,
+            serde_json::from_value(jval!({"plane": "p", "nodes": [
+                {"external_key": "m::f", "labels": ["Function"],
+                 "properties": {"file": "src/m.rs", "line": 10}},
+                {"external_key": "m::g", "labels": ["Function"],
+                 "properties": {"file": "src/m.rs", "line": 30}},
+                {"external_key": "loose", "labels": ["Note"], "properties": {}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let plane = db.plane("p").unwrap();
+        let index = SymbolIndex::from_plane(&plane).unwrap();
+        assert_eq!(index.enclosing("src/m.rs", 12), Some("m::f"));
+        assert_eq!(index.enclosing("src/m.rs", 30), Some("m::g"));
+        assert_eq!(index.enclosing("src/m.rs", 9), None);
     }
 }
 

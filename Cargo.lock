@@ -1253,6 +1253,7 @@ dependencies = [
  "dr-strange-log",
  "dr-strange-parser",
  "mimalloc",
+ "regex",
  "reqwest 0.13.4",
  "rmcp",
  "schemars",
