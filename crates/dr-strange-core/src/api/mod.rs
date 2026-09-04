@@ -51,6 +51,7 @@ use crate::storage::vector::Metric;
 use crate::text::Language;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
+    QueryRecord,
 };
 
 mod snapshot;
@@ -590,6 +591,37 @@ impl Database {
     pub fn commit_seq(&self) -> Result<u64> {
         self.engine.with_read(|txn| graph::read_commit_seq(txn))
     }
+
+    /// Records a query that ran, so it can be run again — the dashboard's
+    /// history list and the CLI's `history`.
+    ///
+    /// `keep` caps the list: the oldest are purged as new ones arrive, which is
+    /// what makes it a history rather than a log. Running the same query twice
+    /// in a row restamps the entry it already has instead of adding a second —
+    /// see [`graph::record_query`]. Returns the id it was filed under.
+    ///
+    /// A **write**, and callers should treat it as best-effort: a query that
+    /// ran is a query that ran, whether or not the note about it landed.
+    pub fn record_query(&self, plane: &str, query: &str, keep: usize) -> Result<u64> {
+        let at = now_millis();
+        self.engine
+            .with_write(|txn| graph::record_query(txn, plane, query, at, keep))
+    }
+
+    /// The queries recorded, newest first, at most `limit` of them.
+    pub fn query_history(&self, limit: usize) -> Result<Vec<QueryRecord>> {
+        self.engine.with_read(|txn| graph::list_history(txn, limit))
+    }
+
+    /// One recorded query, by id; `None` when it has been purged or never was.
+    pub fn recorded_query(&self, id: u64) -> Result<Option<QueryRecord>> {
+        self.engine.with_read(|txn| graph::get_history(txn, id))
+    }
+
+    /// How many queries a history keeps unless a caller says otherwise. Two
+    /// hundred is a few days of a person's work and a few seconds of an
+    /// agent's, which is the right side of both.
+    pub const DEFAULT_HISTORY: usize = 200;
 
     /// Register a commit-time change observer (ROADMAP §5): after every
     /// committed write, `f` is called with the [`ChangeSet`] that landed. Only

@@ -690,3 +690,115 @@ async fn a_node_reached_many_ways_comes_back_once() {
     assert_eq!(out["total"], 1, "and the count paging reports is of nodes");
     assert_eq!(out["count"], 1);
 }
+
+/// A history is of what ran, and only of what ran. A query that failed to
+/// parse, or failed against the plane, is not something to offer back to the
+/// reader as a thing they once did — so the record is written after the rows
+/// come out, not after the parse succeeds.
+#[tokio::test]
+async fn the_history_holds_the_queries_that_ran() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let run = |query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/cypher?plane=startup"))
+                .header("origin", &base)
+                .body(query)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let history = || {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .get(format!("{base}/cypher/history"))
+                .header("origin", &base)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(history().await, json!([]), "nothing has run yet");
+
+    assert!(
+        run(r#"CREATE (a:Doc {key:"a"})"#)
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(run("MATCH (n:Doc) RETURN n").await.status().is_success());
+    assert!(
+        run("MATCH (n:Doc) RETURN n.title AS t")
+            .await
+            .status()
+            .is_success(),
+        "a projection runs too"
+    );
+
+    // Two that never ran: one the parser rejects, one the plane does.
+    assert!(!run("MATCH (n:Doc) RETUR n").await.status().is_success());
+    assert!(
+        !run("MATCH (n:Doc) WHERE n.x >< 1 RETURN n")
+            .await
+            .status()
+            .is_success()
+    );
+
+    let rows = history().await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "three ran, two did not: {rows:?}");
+    assert_eq!(
+        rows[0]["query"], "MATCH (n:Doc) RETURN n.title AS t",
+        "newest first"
+    );
+    assert_eq!(rows[2]["query"], r#"CREATE (a:Doc {key:"a"})"#);
+    assert_eq!(rows[0]["plane"], "startup", "each says where it ran");
+    assert!(rows[0]["at"].as_i64().unwrap() > 0, "and when");
+
+    // Each is fetchable on its own, by the id the listing gave.
+    let id = rows[1]["id"].as_u64().unwrap();
+    let one: Value = client
+        .get(format!("{base}/cypher/history/{id}"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one, rows[1]);
+
+    // An id that was never issued is absent, not an empty answer.
+    let missing = client
+        .get(format!("{base}/cypher/history/99999"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // And a caller can ask for just the top of it.
+    let recent: Value = client
+        .get(format!("{base}/cypher/history?limit=1"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recent.as_array().unwrap().len(), 1);
+}

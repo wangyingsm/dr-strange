@@ -342,6 +342,7 @@ mod tests {
             db_path: None,
             digest: crate::DigestDefaults::default(),
             deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
         };
         handle(&ctx, &Auth::allow_all(), body.as_bytes())
     }
@@ -354,6 +355,7 @@ mod tests {
             db_path: None,
             digest: crate::DigestDefaults::default(),
             deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
         };
         handle(&ctx, auth, body.as_bytes())
     }

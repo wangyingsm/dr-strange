@@ -8,7 +8,7 @@ use crate::storage::engine::{ReadTransaction, TableId, WriteTransaction, prefix_
 use crate::storage::vector::Metric;
 use crate::storage::{codec, keys};
 use crate::text::Language;
-use crate::types::{EdgeId, NodeId, PlaneId, Properties};
+use crate::types::{EdgeId, NodeId, PlaneId, Properties, QueryRecord};
 
 /// v2 (M1): node records gained an inline `external_key` field
 /// (arch/01 §2 — `codec::NodeRecordRaw`).
@@ -543,6 +543,119 @@ pub fn list_vector_indexes(
         out.push((plane, label, property, metric));
     }
     Ok(out)
+}
+
+// ---- query history --------------------------------------------------------
+//
+// A list of what has been run, so it can be run again — the dashboard's
+// clickable list and the CLI's `history`. It lives in `meta` beside the
+// counters and the index declarations, keyed by a monotonic id.
+
+/// What is kept per entry; the id is the key it is filed under.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredQuery {
+    at: i64,
+    plane: String,
+    query: String,
+}
+
+fn history_entries(txn: &dyn ReadTransaction) -> Result<Vec<(u64, StoredQuery)>> {
+    let prefix = keys::HISTORY_PREFIX;
+    let end = prefix_successor(prefix);
+    let mut out = Vec::new();
+    for item in txn.range(TableId::Meta, prefix, end.as_deref())? {
+        let (key, value) = item?;
+        let Some(id) = keys::parse_history_key(&key) else {
+            continue;
+        };
+        let stored: StoredQuery = postcard::from_bytes(&value)
+            .map_err(|e| Error::Corrupt(format!("bad history entry: {e}")))?;
+        out.push((id, stored));
+    }
+    Ok(out)
+}
+
+/// Files `query` under the next id, and purges the oldest beyond `keep`.
+///
+/// Running the same query twice in a row does not fill the list with it: the
+/// newest entry is stamped with the new time instead, which is what a shell's
+/// history does and what a list you pick from wants. An older identical entry
+/// is left where it is — it is a different moment, and the list is a record of
+/// moments.
+///
+/// Returns the id it was filed under.
+pub fn record_query(
+    txn: &mut dyn WriteTransaction,
+    plane: &str,
+    query: &str,
+    at: i64,
+    keep: usize,
+) -> Result<u64> {
+    let entries = history_entries(&*txn)?;
+    if let Some((id, last)) = entries.last()
+        && last.plane == plane
+        && last.query == query
+    {
+        let id = *id;
+        write_history(txn, id, at, plane, query)?;
+        return Ok(id);
+    }
+    let id = entries.last().map_or(1, |(id, _)| id + 1);
+    write_history(txn, id, at, plane, query)?;
+    // Oldest first, so the head of the range is what a full history drops.
+    let keep = keep.max(1);
+    let over = (entries.len() + 1).saturating_sub(keep);
+    for (old, _) in entries.iter().take(over) {
+        txn.delete(TableId::Meta, &keys::history_key(*old))?;
+    }
+    Ok(id)
+}
+
+fn write_history(
+    txn: &mut dyn WriteTransaction,
+    id: u64,
+    at: i64,
+    plane: &str,
+    query: &str,
+) -> Result<()> {
+    let value = postcard::to_stdvec(&StoredQuery {
+        at,
+        plane: plane.to_string(),
+        query: query.to_string(),
+    })
+    .map_err(|e| Error::Corrupt(format!("encoding a history entry: {e}")))?;
+    txn.put(TableId::Meta, &keys::history_key(id), &value)
+}
+
+/// The recorded queries, **newest first**, at most `limit` of them.
+pub fn list_history(txn: &dyn ReadTransaction, limit: usize) -> Result<Vec<QueryRecord>> {
+    let mut all = history_entries(txn)?;
+    all.reverse();
+    all.truncate(limit);
+    Ok(all
+        .into_iter()
+        .map(|(id, s)| QueryRecord {
+            id,
+            at: s.at,
+            plane: s.plane,
+            query: s.query,
+        })
+        .collect())
+}
+
+/// One recorded query, by the id it was filed under.
+pub fn get_history(txn: &dyn ReadTransaction, id: u64) -> Result<Option<QueryRecord>> {
+    let Some(value) = txn.get(TableId::Meta, &keys::history_key(id))? else {
+        return Ok(None);
+    };
+    let s: StoredQuery = postcard::from_bytes(&value)
+        .map_err(|e| Error::Corrupt(format!("bad history entry: {e}")))?;
+    Ok(Some(QueryRecord {
+        id,
+        at: s.at,
+        plane: s.plane,
+        query: s.query,
+    }))
 }
 
 // ---- keyword index declarations (ROADMAP §2) ------------------------------

@@ -33,6 +33,8 @@ pub struct Ctx<'a> {
     pub digest: crate::DigestDefaults,
     /// When this request's queries must stop. `None` ⇒ run to completion.
     pub deadline: Option<std::time::Instant>,
+    /// How many queries the history keeps.
+    pub history_limit: usize,
 }
 
 impl Ctx<'_> {
@@ -1001,6 +1003,33 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     )
 }
 
+/// Notes a query that ran, so it can be run again.
+///
+/// **Best-effort, and deliberately so.** Recording is a write, and a read
+/// query that could not be written down still ran: failing it because the note
+/// did not land would be answering the wrong question. A failure is logged and
+/// forgotten.
+fn remember(ctx: &Ctx<'_>, plane: &str, query: &str) {
+    if let Err(e) = ctx.db.record_query(plane, query, ctx.history_limit) {
+        tracing::debug!(plane = %plane, error = %e, "could not record the query");
+    }
+}
+
+/// The queries this database has run, newest first.
+pub fn query_history(ctx: &Ctx<'_>, limit: usize) -> Result<Value, RpcError> {
+    let rows = app(ctx.db.query_history(limit))?;
+    Ok(Value::Array(rows.iter().map(history_json).collect()))
+}
+
+/// One recorded query, or `null` when it has been purged or never was.
+pub fn recorded_query(ctx: &Ctx<'_>, id: u64) -> Result<Option<Value>, RpcError> {
+    Ok(app(ctx.db.recorded_query(id))?.as_ref().map(history_json))
+}
+
+fn history_json(r: &dr_strange_core::QueryRecord) -> Value {
+    jval!({ "id": r.id, "at": r.at, "plane": r.plane, "query": r.query })
+}
+
 /// One page of a result: where to start, and how many rows to carry.
 ///
 /// A query says how many rows there are; a reader looks at a screenful. The
@@ -1068,6 +1097,7 @@ pub fn cypher_subgraph(
         dr_strange_parser::Statement::Read(read) => (pin(plane, read.as_of)?, read.plan),
         dr_strange_parser::Statement::Write(w) => {
             let s = w.apply(&plane).map_err(RpcError::server)?;
+            remember(ctx, plane_name, query);
             return Ok(jval!({
                 "write": true,
                 "nodes_created": s.nodes_created,
@@ -1084,6 +1114,7 @@ pub fn cypher_subgraph(
     let q = plane.query_from_plan(plan);
     if q.plan().project.is_some() {
         let table = app(q.table())?;
+        remember(ctx, plane_name, query);
         let total = table.rows.len();
         // A projected column is as able to be an embedding as a property is:
         // `RETURN m.embedding` asks for one by name.
@@ -1114,7 +1145,9 @@ pub fn cypher_subgraph(
     // untidy but fatal: repeated keys abort the render, and the page sits on
     // "Running…" with no result and no error.
     let mut seen = std::collections::BTreeSet::new();
-    let all: Vec<_> = app(q.scored_nodes())?
+    let ran = app(q.scored_nodes())?;
+    remember(ctx, plane_name, query);
+    let all: Vec<_> = ran
         .into_iter()
         .filter(|(n, _)| seen.insert(n.id.0))
         .collect();

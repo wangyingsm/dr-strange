@@ -157,6 +157,21 @@ impl From<Vec<f32>> for PropValue {
     }
 }
 
+/// A query that ran, kept so it can be run again.
+///
+/// The history is a database-level list rather than a per-plane one: a person
+/// writes a query, switches plane, writes another, and wants both back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryRecord {
+    /// Monotonic, and the order the history is read in.
+    pub id: u64,
+    /// When it ran, in unix-epoch milliseconds.
+    pub at: i64,
+    /// The plane it ran against.
+    pub plane: String,
+    pub query: String,
+}
+
 /// A fully decoded node, as returned by reads (arch/04 §3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeRecord {

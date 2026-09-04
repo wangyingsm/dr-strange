@@ -66,6 +66,9 @@ pub struct ServeOptions {
     pub digest: DigestDefaults,
     /// Policy and budgets for the URL fetcher (ROADMAP §9).
     pub fetch: FetchDefaults,
+    /// How many queries the history keeps — the list the dashboard shows and
+    /// `drsg history` prints. The oldest are purged as new ones arrive.
+    pub history_limit: usize,
     /// How long a write transaction waits for the single writer slot before
     /// failing with a retryable timeout; `None` waits forever.
     ///
@@ -191,6 +194,7 @@ impl Default for ServeOptions {
             fetch: FetchDefaults::default(),
             write_timeout: Some(DEFAULT_WRITE_TIMEOUT),
             query_timeout: Some(DEFAULT_QUERY_TIMEOUT),
+            history_limit: Database::DEFAULT_HISTORY,
             retain_commits: Some(DEFAULT_RETAIN_COMMITS),
             embed_provider: None,
             source_root: None,

@@ -51,6 +51,26 @@ pub fn counters_key(plane: PlaneId) -> Vec<u8> {
 /// time-travel (ROADMAP §4): `AS OF <timestamp>` resolves against it.
 pub const META_COMMIT_TIME: &[u8] = b"commit_time";
 
+/// Query history lives in `meta`, keyed `hist:` · `id` (u64 BE), value =
+/// postcard `(at, plane, query)`.
+///
+/// Big-endian ids make the range scan run oldest-first, which is what both
+/// readings of a history want: the newest entries are its tail, and the ones
+/// to purge when it outgrows its cap are its head.
+pub const HISTORY_PREFIX: &[u8] = b"hist:";
+
+pub fn history_key(id: u64) -> Vec<u8> {
+    let mut k = HISTORY_PREFIX.to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// The id in a `hist:` key, or nothing when the key is not one.
+pub fn parse_history_key(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(HISTORY_PREFIX)?;
+    (rest.len() == 8).then(|| u64be(rest))
+}
+
 /// Vector-index declarations live in `meta`, keyed
 /// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag.
 /// The `\0` separates the two variable-length names unambiguously (labels

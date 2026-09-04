@@ -13,7 +13,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -89,6 +89,8 @@ pub struct AppState {
     /// Per-request query budget (`[server] query_timeout_secs`); `None` runs
     /// to completion.
     pub query_timeout: Option<Duration>,
+    /// How many queries the history keeps.
+    pub history_limit: usize,
     /// The completion vocabulary last built, and what it was built from —
     /// see [`AppState::vocab`].
     vocab_cache: Mutex<Option<CachedVocab>>,
@@ -146,6 +148,7 @@ impl AppState {
             // Stamped per request, not per process: the budget is how long
             // *this* call may run, so it starts when the call does.
             deadline: self.query_timeout.map(|d| Instant::now() + d),
+            history_limit: self.history_limit,
         }
     }
 }
@@ -367,6 +370,8 @@ fn router(
         // schema / SDKs) as a web-only surface, like /export.
         .route("/cypher", post(cypher_http))
         .route("/cypher/complete", post(complete_http))
+        .route("/cypher/history", get(history_http))
+        .route("/cypher/history/{id}", get(history_one_http))
         // Unauthenticated liveness probe for load balancers / orchestrators.
         .route("/health", get(health))
         // `.layer` after `.fallback` so the SPA (served by the fallback) is
@@ -827,6 +832,65 @@ async fn cypher_http(
 }
 
 #[derive(serde::Deserialize)]
+struct HistoryQuery {
+    /// How many to return, newest first. The whole history by default, which
+    /// is capped anyway — see [`ServeOptions::history_limit`].
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /cypher/history` — the queries this database has run, newest first,
+/// each with the plane it ran against and when.
+///
+/// **Read-gated**: it is a list of what was asked, not a way to ask anything.
+async fn history_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let limit = q.limit.unwrap_or(state.history_limit);
+    let built =
+        tokio::task::spawn_blocking(move || methods::query_history(&state.ctx(), limit)).await;
+    match built {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "history task failed").into_response(),
+    }
+}
+
+/// `GET /cypher/history/{id}` — one recorded query, or 404 once it has been
+/// purged: a history is capped, and an id that has fallen off the end is
+/// absent rather than empty.
+async fn history_one_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let built =
+        tokio::task::spawn_blocking(move || methods::recorded_query(&state.ctx(), id)).await;
+    match built {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "no such query in the history").into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "history task failed").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct CompleteQuery {
     #[serde(default)]
     plane: String,
@@ -1049,6 +1113,7 @@ pub async fn run(
             digest: opts.digest,
             fetch: opts.fetch.clone(),
             query_timeout: opts.query_timeout,
+            history_limit: opts.history_limit,
             vocab_cache: Mutex::new(None),
         });
         return run_app(state, opts, &resync_needed, &follow_lost).await;
@@ -1064,6 +1129,7 @@ pub async fn run(
         digest: opts.digest,
         fetch: opts.fetch.clone(),
         query_timeout: opts.query_timeout,
+        history_limit: opts.history_limit,
         vocab_cache: Mutex::new(None),
     });
     run_app(state, opts, &resync_needed, &follow_lost).await
