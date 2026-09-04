@@ -17,7 +17,10 @@
     ['Past snapshot', 'MATCH (n:Fn) RETURN count(*) AS fns AS OF 1'],
   ]
 
-  let text = $state(loadPref('queryText', EXAMPLES[0][1]))
+  // Empty on a first visit: the box opens with the placeholder's hint, not a
+  // statement written for one plane's labels that would fail on most others.
+  // What the user last ran is restored, since that was their own choice.
+  let text = $state(loadPref('queryText', ''))
   let provider = $state(loadPref('embedProvider', 'openai'))
   let busy = $state(false)
   let error = $state(null)
@@ -117,7 +120,7 @@
         onkeydown={onKey}
         spellcheck="false"
         rows="6"
-        placeholder="MATCH (n:Label) RETURN n.name, count(*) AS n"
+        placeholder="MATCH (n:Label)-[:TYPE]->(m) WHERE n.name = &quot;…&quot; RETURN n.name, count(*) AS c"
         aria-label="Query"
       ></textarea>
     </div>
