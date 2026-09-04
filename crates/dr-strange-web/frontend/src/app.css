@@ -2418,6 +2418,43 @@ nav button,
 .q-plane b {
   color: var(--fg);
 }
+/* What the plane says could come next: a row of candidates under the box,
+   each carrying the count that ranked it. */
+.q-suggest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+.q-suggest-about {
+  font: 11px system-ui;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-right: 0.2rem;
+}
+.q-sug {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  font: 12px ui-monospace, monospace;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.15rem 0.45rem;
+  cursor: pointer;
+}
+.q-sug:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.q-sug-detail {
+  font: 11px system-ui;
+  color: var(--muted);
+}
+
 .q-examples {
   display: flex;
   flex-wrap: wrap;

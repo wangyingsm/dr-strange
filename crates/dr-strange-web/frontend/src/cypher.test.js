@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { cell, ghost, inStringLiteral, toTsv } from './cypher.js'
+import { accept, cell, ghost, inStringLiteral, toTsv } from './cypher.js'
 
 describe('completion', () => {
   test('completes the word being typed, keeping the keyword casing', () => {
@@ -57,5 +57,23 @@ describe('results', () => {
   test('a cell that contains a tab or newline cannot break the columns', () => {
     const table = { columns: ['doc'], rows: [['two\tparts\nand a line']] }
     expect(toTsv(table)).toBe('doc\ntwo parts and a line')
+  })
+})
+
+describe('accepting a completion', () => {
+  test('splices at the caret and leaves the caret after it', () => {
+    expect(accept('MATCH ', 6, '(n:Fn)')).toEqual({ text: 'MATCH (n:Fn)', caret: 12 })
+  })
+
+  test('keeps what follows a caret in the middle', () => {
+    expect(accept('MATCH  RETURN n', 6, '(n:Fn)')).toEqual({
+      text: 'MATCH (n:Fn) RETURN n',
+      caret: 12,
+    })
+  })
+
+  test('clamps a caret that is outside the text', () => {
+    expect(accept('abc', 99, 'X')).toEqual({ text: 'abcX', caret: 4 })
+    expect(accept('abc', -5, 'X')).toEqual({ text: 'Xabc', caret: 1 })
   })
 })

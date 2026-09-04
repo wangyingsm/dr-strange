@@ -60,6 +60,22 @@ export function ghost(text) {
   return kw ? kw.slice(m[1].length) : ''
 }
 
+/**
+ * Take a completion at the caret: the text with `insert` spliced in, and
+ * where the caret lands after it.
+ *
+ * Spliced rather than appended, because the caret is not always at the end of
+ * the box — and a completion is always *for* the text before it, wherever
+ * that ends.
+ */
+export function accept(text, caret, insert) {
+  const at = Math.max(0, Math.min(caret, text.length))
+  return {
+    text: text.slice(0, at) + insert + text.slice(at),
+    caret: at + insert.length,
+  }
+}
+
 /** A result cell as text: null is absence, a list or map shows as JSON. */
 export function cell(v) {
   if (v === null || v === undefined) return '—'

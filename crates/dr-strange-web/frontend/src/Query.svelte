@@ -1,7 +1,7 @@
 <script>
   import { authHeaders } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
-  import { cell, ghost, toTsv } from './cypher.js'
+  import { accept, cell, ghost, toTsv } from './cypher.js'
 
   // `plane` is the app-wide current plane, which a query names none of its own.
   let { plane } = $props()
@@ -17,10 +17,22 @@
     ['Past snapshot', 'MATCH (n:Fn) RETURN count(*) AS fns AS OF 1'],
   ]
 
+  // How long typing must pause before the server is asked what comes next.
+  // A round trip is not free, and a guess that arrives while the next
+  // character is being typed was never worth making.
+  const IDLE_MS = 1000
+
   // Empty on a first visit: the box opens with the placeholder's hint, not a
   // statement written for one plane's labels that would fail on most others.
   // What the user last ran is restored, since that was their own choice.
   let text = $state(loadPref('queryText', ''))
+  // Where the caret is, and the textarea itself — a completion is for the
+  // text *before* the caret, and accepting one has to put the caret after it.
+  let caret = $state(text.length)
+  let box = $state(null)
+  let focused = $state(false)
+  // The server's last answer: `{ prefix, plane, best, about, suggestions }`.
+  let guess = $state(null)
   let provider = $state(loadPref('embedProvider', 'openai'))
   let busy = $state(false)
   let error = $state(null)
@@ -28,7 +40,72 @@
   let elapsed = $state(null) // ms of the last run, so a slow query says so
   let copied = $state(false)
 
-  const completion = $derived(ghost(text))
+  // What a completion is for: the query up to the caret.
+  const prefix = $derived(text.slice(0, caret))
+  // The server's answer, but only while it still describes what is typed in
+  // the plane it was asked about — one keystroke later, or one plane over, it
+  // is about a query that no longer exists.
+  const remote = $derived(guess?.prefix === prefix && guess?.plane === plane ? guess : null)
+  // The ghost is drawn after the caret, so it can only be drawn when the
+  // caret is at the end; mid-text, the list below is the whole story.
+  const atEnd = $derived(caret >= text.length)
+  // Once the server has spoken about this exact prefix its word is final,
+  // including when the word is "nothing" — inside a string literal, say. The
+  // keyword ghost fills the second before it answers, so the box is never
+  // dead while a key is still warm.
+  const completion = $derived(!atEnd ? '' : remote ? (remote.best ?? '') : ghost(prefix))
+  const suggestions = $derived(focused && remote ? remote.suggestions : [])
+
+  // Ask on a pause, and only about what is actually typed now.
+  let timer
+  let inflight
+  $effect(() => {
+    const asked = prefix
+    const on = plane
+    clearTimeout(timer)
+    timer = setTimeout(() => ask(asked, on), IDLE_MS)
+    return () => clearTimeout(timer)
+  })
+
+  async function ask(asked, on) {
+    inflight?.abort()
+    const ctrl = new AbortController()
+    inflight = ctrl
+    try {
+      // POST /cypher/complete is web-only, like /cypher: a raw fetch carrying
+      // the bearer token the RPC client would add.
+      const res = await fetch(`/cypher/complete?plane=${encodeURIComponent(on)}`, {
+        method: 'POST',
+        headers: authHeaders({ 'content-type': 'text/plain' }),
+        body: asked,
+        signal: ctrl.signal,
+      })
+      if (!res.ok) return
+      guess = { prefix: asked, plane: on, ...(await res.json()) }
+    } catch {
+      // Advisory: a guess that never arrives is no worse than no guess, and
+      // an aborted one is a guess we no longer wanted.
+    }
+  }
+
+  // The caret drives everything, so it is read back from the DOM after
+  // anything that could have moved it.
+  function track(e) {
+    caret = e.currentTarget.selectionStart ?? 0
+  }
+
+  /** Take a suggestion: splice it in, and leave the caret after it. */
+  function apply(insert) {
+    const out = accept(text, caret, `${insert} `)
+    text = out.text
+    caret = out.caret
+    // The DOM caret has to follow, or the next keystroke lands where the old
+    // one was.
+    queueMicrotask(() => {
+      box?.focus()
+      box?.setSelectionRange(out.caret, out.caret)
+    })
+  }
 
   // Ctrl/Cmd+Enter runs; plain Enter is a newline. Tab takes the completion
   // when there is one and otherwise moves focus, so a keyboard user can leave
@@ -39,7 +116,7 @@
       run()
     } else if (e.key === 'Tab' && completion) {
       e.preventDefault()
-      text = text + completion + ' '
+      apply(completion)
     }
   }
 
@@ -116,14 +193,37 @@
       <div class="q-ghost" aria-hidden="true"><span class="typed">{text}</span>{completion}{#if completion}<span class="tab-key">Tab</span>{/if}</div>
       <textarea
         class="q-text"
+        bind:this={box}
         bind:value={text}
         onkeydown={onKey}
+        oninput={track}
+        onkeyup={track}
+        onclick={track}
+        onfocus={(e) => {
+          focused = true
+          track(e)
+        }}
+        onblur={() => (focused = false)}
         spellcheck="false"
         rows="6"
         placeholder="MATCH (n:Label)-[:TYPE]->(m) WHERE n.name = &quot;…&quot; RETURN n.name, count(*) AS c"
         aria-label="Query"
       ></textarea>
     </div>
+    {#if suggestions.length}
+      <!-- What this plane would make of the caret: the candidates, each with
+           the count that ranked it. `mousedown` is swallowed so clicking one
+           does not blur the box out from under the click. -->
+      <div class="q-suggest">
+        <span class="q-suggest-about">{remote.about}</span>
+        {#each suggestions as s (s.text + s.insert)}
+          <button class="q-sug" onmousedown={(e) => e.preventDefault()} onclick={() => apply(s.insert)}>
+            <span class="q-sug-text">{s.text}</span>
+            {#if s.detail}<span class="q-sug-detail">{s.detail}</span>{/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
     <div class="q-actions">
       <button class="run" onclick={run} disabled={busy}>{busy ? 'Running…' : 'Run'}</button>
       <span class="hint"><kbd>⌘</kbd>/<kbd>Ctrl</kbd>+<kbd>Enter</kbd></span>
