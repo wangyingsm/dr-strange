@@ -370,7 +370,7 @@
           "name": "lean",
           "schema": {
             "type": "boolean",
-            "description": "Omit vector-valued properties (replaced by a `$vector(N dims, omitted)` marker) — the agent shape. Default false: existing callers see the full records."
+            "description": "Vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. **Default true** — nothing that reads a node renders an embedding, and a thousand floats per node is the difference between a hundred-kilobyte answer and a hundred-megabyte one. Pass false to ask for the embeddings themselves."
           }
         }
       ],
@@ -454,7 +454,7 @@
           "name": "lean",
           "schema": {
             "type": "boolean",
-            "description": "With hydrate: elide vector-valued properties (agent shape). Default false."
+            "description": "With hydrate: vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. Default true; pass false for the embeddings themselves."
           }
         }
       ],
@@ -651,7 +651,7 @@
           "name": "lean",
           "schema": {
             "type": "boolean",
-            "description": "Omit vector-valued properties (replaced by a `$vector(N dims, omitted)` marker) — the agent shape. Default false: existing callers see the full records."
+            "description": "Vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. **Default true** — nothing that reads a node renders an embedding, and a thousand floats per node is the difference between a hundred-kilobyte answer and a hundred-megabyte one. Pass false to ask for the embeddings themselves."
           }
         }
       ],

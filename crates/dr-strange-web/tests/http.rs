@@ -492,4 +492,32 @@ async fn a_query_result_elides_the_vectors_nobody_renders() {
         "the vector is a marker, not its floats: {props}"
     );
     assert_eq!(props["title"], "a doc", "everything else is untouched");
+
+    // Every other read says the same, unasked.
+    let got = rpc(
+        &client,
+        &base,
+        "node.get",
+        json!({ "plane": "startup", "key": "vec" }),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["properties"]["embedding"],
+        "$vector(3 dims, omitted)"
+    );
+
+    // And `lean: false` is the one way to the floats — the click behind the
+    // dashboard's "show vector" button.
+    let whole = rpc(
+        &client,
+        &base,
+        "node.get",
+        json!({ "plane": "startup", "key": "vec", "lean": false }),
+    )
+    .await;
+    assert_eq!(
+        whole["result"]["properties"]["embedding"]["$vector"],
+        json!([1.0, 2.0, 3.0]),
+        "asked for, the embedding is itself"
+    );
 }

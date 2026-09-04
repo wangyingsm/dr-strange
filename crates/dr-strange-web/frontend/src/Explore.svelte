@@ -50,7 +50,7 @@
   let legend = $state([])
   let status = $state('')
   let error = $state(null)
-  let vectorView = $state(null) // { k, values } — floats popup, null = closed
+  let vectorView = $state(null) // { k, dims, values } — floats popup, null = closed
   let textView = $state(null) // { k, text } — full-value popup, null = closed
   let hint = $state(null) // { path, label, x, y } — floating hint, null = hidden
 
@@ -317,7 +317,23 @@
   }
 
   // A numeric array = an embedding vector; render a button, not 128+ floats.
-  const isVector = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')
+  // A vector arrives as a marker — `$vector(1024 dims, omitted)` — because a
+  // thousand floats per node is a hundred megabytes nobody draws. The
+  // dimension is in the marker; the values are one call away, on the click
+  // that asks for them. A literal array still counts, for a caller that
+  // opted out of lean.
+  const VECTOR_MARKER = /^\$vector\((\d+) dims, omitted\)$/
+  function vectorDims(v) {
+    if (Array.isArray(v)) {
+      return v.length > 0 && v.every((x) => typeof x === 'number') ? v.length : null
+    }
+    if (typeof v === 'string') {
+      const m = v.match(VECTOR_MARKER)
+      return m ? Number(m[1]) : null
+    }
+    return null
+  }
+  const isVector = (v) => vectorDims(v) !== null
 
   // ---- properties that name other nodes -----------------------------------
   //
@@ -856,6 +872,31 @@
       copyTimer = setTimeout(() => (copied = false), 1200)
     } catch {
       error = 'clipboard copy failed'
+    }
+  }
+
+  /// Show a property's embedding, fetching it when only its marker is here.
+  ///
+  /// One node, one call: `lean: false` is what the whole dashboard gives up by
+  /// default and this button asks back for.
+  async function showVector(k, v) {
+    const dims = vectorDims(v)
+    if (Array.isArray(v)) {
+      vectorView = { k, dims, values: v }
+      return
+    }
+    vectorView = { k, dims, values: null }
+    try {
+      if (selected?.kind !== 'node') throw new Error('only a node carries one')
+      const whole = await rpc('node.get', { plane, id: selected.data.id, lean: false })
+      const raw = whole?.properties?.[k]
+      const unwrapped = raw && typeof raw === 'object' && '$value' in raw ? raw.$value : raw
+      const values = Array.isArray(unwrapped?.$vector) ? unwrapped.$vector : unwrapped
+      if (!Array.isArray(values)) throw new Error('no vector came back')
+      // A later click may have moved on; only the open one is ours to fill.
+      if (vectorView?.k === k) vectorView = { k, dims: values.length, values }
+    } catch (e) {
+      if (vectorView?.k === k) vectorView = { k, dims, values: null, error: e.message }
     }
   }
 
@@ -1644,8 +1685,8 @@
             <dt title={pe.desc ?? ''}>{pe.k}{#if pe.desc}<span class="badge" title={pe.desc}>ℹ</span>{/if}</dt>
             <dd>
               {#if isVector(pe.v)}
-                <button class="vec-btn" onclick={() => (vectorView = { k: pe.k, values: pe.v })}>
-                  show vector ({pe.v.length} dims)
+                <button class="vec-btn" onclick={() => showVector(pe.k, pe.v)}>
+                  show vector ({vectorDims(pe.v)} dims)
                 </button>
               {:else if Array.isArray(pe.v)}
                 <!-- Any other list collapses the same way an embedding does:
@@ -1737,10 +1778,14 @@
     <div class="modal-backdrop">
       <div class="modal">
         <header>
-          <span>{vectorView.k} · {vectorView.values.length} dims</span>
+          <span>{vectorView.k} · {vectorView.dims} dims</span>
           <button class="close" onclick={() => (vectorView = null)}>×</button>
         </header>
-        <pre class="floats">{formatVector(vectorView.values)}</pre>
+        {#if vectorView.values}
+          <pre class="floats">{formatVector(vectorView.values)}</pre>
+        {:else}
+          <pre class="floats">{vectorView.error ?? 'fetching…'}</pre>
+        {/if}
       </div>
     </div>
   {/if}

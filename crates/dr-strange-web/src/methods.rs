@@ -160,6 +160,24 @@ fn parse_dir(s: Option<&str>) -> Dir {
 /// Node records with an optional similarity/traversal score folded in as a
 /// `score` field — mirrors the MCP `scored_rows` shape so plots (chunk 2) can
 /// size/colour by score without a second call.
+/// How a node reaches the dashboard: **lean**, always.
+///
+/// A vector property comes back as the marker `$vector(N dims, omitted)`
+/// rather than N floats. Nothing in the dashboard draws an embedding — the
+/// inspector shows a button, the plot a circle, the query table a summary
+/// line — and a thousand floats per node is the difference between a
+/// hundred-kilobyte answer and a hundred-megabyte one. The values themselves
+/// are one call away: `node.get` with `lean: false` returns the node whole.
+fn node_json(n: &NodeRecord) -> Value {
+    json::node_to_json_lean(n)
+}
+
+/// What every `lean` flag defaults to, now that nothing wants the other
+/// answer unasked.
+fn lean() -> bool {
+    true
+}
+
 /// An edge record as a JSON object — the counterpart to `json::node_to_json`
 /// (which the core provides), kept here since the core's dialect has no edge
 /// form yet. The plot merges these into its graph model alongside nodes.
@@ -192,7 +210,7 @@ fn change_to_json(c: &Change) -> Value {
             map.insert("labels".into(), jval!(c.labels));
         }
         if let Some(n) = &c.node {
-            map.insert("record".into(), json::node_to_json(n));
+            map.insert("record".into(), node_json(n));
         } else if let Some(e) = &c.edge {
             map.insert("record".into(), edge_to_json(e));
         }
@@ -237,7 +255,7 @@ fn scored_rows(rows: &[(NodeRecord, Option<f32>)]) -> Value {
     Value::Array(
         rows.iter()
             .map(|(n, s)| {
-                let mut obj = json::node_to_json(n);
+                let mut obj = node_json(n);
                 if let (Some(score), Value::Object(map)) = (s, &mut obj) {
                     map.insert("score".into(), jval!(score));
                 }
@@ -743,10 +761,10 @@ pub struct GetNode {
     id: Option<u64>,
     #[serde(default)]
     key: Option<String>,
-    /// Omit vector-valued properties (an embedding is a thousand floats no
-    /// reader reads). Off by default so existing callers — the dashboard —
-    /// see the exact shape they always did; agents pass `true`.
-    #[serde(default)]
+    /// Vector properties as markers rather than floats — **the default**, and
+    /// what every other read returns. `lean: false` is the one way to ask for
+    /// an embedding itself: the dashboard's "show vector" button is this call.
+    #[serde(default = "lean")]
     lean: bool,
 }
 
@@ -782,8 +800,9 @@ pub struct Neighbors {
     /// existing callers see the exact id pairs they always did.
     #[serde(default)]
     hydrate: bool,
-    /// With `hydrate`, render nodes lean (vectors elided) — the agent shape.
-    #[serde(default)]
+    /// With `hydrate`, vector properties as markers rather than floats —
+    /// the default; `lean: false` returns the embeddings themselves.
+    #[serde(default = "lean")]
     lean: bool,
     #[serde(flatten)]
     at: AsOfParams,
@@ -942,9 +961,9 @@ pub struct CypherReq {
     /// Values for `$name` placeholders in the query.
     #[serde(default)]
     params: serde_json::Map<String, Value>,
-    /// Omit vector-valued properties from returned nodes (agents' shape;
-    /// the dashboard leaves it unset and sees the full records).
-    #[serde(default)]
+    /// Vector properties as markers rather than floats — the default;
+    /// `lean: false` returns the embeddings themselves.
+    #[serde(default = "lean")]
     lean: bool,
 }
 
@@ -1150,7 +1169,7 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let mut nodes = Vec::with_capacity(ids.len());
     for id in &ids {
         if let Some(node) = app(plane.node(*id))? {
-            nodes.push(json::node_to_json(&node));
+            nodes.push(node_json(&node));
         }
     }
 
@@ -1257,7 +1276,7 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         }
         examined += 1;
         if let Some(hint) = match_node(n, &needle) {
-            let mut obj = json::node_to_json(n);
+            let mut obj = node_json(n);
             if let Value::Object(map) = &mut obj {
                 map.insert("match".into(), Value::String(hint));
             }
@@ -1524,7 +1543,7 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let mut results = Vec::with_capacity(hits.len());
     for h in &hits {
         let mut obj = match app(plane.node(h.node))? {
-            Some(node) => json::node_to_json(&node),
+            Some(node) => node_json(&node),
             None => jval!({ "id": h.node.0 }),
         };
         if let Value::Object(map) = &mut obj {
@@ -1726,7 +1745,7 @@ fn semantic_find(
     Ok(hits
         .iter()
         .map(|(n, score)| {
-            let mut obj = json::node_to_json(n);
+            let mut obj = node_json(n);
             if let Value::Object(map) = &mut obj {
                 match score {
                     Some(s) => {
@@ -1829,7 +1848,7 @@ pub fn graph_expand(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         if seen_nodes.insert(hop.node.0)
             && let Some(node) = app(plane.node(hop.node))?
         {
-            nodes.push(json::node_to_json(&node));
+            nodes.push(node_json(&node));
         }
         if seen_edges.insert(hop.edge.0)
             && let Some(edge) = app(plane.edge(hop.edge))?
@@ -2185,7 +2204,7 @@ pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     app(txn.commit())?;
 
     Ok(app(plane.node(id))?
-        .map(|n| json::node_to_json(&n))
+        .map(|n| node_json(&n))
         .unwrap_or(Value::Null))
 }
 
@@ -2229,7 +2248,7 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     app(txn.commit())?;
 
     Ok(app(plane.node(id))?
-        .map(|n| json::node_to_json(&n))
+        .map(|n| node_json(&n))
         .unwrap_or(Value::Null))
 }
 
@@ -2241,7 +2260,7 @@ pub fn export_plane(ctx: &Ctx<'_>, plane_name: &str) -> Result<String, RpcError>
     let plane = ctx.plane(plane_name)?;
     let mut out = String::new();
     for node in app(plane.query().scan_all().nodes())? {
-        out.push_str(&json::node_to_json(&node).to_string());
+        out.push_str(&node_json(&node).to_string());
         out.push('\n');
     }
     // Edges: walk each node's out-adjacency and emit each edge once.
