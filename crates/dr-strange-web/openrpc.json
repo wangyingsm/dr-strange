@@ -2063,6 +2063,17 @@
               "integer",
               "null"
             ]
+          },
+          "rss_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The server process's resident set, in bytes. Null where the platform does not report it."
+          },
+          "plugin_bytes": {
+            "type": "integer",
+            "description": "Bytes the loaded preprocessor plugins hold right now: every compiled plugin image plus the linear memory of every instance mid-call. Zero when no plugin is loaded."
           }
         },
         "required": [
@@ -2073,7 +2084,8 @@
           "edge_types",
           "indexes",
           "commit_seq",
-          "persistent"
+          "persistent",
+          "plugin_bytes"
         ]
       }
     }

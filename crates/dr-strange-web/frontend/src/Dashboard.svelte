@@ -11,7 +11,7 @@
     onSelectPlane = () => {},
   } = $props()
 
-  let stats = $state(null) // live db.stats (planes/nodes/edges/file_size)
+  let stats = $state(null) // live db.stats (planes/nodes/edges/file_size/memory)
   let planes = $state([]) // plane cards
   import extensionLogo from './assets/extension-logo.svg'
 
@@ -251,6 +251,17 @@
     <div class="v">
       <span class="n">{stats?.persistent ? fmtBytes(stats?.file_size) : 'in-mem'}</span>
       <span class="l">on disk</span>
+    </div>
+  </div>
+  <!-- The whole process's resident set, with what the loaded plugins hold
+       (compiled images + live instance memory) underneath: that share is the
+       one an operator can change, by removing a plugin. -->
+  <div class="stat" title="Resident set of the server process; below it, the bytes the loaded plugins hold">
+    <Icon name="memory" size={22} />
+    <div class="v">
+      <span class="n">{fmtBytes(stats?.rss_bytes)}</span>
+      <span class="l">memory</span>
+      <span class="sub">plugins {fmtBytes(stats?.plugin_bytes)}</span>
     </div>
   </div>
 </section>

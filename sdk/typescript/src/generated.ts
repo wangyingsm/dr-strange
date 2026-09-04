@@ -71,6 +71,8 @@ export interface DbStats {
   commit_seq: number;
   persistent: boolean;
   file_size?: number | null;
+  rss_bytes?: number | null;
+  plugin_bytes: number;
 }
 
 /** A dr-strange server client — one method per JSON-RPC method. */

@@ -41,8 +41,8 @@ pub use preprocess::{
 };
 pub use preprocess::{
     CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, LocalFiles, PluginConfig, Plugins,
-    Preprocessed, Preprocessor, SyncStats, fold, git_dir, resync, route_document, route_paths,
-    route_repository, route_tree, stamp_run, sync_paths,
+    Preprocessed, Preprocessor, SyncStats, fold, git_dir, plugin_memory_bytes, resync,
+    route_document, route_paths, route_repository, route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
 pub use preprocess::{InstalledPlugin, Limits, LivePlugins, PluginStore, StoreStamp, WasmPlugin};

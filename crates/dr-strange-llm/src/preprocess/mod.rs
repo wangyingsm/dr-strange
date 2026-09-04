@@ -68,6 +68,20 @@ pub use catalog::{
     read_cache as cached_catalog, refresh_cache,
 };
 pub use ground::{FactsAndPlane, fold, stamp_run};
+
+/// Bytes the loaded wasm plugins hold right now, process-wide: every compiled
+/// plugin image plus the linear memory of every instance mid-call. Zero with
+/// the runtime compiled out — nothing is loaded, so nothing is held.
+pub fn plugin_memory_bytes() -> usize {
+    #[cfg(feature = "plugins")]
+    {
+        wasm::held_bytes()
+    }
+    #[cfg(not(feature = "plugins"))]
+    {
+        0
+    }
+}
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, PluginStore, StoreStamp};
 pub use repo::{

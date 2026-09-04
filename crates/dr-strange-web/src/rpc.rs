@@ -425,6 +425,11 @@ mod tests {
         assert_eq!(resp["result"]["nodes"], 1);
         assert!(resp["result"]["planes"].as_u64().unwrap() >= 1);
         assert_eq!(resp["result"]["persistent"], false);
+        // Memory: the plugin gauge is always a number (zero with nothing
+        // loaded); the resident set is null where the platform has no
+        // `/proc`, so only its shape is asserted.
+        assert!(resp["result"]["plugin_bytes"].as_u64().is_some());
+        assert!(resp["result"]["rss_bytes"].is_null() || resp["result"]["rss_bytes"].is_u64());
     }
 
     #[test]

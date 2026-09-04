@@ -69,8 +69,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use super::{Host, Input, Manifest, PreprocessReport, Preprocessed, Preprocessor};
@@ -198,6 +199,95 @@ const FORBIDDEN: &[&str] = &["wasi:sockets"];
 /// spells the project, which makes it recognisable in a debugger.
 const FIXED_ENTROPY: [u8; 4] = *b"drsg";
 
+/// Bytes the plugins hold right now, process-wide: every loaded plugin's
+/// compiled image, plus the linear memory of every instance mid-call.
+///
+/// A gauge, not a meter: a plugin adds its image when it loads and takes it
+/// back when it drops, and a store adds what its guest grew to and takes that
+/// back when the call ends. What is left is what a dashboard can show beside
+/// the process's resident set — the share an operator can change, by removing
+/// a plugin. The two cannot be read off the process: the images are mapped
+/// files and the guest heaps are freed to the allocator, so neither shows up
+/// as its own line anywhere else.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// What the loaded plugins hold right now — see [`HELD`].
+pub fn held_bytes() -> usize {
+    HELD.load(Ordering::Relaxed)
+}
+
+/// A store's limits, with what its guest grew to kept on [`HELD`] for as long
+/// as the store lives.
+///
+/// Wraps [`StoreLimits`] rather than replacing it: the ceiling is still
+/// wasmtime's own check, and this only watches what it allowed. Every growth
+/// it approves is added — the first one, at instantiation, is the guest's
+/// initial memory — and the whole of it is taken back on drop, which is when
+/// the guest's memory is actually freed.
+struct Metered {
+    inner: StoreLimits,
+    /// What this store added to [`HELD`], so the drop takes back exactly that.
+    held: usize,
+}
+
+impl Metered {
+    fn new(inner: StoreLimits) -> Self {
+        Self { inner, held: 0 }
+    }
+}
+
+impl ResourceLimiter for Metered {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allow = self.inner.memory_growing(current, desired, maximum)?;
+        if allow && desired > current {
+            let grew = desired - current;
+            self.held += grew;
+            HELD.fetch_add(grew, Ordering::Relaxed);
+        }
+        Ok(allow)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
+impl Drop for Metered {
+    fn drop(&mut self) {
+        HELD.fetch_sub(self.held, Ordering::Relaxed);
+    }
+}
+
 /// A plugin, compiled once and ready to run.
 ///
 /// The `Engine` owns the compiled code and the `Component` shares it across
@@ -216,6 +306,15 @@ pub struct WasmPlugin {
     /// uninterpreted: what a plugin can be configured to do is the plugin's
     /// business, not the database's.
     options: Vec<(String, String)>,
+    /// The compiled image's size, added to [`HELD`] for as long as this
+    /// plugin is loaded.
+    image_bytes: usize,
+}
+
+impl Drop for WasmPlugin {
+    fn drop(&mut self) {
+        HELD.fetch_sub(self.image_bytes, Ordering::Relaxed);
+    }
 }
 
 impl WasmPlugin {
@@ -322,6 +421,12 @@ impl WasmPlugin {
         .map_err(wt)
         .context("the component does not export the plugin world")?;
 
+        // The mapped compiled artifact — code, and the metadata beside it —
+        // which is what loading this plugin costs for as long as it stays.
+        let image = component.image_range();
+        let image_bytes = image.end as usize - image.start as usize;
+        HELD.fetch_add(image_bytes, Ordering::Relaxed);
+
         let mut plugin = Self {
             engine,
             instance_pre,
@@ -333,6 +438,7 @@ impl WasmPlugin {
             },
             limits,
             options,
+            image_bytes,
         };
         plugin.manifest = plugin.ask_describe()?;
         Ok(plugin)
@@ -431,9 +537,11 @@ impl WasmPlugin {
                 host,
                 wasi,
                 table: ResourceTable::new(),
-                limits: StoreLimitsBuilder::new()
-                    .memory_size(self.limits.memory_bytes)
-                    .build(),
+                limits: Metered::new(
+                    StoreLimitsBuilder::new()
+                        .memory_size(self.limits.memory_bytes)
+                        .build(),
+                ),
                 stderr,
             },
         );
@@ -729,7 +837,7 @@ struct State {
     host: Option<&'static dyn Host>,
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: Metered,
     /// Where the guest's stderr lands. Discarding it kept a Go plugin's
     /// panic message invisible behind a bare "trapped" — so it is captured
     /// instead, and surfaced when a trap has to be explained.

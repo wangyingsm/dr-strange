@@ -5,15 +5,17 @@ package drsg
 import "context"
 
 type DbStats struct {
-	CommitSeq  int64  `json:"commit_seq"`
-	EdgeTypes  int64  `json:"edge_types"`
-	Edges      int64  `json:"edges"`
-	FileSize   *int64 `json:"file_size,omitempty"`
-	Indexes    int64  `json:"indexes"`
-	Labels     int64  `json:"labels"`
-	Nodes      int64  `json:"nodes"`
-	Persistent bool   `json:"persistent"`
-	Planes     int64  `json:"planes"`
+	CommitSeq   int64  `json:"commit_seq"`
+	EdgeTypes   int64  `json:"edge_types"`
+	Edges       int64  `json:"edges"`
+	FileSize    *int64 `json:"file_size,omitempty"`
+	Indexes     int64  `json:"indexes"`
+	Labels      int64  `json:"labels"`
+	Nodes       int64  `json:"nodes"`
+	Persistent  bool   `json:"persistent"`
+	Planes      int64  `json:"planes"`
+	PluginBytes int64  `json:"plugin_bytes"`
+	RssBytes    *int64 `json:"rss_bytes,omitempty"`
 }
 
 type Deleted struct {

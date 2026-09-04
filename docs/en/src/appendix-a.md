@@ -15,7 +15,7 @@ or an external key.
 ## Discovery and database
 
 - **`rpc.discover`** · read — the OpenRPC service description. Params: none.
-- **`db.stats`** · read — plane/node/edge counts, labels, edge types, indexes, commits, on-disk size. Params: none.
+- **`db.stats`** · read — plane/node/edge counts, labels, edge types, indexes, commits, on-disk size, memory (the process's resident set, and the bytes the loaded plugins hold). Params: none.
 - **`db.catalog`** · read — the soft-schema catalog across every plane. Params: none.
 
 ## Planes

@@ -288,7 +288,21 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         "commit_seq": commit_seq,
         "persistent": ctx.db_path.is_some(),
         "file_size": file_size,
+        "rss_bytes": resident_bytes(),
+        "plugin_bytes": dr_strange_llm::plugin_memory_bytes(),
     }))
+}
+
+/// The process's resident set, in bytes — what the whole server holds right
+/// now, plugins and page cache of the database included. Read from
+/// `/proc/self/status`, so Linux only; anywhere else it is `None`, which the
+/// dashboard shows as a dash rather than a zero that would read as a
+/// measurement.
+fn resident_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Bytes the database occupies on disk. The native backend's "path" is a

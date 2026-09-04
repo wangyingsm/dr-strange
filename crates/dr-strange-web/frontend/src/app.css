@@ -217,6 +217,15 @@ h2 {
   letter-spacing: 0.06em;
   color: var(--muted);
 }
+/* A second line under the label: a breakdown of the figure above it. */
+.stat .sub {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .planes,
 .plugins {
