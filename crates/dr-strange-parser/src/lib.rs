@@ -84,9 +84,19 @@
 //!   its values project (`RETURN p.name`);
 //! - `WITH` pipelining: a projection is a tail, so nothing follows it;
 //! - unbounded variable-length (`*`, `*n..`).
+//!
+//! # Completing a prefix
+//! [`complete`] answers the other question an editor asks: not "is this a
+//! statement" but "what could this become". It reads a half-typed query
+//! against a plane's [`Vocab`] — its labels, edge types and properties, with
+//! the counts — so the guess after `MATCH ` is the label that plane holds most
+//! of, and the guess after a node is the edge that most often leaves it. It is
+//! a second, smaller reading of this same grammar; see [`complete`] for why a
+//! `nom` parser cannot do it.
 
 mod ast;
 mod compile;
+mod complete;
 mod hint;
 mod parse;
 mod write;
@@ -96,6 +106,9 @@ use ahash::AHashMap;
 use dr_strange_core::{LogicalPlan, PropValue};
 
 pub use ast::AsOfSpec;
+pub use complete::{
+    Completion, Connection, EdgeInfo, Expect, Kind, LabelInfo, Suggestion, Vocab, complete,
+};
 pub use hint::grammar_hint;
 pub use write::{WriteStatement, WriteSummary};
 
