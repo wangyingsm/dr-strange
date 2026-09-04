@@ -356,3 +356,94 @@ async fn digest_write_never_shadows_an_existing_key() {
         "edge onto a skipped key must resolve to the node already there"
     );
 }
+
+/// Completion reads the plane it will run against: the labels it holds, the
+/// edges between them, the properties they carry — none of which an editor
+/// could know on its own.
+#[tokio::test]
+async fn completes_a_query_against_the_planes_own_shape() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let cypher = |query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let res = client
+                .post(format!("{base}/cypher?plane=startup"))
+                .header("origin", &base)
+                .body(query)
+                .send()
+                .await
+                .unwrap();
+            assert!(res.status().is_success(), "{query}: {}", res.status());
+        }
+    };
+    let complete = |prefix: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let res = client
+                .post(format!("{base}/cypher/complete?plane=startup"))
+                .header("origin", &base)
+                .body(prefix)
+                .send()
+                .await
+                .unwrap();
+            assert!(res.status().is_success(), "{prefix}: {}", res.status());
+            res.json::<Value>().await.unwrap()
+        }
+    };
+
+    // A shape worth completing against.
+    cypher(r#"CREATE (a:Person {key:"bob", city:"Oslo"})-[:KNOWS]->(b:Person {key:"carol"})"#)
+        .await;
+
+    let c = complete("MATCH ").await;
+    assert_eq!(c["best"], "(n:Person)");
+    assert_eq!(c["expects"], "node");
+    assert_eq!(c["about"], "a node to match");
+    assert_eq!(c["suggestions"][0]["kind"], "snippet");
+    assert_eq!(c["suggestions"][0]["detail"], "3 nodes");
+
+    let c = complete("MATCH (n:Person) ").await;
+    assert_eq!(c["best"], "-[:KNOWS]->(m:Person)");
+    assert_eq!(c["about"], "what leaves a Person");
+
+    // A property the plane actually holds, on the label the variable was
+    // declared with.
+    let c = complete("MATCH (n:Person) WHERE n.").await;
+    assert_eq!(c["best"], "city");
+    assert_eq!(c["about"], "properties of n, a Person");
+    assert_eq!(c["suggestions"][0]["kind"], "property");
+
+    // Half a word is completed from where it left off.
+    let c = complete("MATCH (n:Per").await;
+    assert_eq!(c["best"], "son)");
+    assert_eq!(c["word"], "Per");
+
+    // The vocabulary is cached, so it has to notice the plane moving: a label
+    // written after the first completion still shows up in the next.
+    cypher(r#"CREATE (r:Robot {key:"r2"})"#).await;
+    let c = complete("MATCH ").await;
+    let texts: Vec<&str> = c["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["text"].as_str().unwrap())
+        .collect();
+    assert!(texts.contains(&"(n:Robot)"), "{texts:?}");
+
+    // A plane that does not exist is a mistake worth reporting, not an empty
+    // list.
+    let res = client
+        .post(format!("{base}/cypher/complete?plane=ghost"))
+        .header("origin", &base)
+        .body("MATCH ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+}

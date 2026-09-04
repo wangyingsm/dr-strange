@@ -17,6 +17,7 @@ use dr_strange_core::{
 #[cfg(feature = "native-backend")]
 use dr_strange_core::AsOf;
 use dr_strange_llm::Embedder; // brings `.embed()` into scope for semantic_find
+use dr_strange_parser::{Connection, EdgeInfo, Expect, Kind, LabelInfo, Vocab};
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
 
@@ -579,6 +580,138 @@ pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 #[derive(Deserialize)]
 pub struct PlaneOnly {
     plane: String,
+}
+
+/// The vocabulary a completion ranks by: this plane's catalog, read as the
+/// labels and edge types a query may name.
+///
+/// The catalog is the same soft schema `plane.catalog` serves — computed by
+/// scanning the plane, which is why the caller caches what comes back rather
+/// than asking on every keystroke. Properties are ordered by how many of the
+/// label's nodes carry them, so the commonest is offered first; the catalog
+/// itself is alphabetical, which is nobody's idea of a ranking.
+pub fn plane_vocab(ctx: &Ctx<'_>, plane: &str) -> Result<Vocab, RpcError> {
+    let cat = app(ctx.plane(plane)?.catalog())?;
+    Ok(Vocab {
+        labels: cat
+            .labels
+            .iter()
+            .map(|(name, stats)| {
+                let mut properties: Vec<(&String, u64)> =
+                    stats.properties.iter().map(|(p, s)| (p, s.count)).collect();
+                properties
+                    .sort_by_key(|(name, count)| (std::cmp::Reverse(*count), (*name).clone()));
+                LabelInfo {
+                    name: name.clone(),
+                    count: stats.count,
+                    properties: properties.into_iter().map(|(p, _)| p.clone()).collect(),
+                }
+            })
+            .collect(),
+        edges: cat
+            .edge_types
+            .iter()
+            .map(|(name, stats)| EdgeInfo {
+                name: name.clone(),
+                count: stats.count,
+                connections: stats
+                    .connections
+                    .iter()
+                    .map(|c| Connection {
+                        src: c.src_label.clone(),
+                        dst: c.dst_label.clone(),
+                        count: c.count,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
+/// What may follow `prefix`, as JSON: the best guess, every candidate, and
+/// what the caret sits at — said in words, since a caller showing the list
+/// wants a heading for it and should not have to know the grammar to write
+/// one.
+pub fn completion(prefix: &str, vocab: &Vocab) -> Value {
+    let c = dr_strange_parser::complete(prefix, vocab);
+    jval!({
+        "best": c.best,
+        "word": c.word,
+        "expects": expects_tag(&c.expects),
+        "about": expects_about(&c.expects),
+        "suggestions": c.suggestions.iter().map(|s| jval!({
+            "text": s.text,
+            "insert": s.insert,
+            "detail": s.detail,
+            "kind": kind_tag(s.kind),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// What the caret sits at, as a stable tag a caller can branch on.
+fn expects_tag(e: &Expect) -> &'static str {
+    match e {
+        Expect::Statement => "statement",
+        Expect::Node { .. } => "node",
+        Expect::NodeVar { .. } => "node-var",
+        Expect::Label => "label",
+        Expect::NodeEnd => "node-end",
+        Expect::Hop { .. } => "hop",
+        Expect::EdgeType { .. } => "edge-type",
+        Expect::RelEnd { .. } => "rel-end",
+        Expect::Arrow { .. } => "arrow",
+        Expect::Predicate { .. } => "predicate",
+        Expect::Projection { .. } => "projection",
+        Expect::Property { .. } => "property",
+        Expect::Value => "value",
+        Expect::Clause => "clause",
+        Expect::Nothing => "nothing",
+    }
+}
+
+/// The same, in words, with the context that made the guess possible — what a
+/// list of candidates should be headed with.
+fn expects_about(e: &Expect) -> String {
+    match e {
+        Expect::Statement => "how the query starts".into(),
+        Expect::Node { .. } => "a node to match".into(),
+        Expect::NodeVar { .. } => "a name for this node".into(),
+        Expect::Label | Expect::NodeEnd => "which label".into(),
+        Expect::Hop { from: Some(l), .. } => format!("what leaves a {l}"),
+        Expect::Hop { from: None, .. } => "what leaves this node".into(),
+        Expect::EdgeType {
+            from: Some(l),
+            incoming,
+            ..
+        } => format!(
+            "what {} a {l}",
+            if *incoming { "reaches" } else { "leaves" }
+        ),
+        Expect::EdgeType { from: None, .. } => "which edge type".into(),
+        Expect::RelEnd { ranged: true, .. } => "how many hops".into(),
+        Expect::RelEnd { .. } | Expect::Arrow { .. } => "closing the relationship".into(),
+        Expect::Predicate { .. } => "what to filter on".into(),
+        Expect::Projection { .. } => "what to return".into(),
+        Expect::Property {
+            var,
+            label: Some(l),
+        } => format!("properties of {var}, a {l}"),
+        Expect::Property { var, label: None } => format!("properties of {var}"),
+        Expect::Value => "a value only you know".into(),
+        Expect::Clause => "what comes after".into(),
+        Expect::Nothing => "inside a string".into(),
+    }
+}
+
+fn kind_tag(k: Kind) -> &'static str {
+    match k {
+        Kind::Keyword => "keyword",
+        Kind::Label => "label",
+        Kind::EdgeType => "edge-type",
+        Kind::Property => "property",
+        Kind::Variable => "variable",
+        Kind::Snippet => "snippet",
+    }
 }
 
 /// `plane.catalog` — one plane's soft schema (labels, property descriptions,

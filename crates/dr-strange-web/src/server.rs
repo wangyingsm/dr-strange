@@ -6,7 +6,7 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use dr_strange_core::{ChangeSet, Database, PlaneId, ReplicatedBatch};
 use dr_strange_mcp::DrStrange;
+use dr_strange_parser::Vocab;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -88,9 +89,55 @@ pub struct AppState {
     /// Per-request query budget (`[server] query_timeout_secs`); `None` runs
     /// to completion.
     pub query_timeout: Option<Duration>,
+    /// The completion vocabulary last built, and what it was built from —
+    /// see [`AppState::vocab`].
+    vocab_cache: Mutex<Option<CachedVocab>>,
+}
+
+/// A plane's completion vocabulary, and the state of the database it was read
+/// from.
+struct CachedVocab {
+    plane: String,
+    commit_seq: u64,
+    vocab: Arc<Vocab>,
 }
 
 impl AppState {
+    /// This plane's completion vocabulary, rebuilt only when the database has
+    /// moved since the last one.
+    ///
+    /// Building it *scans the plane* — the catalog is computed, not stored —
+    /// and completion is asked for on every pause in typing, so the answer is
+    /// kept until a commit could have changed it. The commit sequence is the
+    /// whole database's, which is conservative: a write to another plane
+    /// rebuilds this one needlessly, and needlessly is far better than
+    /// stale. One entry, because a person writes a query in one plane at a
+    /// time.
+    ///
+    /// Blocking, like everything that reads the graph.
+    fn vocab(&self, plane: &str) -> Result<Arc<Vocab>, rpc::RpcError> {
+        let seq = self
+            .db
+            .commit_seq()
+            .map_err(|e| rpc::RpcError::server(e.to_string()))?;
+        if let Ok(cache) = self.vocab_cache.lock()
+            && let Some(hit) = cache
+                .as_ref()
+                .filter(|c| c.plane == plane && c.commit_seq == seq)
+        {
+            return Ok(hit.vocab.clone());
+        }
+        let vocab = Arc::new(methods::plane_vocab(&self.ctx(), plane)?);
+        if let Ok(mut cache) = self.vocab_cache.lock() {
+            *cache = Some(CachedVocab {
+                plane: plane.to_string(),
+                commit_seq: seq,
+                vocab: vocab.clone(),
+            });
+        }
+        Ok(vocab)
+    }
+
     fn ctx(&self) -> Ctx<'_> {
         Ctx {
             db: self.db.as_ref(),
@@ -319,6 +366,7 @@ fn router(
         // POST: the query text is the body; kept off /rpc (and thus the OpenRPC
         // schema / SDKs) as a web-only surface, like /export.
         .route("/cypher", post(cypher_http))
+        .route("/cypher/complete", post(complete_http))
         // Unauthenticated liveness probe for load balancers / orchestrators.
         .route("/health", get(health))
         // `.layer` after `.fallback` so the SPA (served by the fallback) is
@@ -743,6 +791,62 @@ async fn cypher_http(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct CompleteQuery {
+    #[serde(default)]
+    plane: String,
+}
+
+/// `POST /cypher/complete?plane=startup` — the query text **up to the caret**
+/// in the body; what may follow it comes back as JSON (see
+/// [`methods::completion`]).
+///
+/// **Read-gated**, unlike `/cypher`: this runs nothing at all. It reads the
+/// plane's shape — its labels, edge types and properties, with their counts —
+/// and says which of them could come next, so a query is written against the
+/// graph that exists rather than against one the author remembers.
+///
+/// Advisory by nature, but not silent: a plane that cannot be resolved is a
+/// 400 rather than an empty list, because "no suggestions" and "no such
+/// plane" are different things and only one of them is worth fixing.
+async fn complete_http(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<CompleteQuery>,
+    body: Bytes,
+) -> Response {
+    let creds = match resolve_credentials(&state, &headers, None) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if !state.authorizer.allows(Access::Read, &creds) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let prefix = match String::from_utf8(body.to_vec()) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
+    };
+    let built = tokio::task::spawn_blocking({
+        let state = state.clone();
+        let plane = q.plane.clone();
+        move || {
+            state
+                .vocab(&plane)
+                .map(|vocab| methods::completion(&prefix, &vocab))
+        }
+    })
+    .await;
+
+    match built {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.message).into_response(),
+        Err(_) => {
+            tracing::error!(plane = %q.plane, "completion task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "completion task failed").into_response()
+        }
+    }
+}
+
 /// The Eye-of-Agamotto seal (the same square + diamond + tick-ring emblem as
 /// the web UI's SVG logo), rendered in text for the startup banner.
 const LOGO: &str = r#"
@@ -910,6 +1014,7 @@ pub async fn run(
             digest: opts.digest,
             fetch: opts.fetch.clone(),
             query_timeout: opts.query_timeout,
+            vocab_cache: Mutex::new(None),
         });
         return run_app(state, opts, &resync_needed, &follow_lost).await;
     }
@@ -924,6 +1029,7 @@ pub async fn run(
         digest: opts.digest,
         fetch: opts.fetch.clone(),
         query_timeout: opts.query_timeout,
+        vocab_cache: Mutex::new(None),
     });
     run_app(state, opts, &resync_needed, &follow_lost).await
 }
