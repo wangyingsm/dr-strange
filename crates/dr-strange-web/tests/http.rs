@@ -493,6 +493,25 @@ async fn a_query_result_elides_the_vectors_nobody_renders() {
     );
     assert_eq!(props["title"], "a doc", "everything else is untouched");
 
+    // A projection asks for the embedding by name, and gets the same answer:
+    // the column is a marker, not a thousand floats in a table cell.
+    let projected: Value = client
+        .post(format!("{base}/cypher?plane=startup"))
+        .header("origin", &base)
+        .body("MATCH (n:Doc) RETURN key(n), n.embedding, n.title")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        projected["rows"][0][1], "$vector(3 dims, omitted)",
+        "a projected vector is a marker: {}",
+        projected["rows"][0]
+    );
+    assert_eq!(projected["rows"][0][2], "a doc", "the rest is untouched");
+
     // Every other read says the same, unasked.
     let got = rpc(
         &client,

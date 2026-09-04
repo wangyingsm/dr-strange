@@ -187,7 +187,9 @@ fn edge_to_json(e: &EdgeRecord) -> Value {
         "src": e.src.0,
         "dst": e.dst.0,
         "type": e.ty,
-        "properties": json::properties_to_json(&e.properties),
+        // Lean, like the nodes it joins: an edge is far less likely to carry a
+        // vector, and just as unlikely to want one inlined if it does.
+        "properties": json::properties_to_json_lean(&e.properties),
     })
 }
 
@@ -919,7 +921,7 @@ pub fn plane_query(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// scored nodes otherwise.
 fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> Result<Value, RpcError> {
     match q.plan().project.is_some() {
-        true => Ok(json::table_to_json(&app(q.table())?)),
+        true => Ok(json::table_to_json_lean(&app(q.table())?)),
         false => Ok(scored_rows(&app(q.scored_nodes())?)),
     }
 }
@@ -1081,7 +1083,13 @@ pub fn cypher_subgraph(
     if q.plan().project.is_some() {
         let table = app(q.table())?;
         let total = table.rows.len();
-        let mut out = json::table_to_json(&table);
+        // A projected column is as able to be an embedding as a property is:
+        // `RETURN m.embedding` asks for one by name.
+        let mut out = if lean {
+            json::table_to_json_lean(&table)
+        } else {
+            json::table_to_json(&table)
+        };
         if let Value::Object(map) = &mut out {
             let rows = map.get_mut("rows").and_then(Value::as_array_mut);
             if let Some(rows) = rows {

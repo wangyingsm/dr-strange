@@ -130,12 +130,21 @@ pub fn value_to_json(v: &PropValue) -> Value {
 /// answer. Rows stay arrays rather than objects: two columns may share a name,
 /// and an object would keep one of them.
 pub fn table_to_json(table: &crate::Table) -> Value {
+    table_with(table, value_to_json)
+}
+
+/// [`table_to_json`] with lean values — a projected embedding is its marker.
+pub fn table_to_json_lean(table: &crate::Table) -> Value {
+    table_with(table, value_to_json_lean)
+}
+
+fn table_with(table: &crate::Table, cell: fn(&PropValue) -> Value) -> Value {
     json!({
         "columns": table.columns,
         "rows": table
             .rows
             .iter()
-            .map(|row| Value::Array(row.iter().map(value_to_json).collect()))
+            .map(|row| Value::Array(row.iter().map(cell).collect()))
             .collect::<Vec<_>>(),
     })
 }
@@ -179,15 +188,31 @@ pub fn properties_to_json_lean(props: &Properties) -> Value {
             .iter()
             .map(|(k, p)| {
                 let v = match &p.value {
-                    PropValue::Vector(vec) => {
-                        json!(format!("$vector({} dims, omitted)", vec.len()))
-                    }
+                    PropValue::Vector(vec) => vector_marker(vec.len()),
                     _ => propdesc_to_json(p),
                 };
                 (k.clone(), v)
             })
             .collect(),
     )
+}
+
+/// How a vector reads when it is not being sent: how big it is, and that it
+/// was left out. One place, so every lean surface says it the same way — a
+/// reader (and the dashboard, which turns it into a button) matches on it.
+pub fn vector_marker(dims: usize) -> Value {
+    json!(format!("$vector({dims} dims, omitted)"))
+}
+
+/// [`value_to_json`] with a vector as its marker — for a *projected* column,
+/// which is as able to be an embedding as a property is: `RETURN m.embedding`
+/// asks for one by name.
+pub fn value_to_json_lean(v: &PropValue) -> Value {
+    match v {
+        PropValue::Vector(vec) => vector_marker(vec.len()),
+        PropValue::List(items) => Value::Array(items.iter().map(value_to_json_lean).collect()),
+        other => value_to_json(other),
+    }
 }
 
 /// [`node_to_json`] with lean properties — what RPC's `lean: true` and the
@@ -229,6 +254,30 @@ mod tests {
         // The full shape still carries the floats for whoever asks for them.
         let full = properties_to_json(&props);
         assert!(full["embedding"].as_array().is_some() || full["embedding"].is_object());
+    }
+
+    /// A column is as able to be an embedding as a property is: `RETURN
+    /// m.embedding` asks for one by name, and the table it lands in is read by
+    /// the same people who never wanted the floats inline.
+    #[test]
+    fn a_projected_vector_is_a_marker_too() {
+        let table = crate::Table {
+            columns: vec!["key".into(), "embedding".into()],
+            rows: vec![vec![
+                PropValue::Str("m::run".into()),
+                PropValue::Vector(vec![0.5; 1024]),
+            ]],
+        };
+        let lean = table_to_json_lean(&table);
+        assert_eq!(lean["rows"][0][0], json!("m::run"));
+        assert_eq!(lean["rows"][0][1], json!("$vector(1024 dims, omitted)"));
+
+        // And asked for whole, it is still whole.
+        let full = table_to_json(&table);
+        assert_eq!(
+            full["rows"][0][1]["$vector"].as_array().unwrap().len(),
+            1024
+        );
     }
 
     #[test]
