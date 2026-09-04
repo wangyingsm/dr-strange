@@ -4,6 +4,16 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Compaction moves surviving versions instead of cloning them.** The native
+  engine's compaction merged every run into one map and then copied each
+  surviving key and value into a second — two copies of the whole store at the
+  peak, measured at ~400 MiB over a 175 MiB database. The garbage-collecting
+  pass now takes ownership of what it keeps, so the peak is near one copy.
+
 ## [2.4.2] - 2026-09-04
 
 ### Changed
