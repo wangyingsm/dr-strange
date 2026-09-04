@@ -395,7 +395,14 @@
 
   <!-- What has run, newest first. Click one to put it back in the box; the
        plane is shown only when it is not the one currently selected, which is
-       the case where running it unchanged would answer a different question. -->
+       the case where running it unchanged would answer a different question.
+
+       The slot is what takes up room in the row; the panel fills it from
+       outside the flow. That is the only way a flex row lets one item set the
+       height and the other follow — stretched to the row is stretched to
+       whichever item is tallest, which would be this one as soon as a few
+       queries had run. -->
+  <div class="q-hist-slot">
   <aside class="q-history">
     <header>
       <span>History</span>
@@ -421,6 +428,7 @@
       </ul>
     {/if}
   </aside>
+  </div>
   </div>
 
   {#if error}

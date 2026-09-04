@@ -2353,23 +2353,32 @@ nav button,
   gap: 0.75rem;
   padding: 0 0.75rem 1rem;
 }
-/* The box and what has already been asked, side by side: the editor takes the
-   room it needs and the history is a fixed column beside it, because a list of
-   one-line queries does not get more readable by being wider. Under 900px they
-   stack — a phone has one column of anything. */
+/* The box and what has already been asked, side by side and evenly: two panels
+   of one width, stretched to one height, so the pair reads as a pair however
+   many queries the list happens to hold. The list scrolls inside its own panel
+   rather than setting the panel's height — a history that grew a card taller
+   than the editor beside it would move the Run button every time a query ran.
+   Under 900px they stack: a phone has one column of anything. */
 .q-compose {
   display: flex;
-  align-items: flex-start;
+  align-items: stretch;
   gap: 0.75rem;
 }
-.q-compose > .q-editor {
-  flex: 1 1 auto;
+.q-compose > .q-editor,
+.q-compose > .q-hist-slot {
+  flex: 1 1 0;
   min-width: 0;
 }
+/* Empty as far as the row is concerned — its child is out of the flow — so
+   the editor alone decides how tall the row is and this follows it. */
+.q-hist-slot {
+  position: relative;
+}
 .q-history {
-  flex: 0 0 15rem;
-  max-height: 22rem;
-  overflow-y: auto;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -2395,6 +2404,12 @@ nav button,
   list-style: none;
   margin: 0;
   padding: 0;
+  /* Takes the room the header leaves and scrolls within it. `min-height: 0`
+     because a flex item's floor is its content, and without it a long list
+     pushes the panel open instead of scrolling. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 .q-history li + li {
   border-top: 1px solid var(--border);
@@ -2442,9 +2457,13 @@ nav button,
   .q-compose {
     flex-direction: column;
   }
+  /* Stacked, there is no row height to match: the panel comes back into the
+     flow and sizes itself, up to a screenful of a phone. */
+  .q-hist-slot {
+    position: static;
+  }
   .q-history {
-    flex: 1 1 auto;
-    align-self: stretch;
+    position: static;
     max-height: 14rem;
   }
 }
