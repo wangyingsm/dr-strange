@@ -17,7 +17,10 @@ fn a_recorded_query_comes_back_by_id_and_in_the_list() {
         .record_query("code", "MATCH (n:Fn) RETURN n", Database::DEFAULT_HISTORY)
         .unwrap();
 
-    let one = db.recorded_query(id).unwrap().expect("it was just recorded");
+    let one = db
+        .recorded_query(id)
+        .unwrap()
+        .expect("it was just recorded");
     assert_eq!(one.query, "MATCH (n:Fn) RETURN n");
     assert_eq!(one.plane, "code");
     assert_eq!(one.id, id);
@@ -31,7 +34,8 @@ fn a_recorded_query_comes_back_by_id_and_in_the_list() {
 fn the_newest_is_first() {
     let db = db();
     for q in ["one", "two", "three"] {
-        db.record_query("code", q, Database::DEFAULT_HISTORY).unwrap();
+        db.record_query("code", q, Database::DEFAULT_HISTORY)
+            .unwrap();
     }
     let queries: Vec<String> = db
         .query_history(10)
@@ -101,7 +105,8 @@ fn history_survives_a_reopen() {
     let path = dir.path().join("g.drsg");
     {
         let db = Database::open(&path).unwrap();
-        db.record_query("code", "MATCH (n:Fn) RETURN n", 200).unwrap();
+        db.record_query("code", "MATCH (n:Fn) RETURN n", 200)
+            .unwrap();
     }
     let db = Database::open(&path).unwrap();
     let list = db.query_history(10).unwrap();

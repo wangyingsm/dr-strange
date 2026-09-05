@@ -50,8 +50,8 @@ use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::storage::vector::Metric;
 use crate::text::Language;
 use crate::types::{
-    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue, Properties,
-    QueryRecord,
+    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue,
+    Properties, QueryRecord,
 };
 
 mod snapshot;

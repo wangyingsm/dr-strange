@@ -26,12 +26,11 @@ pub use bulk::{BulkEdge, BulkEdgeById, BulkNode, BulkStats, bulk_load, bulk_load
 
 pub use meta::{
     DEFAULT_PLANE_NAME, FORMAT_VERSION, MIN_SUPPORTED_VERSION, bump_commit_seq, create_plane,
-    declare_keyword_index, declare_vector_index, drop_plane, init, intern_edge_type, intern_label,
-    get_history, list_history, list_keyword_indexes, list_planes, list_vector_indexes,
-    lookup_edge_type, lookup_label, record_query,
-    plane_id_by_name, read_commit_seq, read_commit_time, read_id_counters, read_plane,
-    rename_plane, resolve_label, set_commit_seq, set_id_counters, set_plane_properties,
-    write_commit_time,
+    declare_keyword_index, declare_vector_index, drop_plane, get_history, init, intern_edge_type,
+    intern_label, list_history, list_keyword_indexes, list_planes, list_vector_indexes,
+    lookup_edge_type, lookup_label, plane_id_by_name, read_commit_seq, read_commit_time,
+    read_id_counters, read_plane, record_query, rename_plane, resolve_label, set_commit_seq,
+    set_id_counters, set_plane_properties, write_commit_time,
 };
 pub(crate) use meta::{IdAllocator, write_plane};
 
