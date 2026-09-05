@@ -142,7 +142,7 @@ told so and nothing is downloaded.
 
 ```console
 $ drsg update
-drsg 2.5.0 is the latest release — nothing to do
+drsg 2.6.0 is the latest release — nothing to do
 ```
 
 Alternatives: the container image, `ghcr.io/wangyingsm/dr-strange:latest`, or the

@@ -4,6 +4,101 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-09-05
+
+### Added
+
+- **The Query box asks the plane what could come next.** `POST
+  /cypher/complete` takes however much of a query is written and answers
+  with what may follow it — the clause, the labels this plane actually
+  holds, the edge types that leave them, the properties a bound variable
+  has, `key(n)` where a projection or a sort wants a value — each carrying
+  the count that ranked it, read from the plane's own catalog rather than
+  from a fixed grammar. It completes from a cut anywhere: mid-word, mid
+  `-[:TYPE]->`, inside a call's brackets, after `ORDER BY`. A property test
+  asserts that every truncation of a real query can be finished from where
+  it was cut. The Query page asks after a second's pause in typing, draws
+  the best guess as ghost text after the caret (Tab takes it), and lists
+  the candidates below with what each one is.
+- **The database remembers the queries that ran, and offers them back.**
+  A capped history — two hundred entries by default, newest first, the
+  oldest dropped as a new one arrives — recording what *ran*, not what
+  parsed: a query the plane rejected is not something to hand back as a
+  thing you once did. Re-running the query you just ran restamps its entry
+  rather than adding a second copy. `GET /cypher/history` lists them and
+  `GET /cypher/history/{id}` reads one (both also answer to POST, which is
+  how the browser UI authorizes itself). `drsg queries` prints the list and
+  `drsg queries <id>` one query's text alone; `drsg cypher --history <id>`
+  runs a saved one again, against the plane it was written for. The Query
+  page shows the list beside the editor, a click away from the box. Queries
+  an agent runs through the MCP `cypher` tool are recorded the same way.
+- **A memory badge on the dashboard.** What the server process holds right
+  now, with what the loaded plugins hold as its subtitle — read per
+  platform (`/proc/self/status` on Linux, `proc_pidinfo` on macOS,
+  `GetProcessMemoryInfo` on Windows) rather than on Linux alone.
+- **`drsg init --rebuild`.** Drops the plane and folds the whole tree
+  through the plugins as they are installed now — what to reach for after
+  upgrading a language plugin, since the parser decides what a source file
+  means and a resumed plane keeps whatever the old one made of the files it
+  had already seen. It stops the server that holds the database (and the
+  loaded copy of every plugin) and brings it back on the same address and
+  token, so no agent's configuration changes underneath it. `GET /health`
+  now reports the server's `pid`, which is how it knows what to stop.
+- **The Query page reads its answer a page at a time.** Two hundred rows or
+  nodes to a page, with the range and the total in the header and prev/next
+  beside them. A pattern over a real codebase answered with four thousand
+  functions each carrying its own source — eleven megabytes to ship, parse
+  and lay out, for a table nobody scrolls to the end of.
+- **A result table is read column by column.** Labels are coloured chips
+  (deterministically, so a label is the same colour on every page), the
+  embedding has its own column as a button saying how many dimensions it
+  holds, and the remaining properties show in brief with an expand button
+  that opens the whole map as syntax-highlighted JSON.
+
+### Changed
+
+- **An embedding is a marker everywhere, and a click away when wanted.**
+  Nothing that reads a node drew its embedding, and yet every read shipped
+  a thousand floats per node because `lean` was a flag the dashboard never
+  set — one query came to 35.9 MB of which 34 were numbers nobody looked
+  at. Every read now renders a vector as `$vector(N dims, omitted)`,
+  including a *projected* one (`RETURN m.embedding` asks for one by name).
+  The floats have one door left: `node.get` with `lean: false`, one node at
+  a time, which is what the dashboard's own button now goes through.
+  **Breaking**: `lean` defaults to true on `node.get`, `plane.neighbors`
+  and `plane.cypher`. A caller that wants embeddings inline passes `lean:
+  false`; the generated SDK clients need no change, since they carry no
+  defaults of their own.
+- **The Query page opens empty.** It used to open on a fixed statement that
+  failed on most planes — a statement someone has to read and delete before
+  they can start. The placeholder says the shape instead, and the examples
+  below the box write a real one on request.
+
+### Fixed
+
+- **A node reached many ways comes back once.** A pattern reaches the same
+  node through every path that lands on it, and the result table is keyed
+  by node id: the repeat did not merely look untidy, it aborted the render,
+  and the page sat on "Running…" with no result and no error for as long as
+  you cared to wait.
+- **Every row of a result table is one height.** Two cells laid their own
+  contents out with `display: flex`, which takes a `td` out of table layout
+  — the row stopped sizing them and their rule was drawn short of the rules
+  either side. Rows also took their height from whatever the tallest cell
+  happened to hold, none of those a whole number of pixels, so each row
+  rounded differently from the one above; and a collapsed border between
+  two rows is one edge shared by the cells either side, rasterized per cell,
+  so a half-pixel edge rounded up in some columns and down in others.
+- **The hint row keeps its line.** It was shown only while the box had
+  focus, so it vanished on the way to the Run button and moved the button
+  out from under the click.
+- **A half-written hop is completed as written.** A lone `<` owes its
+  hyphen and `<-` owes its bracket; a hop is finished from however much of
+  it is on screen rather than only from a bare `-`.
+- **The caret starts where the box does.** It was assumed to be at the end
+  of the text, so the first completion after opening the page described a
+  position nobody was at.
+
 ## [2.5.0] - 2026-09-04
 
 ### Added
