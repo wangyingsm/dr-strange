@@ -125,8 +125,26 @@ drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "targe
 # change the other in the same commit.
 #
 # Everything CI runs, locally: run this before pushing.
-gate: gate-rust gate-features gate-frontend gate-docs gate-sdk
+gate: gate-rust gate-features gate-frontend gate-docs gate-sdk gate-supply
     @echo "gate: every CI job passed locally"
+
+# What no compiler answers. `cargo deny` reads the dependency graph against
+# `deny.toml` — licences, RUSTSEC advisories, the registries a crate may come
+# from — and an advisory published this morning turns a green tree red without
+# a line of ours changing, which is the point. `cargo machete` catches the
+# dependency a refactor stopped using; `syn` and `quote` outlived the built-in
+# Rust preprocessor by several releases that way.
+#
+# `ruff` is here rather than in gate-sdk because the Python SDK is the one
+# member nothing above compiles: `gate-sdk` runs its tests, and a test suite
+# does not read the code it never executes. `--with ruff` keeps the linter out
+# of the package's own dependencies, which are deliberately stdlib-only.
+#
+# CI's `supply` job.
+gate-supply:
+    cargo deny check
+    cargo machete
+    cd sdk/python && uv run --with ruff ruff check .
 
 # The redb pass is the one an all-defaults `cargo test` never covers: the
 # storage backend is a cargo feature, and the other one has its own

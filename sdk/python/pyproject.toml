@@ -21,6 +21,10 @@ testpaths = ["tests"]
 pythonpath = ["."]  # so tests can `import codegen`
 
 [tool.ruff.lint]
-# The generated client mirrors wire param names (id, type, set), which shadow
-# builtins; that's intentional and lives behind a per-file noqa in the codegen.
-ignore = ["A002"]
+# `A` (builtin shadowing) and `S310` (unaudited URL open) are extended onto the
+# default set rather than replacing it, because the code already answers both:
+# the generated client mirrors wire param names (id, type, set) that shadow
+# builtins and carries a per-file noqa for it, and `_client.py` opens a fixed
+# http(s) endpoint it built itself. Neither rule was enabled before, so both
+# those directives sat dead — `RUF100` is what noticed.
+extend-select = ["A", "S310"]

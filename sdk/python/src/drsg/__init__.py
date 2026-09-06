@@ -14,5 +14,5 @@ The method surface is generated from the server's OpenRPC schema
 from ._client import DrsgAuthError, DrsgError
 from ._generated import Drsg
 
-__all__ = ["Drsg", "DrsgError", "DrsgAuthError"]
+__all__ = ["Drsg", "DrsgAuthError", "DrsgError"]
 __version__ = "0.1.0"

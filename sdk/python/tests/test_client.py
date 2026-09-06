@@ -150,7 +150,10 @@ def test_change_feed_over_websocket(base_url):
         # Blocking generator; a daemon thread so it dies with the process /
         # when the server (module fixture) tears down and the socket EOFs.
         for event in db.watch("startup", label="Widget"):
-            events.append(event)
+            # Appended one at a time, not `extend`ed: the generator never ends,
+            # and the assertions below poll `events` from the main thread while
+            # this runs. `extend` would consume forever and publish nothing.
+            events.append(event)  # noqa: PERF402
 
     threading.Thread(target=consume, daemon=True).start()
     time.sleep(0.5)  # let the socket connect + the server register the watch

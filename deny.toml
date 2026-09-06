@@ -1,0 +1,65 @@
+# cargo-deny policy: what this tree is allowed to depend on.
+#
+# Run by `just gate` and by CI on every push. Without this file cargo-deny has
+# no allow-list to check against and rejects every crate in the graph, which is
+# why the check could not be wired up before it existed.
+
+[advisories]
+# An advisory with a fix is an upgrade, not an entry here. These two have none:
+# both are transitive, neither is reachable from a dependency this workspace
+# names, and both are noise until their own upstreams move.
+ignore = [
+    # heapless 0.7 → postcard → cranelift → wasmtime. Only compiled for targets
+    # that need the polyfill at all, which does not include any we ship. Gone
+    # when wasmtime's postcard reaches heapless 0.8.
+    "RUSTSEC-2023-0089",
+    # lopdf → pdf-inspector → anydoc, the document converter (pinned `=0.1.8`).
+    # Reached only when a digest is handed a PDF, and unmaintained is not the
+    # same as vulnerable.
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+# Permissive only. Every entry below is present in the tree today — this is an
+# inventory, not a wish list, so a new license shows up as a build failure and
+# a decision rather than as silent drift.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # the wasmtime/cranelift/rustix family
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots: the Mozilla root bundle, a data set
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # Weak, file-level copyleft, and the only copyleft here: cssparser and
+    # selectors, reached through `scraper` for the HTML→Markdown path. Nothing
+    # in this workspace modifies those files, so the obligation is satisfied by
+    # shipping them unchanged; a fork of either would need this revisited.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are a fact of a graph this size (three `rand` majors, two
+# `tungstenite`), and failing on them would mean pinning transitive deps we do
+# not own. Warn so the count stays visible and does not quietly double.
+multiple-versions = "warn"
+# A wildcard on a registry crate means an unreviewed upgrade lands silently, and
+# is worth seeing. It cannot be `deny` here: the members reach each other by
+# `path` with no version, which reads as a wildcard, and `allow-wildcard-paths`
+# excuses that only for crates marked `publish = false`. None of ours are —
+# whether they are meant for crates.io is a release decision, not a lint one, so
+# this warns until that is settled rather than pre-empting it.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
