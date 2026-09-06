@@ -146,170 +146,209 @@ impl<'a> Harness<'a> {
         Ok(first)
     }
 
+    /// One op against every plane, then the model check.
+    ///
+    /// An op whose target does not exist is a no-op and answers `false`: it
+    /// changed nothing, so there is nothing to verify, and checking anyway
+    /// would only re-prove the op before it.
     fn apply(&mut self, op: &Op) -> Result<(), TestCaseError> {
-        match op {
-            Op::CreateNode { labels } => {
-                let labels = labels_of(labels);
-                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let id = self
-                    .on_all(|p| {
-                        let mut t = p.write()?;
-                        let id = t.create_node(&refs, Properties::new())?;
-                        t.commit()?;
-                        Ok(id)
-                    })?
-                    .expect("create_node is infallible here");
+        let changed = match op {
+            Op::CreateNode { labels } => self.create_node(labels).map(|()| true),
+            Op::CreateNodeWithKey { key, labels } => {
+                self.create_node_with_key(*key, labels).map(|()| true)
+            }
+            Op::CreateEdge { src, dst, ty } => self.create_edge(*src, *dst, *ty),
+            Op::DeleteNode { idx } => self.delete_node(*idx),
+            Op::DeleteEdge { idx } => self.delete_edge(*idx),
+            Op::SetProp { idx, val } => self.set_prop(*idx, *val),
+            Op::RemoveProp { idx } => self.remove_prop(*idx),
+        }?;
+        if changed { self.verify() } else { Ok(()) }
+    }
+
+    fn create_node(&mut self, labels: &[u8]) -> Result<(), TestCaseError> {
+        let labels = labels_of(labels);
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let id = self
+            .on_all(|p| {
+                let mut t = p.write()?;
+                let id = t.create_node(&refs, Properties::new())?;
+                t.commit()?;
+                Ok(id)
+            })?
+            .expect("create_node is infallible here");
+        self.model.nodes.insert(
+            id,
+            NodeModel {
+                labels,
+                external_key: None,
+                tag: None,
+            },
+        );
+        self.model.all_nodes.push(id);
+        Ok(())
+    }
+
+    /// A key the model already holds must be refused, and one it does not
+    /// must be accepted — the assertion runs both ways.
+    fn create_node_with_key(&mut self, key: u8, labels: &[u8]) -> Result<(), TestCaseError> {
+        let key = format!("k{key}");
+        let labels = labels_of(labels);
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let result = self.on_all(|p| {
+            let mut t = p.write()?;
+            match t.create_node_with_key(&key, &refs, Properties::new()) {
+                Ok(id) => {
+                    t.commit()?;
+                    Ok(id)
+                }
+                Err(e) => Err(e),
+            }
+        })?;
+        match result {
+            Ok(id) => {
+                prop_assert!(
+                    !self.model.ext_keys.contains_key(&key),
+                    "DB accepted key '{key}' the model already has bound"
+                );
                 self.model.nodes.insert(
                     id,
                     NodeModel {
                         labels,
-                        external_key: None,
+                        external_key: Some(key.clone()),
                         tag: None,
                     },
                 );
+                self.model.ext_keys.insert(key, id);
                 self.model.all_nodes.push(id);
             }
-            Op::CreateNodeWithKey { key, labels } => {
-                let key = format!("k{key}");
-                let labels = labels_of(labels);
-                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let result = self.on_all(|p| {
-                    let mut t = p.write()?;
-                    match t.create_node_with_key(&key, &refs, Properties::new()) {
-                        Ok(id) => {
-                            t.commit()?;
-                            Ok(id)
-                        }
-                        Err(e) => Err(e),
-                    }
-                })?;
-                match result {
-                    Ok(id) => {
-                        prop_assert!(
-                            !self.model.ext_keys.contains_key(&key),
-                            "DB accepted key '{key}' the model already has bound"
-                        );
-                        self.model.nodes.insert(
-                            id,
-                            NodeModel {
-                                labels,
-                                external_key: Some(key.clone()),
-                                tag: None,
-                            },
-                        );
-                        self.model.ext_keys.insert(key, id);
-                        self.model.all_nodes.push(id);
-                    }
-                    Err(Error::Conflict(_)) => {
-                        prop_assert!(
-                            self.model.ext_keys.contains_key(&key),
-                            "DB rejected key '{key}' the model thinks is free"
-                        );
-                    }
-                    Err(e) => return Err(TestCaseError::fail(format!("unexpected: {e}"))),
-                }
+            Err(Error::Conflict(_)) => {
+                prop_assert!(
+                    self.model.ext_keys.contains_key(&key),
+                    "DB rejected key '{key}' the model thinks is free"
+                );
             }
-            Op::CreateEdge { src, dst, ty } => {
-                if self.model.all_nodes.is_empty() {
-                    return Ok(());
-                }
-                let src = self.model.all_nodes[src % self.model.all_nodes.len()];
-                let dst = self.model.all_nodes[dst % self.model.all_nodes.len()];
-                let ty_name = EDGE_TYPE_POOL[*ty as usize].to_string();
-                // src/dst may be dead (deleted); the model predicts the outcome.
-                let both_alive =
-                    self.model.nodes.contains_key(&src) && self.model.nodes.contains_key(&dst);
-                let result = self.on_all(|p| {
-                    let mut t = p.write()?;
-                    match t.create_edge(src, dst, &ty_name, Properties::new()) {
-                        Ok(id) => {
-                            t.commit()?;
-                            Ok(id)
-                        }
-                        Err(e) => Err(e),
-                    }
-                })?;
-                match result {
-                    Ok(id) => {
-                        prop_assert!(both_alive, "DB created an edge on a deleted endpoint");
-                        self.model.edges.insert(
-                            id,
-                            EdgeModel {
-                                src,
-                                dst,
-                                ty: ty_name,
-                                tag: None,
-                            },
-                        );
-                        self.model.all_edges.push(id);
-                    }
-                    Err(Error::PlaneMismatch(_)) => {
-                        prop_assert!(!both_alive, "DB rejected an edge between two live nodes");
-                    }
-                    Err(e) => return Err(TestCaseError::fail(format!("unexpected: {e}"))),
-                }
-            }
-            Op::DeleteNode { idx } => {
-                if self.model.all_nodes.is_empty() {
-                    return Ok(());
-                }
-                let id = self.model.all_nodes[idx % self.model.all_nodes.len()];
-                self.on_all(|p| {
-                    let mut t = p.write()?;
-                    t.delete_node(id)?;
-                    t.commit()?;
-                    Ok(())
-                })?
-                .expect("delete_node is infallible");
-                if let Some(nm) = self.model.nodes.remove(&id) {
-                    if let Some(k) = nm.external_key {
-                        self.model.ext_keys.remove(&k);
-                    }
-                    self.model.edges.retain(|_, e| e.src != id && e.dst != id);
-                }
-            }
-            Op::DeleteEdge { idx } => {
-                if self.model.all_edges.is_empty() {
-                    return Ok(());
-                }
-                let id = self.model.all_edges[idx % self.model.all_edges.len()];
-                self.on_all(|p| {
-                    let mut t = p.write()?;
-                    t.delete_edge(id)?;
-                    t.commit()?;
-                    Ok(())
-                })?
-                .expect("delete_edge is infallible");
-                self.model.edges.remove(&id);
-            }
-            Op::SetProp { idx, val } => {
-                let Some(id) = self.live_node(*idx) else {
-                    return Ok(());
-                };
-                self.on_all(|p| {
-                    let mut t = p.write()?;
-                    t.set_prop(id, "tag", PropDesc::new(PropValue::Int(*val)))?;
-                    t.commit()?;
-                    Ok(())
-                })?
-                .expect("set_prop on a live node is infallible");
-                self.model.nodes.get_mut(&id).unwrap().tag = Some(*val);
-            }
-            Op::RemoveProp { idx } => {
-                let Some(id) = self.live_node(*idx) else {
-                    return Ok(());
-                };
-                self.on_all(|p| {
-                    let mut t = p.write()?;
-                    t.remove_prop(id, "tag")?;
-                    t.commit()?;
-                    Ok(())
-                })?
-                .expect("remove_prop on a live node is infallible");
-                self.model.nodes.get_mut(&id).unwrap().tag = None;
-            }
+            Err(e) => return Err(TestCaseError::fail(format!("unexpected: {e}"))),
         }
-        self.verify()
+        Ok(())
+    }
+
+    /// An endpoint may already be deleted; the model predicts which way the
+    /// engine answers, and both outcomes are checked against it.
+    fn create_edge(&mut self, src: usize, dst: usize, ty: u8) -> Result<bool, TestCaseError> {
+        if self.model.all_nodes.is_empty() {
+            return Ok(false);
+        }
+        let (src, dst, ty) = (&src, &dst, &ty);
+        let src = self.model.all_nodes[src % self.model.all_nodes.len()];
+        let dst = self.model.all_nodes[dst % self.model.all_nodes.len()];
+        let ty_name = EDGE_TYPE_POOL[*ty as usize].to_string();
+        // src/dst may be dead (deleted); the model predicts the outcome.
+        let both_alive = self.model.nodes.contains_key(&src) && self.model.nodes.contains_key(&dst);
+        let result = self.on_all(|p| {
+            let mut t = p.write()?;
+            match t.create_edge(src, dst, &ty_name, Properties::new()) {
+                Ok(id) => {
+                    t.commit()?;
+                    Ok(id)
+                }
+                Err(e) => Err(e),
+            }
+        })?;
+        match result {
+            Ok(id) => {
+                prop_assert!(both_alive, "DB created an edge on a deleted endpoint");
+                self.model.edges.insert(
+                    id,
+                    EdgeModel {
+                        src,
+                        dst,
+                        ty: ty_name,
+                        tag: None,
+                    },
+                );
+                self.model.all_edges.push(id);
+            }
+            Err(Error::PlaneMismatch(_)) => {
+                prop_assert!(!both_alive, "DB rejected an edge between two live nodes");
+            }
+            Err(e) => return Err(TestCaseError::fail(format!("unexpected: {e}"))),
+        }
+        Ok(true)
+    }
+
+    /// Deleting takes the node's edges and its key binding with it.
+    fn delete_node(&mut self, idx: usize) -> Result<bool, TestCaseError> {
+        if self.model.all_nodes.is_empty() {
+            return Ok(false);
+        }
+        let id = self.model.all_nodes[idx % self.model.all_nodes.len()];
+        self.on_all(|p| {
+            let mut t = p.write()?;
+            t.delete_node(id)?;
+            t.commit()?;
+            Ok(())
+        })?
+        .expect("delete_node is infallible");
+        if let Some(nm) = self.model.nodes.remove(&id) {
+            if let Some(k) = nm.external_key {
+                self.model.ext_keys.remove(&k);
+            }
+            self.model.edges.retain(|_, e| e.src != id && e.dst != id);
+        }
+        Ok(true)
+    }
+
+    /// An index resolves against every id ever created, so this re-hits
+    /// already-dead edges too — which is how idempotent delete gets exercised.
+    fn delete_edge(&mut self, idx: usize) -> Result<bool, TestCaseError> {
+        if self.model.all_edges.is_empty() {
+            return Ok(false);
+        }
+        let id = self.model.all_edges[idx % self.model.all_edges.len()];
+        self.on_all(|p| {
+            let mut t = p.write()?;
+            t.delete_edge(id)?;
+            t.commit()?;
+            Ok(())
+        })?
+        .expect("delete_edge is infallible");
+        self.model.edges.remove(&id);
+        Ok(true)
+    }
+
+    /// Property mutation needs a live target; with none, there is nothing to
+    /// do and nothing to check.
+    fn set_prop(&mut self, idx: usize, val: i64) -> Result<bool, TestCaseError> {
+        let val = &val;
+        let Some(id) = self.live_node(idx) else {
+            return Ok(false);
+        };
+        self.on_all(|p| {
+            let mut t = p.write()?;
+            t.set_prop(id, "tag", PropDesc::new(PropValue::Int(*val)))?;
+            t.commit()?;
+            Ok(())
+        })?
+        .expect("set_prop on a live node is infallible");
+        self.model.nodes.get_mut(&id).unwrap().tag = Some(*val);
+        Ok(true)
+    }
+
+    /// As `set_prop`: a missing target is a no-op, not a failure.
+    fn remove_prop(&mut self, idx: usize) -> Result<bool, TestCaseError> {
+        let Some(id) = self.live_node(idx) else {
+            return Ok(false);
+        };
+        self.on_all(|p| {
+            let mut t = p.write()?;
+            t.remove_prop(id, "tag")?;
+            t.commit()?;
+            Ok(())
+        })?
+        .expect("remove_prop on a live node is infallible");
+        self.model.nodes.get_mut(&id).unwrap().tag = None;
+        Ok(true)
     }
 
     /// Resolves an index to a *currently alive* node id, or `None` if there

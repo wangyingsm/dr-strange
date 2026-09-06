@@ -772,8 +772,6 @@ pub fn impact(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
 /// stopped it. Counts are exact over what was walked — a budget stop truncates
 /// the region, not the tallies.
 pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<String> {
-    use std::collections::BTreeMap;
-
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
@@ -808,12 +806,29 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
         },
     )?;
 
-    // Close the induced subgraph. A node is swept when it is *in* the frontier,
-    // so the last hop's nodes were only ever reached, never walked from, and
-    // an edge between two of them would go uncounted — leaving them all tied
-    // at one edge apiece and the tallies short. No node is added here: the
-    // region is what the walk found.
-    let seed_only = [node.id];
+    close_region(plane, &region, node.id, &mut tally)?;
+    let labels = region_labels(plane, &node, &region)?;
+
+    let reached = region.levels.len();
+    out.push_str(&counts(&region, &labels, &tally, reached));
+    out.push_str(&hubs(plane, &tally, node.id)?);
+    out.push_str(&bound_note(&region, reached, depth));
+    Ok(out)
+}
+
+/// Close the induced subgraph the walk left open.
+///
+/// A node is swept when it is *in* the frontier, so the last hop's nodes were
+/// only ever reached, never walked from, and an edge between two of them would
+/// go uncounted — leaving them all tied at one edge apiece and the tallies
+/// short. No node is added here: the region is what the walk found.
+fn close_region(
+    plane: &PlaneHandle<'_>,
+    region: &Region,
+    seed: crate::NodeId,
+    tally: &mut Tally,
+) -> Result<()> {
+    let seed_only = [seed];
     let last: &[crate::NodeId] = region.levels.last().map_or(&seed_only[..], Vec::as_slice);
     for &id in last {
         for &dir in BOTH_WAYS {
@@ -836,26 +851,41 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
             }
         }
     }
+    Ok(())
+}
 
-    // Labels come from the region the walk settled on, not from what it
-    // offered: a node the budget refused is not part of the count.
-    let mut labels: BTreeMap<String, usize> = BTreeMap::new();
-    tally_labels(&node, &mut labels);
+/// Label counts over the region the walk settled on, not over what it offered:
+/// a node the budget refused is not part of the count.
+fn region_labels(
+    plane: &PlaneHandle<'_>,
+    seed: &NodeRecord,
+    region: &Region,
+) -> Result<std::collections::BTreeMap<String, usize>> {
+    let mut labels = std::collections::BTreeMap::new();
+    tally_labels(seed, &mut labels);
     for id in region.levels.iter().flatten() {
         if let Some(n) = plane.node(*id)? {
             tally_labels(&n, &mut labels);
         }
     }
+    Ok(labels)
+}
 
-    let reached = region.levels.len();
-    let region_edges: usize = tally.counted.len();
-    out.push_str(&format!(
+/// The four count lines: the region's size, what each hop added, and the label
+/// and edge-type makeup.
+fn counts(
+    region: &Region,
+    labels: &std::collections::BTreeMap<String, usize>,
+    tally: &Tally,
+    reached: usize,
+) -> String {
+    let mut out = format!(
         "region: {} hop{} out and in — {} nodes, {} edges\n",
         reached,
         if reached == 1 { "" } else { "s" },
         region.seen.len(),
-        region_edges,
-    ));
+        tally.counted.len(),
+    );
     out.push_str(&format!(
         "per hop: {}\n",
         region
@@ -887,45 +917,50 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
             FATHOM_GROUPS
         )
     ));
+    out
+}
 
-    // Ranked by degree *within the region*: a global degree would rank the
-    // plane's hubs, not this region's.
-    //
-    // Without the seed, which is the centre by construction — at depth 1 every
-    // edge touches it, so ranking it first says nothing — and without the
-    // nodes holding a single edge, which hold nothing together.
-    let mut hubs: Vec<(crate::NodeId, usize)> = tally
+/// The nodes holding the region together, ranked by degree *within it* — a
+/// global degree would rank the plane's hubs, not this region's.
+///
+/// Without the seed, which is the centre by construction (at depth 1 every edge
+/// touches it, so ranking it first says nothing), and without the nodes holding
+/// a single edge, which hold nothing together.
+fn hubs(plane: &PlaneHandle<'_>, tally: &Tally, seed: crate::NodeId) -> Result<String> {
+    let mut ranked: Vec<(crate::NodeId, usize)> = tally
         .degree
-        .into_iter()
-        .filter(|&(id, deg)| id != node.id && deg > 1)
+        .iter()
+        .filter(|&(&id, &deg)| id != seed && deg > 1)
+        .map(|(&id, &deg)| (id, deg))
         .collect();
-    hubs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
-    match hubs.first() {
-        None => out.push_str("hubs: none — every node here but the seed holds a single edge\n"),
-        Some(_) => {
-            out.push_str("hubs (by edges inside the region):\n");
-            for (id, deg) in hubs.iter().take(FATHOM_HUBS) {
-                if let Some(n) = plane.node(*id)? {
-                    out.push_str(&format!("  {deg:>4}  {}\n", one_line(&n)));
-                }
-            }
-            // A listing cut mid-tie names an arbitrary few of the tied: say how
-            // many share the last degree shown, so the cut is visible.
-            if let Some(&(_, cutoff)) = hubs.get(FATHOM_HUBS.saturating_sub(1)) {
-                let tied = hubs
-                    .iter()
-                    .skip(FATHOM_HUBS)
-                    .filter(|(_, d)| *d == cutoff)
-                    .count();
-                if tied > 0 {
-                    out.push_str(&format!("  … and {tied} more with {cutoff}\n"));
-                }
-            }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+    if ranked.is_empty() {
+        return Ok("hubs: none — every node here but the seed holds a single edge\n".into());
+    }
+    let mut out = String::from("hubs (by edges inside the region):\n");
+    for (id, deg) in ranked.iter().take(FATHOM_HUBS) {
+        if let Some(n) = plane.node(*id)? {
+            out.push_str(&format!("  {deg:>4}  {}\n", one_line(&n)));
         }
     }
+    // A listing cut mid-tie names an arbitrary few of the tied: say how many
+    // share the last degree shown, so the cut is visible.
+    if let Some(&(_, cutoff)) = ranked.get(FATHOM_HUBS.saturating_sub(1)) {
+        let tied = ranked
+            .iter()
+            .skip(FATHOM_HUBS)
+            .filter(|(_, d)| *d == cutoff)
+            .count();
+        if tied > 0 {
+            out.push_str(&format!("  … and {tied} more with {cutoff}\n"));
+        }
+    }
+    Ok(out)
+}
 
-    out.push_str(&match (region.budget_hit, reached < depth) {
-        // Which bound stopped the walk.
+/// Which bound stopped the walk — the honesty footer every verb owes.
+fn bound_note(region: &Region, reached: usize, depth: usize) -> String {
+    match (region.budget_hit, reached < depth) {
         (true, _) => format!(
             "note: stopped at the {FATHOM_BUDGET}-node budget, so the region is the nearest \
              part of a larger one; counts are exact over what was walked. Narrow it with a \
@@ -937,8 +972,7 @@ pub fn fathom(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Strin
             if reached == 1 { "" } else { "s" }
         ),
         (false, false) => format!("note: walked every edge type to depth {depth}.\n"),
-    });
-    Ok(out)
+    }
 }
 
 /// Nodes one `fathom` walks before stopping and saying so: a hub two hops
@@ -1108,115 +1142,143 @@ pub fn history(plane: &PlaneHandle<'_>, limit: Option<usize>) -> Result<String> 
         ));
     }
 
-    // Rendered as a block rather than line by line: the name column is as wide
-    // as the widest name actually present, so `origin/feat/preprocessor-plugins`
-    // does not push every sha beside it out of alignment.
-    let ref_block = |nodes: &[NodeRecord], name_prop: &str, target_prop: &str| -> String {
-        let rows: Vec<(bool, &str, String, String)> = nodes
-            .iter()
-            .map(|node| {
-                let p = &node.properties;
-                let target = prop_str(p, target_prop).unwrap_or_default();
-                (
-                    prop_bool(p, "is_head"),
-                    prop_str(p, name_prop).unwrap_or("<unnamed>"),
-                    target.chars().take(7).collect(),
-                    tip_subject(plane, target).unwrap_or_default(),
-                )
-            })
-            .collect();
-        let width = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
-        rows.iter()
-            .map(|(head, name, short, subject)| {
-                let pad = " ".repeat(width - name.chars().count());
-                let head = if *head { "*" } else { " " };
-                format!("  {head} {name}{pad}  {short}  {subject}\n")
-            })
-            .collect()
-    };
+    out.push_str(&branch_block(plane, branches));
+    out.push_str(&tag_block(plane, tags));
+    out.push_str(&rebase_block(rebases));
+    out.push_str(&commit_block(commits, limit));
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    Ok(out)
+}
 
-    if !branches.is_empty() {
-        let mut sorted = branches.clone();
-        // Local branches first, then remote-tracking: a reader is asking about
-        // this checkout before they are asking about someone else's.
-        sorted.sort_by_key(|b| {
+/// A ref listing as a block rather than line by line: the name column is as
+/// wide as the widest name actually present, so `origin/feat/preprocessor-plugins`
+/// does not push every sha beside it out of alignment.
+fn ref_block(
+    plane: &PlaneHandle<'_>,
+    nodes: &[NodeRecord],
+    name_prop: &str,
+    target_prop: &str,
+) -> String {
+    let rows: Vec<(bool, &str, String, String)> = nodes
+        .iter()
+        .map(|node| {
+            let p = &node.properties;
+            let target = prop_str(p, target_prop).unwrap_or_default();
             (
-                prop_bool(&b.properties, "remote"),
-                prop_str(&b.properties, "name").unwrap_or("").to_string(),
+                prop_bool(p, "is_head"),
+                prop_str(p, name_prop).unwrap_or("<unnamed>"),
+                target.chars().take(7).collect(),
+                tip_subject(plane, target).unwrap_or_default(),
             )
-        });
+        })
+        .collect();
+    let width = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(head, name, short, subject)| {
+            let pad = " ".repeat(width - name.chars().count());
+            let head = if *head { "*" } else { " " };
+            format!("  {head} {name}{pad}  {short}  {subject}\n")
+        })
+        .collect()
+}
+
+/// Local branches first, then remote-tracking: a reader is asking about this
+/// checkout before they are asking about someone else's.
+fn branch_block(plane: &PlaneHandle<'_>, mut branches: Vec<NodeRecord>) -> String {
+    if branches.is_empty() {
+        return String::new();
+    }
+    branches.sort_by_key(|b| {
+        (
+            prop_bool(&b.properties, "remote"),
+            prop_str(&b.properties, "name").unwrap_or("").to_string(),
+        )
+    });
+    let mut out = format!(
+        "branches ({} shown of {}):\n",
+        branches.len().min(HISTORY_REFS),
+        branches.len()
+    );
+    branches.truncate(HISTORY_REFS);
+    out.push_str(&ref_block(plane, &branches, "name", "tip"));
+    out
+}
+
+/// Tags, newest first by tag time.
+fn tag_block(plane: &PlaneHandle<'_>, mut tags: Vec<NodeRecord>) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    tags.sort_by(|a, b| {
+        prop_int(&b.properties, "tagged_ts")
+            .unwrap_or(0)
+            .cmp(&prop_int(&a.properties, "tagged_ts").unwrap_or(0))
+    });
+    let mut out = format!(
+        "tags (newest {} of {}):\n",
+        tags.len().min(HISTORY_REFS),
+        tags.len()
+    );
+    tags.truncate(HISTORY_REFS);
+    out.push_str(&ref_block(plane, &tags, "name", "target"));
+    out
+}
+
+/// Rebases, newest first, each with the caveat that they are reconstructed
+/// from a reflog rather than recorded in the commit graph.
+fn rebase_block(mut rebases: Vec<NodeRecord>) -> String {
+    if rebases.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("rebases ({}):\n", rebases.len());
+    rebases.sort_by(|a, b| {
+        prop_str(&b.properties, "finished_at")
+            .unwrap_or_default()
+            .cmp(prop_str(&a.properties, "finished_at").unwrap_or_default())
+    });
+    for r in rebases.iter().take(HISTORY_REFS) {
+        let p = &r.properties;
+        let short =
+            |key: &str| -> String { prop_str(p, key).unwrap_or("").chars().take(7).collect() };
         out.push_str(&format!(
-            "branches ({} shown of {}):\n",
-            sorted.len().min(HISTORY_REFS),
-            sorted.len()
+            "    {:<24} {}  onto {}, {} commit(s), replaced {}{}\n",
+            prop_str(p, "branch").unwrap_or("<detached>"),
+            day(p, "finished_at"),
+            short("onto"),
+            prop_int(p, "steps").unwrap_or(0),
+            short("replaced"),
+            if prop_bool(p, "completed") {
+                ""
+            } else {
+                " — never finished"
+            },
         ));
-        sorted.truncate(HISTORY_REFS);
-        out.push_str(&ref_block(&sorted, "name", "tip"));
     }
+    out.push_str(
+        "note: rebases come from this clone's reflog, which is local and \
+         expires (gc.reflogExpire, 90 days by default) — the commit graph \
+         records none, so an absent rebase means \"no record\", not \"did not \
+         happen\"\n",
+    );
+    out
+}
 
-    if !tags.is_empty() {
-        let mut sorted = tags.clone();
-        sorted.sort_by(|a, b| {
-            prop_int(&b.properties, "tagged_ts")
-                .unwrap_or(0)
-                .cmp(&prop_int(&a.properties, "tagged_ts").unwrap_or(0))
-        });
-        out.push_str(&format!(
-            "tags (newest {} of {}):\n",
-            sorted.len().min(HISTORY_REFS),
-            sorted.len()
-        ));
-        sorted.truncate(HISTORY_REFS);
-        out.push_str(&ref_block(&sorted, "name", "target"));
-    }
-
-    if !rebases.is_empty() {
-        out.push_str(&format!("rebases ({}):\n", rebases.len()));
-        let mut sorted = rebases.clone();
-        sorted.sort_by(|a, b| {
-            prop_str(&b.properties, "finished_at")
-                .unwrap_or_default()
-                .cmp(prop_str(&a.properties, "finished_at").unwrap_or_default())
-        });
-        for r in sorted.iter().take(HISTORY_REFS) {
-            let p = &r.properties;
-            let short =
-                |key: &str| -> String { prop_str(p, key).unwrap_or("").chars().take(7).collect() };
-            out.push_str(&format!(
-                "    {:<24} {}  onto {}, {} commit(s), replaced {}{}\n",
-                prop_str(p, "branch").unwrap_or("<detached>"),
-                day(p, "finished_at"),
-                short("onto"),
-                prop_int(p, "steps").unwrap_or(0),
-                short("replaced"),
-                if prop_bool(p, "completed") {
-                    ""
-                } else {
-                    " — never finished"
-                },
-            ));
-        }
-        out.push_str(
-            "note: rebases come from this clone's reflog, which is local and \
-             expires (gc.reflogExpire, 90 days by default) — the commit graph \
-             records none, so an absent rebase means \"no record\", not \"did not \
-             happen\"\n",
-        );
-    }
-
+/// The newest commits, one line each.
+fn commit_block(mut commits: Vec<NodeRecord>, limit: Option<usize>) -> String {
     let limit = limit.unwrap_or(HISTORY_COMMITS).max(1);
-    let mut newest = commits;
-    newest.sort_by(|a, b| {
+    commits.sort_by(|a, b| {
         prop_int(&b.properties, "committed_ts")
             .unwrap_or(0)
             .cmp(&prop_int(&a.properties, "committed_ts").unwrap_or(0))
     });
-    out.push_str(&format!(
+    let mut out = format!(
         "commits (newest {} of {}):\n",
-        newest.len().min(limit),
-        newest.len()
-    ));
-    for c in newest.iter().take(limit) {
+        commits.len().min(limit),
+        commits.len()
+    );
+    for c in commits.iter().take(limit) {
         let p = &c.properties;
         out.push_str(&format!(
             "  {}  {}  {:<18} {}{}\n",
@@ -1231,10 +1293,7 @@ pub fn history(plane: &PlaneHandle<'_>, limit: Option<usize>) -> Result<String> 
             },
         ));
     }
-    if let Some(note) = synced_note(plane)? {
-        out.push_str(&note);
-    }
-    Ok(out)
+    out
 }
 
 /// The first line of the commit a ref points at, when that commit is in this

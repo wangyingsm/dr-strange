@@ -1,0 +1,5 @@
+# The `too_many_lines` threshold declared in Cargo.toml's `[workspace.lints]`.
+# Clippy has no way to carry a lint's configuration in the manifest, so the
+# limit and the lint that enforces it are written in two files; changing one
+# without the other is the mistake to watch for.
+too-many-lines-threshold = 100

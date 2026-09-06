@@ -1,7 +1,9 @@
 //! M0 vertical slice (arch/00 §5): create node → get node → 1-hop expand,
 //! through the public API, on both backends, with redb persistence.
 
-use dr_strange_core::{Database, Dir, Error, PlaneId, PropDesc, PropValue, Properties};
+use dr_strange_core::{
+    Database, Dir, EdgeId, Error, NodeId, PlaneId, PropDesc, PropValue, Properties,
+};
 
 fn props(entries: &[(&str, PropValue)]) -> Properties {
     entries
@@ -309,10 +311,21 @@ fn errors_render_readable_messages() {
 
 // ---- M1: deletes, external keys, property mutation, batched ids ----------
 
+/// One slice per concern, threaded by the nodes each hands the next, so a
+/// failure names the operation rather than a line partway down a long body.
 fn m1_slice(db: &Database) {
+    let alice = external_keys(db);
+    property_mutation(db, alice);
+    let (bob, knows) = edge_properties(db, alice);
+    deletes(db, alice, bob, knows);
+    batched_ids(db);
+}
+
+/// A key is unique within its plane: it finds the node, a miss is `None`, and
+/// a second claim on it is a conflict.
+fn external_keys(db: &Database) -> NodeId {
     let plane = db.plane("startup").unwrap();
 
-    // external keys
     let mut txn = plane.write().unwrap();
     let alice = txn
         .create_node_with_key(
@@ -334,8 +347,14 @@ fn m1_slice(db: &Database) {
         .unwrap_err();
     assert!(matches!(err, Error::Conflict(_)), "got: {err:?}");
     drop(txn);
+    alice
+}
 
-    // property mutation
+/// A property set is readable after commit, and removing it takes it off the
+/// record rather than leaving an empty value behind.
+fn property_mutation(db: &Database, alice: NodeId) {
+    let plane = db.plane("startup").unwrap();
+
     let mut txn = plane.write().unwrap();
     txn.set_prop(
         alice,
@@ -361,8 +380,13 @@ fn m1_slice(db: &Database) {
             .properties
             .contains_key("affiliation")
     );
+}
 
-    // edge + edge property mutation
+/// An edge carries properties the same way a node does, and reads back with
+/// both endpoints intact.
+fn edge_properties(db: &Database, alice: NodeId) -> (NodeId, EdgeId) {
+    let plane = db.plane("startup").unwrap();
+
     let mut txn = plane.write().unwrap();
     let bob = txn.create_node(&["Person"], Properties::new()).unwrap();
     let knows = txn
@@ -383,8 +407,14 @@ fn m1_slice(db: &Database) {
     txn.remove_edge_prop(knows, "since").unwrap();
     txn.commit().unwrap();
     assert!(plane.edge(knows).unwrap().unwrap().properties.is_empty());
+    (bob, knows)
+}
 
-    // delete_edge
+/// Deleting an edge leaves both endpoints; deleting a node takes its edges
+/// with it; and deleting either one twice is not an error.
+fn deletes(db: &Database, alice: NodeId, bob: NodeId, knows: EdgeId) {
+    let plane = db.plane("startup").unwrap();
+
     let mut txn = plane.write().unwrap();
     txn.delete_edge(knows).unwrap();
     txn.commit().unwrap();
@@ -421,9 +451,13 @@ fn m1_slice(db: &Database) {
     txn.delete_node(carol).unwrap();
     txn.delete_edge(knows).unwrap();
     txn.commit().unwrap();
+}
 
-    // batched ids: creating many nodes across ID_BATCH_SIZE (64) boundaries
-    // still yields distinct, usable ids
+/// Creating many nodes across the ID_BATCH_SIZE (64) boundaries still yields
+/// distinct, usable ids.
+fn batched_ids(db: &Database) {
+    let plane = db.plane("startup").unwrap();
+
     let mut txn = plane.write().unwrap();
     let mut created = Vec::new();
     for _ in 0..130 {

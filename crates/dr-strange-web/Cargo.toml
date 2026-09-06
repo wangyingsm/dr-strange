@@ -102,3 +102,6 @@ rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
+
+[lints]
+workspace = true

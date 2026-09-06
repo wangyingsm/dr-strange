@@ -16,3 +16,6 @@ tracing = { workspace = true }
 # document converter's warnings, e.g. "pages need OCR", reach these sinks).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+[lints]
+workspace = true

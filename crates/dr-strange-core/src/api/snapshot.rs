@@ -213,7 +213,31 @@ impl Database {
     /// id, restores the id counters and commit sequence, and loads the shipped
     /// sidecars as-is. Errors if the target already holds data.
     pub fn restore(&self, mut input: impl Read) -> Result<SnapshotStats> {
-        // Refuse a non-empty target: any user plane, or any node anywhere.
+        self.refuse_non_empty()?;
+
+        let mut acc = Restoring::default();
+        // One transaction, no automatic commit-seq bump — we land the source's
+        // exact sequence so the sidecars (stamped with it) stay valid.
+        self.engine.with_write_raw(|txn| {
+            while let Some(frame) = read_frame(&mut input)? {
+                apply_frame(txn, frame, &mut acc)?;
+            }
+            let (seq, counters) = acc
+                .manifest
+                .ok_or_else(|| Error::Corrupt("snapshot has no manifest".into()))?;
+            graph::set_id_counters(txn, counters)?;
+            graph::set_commit_seq(txn, seq)?;
+            Ok::<(), Error>(())
+        })?;
+
+        self.load_sidecars(&acc)?;
+        Ok(acc.stats)
+    }
+
+    /// A restore lands ids verbatim, so it can only target an empty database:
+    /// any user plane, or any node anywhere, and it refuses rather than
+    /// colliding.
+    fn refuse_non_empty(&self) -> Result<()> {
         self.engine.with_read(|txn| {
             for (pid, name) in graph::list_planes(txn)? {
                 if name != graph::DEFAULT_PLANE_NAME {
@@ -228,131 +252,121 @@ impl Database {
                 }
             }
             Ok::<(), Error>(())
-        })?;
+        })
+    }
 
-        let mut manifest: Option<(u64, [u64; 5])> = None;
-        let mut hnsw: Option<Vec<u8>> = None;
-        let mut bm25: Option<Vec<u8>> = None;
-        let mut stats = SnapshotStats::default();
-
-        // One transaction, no automatic commit-seq bump — we land the source's
-        // exact sequence so the sidecars (stamped with it) stay valid.
-        self.engine.with_write_raw(|txn| {
-            while let Some(frame) = read_frame(&mut input)? {
-                match frame {
-                    Frame::Manifest {
-                        format,
-                        seq,
-                        counters,
-                    } => {
-                        if format != SNAPSHOT_FORMAT {
-                            return Err(Error::InvalidArgument(format!(
-                                "unsupported snapshot format {format} (expected {SNAPSHOT_FORMAT})"
-                            )));
-                        }
-                        manifest = Some((seq, counters));
-                        stats.seq = seq;
-                    }
-                    Frame::Plane { id, name, props } => {
-                        // Startup already exists from init(); write_plane at the
-                        // same id simply overwrites it.
-                        graph::write_plane(txn, PlaneId(id), &name, &props)?;
-                        stats.planes += 1;
-                    }
-                    Frame::Node {
-                        plane,
-                        id,
-                        key,
-                        labels,
-                        props,
-                    } => {
-                        let lbls: Vec<&str> = labels.iter().map(String::as_str).collect();
-                        graph::insert_node(
-                            txn,
-                            PlaneId(plane),
-                            NodeId(id),
-                            key.as_deref(),
-                            &lbls,
-                            &props,
-                        )?;
-                        stats.nodes += 1;
-                    }
-                    Frame::Edge {
-                        plane,
-                        id,
-                        src,
-                        dst,
-                        ty,
-                        props,
-                    } => {
-                        graph::insert_edge(
-                            txn,
-                            PlaneId(plane),
-                            EdgeId(id),
-                            NodeId(src),
-                            NodeId(dst),
-                            &ty,
-                            &props,
-                        )?;
-                        stats.edges += 1;
-                    }
-                    Frame::VectorIndex {
-                        plane,
-                        label,
-                        property,
-                        metric,
-                    } => {
-                        graph::declare_vector_index(
-                            txn,
-                            PlaneId(plane),
-                            &label,
-                            &property,
-                            metric,
-                        )?;
-                    }
-                    Frame::KeywordIndex {
-                        plane,
-                        label,
-                        property,
-                        language,
-                    } => {
-                        graph::declare_keyword_index(
-                            txn,
-                            PlaneId(plane),
-                            &label,
-                            &property,
-                            language,
-                        )?;
-                    }
-                    Frame::Hnsw(bytes) => hnsw = Some(bytes),
-                    Frame::Bm25(bytes) => bm25 = Some(bytes),
-                }
-            }
-            let (seq, counters) =
-                manifest.ok_or_else(|| Error::Corrupt("snapshot has no manifest".into()))?;
-            graph::set_id_counters(txn, counters)?;
-            graph::set_commit_seq(txn, seq)?;
-            Ok::<(), Error>(())
-        })?;
-
-        let seq = stats.seq;
-        // Persist + load the sidecars. Ids are preserved, so they match; loading
-        // them into the live registries means this database (and its drop-time
-        // save) stays coherent without a rebuild-from-KV.
-        if let (Some(bytes), Some(path)) = (&hnsw, self.sidecar.as_deref()) {
+    /// Persist the sidecars the bundle carried, then load them into the live
+    /// registries. Ids are preserved, so they match — which is what lets this
+    /// database (and its drop-time save) stay coherent with no rebuild-from-KV.
+    fn load_sidecars(&self, acc: &Restoring) -> Result<()> {
+        let seq = acc.stats.seq;
+        if let (Some(bytes), Some(path)) = (&acc.hnsw, self.sidecar.as_deref()) {
             std::fs::write(path, bytes)?;
             if let Some(reg) = VectorRegistry::from_bytes(bytes, seq) {
                 *self.indexes_mut() = reg;
             }
         }
-        if let (Some(bytes), Some(path)) = (&bm25, self.keyword_sidecar.as_deref()) {
+        if let (Some(bytes), Some(path)) = (&acc.bm25, self.keyword_sidecar.as_deref()) {
             std::fs::write(path, bytes)?;
             if let Some(reg) = KeywordRegistry::from_bytes(bytes, seq) {
                 *self.keywords_mut() = reg;
             }
         }
-        Ok(stats)
+        Ok(())
     }
+}
+
+/// What a restore gathers as it reads: the manifest it must find before the
+/// transaction can close, the sidecar bytes it may find, and the counts it
+/// reports back.
+#[derive(Default)]
+struct Restoring {
+    manifest: Option<(u64, [u64; 5])>,
+    hnsw: Option<Vec<u8>>,
+    bm25: Option<Vec<u8>>,
+    stats: SnapshotStats,
+}
+
+/// Write one frame into the open transaction, or hold it on `acc` when it is
+/// not a graph fact (the manifest and the two index sidecars).
+fn apply_frame(txn: &mut dyn WriteTransaction, frame: Frame, acc: &mut Restoring) -> Result<()> {
+    match frame {
+        Frame::Manifest {
+            format,
+            seq,
+            counters,
+        } => {
+            if format != SNAPSHOT_FORMAT {
+                return Err(Error::InvalidArgument(format!(
+                    "unsupported snapshot format {format} (expected {SNAPSHOT_FORMAT})"
+                )));
+            }
+            acc.manifest = Some((seq, counters));
+            acc.stats.seq = seq;
+        }
+        Frame::Plane { id, name, props } => {
+            // Startup already exists from init(); write_plane at the same id
+            // simply overwrites it.
+            graph::write_plane(txn, PlaneId(id), &name, &props)?;
+            acc.stats.planes += 1;
+        }
+        Frame::Node {
+            plane,
+            id,
+            key,
+            labels,
+            props,
+        } => {
+            let lbls: Vec<&str> = labels.iter().map(String::as_str).collect();
+            graph::insert_node(
+                txn,
+                PlaneId(plane),
+                NodeId(id),
+                key.as_deref(),
+                &lbls,
+                &props,
+            )?;
+            acc.stats.nodes += 1;
+        }
+        Frame::Edge {
+            plane,
+            id,
+            src,
+            dst,
+            ty,
+            props,
+        } => {
+            graph::insert_edge(
+                txn,
+                PlaneId(plane),
+                EdgeId(id),
+                NodeId(src),
+                NodeId(dst),
+                &ty,
+                &props,
+            )?;
+            acc.stats.edges += 1;
+        }
+        Frame::VectorIndex {
+            plane,
+            label,
+            property,
+            metric,
+        } => {
+            graph::declare_vector_index(txn, PlaneId(plane), &label, &property, metric)?;
+        }
+        Frame::KeywordIndex {
+            plane,
+            label,
+            property,
+            language,
+        } => {
+            graph::declare_keyword_index(txn, PlaneId(plane), &label, &property, language)?;
+        }
+        Frame::Hnsw(bytes) => acc.hnsw = Some(bytes),
+        Frame::Bm25(bytes) => acc.bm25 = Some(bytes),
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "native-backend"))]

@@ -56,3 +56,6 @@ tracing.workspace = true
 [dev-dependencies]
 # `relay`'s discovery tests write `.mcp.json` files into throwaway trees.
 tempfile = "3.27.0"
+
+[lints]
+workspace = true

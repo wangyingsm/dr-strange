@@ -64,10 +64,22 @@ fn years(nodes: &[dr_strange_core::NodeRecord]) -> Vec<i64> {
         .collect()
 }
 
+/// The whole builder surface, over one fixture, on whichever backend the
+/// caller opened. Grouped by what each block is about so a failure names the
+/// area rather than a line in a wall of assertions; each group re-opens the
+/// plane, which costs nothing and keeps them independently runnable.
 fn run_query_suite(db: &Database) {
     build_fixture(db);
+    let ids = (key_id(db, "p1"), key_id(db, "p2"), key_id(db, "p3"));
+    scans_and_filters(db, ids);
+    expansions(db, ids);
+    ordering_and_paging(db);
+    projections(db, ids);
+}
+
+/// Scanning by label or wholesale, and narrowing with a predicate.
+fn scans_and_filters(db: &Database, (p1, _p2, p3): (NodeId, NodeId, NodeId)) {
     let plane = db.plane("startup").unwrap();
-    let (p1, p2, p3) = (key_id(db, "p1"), key_id(db, "p2"), key_id(db, "p3"));
 
     // scan by label
     assert_eq!(plane.query().scan_label("Paper").count().unwrap(), 3);
@@ -96,6 +108,11 @@ fn run_query_suite(db: &Database) {
             .unwrap(),
         3
     );
+}
+
+/// Walking edges: one hop, a filtered hop, a variable-length hop, and inward.
+fn expansions(db: &Database, (_p1, p2, p3): (NodeId, NodeId, NodeId)) {
+    let plane = db.plane("startup").unwrap();
 
     // 1-hop expand from a seeded node
     let mut cited = plane
@@ -147,6 +164,11 @@ fn run_query_suite(db: &Database) {
             .unwrap(),
         2
     );
+}
+
+/// Ordering, then the top-k and window forms that ordering makes possible.
+fn ordering_and_paging(db: &Database) {
+    let plane = db.plane("startup").unwrap();
 
     // sort ascending / descending by year
     let asc = plane
@@ -184,6 +206,12 @@ fn run_query_suite(db: &Database) {
         .nodes()
         .unwrap();
     assert_eq!(years(&middle), vec![2020]);
+}
+
+/// Rows of values rather than nodes: per-row expressions, the named-column
+/// table, and a sort composed from an explicit key list.
+fn projections(db: &Database, (p1, p2, p3): (NodeId, NodeId, NodeId)) {
+    let plane = db.plane("startup").unwrap();
 
     // select projects expressions per row
     let projected = plane

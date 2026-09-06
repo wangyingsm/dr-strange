@@ -22,6 +22,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/wangyingsm/dr-strange"
 homepage = "https://github.com/wangyingsm/dr-strange"
 
+# A function that does not fit on a couple of screens is one nobody re-reads
+# before changing it. 100 lines is the limit, checked rather than remembered:
+# the threshold lives in `clippy.toml` beside this, and CI's `-D warnings`
+# turns it into a build failure. Members opt in with `[lints] workspace = true`.
+#
+# Clippy counts statements, not the span a symbol occupies — comments and blank
+# lines are free, which is the right incentive. Where a body is genuinely one
+# indivisible thing (a data table, a dispatch match with a stanza per variant),
+# the answer here was to split it anyway rather than to write an `allow`: an
+# exception nobody re-examines is how a limit stops meaning anything.
+[workspace.lints.clippy]
+too_many_lines = "warn"
+
 [workspace.dependencies]
 # default-features off so each member picks the storage backend (redb/native);
 # members that just need core's types (e.g. the parser) get a backend-free core.
