@@ -98,148 +98,166 @@ export class Plot {
     // ring so its interior blends with the canvas.
     const canvasBg = () => (media.matches ? '#1f1f27' : '#ffffff')
 
-    this.sigma = new Sigma(this.graph, container, {
-      // Curved edges (arrowheads kept): prettier than straight lines, and a
-      // curve per direction keeps A→B and B→A from sitting on top of each other.
-      defaultEdgeType: 'curved',
-      edgeProgramClasses: { curved: EdgeCurvedArrowProgram },
-      enableEdgeEvents: true,
-      renderEdgeLabels: true,
-      labelColor: { color: nodeLabel() },
-      edgeLabelColor: { color: edgeLabel() },
-      defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg, canvasBg, this.graph),
-      labelDensity: 0.5,
-      labelRenderedSizeThreshold: 5,
-      // Edge picking reads a downsized framebuffer, so a thin edge has no
-      // clickable pixels and the hit falls through to the stage. Give edges a
-      // floor thickness so they can actually be selected/hovered — this is why
-      // the resting weight above is a fraction and not a vanishing one.
-      minEdgeThickness: 2.5,
-      // Highlight the hovered OR selected edge: full weight, amber, with its
-      // type label forced visible. Hover makes the clickable region obvious;
-      // the selected edge stays lit so a click/search focus is visible.
-      edgeReducer: (edge, data) => {
-        if (edge === this.hoveredEdge || edge === this.selectedEdge) {
-          return { ...data, size: data.size ?? 4, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
-        }
-        if (this.hiddenLabels.size) {
-          const src = this.graph.source(edge)
-          const dst = this.graph.target(edge)
-          const gone = (n) =>
-            !this.graph.getNodeAttribute(n, 'bead') && this.hiddenLabels.has(this._categoryOf(n))
-          if (gone(src) || gone(dst)) return { ...data, hidden: true }
-        }
-        // An overlay lit this one on purpose — leave it exactly as it asked.
-        if (data.emphasis) return data
-        // An edge is only as near as its further end.
-        const alpha = this.focusDist
-          ? Math.min(
-              this._alphaOf(this.graph.source(edge)),
-              this._alphaOf(this.graph.target(edge)),
-            )
-          : 1
-        // The resting style, composed with focus fade rather than replaced by
-        // it: a far edge is fainter still, and a near one is already receded.
-        const rest = {
-          ...data,
-          size: (data.size ?? 4) * EDGE_REST_THICKNESS,
-          color: dim(data.color ?? MUTED_EDGE, alpha * EDGE_REST_ALPHA),
-        }
-        return alpha >= 1 ? rest : { ...rest, label: '' }
-      },
-      // The selected node renders as a hollow ring. Sigma draws a highlighted
-      // node's solid WebGL disc *over* anything the hover drawer paints, so we
-      // make that disc transparent here and let drawNodeHover paint the ring
-      // (its colour read from the graph's stored category colour).
-      nodeReducer: (node, data) => {
-        // Mid-connect: paint the source green and the hovered target blue, both
-        // enlarged with forced labels, so it's unmistakable what's being joined.
-        if (this.connectFrom) {
-          if (node === this.connectFrom) {
-            return { ...data, color: CONNECT_SRC, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
-          }
-          if (node === this.hoveredNode) {
-            return { ...data, color: CONNECT_DST, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
-          }
-        }
-        if (this.focusNodes.has(node)) {
-          return {
-            ...data,
-            highlighted: true,
-            forceLabel: true,
-            size: (data.size ?? 5) * 1.35,
-            color: 'rgba(0,0,0,0)',
-            zIndex: 1,
-          }
-        }
-        if (!data.bead && this.hiddenLabels.size && this.hiddenLabels.has(this._categoryOf(node))) {
-          return { ...data, hidden: true }
-        }
-        // A folded bead always says how much it is hiding.
-        if (data.bead) {
-          return { ...data, forceLabel: true, color: dim(BEAD_COLOR, this._alphaOf(node)) }
-        }
-        const alpha = this._alphaOf(node)
-        // Labels are dropped rather than faded past the focus ring: unreadable
-        // text still costs the space it occupies.
-        return alpha >= 1 ? data : { ...data, color: dim(data.color, alpha), label: alpha > 0.2 ? data.label : '' }
-      },
-    })
+    this.sigma = this._buildSigma(container, nodeLabel, edgeLabel, hoverBg, canvasBg)
 
-    this.sigma.on('clickNode', ({ node }) => {
-      // A bead is not a thing in the graph — clicking it opens what it folded.
-      if (this.graph.getNodeAttribute(node, 'bead')) {
-        this.expandBead(node)
-        return
-      }
-      this.selectedNode = node
-      this.selectedEdge = null // a node click supersedes any edge selection
-      this._setFocus([node])
-      handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record'))
-    })
-    this.sigma.on('clickEdge', ({ edge }) => {
-      this.selectedEdge = edge
-      this.selectedNode = null
-      this._setFocus([this.graph.source(edge), this.graph.target(edge)])
-      handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record'))
-    })
-    this.sigma.on('clickStage', () => {
-      this.selectedEdge = null
-      this.selectedNode = null
-      this._setFocus([])
-      handlers.onClearSelection?.()
-    })
-
-    // Recolour labels if the OS theme flips while the plot is open.
-    media.addEventListener('change', () => {
-      this.sigma.setSetting('labelColor', { color: nodeLabel() })
-      this.sigma.setSetting('edgeLabelColor', { color: edgeLabel() })
-    })
-
-    // Pointer cursor + edge highlight on hover. `hoveredNode` is the connect
-    // target when a left-drag from another node is released.
-    this.sigma.on('enterNode', ({ node }) => {
-      this.hoveredNode = node
-      this._cursor(this.connectFrom ? 'crosshair' : 'pointer')
-      if (this.connectFrom) this.sigma.refresh() // repaint the target highlight
-    })
-    this.sigma.on('leaveNode', () => {
-      this.hoveredNode = null
-      this._cursor(this.connectFrom ? 'crosshair' : '')
-      if (this.connectFrom) this.sigma.refresh()
-    })
-    this.sigma.on('enterEdge', ({ edge }) => {
-      this.hoveredEdge = edge
-      this._cursor('pointer')
-      this.sigma.refresh()
-    })
-    this.sigma.on('leaveEdge', () => {
-      this.hoveredEdge = null
-      this._cursor('')
-      this.sigma.refresh()
-    })
-
+    this._wireSelection(handlers, nodeLabel, edgeLabel, media)
     this._setupMouse(handlers)
+  }
+
+  /**
+   * The sigma instance and its whole settings block: renderers, the
+   * focus fade, and the label colours the constructor resolved for the
+   * current theme. Its reducers read `this`, so it stays a method.
+   */
+  _buildSigma(container, nodeLabel, edgeLabel, hoverBg, canvasBg) {
+      return new Sigma(this.graph, container, {
+        // Curved edges (arrowheads kept): prettier than straight lines, and a
+        // curve per direction keeps A→B and B→A from sitting on top of each other.
+        defaultEdgeType: 'curved',
+        edgeProgramClasses: { curved: EdgeCurvedArrowProgram },
+        enableEdgeEvents: true,
+        renderEdgeLabels: true,
+        labelColor: { color: nodeLabel() },
+        edgeLabelColor: { color: edgeLabel() },
+        defaultDrawNodeHover: drawNodeHover(nodeLabel, hoverBg, canvasBg, this.graph),
+        labelDensity: 0.5,
+        labelRenderedSizeThreshold: 5,
+        // Edge picking reads a downsized framebuffer, so a thin edge has no
+        // clickable pixels and the hit falls through to the stage. Give edges a
+        // floor thickness so they can actually be selected/hovered — this is why
+        // the resting weight above is a fraction and not a vanishing one.
+        minEdgeThickness: 2.5,
+        // Highlight the hovered OR selected edge: full weight, amber, with its
+        // type label forced visible. Hover makes the clickable region obvious;
+        // the selected edge stays lit so a click/search focus is visible.
+        edgeReducer: (edge, data) => {
+          if (edge === this.hoveredEdge || edge === this.selectedEdge) {
+            return { ...data, size: data.size ?? 4, color: HOVER_COLOR, forceLabel: true, zIndex: 1 }
+          }
+          if (this.hiddenLabels.size) {
+            const src = this.graph.source(edge)
+            const dst = this.graph.target(edge)
+            const gone = (n) =>
+              !this.graph.getNodeAttribute(n, 'bead') && this.hiddenLabels.has(this._categoryOf(n))
+            if (gone(src) || gone(dst)) return { ...data, hidden: true }
+          }
+          // An overlay lit this one on purpose — leave it exactly as it asked.
+          if (data.emphasis) return data
+          // An edge is only as near as its further end.
+          const alpha = this.focusDist
+            ? Math.min(
+                this._alphaOf(this.graph.source(edge)),
+                this._alphaOf(this.graph.target(edge)),
+              )
+            : 1
+          // The resting style, composed with focus fade rather than replaced by
+          // it: a far edge is fainter still, and a near one is already receded.
+          const rest = {
+            ...data,
+            size: (data.size ?? 4) * EDGE_REST_THICKNESS,
+            color: dim(data.color ?? MUTED_EDGE, alpha * EDGE_REST_ALPHA),
+          }
+          return alpha >= 1 ? rest : { ...rest, label: '' }
+        },
+        // The selected node renders as a hollow ring. Sigma draws a highlighted
+        // node's solid WebGL disc *over* anything the hover drawer paints, so we
+        // make that disc transparent here and let drawNodeHover paint the ring
+        // (its colour read from the graph's stored category colour).
+        nodeReducer: (node, data) => {
+          // Mid-connect: paint the source green and the hovered target blue, both
+          // enlarged with forced labels, so it's unmistakable what's being joined.
+          if (this.connectFrom) {
+            if (node === this.connectFrom) {
+              return { ...data, color: CONNECT_SRC, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
+            }
+            if (node === this.hoveredNode) {
+              return { ...data, color: CONNECT_DST, size: (data.size ?? 5) * 1.8, forceLabel: true, zIndex: 2 }
+            }
+          }
+          if (this.focusNodes.has(node)) {
+            return {
+              ...data,
+              highlighted: true,
+              forceLabel: true,
+              size: (data.size ?? 5) * 1.35,
+              color: 'rgba(0,0,0,0)',
+              zIndex: 1,
+            }
+          }
+          if (!data.bead && this.hiddenLabels.size && this.hiddenLabels.has(this._categoryOf(node))) {
+            return { ...data, hidden: true }
+          }
+          // A folded bead always says how much it is hiding.
+          if (data.bead) {
+            return { ...data, forceLabel: true, color: dim(BEAD_COLOR, this._alphaOf(node)) }
+          }
+          const alpha = this._alphaOf(node)
+          // Labels are dropped rather than faded past the focus ring: unreadable
+          // text still costs the space it occupies.
+          return alpha >= 1 ? data : { ...data, color: dim(data.color, alpha), label: alpha > 0.2 ? data.label : '' }
+        },
+      })
+  }
+
+  /**
+   * Selection, theme changes and hover, wired onto the sigma instance the
+   * constructor built. Split out because it is behaviour attached after
+   * the fact rather than part of building the object.
+   */
+  _wireSelection(handlers, nodeLabel, edgeLabel, media) {
+      this.sigma.on('clickNode', ({ node }) => {
+        // A bead is not a thing in the graph — clicking it opens what it folded.
+        if (this.graph.getNodeAttribute(node, 'bead')) {
+          this.expandBead(node)
+          return
+        }
+        this.selectedNode = node
+        this.selectedEdge = null // a node click supersedes any edge selection
+        this._setFocus([node])
+        handlers.onSelectNode?.(node, this.graph.getNodeAttribute(node, 'record'))
+      })
+      this.sigma.on('clickEdge', ({ edge }) => {
+        this.selectedEdge = edge
+        this.selectedNode = null
+        this._setFocus([this.graph.source(edge), this.graph.target(edge)])
+        handlers.onSelectEdge?.(edge, this.graph.getEdgeAttribute(edge, 'record'))
+      })
+      this.sigma.on('clickStage', () => {
+        this.selectedEdge = null
+        this.selectedNode = null
+        this._setFocus([])
+        handlers.onClearSelection?.()
+      })
+
+      // Recolour labels if the OS theme flips while the plot is open.
+      media.addEventListener('change', () => {
+        this.sigma.setSetting('labelColor', { color: nodeLabel() })
+        this.sigma.setSetting('edgeLabelColor', { color: edgeLabel() })
+      })
+
+      // Pointer cursor + edge highlight on hover. `hoveredNode` is the connect
+      // target when a left-drag from another node is released.
+      this.sigma.on('enterNode', ({ node }) => {
+        this.hoveredNode = node
+        this._cursor(this.connectFrom ? 'crosshair' : 'pointer')
+        if (this.connectFrom) this.sigma.refresh() // repaint the target highlight
+      })
+      this.sigma.on('leaveNode', () => {
+        this.hoveredNode = null
+        this._cursor(this.connectFrom ? 'crosshair' : '')
+        if (this.connectFrom) this.sigma.refresh()
+      })
+      this.sigma.on('enterEdge', ({ edge }) => {
+        this.hoveredEdge = edge
+        this._cursor('pointer')
+        this.sigma.refresh()
+      })
+      this.sigma.on('leaveEdge', () => {
+        this.hoveredEdge = null
+        this._cursor('')
+        this.sigma.refresh()
+      })
+
   }
 
   // Custom mouse model (arch/08): the RIGHT button drags to pan the canvas

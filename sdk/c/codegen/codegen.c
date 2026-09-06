@@ -93,6 +93,103 @@ struct param {
     int required;
 };
 
+/* One method's declaration and definition, emitted into the header and the
+ * source. Lifted out of `main`, which is now the file plumbing around it. */
+static void emit_method(struct json_object *m, FILE *fh, FILE *fc) {
+    struct json_object *node;
+
+    json_object_object_get_ex(m, "name", &node);
+    const char *wire = json_object_get_string(node);
+    char *id = ident(wire);
+
+    const char *summary = "";
+    if (json_object_object_get_ex(m, "summary", &node)) {
+        summary = json_object_get_string(node);
+    }
+    const char *access = "";
+    if (json_object_object_get_ex(m, "x-access", &node)) {
+        access = json_object_get_string(node);
+    }
+
+    struct param req[16], opt[16];
+    int nreq = 0, nopt = 0;
+    struct json_object *params;
+    if (json_object_object_get_ex(m, "params", &params)) {
+        size_t np = json_object_array_length(params);
+        for (size_t j = 0; j < np; j++) {
+            struct json_object *p = json_object_array_get_idx(params, j);
+            struct json_object *pn, *ps, *pr;
+            json_object_object_get_ex(p, "name", &pn);
+            json_object_object_get_ex(p, "schema", &ps);
+            int required = json_object_object_get_ex(p, "required", &pr)
+                    && json_object_get_boolean(pr);
+            struct param entry = {json_object_get_string(pn), classify(ps), required};
+            if (required) {
+                req[nreq++] = entry;
+            } else {
+                opt[nopt++] = entry;
+            }
+        }
+    }
+
+    char doc_comment[512];
+    if (access[0]) {
+        snprintf(doc_comment, sizeof doc_comment, "/* %s (access: %s) */", summary, access);
+    } else {
+        snprintf(doc_comment, sizeof doc_comment, "/* %s */", summary);
+    }
+
+    /* Optional-params struct. */
+    if (nopt > 0) {
+        fprintf(fh, "typedef struct {\n");
+        for (int k = 0; k < nopt; k++) {
+            print_opt_field(fh, opt[k].type, opt[k].name);
+        }
+        fprintf(fh, "} drsg_%s_opts;\n\n", id);
+    }
+
+    /* Prototype (header) and definition (source) share a signature. */
+    for (int pass = 0; pass < 2; pass++) {
+        FILE *f = pass == 0 ? fh : fc;
+        fprintf(f, "%s\n", doc_comment);
+        fprintf(f, "struct json_object *drsg_%s(drsg_client *c", id);
+        for (int k = 0; k < nreq; k++) {
+            fprintf(f, ", ");
+            print_arg_decl(f, req[k].type, req[k].name);
+        }
+        if (nopt > 0) {
+            fprintf(f, ", const drsg_%s_opts *opts", id);
+        }
+        fprintf(f, ", drsg_error *err)");
+        if (pass == 0) {
+            fprintf(f, ";\n\n");
+            continue;
+        }
+        fprintf(f, " {\n");
+        if (nreq == 0 && nopt == 0) {
+            fprintf(f, "    struct json_object *p = NULL;\n");
+        } else {
+            fprintf(f, "    struct json_object *p = json_object_new_object();\n");
+            for (int k = 0; k < nreq; k++) {
+                print_required_add(f, req[k].type, req[k].name);
+            }
+            if (nopt > 0) {
+                fprintf(f, "    if (opts) {\n");
+                for (int k = 0; k < nopt; k++) {
+                    print_optional_add(f, opt[k].type, opt[k].name);
+                }
+                fprintf(f, "    }\n");
+            }
+        }
+        fprintf(f, "    struct json_object *result = NULL;\n");
+        fprintf(f, "    int rc = drsg_call(c, \"%s\", p, &result, err);\n", wire);
+        fprintf(f, "    if (p) json_object_put(p);\n");
+        fprintf(f, "    return rc == 0 ? result : NULL;\n}\n\n");
+    }
+
+    free(id);
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <schema.json> <out_header> <out_source>\n", argv[0]);
@@ -119,100 +216,9 @@ int main(int argc, char **argv) {
     json_object_object_get_ex(doc, "methods", &methods);
     size_t nm = json_object_array_length(methods);
 
+
     for (size_t i = 0; i < nm; i++) {
-        struct json_object *m = json_object_array_get_idx(methods, i);
-        struct json_object *node;
-
-        json_object_object_get_ex(m, "name", &node);
-        const char *wire = json_object_get_string(node);
-        char *id = ident(wire);
-
-        const char *summary = "";
-        if (json_object_object_get_ex(m, "summary", &node)) {
-            summary = json_object_get_string(node);
-        }
-        const char *access = "";
-        if (json_object_object_get_ex(m, "x-access", &node)) {
-            access = json_object_get_string(node);
-        }
-
-        struct param req[16], opt[16];
-        int nreq = 0, nopt = 0;
-        struct json_object *params;
-        if (json_object_object_get_ex(m, "params", &params)) {
-            size_t np = json_object_array_length(params);
-            for (size_t j = 0; j < np; j++) {
-                struct json_object *p = json_object_array_get_idx(params, j);
-                struct json_object *pn, *ps, *pr;
-                json_object_object_get_ex(p, "name", &pn);
-                json_object_object_get_ex(p, "schema", &ps);
-                int required = json_object_object_get_ex(p, "required", &pr)
-                        && json_object_get_boolean(pr);
-                struct param entry = {json_object_get_string(pn), classify(ps), required};
-                if (required) {
-                    req[nreq++] = entry;
-                } else {
-                    opt[nopt++] = entry;
-                }
-            }
-        }
-
-        char doc_comment[512];
-        if (access[0]) {
-            snprintf(doc_comment, sizeof doc_comment, "/* %s (access: %s) */", summary, access);
-        } else {
-            snprintf(doc_comment, sizeof doc_comment, "/* %s */", summary);
-        }
-
-        /* Optional-params struct. */
-        if (nopt > 0) {
-            fprintf(fh, "typedef struct {\n");
-            for (int k = 0; k < nopt; k++) {
-                print_opt_field(fh, opt[k].type, opt[k].name);
-            }
-            fprintf(fh, "} drsg_%s_opts;\n\n", id);
-        }
-
-        /* Prototype (header) and definition (source) share a signature. */
-        for (int pass = 0; pass < 2; pass++) {
-            FILE *f = pass == 0 ? fh : fc;
-            fprintf(f, "%s\n", doc_comment);
-            fprintf(f, "struct json_object *drsg_%s(drsg_client *c", id);
-            for (int k = 0; k < nreq; k++) {
-                fprintf(f, ", ");
-                print_arg_decl(f, req[k].type, req[k].name);
-            }
-            if (nopt > 0) {
-                fprintf(f, ", const drsg_%s_opts *opts", id);
-            }
-            fprintf(f, ", drsg_error *err)");
-            if (pass == 0) {
-                fprintf(f, ";\n\n");
-                continue;
-            }
-            fprintf(f, " {\n");
-            if (nreq == 0 && nopt == 0) {
-                fprintf(f, "    struct json_object *p = NULL;\n");
-            } else {
-                fprintf(f, "    struct json_object *p = json_object_new_object();\n");
-                for (int k = 0; k < nreq; k++) {
-                    print_required_add(f, req[k].type, req[k].name);
-                }
-                if (nopt > 0) {
-                    fprintf(f, "    if (opts) {\n");
-                    for (int k = 0; k < nopt; k++) {
-                        print_optional_add(f, opt[k].type, opt[k].name);
-                    }
-                    fprintf(f, "    }\n");
-                }
-            }
-            fprintf(f, "    struct json_object *result = NULL;\n");
-            fprintf(f, "    int rc = drsg_call(c, \"%s\", p, &result, err);\n", wire);
-            fprintf(f, "    if (p) json_object_put(p);\n");
-            fprintf(f, "    return rc == 0 ? result : NULL;\n}\n\n");
-        }
-
-        free(id);
+        emit_method(json_object_array_get_idx(methods, i), fh, fc);
     }
 
     fprintf(fh, "#endif /* DRSG_GENERATED_H */\n");

@@ -145,6 +145,10 @@ gate-supply:
     cargo deny check
     cargo machete
     cd sdk/python && uv run --with ruff ruff check .
+    # The bench scripts belong to no package, so they carry the SDK's rules
+    # explicitly rather than inheriting a pyproject they are not under.
+    uv run --no-project --with ruff ruff check benchmarks/ \
+      --extend-select PLR0915 --config 'lint.pylint.max-statements=100'
 
 # The redb pass is the one an all-defaults `cargo test` never covers: the
 # storage backend is a cargo feature, and the other one has its own

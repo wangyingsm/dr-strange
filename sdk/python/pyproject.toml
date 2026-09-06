@@ -27,4 +27,14 @@ pythonpath = ["."]  # so tests can `import codegen`
 # builtins and carries a per-file noqa for it, and `_client.py` opens a fixed
 # http(s) endpoint it built itself. Neither rule was enabled before, so both
 # those directives sat dead — `RUF100` is what noticed.
-extend-select = ["A", "S310"]
+extend-select = [
+    "A",
+    "S310",
+    # The hundred-line limit, the same one `clippy::too_many_lines` holds over
+    # the Rust crates. Ruff counts statements, as clippy does, so comments and
+    # blank lines are free.
+    "PLR0915",
+]
+
+[tool.ruff.lint.pylint]
+max-statements = 100

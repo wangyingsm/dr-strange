@@ -263,3 +263,9 @@ jobs:
       - name: Lint
         run: uv run --with ruff ruff check .
         working-directory: sdk/python
+      # The bench scripts belong to no package, so they carry the SDK's rules
+      # explicitly rather than inheriting a pyproject they are not under.
+      - name: Lint (benchmarks)
+        run: |
+          uv run --no-project --with ruff ruff check benchmarks/ \
+            --extend-select PLR0915 --config 'lint.pylint.max-statements=100'

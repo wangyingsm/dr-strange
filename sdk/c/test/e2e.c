@@ -83,14 +83,11 @@ static void *watch_thread(void *arg) {
     return NULL;
 }
 
-int main(void) {
-    drsg_client *c = drsg_client_new(getenv("DRSG_BASE_URL"), getenv("DRSG_TOKEN"));
-    if (!c) {
-        fprintf(stderr, "FAIL: client_new returned NULL\n");
-        return 1;
-    }
+/* Nodes and edges: create, relate, update, read back, and delete with the
+ * cascade. Split from `main` so each half stays readable; both report
+ * through the same `failures` counter. */
+static void crud_checks(drsg_client *c) {
     drsg_error err;
-
     /* db.stats -> 0 nodes on a fresh db. */
     struct json_object *stats = drsg_db_stats(c, &err);
     CHECK(stats, "db.stats");
@@ -173,6 +170,18 @@ int main(void) {
     CHECK(stats2 && int_field(stats2, "nodes") == 1 && int_field(stats2, "edges") == 0,
             "1 node, 0 edges after delete");
     json_object_put(stats2);
+
+}
+
+int main(void) {
+    drsg_client *c = drsg_client_new(getenv("DRSG_BASE_URL"), getenv("DRSG_TOKEN"));
+    if (!c) {
+        fprintf(stderr, "FAIL: client_new returned NULL\n");
+        return 1;
+    }
+    drsg_error err;
+
+    crud_checks(c);
 
     /* plane admin. */
     struct json_object *plane = drsg_plane_create(c, "notes", NULL, &err);

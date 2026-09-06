@@ -449,11 +449,11 @@ def main():
 
     out = args.out or Path(f"benchmarks/results/{args.engine}.json")
     if args.engine == "sqlite":
-        one_pass = lambda: run_sqlite(args.data, args.k)  # noqa: E731
+        one_pass = lambda: run_sqlite(args.data, args.k)
     elif args.engine == "kuzu":
-        one_pass = lambda: run_kuzu(args.data, args.k)  # noqa: E731
+        one_pass = lambda: run_kuzu(args.data, args.k)
     else:
-        one_pass = lambda: run_neo4j(  # noqa: E731
+        one_pass = lambda: run_neo4j(
             args.data, args.k, args.neo4j_uri, args.neo4j_user, args.neo4j_password)
 
     passes = []
