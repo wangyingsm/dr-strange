@@ -313,61 +313,8 @@ pub fn fetch_with_progress(
         let loaded = ctx.load_all(take, base, progress);
 
         // Gate two: the page itself, re-judged now that it can be read.
-        let avg_len = average_len(&analyzer, &loaded);
-        let mut fresh = Vec::new();
-        for (cand, result) in take.iter().zip(loaded) {
-            match result {
-                Err(why) => out.dropped.push(Dropped {
-                    url: cand.url.to_string(),
-                    reason: why,
-                }),
-                Ok(doc) => {
-                    let score = if target.is_empty() {
-                        1.0
-                    } else {
-                        target.score(&analyzer, &doc.text, avg_len) * decay(cand.depth)
-                    };
-                    let mut page = Page {
-                        url: cand.url.to_string(),
-                        title: doc.title.clone(),
-                        block: String::new(),
-                        chars: 0,
-                        score,
-                        depth: cand.depth,
-                        kept: true,
-                    };
-                    render(&mut page, &doc.text);
-                    fresh.push((page, doc));
-                }
-            }
-        }
-
-        // The floor is relative to the best page found at this depth, so it
-        // adapts to a corpus rather than asserting an absolute meaning for a
-        // BM25 score.
-        let best = fresh.iter().map(|(p, _)| p.score).fold(0.0f32, f32::max);
-        let floor = best * opts.min_ratio;
-        let mut next = Vec::new();
-        for (mut page, doc) in fresh {
-            if page.score < floor {
-                page.kept = false;
-                out.dropped.push(Dropped {
-                    url: page.url.clone(),
-                    reason: format!(
-                        "relevance {:.2} is below the floor {floor:.2} for this crawl",
-                        page.score
-                    ),
-                });
-                out.pages.push(page);
-                continue;
-            }
-            if depth < opts.max_depth {
-                let url = Url::parse(&page.url).expect("a fetched URL parses");
-                next.extend(candidates(&url, &doc.links, depth + 1, &mut seen));
-            }
-            out.pages.push(page);
-        }
-        frontier = next;
+        let fresh = read_pages(take, loaded, &analyzer, &target, &mut out);
+        frontier = keep_or_drop(fresh, opts, depth, &mut seen, &mut out);
         depth += 1;
     }
 
@@ -380,6 +327,85 @@ pub fn fetch_with_progress(
             .then_with(|| a.url.cmp(&b.url))
     });
     Ok(out)
+}
+
+/// Gate two: score each page that loaded, now that its text can be read.
+///
+/// A page that failed to load is dropped with the reason, so a thin crawl is
+/// explainable rather than merely short.
+fn read_pages(
+    take: &[Candidate],
+    loaded: Vec<Result<Loaded, String>>,
+    analyzer: &Analyzer,
+    target: &Target,
+    out: &mut Fetched,
+) -> Vec<(Page, Loaded)> {
+    let avg_len = average_len(analyzer, &loaded);
+    let mut fresh = Vec::new();
+    for (cand, result) in take.iter().zip(loaded) {
+        match result {
+            Err(why) => out.dropped.push(Dropped {
+                url: cand.url.to_string(),
+                reason: why,
+            }),
+            Ok(doc) => {
+                let score = if target.is_empty() {
+                    1.0
+                } else {
+                    target.score(analyzer, &doc.text, avg_len) * decay(cand.depth)
+                };
+                let mut page = Page {
+                    url: cand.url.to_string(),
+                    title: doc.title.clone(),
+                    block: String::new(),
+                    chars: 0,
+                    score,
+                    depth: cand.depth,
+                    kept: true,
+                };
+                render(&mut page, &doc.text);
+                fresh.push((page, doc));
+            }
+        }
+    }
+    fresh
+}
+
+/// Keep what clears this depth's relevance floor, and return the next
+/// frontier from the pages that did.
+///
+/// The floor is relative to the best page found at this depth, so it adapts to
+/// a corpus rather than asserting an absolute meaning for a BM25 score.
+fn keep_or_drop(
+    fresh: Vec<(Page, Loaded)>,
+    opts: &FetchOptions,
+    depth: usize,
+    seen: &mut AHashSet<String>,
+    out: &mut Fetched,
+) -> Vec<Candidate> {
+    let best = fresh.iter().map(|(p, _)| p.score).fold(0.0f32, f32::max);
+    let floor = best * opts.min_ratio;
+    let mut next = Vec::new();
+    for (mut page, doc) in fresh {
+        if page.score < floor {
+            page.kept = false;
+            out.dropped.push(Dropped {
+                url: page.url.clone(),
+                reason: format!(
+                    "relevance {:.2} is below the floor {floor:.2} for this crawl",
+                    page.score
+                ),
+            });
+            out.pages.push(page);
+            continue;
+        }
+        if depth < opts.max_depth {
+            let url = Url::parse(&page.url).expect("a fetched URL parses");
+            next.extend(candidates(&url, &doc.links, depth + 1, seen));
+        }
+        out.pages.push(page);
+    }
+    next
 }
 
 /// Hop decay, the same idiom `plane.hybrid`'s graph channel uses. It breaks

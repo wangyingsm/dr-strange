@@ -1018,14 +1018,13 @@ pub enum ServeOutcome {
 /// Runs the server until Ctrl-C — or, in `--follow` mode, until the
 /// replication stream is lost. Owns the tokio runtime setup's payload; the
 /// synchronous `serve` wrapper in `lib.rs` drives it with `block_on`.
-pub async fn run(
-    db: Database,
-    db_path: Option<PathBuf>,
-    opts: ServeOptions,
-) -> anyhow::Result<ServeOutcome> {
-    startup_banner();
-    // Read the secret once so the checker (`authorizer`) and the SPA's injected
-    // copy (`bootstrap_token`) can never disagree.
+/// Who may do what, and the copy of the token the SPA is handed.
+///
+/// The secret is read once so the checker and the SPA's injected copy can
+/// never disagree. `serve --follow` (arch/01 §9) then refuses every write RPC
+/// regardless of token — a third, orthogonal layer alongside the Origin guard
+/// and the bearer token itself.
+fn build_authorizer(opts: &ServeOptions) -> (Arc<dyn Authorizer>, Option<String>) {
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
     let shared_token = SharedToken::new(token.clone());
     if shared_token.is_configured() {
@@ -1037,15 +1036,47 @@ pub async fn run(
             "no DRSG_TOKEN set; the API is reachable only from the local browser UI. Set DRSG_TOKEN to allow programmatic (SDK / curl) access."
         );
     }
-    // `serve --follow` (arch/01 §9): every write RPC is refused regardless of
-    // token — a third, orthogonal layer alongside the Origin guard and the
-    // bearer token itself.
     let authorizer: Arc<dyn Authorizer> = if opts.follow.is_some() {
         tracing::info!("read-only replica (serve --follow): all write RPCs are refused");
         Arc::new(ReadOnlyAuthorizer(shared_token))
     } else {
         Arc::new(shared_token)
     };
+    (authorizer, token)
+}
+
+/// History retention (see `ServeOptions::retain_commits`): bound how far back
+/// time-travel reaches, so a long-lived server's store stays near the size of
+/// what it holds now.
+///
+/// Native-only — the other engines keep no versions to bound. Set before the
+/// replica path too: a follower applies its master's commits through the same
+/// engine and compacts the same way.
+fn apply_retention(db: &Database, opts: &ServeOptions) {
+    #[cfg(feature = "native-backend")]
+    {
+        db.set_retention(opts.retain_commits);
+        match opts.retain_commits {
+            Some(n) => tracing::info!(
+                commits = n,
+                "history retention: time-travel reaches this many commits back; older versions are reclaimed at compaction"
+            ),
+            None => tracing::info!(
+                "history retention: unbounded — every version ever written stays on disk and in every compaction"
+            ),
+        }
+    }
+    #[cfg(not(feature = "native-backend"))]
+    let _ = (db, opts);
+}
+
+pub async fn run(
+    db: Database,
+    db_path: Option<PathBuf>,
+    opts: ServeOptions,
+) -> anyhow::Result<ServeOutcome> {
+    startup_banner();
+    let (authorizer, token) = build_authorizer(&opts);
     // Change feed (ROADMAP §5): publish every committed ChangeSet to a
     // broadcast channel that `/ws` subscribers drain. Registered before the db
     // is shared, and best-effort — `send` failing (no live subscriber) is fine.
@@ -1075,24 +1106,7 @@ pub async fn run(
     if opts.follow.is_some() && !cfg!(feature = "native-backend") {
         anyhow::bail!("serve --follow requires the native-backend feature");
     }
-    // History retention (see `ServeOptions::retain_commits`): bound how far
-    // back time-travel reaches, so a long-lived server's store stays near the
-    // size of what it holds now. Native-only — the other engines keep no
-    // versions to bound. Set before the replica path too: a follower applies
-    // its master's commits through the same engine and compacts the same way.
-    #[cfg(feature = "native-backend")]
-    {
-        db.set_retention(opts.retain_commits);
-        match opts.retain_commits {
-            Some(n) => tracing::info!(
-                commits = n,
-                "history retention: time-travel reaches this many commits back; older versions are reclaimed at compaction"
-            ),
-            None => tracing::info!(
-                "history retention: unbounded — every version ever written stays on disk and in every compaction"
-            ),
-        }
-    }
+    apply_retention(&db, &opts);
 
     // `serve --follow`: bootstrap from the master before this server ever
     // answers a request — an empty database serving reads would just be

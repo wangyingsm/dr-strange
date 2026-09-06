@@ -258,20 +258,49 @@ pub fn init_bootstrap(
     force |= rebuild;
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
 
+    let pid = spawn_watcher(&dir, &db_path, &plane_name, addr, &token, force)?;
+
+    let what = match (rebuild, force) {
+        (true, _) => "rebuilt",
+        (false, true) => "bootstrapped",
+        (false, false) => "restarted",
+    };
+    writeln!(
+        out,
+        "plane '{plane_name}' {what} — serve watch pid {pid}, http://{addr}/mcp"
+    )?;
+    say_history(&dir, &plane_name, plugin_config, out)?;
+    write_agent_configs(&dir, &addr, &token, out)
+}
+
+/// Spawn `serve watch` detached, and wait until it is actually listening.
+///
+/// Detached in its own session so it outlives this process: `init` returns as
+/// soon as the endpoint answers, and the watcher keeps folding commits after
+/// the shell that started it has gone.
+#[cfg(feature = "digest")]
+fn spawn_watcher(
+    dir: &Path,
+    db_path: &Path,
+    plane_name: &str,
+    addr: std::net::SocketAddr,
+    token: &str,
+    force: bool,
+) -> Result<u32> {
     let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.current_dir(&dir)
+    cmd.current_dir(dir)
         .arg("--db")
-        .arg(&db_path)
+        .arg(db_path)
         .arg("serve")
         .arg("--addr")
         .arg(addr.to_string())
         .arg("watch")
         .arg("--dir")
-        .arg(&dir)
+        .arg(dir)
         .arg("--plane")
-        .arg(&plane_name)
-        .env("DRSG_TOKEN", &token)
+        .arg(plane_name)
+        .env("DRSG_TOKEN", token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -281,9 +310,9 @@ pub fn init_bootstrap(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid()` is async-signal-safe and touches only the
-        // child's own process state; this runs in the forked child before
-        // exec, per `pre_exec`'s contract.
+        // SAFETY: `setsid()` is async-signal-safe and touches only the child's
+        // own process state; this runs in the forked child before exec, per
+        // `pre_exec`'s contract.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -301,25 +330,13 @@ pub fn init_bootstrap(
         )
     })?;
     let pid = child.id();
-
     if !wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
         let log_tail =
-            tail_recent_log(&dir).unwrap_or_else(|| "(no log file found under logs/)".to_string());
+            tail_recent_log(dir).unwrap_or_else(|| "(no log file found under logs/)".to_string());
         let _ = child.kill();
         bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
     }
-
-    let what = match (rebuild, force) {
-        (true, _) => "rebuilt",
-        (false, true) => "bootstrapped",
-        (false, false) => "restarted",
-    };
-    writeln!(
-        out,
-        "plane '{plane_name}' {what} — serve watch pid {pid}, http://{addr}/mcp"
-    )?;
-    say_history(&dir, &plane_name, plugin_config, out)?;
-    write_agent_configs(&dir, &addr, &token, out)
+    Ok(pid)
 }
 
 /// Say what will become of this repository's history — one line, and only
@@ -1304,6 +1321,146 @@ pub fn watch(
 
 #[cfg(feature = "digest")]
 #[allow(clippy::too_many_arguments)]
+/// The embedder a watched plane re-vectorizes through, if it has one.
+///
+/// The server's embed config keeps a watched plane searchable: after a fold
+/// changes facts, the changed nodes re-embed (`_embedded_from` makes that pass
+/// incremental). No config, or a provider that cannot be built (a missing
+/// key), degrades to facts-only — said once here rather than once per fold.
+fn watch_embedder(
+    embed: Option<&(String, Option<String>, Option<String>)>,
+) -> Option<Box<dyn dr_strange_llm::Embedder>> {
+    let (provider, model, key_env) = embed?;
+    match dr_strange_llm::build_provider(provider, model.as_deref(), None, key_env.as_deref(), true)
+    {
+        Ok(e) => Some(Box::new(e) as Box<dyn dr_strange_llm::Embedder>),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "embed provider unavailable — folds will update facts only"
+            );
+            None
+        }
+    }
+}
+
+/// Where to start folding from, for a plane that is neither brand-new nor
+/// being rebuilt: the plane says which commit it reflects, and that answer
+/// decides whether there is a gap to close.
+#[cfg(feature = "digest")]
+fn catch_up_from(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    root: &str,
+    head: String,
+) -> Result<String> {
+    if db.plane(plane_name).is_err() {
+        db.create_plane(plane_name, Properties::new())?;
+        tracing::info!(plane = plane_name, "created plane");
+    }
+    let (rec_commit, rec_root) = recorded_sync_point(db, plane_name);
+    if let Some(r) = &rec_root
+        && r != root
+    {
+        tracing::warn!(
+            plane_root = %r,
+            watch_root = %root,
+            "the plane was parsed from a different directory — file \
+             attribution will not line up; `--force` (or a re-digest \
+             from this directory) puts them on one basis"
+        );
+    }
+    match rec_commit {
+        Some(rec) if rec == head => {
+            tracing::info!(commit = %&rec[..12.min(rec.len())], "graph and repository are in sync");
+        }
+        Some(rec) if commit_known(dir, &rec) => {
+            tracing::info!(
+                from = %&rec[..12.min(rec.len())],
+                to = %&head[..12.min(head.len())],
+                "graph is behind the repository — catching up"
+            );
+            // The ordinary fold covers the gap: start from the recorded commit
+            // and let the first poll diff it against HEAD.
+            return Ok(rec);
+        }
+        Some(rec) => {
+            tracing::warn!(
+                recorded = %&rec[..12.min(rec.len())],
+                "the plane's sync point is unknown to this repository \
+                 (rewritten history, or another repo) — folding forward \
+                 from the current HEAD; `--force` re-establishes exact sync"
+            );
+        }
+        None => {
+            tracing::warn!(
+                "the plane records no sync point, so graph and repository \
+                 cannot be compared — folding forward from the current \
+                 HEAD; a digest of this directory (or `--force`) \
+                 establishes one"
+            );
+        }
+    }
+    Ok(head)
+}
+
+/// Fold however far HEAD moved — several commits, a rebase, a branch switch —
+/// as one delta. What matters is the file set between the two states.
+///
+/// Answers whether anything the plane holds actually changed, which is what
+/// decides if a re-vectorize is worth its provider call.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "digest")]
+fn fold_one_move(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    live: &mut dr_strange_llm::LivePlugins,
+    source: &str,
+    git: bool,
+    head: &str,
+    now: &str,
+) -> Result<bool> {
+    let delta = git_changes(dir, head, now)?;
+    let touches_code = !(delta.changed.is_empty() && delta.deleted.is_empty());
+    if !touches_code && !git {
+        return Ok(false);
+    }
+    // From memory unless the store changed since the last load.
+    let plugins = live.current()?;
+    // History first, and regardless of the delta: a commit is a fact about the
+    // repository even when it touched no file the code plane holds — an empty
+    // commit, or one that moved only something ignored, still moved a branch.
+    if git {
+        fold_history(db, dir, plane_name, plugins, "commit");
+    }
+    if !touches_code {
+        return Ok(false);
+    }
+    let host = dr_strange_llm::LocalFiles::new(dir)?;
+    let stats = dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, source, now)?;
+    tracing::info!(
+        commit = %&now[..12.min(now.len())],
+        changed = delta.changed.len(),
+        deleted = delta.deleted.len(),
+        nodes_loaded = stats.nodes_loaded,
+        nodes_patched = stats.nodes_patched,
+        nodes_deleted = stats.nodes_deleted,
+        edges_written = stats.edges_written,
+        edges_deleted = stats.edges_deleted,
+        edges_reattached = stats.edges_reattached,
+        edges_dropped = stats.edges_dropped,
+        prose_skipped_chars = stats.prose_chars,
+        "commit folded into the graph"
+    );
+    for note in &stats.notes {
+        tracing::info!(note, "sync note");
+    }
+    Ok(stats.nodes_loaded + stats.nodes_patched + stats.nodes_deleted > 0)
+}
+
+#[cfg(feature = "digest")]
 fn watch_loop(
     db: &Database,
     dir: &Path,
@@ -1318,27 +1475,7 @@ fn watch_loop(
     // (`_embedded_from` makes that pass incremental). No config, or a
     // provider that cannot be built (missing key), degrades to facts-only —
     // said once here, not per fold.
-    let embedder: Option<Box<dyn dr_strange_llm::Embedder>> = match &embed {
-        Some((provider, model, key_env)) => {
-            match dr_strange_llm::build_provider(
-                provider,
-                model.as_deref(),
-                None,
-                key_env.as_deref(),
-                true,
-            ) {
-                Ok(e) => Some(Box::new(e) as Box<dyn dr_strange_llm::Embedder>),
-                Err(e) => {
-                    tracing::warn!(
-                        error = format!("{e:#}"),
-                        "embed provider unavailable — folds will update facts only"
-                    );
-                    None
-                }
-            }
-        }
-        None => None,
-    };
+    let embedder = watch_embedder(embed.as_ref());
     let revectorize = |why: &str| {
         let Some(e) = embedder.as_deref() else {
             return;
@@ -1414,55 +1551,7 @@ fn watch_loop(
         );
         revectorize("--force rebuild");
     } else {
-        if db.plane(plane_name).is_err() {
-            db.create_plane(plane_name, Properties::new())?;
-            tracing::info!(plane = plane_name, "created plane");
-        }
-        // Where does the graph stand relative to the repository? The plane
-        // says which commit it reflects; the answer decides how to start.
-        let (rec_commit, rec_root) = recorded_sync_point(db, plane_name);
-        if let Some(r) = &rec_root
-            && *r != root
-        {
-            tracing::warn!(
-                plane_root = %r,
-                watch_root = %root,
-                "the plane was parsed from a different directory — file \
-                 attribution will not line up; `--force` (or a re-digest \
-                 from this directory) puts them on one basis"
-            );
-        }
-        match rec_commit {
-            Some(rec) if rec == head => {
-                tracing::info!(commit = %&rec[..12.min(rec.len())], "graph and repository are in sync");
-            }
-            Some(rec) if commit_known(dir, &rec) => {
-                tracing::info!(
-                    from = %&rec[..12.min(rec.len())],
-                    to = %&head[..12.min(head.len())],
-                    "graph is behind the repository — catching up"
-                );
-                // The ordinary fold covers the gap: start from the recorded
-                // commit and let the first poll diff it against HEAD.
-                head = rec;
-            }
-            Some(rec) => {
-                tracing::warn!(
-                    recorded = %&rec[..12.min(rec.len())],
-                    "the plane's sync point is unknown to this repository \
-                     (rewritten history, or another repo) — folding forward \
-                     from the current HEAD; `--force` re-establishes exact sync"
-                );
-            }
-            None => {
-                tracing::warn!(
-                    "the plane records no sync point, so graph and repository \
-                     cannot be compared — folding forward from the current \
-                     HEAD; a digest of this directory (or `--force`) \
-                     establishes one"
-                );
-            }
-        }
+        head = catch_up_from(db, dir, plane_name, &root, head)?;
     }
     // History, once, before serving: a plane bootstrapped by `drsg init` has
     // never seen a digest, so this is where it first gains one.
@@ -1487,6 +1576,35 @@ fn watch_loop(
         "watching repository — each commit folds into the graph, and \
          into the history plane on the next HEAD move"
     );
+    poll_commits(
+        db,
+        dir,
+        plane_name,
+        &mut live,
+        &source,
+        git,
+        head,
+        &revectorize,
+    )
+}
+
+/// Wake on every HEAD move and fold it, forever.
+///
+/// A fold that fails advances the in-memory cursor so polling continues, but
+/// leaves the recorded sync point behind — so a restart retries exactly the
+/// gap that failed rather than skipping it.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "digest")]
+fn poll_commits(
+    db: &Database,
+    dir: &Path,
+    plane_name: &str,
+    live: &mut dr_strange_llm::LivePlugins,
+    source: &str,
+    git: bool,
+    mut head: String,
+    revectorize: &dyn Fn(&str),
+) -> Result<()> {
     loop {
         std::thread::sleep(WATCH_POLL);
         let now = match git_head(dir) {
@@ -1499,49 +1617,7 @@ fn watch_loop(
         if now == head {
             continue;
         }
-        // One diff covers however far HEAD moved — several commits, a rebase,
-        // a branch switch. What matters is the file set between the states.
-        let step = (|| -> Result<bool> {
-            let delta = git_changes(dir, &head, &now)?;
-            let touches_code = !(delta.changed.is_empty() && delta.deleted.is_empty());
-            if !touches_code && !git {
-                return Ok(false);
-            }
-            // From memory unless the store changed since the last load.
-            let plugins = live.current()?;
-            // History first, and regardless of the delta: a commit is a fact
-            // about the repository even when it touched no file the code plane
-            // holds — an empty commit, or one that moved only something
-            // ignored, still moved a branch.
-            if git {
-                fold_history(db, dir, plane_name, plugins, "commit");
-            }
-            if !touches_code {
-                return Ok(false);
-            }
-            let host = dr_strange_llm::LocalFiles::new(dir)?;
-            let stats =
-                dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, &source, &now)?;
-            tracing::info!(
-                commit = %&now[..12.min(now.len())],
-                changed = delta.changed.len(),
-                deleted = delta.deleted.len(),
-                nodes_loaded = stats.nodes_loaded,
-                nodes_patched = stats.nodes_patched,
-                nodes_deleted = stats.nodes_deleted,
-                edges_written = stats.edges_written,
-                edges_deleted = stats.edges_deleted,
-                edges_reattached = stats.edges_reattached,
-                edges_dropped = stats.edges_dropped,
-                prose_skipped_chars = stats.prose_chars,
-                "commit folded into the graph"
-            );
-            for note in &stats.notes {
-                tracing::info!(note, "sync note");
-            }
-            Ok(stats.nodes_loaded + stats.nodes_patched + stats.nodes_deleted > 0)
-        })();
-        match step {
+        match fold_one_move(db, dir, plane_name, live, source, git, &head, &now) {
             Ok(changed) => {
                 // The plane now reflects `now`; say so durably, so the next
                 // start knows where to catch up from.
@@ -1556,8 +1632,6 @@ fn watch_loop(
                 db.save_sidecars();
             }
             Err(e) => {
-                // The in-memory cursor advances so polling continues, but the
-                // recorded point stays behind — a restart retries this gap.
                 tracing::warn!(
                     error = format!("{e:#}"),
                     from = %head, to = %now,
@@ -2660,6 +2734,75 @@ pub fn plugin_install(
 }
 
 #[cfg(feature = "digest")]
+/// The router routes each extension to exactly one handler, so an install that
+/// would create a second claimant is a decision, not a default: cancel, or
+/// remove the incumbent and continue.
+///
+/// Answers whether the install should proceed. Non-interactively there is
+/// nobody to ask, so it refuses with the remedy rather than picking one.
+fn resolve_extension_conflicts(
+    store: &dr_strange_llm::PluginStore,
+    manifest: &dr_strange_llm::Manifest,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    use std::io::IsTerminal;
+    let conflicts = extension_conflicts(store, &manifest.name, &manifest.extensions)?;
+    if conflicts.is_empty() {
+        return Ok(true);
+    }
+    let named = conflicts
+        .iter()
+        .map(|p| {
+            format!(
+                "{}@{} ({})",
+                p.name,
+                p.version,
+                p.extensions
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "{}@{} claims extensions already handled by {named} — remove \
+             the incumbent first (`drsg plugin remove <name>`) or run \
+             interactively to choose",
+            manifest.name,
+            manifest.version
+        );
+    }
+    writeln!(
+        out,
+        "{}@{} claims extensions already handled by {named}",
+        manifest.name, manifest.version
+    )?;
+    write!(
+        out,
+        "  c) cancel installation\n  r) remove and continue\nchoice [c/r]: "
+    )?;
+    out.flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    match line.trim() {
+        "r" | "R" => {
+            for p in &conflicts {
+                let removed = store.remove(&p.name)?;
+                writeln!(out, "removed {}@{}", removed.name, removed.version)?;
+            }
+            Ok(true)
+        }
+        _ => {
+            writeln!(out, "cancelled")?;
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(feature = "digest")]
 fn install_one(
     cfg: &dr_strange_llm::PluginConfig,
     allow_private: &[dr_strange_web::fetch::Prefix],
@@ -2695,58 +2838,8 @@ fn install_one(
         )?
         .manifest()
     };
-    let conflicts = extension_conflicts(&store, &manifest.name, &manifest.extensions)?;
-    if !conflicts.is_empty() {
-        use std::io::IsTerminal;
-        let named = conflicts
-            .iter()
-            .map(|p| {
-                format!(
-                    "{}@{} ({})",
-                    p.name,
-                    p.version,
-                    p.extensions
-                        .iter()
-                        .map(|e| format!(".{e}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        if !std::io::stdin().is_terminal() {
-            anyhow::bail!(
-                "{}@{} claims extensions already handled by {named} — remove \
-                 the incumbent first (`drsg plugin remove <name>`) or run \
-                 interactively to choose",
-                manifest.name,
-                manifest.version
-            );
-        }
-        writeln!(
-            out,
-            "{}@{} claims extensions already handled by {named}",
-            manifest.name, manifest.version
-        )?;
-        write!(
-            out,
-            "  c) cancel installation\n  r) remove and continue\nchoice [c/r]: "
-        )?;
-        out.flush()?;
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        match line.trim() {
-            "r" | "R" => {
-                for p in &conflicts {
-                    let removed = store.remove(&p.name)?;
-                    writeln!(out, "removed {}@{}", removed.name, removed.version)?;
-                }
-            }
-            _ => {
-                writeln!(out, "cancelled")?;
-                return Ok(());
-            }
-        }
+    if !resolve_extension_conflicts(&store, &manifest, out)? {
+        return Ok(());
     }
 
     let (entry, replaced) = store.install(&bytes, location)?;
@@ -3006,6 +3099,59 @@ fn read_source(
 /// provenance, and — only with `apply` — written through the bulk path.
 /// Dry-run by default (arch/07 §2: proposals, not mutations).
 #[cfg(feature = "digest")]
+/// Build the providers, extract from the prose, and fold the model's account
+/// into the parser's.
+///
+/// Reached only when there is prose left to read: constructing the chat client
+/// eagerly would defeat the §11 headline, since that is where a missing API
+/// key turns into an error.
+fn extract_with_model(
+    facts: dr_strange_llm::Preprocessed,
+    args: &DigestArgs,
+    p: &dr_strange_core::PlaneHandle<'_>,
+    source: String,
+    run_id: String,
+    mode: dr_strange_llm::DigestMode,
+) -> Result<dr_strange_llm::DigestResult> {
+    let chat = dr_strange_llm::build_provider(
+        args.chat_provider,
+        args.model,
+        args.chat_url,
+        args.chat_key_env,
+        false,
+    )?;
+    let embedder = dr_strange_llm::build_provider(
+        args.embed_provider,
+        args.embed_model,
+        args.embed_url,
+        args.embed_key_env,
+        args.embed,
+    )?;
+    let opts = dr_strange_llm::DigestOptions {
+        source,
+        model: chat.model().to_string(),
+        run_id,
+        chunk_chars: args.chunk_chars,
+        embed: args.embed,
+        concurrency: args.concurrency,
+        mode,
+        refine_max_entities: None,
+        refine_max_context: None,
+    };
+
+    let cands = dr_strange_llm::PlaneCandidates::new(p);
+    let plane_source = args
+        .link
+        .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+    // Grounded whether or not `--link` is on: without this the model is told
+    // the facts this very run parsed are new, and proposes a second `parse`
+    // beside the one the AST just established.
+    let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+    let extracted = dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+    Ok(dr_strange_llm::fold(facts, extracted))
+}
+
+#[cfg(feature = "digest")]
 pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3082,43 +3228,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
     // made. Building the chat client eagerly would defeat it, since that is
     // where a missing API key turns into an error.
     let result = if facts.needs_model() {
-        let chat = dr_strange_llm::build_provider(
-            args.chat_provider,
-            args.model,
-            args.chat_url,
-            args.chat_key_env,
-            false,
-        )?;
-        let embedder = dr_strange_llm::build_provider(
-            args.embed_provider,
-            args.embed_model,
-            args.embed_url,
-            args.embed_key_env,
-            args.embed,
-        )?;
-        let opts = dr_strange_llm::DigestOptions {
-            source,
-            model: chat.model().to_string(),
-            run_id,
-            chunk_chars: args.chunk_chars,
-            embed: args.embed,
-            concurrency: args.concurrency,
-            mode,
-            refine_max_entities: None,
-            refine_max_context: None,
-        };
-
-        let cands = dr_strange_llm::PlaneCandidates::new(&p);
-        let plane_source = args
-            .link
-            .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-        // Grounded whether or not `--link` is on: without this the model is
-        // told the facts this very run parsed are new, and proposes a second
-        // `parse` beside the one the AST just established.
-        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
-        let extracted =
-            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
-        dr_strange_llm::fold(facts, extracted)
+        extract_with_model(facts, args, &p, source, run_id, mode)?
     } else {
         writeln!(out, "no prose left to read — digested without a model call")?;
         dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
@@ -3139,46 +3249,7 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
         writeln!(out, "  note: {note}")?;
     }
 
-    if args.apply {
-        let mut txn = p.write()?;
-        let stats = result.apply(&p, &mut txn)?;
-        txn.commit()?;
-        writeln!(
-            out,
-            "applied: wrote {} nodes, {} edges",
-            stats.written.nodes, stats.written.edges
-        )?;
-        if !stats.skipped.is_empty() {
-            writeln!(
-                out,
-                "  {} entit{} already in the plane, left untouched: {}",
-                stats.skipped.len(),
-                if stats.skipped.len() == 1 { "y" } else { "ies" },
-                stats.skipped.join(", ")
-            )?;
-        }
-        // Only when something was actually embedded: a facts-only digest calls
-        // no provider at all, and pointing at an `embedding` property nothing
-        // wrote would send a reader to build an index over empty vectors.
-        if args.embed && r.embed_tokens > 0 {
-            writeln!(
-                out,
-                "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"
-            )?;
-        }
-        // A directory inside a git repository gets its sync point stamped, so
-        // `serve watch` can later say whether the graph is current and catch
-        // up from exactly here.
-        if std::fs::metadata(args.source)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            record_sync_point(db, args.plane, Path::new(args.source))?;
-        }
-        // What this ingest could and could not read, kept where a later reader
-        // will be: a miss in the graph is ambiguous until this says otherwise.
-        dr_strange_llm::record_ledger(db, args.plane, &ingest_account, &ran_plugins)?;
-    } else {
+    if !args.apply {
         for n in result.nodes.iter().take(12) {
             writeln!(out, "  [{}] {} ({} props)", n.label, n.key, n.props.len())?;
         }
@@ -3186,7 +3257,62 @@ pub fn digest(db: &Database, args: &DigestArgs, out: &mut dyn Write) -> Result<(
             writeln!(out, "  … and {} more", result.nodes.len() - 12)?;
         }
         writeln!(out, "dry run — re-run with --apply to write")?;
+        return Ok(());
     }
+    apply_digest(db, args, &p, result, &ingest_account, &ran_plugins, out)
+}
+
+/// Write the proposal, and record what this ingest could and could not read.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "digest")]
+fn apply_digest(
+    db: &Database,
+    args: &DigestArgs,
+    p: &dr_strange_core::PlaneHandle<'_>,
+    result: dr_strange_llm::DigestResult,
+    ingest_account: &dr_strange_llm::preprocess::PreprocessReport,
+    ran_plugins: &[dr_strange_llm::Manifest],
+    out: &mut dyn Write,
+) -> Result<()> {
+    let embed_tokens = result.report.embed_tokens;
+    let mut txn = p.write()?;
+    let stats = result.apply(p, &mut txn)?;
+    txn.commit()?;
+    writeln!(
+        out,
+        "applied: wrote {} nodes, {} edges",
+        stats.written.nodes, stats.written.edges
+    )?;
+    if !stats.skipped.is_empty() {
+        writeln!(
+            out,
+            "  {} entit{} already in the plane, left untouched: {}",
+            stats.skipped.len(),
+            if stats.skipped.len() == 1 { "y" } else { "ies" },
+            stats.skipped.join(", ")
+        )?;
+    }
+    // Only when something was actually embedded: a facts-only digest calls no
+    // provider at all, and pointing at an `embedding` property nothing wrote
+    // would send a reader to build an index over empty vectors.
+    if args.embed && embed_tokens > 0 {
+        writeln!(
+            out,
+            "  embeddings stored as `embedding`; `drsg index ensure <label> embedding` for indexed search"
+        )?;
+    }
+    // A directory inside a git repository gets its sync point stamped, so
+    // `serve watch` can later say whether the graph is current and catch up
+    // from exactly here.
+    if std::fs::metadata(args.source)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        record_sync_point(db, args.plane, Path::new(args.source))?;
+    }
+    // What this ingest could and could not read, kept where a later reader
+    // will be: a miss in the graph is ambiguous until this says otherwise.
+    dr_strange_llm::record_ledger(db, args.plane, ingest_account, ran_plugins)?;
     Ok(())
 }
 
@@ -3331,22 +3457,26 @@ pub enum OnConflict {
 /// remapping the exported numeric `id` to the node's freshly-assigned one —
 /// and edges are bulk-written. Endpoints must resolve within this batch or
 /// already exist in the plane; keys are assumed fresh (as bulk load requires).
-pub fn import(
-    db: &Database,
-    plane_name: &str,
-    reader: impl BufRead,
-    on_conflict: OnConflict,
-    out: &mut dyn Write,
-) -> Result<()> {
-    let p = plane(db, plane_name)?;
+/// One JSONL import, buffered whole: `bulk_load` needs the batch up front, and
+/// a node's id is only known after the load, so the edges wait for it.
+struct Batch {
+    old_ids: Vec<Option<u64>>,
+    keys: Vec<Option<String>>,
+    labels: Vec<Vec<String>>,
+    node_props: Vec<Properties>,
+    edges: Vec<(Ref, Ref, String, Properties)>,
+}
 
-    // Buffer the whole file (bulk load needs the batch up front).
-    let mut old_ids: Vec<Option<u64>> = Vec::new();
-    let mut keys: Vec<Option<String>> = Vec::new();
-    let mut labels: Vec<Vec<String>> = Vec::new();
-    let mut node_props: Vec<Properties> = Vec::new();
-    let mut edges: Vec<(Ref, Ref, String, Properties)> = Vec::new();
-
+/// Read the file into that batch. A line carrying `type` is an edge; anything
+/// else is a node.
+fn read_jsonl(reader: impl BufRead) -> Result<Batch> {
+    let mut b = Batch {
+        old_ids: Vec::new(),
+        keys: Vec::new(),
+        labels: Vec::new(),
+        node_props: Vec::new(),
+        edges: Vec::new(),
+    };
     for (lineno, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -3367,15 +3497,15 @@ pub fn import(
                 .and_then(|t| t.as_str())
                 .with_context(|| format!("{}: edge missing `type`", ctx()))?
                 .to_string();
-            edges.push((src, dst, ty, edge_props(obj)?));
+            b.edges.push((src, dst, ty, edge_props(obj)?));
         } else {
-            old_ids.push(obj.get("id").and_then(Value::as_u64));
-            keys.push(
+            b.old_ids.push(obj.get("id").and_then(Value::as_u64));
+            b.keys.push(
                 obj.get("external_key")
                     .and_then(|k| k.as_str())
                     .map(str::to_string),
             );
-            labels.push(
+            b.labels.push(
                 obj.get("labels")
                     .and_then(|l| l.as_array())
                     .map(|a| {
@@ -3385,9 +3515,56 @@ pub fn import(
                     })
                     .unwrap_or_default(),
             );
-            node_props.push(edge_props(obj)?);
+            b.node_props.push(edge_props(obj)?);
         }
     }
+    Ok(b)
+}
+
+/// The `--on-conflict error` refusal: nothing is written, and the message
+/// names a few of the colliding keys rather than all of them — a doubled file
+/// collides on every line, and a thousand-key error helps nobody.
+fn refuse_conflicts(
+    keys: &[Option<String>],
+    conflicted: &ahash::AHashMap<usize, NodeId>,
+    plane_name: &str,
+) -> Result<()> {
+    let mut names: Vec<&str> = conflicted
+        .keys()
+        .filter_map(|&i| keys[i].as_deref())
+        .collect();
+    names.sort_unstable();
+    let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    let more = names.len().saturating_sub(5);
+    let tail = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    bail!(
+        "{} external key(s) already exist in plane `{plane_name}`: {shown}{tail}. \
+         Nothing was imported — re-run with `--on-conflict skip` to keep the \
+         existing nodes, or `--on-conflict update` to overwrite them.",
+        names.len()
+    );
+}
+
+pub fn import(
+    db: &Database,
+    plane_name: &str,
+    reader: impl BufRead,
+    on_conflict: OnConflict,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let p = plane(db, plane_name)?;
+
+    let Batch {
+        old_ids,
+        keys,
+        labels,
+        mut node_props,
+        edges,
+    } = read_jsonl(reader)?;
 
     let mut txn = p.write()?;
 
@@ -3402,26 +3579,7 @@ pub fn import(
         }
     }
     if on_conflict == OnConflict::Error && !conflicted.is_empty() {
-        // Name a few rather than all: a doubled file collides on every line,
-        // and a thousand-key error message helps nobody.
-        let mut names: Vec<&str> = conflicted
-            .keys()
-            .filter_map(|&i| keys[i].as_deref())
-            .collect();
-        names.sort_unstable();
-        let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
-        let more = names.len().saturating_sub(5);
-        let tail = if more > 0 {
-            format!(" (and {more} more)")
-        } else {
-            String::new()
-        };
-        bail!(
-            "{} external key(s) already exist in plane `{plane_name}`: {shown}{tail}. \
-             Nothing was imported — re-run with `--on-conflict skip` to keep the \
-             existing nodes, or `--on-conflict update` to overwrite them.",
-            names.len()
-        );
+        refuse_conflicts(&keys, &conflicted, plane_name)?;
     }
 
     // Node phase (fast path): one batch, contiguous ids. Conflicting lines are

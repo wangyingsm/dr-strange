@@ -268,24 +268,13 @@ fn parse_vector(s: &str) -> Vec<f32> {
 }
 
 /// One full measurement pass: fresh database, load, then every query set.
-fn run_pass(data: &Path, db_path: &Path, k: u64) -> Result<Vec<OpResult>> {
-    let engine = "dr-strange".to_string();
-    let mut results: Vec<OpResult> = Vec::new();
-
-    // Fresh database each run. The native backend's db is a directory
-    // (WAL + SSTs), legacy redb's a single file — clear either shape.
-    let _ = fs::remove_file(db_path);
-    let _ = fs::remove_dir_all(db_path);
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let db = Database::open(db_path)?;
-
-    // ---- load nodes + edges via the bulk fast path (one write txn) --------
-    // Every comparator loads through a bulk path (Kùzu COPY / SQLite
-    // executemany / Neo4j UNWIND), so drsg's `bulk_load` is the apples-to-
-    // apples loader. Timed as one "load" (nodes+edges), parsing included to
-    // match how SQLite's timed executemany parses its rows lazily.
+/// Nodes and edges through the bulk fast path, in one write transaction.
+///
+/// Every comparator loads through a bulk path (Kùzu COPY / SQLite executemany
+/// / Neo4j UNWIND), so drsg's `bulk_load` is the apples-to-apples loader.
+/// Timed as one "load" (nodes+edges), parsing included, to match how SQLite's
+/// timed executemany parses its rows lazily.
+fn time_bulk_load(db: &Database, data: &Path, engine: &str) -> Result<OpResult> {
     let node_lines = read_lines(&data.join("nodes.csv"))?;
     let edge_lines = read_lines(&data.join("edges.csv"))?;
     let n_nodes = (node_lines.len() - 1) as u64; // minus header
@@ -347,12 +336,28 @@ fn run_pass(data: &Path, db_path: &Path, k: u64) -> Result<Vec<OpResult>> {
         txn.commit()?;
     }
     let load_ms = t.elapsed().as_secs_f64() * 1000.0;
-    results.push(throughput_result(
-        &engine,
+    Ok(throughput_result(
+        engine,
         "load",
         n_nodes + n_edges,
         load_ms,
-    ));
+    ))
+}
+
+fn run_pass(data: &Path, db_path: &Path, k: u64) -> Result<Vec<OpResult>> {
+    let engine = "dr-strange".to_string();
+    let mut results: Vec<OpResult> = Vec::new();
+
+    // Fresh database each run. The native backend's db is a directory
+    // (WAL + SSTs), legacy redb's a single file — clear either shape.
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(db_path);
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let db = Database::open(db_path)?;
+
+    results.push(time_bulk_load(&db, data, &engine)?);
 
     // ---- point lookup by external key -------------------------------------
     let lookup_keys = read_lines(&data.join("queries/lookup_keys.txt"))?;

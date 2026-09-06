@@ -928,35 +928,18 @@ fn grep_tree(
         ".codebase-memory",
     ];
     const MAX_FILE: u64 = 2 * 1024 * 1024;
-    const MAX_LINE: usize = 300;
-    // Constructs that are near-certainly a reach for a pattern language this
-    // search does not have. `(`, `[` and a lone `.` are deliberately absent:
-    // they are ordinary in a literal code search (`TrimPrefix(`), and a hint
-    // that cries wolf is a hint that gets read past.
-    const REGEX_TELLS: &[&str] = &["|", ".*", ".+", r"\d", r"\w", r"\s", r"\b"];
-    let cap = req.max_results.unwrap_or(50).clamp(1, 200);
-    let around = req.context.unwrap_or(0).min(10);
     let matcher = Matcher::new(req)?;
     let filter = req.path.as_deref();
-
-    // One line as `grep` prints it: trimmed, and cut at a width past which a
-    // minified or generated line says nothing more.
-    let clip = |line: &str| -> String {
-        let mut shown = line.trim_end();
-        if shown.len() > MAX_LINE {
-            let mut end = MAX_LINE;
-            while !shown.is_char_boundary(end) {
-                end -= 1;
-            }
-            shown = &shown[..end];
-        }
-        shown.to_string()
+    let mut g = GrepOut {
+        out: String::new(),
+        hits: 0,
+        cap: req.max_results.unwrap_or(50).clamp(1, 200),
+        around: req.context.unwrap_or(0).min(10),
+        capped: false,
+        named_any: false,
+        symbols,
     };
 
-    let mut out = String::new();
-    let mut hits = 0usize;
-    let mut capped = false;
-    let mut named_any = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -993,89 +976,270 @@ fn grep_tree(
             }
             let text = String::from_utf8_lossy(&bytes);
             let lines: Vec<&str> = text.lines().collect();
-
-            // Hits first, then the printing, so context around one hit never
-            // repeats a line another hit already showed.
-            let mut matched: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                if !matcher.is_match(line) {
-                    continue;
-                }
-                if hits == cap {
-                    capped = true;
-                    break;
-                }
-                matched.push(i);
-                hits += 1;
-            }
-            let mut printed_through: Option<usize> = None; // last line index shown
-            let mut last_symbol: Option<&str> = None;
-            for &i in &matched {
-                let start = i.saturating_sub(around);
-                let end = (i + around).min(lines.len().saturating_sub(1));
-                let from = match printed_through {
-                    Some(p) if p + 1 >= start => p + 1,
-                    Some(_) => {
-                        // A gap between context groups, as `rg -C` marks it;
-                        // plain hits are one line each and need no marker.
-                        if around > 0 {
-                            out.push_str("--\n");
-                        }
-                        start
-                    }
-                    None => start,
-                };
-                for (j, line) in lines.iter().enumerate().take(end + 1).skip(from) {
-                    let sep = if j == i { ':' } else { '-' };
-                    out.push_str(&format!("{rel}:{}{sep} {}\n", j + 1, clip(line)));
-                    if j == i
-                        && let Some(key) = symbols.and_then(|s| s.enclosing(&rel, i + 1))
-                        && last_symbol != Some(key)
-                    {
-                        out.push_str(&format!("    in {key}\n"));
-                        last_symbol = Some(key);
-                        named_any = true;
-                    }
-                }
-                printed_through = Some(end.max(printed_through.unwrap_or(0)));
-            }
-            if capped {
+            g.file(&rel, &lines, &matcher);
+            if g.capped {
                 break;
             }
         }
-        if capped {
+        if g.capped {
             break;
         }
     }
-    if hits == 0 {
-        out.push_str("no matches\n");
-        if let Some(f) = filter {
-            out.push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+    Ok(g.finish(req))
+}
+
+/// The model half of a digest: build the providers, extract, and fold the
+/// model's account into the parser's.
+///
+/// Provider keys come from the server's environment, never from tool
+/// parameters — `key_env` names the variable, it does not carry the key.
+#[allow(clippy::too_many_arguments)]
+fn run_digest(
+    facts: dr_strange_llm::Preprocessed,
+    req: &Digest,
+    tuning: &DigestTuning,
+    p: &dr_strange_core::PlaneHandle<'_>,
+    source: String,
+    run_id: String,
+    mode: dr_strange_llm::DigestMode,
+) -> AnyResult<dr_strange_llm::DigestResult> {
+    let chat_provider = req.chat.as_deref().unwrap_or("openai");
+    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let embed = !req.no_embed;
+
+    let chat = dr_strange_llm::build_provider(
+        chat_provider,
+        req.model.as_deref(),
+        None,
+        req.key_env.as_deref(),
+        false,
+    )?;
+    let embedder = dr_strange_llm::build_provider(
+        embed_provider,
+        req.embed_model.as_deref(),
+        None,
+        req.embed_key_env.as_deref(),
+        embed,
+    )?;
+    let opts = dr_strange_llm::DigestOptions {
+        source,
+        model: chat.model().to_string(),
+        run_id,
+        chunk_chars: tuning.chunk_chars,
+        embed,
+        concurrency: tuning.concurrency,
+        mode,
+        refine_max_entities: None,
+        refine_max_context: None,
+    };
+
+    let cands = dr_strange_llm::PlaneCandidates::new(p);
+    let plane_source = req
+        .link
+        .unwrap_or(true)
+        .then_some(&cands as &dyn dr_strange_llm::CandidateSource);
+    // Grounded whether or not `link` is on: without this the model is told the
+    // facts this very run parsed are new, and proposes a duplicate of what the
+    // parser just established.
+    let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
+    let extracted = dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
+    Ok(dr_strange_llm::fold(facts, extracted))
+}
+
+/// What a digest is being asked to read, resolved before anything expensive:
+/// a refused `path` should cost no provider call.
+///
+/// Returns the facts and the plugin builds that produced them — a text digest
+/// loads no plugins and records none.
+fn resolve_input(
+    req: &Digest,
+    local_files: bool,
+) -> AnyResult<(dr_strange_llm::Preprocessed, Vec<dr_strange_llm::Manifest>)> {
+    // Built only on the branch that routes: a text digest never needs the
+    // plugin store, and must not fail because something in it is broken.
+    let load_plugins = || -> AnyResult<dr_strange_llm::Plugins> {
+        let mut options = std::collections::BTreeMap::new();
+        if req.plugin_source.unwrap_or(false) {
+            options.insert(
+                "rust".to_string(),
+                vec![("include_source".to_string(), "true".to_string())],
+            );
         }
-        // A regex-shaped pattern sent to a literal search fails exactly like a
-        // real absence: both say "no matches". That silence is what turns a
-        // mis-typed pattern into "I checked, it isn't there" in someone's
-        // conclusion. Only when `regex` was not asked for — having asked, an
-        // empty result means what it says.
-        if !req.regex.unwrap_or(false)
-            && let Some(tell) = REGEX_TELLS.iter().find(|t| req.pattern.contains(**t))
-        {
-            out.push_str(&format!(
-                "note: search text contains a regexp pattern ({tell}). it seems to be a pattern match \
-                 but `regex` flag argument set to false. you can retry this search with `regex` flag set to true.\n"
+        dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
+            options,
+            ..Default::default()
+        })
+    };
+    let handler = req.handler.as_deref();
+    let mut ran_plugins: Vec<dr_strange_llm::Manifest> = Vec::new();
+
+    let facts = match &req.path {
+        // Text sent over the wire stays prose, deliberately. Preprocessing is
+        // for reading a checkout the agent already has — it is worth its cost
+        // when a plugin can pull the files around the one it was handed, and
+        // that pull is exactly what a shared server must not offer. Routing it
+        // here would hand every caller a handler whose only reachable input is
+        // the server's own filesystem.
+        None => dr_strange_llm::Preprocessed::prose_only("text", req.text.clone()),
+        Some(_) if !local_files => anyhow::bail!(
+            "this server does not read local files — send the document as `text`. \
+             (`path` is honoured only by the stdio server, which runs on your own machine.)"
+        ),
+        Some(path) => {
+            let p = std::path::Path::new(path);
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            // A directory is a legal source since ROADMAP §11: the preprocessor
+            // pulls what it needs, so "digest this project" needs no file list.
+            if p.is_dir() {
+                let host = dr_strange_llm::LocalFiles::new(p)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
+                ran_plugins = plugins.manifests();
+                dr_strange_llm::route_tree(&host, handler, &plugins)?
+            } else {
+                let bytes =
+                    std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let host = dr_strange_llm::LocalFiles::new(
+                    p.parent().unwrap_or(std::path::Path::new(".")),
+                )
+                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let plugins = load_plugins()?;
+                ran_plugins = plugins.manifests();
+                dr_strange_llm::route_document(&name, &bytes, handler, &host, &plugins)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            }
+        }
+    };
+    if facts.nodes.is_empty() && !facts.needs_model() {
+        anyhow::bail!("nothing to digest — give `text`, or `path` on a stdio server");
+    }
+    Ok((facts, ran_plugins))
+}
+
+/// One `grep` run's accumulating output, and the bounds it reports hitting.
+struct GrepOut<'a> {
+    out: String,
+    hits: usize,
+    cap: usize,
+    /// Lines of surrounding source per hit.
+    around: usize,
+    capped: bool,
+    /// Whether any hit was placed in a symbol — the footer only earns its
+    /// line if at least one was.
+    named_any: bool,
+    symbols: Option<&'a SymbolIndex>,
+}
+
+impl GrepOut<'_> {
+    /// One file's matches, printed with their context.
+    ///
+    /// Hits are collected first and printed after, so the context around one
+    /// hit never repeats a line another hit already showed.
+    fn file(&mut self, rel: &str, lines: &[&str], matcher: &Matcher) {
+        let mut matched: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !matcher.is_match(line) {
+                continue;
+            }
+            if self.hits == self.cap {
+                self.capped = true;
+                break;
+            }
+            matched.push(i);
+            self.hits += 1;
+        }
+        let mut printed_through: Option<usize> = None; // last line index shown
+        let mut last_symbol: Option<&str> = None;
+        for &i in &matched {
+            let start = i.saturating_sub(self.around);
+            let end = (i + self.around).min(lines.len().saturating_sub(1));
+            let from = match printed_through {
+                Some(p) if p + 1 >= start => p + 1,
+                Some(_) => {
+                    // A gap between context groups, as `rg -C` marks it; plain
+                    // hits are one line each and need no marker.
+                    if self.around > 0 {
+                        self.out.push_str("--\n");
+                    }
+                    start
+                }
+                None => start,
+            };
+            for (j, line) in lines.iter().enumerate().take(end + 1).skip(from) {
+                let sep = if j == i { ':' } else { '-' };
+                self.out
+                    .push_str(&format!("{rel}:{}{sep} {}\n", j + 1, clip(line)));
+                if j == i
+                    && let Some(key) = self.symbols.and_then(|s| s.enclosing(rel, i + 1))
+                    && last_symbol != Some(key)
+                {
+                    self.out.push_str(&format!("    in {key}\n"));
+                    last_symbol = Some(key);
+                    self.named_any = true;
+                }
+            }
+            printed_through = Some(end.max(printed_through.unwrap_or(0)));
+        }
+    }
+
+    /// The honesty footer: what was not searched, what was cut, and the call
+    /// to make next.
+    fn finish(mut self, req: &GrepReq) -> String {
+        // Constructs that are near-certainly a reach for a pattern language this
+        // search does not have. `(`, `[` and a lone `.` are deliberately absent:
+        // they are ordinary in a literal code search (`TrimPrefix(`), and a hint
+        // that cries wolf is a hint that gets read past.
+        const REGEX_TELLS: &[&str] = &["|", ".*", ".+", r"\d", r"\w", r"\s", r"\b"];
+        if self.hits == 0 {
+            self.out.push_str("no matches\n");
+            if let Some(f) = req.path.as_deref() {
+                self.out
+                    .push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+            }
+            // A regex-shaped pattern sent to a literal search fails exactly like a
+            // real absence: both say "no matches". That silence is what turns a
+            // mis-typed pattern into "I checked, it isn't there" in someone's
+            // conclusion. Only when `regex` was not asked for — having asked, an
+            // empty result means what it says.
+            if !req.regex.unwrap_or(false)
+                && let Some(tell) = REGEX_TELLS.iter().find(|t| req.pattern.contains(**t))
+            {
+                self.out.push_str(&format!(
+                    "note: search text contains a regexp pattern ({tell}). it seems to be a pattern match \
+                     but `regex` flag argument set to false. you can retry this search with `regex` flag set to true.\n"
+                ));
+            }
+        } else if self.capped {
+            let cap = self.cap;
+            self.out.push_str(&format!(
+                "… capped at {cap} matches — narrow the pattern (or `path`) or raise max_results\n"
             ));
         }
-    } else if capped {
-        out.push_str(&format!(
-            "… capped at {cap} matches — narrow the pattern (or `path`) or raise max_results\n"
-        ));
+        if self.named_any {
+            self.out.push_str(
+                "context <key> expands any symbol named above; snippet <key> shows its source\n",
+            );
+        }
+        self.out
     }
-    if named_any {
-        out.push_str(
-            "context <key> expands any symbol named above; snippet <key> shows its source\n",
-        );
+}
+
+/// One line as `grep` prints it: trimmed, and cut at a width past which a
+/// minified or generated line says nothing more.
+fn clip(line: &str) -> String {
+    const MAX_LINE: usize = 300;
+    let mut shown = line.trim_end();
+    if shown.len() > MAX_LINE {
+        let mut end = MAX_LINE;
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        shown = &shown[..end];
     }
-    Ok(out)
+    shown.to_string()
 }
 
 fn compact_logic(
@@ -1596,76 +1760,7 @@ fn digest_logic(
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Which plugin builds ran, filled by whichever routing branch loaded them
-    // — a text digest loads none, and records none.
-    let mut ran_plugins: Vec<dr_strange_llm::Manifest> = Vec::new();
-    // Built only on the branch that routes: a text digest never needs the
-    // plugin store, and must not fail because something in it is broken.
-    let load_plugins = || -> AnyResult<dr_strange_llm::Plugins> {
-        let mut options = std::collections::BTreeMap::new();
-        if req.plugin_source.unwrap_or(false) {
-            options.insert(
-                "rust".to_string(),
-                vec![("include_source".to_string(), "true".to_string())],
-            );
-        }
-        dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig {
-            options,
-            ..Default::default()
-        })
-    };
-    let handler = req.handler.as_deref();
-
-    // Resolve the input before anything else: a refused `path` should cost
-    // no provider call.
-    let mut facts = match &req.path {
-        // Text sent over the wire stays prose, deliberately. Preprocessing is
-        // for reading a checkout the agent already has — it is worth its cost
-        // when a plugin can pull the files around the one it was handed, and
-        // that pull is exactly what a shared server must not offer. Routing it
-        // here would hand every caller a handler whose only reachable input is
-        // the server's own filesystem.
-        None => dr_strange_llm::Preprocessed::prose_only("text", req.text.clone()),
-        Some(_) if !local_files => anyhow::bail!(
-            "this server does not read local files — send the document as `text`. \
-             (`path` is honoured only by the stdio server, which runs on your own machine.)"
-        ),
-        Some(path) => {
-            let p = std::path::Path::new(path);
-            let name = p
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            // A directory is a legal source since ROADMAP §11: the preprocessor
-            // pulls what it needs, so "digest this project" needs no file list.
-            if p.is_dir() {
-                let host = dr_strange_llm::LocalFiles::new(p)
-                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-                let plugins = load_plugins()?;
-                ran_plugins = plugins.manifests();
-                dr_strange_llm::route_tree(&host, handler, &plugins)?
-            } else {
-                let bytes =
-                    std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-                let host = dr_strange_llm::LocalFiles::new(
-                    p.parent().unwrap_or(std::path::Path::new(".")),
-                )
-                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-                let plugins = load_plugins()?;
-                ran_plugins = plugins.manifests();
-                dr_strange_llm::route_document(&name, &bytes, handler, &host, &plugins)
-                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
-            }
-        }
-    };
-    if facts.nodes.is_empty() && !facts.needs_model() {
-        anyhow::bail!("nothing to digest — give `text`, or `path` on a stdio server");
-    }
-
-    let chat_provider = req.chat.as_deref().unwrap_or("openai");
-    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
-    let embed = !req.no_embed;
-    let link = req.link.unwrap_or(true);
+    let (mut facts, ran_plugins) = resolve_input(&req, local_files)?;
 
     // Parsed before anything expensive: a typo should not cost a provider call.
     let mode = match req.mode.as_deref() {
@@ -1682,7 +1777,7 @@ fn digest_logic(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let source = req.source.unwrap_or_else(|| "mcp-digest".into());
+    let source = req.source.clone().unwrap_or_else(|| "mcp-digest".into());
     dr_strange_llm::stamp_run(&mut facts, &source, &run_id);
 
     // Kept before `fold` merges the parser's account into the digest's: the
@@ -1694,43 +1789,7 @@ fn digest_logic(
     // model call at all** — no provider constructed, no key read from the
     // environment, no request made.
     let result = if facts.needs_model() {
-        // Provider keys come from the server's environment (never tool params) —
-        // `key_env` names the variable, it does not carry the key.
-        let chat = dr_strange_llm::build_provider(
-            chat_provider,
-            req.model.as_deref(),
-            None,
-            req.key_env.as_deref(),
-            false,
-        )?;
-        let embedder = dr_strange_llm::build_provider(
-            embed_provider,
-            req.embed_model.as_deref(),
-            None,
-            req.embed_key_env.as_deref(),
-            embed,
-        )?;
-        let opts = dr_strange_llm::DigestOptions {
-            source,
-            model: chat.model().to_string(),
-            run_id,
-            chunk_chars: tuning.chunk_chars,
-            embed,
-            concurrency: tuning.concurrency,
-            mode,
-            refine_max_entities: None,
-            refine_max_context: None,
-        };
-
-        let cands = dr_strange_llm::PlaneCandidates::new(&p);
-        let plane_source = link.then_some(&cands as &dyn dr_strange_llm::CandidateSource);
-        // Grounded whether or not `link` is on: without this the model is told
-        // the facts this very run parsed are new, and proposes a duplicate of
-        // what the parser just established.
-        let grounded = dr_strange_llm::FactsAndPlane::new(&facts, plane_source);
-        let extracted =
-            dr_strange_llm::digest(&facts.prose, &chat, &embedder, Some(&grounded), &opts)?;
-        dr_strange_llm::fold(facts, extracted)
+        run_digest(facts, &req, &tuning, &p, source, run_id, mode)?
     } else {
         dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
     };

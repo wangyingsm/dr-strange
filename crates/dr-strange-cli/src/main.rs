@@ -18,7 +18,7 @@ mod update;
 
 use std::io::{self, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -777,8 +777,25 @@ fn as_text(v: &serde_json::Value) -> String {
     }
 }
 
+/// The command surface, dispatched in groups.
+///
+/// One `match` over thirty-odd variants is a body nobody re-reads before
+/// changing it, so the arms are grouped by what they are for and each group
+/// hands what it does not recognise to the next. The chain is exhaustive by
+/// construction: the last group has no `other` arm to fall through.
 fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
-    match cli.command {
+    let db = cli.db.clone();
+    run_bootstrap(cli.command, &db, cfg, out)
+}
+
+/// Bootstrapping a repository, plane lifecycle, and data in and out.
+fn run_bootstrap(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         #[cfg(feature = "digest")]
         Command::Init {
             dir,
@@ -797,7 +814,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             // and a promise it cannot keep would be worse than silence.
             let plugin_config = config::plugin_config(cfg)?;
             commands::init_bootstrap(
-                &cli.db,
+                db_path,
                 dir,
                 plane,
                 addr,
@@ -808,9 +825,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             )
         }
         #[cfg(not(feature = "digest"))]
-        Command::Init => commands::init(&cli.db, out),
+        Command::Init => commands::init(db_path, out),
         Command::Plane(cmd) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             match cmd {
                 PlaneCmd::List => commands::plane_list(&db, out),
                 PlaneCmd::Create { name } => commands::plane_create(&db, &name, out),
@@ -823,20 +840,32 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             on_conflict,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let reader = BufReader::new(std::fs::File::open(&file)?);
             commands::import(&db, &plane, reader, on_conflict, out)
         }
         Command::Export { plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::export(&db, &plane, out)
         }
         Command::Get { node, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::get(&db, &plane, &node, out)
         }
+        other => run_query(other, db_path, cfg, out),
+    }
+}
+
+/// Running a query, and the record of what has run.
+fn run_query(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Query { plan, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let plan = if plan == "-" {
                 io::read_to_string(io::stdin())?
             } else {
@@ -851,7 +880,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             param,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             // A saved query brings its own plane with it: it was written
             // against one, and re-running it against `startup` would be
             // running a different query. An explicit `--plane` still wins.
@@ -875,11 +904,24 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
         }
         Command::Queries { id, limit } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::queries(&db, id, limit, out)
         }
+        other => run_agent_verbs(other, db_path, cfg, out),
+    }
+}
+
+/// The agent verbs over a digested code plane (chapter 10's eight),
+/// answering about symbols rather than about rows.
+fn run_agent_verbs(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Context { name, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::context, out)
         }
         #[cfg(feature = "digest")]
@@ -890,7 +932,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed_model,
             k,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let embedder =
                 dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
             write!(
@@ -906,17 +948,17 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
              rebuild with default features"
         ),
         Command::Describe { name, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)
         }
         Command::Trace { from, to, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let p = db.plane(&plane)?;
             write!(out, "{}", dr_strange_core::compact::trace(&p, &from, &to)?)?;
             Ok(())
         }
         Command::Impact { name, plane, depth } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let p = db.plane(&plane)?;
             write!(
                 out,
@@ -928,13 +970,28 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         // `snippet`, `grep` and `traverse` are the MCP surface's, called here
         // rather than reimplemented: two copies of a reader's verb would
         // answer differently the first time one of them was fixed.
+        other => run_tree_verbs(other, db_path, cfg, out),
+    }
+}
+
+/// The verbs that read the source tree a plane was parsed from, rather
+/// than the graph alone. Called into the MCP surface rather than
+/// reimplemented: two copies of a reader's verb would answer differently
+/// the first time one of them was fixed.
+fn run_tree_verbs(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Snippet {
             name,
             plane,
             lines,
             root,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             // `--root` is only the fallback: a plane that records the tree it
             // was parsed from already knows better.
             let rendered = dr_strange_mcp::snippet_logic(
@@ -955,7 +1012,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             max_results,
             root,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             // The tree a plane was parsed from is the one to search; `--root`
             // overrides, and the cwd is the last resort.
             let root = match root {
@@ -986,7 +1043,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             min,
             max,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let plane_name = plane.clone();
             let rendered = dr_strange_mcp::traverse_logic(
                 &db,
@@ -1015,7 +1072,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Command::Fathom { name, plane, depth } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let p = db.plane(&plane)?;
             write!(
                 out,
@@ -1025,15 +1082,27 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Command::History { plane, limit } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::history(&db, &plane, limit, out)
         }
+        other => run_analytics(other, db_path, cfg, out),
+    }
+}
+
+/// The soft schema, the graph algorithms, and the retrieval surface.
+fn run_analytics(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Catalog { plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::catalog(&db, plane.as_deref(), out)
         }
         Command::Algo(cmd) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             match cmd {
                 AlgoCmd::Pagerank {
                     plane,
@@ -1075,6 +1144,18 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 }
             }
         }
+        other => run_retrieval(other, db_path, cfg, out),
+    }
+}
+
+/// Fused retrieval and the indexes that make it possible.
+fn run_retrieval(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Hybrid {
             query,
             plane,
@@ -1088,7 +1169,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             embed_model,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::hybrid(
                 &db,
                 &plane,
@@ -1110,7 +1191,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             metric,
         }) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             match second {
                 Some(property) => {
                     commands::index_ensure(&db, &plane, &first, &property, metric.into(), out)
@@ -1124,7 +1205,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             lang,
         }) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let language = lang.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             match second {
                 Some(property) => {
@@ -1133,22 +1214,47 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 None => commands::keyword_index_ensure_all(&db, &plane, &first, language, out),
             }
         }
+        other => run_maintenance(other, db_path, cfg, out),
+    }
+}
+
+/// Counting, checking, backing up and updating — the operator's verbs.
+fn run_maintenance(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Stats => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::stats(&db, out)
         }
         Command::Check => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::check(&db, out)
         }
         Command::Snapshot { out: path } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::snapshot(&db, &path, out)
         }
         Command::Restore { input } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::restore(&db, &input, out)
         }
+        other => run_services(other, db_path, cfg, out),
+    }
+}
+
+/// The long-running and model-backed commands: the server, embedding,
+/// natural language, plugins, and ingestion.
+fn run_services(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         Command::Serve {
             addr,
             mode,
@@ -1164,16 +1270,16 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                     token: follow_token.or_else(|| std::env::var("DRSG_FOLLOW_TOKEN").ok()),
                 };
                 // Every (re)connect is a full resync from scratch (arch/01
-                // §9): each loop iteration wipes `cli.db` and reopens a fresh,
+                // §9): each loop iteration wipes `db_path` and reopens a fresh,
                 // empty, read-only engine before `serve` bootstraps it from
                 // the master's `/snapshot`.
                 loop {
-                    commands::prepare_follower_dir(&cli.db)?;
-                    let db = dr_strange_core::Database::open_read_only(&cli.db)
-                        .with_context(|| format!("opening replica at {}", cli.db.display()))?;
+                    commands::prepare_follower_dir(db_path)?;
+                    let db = dr_strange_core::Database::open_read_only(db_path)
+                        .with_context(|| format!("opening replica at {}", db_path.display()))?;
                     let mut opts = config::serve_options(cfg, addr);
                     opts.follow = Some(follow_opts.clone());
-                    match dr_strange_web::serve(db, Some(cli.db.clone()), opts)? {
+                    match dr_strange_web::serve(db, Some(db_path.to_path_buf()), opts)? {
                         dr_strange_web::ServeOutcome::Stopped => break Ok(()),
                         dr_strange_web::ServeOutcome::ResyncNeeded => {
                             tracing::warn!(
@@ -1184,7 +1290,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                     }
                 }
             } else {
-                let db = commands::open(&cli.db)?;
+                let db = commands::open(db_path)?;
                 #[allow(unused_mut)]
                 let mut opts = config::serve_options(cfg, addr);
                 #[cfg(feature = "digest")]
@@ -1214,9 +1320,21 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 // Hands off to the web crate, which owns its own async runtime
                 // and blocks until a shutdown signal; `out` is unused (the
                 // server logs itself). Never `--follow`, so always `Stopped`.
-                dr_strange_web::serve(db, Some(cli.db.clone()), opts).map(|_| ())
+                dr_strange_web::serve(db, Some(db_path.to_path_buf()), opts).map(|_| ())
             }
         }
+        other => run_model_backed(other, db_path, cfg, out),
+    }
+}
+
+/// The model-backed commands: embedding a plane, and asking in words.
+fn run_model_backed(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         #[cfg(feature = "digest")]
         Command::Vectorize {
             plane,
@@ -1224,7 +1342,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed_model,
             metric,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             let embedder =
                 dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
             commands::vectorize(&db, &plane, &embedder, metric.into(), out)
@@ -1241,7 +1359,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             embed_model,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             commands::ask(
                 &db,
                 &plane,
@@ -1267,7 +1385,21 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 .collect::<Result<_>>()?;
             update::update(&allow, bin.as_deref(), dir.as_deref(), out)
         }
-        #[cfg(feature = "digest")]
+        other => run_plugins_and_ingest(other, db_path, cfg, out),
+    }
+}
+
+/// Preprocessor plugins, and the ingestion that runs them.
+// Every arm here is a `digest` command, so without that feature the
+// group is empty and only the chain's own contract is left.
+#[cfg_attr(not(feature = "digest"), allow(unused_variables))]
+fn run_plugins_and_ingest(
+    cmd: Command,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match cmd {
         #[cfg(feature = "digest")]
         Command::Plugin(cmd) => {
             let plugin_config = config::plugin_config(cfg)?;
@@ -1315,7 +1447,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             no_git,
             git_plane,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(db_path)?;
             // The `[plugins]` section, with the legacy flag folded in on top.
             let mut plugin_config = config::plugin_config(cfg)?;
             if plugin_source {
@@ -1352,6 +1484,9 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             };
             commands::digest(&db, &args, out)
         }
+        // The chain above is exhaustive over `Command`; anything reaching
+        // here was handled by an earlier group and cannot arrive twice.
+        _ => unreachable!("every Command variant belongs to a dispatch group"),
     }
 }
 

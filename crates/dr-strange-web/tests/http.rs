@@ -772,11 +772,18 @@ async fn the_history_holds_the_queries_that_ran() {
     assert_eq!(rows[0]["plane"], "startup", "each says where it ran");
     assert!(rows[0]["at"].as_i64().unwrap() > 0, "and when");
 
+    history_is_addressable(&client, &base, rows).await;
+}
+
+/// The rest of the history surface, over the listing the caller above built:
+/// one entry by id, a miss, the POST form the browser UI uses, the refusal
+/// when no origin is claimed, and `limit`.
+async fn history_is_addressable(client: &reqwest::Client, base: &str, rows: &[Value]) {
     // Each is fetchable on its own, by the id the listing gave.
     let id = rows[1]["id"].as_u64().unwrap();
     let one: Value = client
         .get(format!("{base}/cypher/history/{id}"))
-        .header("origin", &base)
+        .header("origin", base)
         .send()
         .await
         .unwrap()
@@ -788,7 +795,7 @@ async fn the_history_holds_the_queries_that_ran() {
     // An id that was never issued is absent, not an empty answer.
     let missing = client
         .get(format!("{base}/cypher/history/99999"))
-        .header("origin", &base)
+        .header("origin", base)
         .send()
         .await
         .unwrap();
@@ -800,14 +807,14 @@ async fn the_history_holds_the_queries_that_ran() {
     // no way to be recognized as the local UI. Same path, same answer.
     let posted: Value = client
         .post(format!("{base}/cypher/history"))
-        .header("origin", &base)
+        .header("origin", base)
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(posted, Value::Array(rows.clone()));
+    assert_eq!(posted, Value::Array(rows.to_vec()));
 
     // No claim of an origin is a refusal, not a pass.
     let anonymous = client
@@ -820,7 +827,7 @@ async fn the_history_holds_the_queries_that_ran() {
     // And a caller can ask for just the top of it.
     let recent: Value = client
         .get(format!("{base}/cypher/history?limit=1"))
-        .header("origin", &base)
+        .header("origin", base)
         .send()
         .await
         .unwrap()
