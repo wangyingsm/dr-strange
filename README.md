@@ -247,9 +247,9 @@ and `token` under `[server]` in `drsg.toml` keeps the endpoint byte-identical
 across restarts even if the recorded port is taken by then.
 
 Eight verbs answer an agent's questions, one round trip each, as compact
-one-fact-per-line text. All eight are MCP tools on `drsg serve`; six are
-also CLI subcommands (`grep` and `snippet` read the watched source tree, so
-they live with the server).
+one-fact-per-line text. All eight are MCP tools on `drsg serve`, and all
+eight are CLI subcommands (`grep` and `snippet` read the tree the plane was
+parsed from, which `--root` names when the plane records none of its own).
 
 | Verb | The question it answers |
 |---|---|

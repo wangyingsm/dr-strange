@@ -125,4 +125,4 @@ subscription is a WebSocket extension of the same protocol.
 The detailed, per-layer design notes live under [`arch/`][arch] in the
 repository — the source of truth this chapter summarizes.
 
-[arch]: https://github.com/wangyingsm/dr-strange/tree/main/arch
+[arch]: https://github.com/wangyingsm/dr-strange/tree/master/arch

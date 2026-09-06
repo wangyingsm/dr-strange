@@ -106,4 +106,4 @@
 逐层的详细设计笔记位于仓库的 [`arch/`][arch] 目录下——那是本章所概述内容的权威
 来源。
 
-[arch]: https://github.com/wangyingsm/dr-strange/tree/main/arch
+[arch]: https://github.com/wangyingsm/dr-strange/tree/master/arch

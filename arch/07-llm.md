@@ -34,8 +34,9 @@ from the same file. Two readers would mean two vector spaces for one corpus.
 - **Provenance on everything written**: digested nodes/edges carry properties
   recording source document, model, and run id — using `PropDesc`
   descriptions so provenance is itself self-explaining. One digest run = one
-  plane by default. A preprocessor's facts carry `_generated_by` (`rust@1`)
-  instead of `_model`, so a parsed fact is always distinguishable from a
+  plane by default. A preprocessor's facts carry `_generated_by`
+  (`rust@3+fdb01bb6` — plugin, version, and the leading bytes of the pinned
+  artifact hash) instead of `_model`, so a parsed fact is always distinguishable from a
   model's guess; where both claim one key, **the fact wins** and the model's is
   dropped and counted.
 - **Preprocessing is local-only**: what makes parsing worth its cost is a

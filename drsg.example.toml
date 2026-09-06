@@ -34,6 +34,11 @@ query_timeout_secs = 60
 retain_commits = 20
 # Extra browser origins allowed past the CSRF guard (→ DRSG_ALLOWED_ORIGINS).
 allowed_origins = ["https://app.example.com"]
+# The source tree the `grep` and `snippet` agent tools read. `serve watch` sets
+# it from its own `--dir`, so this is for a plain `serve` in front of a tree
+# that some earlier `digest` parsed. Unset, those tools answer that they have no
+# tree rather than guessing at one.
+# source_root = "/srv/myrepo"
 
 # Uncomment to serve HTTPS directly (rustls). Both files are PEM; `cert` is the
 # certificate chain, `key` its private key. Omit the whole section for plain
@@ -71,6 +76,24 @@ dir = "logs"
 # embed_provider = "openai"
 # embed_model = "text-embedding-3-small"
 # embed_key_env = "OPENAI_API_KEY"
+
+# URL ingestion for the web AIgest (ROADMAP §9). Fetching is on by default; what
+# is NOT a default is reaching the private network. A client names an address
+# that *the server* then connects to, and the server's position on the network
+# is usually the more privileged one, so every non-routable address is refused:
+# loopback, RFC-1918, link-local (169.254.0.0/16, where cloud instance metadata
+# hands out credentials), and the rest. The check is on the RESOLVED address,
+# not the hostname, and is repeated at every redirect hop.
+[fetch]
+# enabled = true         # false refuses URL fetching outright
+# max_pages = 10         # ceiling on pages kept per crawl; a request may ask for fewer, never more
+# max_depth = 1          # ceiling on link-following depth a request may ask for
+# concurrency = 4        # requests in flight
+# CIDR blocks to re-permit despite not being publicly routable — e.g.
+# ["10.0.0.0/8"] to read an intranet wiki. This is the one deliberate exception
+# to the guard above, not a switch that turns it off: a server reachable by
+# untrusted clients should leave it empty.
+# allow_private = []
 
 # Preprocessor plugins (ROADMAP §11): sandboxed wasm components installed with
 # `drsg plugin install <file.wasm | url>`. Budgets apply per sandbox call.

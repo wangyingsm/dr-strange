@@ -215,6 +215,7 @@ wait, it does not turn it away.
 | `impact` | read | everything reaching a symbol, grouped by distance |
 | `fathom` | read | the makeup of the region around a symbol — labels, edge types, hubs |
 | `snippet` | read | a symbol's source text, or a range of a file (`path:start-end`); says which symbol a range opens in and how to read on |
+| `history` | read | a repository's history at a glance — where HEAD is, what the branches and tags point at, what was rebased, and the newest commits; reads the `_git` plane a digest of a git checkout writes |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
 | `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated |

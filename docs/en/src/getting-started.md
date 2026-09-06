@@ -242,7 +242,9 @@ if present. Unknown keys are rejected.
 [server]
 addr = "0.0.0.0:7700"                       # bind address (CLI --addr overrides)
 token = "please-change-me"                  # shared API token (→ DRSG_TOKEN)
-max_concurrent = 256                        # ceiling on in-flight requests
+max_concurrent = 1024                       # ceiling on in-flight requests
+write_timeout_secs = 30                     # how long a write waits for the single writer slot before failing retryably (0 waits forever)
+query_timeout_secs = 60                     # how long one request's queries may run before stopping the same way (0 runs to completion)
 retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all)
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins

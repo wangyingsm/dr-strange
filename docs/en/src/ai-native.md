@@ -221,8 +221,8 @@ Parsers are **plugins** — sandboxed WebAssembly components you install once an
 use anywhere:
 
 ```console
-$ drsg plugin install https://github.com/…/releases/download/rust-v2/rust.wasm
-installed rust@2  sha256:e3a586a150d0
+$ drsg plugin install https://github.com/…/releases/download/rust-v2.0.0/rust.wasm
+installed rust@3  sha256:fdb01bb6967f
   handles: .rs
 ```
 
@@ -237,7 +237,7 @@ at install.
 
 ```console
 $ drsg --db graph.drsg digest ./crates/dr-strange-core/src --plane code --apply
-preprocessed by rust@2 (5528 facts)
+preprocessed by rust@3 (5528 facts)
 no prose left to read — digested without a model call
   0 chat request(s); tokens 0 in / 0 out / 0 embed
 applied: wrote 1139 nodes, 2739 edges

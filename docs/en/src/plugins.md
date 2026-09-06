@@ -10,7 +10,7 @@ The plugins live in their own repository,
 [dr-strange-extension](https://github.com/wangyingsm/dr-strange-extension),
 apart from the database on purpose: official does not mean lock-step. A parser
 ships a fix without waiting for a database release, and the database releases
-without waiting for eight toolchains. That repository is the extension commons —
+without waiting for ten toolchains. That repository is the extension commons —
 the official plugins, the canonical contract, and the SDKs for writing your own
 (the subject of the [Coding Agent](./coding-agent.md) chapter's second half).
 
@@ -91,9 +91,13 @@ only facts is digested with **no model call at all**.
 
 The same line is kept visible in the graph itself:
 
-- A parsed fact carries `_generated_by` (`rust@2`) instead of `_model`, so it
-  is always distinguishable from a model's extraction. Where both claim one
-  key, **the fact wins** and the model's claim is dropped and counted.
+- A parsed fact carries `_generated_by` instead of `_model`, so it is always
+  distinguishable from a model's extraction. Where both claim one key, **the
+  fact wins** and the model's claim is dropped and counted. The stamp names
+  the plugin, its version, and the artifact that produced the fact —
+  `rust@3+fdb01bb6`, the suffix being the leading bytes of the wasm's pinned
+  SHA-256 — so two facts made by the same version of a plugin from different
+  bytes never read as one.
 - Determinism is part of the contract, not an aspiration. The sandbox freezes
   the clock, deals entropy from a fixed sequence, and sorts directory
   listings — so digesting the same tree twice yields byte-identical facts.
@@ -110,13 +114,24 @@ guest's stderr is captured into the error the operator sees, along with the
 trap code itself. Whatever a plugin produces comes back as a **return value** —
 only the host writes to the database.
 
-A call parses **one file**, so a plugin that trips over one is one file's worth
-of loss: it is skipped and counted, and the report names it. Generated source
-is the usual culprit — a `.pb.go` whose descriptor blob is a thousand-term
-string concatenation will walk a recursive printer straight off the stack the
-plugin was linked with, which is the plugin author's to fix and no host setting
-can raise. A plugin that fails on *every* file it claimed is a different
-matter, and still refuses the run.
+A `parse` call handles **one file**, so a plugin that trips over one is one
+file's worth of loss: it is skipped and counted, and the report names it.
+Generated source is the usual culprit — a `.pb.go` whose descriptor blob is a
+thousand-term string concatenation will walk a recursive printer straight off
+the stack the plugin was linked with, which is the plugin author's to fix and
+no host setting can raise. A plugin that fails on *every* file it claimed is a
+different matter, and still refuses the run.
+
+**`assemble` carries no such bound, and the difference is worth knowing.** It
+runs once, over every partial at once, so a trap there is not one file's loss:
+it fails the plugin outright, and with it the routing pass folding the tree.
+One file the parser chokes on, in a language that is a rounding error in the
+repository, can therefore empty the plane — and under `drsg init --rebuild`, which drops
+the plane before folding it again, that is destructive rather than a no-op.
+Until the host isolates a trapping plugin from the rest of the route, read an
+`assemble` failure as an outage rather than a gap in the report: the operator's
+recourse is to reinstall the plugin's previous version while the parser is
+fixed.
 
 The budgets are tunable in `drsg.toml`
 ([Chapter 2](./getting-started.md#configuration-file)):
@@ -139,8 +154,8 @@ installed plugins.
 
 ## The official catalog
 
-Eight official plugins cover the common languages, each wrapping a mature
-parser rather than reinventing one:
+Ten official plugins cover the common languages and two cross-cutting
+sources, each wrapping a mature parser rather than reinventing one:
 
 | Plugin | Claims | Parser underneath |
 |---|---|---|
@@ -152,6 +167,8 @@ parser rather than reinventing one:
 | `c` | `.c .h` | [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) |
 | `web` | `.html .htm .css` | tree-sitter html/css/js — one plugin, so `class="btn"` binds to the stylesheet defining `.btn` |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) |
+| `git` | *(a git checkout)* | git's own object database, read directly — [flate2](https://crates.io/crates/flate2) for the zlib streams. Dispatched by the source being a checkout rather than by extension, and writes the history plane beside the code one |
+| `deps` | *(manifests, by name)* | [toml_edit](https://crates.io/crates/toml_edit) and [quick-xml](https://crates.io/crates/quick-xml): `package.json`, `go.mod`, `pyproject.toml`, `requirements.txt`, `pom.xml`. A manifest is a *filename*, not an extension — `Cargo.toml` stays with the `toml` plugin |
 
 Each releases at its own pace as a `<plugin>-vX.Y.Z` tag; CI builds the
 component and publishes `<plugin>.wasm` with its SHA-256 on the
@@ -198,7 +215,7 @@ stores the result for the next one.
 
 ## What every official parser promises
 
-The eight parsers are one family, built to one discipline:
+The ten parsers are one family, built to one discipline:
 
 - **Keys are the language's own qualified names** — `crate::module::fn`,
   `pkg.Type.Method`, `file.c::func`, `index.html#map` — never invented ids.

@@ -12,7 +12,7 @@
 
 | 命令 | 用途 |
 |---|---|
-| `init` | 创建一个空数据库（多数命令也会在首次使用时创建） |
+| `init [--dir] [--rebuild]` | 为智能体引导本仓库：图化、以分离方式拉起 `serve watch`、写出 `.mcp.json`（见[第 10 章](./coding-agent.md)）。在不含 `digest` 特性的 `--no-default-features` 构建中，它退化为创建一个空数据库——多数命令也会在首次使用时创建 |
 | `plane list \| create \| drop \| show` | 平面生命周期 |
 | `import <文件> --plane` | 加载 JSONL 节点/边 |
 | `export --plane` | 将一个平面导出为 JSONL |
@@ -27,12 +27,18 @@
 | `digest <文件\|目录\|url> --plane [--mode]` | 导入一篇文档、一个代码仓库，或一个页面及其链接 |
 | `search <查询> --plane` | 语义查找：嵌入查询文本，返回最近的节点 |
 | `context \| describe \| trace \| impact \| fathom <名称> --plane` | 已图化代码平面上的智能体动词 |
+| `snippet <名称 \| path:start-end> --plane` | 一个符号的源码文本，或被解析树中任一文件的某个行区间 |
+| `grep <模式> --plane [--regex] [--path]` | 在该树上做文本检索；每个命中都标出所在的符号 |
+| `traverse <键> --plane [--edge-type]` | 一跳（或数跳）之外的邻居 |
+| `history --plane [--limit]` | 平面背后的代码仓库：HEAD、分支与标签指向、变基、最新的提交 |
+| `queries [<id>] [--limit]` | 已经运行过的 Cypher 查询；`cypher --history <id>` 可再跑一次 |
 | `vectorize --plane` | 为一个平面的节点生成向量嵌入，以供相似度检索 |
 | `plugin install \| list \| remove` | 管理预处理插件（沙箱化的 wasm 解析器） |
 | `snapshot <out>` / `restore <in>` | 整库备份与恢复 |
 | `stats` / `check` | 汇总计数 / 完整性扫描 |
 | `serve [--addr]` | 运行 Web 仪表盘 + JSON-RPC 接口 + MCP 端点 |
 | `serve watch [--dir]` | 对外服务，并让代码平面随每次提交保持同步 |
+| `update [--bin] [--dir]` | 若有更新的发行版，就把本二进制替换掉 |
 
 被导入的文件可以是 Markdown 或纯文本，也可以是 Word、PowerPoint、Excel、
 OpenDocument、RTF、EPUB、CSV 与 PDF；后一类会先转换为 Markdown，让模型读到的是标题、

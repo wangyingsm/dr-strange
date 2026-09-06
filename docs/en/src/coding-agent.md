@@ -111,7 +111,8 @@ round trip** instead of a search-and-read loop.
 
 Eight verbs carry the workload, identical over MCP
 ([Chapter 8](./mcp.md)) and the CLI ([Chapter 7](./embedded-cli.md); `grep`
-and `snippet` read the watched source tree, so they live with the server):
+and `snippet` read the tree the plane was parsed from, which `--root` names
+when the plane records none of its own):
 
 | Verb | The question it answers |
 |---|---|

@@ -21,7 +21,8 @@ database logic.
 ## 1. Command surface (current)
 
 ```
-drsg init <path>                          # create a database
+drsg init [--dir D] [--rebuild]           # bootstrap a repo: digest, spawn `serve watch`, write .mcp.json
+                                          #   (without the `digest` feature: create a database)
 drsg plane list|create|drop|show          # plane lifecycle (09-planes.md)
 drsg import <file> --plane P              # JSONL ingest (bulk writer)
 drsg export --plane P                     # snapshot export
@@ -33,6 +34,8 @@ drsg snippet <name|path:a-b> [--root D]   # a symbol read to its end, or a range
 drsg grep '<text>' [--regex] [--path P]   # text search over the tree a plane was parsed from
 drsg traverse <key> [--edge-type T]       # the neighbours a hop (or several) away
 drsg search '<query>' --plane P           # semantic top-k (embeds the query)
+drsg history [--plane P] [--limit N]      # the repository behind a plane: HEAD, tips, rebases, newest commits
+drsg queries [<id>] [--limit N]           # the Cypher queries that have run; `cypher --history <id>` reruns one
 drsg catalog [--plane P]                  # soft-schema view (labels, props, descriptions)
 drsg algo … / drsg hybrid …               # graph algorithms; fused retrieval
 drsg index ensure <label> <prop> --plane P --metric cosine
@@ -42,6 +45,7 @@ drsg snapshot / drsg restore              # whole-database backup bundles
 drsg serve [watch]                        # dashboard + JSON-RPC + MCP; watch keeps a code plane commit-synced
 drsg ask '<question>'                     # NL → read-only plan → run
 drsg plugin install|list|remove           # preprocessor plugins (07 §1)
+drsg update [--bin B] [--dir D]           # hand this process to the installer when a newer release exists
 drsg digest [<src>] --plane P             # document/repo → graph ingest, dry-run by default (§3)
 ```
 

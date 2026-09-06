@@ -183,8 +183,9 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 平面支持语义检索。
 
 八个动词回答智能体的问题，每个都在一次往返内完成，输出均为紧凑的每行一条事实的
-文本。八个动词全部是 `drsg serve` 上的 MCP 工具；其中六个同时是 CLI 子命令
-（`grep` 与 `snippet` 需要读取被监视的源码树，因此只随服务端提供）。
+文本。八个动词全部是 `drsg serve` 上的 MCP 工具，也全部是 CLI 子命令
+（`grep` 与 `snippet` 读取平面被解析自的那棵源码树；平面若未记录，则由 `--root`
+指明）。
 
 | 动词 | 它回答的问题 |
 |---|---|

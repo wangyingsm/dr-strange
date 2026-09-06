@@ -16,7 +16,7 @@ access, and the CLI for offline operations.
 
 | Command | Purpose |
 |---|---|
-| `init` | create an empty database (most commands also create on first use) |
+| `init [--dir] [--rebuild]` | bootstrap this repository for agents: digest it, spawn `serve watch` detached, write `.mcp.json` ([Chapter 10](./coding-agent.md)). In a `--no-default-features` build without `digest`, it creates an empty database instead — as most commands do on first use |
 | `plane list \| create \| drop \| show` | plane lifecycle |
 | `import <file> --plane` | load JSONL nodes/edges |
 | `export --plane` | dump a plane as JSONL |
@@ -31,12 +31,18 @@ access, and the CLI for offline operations.
 | `digest <file\|dir\|url> --plane [--mode]` | ingest a document, a repository, or a page and its links |
 | `search <query> --plane` | semantic lookup: embeds the query, returns the nearest nodes |
 | `context \| describe \| trace \| impact \| fathom <name> --plane` | the agent verbs over a digested code plane |
+| `snippet <name \| path:start-end> --plane` | a symbol's source text, or a range of any file in the parsed tree |
+| `grep <pattern> --plane [--regex] [--path]` | text search over that tree; each hit names the symbol it falls in |
+| `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
+| `history --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits |
+| `queries [<id>] [--limit]` | the Cypher queries that have run; `cypher --history <id>` runs one again |
 | `vectorize --plane` | embed a plane's nodes for similarity search |
 | `plugin install \| list \| remove` | manage preprocessor plugins (sandboxed wasm parsers) |
 | `snapshot <out>` / `restore <in>` | whole-database backup and restore |
 | `stats` / `check` | summary counts / integrity scan |
 | `serve [--addr]` | run the web dashboard + JSON-RPC API + MCP endpoint |
 | `serve watch [--dir]` | serve, and keep a code plane synced to every commit |
+| `update [--bin] [--dir]` | replace this binary with a newer release, if there is one |
 
 A digested file may be Markdown or plain text, or any of Word, PowerPoint,
 Excel, OpenDocument, RTF, EPUB, CSV and PDF — those are converted to Markdown
