@@ -116,25 +116,7 @@ pub fn sync_paths(
 
     let plane = db.plane(plane_name)?;
 
-    // The plane's parser-owned nodes: keyed, and stamped by a plugin this
-    // router carries (matched by name, so a version bump still owns its
-    // older nodes). Everything else — model entities, document pages — is
-    // outside this fold's authority.
-    let manifests = plugins.manifests();
-    let owners: BTreeSet<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
-    let mut stored: BTreeMap<String, dr_strange_core::NodeRecord> = BTreeMap::new();
-    for node in plane.query().scan_all().nodes()? {
-        let Some(key) = node.external_key.clone() else {
-            continue; // keyless nodes are a model's, never a parser's
-        };
-        let owned = matches!(
-            node.properties.get("_generated_by").map(|d| &d.value),
-            Some(PropValue::Str(g)) if owners.contains(g.split('@').next().unwrap_or(g))
-        );
-        if owned {
-            stored.insert(key, node);
-        }
-    }
+    let stored = owned_nodes(&plane, plugins)?;
 
     // The tree's facts, one node per key.
     let mut fresh: BTreeMap<&str, &crate::digest::DigestNode> = BTreeMap::new();
@@ -142,62 +124,16 @@ pub fn sync_paths(
         fresh.entry(fact.key.as_str()).or_insert(fact);
     }
 
-    // ---- classify nodes ---------------------------------------------------
-    let mut creates: Vec<&crate::digest::DigestNode> = Vec::new(); // incl. replaces
-    let mut patches: Vec<(dr_strange_core::NodeId, &crate::digest::DigestNode)> = Vec::new();
-    let mut replaced: BTreeSet<&str> = BTreeSet::new();
-    let mut deleted: BTreeSet<&str> = BTreeSet::new();
+    let Classified {
+        creates,
+        patches,
+        replaced,
+        deleted,
+    } = classify_nodes(&plane, &fresh, &stored, &mut stats)?;
 
-    for (key, fact) in &fresh {
-        match stored.get(*key) {
-            None => {
-                if plane.node_by_key(key)?.is_some() {
-                    stats.nodes_skipped += 1; // an unowned node holds the key
-                } else {
-                    creates.push(fact);
-                }
-            }
-            Some(node) => {
-                let mut want: Vec<&str> = std::iter::once(fact.label.as_str())
-                    .chain(fact.extra_labels.iter().map(String::as_str))
-                    .collect();
-                want.sort_unstable();
-                let mut have: Vec<&str> = node.labels.iter().map(String::as_str).collect();
-                have.sort_unstable();
-                if want != have {
-                    replaced.insert(key);
-                    creates.push(fact);
-                } else if content_of(&fact.props) != content_of(&node.properties) {
-                    patches.push((node.id, fact));
-                }
-            }
-        }
-    }
-    for key in stored.keys() {
-        if !fresh.contains_key(key.as_str()) {
-            deleted.insert(key);
-        }
-    }
-
-    // ---- diff the parser edges -------------------------------------------
-    // The stored universe: edges between parser-owned endpoints. A model's
-    // link *into* a parser node has an unowned source and is never here.
     let ids: BTreeMap<dr_strange_core::NodeId, &str> =
         stored.iter().map(|(k, n)| (n.id, k.as_str())).collect();
-    let mut standing: BTreeMap<(String, String, String), (EdgeId, Properties)> = BTreeMap::new();
-    for (key, node) in &stored {
-        for n in plane.neighbors(node.id, Dir::Out, None)? {
-            let Some(dst_key) = ids.get(&n.node) else {
-                continue;
-            };
-            if let Some(edge) = plane.edge(n.edge)? {
-                standing.insert(
-                    (key.clone(), edge.ty, dst_key.to_string()),
-                    (n.edge, edge.properties),
-                );
-            }
-        }
-    }
+    let mut standing = standing_edges(&plane, &stored, &ids)?;
 
     let batch_keys: BTreeSet<&str> = creates.iter().map(|f| f.key.as_str()).collect();
     // An endpoint resolves in the batch, or on a plane node this fold is not
@@ -212,55 +148,10 @@ pub fn sync_paths(
         Ok(plane.node_by_key(key)?.is_some())
     };
 
-    let mut seen: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
-    let mut edge_creates: Vec<&crate::digest::DigestEdge> = Vec::new();
-    let mut edge_deletes: Vec<EdgeId> = Vec::new();
-    for edge in &facts.edges {
-        if !seen.insert((&edge.src, &edge.dst, &edge.ty)) {
-            continue; // the same assertion twice in one batch is one fact
-        }
-        match standing.remove(&(edge.src.clone(), edge.ty.clone(), edge.dst.clone())) {
-            // Asserted and standing with the same content: nothing to do.
-            Some((_, props)) if content_of(&props) == content_of(&edge.props) => {}
-            // Standing but different (a call site moved lines, a resolution
-            // strategy changed): replace it.
-            Some((id, _)) => {
-                edge_deletes.push(id);
-                edge_creates.push(edge);
-            }
-            None => edge_creates.push(edge),
-        }
-    }
-    // Whatever still stands was asserted by no fact — unless its endpoint is
-    // being deleted or replaced, in which case the node cascade owns it.
-    for ((src, _, dst), (id, _)) in &standing {
-        let cascades = [src, dst]
-            .into_iter()
-            .any(|k| deleted.contains(k.as_str()) || replaced.contains(k.as_str()));
-        if !cascades {
-            edge_deletes.push(*id);
-            stats.edges_deleted += 1;
-        }
-    }
+    let (edge_creates, edge_deletes) =
+        diff_edges(&facts.edges, &mut standing, &deleted, &replaced, &mut stats);
 
-    // Snapshot unowned incoming edges of replaced nodes before the cascade.
-    let mut saved: Vec<SavedEdge> = Vec::new();
-    for key in &replaced {
-        let node = &stored[*key];
-        for n in plane.neighbors(node.id, Dir::In, None)? {
-            if ids.contains_key(&n.node) {
-                continue; // parser-owned source: the edge diff owns it
-            }
-            if let Some(edge) = plane.edge(n.edge)? {
-                saved.push(SavedEdge {
-                    src: edge.src,
-                    dst_key: key.to_string(),
-                    ty: edge.ty,
-                    props: edge.properties,
-                });
-            }
-        }
-    }
+    let saved = save_unowned_incoming(&plane, &replaced, &stored, &ids)?;
 
     // ---- apply, atomically ------------------------------------------------
     let mut txn = plane.write()?;
@@ -269,25 +160,7 @@ pub fn sync_paths(
     }
     stats.nodes_deleted = deleted.len() + replaced.len();
 
-    for (id, fact) in &patches {
-        // Content written through — the parser's word replaces the old —
-        // then provenance restamped. `_`-reserved extras the pipeline added
-        // (embedding bookkeeping) and vectors are left standing.
-        let old = &stored[fact.key.as_str()];
-        for (k, d) in &old.properties {
-            let stale = !k.starts_with('_')
-                && !matches!(d.value, PropValue::Vector(_))
-                && !fact.props.contains_key(k);
-            if stale {
-                txn.remove_prop(*id, k)?;
-            }
-        }
-        for (k, d) in &fact.props {
-            if old.properties.get(k).map(|o| &o.value) != Some(&d.value) {
-                txn.set_prop(*id, k, d.clone())?;
-            }
-        }
-    }
+    apply_patches(&mut txn, &patches, &stored)?;
     stats.nodes_patched = patches.len();
 
     for id in edge_deletes {
@@ -331,10 +204,232 @@ pub fn sync_paths(
     txn.bulk_load(nodes, edges)?;
     txn.commit()?;
 
-    // Re-attach and carry over in a second transaction: the re-created nodes
-    // are only visible to reads once the load committed.
+    reattach(&plane, &saved, &replaced, &stored, &mut stats)?;
+    Ok(stats)
+}
+
+/// The plane's parser-owned nodes: keyed, and stamped by a plugin this router
+/// carries (matched by name, so a version bump still owns its older nodes).
+/// Everything else — model entities, document pages — is outside this fold's
+/// authority, and a keyless node was never a parser's.
+fn owned_nodes(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    plugins: &Plugins,
+) -> Result<BTreeMap<String, dr_strange_core::NodeRecord>> {
+    let manifests = plugins.manifests();
+    let owners: BTreeSet<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
+    let mut stored = BTreeMap::new();
+    for node in plane.query().scan_all().nodes()? {
+        let Some(key) = node.external_key.clone() else {
+            continue;
+        };
+        let owned = matches!(
+            node.properties.get("_generated_by").map(|d| &d.value),
+            Some(PropValue::Str(g)) if owners.contains(g.split('@').next().unwrap_or(g))
+        );
+        if owned {
+            stored.insert(key, node);
+        }
+    }
+    Ok(stored)
+}
+
+/// What the fold decided about each keyed node.
+struct Classified<'a> {
+    /// New nodes, and the replacements for nodes whose label set changed.
+    creates: Vec<&'a crate::digest::DigestNode>,
+    patches: Vec<(dr_strange_core::NodeId, &'a crate::digest::DigestNode)>,
+    /// Keys being re-created rather than patched: a label set cannot be
+    /// edited in place, so the node goes and comes back.
+    replaced: BTreeSet<&'a str>,
+    /// Owned keys the tree no longer asserts.
+    deleted: BTreeSet<&'a str>,
+}
+
+fn classify_nodes<'a>(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    fresh: &BTreeMap<&'a str, &'a crate::digest::DigestNode>,
+    stored: &'a BTreeMap<String, dr_strange_core::NodeRecord>,
+    stats: &mut SyncStats,
+) -> Result<Classified<'a>> {
+    let mut c = Classified {
+        creates: Vec::new(),
+        patches: Vec::new(),
+        replaced: BTreeSet::new(),
+        deleted: BTreeSet::new(),
+    };
+    for (key, fact) in fresh {
+        match stored.get(*key) {
+            None => {
+                if plane.node_by_key(key)?.is_some() {
+                    stats.nodes_skipped += 1; // an unowned node holds the key
+                } else {
+                    c.creates.push(fact);
+                }
+            }
+            Some(node) => {
+                let mut want: Vec<&str> = std::iter::once(fact.label.as_str())
+                    .chain(fact.extra_labels.iter().map(String::as_str))
+                    .collect();
+                want.sort_unstable();
+                let mut have: Vec<&str> = node.labels.iter().map(String::as_str).collect();
+                have.sort_unstable();
+                if want != have {
+                    c.replaced.insert(key);
+                    c.creates.push(fact);
+                } else if content_of(&fact.props) != content_of(&node.properties) {
+                    c.patches.push((node.id, fact));
+                }
+            }
+        }
+    }
+    for key in stored.keys() {
+        if !fresh.contains_key(key.as_str()) {
+            c.deleted.insert(key);
+        }
+    }
+    Ok(c)
+}
+
+/// What the tree asserts against what the plane already holds: the edges to
+/// write, and the ones to take away.
+///
+/// `standing` is drained as it goes, so whatever remains was asserted by no
+/// fact — and goes too, unless one of its endpoints is being deleted or
+/// replaced, in which case the node cascade owns it and a second delete would
+/// only double-count.
+#[allow(clippy::type_complexity)]
+fn diff_edges<'a>(
+    facts: &'a [crate::digest::DigestEdge],
+    standing: &mut BTreeMap<(String, String, String), (EdgeId, Properties)>,
+    deleted: &BTreeSet<&str>,
+    replaced: &BTreeSet<&str>,
+    stats: &mut SyncStats,
+) -> (Vec<&'a crate::digest::DigestEdge>, Vec<EdgeId>) {
+    let mut seen: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    let mut creates: Vec<&crate::digest::DigestEdge> = Vec::new();
+    let mut deletes: Vec<EdgeId> = Vec::new();
+    for edge in facts {
+        if !seen.insert((&edge.src, &edge.dst, &edge.ty)) {
+            continue; // the same assertion twice in one batch is one fact
+        }
+        match standing.remove(&(edge.src.clone(), edge.ty.clone(), edge.dst.clone())) {
+            // Asserted and standing with the same content: nothing to do.
+            Some((_, props)) if content_of(&props) == content_of(&edge.props) => {}
+            // Standing but different (a call site moved lines, a resolution
+            // strategy changed): replace it.
+            Some((id, _)) => {
+                deletes.push(id);
+                creates.push(edge);
+            }
+            None => creates.push(edge),
+        }
+    }
+    for ((src, _, dst), (id, _)) in standing.iter() {
+        let cascades = [src, dst]
+            .into_iter()
+            .any(|k| deleted.contains(k.as_str()) || replaced.contains(k.as_str()));
+        if !cascades {
+            deletes.push(*id);
+            stats.edges_deleted += 1;
+        }
+    }
+    (creates, deletes)
+}
+
+/// Content written through — the parser's word replaces the old. The
+/// `_`-reserved extras the pipeline added (embedding bookkeeping) and any
+/// vectors are left standing, because the parser does not own them.
+fn apply_patches(
+    txn: &mut dr_strange_core::WriteTxn<'_>,
+    patches: &[(dr_strange_core::NodeId, &crate::digest::DigestNode)],
+    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+) -> Result<()> {
+    for (id, fact) in patches {
+        let old = &stored[fact.key.as_str()];
+        for (k, d) in &old.properties {
+            let stale = !k.starts_with('_')
+                && !matches!(d.value, PropValue::Vector(_))
+                && !fact.props.contains_key(k);
+            if stale {
+                txn.remove_prop(*id, k)?;
+            }
+        }
+        for (k, d) in &fact.props {
+            if old.properties.get(k).map(|o| &o.value) != Some(&d.value) {
+                txn.set_prop(*id, k, d.clone())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stored universe: edges between parser-owned endpoints. A model's link
+/// *into* a parser node has an unowned source and is never here.
+#[allow(clippy::type_complexity)]
+fn standing_edges(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+    ids: &BTreeMap<dr_strange_core::NodeId, &str>,
+) -> Result<BTreeMap<(String, String, String), (EdgeId, Properties)>> {
+    let mut standing = BTreeMap::new();
+    for (key, node) in stored {
+        for n in plane.neighbors(node.id, Dir::Out, None)? {
+            let Some(dst_key) = ids.get(&n.node) else {
+                continue;
+            };
+            if let Some(edge) = plane.edge(n.edge)? {
+                standing.insert(
+                    (key.clone(), edge.ty, dst_key.to_string()),
+                    (n.edge, edge.properties),
+                );
+            }
+        }
+    }
+    Ok(standing)
+}
+
+/// Unowned incoming edges of the nodes about to be replaced, snapshotted
+/// before the delete cascades them away — a model's link into a symbol should
+/// survive the symbol being re-parsed.
+fn save_unowned_incoming(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    replaced: &BTreeSet<&str>,
+    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+    ids: &BTreeMap<dr_strange_core::NodeId, &str>,
+) -> Result<Vec<SavedEdge>> {
+    let mut saved = Vec::new();
+    for key in replaced {
+        let node = &stored[*key];
+        for n in plane.neighbors(node.id, Dir::In, None)? {
+            if ids.contains_key(&n.node) {
+                continue; // parser-owned source: the edge diff owns it
+            }
+            if let Some(edge) = plane.edge(n.edge)? {
+                saved.push(SavedEdge {
+                    src: edge.src,
+                    dst_key: key.to_string(),
+                    ty: edge.ty,
+                    props: edge.properties,
+                });
+            }
+        }
+    }
+    Ok(saved)
+}
+
+/// Re-attach the saved edges and carry the kept properties over, in a second
+/// transaction: the re-created nodes are only visible to reads once the bulk
+/// load has committed.
+fn reattach(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    saved: &[SavedEdge],
+    replaced: &BTreeSet<&str>,
+    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+    stats: &mut SyncStats,
+) -> Result<()> {
     let mut txn = plane.write()?;
-    for edge in &saved {
+    for edge in saved {
         let Some(dst) = plane.node_by_key(&edge.dst_key)? else {
             continue; // the symbol vanished; the dangling assertion goes too
         };
@@ -348,7 +443,7 @@ pub fn sync_paths(
         txn.create_edge(edge.src, dst.id, &edge.ty, edge.props.clone())?;
         stats.edges_reattached += 1;
     }
-    for key in &replaced {
+    for key in replaced {
         let node = &stored[*key];
         let Some(new) = plane.node_by_key(key)? else {
             continue;
@@ -362,8 +457,7 @@ pub fn sync_paths(
         }
     }
     txn.commit()?;
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Rebuild `plane_name` from scratch: drop it, re-create it, and reconcile

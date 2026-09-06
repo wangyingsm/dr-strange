@@ -49,7 +49,7 @@ enum Hop<'a> {
 }
 
 pub fn compile(
-    q: Query,
+    mut q: Query,
     embedder: Option<&dyn Embedder>,
     params: &crate::Params,
 ) -> Result<LogicalPlan, String> {
@@ -69,9 +69,44 @@ pub fn compile(
     nodes.extend(hops.iter().map(|(_, n)| *n));
     let last = nodes.len() - 1;
 
-    // Variable → slot index. Reusing a variable would mean a graph constraint
-    // (same node reached two ways), which the linear model can't express.
-    let mut var_slot: AHashMap<&str, usize> = AHashMap::new();
+    let var_slot = bind_variables(&nodes)?;
+    // Taken rather than borrowed: the conjuncts are consumed into the slots,
+    // and `q` is still read whole by `compile_return` below.
+    let where_clause = q.where_clause.take();
+    let mut slot_filters = push_down_where(where_clause, &var_slot, nodes.len())?;
+    let source = key_seek_rewrite(source, &mut slot_filters[0], first_node, params)?;
+
+    let mut steps: Vec<Step> = Vec::new();
+    for e in slot_filters[0].drain(..) {
+        let scope = Scope {
+            var_slot: &var_slot,
+            current: 0,
+        };
+        steps.push(Step::Filter(compile_expr(&e, embedder, params, &scope)?));
+    }
+    compile_hops(
+        &mut steps,
+        &hops,
+        &nodes,
+        &mut slot_filters,
+        &var_slot,
+        embedder,
+        params,
+    )?;
+
+    let project = compile_return(&q, &mut steps, &var_slot, last, embedder, params)?;
+    Ok(LogicalPlan {
+        source,
+        steps,
+        project,
+    })
+}
+
+/// Variable → slot index. Reusing a variable would mean a graph constraint
+/// (the same node reached two ways), which the linear model can't express, so
+/// a second binding is refused rather than silently shadowing the first.
+fn bind_variables<'a>(nodes: &[&'a NodePat]) -> Result<AHashMap<&'a str, usize>, String> {
+    let mut var_slot: AHashMap<&'a str, usize> = AHashMap::new();
     for (idx, n) in nodes.iter().enumerate() {
         if let Some(v) = &n.var
             && var_slot.insert(v.as_str(), idx).is_some()
@@ -81,74 +116,93 @@ pub fn compile(
             ));
         }
     }
+    Ok(var_slot)
+}
 
-    // WHERE conjuncts, each pushed down to its single variable's slot. Kept as
-    // parser expressions for now so the key-seek rewrite below can still see
-    // `key(n) = "…"` before the qualifier is dropped.
-    let mut slot_filters: Vec<Vec<PExpr>> = vec![Vec::new(); nodes.len()];
-    if let Some(w) = q.where_clause {
-        for conj in split_and(w) {
-            let vars = referenced_vars(&conj);
-            let slot = match vars.len() {
-                0 => 0, // constant predicate — evaluate at the source
-                1 => {
-                    let v = vars.iter().next().unwrap();
-                    *var_slot
-                        .get(v.as_str())
-                        .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?
-                }
-                _ => {
-                    return Err(
-                        "a WHERE condition may reference only one pattern variable; \
-                         cross-variable predicates aren't supported yet"
-                            .to_string(),
-                    );
-                }
-            };
-            slot_filters[slot].push(conj);
-        }
-    }
-
-    // Key-seek: a `key(n) = "…"` / `key(n) IN […]` on a *scanned* source
-    // becomes a `SeekKeys` seek — an index lookup instead of a scan-and-filter.
-    // The scan's label survives as a HasLabel filter, since the seek is by key
-    // alone. Only for MATCH: on a retrieval seed the predicate stays a filter.
-    let mut source = source;
-    if matches!(source, Source::ScanAll | Source::ScanLabel(_)) {
-        let var = first_node.var.as_deref();
-        if let Some(pos) = slot_filters[0]
-            .iter()
-            .position(|e| key_seek_keys(e, var, params).is_some())
-        {
-            let keys = key_seek_keys(&slot_filters[0][pos], var, params).expect("just matched")?;
-            slot_filters[0].remove(pos);
-            if let Source::ScanLabel(label) = &source {
-                slot_filters[0].insert(
-                    0,
-                    PExpr::HasLabel {
-                        var: var.unwrap_or_default().to_string(),
-                        label: label.clone(),
-                    },
+/// WHERE conjuncts, each pushed down to its single variable's slot.
+///
+/// Kept as parser expressions rather than compiled here, so the key-seek
+/// rewrite can still recognise `key(n) = "…"` before the qualifier is dropped.
+fn push_down_where(
+    where_clause: Option<PExpr>,
+    var_slot: &AHashMap<&str, usize>,
+    slots: usize,
+) -> Result<Vec<Vec<PExpr>>, String> {
+    let mut slot_filters: Vec<Vec<PExpr>> = vec![Vec::new(); slots];
+    let Some(w) = where_clause else {
+        return Ok(slot_filters);
+    };
+    for conj in split_and(w) {
+        let vars = referenced_vars(&conj);
+        let slot = match vars.len() {
+            0 => 0, // constant predicate — evaluate at the source
+            1 => {
+                let v = vars.iter().next().unwrap();
+                *var_slot
+                    .get(v.as_str())
+                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?
+            }
+            _ => {
+                return Err(
+                    "a WHERE condition may reference only one pattern variable; \
+                     cross-variable predicates aren't supported yet"
+                        .to_string(),
                 );
             }
-            source = Source::SeekKeys(keys);
-        }
+        };
+        slot_filters[slot].push(conj);
     }
+    Ok(slot_filters)
+}
 
-    let mut steps: Vec<Step> = Vec::new();
-    let at_slot = |slot: usize| Scope {
-        var_slot: &var_slot,
-        current: slot,
+/// A `key(n) = "…"` / `key(n) IN […]` on a *scanned* source becomes a
+/// `SeekKeys` seek — an index lookup instead of a scan-and-filter.
+///
+/// The scan's label survives as a `HasLabel` filter, since the seek is by key
+/// alone. Only for `MATCH`: on a retrieval seed the predicate stays a filter,
+/// because the seed order is what the query asked for.
+fn key_seek_rewrite(
+    source: Source,
+    slot0: &mut Vec<PExpr>,
+    first_node: &NodePat,
+    params: &crate::Params,
+) -> Result<Source, String> {
+    if !matches!(source, Source::ScanAll | Source::ScanLabel(_)) {
+        return Ok(source);
+    }
+    let var = first_node.var.as_deref();
+    let Some(pos) = slot0
+        .iter()
+        .position(|e| key_seek_keys(e, var, params).is_some())
+    else {
+        return Ok(source);
     };
-    for e in slot_filters[0].drain(..) {
-        steps.push(Step::Filter(compile_expr(
-            &e,
-            embedder,
-            params,
-            &at_slot(0),
-        )?));
+    let keys = key_seek_keys(&slot0[pos], var, params).expect("just matched")?;
+    slot0.remove(pos);
+    if let Source::ScanLabel(label) = &source {
+        slot0.insert(
+            0,
+            PExpr::HasLabel {
+                var: var.unwrap_or_default().to_string(),
+                label: label.clone(),
+            },
+        );
     }
+    Ok(Source::SeekKeys(keys))
+}
 
+/// One expansion per hop, in path order, each followed by the filters that
+/// belong to the node it lands on.
+#[allow(clippy::too_many_arguments)]
+fn compile_hops(
+    steps: &mut Vec<Step>,
+    hops: &[(Hop<'_>, &NodePat)],
+    nodes: &[&NodePat],
+    slot_filters: &mut [Vec<PExpr>],
+    var_slot: &AHashMap<&str, usize>,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<(), String> {
     for idx in 1..nodes.len() {
         match &hops[idx - 1].0 {
             Hop::Rel(rel) => match rel.var_len {
@@ -189,20 +243,30 @@ pub fn compile(
         if let Some(l) = &nodes[idx].label {
             steps.push(Step::Filter(Expr::HasLabel(l.clone())));
         }
+        let scope = Scope {
+            var_slot,
+            current: idx,
+        };
         for e in slot_filters[idx].drain(..) {
-            steps.push(Step::Filter(compile_expr(
-                &e,
-                embedder,
-                params,
-                &at_slot(idx),
-            )?));
+            steps.push(Step::Filter(compile_expr(&e, embedder, params, &scope)?));
         }
     }
+    Ok(())
+}
 
-    // RETURN decides what the query *is*: naming a node (`n`, `*`) keeps the
-    // rows themselves, anything else projects them into a table.
+/// `RETURN` decides what the query *is*: naming a node (`n`, `*`) keeps the
+/// rows themselves and the tail operators apply to them; anything else
+/// projects the rows into a table, and the tail moves onto the projection.
+fn compile_return(
+    q: &Query,
+    steps: &mut Vec<Step>,
+    var_slot: &AHashMap<&str, usize>,
+    last: usize,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<Option<Projection>, String> {
     let scope = Scope {
-        var_slot: &var_slot,
+        var_slot,
         current: last,
     };
     let node_rows = q
@@ -213,96 +277,97 @@ pub fn compile(
     if node_rows && q.ret.items.len() > 1 {
         return Err(
             "RETURN mixes a node with columns of values; a node isn't a value, \
-                    so return its properties instead (`RETURN n.name, count(*)`)"
+             so return its properties instead (`RETURN n.name, count(*)`)"
                 .to_string(),
         );
     }
+    if !node_rows {
+        return projection(q, &scope, embedder, params).map(Some);
+    }
 
-    let project = match node_rows {
-        true => {
-            if let Some(ReturnItem::Var(v)) = q.ret.items.first() {
-                let slot = *var_slot
-                    .get(v.as_str())
-                    .ok_or_else(|| format!("RETURN refers to unknown variable `{v}`"))?;
-                // The pipeline ends on the last pattern node, so returning the
-                // *rows* of an earlier one is the one thing a projection can't
-                // stand in for — it would have to un-expand them.
-                if slot != last {
-                    return Err(format!(
-                        "RETURN must name the pattern's last variable; returning an earlier \
-                         variable (`{v}`) isn't supported yet — project its values instead \
-                         (`RETURN {v}.name`)"
-                    ));
-                }
-            }
-            if q.ret.distinct {
-                steps.push(Step::Distinct);
-            }
-            if !q.order_by.is_empty() {
-                steps.push(Step::Sort(compile_sort(
-                    &q.order_by,
-                    &var_slot,
-                    last,
-                    embedder,
-                    params,
-                )?));
-            }
-            if let Some(s) = q.skip {
-                steps.push(Step::Skip(s));
-            }
-            if let Some(l) = q.limit {
-                steps.push(Step::Limit(l));
-            }
-            None
+    if let Some(ReturnItem::Var(v)) = q.ret.items.first() {
+        let slot = *var_slot
+            .get(v.as_str())
+            .ok_or_else(|| format!("RETURN refers to unknown variable `{v}`"))?;
+        // The pipeline ends on the last pattern node, so returning the *rows*
+        // of an earlier one is the one thing a projection can't stand in for —
+        // it would have to un-expand them.
+        if slot != last {
+            return Err(format!(
+                "RETURN must name the pattern's last variable; returning an earlier \
+                 variable (`{v}`) isn't supported yet — project its values instead \
+                 (`RETURN {v}.name`)"
+            ));
         }
-        false => {
-            let mut items = Vec::with_capacity(q.ret.items.len());
-            for item in &q.ret.items {
-                items.push(match item {
-                    ReturnItem::Value { expr, name } => {
-                        ProjItem::value(name.clone(), compile_expr(expr, embedder, params, &scope)?)
-                    }
-                    ReturnItem::Agg {
-                        func,
+    }
+    if q.ret.distinct {
+        steps.push(Step::Distinct);
+    }
+    if !q.order_by.is_empty() {
+        steps.push(Step::Sort(compile_sort(
+            &q.order_by,
+            var_slot,
+            last,
+            embedder,
+            params,
+        )?));
+    }
+    if let Some(s) = q.skip {
+        steps.push(Step::Skip(s));
+    }
+    if let Some(l) = q.limit {
+        steps.push(Step::Limit(l));
+    }
+    Ok(None)
+}
+
+/// The table form of `RETURN`: one column per item, with the tail operators
+/// riding on the projection rather than on the rows.
+fn projection(
+    q: &Query,
+    scope: &Scope<'_, '_>,
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+) -> Result<Projection, String> {
+    let mut items = Vec::with_capacity(q.ret.items.len());
+    for item in &q.ret.items {
+        items.push(match item {
+            ReturnItem::Value { expr, name } => {
+                ProjItem::value(name.clone(), compile_expr(expr, embedder, params, scope)?)
+            }
+            ReturnItem::Agg {
+                func,
+                arg,
+                distinct,
+                name,
+            } => {
+                let arg = arg
+                    .as_ref()
+                    .map(|e| compile_expr(e, embedder, params, scope))
+                    .transpose()?;
+                ProjItem::agg(
+                    name.clone(),
+                    Agg {
+                        func: *func,
                         arg,
-                        distinct,
-                        name,
-                    } => {
-                        let arg = arg
-                            .as_ref()
-                            .map(|e| compile_expr(e, embedder, params, &scope))
-                            .transpose()?;
-                        ProjItem::agg(
-                            name.clone(),
-                            Agg {
-                                func: *func,
-                                arg,
-                                distinct: *distinct,
-                            },
-                        )
-                    }
-                    // Excluded above: these are what `node_rows` matched on.
-                    ReturnItem::Star | ReturnItem::Var(_) => unreachable!("node RETURN"),
-                });
+                        distinct: *distinct,
+                    },
+                )
             }
-            let order_by = order_columns(&q.order_by, &items, embedder, params, &scope)?;
-            Some(Projection {
-                items,
-                // Over tuples, not node ids.
-                distinct: q.ret.distinct,
-                order_by,
-                // On the tail: a LIMIT before an aggregate would change what
-                // the aggregate is over.
-                skip: q.skip,
-                limit: q.limit,
-            })
-        }
-    };
-
-    Ok(LogicalPlan {
-        source,
-        steps,
-        project,
+            // Excluded by the caller: these are what `node_rows` matched on.
+            ReturnItem::Star | ReturnItem::Var(_) => unreachable!("node RETURN"),
+        });
+    }
+    let order_by = order_columns(&q.order_by, &items, embedder, params, scope)?;
+    Ok(Projection {
+        items,
+        // Over tuples, not node ids.
+        distinct: q.ret.distinct,
+        order_by,
+        // On the tail: a LIMIT before an aggregate would change what the
+        // aggregate is over.
+        skip: q.skip,
+        limit: q.limit,
     })
 }
 

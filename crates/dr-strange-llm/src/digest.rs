@@ -436,30 +436,7 @@ pub fn digest(
 
     // Phase A (sequential): entity-link each chunk into a reuse-context block.
     // Kept sequential so the candidate graph reads are never concurrent.
-    let mut blocks: Vec<Option<String>> = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        let block = match candidates {
-            // `wants_similar` gates the chunk embedding: a grounding-only
-            // source (facts with no plane behind them — `--no-link`) answers
-            // `similar` with nothing, so embedding the chunk would spend a
-            // provider call, and require a key, for a vector nobody reads.
-            Some(src) if src.wants_similar() => {
-                let emb = embedder.embed(std::slice::from_ref(chunk))?;
-                report.embed_tokens += emb.tokens;
-                let cands = match emb.vectors.first() {
-                    Some(qv) => src.similar(qv, LINK_K)?,
-                    None => Vec::new(),
-                };
-                let block = existing_block(&cands);
-                for e in cands {
-                    existing.entry(e.key.clone()).or_insert(e);
-                }
-                block
-            }
-            _ => None,
-        };
-        blocks.push(block);
-    }
+    let blocks = link_chunks(&chunks, embedder, candidates, &mut existing, &mut report)?;
 
     // Phase B (concurrent): the per-chunk extraction chat calls — the slow,
     // network-bound part. Each recovers from a truncated reply by re-splitting.
@@ -468,63 +445,58 @@ pub fn digest(
     // Phase C (sequential, in chunk order): merge entities and relations. The
     // order is deterministic (chunk order, then sub-chunk order) despite the
     // parallel extraction above.
-    let mut entities: BTreeMap<String, DigestNode> = BTreeMap::new();
-    let mut edges: Vec<DigestEdge> = Vec::new();
-    let mut seen_rel: AHashSet<(String, String, String)> = AHashSet::new();
-    // Which chunk(s) produced each entity — stage 3 needs it to tell an entity
-    // that has more to say elsewhere in the document from one that does not
-    // (ROADMAP §8), and nothing else records it.
-    let mut origins: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-    for (chunk_index, extraction) in extracts.into_iter().enumerate() {
-        report.chat_requests += extraction.chat_requests;
-        report.input_tokens += extraction.input_tokens;
-        report.output_tokens += extraction.output_tokens;
-        for e in extraction.entities {
-            origins
-                .entry(e.key.clone())
-                .or_default()
-                .insert(chunk_index);
-            let node = entities.entry(e.key.clone()).or_insert_with(|| DigestNode {
-                key: e.key.clone(),
-                label: String::new(),
-                extra_labels: Vec::new(),
-                props: Properties::new(),
-            });
-            if node.label.is_empty() && !e.label.is_empty() {
-                node.label = e.label;
-            }
-            merge_props(&mut node.props, &e.properties);
-            if let Some(d) = e.description {
-                node.props
-                    .entry("description".into())
-                    .or_insert_with(|| desc_prop(d));
-            }
-        }
-        for r in extraction.relations {
-            if r.ty.is_empty() {
-                continue;
-            }
-            if seen_rel.insert((r.src.clone(), r.dst.clone(), r.ty.clone())) {
-                let mut props = Properties::new();
-                merge_props(&mut props, &r.properties);
-                if let Some(d) = r.description {
-                    props.insert("description".into(), desc_prop(d));
-                }
-                edges.push(DigestEdge {
-                    src: r.src,
-                    dst: r.dst,
-                    ty: r.ty,
-                    props,
-                });
-            }
-        }
-    }
+    let Merged {
+        mut entities,
+        mut edges,
+        mut origins,
+    } = merge_extractions(extracts, &mut report);
 
     // Stage 1 of extraction precision (ROADMAP §8): the chunks were read
     // independently, so the label and edge-type vocabularies never converged.
     // Reconcile each *set* — O(1) calls in document size — before anything
     // downstream sees them, keeping the document's own wording as an alias.
     if opts.mode.reconciles() {
+        reconcile_vocabulary(chat, &mut entities, &mut edges, &mut report)?;
+    }
+    if opts.mode.resolves_identity() {
+        resolve_identity(chat, &mut entities, &mut edges, &mut origins, &mut report)?;
+    }
+    if opts.mode.refines() {
+        refine_entities(
+            chat,
+            &chunks,
+            &mut entities,
+            &edges,
+            &origins,
+            opts,
+            &mut report,
+        )?;
+    }
+
+    // Whatever keys remain, check them against the graph *exactly* — the one
+    // duplicate-prevention path that does not depend on the plane's embeddings
+    // being present and usable (ROADMAP §8). Without it a re-digest of a plane
+    // with empty vectors writes a second node under a key it already holds.
+    if let Some(src) = candidates {
+        let keys: Vec<String> = entities.keys().cloned().collect();
+        for e in src.existing_keys(&keys)? {
+            existing.entry(e.key.clone()).or_insert(e);
+        }
+    }
+    finish(entities, edges, &existing, embedder, opts, &mut report)
+}
+
+/// Stage 1 of extraction precision (ROADMAP §8): the chunks were read
+/// independently, so the label and edge-type vocabularies never converged.
+/// Reconcile each *set* — O(1) calls in document size — before anything
+/// downstream sees them, keeping the document's own wording as an alias.
+fn reconcile_vocabulary(
+    chat: &(dyn Chat + Sync),
+    entities: &mut BTreeMap<String, DigestNode>,
+    edges: &mut Vec<DigestEdge>,
+    report: &mut DigestReport,
+) -> Result<()> {
+    {
         let label_counts = reconcile::tally(
             entities
                 .values()
@@ -549,7 +521,7 @@ pub fn digest(
         let (renames, r) =
             reconcile::reconcile(chat, "edge type", reconcile::EDGE_RULE, &type_counts)?;
         report.edge_types = r;
-        for edge in &mut edges {
+        for edge in edges.iter_mut() {
             if let Some(canonical) = renames.get(&edge.ty) {
                 reconcile::note_original(
                     &mut edge.props,
@@ -579,11 +551,20 @@ pub fn digest(
             "vocabulary reconciled",
         );
     }
+    Ok(())
+}
 
-    // Stage 2 of extraction precision (ROADMAP §8): the vocabulary is settled,
-    // now the entities themselves. Independent chunks name one thing several
-    // ways; merge those, keeping every absorbed key as an alias.
-    if opts.mode.resolves_identity() {
+/// Stage 2 of extraction precision (ROADMAP §8): the vocabulary is settled,
+/// now the entities themselves. Independent chunks name one thing several
+/// ways; merge those, keeping every absorbed key as an alias.
+fn resolve_identity(
+    chat: &(dyn Chat + Sync),
+    entities: &mut BTreeMap<String, DigestNode>,
+    edges: &mut Vec<DigestEdge>,
+    origins: &mut BTreeMap<String, BTreeSet<usize>>,
+    report: &mut DigestReport,
+) -> Result<()> {
+    {
         let key_counts = reconcile::tally(entities.keys().map(String::as_str));
         let descriptions: BTreeMap<String, String> = entities
             .iter()
@@ -634,7 +615,7 @@ pub fn digest(
             // Move every edge onto the surviving endpoints, then collapse the
             // duplicates that creates — and the self-loops, which are what two
             // names for one entity related to each other become.
-            for edge in &mut edges {
+            for edge in edges.iter_mut() {
                 if let Some(into) = renames.get(&edge.src) {
                     edge.src = into.clone();
                 }
@@ -662,14 +643,26 @@ pub fn digest(
             "identity resolved",
         );
     }
+    Ok(())
+}
 
-    // Stage 3 (ROADMAP §8): the graph now holds the right things under the
-    // right names, but each still says only what its first chunk said. Re-read
-    // every entity that is mentioned somewhere its own chunks did not cover.
-    if opts.mode.refines() {
+/// Stage 3 (ROADMAP §8): the graph now holds the right things under the right
+/// names, but each still says only what its first chunk said. Re-read every
+/// entity that is mentioned somewhere its own chunks did not cover.
+#[allow(clippy::too_many_arguments)]
+fn refine_entities(
+    chat: &(dyn Chat + Sync),
+    chunks: &[String],
+    entities: &mut BTreeMap<String, DigestNode>,
+    edges: &[DigestEdge],
+    origins: &BTreeMap<String, BTreeSet<usize>>,
+    opts: &DigestOptions,
+    report: &mut DigestReport,
+) -> Result<()> {
+    {
         let degrees = {
             let mut d: BTreeMap<String, usize> = BTreeMap::new();
-            for e in &edges {
+            for e in edges.iter() {
                 *d.entry(e.src.clone()).or_default() += 1;
                 *d.entry(e.dst.clone()).or_default() += 1;
             }
@@ -683,8 +676,8 @@ pub fn digest(
             })
             .collect();
         let mut candidates = refine::candidates(
-            &chunks,
-            &origins,
+            chunks,
+            origins,
             &degrees,
             &prop_counts,
             opts.refine_max_context,
@@ -779,18 +772,19 @@ pub fn digest(
             "entities refined",
         );
     }
+    Ok(())
+}
 
-    // Whatever keys remain, check them against the graph *exactly* — the one
-    // duplicate-prevention path that does not depend on the plane's embeddings
-    // being present and usable (ROADMAP §8). Without it a re-digest of a plane
-    // with empty vectors writes a second node under a key it already holds.
-    if let Some(src) = candidates {
-        let keys: Vec<String> = entities.keys().cloned().collect();
-        for e in src.existing_keys(&keys)? {
-            existing.entry(e.key.clone()).or_insert(e);
-        }
-    }
-
+/// The tail every mode reaches: drop what is already in the graph, drop the
+/// relations that lead nowhere, embed, and stamp provenance.
+fn finish(
+    entities: BTreeMap<String, DigestNode>,
+    mut edges: Vec<DigestEdge>,
+    existing: &AHashMap<String, ExistingEntity>,
+    embedder: &dyn Embedder,
+    opts: &DigestOptions,
+    report: &mut DigestReport,
+) -> Result<DigestResult> {
     // Entities the model reused an existing key for are linked, not re-created:
     // drop them from the new-node set (bulk load would otherwise write a second
     // node under a key the plane already holds and corrupt the key index).
@@ -858,8 +852,113 @@ pub fn digest(
     Ok(DigestResult {
         nodes,
         edges,
-        report,
+        report: std::mem::take(report),
     })
+}
+
+/// Phase A: for each chunk, the block of existing entities worth reusing.
+///
+/// `wants_similar` gates the chunk embedding: a grounding-only source (facts
+/// with no plane behind them — `--no-link`) answers `similar` with nothing, so
+/// embedding the chunk would spend a provider call, and require a key, for a
+/// vector nobody reads.
+fn link_chunks(
+    chunks: &[String],
+    embedder: &dyn Embedder,
+    candidates: Option<&dyn CandidateSource>,
+    existing: &mut AHashMap<String, ExistingEntity>,
+    report: &mut DigestReport,
+) -> Result<Vec<Option<String>>> {
+    let mut blocks: Vec<Option<String>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let block = match candidates {
+            Some(src) if src.wants_similar() => {
+                let emb = embedder.embed(std::slice::from_ref(chunk))?;
+                report.embed_tokens += emb.tokens;
+                let cands = match emb.vectors.first() {
+                    Some(qv) => src.similar(qv, LINK_K)?,
+                    None => Vec::new(),
+                };
+                let block = existing_block(&cands);
+                for e in cands {
+                    existing.entry(e.key.clone()).or_insert(e);
+                }
+                block
+            }
+            _ => None,
+        };
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// What phase C folds the per-chunk extractions into.
+struct Merged {
+    entities: BTreeMap<String, DigestNode>,
+    edges: Vec<DigestEdge>,
+    /// Which chunk(s) produced each entity. Stage 3 needs it to tell an entity
+    /// that has more to say elsewhere in the document from one that does not
+    /// (ROADMAP §8), and nothing else records it.
+    origins: BTreeMap<String, BTreeSet<usize>>,
+}
+
+/// Phase C: merge the extractions in chunk order, so the result is the same
+/// however the parallel calls above happened to interleave.
+fn merge_extractions(extracts: Vec<ChunkExtract>, report: &mut DigestReport) -> Merged {
+    let mut m = Merged {
+        entities: BTreeMap::new(),
+        edges: Vec::new(),
+        origins: BTreeMap::new(),
+    };
+    let mut seen_rel: AHashSet<(String, String, String)> = AHashSet::new();
+    for (chunk_index, extraction) in extracts.into_iter().enumerate() {
+        report.chat_requests += extraction.chat_requests;
+        report.input_tokens += extraction.input_tokens;
+        report.output_tokens += extraction.output_tokens;
+        for e in extraction.entities {
+            m.origins
+                .entry(e.key.clone())
+                .or_default()
+                .insert(chunk_index);
+            let node = m
+                .entities
+                .entry(e.key.clone())
+                .or_insert_with(|| DigestNode {
+                    key: e.key.clone(),
+                    label: String::new(),
+                    extra_labels: Vec::new(),
+                    props: Properties::new(),
+                });
+            if node.label.is_empty() && !e.label.is_empty() {
+                node.label = e.label;
+            }
+            merge_props(&mut node.props, &e.properties);
+            if let Some(d) = e.description {
+                node.props
+                    .entry("description".into())
+                    .or_insert_with(|| desc_prop(d));
+            }
+        }
+        for r in extraction.relations {
+            if r.ty.is_empty() {
+                continue;
+            }
+            if seen_rel.insert((r.src.clone(), r.dst.clone(), r.ty.clone())) {
+                let mut props = Properties::new();
+                merge_props(&mut props, &r.properties);
+                if let Some(d) = r.description {
+                    props.insert("description".into(), desc_prop(d));
+                }
+                m.edges.push(DigestEdge {
+                    src: r.src,
+                    dst: r.dst,
+                    ty: r.ty,
+                    props,
+                });
+            }
+        }
+    }
+    m
 }
 
 // ---- helpers -------------------------------------------------------------

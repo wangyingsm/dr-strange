@@ -222,26 +222,7 @@ pub fn write_history(db: &Database, plane_name: &str, facts: &Preprocessed) -> R
     let created: BTreeSet<&str> = creates.iter().map(|n| n.key.as_str()).collect();
     let resolves = |key: &str| created.contains(key) || stored.contains_key(key);
 
-    // What the moving pointers assert today, so an edge that did not change is
-    // left exactly where it is. Rewriting every one of them each digest would
-    // work and would churn the graph for nothing — and would make "3 edges
-    // replaced" stop meaning anything.
-    let by_id: BTreeMap<dr_strange_core::NodeId, &str> = stored
-        .iter()
-        .map(|(key, node)| (node.id, key.as_str()))
-        .collect();
-    let mut standing: BTreeMap<(&str, String, &str), (dr_strange_core::EdgeId, Properties)> =
-        BTreeMap::new();
-    for (key, id) in &moving {
-        for n in plane.neighbors(*id, Dir::Out, None)? {
-            let Some(dst) = by_id.get(&n.node) else {
-                continue;
-            };
-            if let Some(edge) = plane.edge(n.edge)? {
-                standing.insert((key, edge.ty, dst), (n.edge, edge.properties));
-            }
-        }
-    }
+    let mut standing = standing_edges(&plane, &moving, &stored)?;
 
     let mut wanted: Vec<&DigestEdge> = Vec::new();
     let mut edge_deletes: Vec<dr_strange_core::EdgeId> = Vec::new();
@@ -284,21 +265,23 @@ pub fn write_history(db: &Database, plane_name: &str, facts: &Preprocessed) -> R
             stats.edges_deleted += 1;
         }
     }
-    for (id, fact) in &patches {
-        let old = &stored[fact.key.as_str()];
-        for key in old.properties.keys() {
-            if !key.starts_with('_') && !fact.props.contains_key(key) {
-                txn.remove_prop(*id, key)?;
-            }
-        }
-        for (key, desc) in &fact.props {
-            if old.properties.get(key).map(|o| &o.value) != Some(&desc.value) {
-                txn.set_prop(*id, key, desc.clone())?;
-            }
-        }
-    }
+    apply_patches(&mut txn, &patches, &stored)?;
     stats.nodes_patched = patches.len();
 
+    (stats.nodes_created, stats.edges_created) = bulk_load_facts(&mut txn, &creates, &wanted)?;
+    txn.commit()?;
+    Ok(stats)
+}
+
+/// The new nodes and edges, in one bulk load. Returns what it wrote.
+///
+/// The label slices are built first and held here: a `BulkNode` borrows its
+/// labels, so the backing `Vec`s have to outlive the payload.
+fn bulk_load_facts(
+    txn: &mut dr_strange_core::WriteTxn<'_>,
+    creates: &[&DigestNode],
+    wanted: &[&DigestEdge],
+) -> Result<(usize, usize)> {
     let label_slots: Vec<Vec<&str>> = creates
         .iter()
         .map(|n| {
@@ -325,11 +308,62 @@ pub fn write_history(db: &Database, plane_name: &str, facts: &Preprocessed) -> R
             props: e.props.clone(),
         })
         .collect();
-    stats.nodes_created = nodes.len();
-    stats.edges_created = edges.len();
+    let counts = (nodes.len(), edges.len());
     txn.bulk_load(nodes, edges)?;
-    txn.commit()?;
-    Ok(stats)
+    Ok(counts)
+}
+
+/// What the moving pointers assert today, keyed by (source, type, target).
+///
+/// An edge that did not change is then left exactly where it is. Rewriting
+/// every one of them each digest would work and would churn the graph for
+/// nothing — and would make "3 edges replaced" stop meaning anything.
+#[allow(clippy::type_complexity)]
+fn standing_edges<'a>(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    moving: &BTreeMap<&'a str, dr_strange_core::NodeId>,
+    stored: &'a BTreeMap<String, dr_strange_core::NodeRecord>,
+) -> Result<BTreeMap<(&'a str, String, &'a str), (dr_strange_core::EdgeId, Properties)>> {
+    let by_id: BTreeMap<dr_strange_core::NodeId, &str> = stored
+        .iter()
+        .map(|(key, node)| (node.id, key.as_str()))
+        .collect();
+    let mut standing = BTreeMap::new();
+    for (key, id) in moving {
+        for n in plane.neighbors(*id, Dir::Out, None)? {
+            let Some(dst) = by_id.get(&n.node) else {
+                continue;
+            };
+            if let Some(edge) = plane.edge(n.edge)? {
+                standing.insert((*key, edge.ty, *dst), (n.edge, edge.properties));
+            }
+        }
+    }
+    Ok(standing)
+}
+
+/// Bring a stored node's properties up to what the fact says: drop what the
+/// fact no longer carries (leaving the `_`-prefixed bookkeeping alone), and
+/// set what actually differs.
+fn apply_patches(
+    txn: &mut dr_strange_core::WriteTxn<'_>,
+    patches: &[(dr_strange_core::NodeId, &DigestNode)],
+    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+) -> Result<()> {
+    for (id, fact) in patches {
+        let old = &stored[fact.key.as_str()];
+        for key in old.properties.keys() {
+            if !key.starts_with('_') && !fact.props.contains_key(key) {
+                txn.remove_prop(*id, key)?;
+            }
+        }
+        for (key, desc) in &fact.props {
+            if old.properties.get(key).map(|o| &o.value) != Some(&desc.value) {
+                txn.set_prop(*id, key, desc.clone())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The label an immutable fact carries — the one kind of node whose edges are

@@ -87,80 +87,22 @@ pub fn ask(
         .map_err(|e| anyhow::anyhow!("reading the plane catalog: {e}"))?;
     let tools = embedder.is_some();
     let system = system_prompt(&catalog, tools);
-    let question = question.trim();
-    let mut transcript = format!("Question: {question}");
+    let mut c = Conversation::new(question.trim());
     let steps = opts.max_attempts.max(1);
     let mut turns = 0u32;
-    let mut last_err = String::new();
-    // A human-readable log of what the model did each turn (tool calls +
-    // rejected plans), surfaced for debugging/refinement.
-    let mut trace: Vec<String> = Vec::new();
-    // How many sub-questions the model declared (via its `asks` decomposition);
-    // we then require one plan per sub-question.
-    let mut expected: Option<usize> = None;
-    // How many find_edge calls the model made — we require one per ask so it
-    // actually sees the ranked candidates (and every fitting edge) rather than
-    // picking a single literal edge off the schema.
-    let mut edge_searches = 0usize;
 
     for i in 0..steps {
         turns += 1;
         // Reserve the final turn for the plan, so a tool-happy model can't burn
         // the whole budget searching and never answer.
         let is_last = i + 1 == steps;
-        let user = if tools && !is_last {
-            format!(
-                "{transcript}\n\nReply with ONE JSON object — a tool call \
-                 ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
-            )
-        } else if tools {
-            format!(
-                "{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s). If the question asked for more than one thing, return one plan per part: {{\"plans\": […]}}; otherwise {{\"plan\": …}}."
-            )
-        } else {
-            format!("{transcript}\n\nReturn the plan JSON.")
-        };
-        let reply = chat.complete(&system, &user)?;
+        let reply = chat.complete(&system, &c.turn_prompt(tools, is_last))?;
         let json = extract_json(&reply.text).to_string();
 
-        // First, the model declares its decomposition: {"asks": ["…", "…"]}.
-        // Remember the count so we can require one plan per sub-question.
-        if tools
-            && !is_last
-            && let Some(asks) = parse_asks(&json)
-        {
-            let n = asks.len();
-            expected = Some(n);
-            trace.push(format!("decompose → {n} ask(s): {}", asks.join(" | ")));
-            transcript.push_str(&format!(
-                "\n\nYou split the question into {n} sub-question(s): {asks:?}. Now call find_edge on \
-                 EACH sub-question's relationship (one at a time), then find_entity for named \
-                 entities, then return at least {n} plan(s) — one per (sub-question × fitting edge)."
-            ));
+        if tools && !is_last && c.take_decomposition(&json) {
             continue;
         }
-
-        // A tool call short-circuits (but not on the final turn): run it, feed
-        // the result back, continue.
-        if tools
-            && !is_last
-            && let Some(call) = parse_tool_call(&json)
-        {
-            if call.tool == "find_edge" {
-                edge_searches += 1;
-            }
-            let result = run_tool(embedder.expect("tools ⇒ embedder"), plane, &catalog, &call);
-            let result = result.unwrap_or_else(|e| format!("tool error: {e}"));
-            trace.push(format!(
-                "{}(\"{}\") → {}",
-                call.tool,
-                call.query,
-                result.chars().take(500).collect::<String>()
-            ));
-            transcript.push_str(&format!(
-                "\n\nYou called {}(\"{}\"):\n{result}",
-                call.tool, call.query
-            ));
+        if tools && !is_last && c.take_tool_call(&json, embedder, plane, &catalog) {
             continue;
         }
 
@@ -171,40 +113,8 @@ pub fn ask(
                 for p in &mut plans {
                     ensure_limit(p, opts.limit);
                 }
-                // Require a find_edge per sub-question first, so the model saw
-                // the ranked candidates (and every fitting edge) instead of
-                // picking one literal edge off the schema. Skip on the last turn.
-                if let Some(n) = expected
-                    && edge_searches < n
-                    && !is_last
-                {
-                    last_err = format!(
-                        "before planning you must call find_edge for EACH of the {n} sub-questions' \
-                         relationships (you've called it {edge_searches}× — its ranked candidates \
-                         reveal every fitting edge, e.g. both IMPLEMENTS and DEVELOPS for \"make\")"
-                    );
-                    trace.push(format!("plan rejected: {last_err}"));
-                    transcript.push_str(&format!(
-                        "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again."
-                    ));
-                    continue;
-                }
-                // Enforce the declared decomposition: one plan per sub-question
-                // (the model tends to answer only the first otherwise). Skip the
-                // check on the final turn — take what we have rather than fail.
-                if let Some(n) = expected
-                    && plans.len() < n
-                    && !is_last
-                {
-                    last_err = format!(
-                        "you split the question into {n} sub-questions but returned only {} plan(s) — \
-                         return one plan per sub-question in {{\"plans\":[…]}}",
-                        plans.len()
-                    );
-                    trace.push(format!("plan rejected: {last_err}"));
-                    transcript.push_str(&format!(
-                        "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again."
-                    ));
+                if let Some(why) = c.plans_fall_short(&plans, is_last) {
+                    c.reject(&json, why);
                     continue;
                 }
                 if opts.dry_run {
@@ -214,7 +124,7 @@ pub fn ask(
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         ran: false,
-                        trace,
+                        trace: c.trace,
                     });
                 }
                 // Run each plan and union their subgraphs into one graph.
@@ -226,26 +136,160 @@ pub fn ask(
                             nodes,
                             edges,
                             ran: true,
-                            trace,
+                            trace: c.trace,
                         });
                     }
-                    Err(e) => last_err = format!("running the plan(s) failed: {e}"),
+                    Err(e) => c.last_err = format!("running the plan(s) failed: {e}"),
                 }
             }
-            Ok(_) => last_err = "you returned an empty plan list".to_string(),
-            Err(e) => last_err = format!("that was not a valid tool call or plan JSON: {e}"),
+            Ok(_) => c.last_err = "you returned an empty plan list".to_string(),
+            Err(e) => c.last_err = format!("that was not a valid tool call or plan JSON: {e}"),
         }
-        trace.push(format!("plan rejected: {last_err}"));
-        transcript.push_str(&format!(
-            "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again.",
-        ));
+        let why = std::mem::take(&mut c.last_err);
+        c.reject(&json, why);
     }
-    let reason = if last_err.is_empty() {
+    let reason = if c.last_err.is_empty() {
         "the model kept calling tools without emitting a plan".to_string()
     } else {
-        last_err
+        c.last_err
     };
     bail!("couldn't produce a runnable plan after {turns} steps: {reason}")
+}
+
+/// What one `ask` carries across turns: the running transcript the model is
+/// re-shown, the human-readable trace of what it did, and the two counts that
+/// decide whether a plan is accepted.
+struct Conversation {
+    transcript: String,
+    /// A human-readable log of each turn (tool calls + rejected plans),
+    /// surfaced for debugging and refinement.
+    trace: Vec<String>,
+    /// How many sub-questions the model declared via its `asks` decomposition;
+    /// one plan per sub-question is then required.
+    expected: Option<usize>,
+    /// How many `find_edge` calls it made — one per ask is required, so it
+    /// actually sees the ranked candidates (and every fitting edge) rather than
+    /// picking a single literal edge off the schema.
+    edge_searches: usize,
+    last_err: String,
+}
+
+impl Conversation {
+    fn new(question: &str) -> Self {
+        Self {
+            transcript: format!("Question: {question}"),
+            trace: Vec::new(),
+            expected: None,
+            edge_searches: 0,
+            last_err: String::new(),
+        }
+    }
+
+    /// The transcript plus the instruction for this turn. The final turn says
+    /// so out loud, because that is the one where tools are refused.
+    fn turn_prompt(&self, tools: bool, is_last: bool) -> String {
+        let transcript = &self.transcript;
+        if tools && !is_last {
+            format!(
+                "{transcript}\n\nReply with ONE JSON object — a tool call \
+                 ({{\"tool\":…}}) or the final plan ({{\"plan\":…}})."
+            )
+        } else if tools {
+            format!(
+                "{transcript}\n\nFINAL TURN — do NOT call tools. Reply with ONLY the plan(s). If the question asked for more than one thing, return one plan per part: {{\"plans\": […]}}; otherwise {{\"plan\": …}}."
+            )
+        } else {
+            format!("{transcript}\n\nReturn the plan JSON.")
+        }
+    }
+
+    /// The model declaring its decomposition: `{"asks": ["…", "…"]}`. Remember
+    /// the count, so one plan per sub-question can be required later.
+    fn take_decomposition(&mut self, json: &str) -> bool {
+        let Some(asks) = parse_asks(json) else {
+            return false;
+        };
+        let n = asks.len();
+        self.expected = Some(n);
+        self.trace
+            .push(format!("decompose → {n} ask(s): {}", asks.join(" | ")));
+        self.transcript.push_str(&format!(
+            "\n\nYou split the question into {n} sub-question(s): {asks:?}. Now call find_edge on \
+             EACH sub-question's relationship (one at a time), then find_entity for named \
+             entities, then return at least {n} plan(s) — one per (sub-question × fitting edge)."
+        ));
+        true
+    }
+
+    /// A tool call: run it and feed the result back for the next turn.
+    fn take_tool_call(
+        &mut self,
+        json: &str,
+        embedder: Option<&dyn Embedder>,
+        plane: &PlaneHandle<'_>,
+        catalog: &dr_strange_core::CatalogSnapshot,
+    ) -> bool {
+        let Some(call) = parse_tool_call(json) else {
+            return false;
+        };
+        if call.tool == "find_edge" {
+            self.edge_searches += 1;
+        }
+        let result = run_tool(embedder.expect("tools ⇒ embedder"), plane, catalog, &call)
+            .unwrap_or_else(|e| format!("tool error: {e}"));
+        self.trace.push(format!(
+            "{}(\"{}\") → {}",
+            call.tool,
+            call.query,
+            result.chars().take(500).collect::<String>()
+        ));
+        self.transcript.push_str(&format!(
+            "\n\nYou called {}(\"{}\"):\n{result}",
+            call.tool, call.query
+        ));
+        true
+    }
+
+    /// Why this plan set is not yet good enough, or `None` to accept it.
+    ///
+    /// Both checks are skipped on the final turn: take what there is rather
+    /// than spend the last turn refusing it.
+    fn plans_fall_short(&self, plans: &[LogicalPlan], is_last: bool) -> Option<String> {
+        let n = self.expected?;
+        if is_last {
+            return None;
+        }
+        // A find_edge per sub-question, so the model saw the ranked candidates
+        // instead of picking one literal edge off the schema.
+        if self.edge_searches < n {
+            return Some(format!(
+                "before planning you must call find_edge for EACH of the {n} sub-questions' \
+                 relationships (you've called it {}× — its ranked candidates \
+                 reveal every fitting edge, e.g. both IMPLEMENTS and DEVELOPS for \"make\")",
+                self.edge_searches
+            ));
+        }
+        // One plan per sub-question: the model tends to answer only the first
+        // otherwise.
+        if plans.len() < n {
+            return Some(format!(
+                "you split the question into {n} sub-questions but returned only {} plan(s) — \
+                 return one plan per sub-question in {{\"plans\":[…]}}",
+                plans.len()
+            ));
+        }
+        None
+    }
+
+    /// Record a refusal and put it to the model, so the next turn sees both
+    /// what it said and why that did not work.
+    fn reject(&mut self, json: &str, why: String) {
+        self.trace.push(format!("plan rejected: {why}"));
+        self.transcript.push_str(&format!(
+            "\n\nYour previous answer:\n{json}\nIt failed — {why}\nTry again."
+        ));
+        self.last_err = why;
+    }
 }
 
 // ---- tools ----------------------------------------------------------------

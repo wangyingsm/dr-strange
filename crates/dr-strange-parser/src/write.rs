@@ -261,59 +261,21 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
 
     for op in &stmt.ops {
         match op {
-            WriteOp::Create(paths) => match &stmt.binding {
-                // Standalone CREATE: build once; vars are scoped to it.
-                None => {
-                    let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
-                    for path in paths {
-                        create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
-                    }
-                }
-                // CREATE after MATCH: once per matched row, with the matched
-                // variable pre-bound so `(a)` anchors to that node.
-                Some((bound, _)) => {
-                    for id in &ids {
-                        let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
-                        vars.insert(bound.as_str(), *id);
-                        for path in paths {
-                            create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
-                        }
-                    }
-                }
-            },
-            WriteOp::Merge(m) => match &stmt.binding {
-                // Standalone MERGE: run once.
-                None => {
-                    let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
-                    merge_path(
-                        plane,
-                        &mut txn,
-                        m,
-                        &mut vars,
-                        &mut merged,
-                        &mut labels,
-                        &mut summary,
-                        &stmt.params,
-                    )?;
-                }
-                // MERGE after MATCH: once per matched row, anchored to that node.
-                Some((bound, _)) => {
-                    for id in &ids {
-                        let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
-                        vars.insert(bound.as_str(), *id);
-                        merge_path(
-                            plane,
-                            &mut txn,
-                            m,
-                            &mut vars,
-                            &mut merged,
-                            &mut labels,
-                            &mut summary,
-                            &stmt.params,
-                        )?;
-                    }
-                }
-            },
+            WriteOp::Create(paths) => {
+                run_create(&mut txn, paths, stmt, &ids, &mut summary)?;
+            }
+            WriteOp::Merge(m) => {
+                run_merge(
+                    plane,
+                    &mut txn,
+                    m,
+                    stmt,
+                    &ids,
+                    &mut merged,
+                    &mut labels,
+                    &mut summary,
+                )?;
+            }
             WriteOp::Set(items) => {
                 for id in &ids {
                     for it in items {
@@ -329,31 +291,126 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 }
             }
             WriteOp::Delete { detach, .. } => {
-                for id in &ids {
-                    // Plain DELETE refuses a node with relationships (Cypher
-                    // semantics); DETACH DELETE cascades (core deletes incident
-                    // edges with the node).
-                    if !detach
-                        && !plane
-                            .neighbors(*id, Dir::Both, None)
-                            .map_err(|e| e.to_string())?
-                            .is_empty()
-                    {
-                        return Err(format!(
-                            "cannot DELETE node {} — it still has relationships; use DETACH DELETE",
-                            id.0
-                        ));
-                    }
-                    txn.delete_node(*id).map_err(|e| e.to_string())?;
-                    summary.nodes_deleted += 1;
-                    labels.remove(&id.0);
-                }
+                run_delete(plane, &mut txn, &ids, *detach, &mut labels, &mut summary)?;
             }
         }
     }
 
     txn.commit().map_err(|e| e.to_string())?;
     Ok(summary)
+}
+
+/// `CREATE`, standalone or after a `MATCH`.
+///
+/// Standalone builds once, with variables scoped to the clause. After a match
+/// it runs once per matched row with the matched variable pre-bound, so `(a)`
+/// anchors to that row's node rather than creating a fresh one.
+fn run_create<'a>(
+    txn: &mut WriteTxn<'_>,
+    paths: &'a [CreatePath],
+    stmt: &'a WriteStatement,
+    ids: &[NodeId],
+    summary: &mut WriteSummary,
+) -> Result<(), String> {
+    match &stmt.binding {
+        None => {
+            let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
+            for path in paths {
+                create_path(txn, path, &mut vars, summary, &stmt.params)?;
+            }
+        }
+        Some((bound, _)) => {
+            for id in ids {
+                let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
+                vars.insert(bound.as_str(), *id);
+                for path in paths {
+                    create_path(txn, path, &mut vars, summary, &stmt.params)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `MERGE`, standalone or once per matched row — the same anchoring rule as
+/// [`run_create`]. `merged` outlives the rows on purpose: a keyed node two rows
+/// both name must resolve to one node, and `node_by_key` cannot see a create
+/// this transaction has not committed.
+#[allow(clippy::too_many_arguments)]
+fn run_merge<'a>(
+    plane: &PlaneHandle<'_>,
+    txn: &mut WriteTxn<'_>,
+    m: &'a MergeClause,
+    stmt: &'a WriteStatement,
+    ids: &[NodeId],
+    merged: &mut AHashMap<&'a str, NodeId>,
+    labels: &mut AHashMap<u64, Vec<String>>,
+    summary: &mut WriteSummary,
+) -> Result<(), String> {
+    match &stmt.binding {
+        None => {
+            let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
+            merge_path(
+                plane,
+                txn,
+                m,
+                &mut vars,
+                merged,
+                labels,
+                summary,
+                &stmt.params,
+            )?;
+        }
+        Some((bound, _)) => {
+            for id in ids {
+                let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
+                vars.insert(bound.as_str(), *id);
+                merge_path(
+                    plane,
+                    txn,
+                    m,
+                    &mut vars,
+                    merged,
+                    labels,
+                    summary,
+                    &stmt.params,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE`, and `DETACH DELETE`.
+///
+/// Plain `DELETE` refuses a node that still has relationships, which is
+/// Cypher's own semantics; `DETACH DELETE` cascades, core deleting the
+/// incident edges along with the node.
+fn run_delete(
+    plane: &PlaneHandle<'_>,
+    txn: &mut WriteTxn<'_>,
+    ids: &[NodeId],
+    detach: bool,
+    labels: &mut AHashMap<u64, Vec<String>>,
+    summary: &mut WriteSummary,
+) -> Result<(), String> {
+    for id in ids {
+        if !detach
+            && !plane
+                .neighbors(*id, Dir::Both, None)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        {
+            return Err(format!(
+                "cannot DELETE node {} — it still has relationships; use DETACH DELETE",
+                id.0
+            ));
+        }
+        txn.delete_node(*id).map_err(|e| e.to_string())?;
+        summary.nodes_deleted += 1;
+        labels.remove(&id.0);
+    }
+    Ok(())
 }
 
 fn apply_set(
