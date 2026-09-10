@@ -4,6 +4,19 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-09-10
+
+### Fixed
+
+- **`grep` says why a regex-shaped pattern found nothing.** A regex sent to a
+  literal search returned `no matches`, the same words a real absence returns.
+  A miss whose pattern carries `|`, `.*`, `.+`, `\d`, `\w`, `\s` or `\b` now
+  names the construct and points at `regex: true`.
+
+- **The wasm plugin sandbox takes its patch.** wasmtime moves to 47.0.4 for
+  RUSTSEC-2026-0269, a filesystem sandbox escape on a trailing slash, and
+  RUSTSEC-2026-0268.
+
 ## [2.7.0] - 2026-09-06
 
 ### Added
