@@ -4,27 +4,12 @@
 //! needs no wasm toolchain — it is the *host* under test.
 #![cfg(feature = "plugins")]
 
+mod common;
+
 use std::path::Path;
 
-use dr_strange_llm::preprocess::{
-    Input, Limits, LocalFiles, Plugins, Preprocessor, WasmPlugin, route_tree,
-};
-
-fn fixture(mode: &str, limits: Limits) -> WasmPlugin {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture.wasm");
-    WasmPlugin::load(&path, vec![("mode".to_string(), mode.to_string())], limits)
-        .expect("the committed fixture must load")
-}
-
-/// A scratch dir with one claimable file, for calls that need a host.
-fn scratch(name: &str) -> (std::path::PathBuf, LocalFiles) {
-    let dir = std::env::temp_dir().join(format!("drsg-sandbox-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.fix"), "x").unwrap();
-    let host = LocalFiles::new(&dir).unwrap();
-    (dir, host)
-}
+use common::{fixture, scratch};
+use dr_strange_llm::preprocess::{Input, Limits, Plugins, Preprocessor, WasmPlugin, route_tree};
 
 /// The well-behaved mode round-trips through parse and assemble — the control
 /// the hostile cases are measured against.
@@ -294,44 +279,6 @@ fn a_plugin_that_fails_on_every_file_is_still_fatal() {
     assert!(
         said.contains("all 2") && said.contains("fixture"),
         "the error should say the plugin failed on everything: {said}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// What the plugins hold is a gauge the process can read: loading a plugin
-/// adds its compiled image, a call adds the guest's memory while it runs and
-/// takes it back when it returns, and dropping the plugin takes the image
-/// back — so the figure a dashboard shows beside the resident set is what is
-/// held *now*, not what was ever allocated.
-#[test]
-fn what_the_plugins_hold_is_a_gauge() {
-    use dr_strange_llm::plugin_memory_bytes;
-    let (dir, host) = scratch("gauge");
-    let before = plugin_memory_bytes();
-    let plugin = fixture("ok", Limits::default());
-    let loaded = plugin_memory_bytes();
-    assert!(
-        loaded > before,
-        "a loaded plugin holds its compiled image: {before} -> {loaded}"
-    );
-    plugin
-        .preprocess(
-            &Input::Files {
-                paths: &["a.fix".to_string()],
-            },
-            &host,
-        )
-        .unwrap();
-    assert_eq!(
-        plugin_memory_bytes(),
-        loaded,
-        "a finished call gives the guest's memory back"
-    );
-    drop(plugin);
-    assert_eq!(
-        plugin_memory_bytes(),
-        before,
-        "a dropped plugin gives its image back"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

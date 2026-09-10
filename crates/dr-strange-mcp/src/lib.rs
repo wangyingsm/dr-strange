@@ -929,6 +929,11 @@ fn grep_tree(
     ];
     const MAX_FILE: u64 = 2 * 1024 * 1024;
     const MAX_LINE: usize = 300;
+    // Constructs that are near-certainly a reach for a pattern language this
+    // search does not have. `(`, `[` and a lone `.` are deliberately absent:
+    // they are ordinary in a literal code search (`TrimPrefix(`), and a hint
+    // that cries wolf is a hint that gets read past.
+    const REGEX_TELLS: &[&str] = &["|", ".*", ".+", r"\d", r"\w", r"\s", r"\b"];
     let cap = req.max_results.unwrap_or(50).clamp(1, 200);
     let around = req.context.unwrap_or(0).min(10);
     let matcher = Matcher::new(req)?;
@@ -1046,6 +1051,19 @@ fn grep_tree(
         out.push_str("no matches\n");
         if let Some(f) = filter {
             out.push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+        }
+        // A regex-shaped pattern sent to a literal search fails exactly like a
+        // real absence: both say "no matches". That silence is what turns a
+        // mis-typed pattern into "I checked, it isn't there" in someone's
+        // conclusion. Only when `regex` was not asked for — having asked, an
+        // empty result means what it says.
+        if !req.regex.unwrap_or(false)
+            && let Some(tell) = REGEX_TELLS.iter().find(|t| req.pattern.contains(**t))
+        {
+            out.push_str(&format!(
+                "note: search text contains a regexp pattern ({tell}). it seems to be a pattern match \
+                 but `regex` flag argument set to false. you can retry this search with `regex` flag set to true.\n"
+            ));
         }
     } else if capped {
         out.push_str(&format!(
@@ -3363,6 +3381,58 @@ mod grep_tests {
         assert_eq!(index.enclosing("src/m.rs", 12), Some("m::f"));
         assert_eq!(index.enclosing("src/m.rs", 30), Some("m::g"));
         assert_eq!(index.enclosing("src/m.rs", 9), None);
+    }
+
+    /// A regex handed to a literal search returns `no matches` — the same words
+    /// a real absence returns. Both observed cases came back silent and were
+    /// written up as "checked, not present"; the note is what breaks the tie.
+    #[test]
+    fn a_regex_shaped_pattern_says_why_it_found_nothing() {
+        let dir = std::env::temp_dir().join(format!("drsg-grep-re-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+        for pattern in ["alpha|beta", r#"TrimPrefix(.*"models/""#] {
+            let out = grep_tree(&dir, &req(pattern), None).unwrap();
+            assert!(out.contains("no matches"), "{pattern}: {out}");
+            assert!(out.contains("regexp pattern"), "{pattern}: {out}");
+            assert!(
+                out.contains("retry this search with `regex` flag set to true"),
+                "{pattern}: {out}"
+            );
+        }
+        // Each half on its own is found, which is the whole point of the note.
+        assert!(
+            grep_tree(&dir, &req("alpha"), None)
+                .unwrap()
+                .contains("a.rs:1:")
+        );
+
+        // Having asked for a regex, an empty result means what it says — the
+        // note would be telling the caller about a choice they already made.
+        let asked = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "gamma|delta".into(),
+                regex: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(asked.contains("no matches"), "{asked}");
+        assert!(!asked.contains("regexp pattern"), "{asked}");
+
+        // A genuine absence stays quiet — the note must not fire on every miss,
+        // or it stops being read.
+        let plain = grep_tree(&dir, &req("gamma"), None).unwrap();
+        assert!(plain.contains("no matches"), "{plain}");
+        assert!(!plain.contains("regexp pattern"), "{plain}");
+        // Nor on a literal that merely contains a paren or a dot.
+        let paren = grep_tree(&dir, &req("gamma(x)"), None).unwrap();
+        assert!(!paren.contains("regexp pattern"), "{paren}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
