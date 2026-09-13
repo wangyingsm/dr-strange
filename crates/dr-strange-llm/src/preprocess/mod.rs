@@ -263,7 +263,7 @@ const DOCUMENT_EXTS: &[&str] = &[
 /// A `target/` can outweigh the source it was built from by orders of
 /// magnitude, and a repository checked out without its `.gitignore` is still
 /// not a request to ingest build output.
-const IGNORED_DIRS: &[&str] = &[
+pub(crate) const IGNORED_DIRS: &[&str] = &[
     ".git",
     "target",
     "node_modules",

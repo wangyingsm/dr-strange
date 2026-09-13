@@ -468,6 +468,33 @@ fn calls(db: &dr_strange_core::Database, src: &str) -> Vec<String> {
     out
 }
 
+/// A commit's tree read back through git yields the keys the checkout does,
+/// so a symbol located at an old commit carries today's key.
+#[test]
+fn a_tree_read_at_a_commit_yields_the_keys_the_checkout_does() {
+    let repo = crate::git::scratch::Repo::new("parity");
+    let sha = repo
+        .write("a.aa", "f->b.aa::h\ng\n")
+        .write("b.aa", "h->a.aa::f\n")
+        .commit("one");
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+    let keys = |host: &dyn Host| -> Vec<String> {
+        let out = route_tree(host, None, &plugins).unwrap();
+        out.nodes.into_iter().map(|n| n.key).collect()
+    };
+    let local = LocalFiles::new(&repo.0).unwrap();
+    let at = || {
+        crate::git::GitTree::open(&repo.0, sha.clone())
+            .unwrap()
+            .with_label(local.label())
+    };
+    let then = keys(&at());
+    assert_eq!(then, keys(&local));
+    repo.write("a.aa", "renamed\n");
+    assert_ne!(keys(&local), then, "the checkout moved on");
+    assert_eq!(keys(&at()), then, "the commit did not");
+}
+
 #[test]
 fn the_first_sync_loads_the_whole_set() {
     let (_tree, db, _plugins) = sync_fixture("first");

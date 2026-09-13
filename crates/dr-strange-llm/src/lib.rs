@@ -13,6 +13,7 @@
 mod ask;
 mod digest;
 pub mod document;
+pub mod git;
 mod identity;
 mod openai;
 pub mod preprocess;
