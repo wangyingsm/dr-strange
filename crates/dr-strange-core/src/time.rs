@@ -1,5 +1,7 @@
-//! Calendar arithmetic without a date-time dependency: RFC-3339 instants as
-//! unix-epoch milliseconds.
+//! Calendar arithmetic without a date-time dependency: RFC-3339 instants and
+//! calendar days as unix-epoch milliseconds.
+
+const MS_PER_DAY: i64 = 86_400_000;
 
 /// Days from 1970-01-01 to a proleptic Gregorian date (Hinnant's days-from-civil).
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -67,6 +69,15 @@ pub fn rfc3339_to_epoch_ms(s: &str) -> Option<i64> {
     Some(((days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60) * 1000) + millis)
 }
 
+/// The last millisecond of a `YYYY-MM-DD` day in UTC, or `None` if `s` is not one.
+pub fn date_end_of_day(s: &str) -> Option<i64> {
+    if s.len() != 10 {
+        return None;
+    }
+    let (year, month, day) = civil_date(s)?;
+    Some((days_from_civil(year, month, day) + 1) * MS_PER_DAY - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +108,32 @@ mod tests {
             "2026-07-01T00:00:00+0100",
         ] {
             assert_eq!(rfc3339_to_epoch_ms(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_day_ends_at_its_last_millisecond_in_utc() {
+        assert_eq!(date_end_of_day("1970-01-01"), Some(MS_PER_DAY - 1));
+        assert_eq!(
+            date_end_of_day("2026-07-01"),
+            Some(1_782_864_000_000 + MS_PER_DAY - 1)
+        );
+        assert_eq!(
+            date_end_of_day("2024-02-29"),
+            rfc3339_to_epoch_ms("2024-02-29T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn a_malformed_day_is_none() {
+        for bad in [
+            "2026-7-01",
+            "2026-07-1",
+            "2026-00-10",
+            "2026-07-01T00:00:00Z",
+            "abcd-ef-gh",
+        ] {
+            assert_eq!(date_end_of_day(bad), None, "{bad}");
         }
     }
 }
