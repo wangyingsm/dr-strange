@@ -14,6 +14,7 @@ use dr_strange_core::AggFunc;
 use dr_strange_core::Metric;
 use dr_strange_core::PropValue;
 use dr_strange_core::compute::expr::{ArithOp, CmpOp, LogicOp, StrOp};
+use dr_strange_core::time::rfc3339_to_epoch_ms;
 use dr_strange_core::types::Dir;
 
 use crate::ast::*;
@@ -933,75 +934,6 @@ fn call_arg(i: &str) -> IResult<&str, (String, Val)> {
     let (i, _) = symbol(":")(i)?;
     let (i, value) = prop_value(i)?;
     Ok((i, (name, value)))
-}
-
-/// Convert an RFC-3339 instant to unix-epoch milliseconds, or `None` if it
-/// isn't one. Hand-rolled (`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`) so the
-/// parser keeps no date-time dependency; the date part uses Howard Hinnant's
-/// days-from-civil algorithm, which is exact for the proleptic Gregorian
-/// calendar.
-fn rfc3339_to_epoch_ms(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 20 || (b[10] != b'T' && b[10] != b't' && b[10] != b' ') {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if s.as_bytes()[4] != b'-'
-        || s.as_bytes()[7] != b'-'
-        || s.as_bytes()[13] != b':'
-        || s.as_bytes()[16] != b':'
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 60
-    {
-        return None;
-    }
-
-    // Optional fractional seconds, then a mandatory zone.
-    let mut rest = &s[19..];
-    let mut millis = 0i64;
-    if let Some(frac) = rest.strip_prefix('.') {
-        let digits: String = frac.chars().take_while(char::is_ascii_digit).collect();
-        if digits.is_empty() {
-            return None;
-        }
-        // Truncate/pad to milliseconds.
-        let ms: String = digits.chars().chain("000".chars()).take(3).collect();
-        millis = ms.parse::<i64>().ok()?;
-        rest = &rest[1 + digits.len()..];
-    }
-    let offset_min = match rest.as_bytes().first() {
-        Some(b'Z') | Some(b'z') if rest.len() == 1 => 0,
-        Some(sign @ (b'+' | b'-')) if rest.len() == 6 && rest.as_bytes()[3] == b':' => {
-            let h = rest.get(1..3)?.parse::<i64>().ok()?;
-            let m = rest.get(4..6)?.parse::<i64>().ok()?;
-            if h > 23 || m > 59 {
-                return None;
-            }
-            if *sign == b'-' {
-                -(h * 60 + m)
-            } else {
-                h * 60 + m
-            }
-        }
-        _ => return None,
-    };
-
-    // days_from_civil: days since 1970-01-01, shifting the year to start in
-    // March so the leap day lands at the end of the era.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12; // March = 0
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-
-    Some(((days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60) * 1000) + millis)
 }
 
 /// A traversal direction keyword for `BEAM`.
