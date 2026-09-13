@@ -228,6 +228,35 @@ impl GitTree {
             .collect())
     }
 
+    /// Where `path`, as named at commit `later`, lived at this tree's commit,
+    /// when git sees it renamed in between.
+    pub fn renamed_from(&self, later: &str, path: &RelPath) -> Result<Option<String>> {
+        let raw = self.git.run(&[
+            "diff",
+            "--name-status",
+            "-M",
+            "-z",
+            "--relative",
+            self.sha.as_str(),
+            later,
+        ])?;
+        let mut fields = raw
+            .split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .map(|f| String::from_utf8_lossy(f).into_owned());
+        while let Some(status) = fields.next() {
+            let Some(from) = fields.next() else { break };
+            if !(status.starts_with('R') || status.starts_with('C')) {
+                continue;
+            }
+            let Some(to) = fields.next() else { break };
+            if status.starts_with('R') && to == path.as_str() {
+                return Ok(Some(from));
+            }
+        }
+        Ok(None)
+    }
+
     /// `path`'s object name at this commit.
     fn spec(&self, path: &RelPath) -> String {
         format!("{}:{}{}", self.sha.as_str(), self.prefix, path.as_str())
@@ -529,6 +558,29 @@ mod tests {
             ["src/lib.rs"],
             "only files are served"
         );
+    }
+
+    #[test]
+    fn a_rename_since_a_commit_is_traced_back_to_its_old_name() {
+        let repo = Repo::new("rename");
+        let one = repo
+            .write("old.rs", "same body\nsecond line\n")
+            .write("kept.rs", "k\n")
+            .commit("one");
+        std::fs::remove_file(repo.0.join("old.rs")).unwrap();
+        let two = repo
+            .write("new.rs", "same body\nsecond line\n")
+            .commit("two");
+        let tree = GitTree::open(&repo.0, one).unwrap();
+        let path = |p: &str| RelPath::parse(p).unwrap();
+        assert_eq!(
+            tree.renamed_from(two.as_str(), &path("new.rs"))
+                .unwrap()
+                .as_deref(),
+            Some("old.rs")
+        );
+        assert_eq!(tree.renamed_from("HEAD", &path("kept.rs")).unwrap(), None);
+        assert_eq!(tree.renamed_from("HEAD", &path("other.rs")).unwrap(), None);
     }
 
     #[test]

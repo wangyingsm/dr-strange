@@ -20,7 +20,7 @@
 mod recall;
 pub mod relay;
 
-pub use recall::{RecallReq, recall_logic};
+pub use recall::{Parsers, RecallReq, recall_logic};
 
 use std::sync::Arc;
 
@@ -59,6 +59,8 @@ pub struct DrStrange {
     /// The source tree behind the graph, when the host attached one — what
     /// the `grep` tool searches. `serve watch` attaches its `--dir`.
     source_root: Option<std::path::PathBuf>,
+    /// The preprocessors `recall` locates a symbol with — see [`DrStrange::with_parsers`].
+    parsers: Arc<dyn Parsers>,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -105,6 +107,19 @@ impl Default for DigestTuning {
 /// the HTTP request ceiling, which counts cheap requests too.
 pub const DEFAULT_TOOL_CONCURRENCY: usize = 16;
 
+/// The preprocessors every session shares unless its host names others: the
+/// default plugin store, loaded on first use and reloaded when it changes.
+fn default_parsers() -> Arc<dyn Parsers> {
+    static SHARED: std::sync::OnceLock<Arc<dyn Parsers>> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            Arc::new(std::sync::Mutex::new(dr_strange_llm::LivePlugins::new(
+                dr_strange_llm::PluginConfig::default(),
+            )))
+        })
+        .clone()
+}
+
 impl DrStrange {
     pub fn new(db: Arc<Database>) -> Self {
         Self::with_digest(db, DigestTuning::default())
@@ -119,6 +134,7 @@ impl DrStrange {
             embed: None,
             local_files: false,
             source_root: None,
+            parsers: default_parsers(),
         }
     }
 
@@ -154,6 +170,12 @@ impl DrStrange {
     /// pretend to answer, and with the tree attached it need not.
     pub fn with_source_root(mut self, root: std::path::PathBuf) -> Self {
         self.source_root = Some(root);
+        self
+    }
+
+    /// Locate `recall`'s symbols with `parsers` instead of the default plugin store.
+    pub fn with_parsers(mut self, parsers: Arc<dyn Parsers>) -> Self {
+        self.parsers = parsers;
         self
     }
 
@@ -2303,20 +2325,24 @@ impl DrStrange {
     #[tool(
         description = "Code as it was at a git revision — use this instead of \
         `git show <rev>:<path>` or checking out an old commit. `name` is a path, \
-        `path:line` / `path:start-end`, or a directory (\"\" for the root); `at` \
-        is a sha (4+ hex digits), a branch, a tag, HEAD, a date (YYYY-MM-DD or \
-        RFC-3339) or `<rev>@{<date>}`, each optionally followed by `~n` / `^n`, \
-        resolved over the `<plane>_git` history plane. The answer opens with the \
-        commit it read and ends by naming the next call; `snippet` reads the \
-        code as it is now."
+        `path:line` / `path:start-end`, a directory (\"\" for the root), or a \
+        symbol — located by parsing its file as it was, so the answer is the \
+        declaration then, not today's line numbers; `at` is a sha (4+ hex \
+        digits), a branch, a tag, HEAD, a date (YYYY-MM-DD or RFC-3339) or \
+        `<rev>@{<date>}`, each optionally followed by `~n` / `^n`, resolved over \
+        the `<plane>_git` history plane. The answer opens with the commit it \
+        read and ends by naming the next call; `snippet` reads the code as it \
+        is now."
     )]
     async fn recall(
         &self,
         Parameters(req): Parameters<RecallReq>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.source_root.clone();
-        self.blocking("recall", move |db| recall_logic(db, root.as_deref(), req))
-            .await
+        let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
+        self.blocking("recall", move |db| {
+            recall_logic(db, root.as_deref(), &*parsers, req)
+        })
+        .await
     }
 
     #[tool(
