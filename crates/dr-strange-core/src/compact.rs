@@ -29,14 +29,14 @@ const PROP_CAP: usize = 500;
 /// Candidate cap for fuzzy listings.
 const FIND_CAP: usize = 20;
 
-fn prop_str<'a>(props: &'a Properties, key: &str) -> Option<&'a str> {
+pub(crate) fn prop_str<'a>(props: &'a Properties, key: &str) -> Option<&'a str> {
     match props.get(key).map(|d| &d.value) {
         Some(PropValue::Str(s)) if !s.is_empty() => Some(s),
         _ => None,
     }
 }
 
-fn prop_int(props: &Properties, key: &str) -> Option<i64> {
+pub(crate) fn prop_int(props: &Properties, key: &str) -> Option<i64> {
     match props.get(key).map(|d| &d.value) {
         Some(PropValue::Int(i)) => Some(*i),
         _ => None,
@@ -1070,7 +1070,7 @@ const HISTORY_COMMITS: usize = 15;
 /// Branches, tags and rebases shown before the listing is cut short.
 const HISTORY_REFS: usize = 12;
 
-fn prop_bool(props: &Properties, key: &str) -> bool {
+pub(crate) fn prop_bool(props: &Properties, key: &str) -> bool {
     matches!(
         props.get(key).map(|d| &d.value),
         Some(PropValue::Bool(true))
@@ -1080,7 +1080,7 @@ fn prop_bool(props: &Properties, key: &str) -> bool {
 /// The date part of an ISO-8601 timestamp — `2026-08-25` out of
 /// `2026-08-25T16:29:01+08:00`. History is read a day at a time; the seconds
 /// are noise a reader pays for.
-fn day(props: &Properties, key: &str) -> String {
+pub(crate) fn day(props: &Properties, key: &str) -> String {
     prop_str(props, key)
         .map(|t| t.chars().take(10).collect())
         .unwrap_or_default()

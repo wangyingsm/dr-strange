@@ -18,6 +18,8 @@ pub mod index;
 #[cfg(feature = "json")]
 pub mod json;
 pub mod keyword;
+#[cfg(feature = "json")]
+pub mod rev;
 pub mod storage;
 pub mod text;
 pub mod time;
