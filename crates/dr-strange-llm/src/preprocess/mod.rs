@@ -420,7 +420,7 @@ impl Host for LocalFiles {
 }
 
 /// A format-specific reader: input in, facts and prose out.
-pub trait Preprocessor: Sync {
+pub trait Preprocessor: Send + Sync {
     fn manifest(&self) -> Manifest;
 
     fn preprocess(&self, input: &Input<'_>, host: &dyn Host) -> Result<Preprocessed>;
