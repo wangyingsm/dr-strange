@@ -1859,6 +1859,31 @@ fn digest_logic(
 /// ranges, which the answer spells out.
 const SNIPPET_CAP: usize = 400;
 
+/// The tree `plane` was parsed from, as it records it (`synced_root`), else `fallback`.
+///
+/// The plane's own record wins: a server holding a second code plane would
+/// otherwise read another repository's file at the same relative path.
+pub(crate) fn source_root(
+    plane: &PlaneHandle<'_>,
+    fallback: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let recorded = plane.properties().ok().and_then(|props| {
+        match props.get("synced_root").map(|d| &d.value) {
+            Some(PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
+            _ => None,
+        }
+    });
+    recorded.or_else(|| fallback.map(std::path::Path::to_path_buf))
+}
+
+/// `lines` numbered from `first`, one per line, as `snippet` prints source.
+pub(crate) fn numbered<'a>(first: usize, lines: impl Iterator<Item = &'a str>) -> String {
+    lines
+        .enumerate()
+        .map(|(i, l)| format!("{:>5} | {l}\n", first + i))
+        .collect()
+}
+
 /// `snippet`'s range form: `path:line` or `path:start-end`. A path is told
 /// from a symbol by looking like one — a separator or an extension, and no
 /// `::` — so `src/lib.rs:12` is a range and `a::b` never is.
@@ -1899,9 +1924,7 @@ fn read_range(
     if let Some(key) = symbols.and_then(|s| s.enclosing(file, start)) {
         out.push_str(&format!("in {key}\n"));
     }
-    for (i, l) in slice.iter().enumerate() {
-        out.push_str(&format!("{:>5} | {l}\n", start + i));
-    }
+    out.push_str(&numbered(start, slice.iter().copied()));
     if end < total {
         out.push_str(&format!(
             "… {file} continues to line {total}; snippet {file}:{}-{} reads on\n",
@@ -1938,18 +1961,8 @@ pub fn snippet_logic(
     req: SnippetReq,
 ) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
-    // `file` is relative to whatever directory *this plane* was parsed from,
-    // which the digest records on the plane as `synced_root`. The process's own
-    // tree is only a fallback: once a server holds a second code plane, using it
-    // reads another repository's file at the same relative path — a plausible
-    // answer with no error, which is worse than failing.
-    let plane_root = plane.properties().ok().and_then(|props| {
-        match props.get("synced_root").map(|d| &d.value) {
-            Some(dr_strange_core::PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
-            _ => None,
-        }
-    });
-    let root = plane_root.as_deref().or(fallback_root);
+    let plane_root = source_root(&plane, fallback_root);
+    let root = plane_root.as_deref();
     let no_tree = || {
         anyhow::anyhow!(
             "no stored source, and no source tree for this plane — the plane \
@@ -2036,9 +2049,7 @@ pub fn snippet_logic(
     let total = text.lines().count();
     let slice: Vec<&str> = text.lines().skip(start).take(want).collect();
     let mut out = format!("{file}:{line} ({} lines)\n", slice.len());
-    for (i, l) in slice.iter().enumerate() {
-        out.push_str(&format!("{:>5} | {l}\n", start + i + 1));
-    }
+    out.push_str(&numbered(start + 1, slice.iter().copied()));
     let shown_through = start + slice.len();
     // "Reads on" means *this symbol* has more, not that the file does. Once
     // the parser records where a declaration ends, a complete one is complete
