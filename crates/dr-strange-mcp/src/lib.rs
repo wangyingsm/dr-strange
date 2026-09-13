@@ -17,7 +17,10 @@
 //! runs the second one, `drsg-mcp` forwards to it rather than opening the
 //! same database, which one process at a time may do.
 
+mod recall;
 pub mod relay;
+
+pub use recall::{RecallReq, recall_logic};
 
 use std::sync::Arc;
 
@@ -2294,6 +2297,25 @@ impl DrStrange {
     ) -> Result<CallToolResult, McpError> {
         let root = self.source_root.clone();
         self.blocking("snippet", move |db| snippet_logic(db, root.as_deref(), req))
+            .await
+    }
+
+    #[tool(
+        description = "Code as it was at a git revision — use this instead of \
+        `git show <rev>:<path>` or checking out an old commit. `name` is a path, \
+        `path:line` / `path:start-end`, or a directory (\"\" for the root); `at` \
+        is a sha (4+ hex digits), a branch, a tag, HEAD, a date (YYYY-MM-DD or \
+        RFC-3339) or `<rev>@{<date>}`, each optionally followed by `~n` / `^n`, \
+        resolved over the `<plane>_git` history plane. The answer opens with the \
+        commit it read and ends by naming the next call; `snippet` reads the \
+        code as it is now."
+    )]
+    async fn recall(
+        &self,
+        Parameters(req): Parameters<RecallReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.source_root.clone();
+        self.blocking("recall", move |db| recall_logic(db, root.as_deref(), req))
             .await
     }
 

@@ -102,6 +102,45 @@ impl RelPath {
     }
 }
 
+/// What a path names at a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjKind {
+    /// A regular file.
+    File,
+    /// A symbolic link; reading it yields the path it points at.
+    Link,
+    /// A directory.
+    Dir,
+    /// Another repository's commit, which is not followed.
+    Submodule,
+}
+
+/// One entry of a directory at a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Its name inside the directory.
+    pub name: String,
+    /// What it is.
+    pub kind: ObjKind,
+    /// Its size in bytes, for files and links.
+    pub size: Option<u64>,
+}
+
+/// One `ls-tree -z` record: what it names, its size when `-l` gave one, and its path.
+fn parse_entry(record: &[u8]) -> Option<(ObjKind, Option<u64>, &str)> {
+    let (meta, path) = std::str::from_utf8(record).ok()?.split_once('\t')?;
+    let mut meta = meta.split_whitespace();
+    let (mode, kind) = (meta.next()?, meta.next()?);
+    let size = meta.nth(1).and_then(|s| s.parse().ok());
+    let kind = match (mode, kind) {
+        (_, "tree") => ObjKind::Dir,
+        (_, "commit") => ObjKind::Submodule,
+        ("120000", _) => ObjKind::Link,
+        _ => ObjKind::File,
+    };
+    Some((kind, size, path))
+}
+
 /// One commit's files under a root directory, read from git's object store.
 pub struct GitTree {
     git: Git,
@@ -145,6 +184,50 @@ impl GitTree {
         &self.sha
     }
 
+    /// What `path` names at this commit, or `None` when it names nothing.
+    pub fn kind(&self, path: &RelPath) -> Result<Option<ObjKind>> {
+        if path.as_str().is_empty() {
+            return Ok(Some(ObjKind::Dir));
+        }
+        let full = format!("{}{}", self.prefix, path.as_str());
+        let raw = self.git.run(&[
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            self.sha.as_str(),
+            "--",
+            &full,
+        ])?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter_map(parse_entry)
+            .find(|(_, _, name)| *name == full)
+            .map(|(kind, _, _)| kind))
+    }
+
+    /// The entries of directory `dir` at this commit, in git's order.
+    pub fn ls(&self, dir: &RelPath) -> Result<Vec<Entry>> {
+        let raw = self
+            .git
+            .run(&["ls-tree", "--full-tree", "-z", "-l", &self.spec(dir)])
+            .with_context(|| {
+                format!(
+                    "`{}` is not a directory at {}",
+                    dir.as_str(),
+                    self.sha.short()
+                )
+            })?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter_map(parse_entry)
+            .map(|(kind, size, name)| Entry {
+                name: name.to_string(),
+                kind,
+                size,
+            })
+            .collect())
+    }
+
     /// `path`'s object name at this commit.
     fn spec(&self, path: &RelPath) -> String {
         format!("{}:{}{}", self.sha.as_str(), self.prefix, path.as_str())
@@ -165,12 +248,9 @@ impl GitTree {
         ])?;
         let mut files: Vec<String> = raw
             .split(|b| *b == 0)
-            .filter_map(|entry| {
-                let (meta, path) = std::str::from_utf8(entry).ok()?.split_once('\t')?;
-                let mut meta = meta.split(' ');
-                let (mode, kind) = (meta.next()?, meta.next()?);
-                (kind == "blob" && mode != "120000" && servable(path)).then(|| path.to_string())
-            })
+            .filter_map(parse_entry)
+            .filter(|(kind, _, path)| *kind == ObjKind::File && servable(path))
+            .map(|(_, _, path)| path.to_string())
             .collect();
         files.sort_by(|a, b| a.split('/').cmp(b.split('/')));
         *cached = Some(files.clone());
@@ -406,6 +486,49 @@ mod tests {
         };
         let err = missing.run(&["version"]).unwrap_err();
         assert!(err.to_string().contains("git not found on PATH"), "{err}");
+    }
+
+    #[test]
+    fn a_path_names_a_file_a_directory_a_link_a_submodule_or_nothing() {
+        let repo = Repo::new("kinds");
+        repo.write("src/lib.rs", "x\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("src/lib.rs", repo.0.join("link.rs")).unwrap();
+        let first = repo.commit("files");
+        let gitlink = format!("160000,{},vendor/y", first.as_str());
+        repo.git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+        repo.git(&["commit", "-q", "-m", "submodule"]);
+        let sha = Sha::parse(repo.git(&["rev-parse", "HEAD"]).trim()).unwrap();
+        let tree = GitTree::open(&repo.0, sha).unwrap();
+        let path = |p: &str| RelPath::parse(p).unwrap();
+        let kind = |p: &str| tree.kind(&path(p)).unwrap();
+        assert_eq!(kind(""), Some(ObjKind::Dir));
+        assert_eq!(kind("src"), Some(ObjKind::Dir));
+        assert_eq!(kind("src/lib.rs"), Some(ObjKind::File));
+        assert_eq!(kind("vendor/y"), Some(ObjKind::Submodule));
+        assert_eq!(kind("src/nope.rs"), None);
+        assert_eq!(kind("nope/deeper.rs"), None);
+        #[cfg(unix)]
+        assert_eq!(kind("link.rs"), Some(ObjKind::Link));
+
+        let top = tree.ls(&path("")).unwrap();
+        let src = top.iter().find(|e| e.name == "src").unwrap();
+        assert_eq!((src.kind, src.size), (ObjKind::Dir, None));
+        let lib = Entry {
+            name: "lib.rs".into(),
+            kind: ObjKind::File,
+            size: Some(2),
+        };
+        assert_eq!(tree.ls(&path("src")).unwrap(), [lib]);
+        assert!(
+            tree.ls(&path("src/lib.rs")).is_err(),
+            "a file is not a directory"
+        );
+        assert_eq!(
+            tree.list("").unwrap(),
+            ["src/lib.rs"],
+            "only files are served"
+        );
     }
 
     #[test]
