@@ -86,6 +86,14 @@ fn ok_response(id: Value, result: Value) -> Value {
 
 // ---- entry point ----------------------------------------------------------
 
+/// The most requests one JSON-RPC batch may carry. A batch runs its items
+/// in sequence on one blocking task and answers as one body, so it was a
+/// way to multiply one request's cost by the body limit — 64 MiB of
+/// `plane.find` in one call — and to make an unauthorized batch a
+/// brute-force loop with no round trips. A larger batch is refused whole
+/// (-32600), before any item runs. Clients that need more send more bodies.
+pub const MAX_BATCH: usize = 64;
+
 /// Parses and dispatches one JSON-RPC message (single or batch). Returns the
 /// response `Value`, or `None` when nothing is owed to the caller — a batch of
 /// only notifications, or a single notification (a request with no `id`).
@@ -107,6 +115,15 @@ pub fn handle(ctx: &Ctx<'_>, auth: &Auth<'_>, body: &[u8]) -> Option<Value> {
                 return Some(error_response(
                     Value::Null,
                     &RpcError::invalid_request("empty batch"),
+                ));
+            }
+            if items.len() > MAX_BATCH {
+                return Some(error_response(
+                    Value::Null,
+                    &RpcError::invalid_request(format!(
+                        "batch of {} exceeds the limit of {MAX_BATCH} requests",
+                        items.len()
+                    )),
                 ));
             }
             let responses: Vec<Value> = items
@@ -1277,6 +1294,18 @@ mod tests {
         let resp = call(&db, r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#).unwrap();
         assert_eq!(resp["result"]["openrpc"], "1.2.6");
         assert!(resp["result"]["methods"].as_array().unwrap().len() >= 20);
+    }
+
+    #[test]
+    fn a_batch_past_the_limit_is_refused_whole() {
+        let db = seeded();
+        let item = r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#;
+        let ok = format!("[{}]", vec![item; MAX_BATCH].join(","));
+        assert_eq!(call(&db, &ok).unwrap().as_array().unwrap().len(), MAX_BATCH);
+        let over = format!("[{}]", vec![item; MAX_BATCH + 1].join(","));
+        let resp = call(&db, &over).unwrap();
+        assert_eq!(err_code(&resp), -32600, "{resp}");
+        assert!(resp["id"].is_null());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -37,7 +37,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::ServeOptions;
 use crate::assets::static_handler;
 use crate::auth::{
-    Access, AllowedOrigins, Auth, Authorizer, Credentials, ReadOnlyAuthorizer, SharedToken,
+    Access, AllowedOrigins, Auth, Authorizer, Credentials, FailedAuthLimiter, ReadOnlyAuthorizer,
+    SharedToken,
 };
 #[cfg(feature = "native-backend")]
 use crate::follow;
@@ -101,6 +102,9 @@ pub struct AppState {
     /// name), the one non-preset name a request may use — see
     /// [`methods::provider_for`].
     pub configured_provider: Option<String>,
+    /// Per-peer brute-force throttle on the bearer check — see
+    /// [`auth_throttle`].
+    pub auth_limiter: FailedAuthLimiter,
     /// The completion vocabulary last built, and what it was built from —
     /// see [`AppState::vocab`].
     vocab_cache: Mutex<Option<CachedVocab>>,
@@ -209,6 +213,74 @@ fn resolve_credentials(
         bearer: bearer_of(headers).or(ws_token),
         local_ui,
     })
+}
+
+/// The bearer a request presents, wherever it presents it: the header, or
+/// `?token=` for the WebSocket upgrades that cannot send one. Only for the
+/// throttle's accounting — each handler still resolves its own credentials.
+fn presented_bearer(request: &Request) -> Option<String> {
+    if let Some(b) = bearer_of(request.headers()) {
+        return Some(b);
+    }
+    if !request.uri().path().starts_with("/ws") {
+        return None;
+    }
+    let query = request.uri().query()?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// Brute-force protection on the bearer check, as a middleware over the
+/// whole router so no handler can forget it. A peer serving a lockout is
+/// answered 429 with `Retry-After` before its request is read further; a
+/// peer whose bearer authorizes nothing — not even a read, so the request
+/// would be refused wherever it went — earns a strike, and a correct bearer
+/// clears its strikes (see [`FailedAuthLimiter`]). A request carrying no
+/// bearer is neither counted nor blocked: it is not a guess, and the
+/// zero-config local UI sends none. With no connect info there is no peer
+/// to key on, and the throttle steps aside rather than lump every client
+/// together.
+async fn auth_throttle(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(peer) = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+    else {
+        return next.run(request).await;
+    };
+    let now = Instant::now();
+    if let Some(wait) = state.auth_limiter.locked_for(peer, now) {
+        return too_many_attempts(wait);
+    }
+    if let Some(bearer) = presented_bearer(&request) {
+        let creds = Credentials {
+            bearer: Some(bearer),
+            local_ui: false,
+        };
+        if state.authorizer.allows(Access::Read, &creds) {
+            state.auth_limiter.succeeded(peer);
+        } else if let Some(wait) = state.auth_limiter.failed(peer, now) {
+            tracing::warn!(%peer, wait_secs = wait.as_secs(), "repeated failed authentication; peer throttled");
+            return too_many_attempts(wait);
+        }
+    }
+    next.run(request).await
+}
+
+fn too_many_attempts(wait: Duration) -> Response {
+    let secs = wait.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, secs.to_string())],
+        format!("too many failed authentication attempts; retry in {secs}s"),
+    )
+        .into_response()
 }
 
 /// Gates `/mcp` the same way `cypher_http` gates `/cypher`: **write** level,
@@ -404,7 +476,8 @@ fn router(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(CONTENT_SECURITY_POLICY),
         ))
-        .layer(DefaultBodyLimit::max(MAX_BODY));
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_throttle));
     Router::new()
         .merge(mcp_router(
             state.clone(),
@@ -1234,6 +1307,7 @@ pub async fn run(
             query_timeout: opts.query_timeout,
             history_limit: opts.history_limit,
             configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+            auth_limiter: FailedAuthLimiter::new(),
             vocab_cache: Mutex::new(None),
         });
         return run_app(state, opts, &resync_needed, &follow_lost).await;
@@ -1252,6 +1326,7 @@ pub async fn run(
         query_timeout: opts.query_timeout,
         history_limit: opts.history_limit,
         configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+        auth_limiter: FailedAuthLimiter::new(),
         vocab_cache: Mutex::new(None),
     });
     run_app(state, opts, &resync_needed, &follow_lost).await
