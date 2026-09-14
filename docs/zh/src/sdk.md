@@ -7,17 +7,20 @@ Dr Strange 提供**六种语言**的客户端库：TypeScript、Python、Go、Ja
 
 ## 获取 SDK
 
-各 SDK 位于仓库的 `sdk/<语言>` 目录下。在软件包尚未发布到各语言的仓库之前，可将相应
-目录纳入（vendor）你的项目，或就地依赖它：
+各 SDK 位于仓库的 `sdk/<语言>` 目录下，版本号与工作区一致，均为 2.7.0。**目前没有任何
+一个 SDK 发布到语言包仓库**（没有 PyPI、npm、Maven Central 发行版，也没有 `sdk/go/vX`
+标签），因此都需从本仓库的检出安装：
 
-| 语言 | 位置 | 构建 / 引入 |
+| 语言 | 位置 | 从仓库安装 |
 |---|---|---|
-| TypeScript | `sdk/typescript` | 一个 `package.json` 模块（bun / npm） |
-| Python | `sdk/python` | 一个 `pyproject.toml` 包（`pip install`） |
-| Go | `sdk/go` | 模块 `github.com/wangyingsm/dr-strange/sdk/go` |
-| Java | `sdk/java` | 一个 Maven 模块（Jackson + JDK HttpClient） |
-| C | `sdk/c` | `make` → `libdrsg.a` + `drsg.h`（libcurl + json-c） |
-| Zig | `sdk/zig` | 一个 `build.zig` 模块，胶水封装 C 客户端（Zig 0.16） |
+| TypeScript | `sdk/typescript` | 在该目录 `bun install && bun run build`，然后在 `package.json` 中写 `"drsg": "file:…/sdk/typescript"` |
+| Python | `sdk/python` | `pip install …/sdk/python`（或 `pip install "drsg @ git+https://github.com/wangyingsm/dr-strange.git#subdirectory=sdk/python"`） |
+| Go | `sdk/go` | `go get github.com/wangyingsm/dr-strange/sdk/go@<commit>`，或用 `replace … => …/sdk/go` 指令 |
+| Java | `sdk/java` | 在该目录 `./mvnw install`，然后依赖 `io.github.wangyingsm:drsg:2.7.0` |
+| C | `sdk/c` | `make` → `libdrsg.a` + `include/drsg.h`（需要 libcurl + json-c） |
+| Zig | `sdk/zig` | `zig build`，或将 `src/drsg.zig` 作为模块引入（Zig 0.16） |
+
+各目录的 `README.md` 给出了该语言的具体步骤。
 
 ## 连接与调用
 
@@ -62,7 +65,8 @@ console.log(stats.nodes, stats.edges);
 
 ## 变更流
 
-每个 SDK 都能打开一条长连接 WebSocket，订阅某个平面的变更流（[第 3 章](./ai-native.md)），
+除 Zig 外，每个 SDK 都能打开一条长连接 WebSocket，订阅某个平面的变更流（[第 3 章](./ai-native.md)）
+（Zig 绑定只封装 C 客户端的请求/响应接口；需要变更流的 Zig 程序可直接调用 C 库的 `drsg_watch`），
 接收每一个已提交的 `ChangeEvent`：结构为 `{ plane, seq, truncated, changes }`，其中每个
 变更为 `{ kind, op, id, labels?, record? }`。订阅遵循各语言自然的并发模型：
 

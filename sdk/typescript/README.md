@@ -7,9 +7,16 @@ the wire protocol. Runs anywhere `fetch` exists — Bun, Node 18+, Deno, browser
 
 ## Install
 
+The package is not on npm yet; depend on the directory from a checkout of this
+repository. Build `dist/` once, then add the directory as a path dependency:
+
 ```bash
-bun add drsg      # or: npm install drsg
+(cd ../dr-strange/sdk/typescript && bun install && bun run build)
+bun add ../dr-strange/sdk/typescript          # or: npm install ../dr-strange/sdk/typescript
 ```
+
+or, in `package.json`, `"drsg": "file:../dr-strange/sdk/typescript"`. Inside
+this repository the examples import the source directly (`../src/index.ts`).
 
 ## Use
 

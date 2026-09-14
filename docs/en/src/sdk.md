@@ -9,18 +9,21 @@ the generated C client, so it inherits the same guarantee.)
 
 ## Obtaining the SDKs
 
-The SDKs live under `sdk/<language>` in the repository. Until packages are
-published to the language registries, vendor the relevant directory into a
-project or depend on it in place:
+The SDKs live under `sdk/<language>` in the repository, all at version 2.7.0
+in step with the workspace. **None is published to a language registry yet**
+(no PyPI, npm or Maven Central release, no `sdk/go/vX` tags), so each is
+installed from a checkout of this repository:
 
-| Language | Location | Build / import |
+| Language | Location | Install from the repository |
 |---|---|---|
-| TypeScript | `sdk/typescript` | a `package.json` module (bun / npm) |
-| Python | `sdk/python` | a `pyproject.toml` package (`pip install`) |
-| Go | `sdk/go` | module `github.com/wangyingsm/dr-strange/sdk/go` |
-| Java | `sdk/java` | a Maven module (Jackson + JDK HttpClient) |
-| C | `sdk/c` | `make` → `libdrsg.a` + `drsg.h` (libcurl + json-c) |
-| Zig | `sdk/zig` | a `build.zig` module binding the C client (Zig 0.16) |
+| TypeScript | `sdk/typescript` | `bun install && bun run build` there, then `"drsg": "file:…/sdk/typescript"` in `package.json` |
+| Python | `sdk/python` | `pip install …/sdk/python` (or `pip install "drsg @ git+https://github.com/wangyingsm/dr-strange.git#subdirectory=sdk/python"`) |
+| Go | `sdk/go` | `go get github.com/wangyingsm/dr-strange/sdk/go@<commit>`, or a `replace … => …/sdk/go` directive |
+| Java | `sdk/java` | `./mvnw install` there, then depend on `io.github.wangyingsm:drsg:2.7.0` |
+| C | `sdk/c` | `make` → `libdrsg.a` + `include/drsg.h` (needs libcurl + json-c) |
+| Zig | `sdk/zig` | `zig build`, or add `src/drsg.zig` as a module (Zig 0.16) |
+
+Each directory's `README.md` gives the exact steps for its language.
 
 ## Connecting and calling
 
@@ -68,11 +71,13 @@ filled `drsg_error` (with `drsg_is_auth_error`) in C.
 
 ## The change feed
 
-Every SDK can open a long-lived WebSocket and subscribe to a plane's change feed
-([Chapter 3](./ai-native.md)), receiving each committed `ChangeEvent`
-—`{ plane, seq, truncated, changes }`, where each change is
-`{ kind, op, id, labels?, record? }`. The subscription follows each language's
-natural concurrency model:
+Every SDK except Zig can open a long-lived WebSocket and subscribe to a plane's
+change feed ([Chapter 3](./ai-native.md)), receiving each committed
+`ChangeEvent` —`{ plane, seq, truncated, changes }`, where each change is
+`{ kind, op, id, labels?, record? }`. (The Zig binding wraps the C client's
+request/response surface only; a Zig program that needs the feed calls
+`drsg_watch` from the C library directly.) The subscription follows each
+language's natural concurrency model:
 
 **TypeScript** — a callback; the socket auto-reconnects. `close()` stops it.
 

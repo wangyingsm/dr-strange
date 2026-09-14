@@ -7,8 +7,18 @@ the wire protocol.
 
 ## Install
 
+The module is not tagged (there are no `sdk/go/vX` tags), so pin it to a commit
+of this repository:
+
 ```bash
-go get github.com/wangyingsm/dr-strange/sdk/go@latest
+go get github.com/wangyingsm/dr-strange/sdk/go@<commit-sha>
+```
+
+or point a local checkout at it with a `replace` directive in your `go.mod`:
+
+```
+require github.com/wangyingsm/dr-strange/sdk/go v0.0.0
+replace github.com/wangyingsm/dr-strange/sdk/go => ../dr-strange/sdk/go
 ```
 
 ```go

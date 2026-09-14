@@ -6,8 +6,14 @@ endpoint. The method surface is **generated from the server's OpenRPC schema**
 
 ## Install
 
+The package is not on PyPI yet; install it from a checkout of this repository
+(the wheel carries a `py.typed` marker, so type checkers see the annotations):
+
 ```bash
-uv pip install -e sdk/python      # or: pip install -e sdk/python
+pip install /path/to/dr-strange/sdk/python          # or: uv pip install …
+pip install -e /path/to/dr-strange/sdk/python       # editable, for development
+# or straight from git:
+pip install "drsg @ git+https://github.com/wangyingsm/dr-strange.git#subdirectory=sdk/python"
 ```
 
 ## Use
