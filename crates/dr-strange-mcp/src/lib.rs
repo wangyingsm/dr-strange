@@ -80,6 +80,37 @@ pub struct EmbedProvider {
     pub key_env: Option<String>,
 }
 
+impl EmbedProvider {
+    /// The shape [`dr_strange_llm::wire_provider`] compares a request against.
+    fn configured(&self) -> dr_strange_llm::ConfiguredProvider<'_> {
+        dr_strange_llm::ConfiguredProvider {
+            name: &self.provider,
+            key_env: self.key_env.as_deref(),
+        }
+    }
+}
+
+/// Resolve a provider a **tool call** named. The rule is the web crate's
+/// (`provider_for` there, [`dr_strange_llm::wire_provider`] for both): a
+/// preset or exactly the provider the host configured, and the key's
+/// environment variable is the provider's own, never the caller's pick.
+/// `build_provider` accepts a base URL because the operator at their terminal
+/// legitimately means one; a name that arrived over MCP must not reach it
+/// unchecked, or the server POSTs — with a key from its own environment —
+/// wherever the caller points it. Every tool that turns a request field into
+/// a provider goes through here.
+fn wire_provider<'a>(
+    requested: Option<&'a str>,
+    requested_key_env: Option<&str>,
+    allow: Option<&'a EmbedProvider>,
+) -> AnyResult<(&'a str, Option<&'a str>)> {
+    Ok(dr_strange_llm::wire_provider(
+        requested,
+        requested_key_env,
+        allow.map(EmbedProvider::configured),
+    )?)
+}
+
 /// Digest knobs the host resolved, applied to the `digest` tool.
 ///
 /// The stdio binary embeds its own database and has no config file, so it
@@ -339,12 +370,14 @@ struct Hybrid {
     w_graph: Option<f32>,
     #[serde(default)]
     k: Option<usize>,
-    /// Embedding provider for the vector channel (key from the server env).
+    /// Embedding provider for the vector channel: a preset or the provider
+    /// the server was configured with (a base URL is refused); key from the
+    /// server env.
     #[serde(default)]
     provider: Option<String>,
-    /// Name of the environment variable the server reads the provider key
-    /// from. A preset defaults to its own; a base URL has none, so name it
-    /// here when the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     #[serde(default)]
@@ -366,12 +399,14 @@ struct Ask {
     /// Safety row cap appended when the plan declares none (default 100).
     #[serde(default)]
     limit: Option<u64>,
-    /// Chat provider (preset or base URL); key from the server env.
+    /// Chat provider: a preset (`openai`/`deepseek`/`qwen`/`ollama`) or the
+    /// provider the server was configured with; a base URL is refused. Key
+    /// from the server env.
     #[serde(default)]
     provider: Option<String>,
-    /// Name of the environment variable the server reads the chat key from. A
-    /// preset defaults to its own; a base URL has none, so name it here when
-    /// the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     #[serde(default)]
@@ -419,16 +454,17 @@ struct Digest {
     /// (arch/06 §3). A dry-run needs no confirmation.
     #[serde(default)]
     confirm: bool,
-    /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or a base
-    /// URL. API keys are read from the server's environment, never params.
+    /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or the
+    /// provider the server was configured with; a base URL is refused. API
+    /// keys are read from the server's environment, never params.
     #[serde(default)]
     chat: Option<String>,
-    /// Embedding provider preset or base URL (defaults to the chat provider).
+    /// Embedding provider, same rule (defaults to the chat provider).
     #[serde(default)]
     embed: Option<String>,
-    /// Name of the environment variable the server reads the chat key from. A
-    /// preset defaults to its own; a base URL has none, so name it here when
-    /// the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     /// The same, for the embedding provider.
@@ -498,13 +534,14 @@ struct Cypher {
     /// A query in the openCypher-subset language, e.g.
     /// `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.
     query: String,
-    /// Embedding provider for a text `SEARCH … NEAR "…"` (preset or base URL);
-    /// the server environment supplies the key. Defaults to `openai`.
+    /// Embedding provider for a text `SEARCH … NEAR "…"`: a preset or the
+    /// provider the server was configured with (a base URL is refused); the
+    /// server environment supplies the key. Defaults to `openai`.
     #[serde(default)]
     embed: Option<String>,
-    /// Name of the environment variable the server reads the embedding key
-    /// from. A preset defaults to its own; a base URL has none, so name it
-    /// here when the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     embed_key_env: Option<String>,
     /// Embedding model. A preset supplies its own; a base URL has none, so it
@@ -1281,31 +1318,50 @@ fn grep_tree(
 /// Provider keys come from the server's environment, never from tool
 /// parameters — `key_env` names the variable, it does not carry the key.
 #[allow(clippy::too_many_arguments)]
+/// What one digest run needs beyond its input: where it came from, the id it
+/// stamps, the mode it reads in, and the two providers it may call.
+///
+/// The providers arrive already checked by [`wire_provider`] — a name the
+/// request supplied is a preset or the operator's own, never a base URL, and
+/// the key variable is the one that provider reads.
+struct DigestRun<'a> {
+    source: String,
+    run_id: String,
+    mode: dr_strange_llm::DigestMode,
+    chat: (&'a str, Option<&'a str>),
+    embed: (&'a str, Option<&'a str>),
+}
+
 fn run_digest(
     facts: dr_strange_llm::Preprocessed,
     req: &Digest,
     tuning: &DigestTuning,
     p: &dr_strange_core::PlaneHandle<'_>,
-    source: String,
-    run_id: String,
-    mode: dr_strange_llm::DigestMode,
+    run: DigestRun<'_>,
 ) -> AnyResult<dr_strange_llm::DigestResult> {
-    let chat_provider = req.chat.as_deref().unwrap_or("openai");
-    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let DigestRun {
+        source,
+        run_id,
+        mode,
+        chat: (chat_provider, chat_key_env),
+        embed: (embed_provider, embed_key_env),
+    } = run;
     let embed = !req.no_embed;
 
+    // Provider keys come from the server's environment (never tool params) —
+    // `key_env` names the variable, it does not carry the key.
     let chat = dr_strange_llm::build_provider(
         chat_provider,
         req.model.as_deref(),
         None,
-        req.key_env.as_deref(),
+        chat_key_env,
         false,
     )?;
     let embedder = dr_strange_llm::build_provider(
         embed_provider,
         req.embed_model.as_deref(),
         None,
-        req.embed_key_env.as_deref(),
+        embed_key_env,
         embed,
     )?;
     let opts = dr_strange_llm::DigestOptions {
@@ -1679,19 +1735,20 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
     }
 }
 
-fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
+fn hybrid_logic(db: &Database, req: Hybrid, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
     let mut b = plane.hybrid();
     if let Some(label) = &req.label {
         b = b.label(label.clone());
     }
     if let Some(prop) = &req.vector_prop {
-        let provider = req.provider.as_deref().unwrap_or("openai");
+        let (provider, key_env) =
+            wire_provider(req.provider.as_deref(), req.key_env.as_deref(), allow)?;
         let embedder: Box<dyn dr_strange_llm::Embedder> = Box::new(dr_strange_llm::build_provider(
             provider,
             req.embed_model.as_deref(),
             None,
-            req.key_env.as_deref(),
+            key_env,
             true,
         )?);
         let reply = embedder.embed(std::slice::from_ref(&req.query))?;
@@ -1735,26 +1792,29 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
     Ok(jval!({ "results": results, "count": results.len() }))
 }
 
-fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
+fn ask_logic(db: &Database, req: Ask, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
-    let provider = req.provider.as_deref().unwrap_or("openai");
-    let chat = dr_strange_llm::build_provider(
-        provider,
-        req.model.as_deref(),
-        None,
-        req.key_env.as_deref(),
-        false,
-    )?;
-    let embedder = req.embed_provider.as_deref().and_then(|ep| {
-        dr_strange_llm::build_provider(
-            ep,
-            req.embed_model.as_deref(),
-            None,
-            req.embed_key_env.as_deref(),
-            true,
-        )
-        .ok()
-    });
+    let (provider, key_env) =
+        wire_provider(req.provider.as_deref(), req.key_env.as_deref(), allow)?;
+    let chat =
+        dr_strange_llm::build_provider(provider, req.model.as_deref(), None, key_env, false)?;
+    // The grounding embedder is optional, so a provider that cannot be
+    // *built* degrades to schema-only; a provider that is not *allowed* is
+    // refused like the chat one — silence would hide the policy.
+    let embedder = match req.embed_provider.as_deref() {
+        None => None,
+        Some(ep) => {
+            let (ep, embed_key_env) = wire_provider(Some(ep), req.embed_key_env.as_deref(), allow)?;
+            dr_strange_llm::build_provider(
+                ep,
+                req.embed_model.as_deref(),
+                None,
+                embed_key_env,
+                true,
+            )
+            .ok()
+        }
+    };
     let opts = dr_strange_llm::AskOptions {
         max_attempts: req.max_attempts.unwrap_or(20),
         dry_run: req.dry_run,
@@ -1830,8 +1890,9 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> AnyResult
     Ok(p)
 }
 
-fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
-    let provider = req.embed.as_deref().unwrap_or("openai");
+fn cypher_logic(db: &Database, req: Cypher, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
+    let (provider, embed_key_env) =
+        wire_provider(req.embed.as_deref(), req.embed_key_env.as_deref(), allow)?;
     // Built eagerly because the parser needs it up front, but tolerantly: most
     // queries never embed anything, and a plain MATCH must not require a
     // provider. The reason is kept rather than dropped — without it a query
@@ -1842,7 +1903,7 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
         provider,
         req.embed_model.as_deref(),
         None,
-        req.embed_key_env.as_deref(),
+        embed_key_env,
         true,
     );
     let why_no_embedder = built.as_ref().err().map(|e| e.to_string());
@@ -2060,6 +2121,7 @@ fn digest_logic(
     req: Digest,
     tuning: DigestTuning,
     local_files: bool,
+    allow: Option<&EmbedProvider>,
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2105,7 +2167,24 @@ fn digest_logic(
     // model call at all** — no provider constructed, no key read from the
     // environment, no request made.
     let result = if facts.needs_model() {
-        run_digest(facts, &req, &tuning, &p, source, run_id, mode)?
+        {
+            // A provider a request names is a preset or the operator's own; a base
+            // URL would make the server POST wherever a caller says, with a key
+            // from its own environment.
+            let chat = wire_provider(req.chat.as_deref(), req.key_env.as_deref(), allow)?;
+            let embed = match req.embed.as_deref() {
+                Some(e) => wire_provider(Some(e), req.embed_key_env.as_deref(), allow)?,
+                None => chat,
+            };
+            let run = DigestRun {
+                source,
+                run_id,
+                mode,
+                chat,
+                embed,
+            };
+            run_digest(facts, &req, &tuning, &p, run)?
+        }
     } else {
         dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
     };
@@ -2729,7 +2808,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Hybrid>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking("hybrid", move |db| hybrid_logic(db, req))
+        let allow = self.embed.clone();
+        self.blocking("hybrid", move |db| hybrid_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2742,7 +2822,9 @@ impl DrStrange {
         the graph. Chat provider key comes from the server env, never params."
     )]
     async fn ask(&self, Parameters(req): Parameters<Ask>) -> Result<CallToolResult, McpError> {
-        self.blocking("ask", move |db| ask_logic(db, req)).await
+        let allow = self.embed.clone();
+        self.blocking("ask", move |db| ask_logic(db, req, allow.as_ref()))
+            .await
     }
 
     #[tool(description = "Run an openCypher-subset statement — the way to ask \
@@ -2768,7 +2850,8 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<Cypher>,
     ) -> Result<CallToolResult, McpError> {
-        self.blocking("cypher", move |db| cypher_logic(db, req))
+        let allow = self.embed.clone();
+        self.blocking("cypher", move |db| cypher_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2857,8 +2940,9 @@ impl DrStrange {
     ) -> Result<CallToolResult, McpError> {
         let tuning = self.digest;
         let local_files = self.local_files;
+        let allow = self.embed.clone();
         self.blocking("digest", move |db| {
-            digest_logic(db, req, tuning, local_files)
+            digest_logic(db, req, tuning, local_files, allow.as_ref())
         })
         .await
     }
@@ -3048,7 +3132,7 @@ mod tests {
     fn digest_refuses_a_path_unless_the_host_allows_local_files() {
         let db = Database::in_memory().unwrap();
         let req: Digest = from_value(jval!({"path": "/etc/passwd"})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), false)
+        let err = digest_logic(&db, req, DigestTuning::default(), false, None)
             .expect_err("a networked server must refuse a caller-named path");
         let msg = err.to_string();
         assert!(msg.contains("does not read local files"), "got: {msg}");
@@ -3064,7 +3148,7 @@ mod tests {
     fn digest_with_neither_text_nor_path_is_refused() {
         let db = Database::in_memory().unwrap();
         let req: Digest = from_value(jval!({"text": "   "})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), true)
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
             .expect_err("an empty document must not reach a provider");
         assert!(err.to_string().contains("nothing to digest"), "{err}");
     }
@@ -3465,6 +3549,7 @@ mod tests {
         let out = hybrid_logic(
             &db,
             from_value(jval!({"query": "graph", "label": "Doc", "keyword_prop": "body"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(out["count"], jval!(2));
@@ -3476,9 +3561,147 @@ mod tests {
         assert!(
             hybrid_logic(
                 &db,
-                from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap()
+                from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap(),
+                None
             )
             .is_err()
+        );
+    }
+
+    /// SSRF parity with the web crate (audit N2a): a tool call may name a
+    /// preset or the host's configured provider, never a base URL, and never
+    /// the environment variable the key is read from. Checked on `cypher`,
+    /// `hybrid` and `ask`, the tools that take a provider from params.
+    #[test]
+    fn tool_params_cannot_name_a_url_or_a_foreign_key_env() {
+        let db = fixture();
+        let url = "http://169.254.169.254/latest/meta-data";
+        // A raw URL is refused before any request is made — and refused even
+        // for a plain MATCH, which never embeds: the policy is on the name.
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN n", "embed": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = hybrid_logic(
+            &db,
+            from_value(jval!({"query": "x", "vector_prop": "v", "provider": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = ask_logic(
+            &db,
+            from_value(jval!({"question": "q", "provider": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+
+        // A preset passes the gate (the query then runs; nothing embeds).
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN n", "embed": "deepseek"})).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+
+        // A foreign key_env is refused on a preset: the server would
+        // otherwise send whatever that variable holds as a bearer token.
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "openai",
+                "embed_key_env": "AWS_SECRET_ACCESS_KEY",
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+        let err = ask_logic(
+            &db,
+            from_value(jval!({"question": "q", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+
+        // `digest` goes through the same gate: its providers are resolved
+        // before the run, so a URL is refused there too.
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "chat": url})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+
+        // The host's configured provider is the one URL that passes, with its
+        // own key variable and no other.
+        let configured = EmbedProvider {
+            provider: "http://embed.internal/v1".into(),
+            model: Some("m".into()),
+            key_env: Some("EMBED_KEY".into()),
+        };
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "http://embed.internal/v1",
+                "embed_model": "m",
+            }))
+            .unwrap(),
+            Some(&configured),
+        )
+        .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "http://embed.internal/v1",
+                "embed_key_env": "OPENAI_API_KEY",
+            }))
+            .unwrap(),
+            Some(&configured),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'OPENAI_API_KEY' is not accepted"),
+            "{err}"
         );
     }
 
@@ -3489,6 +3712,7 @@ mod tests {
         let all = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (n:Doc) RETURN n"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2);
@@ -3496,12 +3720,20 @@ mod tests {
         let hop = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (a:Doc)-[:CITES]->(b:Doc) RETURN b"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(hop.as_array().unwrap().len(), 1);
         assert_eq!(hop[0]["external_key"], jval!("d1"));
         // a malformed query surfaces the parser error, not a panic
-        assert!(cypher_logic(&db, from_value(jval!({"query": "MATCH (n)"})).unwrap()).is_err());
+        assert!(
+            cypher_logic(
+                &db,
+                from_value(jval!({"query": "MATCH (n)"})).unwrap(),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3510,6 +3742,7 @@ mod tests {
         let out = cypher_logic(
             &db,
             from_value(jval!({"query": r#"CREATE (a:Person {key:"x", age:40})"#})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(out["nodes_created"], jval!(1));
@@ -3532,12 +3765,14 @@ mod tests {
                 jval!({"query": r#"CREATE (a:Person {key:"x", age:40, note:"delete me"})"#}),
             )
             .unwrap(),
+            None,
         )
         .expect("an additive write with a literal saying delete is not gated");
         cypher_logic(
             &db,
             from_value(jval!({"query": r#"MATCH (a:Person) WHERE key(a) = "x" SET a.age = 41"#}))
                 .unwrap(),
+            None,
         )
         .expect("SET is additive");
 
@@ -3546,7 +3781,7 @@ mod tests {
             r#"MATCH (a:Person) WHERE key(a) = "x" DETACH DELETE a"#,
             r#"match (a:Person) where key(a) = "x" delete a"#,
         ] {
-            let err = cypher_logic(&db, from_value(jval!({"query": q})).unwrap())
+            let err = cypher_logic(&db, from_value(jval!({"query": q})).unwrap(), None)
                 .expect_err("a destructive statement without confirm must be refused")
                 .to_string();
             assert!(err.contains("confirm: true"), "{q}: {err}");
@@ -3564,6 +3799,7 @@ mod tests {
                 "confirm": true
             }))
             .unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(out["nodes_deleted"], jval!(1));
@@ -3590,14 +3826,14 @@ mod tests {
         let db = Database::in_memory().unwrap();
         let req: Digest =
             from_value(jval!({"text": "Ada wrote the first program.", "apply": true})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), true)
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
             .expect_err("apply without confirm must be refused")
             .to_string();
         assert!(err.contains("confirm: true"), "{err}");
         // A dry-run over the same text is not gated: it stops later, at the
         // provider, which is the point — nothing destructive was asked.
         let req: Digest = from_value(jval!({"text": "Ada wrote the first program."})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), true)
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
             .expect_err("no provider in tests")
             .to_string();
         assert!(!err.contains("confirm"), "{err}");
@@ -3622,6 +3858,7 @@ mod tests {
         let err = cypher_logic(
             &db,
             from_value(jval!({"query": "SEARCH (d:Doc) NEAR 'x' RETURN"})).unwrap(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3644,6 +3881,7 @@ mod tests {
         let err = cypher_logic(
             &db,
             from_value(jval!({"query": r#"CREATE (a:Person {key:"x"})"#})).unwrap(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3673,11 +3911,11 @@ mod tests {
         let db = fixture();
         let query =
             || from_value(jval!({"query": "MATCH (n:Doc) RETURN n ORDER BY n.year"})).unwrap();
-        let records = cypher_logic(&db, query()).unwrap();
+        let records = cypher_logic(&db, query(), None).unwrap();
         assert_eq!(records[0]["external_key"], jval!("d0"));
 
         mirrored(&db);
-        let text = cypher_logic(&db, query()).unwrap();
+        let text = cypher_logic(&db, query(), None).unwrap();
         let text = text.as_str().expect("compact text on a mirrored plane");
         assert!(
             text.starts_with("2 nodes\nsynced: commit 0123456789ab\n"),
@@ -3690,6 +3928,7 @@ mod tests {
         let table = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (n:Doc) RETURN count(*) AS docs"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(table["rows"], jval!([[2]]));
