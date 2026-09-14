@@ -336,6 +336,11 @@ impl Database {
         })?;
 
         let seq = stats.seq;
+        // The restore landed the source's commit sequence, not a fresh one —
+        // and this database may already hold cache entries stamped with that
+        // very number, read from its own (empty) state before the restore.
+        // Exact-seq matching would serve them as current, so drop everything.
+        self.cache.invalidate_all();
         // Persist + load the sidecars. Ids are preserved, so they match; loading
         // them into the live registries means this database (and its drop-time
         // save) stays coherent without a rebuild-from-KV.
@@ -440,6 +445,111 @@ mod tests {
             c
         };
         assert!(c.0 > a.0 && c.0 > b.0, "new id past restored ids");
+    }
+
+    /// Adjacency of node 1 in the startup plane, read through the query
+    /// path's reader (so through the L2 cache).
+    fn hops_of_node_1(db: &Database) -> Vec<NodeId> {
+        db.plane(graph::DEFAULT_PLANE_NAME)
+            .unwrap()
+            .with_reader(|r| Ok(r.neighbors(NodeId(1), Dir::Out, None)?.to_vec()))
+            .unwrap()
+            .into_iter()
+            .map(|n| n.node)
+            .collect()
+    }
+
+    /// A snapshot whose source made exactly one graph write past a fresh open
+    /// (node 1 → node 2 in the startup plane), and the seq it reached — one
+    /// an empty target reaches with a single graph write of its own.
+    fn snapshot_one_write_in() -> (Vec<u8>, u64) {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Database::open(src_dir.path().join("db")).unwrap();
+        {
+            let mut w = src
+                .plane(graph::DEFAULT_PLANE_NAME)
+                .unwrap()
+                .write()
+                .unwrap();
+            let a = w.create_node(&["Doc"], Properties::new()).unwrap();
+            let b = w.create_node(&["Doc"], Properties::new()).unwrap();
+            w.create_edge(a, b, "LINKS", Properties::new()).unwrap();
+            w.commit().unwrap();
+        }
+        let seq = src.commit_seq().unwrap();
+        let mut buf = Vec::new();
+        src.snapshot(&mut buf).unwrap();
+        (buf, seq)
+    }
+
+    /// Restore lands the source's commit seq verbatim. The target may already
+    /// hold cache entries stamped with that number — read from its own, empty
+    /// state — and exact-seq matching would keep serving them over the
+    /// restored data unless restore drops the cache.
+    #[test]
+    fn restore_invalidates_cache_entries_stamped_with_the_restored_seq() {
+        let (buf, seq) = snapshot_one_write_in();
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = Database::open(dst_dir.path().join("db")).unwrap();
+        // One graph write that leaves the target empty, so it reaches the
+        // source's seq with nothing in it.
+        dst.plane(graph::DEFAULT_PLANE_NAME)
+            .unwrap()
+            .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+            .unwrap();
+        assert_eq!(dst.commit_seq().unwrap(), seq);
+        assert!(
+            hops_of_node_1(&dst).is_empty(),
+            "warm the cache: no node 1 yet"
+        );
+
+        dst.restore(&mut buf.as_slice()).unwrap();
+        assert_eq!(dst.commit_seq().unwrap(), seq);
+        assert_eq!(
+            hops_of_node_1(&dst),
+            vec![NodeId(2)],
+            "restored data, not the stale entry"
+        );
+    }
+
+    /// The same hazard one hop away: a replica applies its master's restore as
+    /// a replicated batch, whose content changes without the commit seq moving.
+    #[test]
+    fn replicated_restore_invalidates_the_replica_cache() {
+        use std::sync::Mutex;
+        let (buf, seq) = snapshot_one_write_in();
+
+        let master_dir = tempfile::tempdir().unwrap();
+        let master = Database::open(master_dir.path().join("db")).unwrap();
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = batches.clone();
+        master
+            .on_wal_commit(move |b| sink.lock().unwrap().push(b))
+            .unwrap();
+        master
+            .plane(graph::DEFAULT_PLANE_NAME)
+            .unwrap()
+            .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+            .unwrap();
+        master.restore(&mut buf.as_slice()).unwrap();
+        let mut captured: Vec<_> = batches.lock().unwrap().drain(..).collect();
+        assert_eq!(captured.len(), 2, "the index declaration, then the restore");
+        let restore = captured.pop().unwrap();
+        let declare = captured.pop().unwrap();
+
+        let replica_dir = tempfile::tempdir().unwrap();
+        let replica = Database::open_read_only(replica_dir.path().join("db")).unwrap();
+        replica.apply_replicated(declare).unwrap();
+        assert_eq!(replica.commit_seq().unwrap(), seq);
+        assert!(
+            hops_of_node_1(&replica).is_empty(),
+            "warm at the source's seq"
+        );
+
+        replica.apply_replicated(restore).unwrap();
+        assert_eq!(replica.commit_seq().unwrap(), seq, "a restore moves no seq");
+        assert_eq!(hops_of_node_1(&replica), vec![NodeId(2)]);
     }
 
     #[test]

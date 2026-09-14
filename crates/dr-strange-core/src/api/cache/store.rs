@@ -89,6 +89,15 @@ impl GraphCache {
         }
     }
 
+    /// Drop every entry, whatever its stamp. For the paths that land a commit
+    /// sequence the cache may already have stamped with *different* data —
+    /// snapshot restore and replication set the sequence to a foreign value
+    /// rather than bumping it, so exact-seq matching alone cannot tell the old
+    /// entries from the new state (arch/02 §3).
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
+
     pub fn node(&self, plane: PlaneId, id: u64, seq: u64) -> Option<Arc<NodeRecord>> {
         match self.cache.get(&Key::Node(plane, id)) {
             Some(Stamped {
@@ -254,5 +263,17 @@ mod tests {
         let small: Arc<[Neighbor]> = Arc::from(vec![]);
         cache.put_adj(plane, 2, Dir::Out, None, 3, small);
         assert!(cache.adj(plane, 2, Dir::Out, None, 3).is_some());
+    }
+
+    #[test]
+    fn invalidate_all_forgets_every_stamp() {
+        let cache = GraphCache::new(1 << 20);
+        let plane = PlaneId(1);
+        cache.put_node(plane, 1, 5, record(plane));
+        cache.invalidate_all();
+        assert!(
+            cache.node(plane, 1, 5).is_none(),
+            "same seq, but restored data"
+        );
     }
 }
