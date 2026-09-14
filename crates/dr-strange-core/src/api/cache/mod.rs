@@ -147,6 +147,44 @@ fn indexed_or_brute<R: GraphReader + ?Sized>(
     brute_force_search(reader, label, property, query, metric, k)
 }
 
+/// Keep only the hits whose node this reader's snapshot can see — present,
+/// and carrying `label` when one was asked for (arch/02 §3).
+///
+/// The registries live outside the snapshot: a writer publishes its KV
+/// commit before it takes the registry lock, and a time-travelling handle
+/// pins a past snapshot under a registry built from the latest one. Either
+/// way an index can name a node the snapshot does not hold (not yet
+/// visible, deleted since, relabelled since). Surfacing such an id would
+/// hand the executor a row it cannot decode — a phantom — so the reader
+/// drops it here, once, for every terminal that searches an index. The
+/// record read is not wasted: the executor decodes the same node next, and
+/// finds it in the per-query L1.
+fn visible_hits<R: GraphReader + ?Sized, T>(
+    reader: &R,
+    hits: Vec<T>,
+    label: Option<&str>,
+    id_of: impl Fn(&T) -> NodeId,
+) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let visible = match reader.node(id_of(&hit))? {
+            Some(node) => label.is_none_or(|l| node.labels.iter().any(|have| have == l)),
+            None => false,
+        };
+        if visible {
+            out.push(hit);
+        }
+    }
+    Ok(out)
+}
+
+/// How many live BM25 postings a historical keyword search asks for per
+/// result it must return. The live index has no notion of the pinned
+/// snapshot, so the reader over-fetches, filters through the snapshot and
+/// truncates; a query whose matches mostly postdate the snapshot can still
+/// come back short, which the builder documents.
+const HISTORICAL_KEYWORD_OVERFETCH: usize = 4;
+
 /// Pass-through `GraphReader` over a storage read transaction (arch/02 §2).
 /// Every read hits storage and decodes fresh — the point of comparison the
 /// future cache must beat, and the always-correct baseline for differential
@@ -219,7 +257,7 @@ impl GraphReader for UncachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        indexed_or_brute(
+        let hits = indexed_or_brute(
             self,
             self.registry,
             self.plane,
@@ -228,7 +266,8 @@ impl GraphReader for UncachedReader<'_> {
             query,
             metric,
             k,
-        )
+        )?;
+        visible_hits(self, hits, label, |hit| NodeId(hit.id))
     }
 }
 
@@ -255,6 +294,10 @@ pub struct CachedReader<'a> {
     /// Optional shared cross-query L2 (arch/02 §3). `None` ⇒ pure per-query
     /// (L1 only) — used by tests and the differential oracle.
     l2: Option<(&'a GraphCache, u64)>,
+    /// This reader pins a past snapshot (AS OF) while the keyword registry
+    /// describes the latest one, so `keyword_search` over-fetches from the
+    /// live postings before filtering through the snapshot.
+    historical: bool,
     // Per-query L1: fast intra-query hits and negative caching. Bound to this
     // reader's snapshot, dropped at query end.
     nodes: RefCell<AHashMap<NodeId, Option<Arc<NodeRecord>>>>,
@@ -287,18 +330,21 @@ impl<'a> CachedReader<'a> {
         Self::build(txn, plane, Some(registry), Some((cache, seq)))
     }
 
-    /// Like [`with_cache`](Self::with_cache) but with no vector index, so every
-    /// vector search takes the exact brute-force path over this snapshot. Used
-    /// by time-travel reads (ROADMAP §4): the live HNSW index is built from the
-    /// latest commit and can't answer a historical snapshot, so a pinned read
-    /// scans instead — correct, just unindexed.
-    pub(crate) fn with_cache_no_index(
+    /// Like [`with_cache`](Self::with_cache) but for a time-travel read
+    /// (ROADMAP §4): no vector index, so every vector search takes the exact
+    /// brute-force path over the pinned snapshot — the live HNSW index is
+    /// built from the latest commit and can't answer a past one — and
+    /// keyword searches (which have no unindexed path) filter the live BM25
+    /// postings through the snapshot, over-fetching to compensate.
+    pub(crate) fn with_cache_historical(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
         cache: &'a GraphCache,
         seq: u64,
     ) -> Self {
-        Self::build(txn, plane, None, Some((cache, seq)))
+        let mut reader = Self::build(txn, plane, None, Some((cache, seq)));
+        reader.historical = true;
+        reader
     }
 
     /// Attach the declared keyword indexes, enabling `keyword_search`. Chained
@@ -321,6 +367,7 @@ impl<'a> CachedReader<'a> {
             registry,
             keywords: None,
             l2,
+            historical: false,
             nodes: RefCell::new(AHashMap::new()),
             edges: RefCell::new(AHashMap::new()),
             adjacency: RefCell::new(AHashMap::new()),
@@ -408,7 +455,7 @@ impl GraphReader for CachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        indexed_or_brute(
+        let hits = indexed_or_brute(
             self,
             self.registry,
             self.plane,
@@ -417,7 +464,8 @@ impl GraphReader for CachedReader<'_> {
             query,
             metric,
             k,
-        )
+        )?;
+        visible_hits(self, hits, label, |hit| NodeId(hit.id))
     }
 
     fn keyword_search(
@@ -427,10 +475,20 @@ impl GraphReader for CachedReader<'_> {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeId, f32)>> {
-        Ok(self
+        // A live read asks for exactly `k`: the only ids the filter can drop
+        // are the skew window's, and a short page there is the honest answer.
+        let fetch = if self.historical {
+            k.saturating_mul(HISTORICAL_KEYWORD_OVERFETCH)
+        } else {
+            k
+        };
+        let hits = self
             .keywords
-            .and_then(|reg| reg.search(self.plane, label, property, query, k))
-            .unwrap_or_default())
+            .and_then(|reg| reg.search(self.plane, label, property, query, fetch))
+            .unwrap_or_default();
+        let mut hits = visible_hits(self, hits, Some(label), |hit| hit.0)?;
+        hits.truncate(k);
+        Ok(hits)
     }
 }
 
@@ -618,6 +676,84 @@ mod tests {
         let n3 = r3.node(seed).unwrap().unwrap();
         assert!(!Arc::ptr_eq(&n1, &n3), "newer seq ⇒ miss ⇒ fresh decode");
         assert_eq!(*n1, *n3, "same underlying record, just re-decoded");
+    }
+
+    #[test]
+    fn index_hits_the_snapshot_cannot_see_are_dropped() {
+        // The registries are updated after the KV commit publishes (and are
+        // never rolled back to a past snapshot), so an index can name a node
+        // a reader's snapshot lacks. Model the window directly: index a
+        // node, then delete it in storage without telling the registries.
+        use crate::index::VectorRegistry;
+        use crate::keyword::KeywordRegistry;
+        use crate::text::Language;
+        use crate::types::{PropDesc, PropValue};
+
+        let eng = MemoryEngine::new();
+        let mut props = Properties::new();
+        props.insert(
+            "emb".into(),
+            PropDesc::new(PropValue::Vector(vec![1.0, 0.0])),
+        );
+        props.insert(
+            "body".into(),
+            PropDesc::new(PropValue::Str("graph databases".into())),
+        );
+        let (kept, phantom) = {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            let kept = graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &props).unwrap();
+            let phantom = graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &props).unwrap();
+            txn.commit().unwrap();
+            (kept, phantom)
+        };
+        let mut vectors = VectorRegistry::new();
+        let mut keywords = KeywordRegistry::new();
+        {
+            let txn = eng.begin_read().unwrap();
+            vectors
+                .build_entry(&txn, PlaneId::STARTUP, "Doc", "emb", Metric::Cosine)
+                .unwrap();
+            keywords
+                .build_entry(&txn, PlaneId::STARTUP, "Doc", "body", Language::English)
+                .unwrap();
+        }
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::delete_node(&mut txn, PlaneId::STARTUP, phantom).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let txn = eng.begin_read().unwrap();
+        let cached =
+            CachedReader::with_registry(&txn, PlaneId::STARTUP, &vectors).with_keywords(&keywords);
+        let ids: Vec<u64> = cached
+            .vector_search(Some("Doc"), "emb", &[1.0, 0.0], Metric::Cosine, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![kept.0],
+            "the indexed-but-deleted node is not surfaced"
+        );
+        let ids: Vec<NodeId> = cached
+            .keyword_search("Doc", "body", "graph", 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![kept]);
+
+        let uncached = UncachedReader::with_registry(&txn, PlaneId::STARTUP, &vectors);
+        let ids: Vec<u64> = uncached
+            .vector_search(Some("Doc"), "emb", &[1.0, 0.0], Metric::Cosine, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(ids, vec![kept.0], "the oracle agrees");
     }
 
     /// A chunky property map so postcard decode on read is non-trivial — the
