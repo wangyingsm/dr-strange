@@ -5,9 +5,9 @@
 //!   query sets to a directory, as plain CSV/txt so every engine (drsg here,
 //!   plus SQLite / Kùzu / Neo4j via `benchmarks/compare.py`) loads *identical*
 //!   data and runs *identical* queries.
-//! - `run`  — loads that dataset into dr-strange (redb file backend) and times
-//!   the core operations + vector search, emitting results JSON in the shared
-//!   schema the Python driver also produces.
+//! - `run`  — loads that dataset into dr-strange (the native LSM backend, the
+//!   shipping default) and times the core operations + vector search, emitting
+//!   results JSON in the shared schema the Python driver also produces.
 //!
 //! The dataset is the single source of truth: `gen` produces the files, and
 //! both `run` and the Python engines read them — no engine regenerates data.
@@ -66,8 +66,9 @@ enum Command {
     Run {
         #[arg(long, default_value = "benchmarks/data")]
         data: PathBuf,
-        /// Scratch database file (recreated each run).
-        #[arg(long, default_value = "benchmarks/data/drsg.redb")]
+        /// Scratch database (a directory for the native backend; recreated
+        /// each run).
+        #[arg(long, default_value = "benchmarks/data/drsg.db")]
         db: PathBuf,
         /// Where to write the results JSON.
         #[arg(long, default_value = "benchmarks/results/dr-strange.json")]

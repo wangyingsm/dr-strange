@@ -92,7 +92,9 @@ def main():
         "(Kùzu), the universal embedded baseline (SQLite as an edge table + "
         "recursive CTEs), and the industry-standard server (Neo4j). Every engine "
         "loads the **same** deterministic dataset and runs the **same** query "
-        "sets; each is timed in its own native optimal path.\n"
+        "sets; each is timed in its own native optimal path. **The measurement "
+        "paths are not symmetric**: dr-strange is timed in-process from Rust, "
+        "the other engines through their Python drivers (see Caveats).\n"
     )
     if meta:
         lines.append(
@@ -142,6 +144,11 @@ def main():
         "- **expand/traverse** resolve the start node by key first (as any "
         "client must), then expand; `traverse_2hop` is the distinct set "
         "reachable in 1–2 hops.\n"
+        "- **Vector index build** times the index build alone, for every "
+        "engine: loading the vectors happens before the timer starts (drsg "
+        "inserts them into a separate plane, Kùzu `COPY`s, Neo4j `UNWIND`s). "
+        "Earlier reports timed Neo4j's load together with its build; a Neo4j "
+        "figure from before that fix understates Neo4j.\n"
         "- Each engine runs **alone** (no CPU contention), **pinned to the same "
         "P-core set** (`bench_pin` in the justfile; the Neo4j container gets the "
         "same `--cpuset-cpus`), for `bench_repeat` passes with a fresh database "
@@ -154,6 +161,19 @@ def main():
 
     lines.append("## Caveats (why cross-engine numbers lie if you squint)\n")
     lines.append(
+        "- **The measurement path differs — this is the big one.** dr-strange "
+        "is driven in-process from Rust (`benchmarks/drsg-bench`): the timer "
+        "wraps a direct library call. SQLite, Kùzu and Neo4j are driven from "
+        "Python (`benchmarks/compare.py`) through `sqlite3`, the `kuzu` "
+        "bindings and the `neo4j` Bolt driver, so every one of their per-op "
+        "latencies includes Python call, argument-marshalling and result-"
+        "materialisation overhead that drsg's do not. On microsecond-scale "
+        "rows (lookup, 1-hop) that overhead is a large share of the figure: "
+        "the SQLite lookup cell is close to the floor of what a Python-driven "
+        "measurement can show at all. Read sub-10 µs cells as \"same class\", "
+        "not as a ranking; the millisecond-scale gaps are real. A Rust-driven "
+        "comparator (rusqlite, Kùzu's Rust API) would remove the asymmetry and "
+        "is the honest next step.\n"
         "- **Durability differs.** SQLite runs WAL + `synchronous=NORMAL`; drsg's "
         "native LSM engine appends and fsyncs its WAL per commit (bulk load is "
         "one commit); Kùzu and Neo4j use their own defaults. These are not "
@@ -188,7 +208,7 @@ def main():
         "built ~10× slower than Kùzu/Neo4j. Cached per-vector norms (every "
         "metric reduces to one dot), a multi-accumulator AVX2+FMA dot kernel, "
         "reused search scratch, and a parallel multi-threaded build (arch/01 "
-        "§5) moved it from ~10× behind to several times ahead of both.\n"
+        "§5) moved it from ~10× behind to ahead of both — by less over Neo4j than the table shows, since the Neo4j build cell was measured with the load included (see Methodology).\n"
         "- **Strong — vector query.** drsg's top-k latency is well below both "
         "Kùzu and Neo4j — the same cached-norm + SIMD path that sped up build "
         "also sharpened search, and the `ef` clamp keeps deep-k recall honest "

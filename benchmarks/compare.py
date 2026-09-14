@@ -204,7 +204,12 @@ def run_kuzu(data, k):
     t0 = time.perf_counter()
     for key in keys:
         s = time.perf_counter()
-        con.execute(q_lookup, {"k": key})
+        res = con.execute(q_lookup, {"k": key})
+        # Drain the result like every other engine's lookup does (SQLite
+        # fetchone, Neo4j list(...)): Kùzu materialises lazily, so timing the
+        # execute() alone would leave the row fetch out of the measurement.
+        while res.has_next():
+            res.get_next()
         micros.append((time.perf_counter() - s) * 1e6)
     results.append(op_latency(engine, "lookup", micros, time.perf_counter() - t0))
 
@@ -358,12 +363,17 @@ def run_neo4j_vectors(ses, data, k, results, engine):
     meta = load_meta(data)
     dim = meta["dim"]
     vecs = list(vector_rows(data))
-    t0 = time.perf_counter()
+    # Loading the vectors is untimed: `vector_build` measures index build
+    # alone for every engine (drsg inserts into its vector plane before the
+    # timer starts, Kùzu COPYs before the timer, Neo4j UNWINDs here before
+    # the timer). Neo4j's row used to include this load, which understated
+    # its build throughput.
     for batch in chunks(vecs, 5000):
         ses.run(
             "UNWIND $rows AS r CREATE (i:Item {key:r.key, emb:r.emb})",
             rows=[{"key": key, "emb": emb} for (key, emb) in batch],
         )
+    t0 = time.perf_counter()
     ses.run(
         "CREATE VECTOR INDEX item_emb IF NOT EXISTS FOR (i:Item) ON i.emb "
         "OPTIONS {indexConfig: {`vector.dimensions`: $dim, `vector.similarity_function`: 'cosine'}}",
