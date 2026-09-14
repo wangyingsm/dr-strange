@@ -4,9 +4,9 @@
 //!
 //! **Layout** (all integers little-endian):
 //! ```text
-//!   [data block]*     entries, sorted by (table, key, seq DESC)
-//!   [index block]     one entry per data block: its first key + offset/len
-//!   [bloom block]     Bloom filter over the run's (table, key) pairs
+//!   [data block]*     entries, sorted by (table, key, seq DESC)   + crc32
+//!   [index block]     one entry per data block: its first key + offset/len + crc32
+//!   [bloom block]     Bloom filter over the run's (table, key) pairs  + crc32
 //!   [footer]          index+bloom offsets/lens, entry_count, max_seq, magic, crc32
 //! ```
 //! An **entry** is `table:u8, key_len:u32, key, seq:u64, flag:u8 (0=del,1=put),
@@ -14,19 +14,33 @@
 //! — the same order the memtable's `BTreeMap` uses — so a block's first key in
 //! the index is enough to binary-search to the run of a user key's versions.
 //!
-//! Reads go through `pread` (a `Mutex<File>` + seek/read, portable) a block at a
-//! time; a block cache lands in a later phase.
+//! **Format versions.** The footer's magic names the version. `DRSS` (v1) has no
+//! block checksums; `DRS2` (v2, current) ends every block — data, index, bloom —
+//! with a CRC-32 of its bytes, and the index/footer lengths include that
+//! trailer. Readers accept both; the writer emits v2 only. A block whose CRC
+//! does not match, or whose bytes do not decode to whole entries, is
+//! `Error::Corrupt` — never a silent "absent", which is what a v1 reader used to
+//! report when bit-rot broke an entry mid-block.
+//!
+//! Reads are positional (`pread`/`seek_read`) a block at a time, so concurrent
+//! readers of one run do not serialize on a file cursor; verified blocks are
+//! kept in the engine's shared block cache.
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::storage::native::{BlockCache, MemKey, Op};
 
-const MAGIC: u32 = 0x5353_5244; // "DRSS"
+/// v1 footer magic ("DRSS"): blocks carry no checksum. Read-only.
+const MAGIC_V1: u32 = 0x5353_5244;
+/// v2 footer magic ("DRS2"): every block ends with a CRC-32 trailer.
+const MAGIC_V2: u32 = 0x3253_5244;
+/// Bytes of the CRC-32 trailer that ends every v2 block.
+const BLOCK_CRC_LEN: usize = 4;
 // Footer: index_offset, index_len, bloom_offset, bloom_len, count, max_seq (6×u64)
 // + magic, crc (2×u32).
 const FOOTER_LEN: u64 = 8 * 6 + 4 * 2; // 56 bytes
@@ -135,8 +149,19 @@ struct BlockRef {
     len: u32,
 }
 
+/// On-disk format version, decided by the footer magic at open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Version {
+    /// No block checksums.
+    V1,
+    /// CRC-32 trailer on every block.
+    V2,
+}
+
 pub(super) struct Sst {
-    file: Mutex<File>,
+    /// Read positionally, never seeked: a shared cursor would serialize readers.
+    file: File,
+    version: Version,
     index: Vec<BlockRef>,
     bloom: Bloom,
     pub(super) max_seq: u64,
@@ -186,6 +211,18 @@ fn encode_index_key(buf: &mut Vec<u8>, k: &KeyPos) {
     encode_key_parts(buf, k.table, &k.key, k.seq);
 }
 
+/// Append a block's CRC-32 trailer and return its on-disk length (payload +
+/// trailer), which is what the index and footer record. A block over `u32::MAX`
+/// bytes is refused rather than having its length wrap in the index — a single
+/// value that large is not something the engine writes today, but a wrapped
+/// length would read back as a checksum failure on a healthy file.
+fn seal_block(block: &mut Vec<u8>) -> Result<u32> {
+    let crc = super::crc32(block);
+    put_u32(block, crc);
+    u32::try_from(block.len())
+        .map_err(|_| Error::InvalidArgument("SST block exceeds u32::MAX bytes".into()))
+}
+
 /// Write `entries` (already sorted, as a memtable `BTreeMap` is) to an SST at
 /// `path`, stamped with `max_seq`. Writes to a temp file then renames, so a
 /// crash mid-flush can't leave a half-written SST under the real name.
@@ -211,9 +248,9 @@ pub(super) fn write(
                        file: &mut File,
                        index: &mut Vec<(KeyPos, u64, u32)>|
      -> Result<()> {
-        if let Some((first, block)) = cur.take() {
+        if let Some((first, mut block)) = cur.take() {
+            let len = seal_block(&mut block)?;
             file.write_all(&block)?;
-            let len = block.len() as u32;
             index.push((first, *offset, len));
             *offset += len as u64;
         }
@@ -247,11 +284,13 @@ pub(super) fn write(
         put_u64(&mut index_bytes, *off);
         put_u32(&mut index_bytes, *len);
     }
+    seal_block(&mut index_bytes)?;
     file.write_all(&index_bytes)?;
 
     // Bloom block (right after the index).
     let bloom_offset = index_offset + index_bytes.len() as u64;
-    let bloom_bytes = bloom.encode();
+    let mut bloom_bytes = bloom.encode();
+    seal_block(&mut bloom_bytes)?;
     file.write_all(&bloom_bytes)?;
 
     // Footer.
@@ -262,7 +301,7 @@ pub(super) fn write(
     put_u64(&mut footer, bloom_bytes.len() as u64);
     put_u64(&mut footer, count);
     put_u64(&mut footer, max_seq);
-    put_u32(&mut footer, MAGIC);
+    put_u32(&mut footer, MAGIC_V2);
     let crc = super::crc32(&footer);
     put_u32(&mut footer, crc);
     file.write_all(&footer)?;
@@ -335,6 +374,20 @@ impl EntryRef<'_> {
     }
 }
 
+/// The next entry of a data block, `Ok(None)` exactly at the block's end. A
+/// block that ends mid-entry is `Error::Corrupt`: v2 blocks are CRC-checked
+/// before decoding, so this can only mean the writer or the file is broken,
+/// and a v1 block has nothing else to catch bit-rot with. Silently stopping
+/// here (the old behaviour) turned corruption into "key absent".
+fn next_entry<'a>(c: &mut Cursor<'a>) -> Result<Option<EntryRef<'a>>> {
+    if c.pos >= c.buf.len() {
+        return Ok(None);
+    }
+    decode_entry(c)
+        .map(Some)
+        .ok_or_else(|| Error::Corrupt("SST data block ends mid-entry".into()))
+}
+
 fn decode_entry<'a>(c: &mut Cursor<'a>) -> Option<EntryRef<'a>> {
     let table = c.u8()?;
     let key_len = c.u32()? as usize;
@@ -351,17 +404,98 @@ fn decode_entry<'a>(c: &mut Cursor<'a>) -> Option<EntryRef<'a>> {
     })
 }
 
+/// Fill `buf` from `file` at `offset` without touching the file's cursor, so
+/// readers on different threads never serialize on a seek. `pread` on unix;
+/// `seek_read` (an overlapped read, likewise cursor-free) on Windows.
+fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        compile_error!("Sst::read_at needs a positional-read primitive for this platform");
+    }
+}
+
+/// Read the `len` on-disk bytes of a block at `offset` and hand back its
+/// payload: for v2 the trailing CRC-32 is checked and stripped, for v1 the
+/// bytes are returned as-is (nothing to check against). A short file is
+/// `Corrupt` rather than an io error — the footer promised bytes that are not
+/// there.
+fn read_block_at(
+    file: &File,
+    version: Version,
+    what: &str,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    read_at(file, offset, &mut buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Corrupt(format!("SST {what} block runs past end of file"))
+        } else {
+            Error::from(e)
+        }
+    })?;
+    match version {
+        Version::V1 => Ok(buf),
+        Version::V2 => {
+            let Some(payload_len) = buf.len().checked_sub(BLOCK_CRC_LEN) else {
+                return Err(Error::Corrupt(format!(
+                    "SST {what} block shorter than its crc"
+                )));
+            };
+            let stored = u32::from_le_bytes(
+                buf[payload_len..]
+                    .try_into()
+                    .map_err(|_| Error::Corrupt(format!("SST {what} block crc unreadable")))?,
+            );
+            buf.truncate(payload_len);
+            if super::crc32(&buf) != stored {
+                return Err(Error::Corrupt(format!("SST {what} block crc mismatch")));
+            }
+            Ok(buf)
+        }
+    }
+}
+
+/// Bound a footer-declared length before allocating for it: a garbled length
+/// cannot exceed the file, so anything larger is corruption, not a request.
+fn checked_len(what: &str, offset: u64, len: u64, file_len: u64) -> Result<usize> {
+    let fits = offset.checked_add(len).is_some_and(|end| end <= file_len);
+    if !fits {
+        return Err(Error::Corrupt(format!(
+            "SST {what} block lies outside the file"
+        )));
+    }
+    usize::try_from(len).map_err(|_| Error::Corrupt(format!("SST {what} block too large")))
+}
+
 impl Sst {
     pub(super) fn open(path: &Path, id: u64, cache: Arc<BlockCache>) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let file_len = file.seek(SeekFrom::End(0))?;
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         if file_len < FOOTER_LEN {
             return Err(Error::Corrupt("SST too short".into()));
         }
         // Footer.
-        file.seek(SeekFrom::Start(file_len - FOOTER_LEN))?;
         let mut footer = vec![0u8; FOOTER_LEN as usize];
-        file.read_exact(&mut footer)?;
+        read_at(&file, file_len - FOOTER_LEN, &mut footer)?;
         let mut c = Cursor::new(&footer);
         let bad = || Error::Corrupt("bad SST footer".into());
         let index_offset = c.u64().ok_or_else(bad)?;
@@ -372,43 +506,37 @@ impl Sst {
         let max_seq = c.u64().ok_or_else(bad)?;
         let magic = c.u32().ok_or_else(bad)?;
         let crc = c.u32().ok_or_else(bad)?;
-        if magic != MAGIC || super::crc32(&footer[..FOOTER_LEN as usize - 4]) != crc {
+        let version = match magic {
+            MAGIC_V1 => Version::V1,
+            MAGIC_V2 => Version::V2,
+            _ => return Err(Error::Corrupt("SST footer magic/crc mismatch".into())),
+        };
+        if super::crc32(&footer[..FOOTER_LEN as usize - 4]) != crc {
             return Err(Error::Corrupt("SST footer magic/crc mismatch".into()));
         }
+        let data_end = file_len - FOOTER_LEN;
 
         // Bloom block.
-        file.seek(SeekFrom::Start(bloom_offset))?;
-        let mut bbuf = vec![0u8; bloom_len as usize];
-        file.read_exact(&mut bbuf)?;
+        let bloom_len = checked_len("bloom", bloom_offset, bloom_len, data_end)?;
+        let bbuf = read_block_at(&file, version, "bloom", bloom_offset, bloom_len)?;
         let bloom = Bloom::decode(&bbuf).ok_or_else(|| Error::Corrupt("bad SST bloom".into()))?;
 
         // Index block.
-        file.seek(SeekFrom::Start(index_offset))?;
-        let mut ibuf = vec![0u8; index_len as usize];
-        file.read_exact(&mut ibuf)?;
+        let index_len = checked_len("index", index_offset, index_len, data_end)?;
+        let ibuf = read_block_at(&file, version, "index", index_offset, index_len)?;
         let mut ic = Cursor::new(&ibuf);
         let mut index = Vec::new();
+        let bad_index = || Error::Corrupt("bad SST index".into());
         while ic.pos < ibuf.len() {
-            let table = ic
-                .u8()
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?;
-            let key_len = ic
-                .u32()
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?
-                as usize;
-            let key = ic
-                .bytes(key_len)
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?
-                .to_vec();
-            let seq = ic
-                .u64()
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?;
-            let offset = ic
-                .u64()
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?;
-            let len = ic
-                .u32()
-                .ok_or_else(|| Error::Corrupt("bad SST index".into()))?;
+            let table = ic.u8().ok_or_else(bad_index)?;
+            let key_len = ic.u32().ok_or_else(bad_index)? as usize;
+            let key = ic.bytes(key_len).ok_or_else(bad_index)?.to_vec();
+            let seq = ic.u64().ok_or_else(bad_index)?;
+            let offset = ic.u64().ok_or_else(bad_index)?;
+            let len = ic.u32().ok_or_else(bad_index)?;
+            // A data block must lie in the data region; a garbled reference is
+            // caught here rather than as a mystery read later.
+            checked_len("data", offset, len as u64, index_offset)?;
             index.push(BlockRef {
                 first: KeyPos { table, key, seq },
                 offset,
@@ -417,7 +545,8 @@ impl Sst {
         }
 
         Ok(Self {
-            file: Mutex::new(file),
+            file,
+            version,
             index,
             bloom,
             max_seq,
@@ -434,7 +563,7 @@ impl Sst {
         for block in &self.index {
             let buf = self.read_block(block)?;
             let mut c = Cursor::new(&buf);
-            while let Some(e) = decode_entry(&mut c) {
+            while let Some(e) = next_entry(&mut c)? {
                 out.insert((e.table, e.key.to_vec(), std::cmp::Reverse(e.seq)), e.op());
             }
         }
@@ -446,13 +575,14 @@ impl Sst {
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
-        let buf = {
-            let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-            file.seek(SeekFrom::Start(block.offset))?;
-            let mut buf = vec![0u8; block.len as usize];
-            file.read_exact(&mut buf)?;
-            buf
-        };
+        // Only verified payloads enter the cache, so a hit needs no re-check.
+        let buf = read_block_at(
+            &self.file,
+            self.version,
+            "data",
+            block.offset,
+            block.len as usize,
+        )?;
         let arc = Arc::new(buf);
         self.cache.insert(key, arc.clone());
         Ok(arc)
@@ -485,7 +615,7 @@ impl Sst {
             // Skip blocks whose whole range is before the key.
             let buf = self.read_block(block)?;
             let mut c = Cursor::new(&buf);
-            while let Some(e) = decode_entry(&mut c) {
+            while let Some(e) = next_entry(&mut c)? {
                 match (e.table, e.key).cmp(&(table, key)) {
                     std::cmp::Ordering::Less => continue,
                     std::cmp::Ordering::Greater => return Ok(None), // passed the key
@@ -519,7 +649,7 @@ impl Sst {
         for block in &self.index[start_block..] {
             let buf = self.read_block(block)?;
             let mut c = Cursor::new(&buf);
-            while let Some(e) = decode_entry(&mut c) {
+            while let Some(e) = next_entry(&mut c)? {
                 if e.table != table {
                     if e.table > table {
                         return Ok(());
@@ -581,4 +711,286 @@ pub(super) fn list(dir: &Path) -> Vec<PathBuf> {
     }
     ssts.sort_by_key(|(n, _)| *n);
     ssts.into_iter().map(|(_, p)| p).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Reverse;
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("drsg-sst-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn sst(&self) -> PathBuf {
+            self.0.join("sst-000001")
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `n` puts on table 1 with 100-byte values (enough to span several
+    /// 16 KiB blocks at n=1000) plus one tombstone, all at seq 1..=n+1.
+    fn entries(n: u64) -> BTreeMap<MemKey, Op> {
+        let mut m = BTreeMap::new();
+        for i in 0..n {
+            let key = format!("key-{i:06}").into_bytes();
+            m.insert((1u8, key, Reverse(i + 1)), Op::Put(vec![i as u8; 100]));
+        }
+        m.insert((1u8, b"key-000000".to_vec(), Reverse(n + 1)), Op::Del);
+        m
+    }
+
+    fn open(path: &Path) -> Result<Sst> {
+        Sst::open(path, 1, super::super::new_block_cache())
+    }
+
+    fn assert_corrupt<T>(r: Result<T>, what: &str) {
+        match r {
+            Err(Error::Corrupt(_)) => {}
+            Err(e) => panic!("{what}: expected Corrupt, got {e:?}"),
+            Ok(_) => panic!("{what}: expected Corrupt, got Ok"),
+        }
+    }
+
+    fn patch(path: &Path, f: impl FnOnce(&mut Vec<u8>)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        f(&mut bytes);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The layout a pre-v2 writer produced: identical entries and footer, but
+    /// no CRC trailers and the `DRSS` magic. Kept here (not in the writer) so
+    /// the production path can never emit it by accident.
+    fn write_v1(path: &Path, entries: &BTreeMap<MemKey, Op>, truncate_last_block_by: usize) {
+        let mut out = Vec::new();
+        let mut index: Vec<(KeyPos, u64, u32)> = Vec::new();
+        let mut cur: Option<(KeyPos, Vec<u8>)> = None;
+        let mut bloom = Bloom::new(entries.len());
+        let mut blocks: Vec<(KeyPos, Vec<u8>)> = Vec::new();
+        for ((table, key, Reverse(seq)), op) in entries {
+            let (_, block) = cur.get_or_insert_with(|| {
+                (
+                    KeyPos {
+                        table: *table,
+                        key: key.clone(),
+                        seq: *seq,
+                    },
+                    Vec::new(),
+                )
+            });
+            encode_entry(block, *table, key, *seq, op);
+            bloom.add(*table, key);
+            if block.len() >= BLOCK_TARGET {
+                blocks.push(cur.take().unwrap());
+            }
+        }
+        if let Some(b) = cur.take() {
+            blocks.push(b);
+        }
+        if let Some((_, last)) = blocks.last_mut() {
+            let keep = last.len() - truncate_last_block_by;
+            last.truncate(keep);
+        }
+        for (first, block) in blocks {
+            index.push((first, out.len() as u64, block.len() as u32));
+            out.extend_from_slice(&block);
+        }
+        let index_offset = out.len() as u64;
+        let mut index_bytes = Vec::new();
+        for (first, off, len) in &index {
+            encode_index_key(&mut index_bytes, first);
+            put_u64(&mut index_bytes, *off);
+            put_u32(&mut index_bytes, *len);
+        }
+        out.extend_from_slice(&index_bytes);
+        let bloom_offset = out.len() as u64;
+        let bloom_bytes = bloom.encode();
+        out.extend_from_slice(&bloom_bytes);
+        let mut footer = Vec::new();
+        put_u64(&mut footer, index_offset);
+        put_u64(&mut footer, index_bytes.len() as u64);
+        put_u64(&mut footer, bloom_offset);
+        put_u64(&mut footer, bloom_bytes.len() as u64);
+        put_u64(&mut footer, entries.len() as u64);
+        put_u64(&mut footer, 7);
+        put_u32(&mut footer, MAGIC_V1);
+        let crc = super::super::crc32(&footer);
+        put_u32(&mut footer, crc);
+        out.extend_from_slice(&footer);
+        std::fs::write(path, out).unwrap();
+    }
+
+    fn check_reads(sst: &Sst, n: u64) {
+        // Point reads: tombstone shadows key 0 at the top, older version visible below.
+        assert_eq!(sst.get(1, b"key-000000", u64::MAX).unwrap(), Some(Op::Del));
+        assert_eq!(
+            sst.get(1, b"key-000000", 1).unwrap(),
+            Some(Op::Put(vec![0u8; 100]))
+        );
+        let mid = format!("key-{:06}", n / 2).into_bytes();
+        assert_eq!(
+            sst.get(1, &mid, u64::MAX).unwrap(),
+            Some(Op::Put(vec![(n / 2) as u8; 100]))
+        );
+        assert_eq!(sst.get(1, b"key-zzz", u64::MAX).unwrap(), None);
+        assert_eq!(sst.get(2, b"key-000001", u64::MAX).unwrap(), None);
+        // Range and full load agree on cardinality.
+        let mut out = BTreeMap::new();
+        sst.range(1, b"", None, u64::MAX, &mut out).unwrap();
+        assert_eq!(out.len() as u64, n);
+        let mut all = BTreeMap::new();
+        sst.load_into(&mut all).unwrap();
+        assert_eq!(all.len() as u64, n + 1);
+    }
+
+    #[test]
+    fn v2_round_trip_spans_blocks() {
+        let d = Dir::new("v2-roundtrip");
+        write(&d.sst(), &entries(1000), 1001).unwrap();
+        let sst = open(&d.sst()).unwrap();
+        assert_eq!(sst.version, Version::V2);
+        assert!(sst.index.len() > 1, "test must span several blocks");
+        assert_eq!(sst.max_seq, 1001);
+        check_reads(&sst, 1000);
+    }
+
+    #[test]
+    fn v1_file_still_opens_and_reads() {
+        let d = Dir::new("v1-compat");
+        write_v1(&d.sst(), &entries(1000), 0);
+        let sst = open(&d.sst()).unwrap();
+        assert_eq!(sst.version, Version::V1);
+        assert!(sst.index.len() > 1);
+        assert_eq!(sst.max_seq, 7);
+        check_reads(&sst, 1000);
+    }
+
+    #[test]
+    fn v1_block_ending_mid_entry_is_corrupt_not_absent() {
+        let d = Dir::new("v1-torn");
+        // Cut 3 bytes off the last block: its final entry decodes short.
+        write_v1(&d.sst(), &entries(1000), 3);
+        let sst = open(&d.sst()).unwrap();
+        // Earlier blocks are intact and still serve.
+        assert_eq!(
+            sst.get(1, b"key-000001", u64::MAX).unwrap(),
+            Some(Op::Put(vec![1u8; 100]))
+        );
+        assert_corrupt(sst.get(1, b"key-000999", u64::MAX), "get in torn block");
+        assert_corrupt(
+            sst.range(1, b"", None, u64::MAX, &mut BTreeMap::new()),
+            "range across torn block",
+        );
+        assert_corrupt(sst.load_into(&mut BTreeMap::new()), "load torn block");
+    }
+
+    #[test]
+    fn v2_flipped_byte_in_data_block_is_corrupt() {
+        let d = Dir::new("v2-bitrot");
+        write(&d.sst(), &entries(1000), 1001).unwrap();
+        let (first_off, last_off) = {
+            let sst = open(&d.sst()).unwrap();
+            let last = sst.index.last().unwrap();
+            (sst.index[0].offset, last.offset)
+        };
+        // Flip one bit inside a value of the last block: the entry still
+        // decodes, so only the checksum can tell.
+        patch(&d.sst(), |b| b[last_off as usize + 40] ^= 0x01);
+        let sst = open(&d.sst()).unwrap();
+        assert_eq!(
+            sst.get(1, b"key-000001", u64::MAX).unwrap(),
+            Some(Op::Put(vec![1u8; 100])),
+            "untouched first block still reads"
+        );
+        assert_corrupt(sst.get(1, b"key-000999", u64::MAX), "get in rotted block");
+        assert_corrupt(sst.load_into(&mut BTreeMap::new()), "load rotted block");
+        // Garble the first block's key length (a structural break) as well:
+        // the CRC catches it before decoding is even attempted.
+        patch(&d.sst(), |b| b[first_off as usize + 1] = 0xff);
+        let sst = open(&d.sst()).unwrap();
+        assert_corrupt(sst.get(1, b"key-000000", u64::MAX), "get in garbled block");
+        assert_corrupt(
+            sst.range(1, b"", None, u64::MAX, &mut BTreeMap::new()),
+            "range from garbled block",
+        );
+    }
+
+    #[test]
+    fn v2_index_and_bloom_are_checksummed() {
+        let d = Dir::new("v2-meta");
+        write(&d.sst(), &entries(50), 51).unwrap();
+        let bytes = std::fs::read(d.sst()).unwrap();
+        let footer = &bytes[bytes.len() - FOOTER_LEN as usize..];
+        let mut c = Cursor::new(footer);
+        let index_offset = c.u64().unwrap() as usize;
+        let _index_len = c.u64().unwrap();
+        let bloom_offset = c.u64().unwrap() as usize;
+        // Index: a flipped byte in an offset field makes the whole file unopenable.
+        let p = d.sst();
+        patch(&p, |b| b[index_offset + 20] ^= 0x80);
+        assert_corrupt(open(&p), "garbled index");
+        // Bloom: restore, then flip a filter bit (would only cause false
+        // negatives — silently missing keys — without the checksum).
+        std::fs::write(&p, &bytes).unwrap();
+        patch(&p, |b| b[bloom_offset + 12] ^= 0x01);
+        assert_corrupt(open(&p), "garbled bloom");
+    }
+
+    #[test]
+    fn unknown_magic_and_out_of_range_blocks_are_corrupt() {
+        let d = Dir::new("v2-footer");
+        write(&d.sst(), &entries(10), 11).unwrap();
+        let bytes = std::fs::read(d.sst()).unwrap();
+        let n = bytes.len();
+        let p = d.sst();
+        // Unknown magic (crc recomputed so only the version is wrong).
+        patch(&p, |b| {
+            let f = n - FOOTER_LEN as usize;
+            b[f + 48..f + 52].copy_from_slice(&0x3353_5244u32.to_le_bytes());
+            let crc = super::super::crc32(&b[f..n - 4]);
+            b[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        });
+        assert_corrupt(open(&p), "unknown magic");
+        // Truncated file: the footer now points past the end.
+        std::fs::write(&p, &bytes[..n - 1]).unwrap();
+        assert_corrupt(open(&p), "truncated file");
+    }
+
+    #[test]
+    fn concurrent_readers_of_one_run_see_correct_values() {
+        let d = Dir::new("v2-concurrent");
+        write(&d.sst(), &entries(1000), 1001).unwrap();
+        // A cache too small to hold anything forces every get to hit the file.
+        let cache: Arc<BlockCache> = Arc::new(
+            moka::sync::Cache::builder()
+                .max_capacity(0)
+                .weigher(|_k, v: &Arc<Vec<u8>>| v.len() as u32)
+                .build(),
+        );
+        let sst = Arc::new(Sst::open(&d.sst(), 1, cache).unwrap());
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let sst = sst.clone();
+                s.spawn(move || {
+                    for i in (t + 1..1000).step_by(4) {
+                        let key = format!("key-{i:06}").into_bytes();
+                        assert_eq!(
+                            sst.get(1, &key, u64::MAX).unwrap(),
+                            Some(Op::Put(vec![i as u8; 100]))
+                        );
+                    }
+                });
+            }
+        });
+    }
 }
