@@ -124,6 +124,13 @@ pub struct PluginsCfg {
     /// Linear memory per sandbox call, in MiB. No value lifts the 4 GiB
     /// ceiling wasm32 itself imposes.
     pub memory_mb: Option<u64>,
+    /// Wall-clock deadline per sandbox call, in seconds; `0` switches it off
+    /// (→ `DRSG_PLUGINS_DEADLINE_SECS`, which overrides it).
+    pub deadline_secs: Option<u64>,
+    /// Linear memory every sandbox call in the process may hold together, in
+    /// MiB; `0` keeps the default (→ `DRSG_PLUGINS_TOTAL_MEMORY_MB`, which
+    /// overrides it).
+    pub total_memory_mb: Option<u64>,
     /// An explicit plugin-store directory; defaults to the per-user store.
     pub store_dir: Option<PathBuf>,
     /// `[plugins.<name>]` sub-tables, passed to each plugin uninterpreted.
@@ -160,6 +167,8 @@ pub fn plugin_config(cfg: &Config) -> Result<dr_strange_llm::PluginConfig> {
         store_dir: cfg.plugins.store_dir.clone(),
         fuel: cfg.plugins.fuel,
         memory_bytes: cfg.plugins.memory_mb.map(|mb| (mb as usize) << 20),
+        deadline_secs: cfg.plugins.deadline_secs,
+        total_memory_mb: cfg.plugins.total_memory_mb,
     })
 }
 
@@ -191,6 +200,14 @@ pub struct ServerCfg {
     pub retain_commits: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
+    /// Hostnames (or `host:port`) `/mcp` answers at besides loopback and the
+    /// bind address — what a proxy or LAN client sends as `Host`. Honoured
+    /// only with a token; merged with `DRSG_ALLOWED_HOSTS`.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Longest one MCP tool call may take over `/mcp`, queue included, in
+    /// seconds; `0` runs without limit; omitted means the default (or
+    /// `DRSG_MCP_TOOL_DEADLINE_SECS`).
+    pub mcp_tool_deadline_secs: Option<u64>,
     /// TLS certificate/key; when present, `serve` speaks HTTPS.
     pub tls: Option<TlsCfg>,
 }
@@ -297,6 +314,13 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
         opts.query_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
     opts.retain_commits = retain_commits(cfg);
+    if let Some(hosts) = &cfg.server.allowed_hosts {
+        opts.allowed_hosts = hosts.clone();
+    }
+    if let Some(secs) = cfg.server.mcp_tool_deadline_secs {
+        // 0 means "no deadline", as the environment variable reads it.
+        opts.mcp_tool_deadline = Some((secs > 0).then(|| std::time::Duration::from_secs(secs)));
+    }
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {
             cert: tls.cert.clone(),
@@ -435,6 +459,49 @@ mod tests {
     #[test]
     fn no_tls_section_means_plain_http() {
         assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
+    }
+
+    /// The `[server]` knobs that reach `/mcp`: `allowed_hosts` lands on the
+    /// options verbatim, and `mcp_tool_deadline_secs` distinguishes "not
+    /// said" (the server's default) from `0` (no deadline) from a number.
+    #[test]
+    fn allowed_hosts_and_the_mcp_tool_deadline_reach_the_serve_options() {
+        let absent = serve_options(&parse(""), None);
+        assert!(absent.allowed_hosts.is_empty());
+        assert_eq!(absent.mcp_tool_deadline, None);
+
+        let set = serve_options(
+            &parse(
+                "[server]\nallowed_hosts = [\"db.internal:7700\", \"graph.example\"]\n\
+                 mcp_tool_deadline_secs = 45\n",
+            ),
+            None,
+        );
+        assert_eq!(set.allowed_hosts, vec!["db.internal:7700", "graph.example"]);
+        assert_eq!(
+            set.mcp_tool_deadline,
+            Some(Some(std::time::Duration::from_secs(45)))
+        );
+
+        let unlimited = serve_options(&parse("[server]\nmcp_tool_deadline_secs = 0\n"), None);
+        assert_eq!(unlimited.mcp_tool_deadline, Some(None));
+    }
+
+    /// The `[plugins]` sandbox knobs map onto the llm crate's config as the
+    /// numbers the file says; the llm crate applies the `0` readings.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn plugin_deadline_and_total_memory_reach_the_plugin_config() {
+        let cfg = plugin_config(&parse(
+            "[plugins]\ndeadline_secs = 7\ntotal_memory_mb = 512\nmemory_mb = 64\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.deadline_secs, Some(7));
+        assert_eq!(cfg.total_memory_mb, Some(512));
+        assert_eq!(cfg.memory_bytes, Some(64 << 20));
+        let absent = plugin_config(&parse("")).unwrap();
+        assert_eq!(absent.deadline_secs, None);
+        assert_eq!(absent.total_memory_mb, None);
     }
 
     #[test]

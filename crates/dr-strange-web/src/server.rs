@@ -462,6 +462,7 @@ fn mcp_router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -482,6 +483,11 @@ fn mcp_router(
             let mut svc = DrStrange::with_digest(db.clone(), digest).with_tool_gate(tools.clone());
             if let Some(root) = &source_root {
                 svc = svc.with_source_root(root.clone());
+            }
+            // The file's deadline over the environment's, when the file
+            // says; `DrStrange::new` already read the variable otherwise.
+            if let Some(deadline) = tool_deadline {
+                svc = svc.with_tool_deadline(deadline);
             }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
@@ -517,6 +523,7 @@ fn router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -551,6 +558,7 @@ fn router(
             embed,
             source_root,
             allowed_hosts,
+            tool_deadline,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -1523,6 +1531,7 @@ async fn run_app(
         opts.embed_provider.clone(),
         opts.source_root.clone(),
         allowed_hosts,
+        opts.mcp_tool_deadline,
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
