@@ -5,8 +5,14 @@ const std = @import("std");
 fn wireC(mod: *std.Build.Module, b: *std.Build) void {
     mod.link_libc = true;
     mod.addIncludePath(b.path("../c/include"));
-    // For <json-c/json.h> pulled in by drsg.h (json-c lives under /usr/include).
-    mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    // drsg.h includes <json-c/json.h>; pkg-config's --cflags points inside the
+    // json-c directory, so ask it for the parent instead of guessing a prefix.
+    const jsonc_inc = std.mem.trim(
+        u8,
+        b.run(&.{ "pkg-config", "--variable=includedir", "json-c" }),
+        " \r\n",
+    );
+    mod.addSystemIncludePath(.{ .cwd_relative = jsonc_inc });
     mod.addCSourceFiles(.{
         .root = b.path("../c"),
         .files = &.{ "src/drsg.c", "src/drsg_generated.c" },

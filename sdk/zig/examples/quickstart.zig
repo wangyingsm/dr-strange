@@ -4,6 +4,13 @@ const std = @import("std");
 const drsg = @import("drsg");
 const c = drsg.c;
 
+/// A failed call returns null with `err` filled; say why and stop rather than
+/// unwrapping a null the way a thrown-together example would.
+fn fail(err: *const c.drsg_error) error{CallFailed} {
+    std.debug.print("error {d}: {s}\n", .{ err.code, std.mem.sliceTo(&err.message, 0) });
+    return error.CallFailed;
+}
+
 pub fn main() !void {
     var client = try drsg.Client.init(null, null); // :7700; token from $DRSG_TOKEN
     defer client.deinit();
@@ -38,7 +45,7 @@ pub fn main() !void {
 
     var get = std.mem.zeroes(c.drsg_node_get_opts);
     get.key = "alice";
-    const alice = c.drsg_node_get(h, "startup", &get, err).?;
+    const alice = c.drsg_node_get(h, "startup", &get, err) orelse return fail(err);
     var props: ?*c.json_object = null;
     var age: ?*c.json_object = null;
     _ = c.json_object_object_get_ex(alice, "properties", &props);
@@ -46,7 +53,7 @@ pub fn main() !void {
     std.debug.print("alice.age = {d}\n", .{c.json_object_get_int(age)});
     _ = c.json_object_put(alice);
 
-    const stats = c.drsg_db_stats(h, err).?;
+    const stats = c.drsg_db_stats(h, err) orelse return fail(err);
     var nodes: ?*c.json_object = null;
     var edges: ?*c.json_object = null;
     _ = c.json_object_object_get_ex(stats, "nodes", &nodes);
