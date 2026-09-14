@@ -294,7 +294,8 @@ pub struct NativeEngine {
     /// (flush/compaction) that failed, cleared once a later pass succeeds.
     /// Maintenance runs after the batch is durable and published, so its
     /// failure cannot be reported through `commit` without lying about a
-    /// write that did land; it is logged and kept here for `check`/stats.
+    /// write that did land; it is logged and kept here, readable through
+    /// `last_maintenance_error` (not yet surfaced by `Database::check`).
     last_maintenance_error: Mutex<Option<String>>,
     /// Test seam: parks a flush after its SST is written but before the swap,
     /// so a test can prove readers get through that window.
