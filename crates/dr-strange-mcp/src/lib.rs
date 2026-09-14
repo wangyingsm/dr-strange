@@ -2334,9 +2334,11 @@ impl DrStrange {
         declaration then, not today's line numbers; `at` is a sha (4+ hex \
         digits), a branch, a tag, HEAD, a date (YYYY-MM-DD or RFC-3339) or \
         `<rev>@{<date>}`, each optionally followed by `~n` / `^n`, resolved over \
-        the `<plane>_git` history plane. The answer opens with the commit it \
-        read and ends by naming the next call; `snippet` reads the code as it \
-        is now."
+        the `<plane>_git` history plane. Give `pattern` instead of `name` to \
+        search the tree as it was (literal, or git's POSIX extended regex with \
+        `regex: true`) — use this instead of `git grep <pattern> <rev>`. The \
+        answer opens with the commit it read and ends by naming the next call; \
+        `snippet` and `grep` read the code as it is now."
     )]
     async fn recall(
         &self,

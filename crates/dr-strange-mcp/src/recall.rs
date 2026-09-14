@@ -8,11 +8,11 @@ use anyhow::{Result as AnyResult, anyhow, bail};
 use dr_strange_core::compact::{self, Resolved};
 use dr_strange_core::rev::{self, CommitRef, RevAnswer, RevExpr, Sha};
 use dr_strange_core::{Database, PlaneHandle, PropValue, Properties};
-use dr_strange_llm::git::{Entry, Git, GitTree, ObjKind, RelPath};
+use dr_strange_llm::git::{Entry, Git, GitTree, GrepAt, ObjKind, RelPath};
 use dr_strange_llm::{Host, LivePlugins, Plugins, Preprocessed, route_paths};
 use serde_json::Value;
 
-use crate::{SNIPPET_CAP, default_plane, numbered, parse_range, source_root};
+use crate::{SNIPPET_CAP, clip, default_plane, numbered, parse_range, regex_tell, source_root};
 
 /// Lines a read returns when the caller names none.
 const DEFAULT_LINES: usize = 40;
@@ -22,6 +22,12 @@ const BINARY_PROBE: usize = 8 << 10;
 const ENTRY_CAP: usize = 200;
 /// Most same-named symbols an answer about a missing one lists.
 const SAME_NAME_CAP: usize = 5;
+/// Matching lines a search returns when the caller names no `max_results`.
+const GREP_DEFAULT: usize = 50;
+/// Most matching lines a search returns.
+const GREP_CAP: usize = 200;
+/// Lines either side of a hit that the suggested follow-up read covers.
+const GREP_AROUND: usize = 5;
 
 /// `recall`'s request: something in a repository, read as it was at a revision.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -31,8 +37,10 @@ pub struct RecallReq {
     pub plane: String,
     /// What to read, relative to the tree's root: a file, `path:line` /
     /// `path:start-end`, a directory (`""` for the root), or a symbol (fuzzy,
-    /// as `snippet` takes it), found by parsing its file as it was.
-    pub name: String,
+    /// as `snippet` takes it), found by parsing its file as it was. Give this
+    /// or `pattern`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The revision: a sha (4+ hex digits), a branch, a tag, HEAD, a date
     /// (YYYY-MM-DD or RFC-3339) or `<rev>@{<date>}`, each optionally followed
     /// by `~n` / `^n`.
@@ -42,6 +50,68 @@ pub struct RecallReq {
     /// how to read on.
     #[serde(default)]
     pub lines: Option<usize>,
+    /// Search the tree at `at` for this text instead of reading `name`: literal
+    /// unless `regex` is set — then a POSIX extended regex (git's), not Rust's.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Treat `pattern` as a regular expression (default false).
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// Case-insensitive matching (default false).
+    #[serde(default)]
+    pub ignore_case: Option<bool>,
+    /// Only files under this directory or at this file, or with this extension
+    /// when it starts with a dot (`.rs`). Relative to the tree's root.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Max matching lines returned (default 50, capped at 200).
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+/// What each kind of `recall` call takes, for answers that refuse a mixed one.
+const TAKES: &str = "`name` reads a path, `path:start-end`, a directory or a symbol; `pattern` \
+                     searches the tree at that revision";
+
+/// What a [`RecallReq`] asks for.
+enum Mode<'a> {
+    /// Read a path, a range, a directory or a symbol.
+    Read,
+    /// Search the tree for a pattern.
+    Grep(&'a str),
+}
+
+impl RecallReq {
+    /// What the request asks for, refusing fields that belong to the other kind of call.
+    fn mode(&self) -> AnyResult<Mode<'_>> {
+        match (&self.name, &self.pattern) {
+            (Some(_), None) => {
+                let stray = [
+                    ("regex", self.regex.is_some()),
+                    ("ignore_case", self.ignore_case.is_some()),
+                    ("path", self.path.is_some()),
+                    ("max_results", self.max_results.is_some()),
+                ];
+                if let Some((field, _)) = stray.into_iter().find(|(_, set)| *set) {
+                    bail!("`{field}` applies to a `pattern` search, not to reading `name`");
+                }
+                Ok(Mode::Read)
+            }
+            (None, Some(_)) if self.lines.is_some() => {
+                bail!(
+                    "`lines` applies to reading `name`; a search returns up to `max_results` lines"
+                )
+            }
+            (None, Some(pattern)) => Ok(Mode::Grep(pattern)),
+            (Some(_), Some(_)) => bail!("recall takes `name` or `pattern`, not both — {TAKES}"),
+            (None, None) => bail!("recall needs `name` or `pattern` — {TAKES}"),
+        }
+    }
+
+    /// The name being read; empty for a search, which never consults it.
+    fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or_default()
+    }
 }
 
 /// Where `recall` gets the preprocessors that find a symbol in a file as it was.
@@ -71,6 +141,7 @@ pub fn recall_logic(
     parsers: &dyn Parsers,
     req: RecallReq,
 ) -> AnyResult<Value> {
+    let mode = req.mode()?;
     let plane = db.plane(&req.plane)?;
     let Some(root) = source_root(&plane, fallback_root) else {
         bail!(
@@ -89,7 +160,10 @@ pub fn recall_logic(
     })?;
     let mut out = rev::commit_header(&commit, &req.at);
     out.push_str(&note);
-    out.push_str(&read(&plane, &tree, parsers, &req)?);
+    out.push_str(&match mode {
+        Mode::Read => read(&plane, &tree, parsers, &req)?,
+        Mode::Grep(pattern) => search(&tree, &req, pattern)?,
+    });
     Ok(Value::String(out))
 }
 
@@ -176,7 +250,7 @@ fn read(
     req: &RecallReq,
 ) -> AnyResult<String> {
     let at = tree.sha().short();
-    if let Some((path, start, end)) = parse_range(&req.name) {
+    if let Some((path, start, end)) = parse_range(req.name()) {
         let rel = RelPath::parse(path)?;
         return match tree.kind(&rel)? {
             Some(ObjKind::File | ObjKind::Link) => path_lines(tree, &rel, Some((start, end)), None),
@@ -184,9 +258,9 @@ fn read(
             None => bail!("`{path}` does not exist at {at} — recall its directory to see what did"),
         };
     }
-    let rel = match RelPath::parse(&req.name) {
+    let rel = match RelPath::parse(req.name()) {
         Ok(rel) => rel,
-        Err(_) if req.name.starts_with("::") => return symbol_lines(plane, tree, parsers, req),
+        Err(_) if req.name().starts_with("::") => return symbol_lines(plane, tree, parsers, req),
         Err(e) => return Err(e),
     };
     match tree.kind(&rel)? {
@@ -195,7 +269,7 @@ fn read(
         Some(ObjKind::Submodule) => bail!(
             "`{}` is a submodule at {at} — another repository's commit, which recall does \
              not follow",
-            req.name
+            req.name()
         ),
         None => symbol_lines(plane, tree, parsers, req),
     }
@@ -244,13 +318,13 @@ fn symbol_lines(
     req: &RecallReq,
 ) -> AnyResult<String> {
     let at = tree.sha().short();
-    let node = match compact::resolve(plane, &req.name)? {
+    let node = match compact::resolve(plane, req.name())? {
         Resolved::One(node) => node,
-        Resolved::Many(hits) => bail!("{}", compact::candidates(&req.name, &hits).trim_end()),
+        Resolved::Many(hits) => bail!("{}", compact::candidates(req.name(), &hits).trim_end()),
         Resolved::None => bail!(
             "`{}` is neither a path at {at} nor a symbol in plane `{}` — recall a directory \
              at {at} to see what the tree held",
-            req.name,
+            req.name(),
             req.plane
         ),
     };
@@ -335,6 +409,48 @@ fn not_declared(key: &str, file: &str, at: &str, parsed: &Preprocessed) -> anyho
     }
     msg.push_str(&format!("\nrecall {file} at {at} reads the whole file"));
     anyhow!(msg)
+}
+
+/// Lines matching `pattern` in the tree at its commit, one `file:line: text` each.
+fn search(tree: &GitTree, req: &RecallReq, pattern: &str) -> AnyResult<String> {
+    let at = tree.sha().short();
+    let cap = req.max_results.unwrap_or(GREP_DEFAULT).clamp(1, GREP_CAP);
+    let regex = req.regex.unwrap_or(false);
+    let hits = tree.grep(&GrepAt {
+        pattern: pattern.to_string(),
+        regex,
+        ignore_case: req.ignore_case.unwrap_or(false),
+        scope: req.path.as_deref().map(RelPath::parse).transpose()?,
+    })?;
+    let Some(first) = hits.first() else {
+        let mut out = format!("no line matches `{pattern}` at {at}\n");
+        if let Some(path) = &req.path {
+            out.push_str(&format!("(searched only `{path}`; drop `path` to widen)\n"));
+        }
+        if let Some(tell) = regex_tell(pattern).filter(|_| !regex) {
+            out.push_str(&format!(
+                "note: the pattern contains `{tell}`, which reads as a regex; this search was \
+                 literal — retry with `regex: true`\n"
+            ));
+        }
+        return Ok(out);
+    };
+    let mut out = String::new();
+    for hit in hits.iter().take(cap) {
+        out.push_str(&format!("{}:{}: {}\n", hit.path, hit.line, clip(&hit.text)));
+    }
+    if hits.len() > cap {
+        out.push_str(&format!(
+            "… capped at {cap} matches — narrow the pattern (or `path`) or raise max_results\n"
+        ));
+    }
+    out.push_str(&format!(
+        "recall {}:{}-{} at {at} reads around a hit; grep searches the tree as it is now\n",
+        first.path,
+        first.line.saturating_sub(GREP_AROUND).max(1),
+        first.line + GREP_AROUND
+    ));
+    Ok(out)
 }
 
 /// A file's text at a commit, or the line saying why it is not shown.
@@ -914,5 +1030,85 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(none.contains("`zzz` is neither a path at"), "{none}");
+    }
+
+    #[test]
+    fn a_pattern_searches_the_tree_as_it_was() {
+        let f = fixture(true);
+        let one = &f.one[..12];
+        let then = recall(&f.db, json!({"plane": "repo", "pattern": "b1", "at": "v1"})).unwrap();
+        assert!(then.contains("src/sym.rs:4:   b1\n"), "{then}");
+        assert!(
+            then.contains(&format!(
+                "recall src/sym.rs:1-9 at {one} reads around a hit"
+            )),
+            "{then}"
+        );
+        let now = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "b1", "at": "main"}),
+        )
+        .unwrap();
+        assert!(now.contains("no line matches `b1` at"), "{now}");
+        let regex = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "^fn (alpha|beta)$", "regex": true, "at": "v1"}),
+        )
+        .unwrap();
+        assert!(
+            regex.contains("src/sym.rs:1: fn alpha\nsrc/sym.rs:3: fn beta\n"),
+            "{regex}"
+        );
+        let folded = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "FN MOVED", "ignore_case": true, "at": "v1"}),
+        )
+        .unwrap();
+        assert!(folded.contains("src/old.rs:1: fn moved"), "{folded}");
+        let scoped = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "a", "path": ".md", "at": "v1"}),
+        )
+        .unwrap();
+        assert!(scoped.contains("docs/a.md:1: # a\n"), "{scoped}");
+        assert!(!scoped.contains("src/"), "{scoped}");
+        let capped = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "fn", "max_results": 1, "at": "v1"}),
+        )
+        .unwrap();
+        assert!(capped.contains("… capped at 1 matches"), "{capped}");
+    }
+
+    #[test]
+    fn a_literal_that_reads_as_a_regex_is_named() {
+        let f = fixture(true);
+        let out = recall(
+            &f.db,
+            json!({"plane": "repo", "pattern": "fn \\w+", "at": "v1"}),
+        )
+        .unwrap();
+        assert!(out.contains("no line matches"), "{out}");
+        assert!(out.contains("retry with `regex: true`"), "{out}");
+    }
+
+    #[test]
+    fn a_request_mixing_reading_and_searching_is_refused() {
+        let f = fixture(true);
+        let refused = |req: serde_json::Value| recall(&f.db, req).unwrap_err().to_string();
+        let both = refused(json!({"plane": "repo", "name": "a", "pattern": "b", "at": "v1"}));
+        assert!(both.contains("not both"), "{both}");
+        let neither = refused(json!({"plane": "repo", "at": "v1"}));
+        assert!(neither.contains("needs `name` or `pattern`"), "{neither}");
+        let stray = refused(json!({"plane": "repo", "name": "src", "regex": true, "at": "v1"}));
+        assert!(
+            stray.contains("`regex` applies to a `pattern` search"),
+            "{stray}"
+        );
+        let lines = refused(json!({"plane": "repo", "pattern": "fn", "lines": 3, "at": "v1"}));
+        assert!(
+            lines.contains("`lines` applies to reading `name`"),
+            "{lines}"
+        );
     }
 }

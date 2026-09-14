@@ -126,6 +126,31 @@ pub struct Entry {
     pub size: Option<u64>,
 }
 
+/// A search of one commit's tree.
+#[derive(Debug, Clone, Default)]
+pub struct GrepAt {
+    /// What to find.
+    pub pattern: String,
+    /// `pattern` is a POSIX extended regular expression, not literal text.
+    pub regex: bool,
+    /// Match regardless of case.
+    pub ignore_case: bool,
+    /// Only under this directory or at this file, or with this extension when
+    /// it starts with a dot.
+    pub scope: Option<RelPath>,
+}
+
+/// One matching line of a [`GitTree::grep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepHit {
+    /// The file, relative to the tree's root.
+    pub path: String,
+    /// Its 1-based line number.
+    pub line: usize,
+    /// The line's text.
+    pub text: String,
+}
+
 /// One `ls-tree -z` record: what it names, its size when `-l` gave one, and its path.
 fn parse_entry(record: &[u8]) -> Option<(ObjKind, Option<u64>, &str)> {
     let (meta, path) = std::str::from_utf8(record).ok()?.split_once('\t')?;
@@ -255,6 +280,36 @@ impl GitTree {
             }
         }
         Ok(None)
+    }
+
+    /// Lines matching `search` in this commit's files under the root, in git's order.
+    pub fn grep(&self, search: &GrepAt) -> Result<Vec<GrepHit>> {
+        let scope = match search.scope.as_ref().map(RelPath::as_str) {
+            None | Some("") => ".".to_string(),
+            Some(ext) if ext.starts_with('.') && !ext.contains('/') => format!(":(glob)**/*{ext}"),
+            Some(path) => format!(":(literal){path}"),
+        };
+        let mut args = vec!["grep", "-n", "-z", "-I", "--no-color"];
+        args.push(if search.regex { "-E" } else { "-F" });
+        if search.ignore_case {
+            args.push("-i");
+        }
+        args.extend(["-e", &search.pattern, self.sha.as_str(), "--", &scope]);
+        // `git grep` exits 1 when nothing matches, which is an answer, not a failure.
+        let (_, raw) = self.git.run_allow(&args, &[1])?;
+        let named = format!("{}:", self.sha.as_str());
+        Ok(String::from_utf8_lossy(&raw)
+            .lines()
+            .filter_map(|record| {
+                let mut field = record.splitn(3, '\0');
+                let (name, line, text) = (field.next()?, field.next()?, field.next()?);
+                Some(GrepHit {
+                    path: name.strip_prefix(&named).unwrap_or(name).to_string(),
+                    line: line.parse().ok()?,
+                    text: text.to_string(),
+                })
+            })
+            .collect())
     }
 
     /// `path`'s object name at this commit.
@@ -581,6 +636,67 @@ mod tests {
         );
         assert_eq!(tree.renamed_from("HEAD", &path("kept.rs")).unwrap(), None);
         assert_eq!(tree.renamed_from("HEAD", &path("other.rs")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_search_reads_the_commit_under_the_root_not_the_checkout() {
+        let repo = Repo::new("grep");
+        let sha = repo
+            .write("crates/x/src/lib.rs", "fn alpha() {}\nfn Beta() {}\n")
+            .write("crates/x/README.md", "alpha docs\n")
+            .write("top.rs", "fn alpha_top() {}\n")
+            .commit("one");
+        repo.write("crates/x/src/lib.rs", "fn gone() {}\n");
+        let tree = GitTree::open(&repo.0.join("crates/x"), sha).unwrap();
+        let find = |pattern: &str, regex: bool, ignore_case: bool, scope: Option<&str>| {
+            let search = GrepAt {
+                pattern: pattern.into(),
+                regex,
+                ignore_case,
+                scope: scope.map(|s| RelPath::parse(s).unwrap()),
+            };
+            tree.grep(&search).unwrap()
+        };
+        let hit = |path: &str, line: usize, text: &str| GrepHit {
+            path: path.into(),
+            line,
+            text: text.into(),
+        };
+        assert_eq!(
+            find("alpha", false, false, None),
+            [
+                hit("README.md", 1, "alpha docs"),
+                hit("src/lib.rs", 1, "fn alpha() {}")
+            ]
+        );
+        assert_eq!(
+            find("fn (alpha|beta)", true, true, Some(".rs")),
+            [
+                hit("src/lib.rs", 1, "fn alpha() {}"),
+                hit("src/lib.rs", 2, "fn Beta() {}")
+            ]
+        );
+        assert_eq!(
+            find("alpha", false, false, Some("src")),
+            [hit("src/lib.rs", 1, "fn alpha() {}")]
+        );
+        assert!(
+            find("gone", false, false, None).is_empty(),
+            "the checkout is not the commit"
+        );
+        assert!(
+            find("alpha_top", false, false, None).is_empty(),
+            "outside the root is not searched"
+        );
+        let broken = GrepAt {
+            pattern: "(".into(),
+            regex: true,
+            ..Default::default()
+        };
+        assert!(
+            tree.grep(&broken).is_err(),
+            "a bad regex is git's error, not an empty answer"
+        );
     }
 
     #[test]
