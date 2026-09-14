@@ -134,15 +134,20 @@ expose an open API on localhost. Set `DRSG_TOKEN` on the server and pass it
 as a bearer token to reach `/mcp` from anywhere else, including another
 agent host.
 
-One limit worth knowing before putting this behind a hostname: the MCP
-transport validates the inbound `Host` header against a loopback-only list
-(`localhost`, `127.0.0.1`, `::1`) to blunt DNS-rebinding attacks on locally
-running servers, and answers **403** to anything else. The check earns its
-keep here — a tokenless server trusts its own same-origin UI, which is what
-rebinding sets out to impersonate — but it does mean `/mcp` answers at
-`http://127.0.0.1:7700/mcp` and not at `https://memory.example.com/mcp`,
-where `/rpc` on the same server would. Agent hosts on the same machine, the
-case ROADMAP §10 is about, are unaffected.
+One thing to know before putting this behind a hostname: the MCP transport
+validates the inbound `Host` header to blunt DNS-rebinding attacks on
+locally running servers, and answers **403** to a name it does not expect.
+Loopback (`localhost`, `127.0.0.1`, `::1`) is always accepted. Once a
+bearer token is configured, the address the server is bound to is accepted
+too, and so is every name in `DRSG_ALLOWED_HOSTS` (comma-separated, a
+hostname or `host:port`) — so `/mcp` behind `https://memory.example.com`
+works with `DRSG_ALLOWED_HOSTS=memory.example.com`. Without a token the
+list is loopback only, whatever the environment says: a tokenless server
+trusts its own same-origin UI, which is exactly what a rebinding page sets
+out to impersonate, and the `Host` check is what defeats it. With a token
+every request has to carry a secret such a page cannot read, so the guard
+adds nothing the token does not, and the operator may widen it. Agent hosts
+on the same machine, the case ROADMAP §10 is about, need none of this.
 
 Every session gets its own `DrStrange` instance, but they all share the one
 `Database` the server opened — a write from one session is visible to every

@@ -118,6 +118,12 @@ pub struct ServeOptions {
     /// of token, and a background task bootstraps from the master's
     /// `/snapshot` then tails its `/ws/wal`.
     pub follow: Option<FollowOptions>,
+    /// Hostnames (or `host:port` authorities) `/mcp` answers at besides
+    /// loopback and the bind address — the `Host` header a proxy or a LAN
+    /// client sends. Honoured only when a bearer token is configured; merged
+    /// with `DRSG_ALLOWED_HOSTS` (comma-separated). See
+    /// [`server::mcp_allowed_hosts`].
+    pub allowed_hosts: Vec<String>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -210,6 +216,7 @@ impl Default for ServeOptions {
             source_root: None,
             on_start: None,
             follow: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }

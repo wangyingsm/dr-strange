@@ -175,6 +175,17 @@ server enforces where the line is (shipped 2026-09, `server::run`,
    unknown plane, bad plan, a provider with no key or embedding model in
    the environment (decided before any network call, from strings this
    process composed).
+10. **`/mcp` answers at loopback, and at the names the operator lists.**
+    The MCP transport's DNS-rebinding guard checks the `Host` header
+    against a list `server::mcp_allowed_hosts` builds: `localhost`,
+    `127.0.0.1`, `::1` always; with a bearer token configured, the bind
+    address (when it names one — a wildcard does not) and every entry of
+    `ServeOptions::allowed_hosts` / `DRSG_ALLOWED_HOSTS`. Without a token
+    the extras are ignored and logged, because the guard is then doing the
+    work the Origin guard does for browsers: a tokenless server trusts its
+    same-origin UI, and a rebinding page impersonating it is what a
+    loopback-only `Host` defeats. The list is never empty — rmcp reads an
+    empty list as "any host".
 
 ### 4.2 v2 — many agents, many machines, one database
 

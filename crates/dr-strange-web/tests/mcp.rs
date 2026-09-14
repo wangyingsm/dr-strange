@@ -259,6 +259,45 @@ async fn mcp_endpoint_refuses_a_non_loopback_host() {
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
+/// An operator who puts `/mcp` behind a hostname lists it: with a token
+/// configured, `ServeOptions::allowed_hosts` (or `DRSG_ALLOWED_HOSTS`) is
+/// answered, and a name not on the list is still refused — the allowlist
+/// widens the guard, it does not switch it off.
+#[tokio::test]
+async fn mcp_endpoint_answers_at_an_allowed_host_under_a_token() {
+    set_token_once();
+    let addr = free_addr();
+    let db = Database::in_memory().unwrap();
+    std::thread::spawn(move || {
+        let opts = dr_strange_web::ServeOptions {
+            addr,
+            allowed_hosts: vec!["lan.example.com".into()],
+            ..Default::default()
+        };
+        dr_strange_web::serve(db, None, opts).unwrap();
+    });
+    wait_ready(addr).await;
+
+    let post = |host: &'static str| {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("host", host)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}},"id":1}"#)
+            .send()
+    };
+    let allowed = post("lan.example.com").await.unwrap();
+    assert_ne!(
+        allowed.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a listed host is answered"
+    );
+    let refused = post("other.example.com").await.unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
 /// No `Authorization` header at all: refused before the tool router ever
 /// sees the request, same posture as every other authenticated route on this
 /// server. Tested over raw HTTP (like `auth_gate_over_http` in `http.rs`) —
