@@ -116,6 +116,34 @@ impl Engine {
         }
     }
 
+    /// Like [`with_write`](Self::with_write) but WITHOUT bumping the commit
+    /// sequence or stamping the commit time: for writes that change nothing a
+    /// graph read can see. The commit sequence is the cache's version stamp
+    /// (arch/02 §3), and bumping it is a whole-cache flush — so a write that
+    /// only touches bookkeeping (the query history) must not, or every query
+    /// run evicts the working set the next query wants. Honours `read_only`
+    /// like `with_write` does: the bookkeeping is still a caller's write.
+    fn with_write_unstamped<T>(
+        &self,
+        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        macro_rules! run {
+            ($e:expr) => {{
+                let mut txn = $e.begin_write()?;
+                let out = f(&mut txn)?;
+                txn.commit()?;
+                Ok(out)
+            }};
+        }
+        match self {
+            Engine::Memory(e) => run!(e),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => run!(e),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => run!(e),
+        }
+    }
+
     /// Like [`with_write`](Self::with_write), but bypasses `read_only`
     /// (native-only, via `begin_write_unchecked`). Used only by
     /// [`Database::init`]'s one-time-per-open plane/counters bootstrap,
@@ -691,10 +719,17 @@ impl Database {
     ///
     /// A **write**, and callers should treat it as best-effort: a query that
     /// ran is a query that ran, whether or not the note about it landed.
+    ///
+    /// Not a *graph* write, though: it leaves [`commit_seq`](Self::commit_seq)
+    /// alone. That sequence is the graph cache's version stamp (arch/02 §3),
+    /// and advancing it for a history row would flush the whole cache after
+    /// every query — the cache would never be warm for the second of two
+    /// queries in a row. Nothing a graph read returns changes here, so the
+    /// stamp stays and so does the cache.
     pub fn record_query(&self, plane: &str, query: &str, keep: usize) -> Result<u64> {
         let at = now_millis();
         self.engine
-            .with_write(|txn| graph::record_query(txn, plane, query, at, keep))
+            .with_write_unstamped(|txn| graph::record_query(txn, plane, query, at, keep))
     }
 
     /// The queries recorded, newest first, at most `limit` of them.
@@ -3364,5 +3399,74 @@ mod maintenance_tests {
             w.commit().unwrap();
         }
         assert_eq!(db.last_maintenance_error(), None);
+    }
+}
+
+/// The commit sequence is the graph cache's version stamp (arch/02 §3), so
+/// which writes move it decides which writes flush the cache.
+#[cfg(test)]
+mod cache_stamp_tests {
+    use super::*;
+
+    /// Decoded through the query path's reader, so a shared `Arc` between two
+    /// calls is proof the second came from the cross-query L2.
+    fn read_arc(plane: &PlaneHandle<'_>, id: NodeId) -> Arc<NodeRecord> {
+        plane
+            .with_reader(|r| Ok(r.node(id)?.expect("node exists")))
+            .unwrap()
+    }
+
+    #[test]
+    fn recording_a_query_keeps_the_cache_warm() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+            w.commit().unwrap();
+            id
+        };
+        let seq = db.commit_seq().unwrap();
+        let first = read_arc(&plane, id);
+
+        // History is bookkeeping, not graph data: the stamp must not move, so
+        // the next query's read is the same decoded record — an L2 hit.
+        let recorded = db.record_query("p", "MATCH (n) RETURN n", 10).unwrap();
+        assert_eq!(
+            db.commit_seq().unwrap(),
+            seq,
+            "history does not bump the seq"
+        );
+        assert!(Arc::ptr_eq(&first, &read_arc(&plane, id)), "cache survived");
+        assert_eq!(
+            db.recorded_query(recorded).unwrap().map(|r| r.query),
+            Some("MATCH (n) RETURN n".to_string()),
+            "the history row still landed"
+        );
+
+        // A graph write still flushes (the exact-match invariant is intact).
+        {
+            let mut w = plane.write().unwrap();
+            w.set_prop(id, "k", PropDesc::new(PropValue::Int(1)))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        assert!(db.commit_seq().unwrap() > seq);
+        let fresh = read_arc(&plane, id);
+        assert!(!Arc::ptr_eq(&first, &fresh));
+        assert!(fresh.properties.contains_key("k"));
+    }
+
+    /// A read-only replica still refuses history writes: unstamped is not
+    /// unchecked.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn recording_a_query_respects_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_read_only(dir.path().join("db")).unwrap();
+        assert!(matches!(
+            db.record_query("startup", "q", 10),
+            Err(Error::ReadOnly(_))
+        ));
     }
 }
