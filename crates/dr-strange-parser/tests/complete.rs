@@ -6,7 +6,9 @@
 //! suggestion that does not fit the grammar is worse than none, and only the
 //! grammar can say.
 
-use dr_strange_parser::{Connection, EdgeInfo, Expect, Kind, LabelInfo, Vocab, complete, parse};
+use dr_strange_parser::{
+    Connection, EdgeInfo, Expect, Kind, LabelInfo, Vocab, complete, parse, parse_statement,
+};
 
 /// A code plane's catalog, in miniature: Rust items and the edges between
 /// them, in the proportions a real one has.
@@ -291,7 +293,8 @@ fn a_predicate_offers_the_variables_in_the_order_they_were_bound() {
 }
 
 /// Words typed inside a string are data. Completing them would be noise, and
-/// the language has no escapes, so the scan is exact.
+/// the scan reads a literal the way the grammar does — an escaped quote is
+/// part of it, not its end — so it knows exactly when the caret is inside one.
 #[test]
 fn a_string_literal_is_data_not_syntax() {
     let c = complete(r#"MATCH (n:Function) WHERE n.file = "exec"#, &code());
@@ -300,6 +303,78 @@ fn a_string_literal_is_data_not_syntax() {
     // Closed again, the query goes on as before.
     let c = complete(r#"MATCH (n:Function) WHERE n.file = "exec.rs" "#, &code());
     assert_eq!(c.expects, Expect::Clause { done: vec![] });
+    // An escaped quote does not close the string; the one after it does.
+    let c = complete(r#"MATCH (n:Function) WHERE n.file = "a\"b"#, &code());
+    assert_eq!(c.expects, Expect::Nothing);
+    let c = complete(r#"MATCH (n:Function) WHERE n.file = "a\"b" "#, &code());
+    assert_eq!(c.expects, Expect::Clause { done: vec![] });
+    let c = complete(r#"MATCH (n:Function) WHERE n.file = 'it\'s' "#, &code());
+    assert_eq!(c.expects, Expect::Clause { done: vec![] });
+    // A backslash before the closing quote is an escape, so the caret is
+    // still inside the literal.
+    let c = complete(r#"MATCH (n:Function) WHERE n.file = "C:\"#, &code());
+    assert_eq!(c.expects, Expect::Nothing);
+}
+
+/// The completer used to walk bytes and cast each to a `char`, which slices a
+/// multi-byte character in half and panics. Identifiers may be Unicode and a
+/// string may hold anything, so a query with either, cut at every character,
+/// must come back with an answer — `Nothing` inside the literal, the usual
+/// position outside it.
+#[test]
+fn a_query_with_multibyte_characters_is_cut_at_every_character_without_panic() {
+    let vocab = code();
+    for whole in [
+        r#"MATCH (n:Function) WHERE n.file = "café/naïve.rs" RETURN n"#,
+        r#"MATCH (n:Function) WHERE n.file = "日本語 \"引用\"" RETURN n"#,
+        "MATCH (函数:Function)-[:CALLS]->(m:Function) WHERE 函数.file = 'ü' RETURN m",
+        "MATCH (n:`Fünction`)-[:`CALLS·TO`]->(m:Function) RETURN m",
+    ] {
+        let cuts = whole.char_indices().map(|(i, _)| i).chain([whole.len()]);
+        let mut inside = false;
+        for cut in cuts {
+            let start = &whole[..cut];
+            let c = complete(start, &vocab);
+            let quotes = start.chars().filter(|&ch| ch == '"' || ch == '\'').count();
+            let escaped_quotes = start.matches("\\\"").count();
+            let open = (quotes - escaped_quotes) % 2 == 1;
+            if open {
+                inside = true;
+                assert_eq!(c.expects, Expect::Nothing, "inside a literal at `{start}`");
+            } else if inside && start.ends_with(' ') {
+                inside = false;
+                assert_eq!(
+                    c.expects,
+                    Expect::Clause { done: vec![] },
+                    "after it at `{start}`"
+                );
+            }
+        }
+    }
+}
+
+/// A Unicode variable is a variable like any other: it is offered back where
+/// a variable goes, and a property after its `.` is looked up by its label.
+#[test]
+fn a_unicode_variable_is_bound_like_any_other() {
+    assert_eq!(best("MATCH (函数:Function) RETURN "), "函数");
+    assert_eq!(best("MATCH (函数:Function) RETURN 函"), "数");
+    assert_eq!(
+        complete("MATCH (café:Module) WHERE café.", &code()).expects,
+        Expect::Property {
+            var: "café".into(),
+            label: Some("Module".into()),
+        }
+    );
+    assert_eq!(best("MATCH (café:Module) WHERE café."), "path");
+    // A backticked name is one word, backticks and all, and the caret inside
+    // one is inside a name of the author's own.
+    assert_eq!(
+        best("MATCH (`first name`:Function) RETURN "),
+        "`first name`"
+    );
+    assert!(complete("MATCH (`first", &code()).best.is_none());
+    assert!(complete("MATCH (n:`Fun", &code()).best.is_none());
 }
 
 /// The right-hand side of a comparison is the author's alone: no count in any
@@ -614,8 +689,13 @@ fn any_truncation_of_a_query_can_be_finished_from_where_it_was_cut() {
         "MATCH (n:Function)-[:CALLS]->(m:Function) RETURN m",
         "MATCH (n:Struct)<-[:CONTAINS]-(m:Module) RETURN m",
         "MATCH (n:Module)-[:IMPORTS]->(m:Struct) RETURN m",
+        // Unicode and backticked names: the cut falls on character
+        // boundaries, which is the only place a caret can be.
+        "MATCH (函数:Function)-[:CALLS]->(m:Function) RETURN m",
+        "MATCH (n:`Fünction`)-[:`CALLS·TO`]->(m:Function) RETURN m",
     ] {
-        for cut in 0..=whole.len() {
+        let cuts = whole.char_indices().map(|(i, _)| i).chain([whole.len()]);
+        for cut in cuts {
             let start = &whole[..cut];
             if complete(start, &vocab).best.is_none() {
                 continue;
@@ -676,6 +756,76 @@ fn a_sort_key_leads_with_the_key() {
     assert_eq!(
         best("MATCH (n:Function)-[:CALLS]->(m:Function) RETURN key(m) ORDER BY "),
         "key(m)"
+    );
+}
+
+/// A projection's folds are sort keys too — `ORDER BY count(*)` — and the
+/// completed sort is one the grammar reads.
+#[test]
+fn a_sort_key_may_be_a_fold() {
+    let prefix = "MATCH (n:Function)-[:CALLS]->(m:Function) RETURN key(n), count(*) ORDER BY ";
+    let out = texts(prefix);
+    assert!(out.contains(&"count(*)".to_string()), "{out:?}");
+    assert_eq!(best(&format!("{prefix}cou")), "nt(*)");
+    let query = format!("{prefix}count(*) DESC LIMIT 5");
+    assert!(
+        parse(&query).is_ok(),
+        "`{query}`: {:?}",
+        parse(&query).err()
+    );
+    // And after the fold, the tail goes on: the sort is done, the cap is not.
+    let after = texts(&format!("{prefix}count(*) "));
+    assert!(!after.contains(&"ORDER BY".to_string()), "{after:?}");
+    assert!(after.contains(&"LIMIT".to_string()), "{after:?}");
+}
+
+/// A write's node carries its key and properties in a map. Inside it a name is
+/// wanted — one of the label's properties — and the `:` after it does not open
+/// a label; after the `}` the node closes as it would without one.
+#[test]
+fn a_property_map_is_read_as_part_of_its_node() {
+    let c = complete("CREATE (n:Function {key: $k, ", &code());
+    assert_eq!(
+        c.expects,
+        Expect::Property {
+            var: "n".into(),
+            label: Some("Function".into()),
+        }
+    );
+    assert_eq!(c.best.as_deref(), Some("file"));
+    assert_eq!(best("CREATE (n:Function {key: $k, fi"), "le");
+    // A value is the author's own.
+    assert_eq!(
+        complete("CREATE (n:Function {key: ", &code()).expects,
+        Expect::Value
+    );
+    assert_eq!(
+        complete("CREATE (n:Function {key: $k", &code()).expects,
+        Expect::Value
+    );
+    // The `:` after a key is not a label's colon, and the `}` returns to the
+    // node, which then closes.
+    for prefix in [
+        "MERGE (n {key: \"x\"}",
+        "CREATE (n:Function {key: \"x\", line: 1.5}",
+        "CREATE (n:Function {key: \"x\", file: 'a\\'b'}",
+    ] {
+        let c = complete(prefix, &code());
+        assert_eq!(c.expects, Expect::NodeEnd, "at `{prefix}`");
+        assert_eq!(c.best.as_deref(), Some(")"), "at `{prefix}`");
+        let query = format!("{prefix})");
+        assert!(
+            parse_statement(&query).is_ok(),
+            "`{query}`: {:?}",
+            parse_statement(&query).err()
+        );
+    }
+    // And the node closed, the pattern goes on: a hop, or the clause after it.
+    let c = complete("MATCH (n:Module {path: \"a\"}) ", &code());
+    assert!(matches!(c.expects, Expect::Hop { .. }), "{:?}", c.expects);
+    assert_eq!(
+        best("MATCH (n:Module {path: \"a\"})-[:CONTAINS]->(m:Function) WHERE m."),
+        "file"
     );
 }
 

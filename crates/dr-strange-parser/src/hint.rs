@@ -36,15 +36,22 @@ WHERE one variable per predicate: = <> != < <= > >=, AND/OR/NOT, IS [NOT] NULL, 
 const TAIL: &str = "\
 RETURN [DISTINCT] var|*                whole records
 RETURN a.prop, count(*) AS n, …        columns; folds count/sum/avg/min/max/collect [DISTINCT], grouped by the rest
-ORDER BY expr|column [ASC|DESC]  SKIP n  LIMIT n  [AS OF seq|\"RFC-3339\"|TIME ms]";
+ORDER BY expr|column|count(*)|sum(a.p)… [ASC|DESC]  SKIP n  LIMIT n  [AS OF seq|\"RFC-3339\"|TIME ms]";
 
 const WRITES: &str = "\
-CREATE (a:Label {key:\"k\", p:1})-[:TYPE]->(b:Label {key:\"k2\"})
+CREATE (a:Label {key:\"k\", p:1})-[:TYPE]->(b:Label {key:$k2})   key is the external key: a string, or a $param bound to one
 MERGE (a:Label {key:\"k\"}) [ON CREATE SET …] [ON MATCH SET …]
 MATCH (n:Label) WHERE … SET n.p = v | SET n:Label | SET n += {…} | REMOVE n.p | REMOVE n:Label | [DETACH] DELETE n";
 
 const OVERVIEW: &str = "\
 a statement opens with one source — MATCH, SEARCH, HYBRID, CALL — or a write — CREATE, MERGE, MATCH … SET/REMOVE/DELETE";
+
+/// How names and values are spelled — the part of the grammar every clause
+/// shares, and the part a retry most often trips on: a quote inside a string,
+/// a label with a space in it.
+const LEXICAL: &str = "\
+names: Unicode words, or `backticked` when they would not be (`order`, `first name`); keywords and function names are case-insensitive
+strings: \"…\" or '…' with escapes \\\" \\' \\\\ \\n \\t \\uXXXX; $name is a bound parameter";
 
 /// The grammar a failed statement was reaching for, chosen by the keywords it
 /// contains. Sections are joined by blank lines; the result stands on its own
@@ -85,6 +92,7 @@ pub fn grammar_hint(input: &str) -> String {
         }
         sections.push(TAIL);
     }
+    sections.push(LEXICAL);
     format!("grammar:\n{}", sections.join("\n\n"))
 }
 
@@ -122,6 +130,24 @@ mod tests {
             let hint = grammar_hint(stmt);
             assert!(hint.contains("MERGE (a:Label"), "{stmt}: {hint}");
             assert!(!hint.contains("RETURN [DISTINCT]"), "{stmt}: {hint}");
+        }
+    }
+
+    /// The three readings of the language — the grammar, the completer and
+    /// this — must agree on what may be written; the snippets here name what
+    /// the grammar learned: a parameterised key, a fold as a sort key, backticks
+    /// and escapes.
+    #[test]
+    fn the_snippets_name_what_the_grammar_reads() {
+        let write = grammar_hint("MERGE (n:P {key: $k}");
+        assert!(write.contains("{key:$k2}"), "{write}");
+        assert!(write.contains("$param bound"), "{write}");
+        let read = grammar_hint("MATCH (n:P) RETURN n ORDER BY count(");
+        assert!(read.contains("ORDER BY expr|column|count(*)"), "{read}");
+        for hint in [&write, &read, &grammar_hint("nonsense")] {
+            assert!(hint.contains("`backticked`"), "{hint}");
+            assert!(hint.contains("\\uXXXX"), "{hint}");
+            assert!(hint.contains("case-insensitive"), "{hint}");
         }
     }
 
