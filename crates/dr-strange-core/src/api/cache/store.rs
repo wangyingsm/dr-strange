@@ -10,22 +10,38 @@
 //! due course. Because the seq lives in the KV, a reader's `seq` always matches
 //! the storage snapshot it sees — no version chains, no locks, no races.
 //!
-//! Keys are the globally-unique node/edge ids (arch/02 §1: ids never collide
-//! across planes), so one cache serves all planes. Only *existing* records are
-//! cached (no negative caching yet — arch/02 §7.4); adjacency is always cached,
-//! empty slice included.
+//! Keys are `(plane, id)`. Node/edge ids are globally unique (arch/02 §1), so
+//! one cache serves all planes without collisions — but a lookup is *scoped*
+//! to a plane: `get_node(plane B, id in A)` is `None`, and the cache must say
+//! the same, so the plane is part of the key rather than checked on hit.
+//! Keying (not checking) is what keeps a per-plane miss a plain miss: a hit
+//! under plane A never shadows the answer for plane B. Only *existing* records
+//! are cached (no negative caching yet — arch/02 §7.4); adjacency is always
+//! cached, empty slice included.
+//!
+//! **Per-entry cap** (arch/02 §4): an entry heavier than [`ENTRY_CAP_BYTES`]
+//! — a hub's adjacency, a record carrying a huge blob — bypasses the L2. It
+//! would evict a whole working set to hold one thing that decodes once per
+//! query anyway; the executor streams it from storage instead.
 
 use std::sync::Arc;
 
 use moka::sync::Cache;
 
-use crate::types::{Dir, EdgeRecord, Neighbor, NodeRecord, PropValue, Properties};
+use crate::types::{Dir, EdgeRecord, Neighbor, NodeRecord, PlaneId, PropValue, Properties};
+
+/// Heaviest entry the L2 will hold, in the weigher's units (arch/02 §4). 4 MiB
+/// is 1/16 of the default 64 MiB budget: a hub with ~250k neighbours, or a
+/// record with a ~4 MiB blob — either is decode-once-per-query territory, not
+/// working-set territory. Bounding the ratio (rather than the absolute size)
+/// keeps one entry from ever being most of the cache.
+const ENTRY_CAP_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
-    Node(u64),
-    Edge(u64),
-    Adj(u64, Dir, Option<String>),
+    Node(PlaneId, u64),
+    Edge(PlaneId, u64),
+    Adj(PlaneId, u64, Dir, Option<String>),
 }
 
 /// A decoded payload tagged with the commit seq it is valid at (arch/02 §3).
@@ -47,6 +63,8 @@ enum Payload {
 /// reader borrows it.
 pub(crate) struct GraphCache {
     cache: Cache<Key, Stamped>,
+    /// Entries weighing more than this are not inserted (arch/02 §4).
+    entry_cap: u32,
 }
 
 impl GraphCache {
@@ -57,11 +75,22 @@ impl GraphCache {
                 .max_capacity(max_bytes)
                 .weigher(|_k, v: &Stamped| weight(v))
                 .build(),
+            // A tiny budget (tests, constrained hosts) shrinks the cap with it,
+            // so one entry can never be more than a sixteenth of the cache.
+            entry_cap: ENTRY_CAP_BYTES.min((max_bytes / 16).max(1).min(u32::MAX as u64) as u32),
         }
     }
 
-    pub fn node(&self, id: u64, seq: u64) -> Option<Arc<NodeRecord>> {
-        match self.cache.get(&Key::Node(id)) {
+    /// Insert unless the entry is over the per-entry cap (arch/02 §4), in
+    /// which case it simply isn't cached and the next reader decodes it again.
+    fn insert(&self, key: Key, value: Stamped) {
+        if weight(&value) <= self.entry_cap {
+            self.cache.insert(key, value);
+        }
+    }
+
+    pub fn node(&self, plane: PlaneId, id: u64, seq: u64) -> Option<Arc<NodeRecord>> {
+        match self.cache.get(&Key::Node(plane, id)) {
             Some(Stamped {
                 seq: s,
                 payload: Payload::Node(n),
@@ -70,9 +99,9 @@ impl GraphCache {
         }
     }
 
-    pub fn put_node(&self, id: u64, seq: u64, node: Arc<NodeRecord>) {
-        self.cache.insert(
-            Key::Node(id),
+    pub fn put_node(&self, plane: PlaneId, id: u64, seq: u64, node: Arc<NodeRecord>) {
+        self.insert(
+            Key::Node(plane, id),
             Stamped {
                 seq,
                 payload: Payload::Node(node),
@@ -80,8 +109,8 @@ impl GraphCache {
         );
     }
 
-    pub fn edge(&self, id: u64, seq: u64) -> Option<Arc<EdgeRecord>> {
-        match self.cache.get(&Key::Edge(id)) {
+    pub fn edge(&self, plane: PlaneId, id: u64, seq: u64) -> Option<Arc<EdgeRecord>> {
+        match self.cache.get(&Key::Edge(plane, id)) {
             Some(Stamped {
                 seq: s,
                 payload: Payload::Edge(e),
@@ -90,9 +119,9 @@ impl GraphCache {
         }
     }
 
-    pub fn put_edge(&self, id: u64, seq: u64, edge: Arc<EdgeRecord>) {
-        self.cache.insert(
-            Key::Edge(id),
+    pub fn put_edge(&self, plane: PlaneId, id: u64, seq: u64, edge: Arc<EdgeRecord>) {
+        self.insert(
+            Key::Edge(plane, id),
             Stamped {
                 seq,
                 payload: Payload::Edge(edge),
@@ -100,8 +129,18 @@ impl GraphCache {
         );
     }
 
-    pub fn adj(&self, id: u64, dir: Dir, ty: Option<&str>, seq: u64) -> Option<Arc<[Neighbor]>> {
-        match self.cache.get(&Key::Adj(id, dir, ty.map(str::to_string))) {
+    pub fn adj(
+        &self,
+        plane: PlaneId,
+        id: u64,
+        dir: Dir,
+        ty: Option<&str>,
+        seq: u64,
+    ) -> Option<Arc<[Neighbor]>> {
+        match self
+            .cache
+            .get(&Key::Adj(plane, id, dir, ty.map(str::to_string)))
+        {
             Some(Stamped {
                 seq: s,
                 payload: Payload::Adj(a),
@@ -110,9 +149,17 @@ impl GraphCache {
         }
     }
 
-    pub fn put_adj(&self, id: u64, dir: Dir, ty: Option<&str>, seq: u64, adj: Arc<[Neighbor]>) {
-        self.cache.insert(
-            Key::Adj(id, dir, ty.map(str::to_string)),
+    pub fn put_adj(
+        &self,
+        plane: PlaneId,
+        id: u64,
+        dir: Dir,
+        ty: Option<&str>,
+        seq: u64,
+        adj: Arc<[Neighbor]>,
+    ) {
+        self.insert(
+            Key::Adj(plane, id, dir, ty.map(str::to_string)),
             Stamped {
                 seq,
                 payload: Payload::Adj(adj),
@@ -154,4 +201,58 @@ fn props(p: &Properties) -> usize {
             k.len() + v + d.description.as_ref().map_or(0, |s| s.len()) + 32
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(plane: PlaneId) -> Arc<NodeRecord> {
+        Arc::new(NodeRecord {
+            id: crate::types::NodeId(1),
+            plane,
+            external_key: None,
+            labels: vec!["N".into()],
+            properties: Properties::new(),
+        })
+    }
+
+    #[test]
+    fn a_hit_is_scoped_to_the_plane_it_was_read_in() {
+        let cache = GraphCache::new(1 << 20);
+        let a = PlaneId(1);
+        let b = PlaneId(2);
+        cache.put_node(a, 1, 5, record(a));
+        cache.put_adj(a, 1, Dir::Out, None, 5, Arc::from(vec![]));
+
+        assert!(cache.node(a, 1, 5).is_some(), "the plane that read it hits");
+        // Ids are global, so the same id looked up from another plane must be
+        // the miss storage would report — never plane A's record.
+        assert!(cache.node(b, 1, 5).is_none());
+        assert!(cache.adj(b, 1, Dir::Out, None, 5).is_none());
+    }
+
+    #[test]
+    fn oversized_entries_bypass_the_cache() {
+        // 1 MiB budget ⇒ 64 KiB per-entry cap; 16 bytes per neighbour.
+        let cache = GraphCache::new(1 << 20);
+        let plane = PlaneId(1);
+        let hub: Arc<[Neighbor]> = (0..10_000u64)
+            .map(|i| Neighbor {
+                node: crate::types::NodeId(i),
+                edge: crate::types::EdgeId(i),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        cache.put_adj(plane, 1, Dir::Out, None, 3, hub);
+        assert!(
+            cache.adj(plane, 1, Dir::Out, None, 3).is_none(),
+            "a hub over the cap is streamed from storage, not cached"
+        );
+        assert_eq!(cache.weighted_size(), 0);
+
+        let small: Arc<[Neighbor]> = Arc::from(vec![]);
+        cache.put_adj(plane, 2, Dir::Out, None, 3, small);
+        assert!(cache.adj(plane, 2, Dir::Out, None, 3).is_some());
+    }
 }
