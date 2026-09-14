@@ -350,6 +350,68 @@ pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
     form-action 'self'; \
     frame-ancestors 'none'";
 
+/// The environment's half of [`ServeOptions::allowed_hosts`]:
+/// `DRSG_ALLOWED_HOSTS`, comma-separated, blanks dropped.
+pub const ENV_ALLOWED_HOSTS: &str = "DRSG_ALLOWED_HOSTS";
+
+fn allowed_hosts_from_env() -> Vec<String> {
+    std::env::var(ENV_ALLOWED_HOSTS)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Host` values `/mcp` answers at — what the MCP transport's
+/// DNS-rebinding guard is handed.
+///
+/// Loopback names are always in: `localhost`, `127.0.0.1`, `::1`. With a
+/// bearer token configured, the bind address joins them when it is a real
+/// address (a wildcard bind names no host), and so does every operator entry
+/// (`[server] allowed_hosts` / `DRSG_ALLOWED_HOSTS`, a hostname or
+/// `host:port`). Without a token the extras are ignored and logged, because
+/// the guard is then doing real work: a tokenless server trusts its own
+/// same-origin UI, and a rebinding page impersonating that UI is precisely
+/// what a loopback-only `Host` list defeats. Once every request has to carry
+/// a secret a rebinding page cannot read, the guard adds nothing the token
+/// does not, and an operator putting `/mcp` behind a hostname must be able
+/// to say so.
+pub fn mcp_allowed_hosts(
+    bind: std::net::SocketAddr,
+    token_configured: bool,
+    extra: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut push = |h: String| {
+        if !h.is_empty() && !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    };
+    let extra: Vec<String> = extra.into_iter().collect();
+    if !token_configured {
+        if !extra.is_empty() {
+            tracing::warn!(
+                hosts = ?extra,
+                "ignoring allowed hosts for /mcp: without DRSG_TOKEN only loopback Host values are answered"
+            );
+        }
+        return hosts;
+    }
+    let ip = bind.ip();
+    if !ip.is_unspecified() && !ip.is_loopback() {
+        push(ip.to_string());
+    }
+    extra.into_iter().for_each(push);
+    hosts
+}
+
 /// Whether a listener may start at all: a non-loopback bind serves the API and
 /// the dashboard to whoever can reach the port, and without a token the only
 /// remaining credential is an `Origin` header any client can type. So the
@@ -396,6 +458,7 @@ fn mcp_router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
+    allowed_hosts: Vec<String>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -430,7 +493,10 @@ fn mcp_router(
             Ok(svc)
         },
         Arc::new(sessions),
-        StreamableHttpServerConfig::default(),
+        // The transport's DNS-rebinding guard: the `Host` values it answers
+        // to. Never empty — an empty list is rmcp's "allow any", which is
+        // exactly the guard switched off.
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
     Router::new()
         .route_service("/mcp", service)
@@ -451,6 +517,7 @@ fn router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
+    allowed_hosts: Vec<String>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -485,6 +552,7 @@ fn router(
             embed,
             source_root,
             parsers,
+            allowed_hosts,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -1474,12 +1542,21 @@ async fn run_app(
     // database's Drop from ever running, so the sidecars must be saved
     // explicitly at shutdown or every restart rebuilds the indexes.
     let db_at_shutdown = state.db.clone();
+    let allowed_hosts = mcp_allowed_hosts(
+        opts.addr,
+        state.bootstrap_token.is_some(),
+        opts.allowed_hosts
+            .iter()
+            .cloned()
+            .chain(allowed_hosts_from_env()),
+    );
     let app = router(
         state,
         opts.max_concurrent,
         opts.embed_provider.clone(),
         opts.source_root.clone(),
         opts.recall_parsers.clone(),
+        allowed_hosts,
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
@@ -1837,7 +1914,43 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_bind_policy;
+    use super::{check_bind_policy, mcp_allowed_hosts};
+
+    /// The `Host` list `/mcp` answers at: loopback always; the bind address
+    /// and the operator's names only once a token gates every request; a
+    /// wildcard bind names nothing; duplicates and blanks are dropped.
+    #[test]
+    fn mcp_hosts_grow_past_loopback_only_under_a_token() {
+        let lan: std::net::SocketAddr = "192.168.1.20:7700".parse().unwrap();
+        let any: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        let loopback = vec!["localhost", "127.0.0.1", "::1"];
+        // No token: the extras are ignored, whatever the bind.
+        assert_eq!(
+            mcp_allowed_hosts(lan, false, vec!["memory.example.com".into()]),
+            loopback
+        );
+        // A token: the bind address and the extras are answered.
+        assert_eq!(
+            mcp_allowed_hosts(
+                lan,
+                true,
+                vec!["memory.example.com".into(), "".into(), "127.0.0.1".into()]
+            ),
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "192.168.1.20",
+                "memory.example.com"
+            ]
+        );
+        // A wildcard or loopback bind adds no host of its own.
+        assert_eq!(mcp_allowed_hosts(any, true, vec![]), loopback);
+        assert_eq!(mcp_allowed_hosts(local, true, vec![]), loopback);
+        // Never empty: rmcp reads an empty list as "any host".
+        assert!(!mcp_allowed_hosts(any, false, vec![]).is_empty());
+    }
 
     #[test]
     fn a_tokenless_listener_may_only_be_loopback() {

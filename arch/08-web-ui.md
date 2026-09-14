@@ -102,7 +102,90 @@ trusted and every programmatic client is denied *even for reads* — so a deskto
 install doesn't quietly expose an open API on localhost.
 
 This model is sound while `drsg serve` is a loopback tool. It does not survive
-contact with §4.2, and the fallback becomes actively dangerous there.
+contact with §4.2, and the fallback becomes actively dangerous there — so the
+server enforces where the line is (shipped 2026-09, `server::run`,
+`assets.rs`, `auth.rs`):
+
+1. **A non-loopback bind requires a token.** `run()` refuses to start on
+   any address that is not loopback unless `DRSG_TOKEN` is configured, and
+   the error names the variable and the `--addr` way back. Without a token
+   the only credential left is an `Origin` header any client can type.
+2. **The fallback is gated on a loopback bind.** `SharedToken` knows whether
+   its listener is loopback-bound, and `resolve_credentials` never sets
+   `local_ui` otherwise; an allowed `Origin` on a LAN bind still passes the
+   CSRF guard but authorizes nothing by itself. Invariant 2 of §4.2, closed.
+3. **The page carries the token only to a local human.** `GET /` is
+   unauthenticated (it must be — it is how the browser gets the page that
+   will authenticate), so whatever is in the page is public to whoever can
+   fetch it. The token is spliced into `index.html` only when the bind *and*
+   the peer address are both loopback; on any other deployment the page is
+   served bare, and the SPA asks for the token the first time the server
+   answers unauthorized, keeping it in the tab's `sessionStorage`.
+4. **The token is data, not code.** It rides a `<meta name="drsg-token">`
+   element, never an inline `<script>`, and every response carries a
+   `Content-Security-Policy` of `script-src 'self'` (and `style-src 'self'` —
+   Svelte and sigma style through the CSSOM, which CSP does not govern) with
+   `worker-src blob:` for the layout worker and `img-src data:` for the
+   inlined logo. An injected script cannot run, whatever else goes wrong.
+5. **The WebSocket takes a header first.** `/ws` accepts `Authorization:
+   Bearer` on the upgrade — the form every non-browser client should use,
+   since a header reaches neither access logs nor browser history — and
+   `?token=` only because the browser WebSocket API cannot set headers. The
+   header wins when both are present. Nothing in the server logs a request
+   target, so a query-string token never reaches a log line.
+6. **A wrong token is guessed five times, then waited for.** A per-peer
+   throttle (`auth::FailedAuthLimiter`, applied as a middleware over the
+   whole router so no route can forget it) counts bearers that authorize
+   nothing; past `FREE_FAILURES` (5) the peer serves a wait that doubles per
+   failure up to `MAX_LOCKOUT` (5 min), answered `429` with `Retry-After`
+   before the request is read further. A correct bearer clears it. A request
+   with no bearer is not a guess and is neither counted nor blocked, so the
+   zero-config local UI is untouched. The table is in memory and bounded
+   (`TRACKED_PEERS`, 4096; idle entries are forgotten after 15 min) — a
+   client rotating addresses weakens the throttle for itself, not the
+   server. A JSON-RPC batch is at most `rpc::MAX_BATCH` (64) requests,
+   refused whole with `-32600` above that.
+7. **A provider named over the wire is a preset or the operator's.** Every
+   method that takes a `provider` / `embed_provider` / `chat` / `embed`
+   field, and `POST /cypher?embed=`, resolves it through one helper
+   (`methods::provider_for`): the name is one of the llm crate's presets
+   (`is_preset`) or exactly the provider the operator configured
+   (`[server] embed_provider`), and anything else — a base URL — is `-32602`.
+   The llm crate accepts a URL because an operator at a terminal means one;
+   the server would be posting to it from its own network on behalf of
+   whoever holds a read credential, which is a request forgery. The
+   dashboard offers presets only.
+8. **A cost knob has a ceiling the request cannot move.** `plane.ask`'s
+   `max_attempts` defaults to and is capped at the llm crate's
+   `ASK_DEFAULT_ATTEMPTS` (20), its `limit` at `ASK_MAX_LIMIT` (1000);
+   `digest.run`'s `concurrency` and `chunk_chars` are clamped to
+   `DIGEST_MAX_CONCURRENCY` (32) / `DIGEST_MAX_CHUNK_CHARS` (32 000) or the
+   operator's own `[digest]` default, whichever is larger. `/export` and
+   `/snapshot` stream (`server::stream_body`: a blocking producer writing
+   64 KiB chunks into a bounded channel) rather than build the whole body
+   in memory; the status line is chosen after the request is validated, so
+   a bad plane is still a `400`, and a failure mid-stream truncates the
+   chunked body, which is the one honest signal left.
+9. **An error says only what the client may know.** Core `Io` / `Backend` /
+   `Corrupt` errors (the database path, a backend's internals), provider
+   *call* errors (the upstream reply body) and plugin-store errors (the
+   store directory) go to the log at `warn` under a short reference, and
+   the client gets the category and the reference — `storage error (ref
+   00002a)` — through `methods::opaque`. Client faults keep their text:
+   unknown plane, bad plan, a provider with no key or embedding model in
+   the environment (decided before any network call, from strings this
+   process composed).
+10. **`/mcp` answers at loopback, and at the names the operator lists.**
+    The MCP transport's DNS-rebinding guard checks the `Host` header
+    against a list `server::mcp_allowed_hosts` builds: `localhost`,
+    `127.0.0.1`, `::1` always; with a bearer token configured, the bind
+    address (when it names one — a wildcard does not) and every entry of
+    `ServeOptions::allowed_hosts` / `DRSG_ALLOWED_HOSTS`. Without a token
+    the extras are ignored and logged, because the guard is then doing the
+    work the Origin guard does for browsers: a tokenless server trusts its
+    same-origin UI, and a rebinding page impersonating it is what a
+    loopback-only `Host` defeats. The list is never empty — rmcp reads an
+    empty list as "any host".
 
 ### 4.2 v2 — many agents, many machines, one database
 
