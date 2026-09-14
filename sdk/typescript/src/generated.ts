@@ -73,6 +73,7 @@ export interface DbStats {
   file_size?: number | null;
   rss_bytes?: number | null;
   plugin_bytes: number;
+  maintenance_error?: string | null;
   retain_commits?: number | null;
 }
 
