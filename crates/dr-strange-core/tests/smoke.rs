@@ -1,5 +1,8 @@
 //! M0 vertical slice (arch/00 §5): create node → get node → 1-hop expand,
-//! through the public API, on both backends, with redb persistence.
+//! through the public API, in memory and on disk. `Database::open` uses
+//! whichever on-disk backend the build selected — native by default, redb
+//! under `--no-default-features --features redb-backend` — so the `_on_disk`
+//! tests exercise redb only in that configuration.
 
 use dr_strange_core::{
     Database, Dir, EdgeId, Error, NodeId, PlaneId, PropDesc, PropValue, Properties,
@@ -104,14 +107,14 @@ fn m0_slice_memory() {
 }
 
 #[test]
-fn m0_slice_redb() {
+fn m0_slice_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("smoke.drsg")).unwrap();
     vertical_slice(&db);
 }
 
 #[test]
-fn m0_redb_survives_reopen() {
+fn m0_on_disk_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reopen.drsg");
 
@@ -180,7 +183,7 @@ fn stable_reads_memory() {
 }
 
 #[test]
-fn stable_reads_redb() {
+fn stable_reads_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("stable.drsg")).unwrap();
     stable_reads_while_writer_open(&db);
@@ -478,7 +481,7 @@ fn m1_slice_memory() {
 }
 
 #[test]
-fn m1_slice_redb() {
+fn m1_slice_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("m1.drsg")).unwrap();
     m1_slice(&db);

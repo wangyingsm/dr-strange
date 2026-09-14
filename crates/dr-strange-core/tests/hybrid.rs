@@ -144,7 +144,7 @@ fn hybrid_suite_memory() {
 }
 
 #[test]
-fn hybrid_suite_redb() {
+fn hybrid_suite_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     run_hybrid_suite(&Database::open(dir.path().join("hybrid.drsg")).unwrap());
 }
@@ -278,7 +278,7 @@ fn index_suite_memory() {
 }
 
 #[test]
-fn index_suite_redb() {
+fn index_suite_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     run_index_suite(&Database::open(dir.path().join("index.drsg")).unwrap());
 }
@@ -286,7 +286,8 @@ fn index_suite_redb() {
 #[test]
 fn index_rebuilds_from_kv_on_reopen() {
     // The declaration is durable; the index is reconstructed from the KV on
-    // open, so a query works immediately after reopening (redb only).
+    // open, so a query works immediately after reopening (on-disk backends
+    // only: an in-memory database cannot be reopened).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reopen-index.drsg");
     let (d0, d1);

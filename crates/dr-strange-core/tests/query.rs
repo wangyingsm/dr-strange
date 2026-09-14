@@ -383,7 +383,7 @@ fn query_suite_memory() {
 }
 
 #[test]
-fn query_suite_redb() {
+fn query_suite_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     run_query_suite(&Database::open(dir.path().join("query.drsg")).unwrap());
 }
