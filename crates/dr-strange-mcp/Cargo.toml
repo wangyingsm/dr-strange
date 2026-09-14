@@ -53,6 +53,11 @@ schemars = "1"
 regex = "1"
 tracing.workspace = true
 
+# `relay` forwards the `Authorization` a `.mcp.json` carries, so it reads
+# only a file the current user owns: the uid comes from here.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # `relay`'s discovery tests write `.mcp.json` files into throwaway trees.
 tempfile = "3.27.0"
