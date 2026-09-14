@@ -27,7 +27,7 @@
 mod sst;
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
@@ -530,21 +530,24 @@ impl NativeEngine {
         };
         let min_snap = self.min_snapshot(committed_seq);
 
-        // Merge every run into one map (a later run's version wins), then drop
-        // what no reader needs.
-        let mut merged: BTreeMap<MemKey, Op> = BTreeMap::new();
-        for run in &runs {
-            run.load_into(&mut merged)?;
-        }
-        let kept = gc_versions(merged, min_snap);
-        let max_seq = kept
-            .keys()
-            .map(|(_, _, Reverse(s))| *s)
+        // Stream the runs through a k-way merge (a later run's version wins)
+        // and the version GC straight into the new file: memory is one block
+        // per run plus one key's version group, not the sum of the runs. The
+        // merged run is stamped with the newest sequence any input held, which
+        // stays right when GC drops the newest entry of an all-dead key.
+        let max_seq = runs
+            .iter()
+            .map(|r| r.max_seq)
             .max()
             .unwrap_or(committed_seq);
-
+        let count_hint = runs.iter().map(|r| r.count).sum::<u64>();
+        let count_hint = usize::try_from(count_hint).unwrap_or(usize::MAX);
         let path = self.dir.join(format!("sst-{next:06}"));
-        sst::write(&path, &kept, max_seq)?;
+        {
+            let merged = MergeIter::new(runs.iter().map(|r| r.entries()));
+            let kept = gc_versions(merged, min_snap);
+            sst::write_sorted(&path, kept, count_hint, max_seq)?;
+        }
         let merged_sst = self.open_sst(&path)?;
 
         // Swap the merged runs out for the single new run. Single writer ⇒ the
@@ -588,36 +591,174 @@ pub(super) fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reclaim dead versions from a merged run. Processing each key newest-first,
-/// keep versions down to and including the first at or below `min_snapshot`
-/// (the "floor" a reader at that snapshot would see); drop everything older. A
-/// key whose only survivor is a tombstone at/below the floor is dropped
-/// entirely — this is the bottom run, so nothing older can resurface.
-///
-/// Surviving values are **moved** out of `merged` into the result, never
-/// cloned, and `merged` is consumed as it is walked. Values are where a store's
-/// bytes are (a node carrying an embedding is a few KiB per version), so this
-/// is what keeps a compaction's peak near one copy of the run rather than
-/// two — measured on a 175 MiB store, the clone doubled it to ~400 MiB.
-fn gc_versions(merged: BTreeMap<MemKey, Op>, min_snapshot: u64) -> BTreeMap<MemKey, Op> {
-    let mut out = BTreeMap::new();
-    let mut group: Vec<(u64, Op)> = Vec::new();
-    let mut cur: Option<(u8, Vec<u8>)> = None;
+/// The k-way merge of several runs' entry sweeps into one `(table, key, seq
+/// DESC)` stream — compaction's input. Each sweep keeps one block resident and
+/// the heap holds one entry per run, so the merge's memory is proportional to
+/// the number of runs, not to their size. Runs are given oldest first; should
+/// two runs ever carry the same `(table, key, seq)`, the later run's entry is
+/// the one emitted (what the memtable-based merge used to produce by
+/// overwriting) and the earlier one is dropped.
+struct MergeIter<I: Iterator<Item = Result<(MemKey, Op)>>> {
+    runs: Vec<I>,
+    heap: BinaryHeap<Reverse<MergeHead>>,
+    last: Option<MemKey>,
+    /// A sweep's error is delivered once and ends the merge.
+    done: bool,
+}
 
-    for ((table, key, Reverse(seq)), op) in merged {
-        let same = matches!(&cur, Some((t, k)) if *t == table && *k == key);
-        if !same {
-            if let Some((t, k)) = cur.take() {
-                emit_group(t, k, &mut group, min_snapshot, &mut out);
-            }
-            cur = Some((table, key));
+/// A run's current front entry. Ordered by key, then by *later run first*, so
+/// equal keys pop in the order that lets the newest run win.
+struct MergeHead {
+    key: MemKey,
+    run: usize,
+    op: Op,
+}
+
+impl PartialEq for MergeHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for MergeHead {}
+impl PartialOrd for MergeHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MergeHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| other.run.cmp(&self.run))
+    }
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> MergeIter<I> {
+    /// `runs` oldest first. Priming reads one block per run; a read error
+    /// there is reported by the first `next`.
+    fn new(runs: impl IntoIterator<Item = I>) -> Self {
+        Self {
+            runs: runs.into_iter().collect(),
+            heap: BinaryHeap::new(),
+            last: None,
+            done: false,
         }
-        group.push((seq, op)); // newest-first: merged iterates seq DESC per key
     }
-    if let Some((t, k)) = cur {
-        emit_group(t, k, &mut group, min_snapshot, &mut out);
+
+    /// Pull `run`'s next entry onto the heap (nothing if the run is drained).
+    fn advance(&mut self, run: usize) -> Result<()> {
+        if let Some(next) = self.runs[run].next() {
+            let (key, op) = next?;
+            self.heap.push(Reverse(MergeHead { key, run, op }));
+        }
+        Ok(())
     }
-    out
+
+    fn fail(&mut self, e: Error) -> Option<Result<(MemKey, Op)>> {
+        self.done = true;
+        self.heap.clear();
+        Some(Err(e))
+    }
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> Iterator for MergeIter<I> {
+    type Item = Result<(MemKey, Op)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.last.is_none() && self.heap.is_empty() {
+            // First call: prime every run.
+            for run in 0..self.runs.len() {
+                if let Err(e) = self.advance(run) {
+                    return self.fail(e);
+                }
+            }
+        }
+        loop {
+            let Reverse(MergeHead { key, run, op }) = self.heap.pop()?;
+            if let Err(e) = self.advance(run) {
+                return self.fail(e);
+            }
+            if self.last.as_ref() == Some(&key) {
+                continue; // an older run's copy of an entry already emitted
+            }
+            self.last = Some(key.clone());
+            return Some(Ok((key, op)));
+        }
+    }
+}
+
+/// Reclaim dead versions from a merged stream, itself streaming: `merged` is
+/// in `(table, key, seq DESC)` order, so a key's versions arrive together
+/// newest-first. Keep versions down to and including the first at or below
+/// `min_snapshot` (the "floor" a reader at that snapshot would see); drop
+/// everything older. A key whose only survivor is a tombstone at/below the
+/// floor is dropped entirely — this is the bottom run, so nothing older can
+/// resurface. Memory is one key's version group; an input error is passed
+/// through and ends the stream.
+fn gc_versions<I: Iterator<Item = Result<(MemKey, Op)>>>(
+    merged: I,
+    min_snapshot: u64,
+) -> GcIter<I> {
+    GcIter {
+        merged,
+        min_snapshot,
+        cur: None,
+        group: Vec::new(),
+        out: VecDeque::new(),
+        done: false,
+    }
+}
+
+/// See [`gc_versions`].
+struct GcIter<I> {
+    merged: I,
+    min_snapshot: u64,
+    /// The key whose versions `group` is collecting.
+    cur: Option<(u8, Vec<u8>)>,
+    group: Vec<(u64, Op)>,
+    /// Survivors of the last closed group, drained before more input is read.
+    out: VecDeque<(MemKey, Op)>,
+    done: bool,
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> Iterator for GcIter<I> {
+    type Item = Result<(MemKey, Op)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.out.pop_front() {
+                return Some(Ok(item));
+            }
+            if self.done {
+                return None;
+            }
+            match self.merged.next() {
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+                Some(Ok(((table, key, Reverse(seq)), op))) => {
+                    let same = matches!(&self.cur, Some((t, k)) if *t == table && *k == key);
+                    if !same {
+                        if let Some((t, k)) = self.cur.take() {
+                            emit_group(t, k, &mut self.group, self.min_snapshot, &mut self.out);
+                        }
+                        self.cur = Some((table, key));
+                    }
+                    self.group.push((seq, op)); // newest-first per key
+                }
+                None => {
+                    self.done = true;
+                    if let Some((t, k)) = self.cur.take() {
+                        emit_group(t, k, &mut self.group, self.min_snapshot, &mut self.out);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Emit the surviving versions of one key (its `group`, newest-first), then
@@ -629,7 +770,7 @@ fn emit_group(
     key: Vec<u8>,
     group: &mut Vec<(u64, Op)>,
     min_snapshot: u64,
-    out: &mut BTreeMap<MemKey, Op>,
+    out: &mut VecDeque<(MemKey, Op)>,
 ) {
     let mut keep = 0;
     for (seq, _) in group.iter() {
@@ -657,7 +798,7 @@ fn emit_group(
                 .expect("still held until the last survivor")
                 .clone()
         };
-        out.insert((table, k, Reverse(seq)), op);
+        out.push_back(((table, k, Reverse(seq)), op));
     }
 }
 
@@ -676,6 +817,13 @@ mod gc_tests {
             .collect()
     }
 
+    /// Run the streaming GC over an in-memory merged run and collect it.
+    fn gc(m: BTreeMap<MemKey, Op>, min_snapshot: u64) -> BTreeMap<MemKey, Op> {
+        gc_versions(m.into_iter().map(Ok), min_snapshot)
+            .collect::<Result<_>>()
+            .unwrap()
+    }
+
     fn seqs(out: &BTreeMap<MemKey, Op>, key: &str) -> Vec<u64> {
         out.keys()
             .filter(|(_, k, _)| k == key.as_bytes())
@@ -691,7 +839,7 @@ mod gc_tests {
             (0, "k", 4, put("v4")),
             (0, "k", 2, put("v2")),
         ]);
-        let out = gc_versions(m, 5);
+        let out = gc(m, 5);
         // Above the floor: 9, 6. The first at/below it (4) is what a reader
         // pinned at 5 sees, so it stays; 2 is unreachable.
         assert_eq!(seqs(&out, "k"), vec![9, 6, 4]);
@@ -706,7 +854,7 @@ mod gc_tests {
             (0, "live", 8, Op::Del),
             (0, "live", 7, put("y")),
         ]);
-        let out = gc_versions(m, 5);
+        let out = gc(m, 5);
         assert!(seqs(&out, "gone").is_empty(), "nothing older can resurface");
         // A tombstone above the floor still shadows the version a pinned
         // reader at 5 would otherwise see.
@@ -720,7 +868,7 @@ mod gc_tests {
             (1, "a", 2, put("e")),
             (1, "a", 1, put("old")),
         ]);
-        let out = gc_versions(m, 10);
+        let out = gc(m, 10);
         assert_eq!(out.len(), 2, "the same key in two tables is two keys");
         assert_eq!(out[&(0, b"a".to_vec(), Reverse(2))], put("n"));
         assert_eq!(out[&(1, b"a".to_vec(), Reverse(2))], put("e"));
@@ -740,8 +888,87 @@ mod gc_tests {
             (0, "gone", 1, put("x")),
         ]);
         let before = m.clone();
-        let out = gc_versions(m, 0);
+        let out = gc(m, 0);
         assert_eq!(out, before, "floor 0 must be a no-op");
+    }
+
+    #[test]
+    fn the_streaming_merge_equals_the_map_merge_and_the_later_run_wins() {
+        // Three runs with interleaved keys and a version spread; a key that
+        // appears in every run; one (table, key, seq) duplicated across runs
+        // to pin the "later run wins" rule the old overwrite gave for free.
+        let runs = [
+            merged(&[
+                (0, "a", 1, put("a1")),
+                (0, "c", 2, put("c2")),
+                (1, "a", 3, put("ta3")),
+                (0, "dup", 4, put("old")),
+            ]),
+            merged(&[
+                (0, "a", 5, Op::Del),
+                (0, "b", 6, put("b6")),
+                (0, "dup", 4, put("new")),
+            ]),
+            merged(&[(0, "a", 7, put("a7")), (0, "c", 8, put("c8"))]),
+        ];
+        let mut expected = BTreeMap::new();
+        for r in &runs {
+            expected.extend(r.clone());
+        }
+        let streamed: Vec<(MemKey, Op)> =
+            MergeIter::new(runs.iter().map(|r| r.clone().into_iter().map(Ok)))
+                .collect::<Result<_>>()
+                .unwrap();
+        assert!(
+            streamed.windows(2).all(|w| w[0].0 < w[1].0),
+            "merge output must be strictly ordered"
+        );
+        let streamed: BTreeMap<MemKey, Op> = streamed.into_iter().collect();
+        assert_eq!(streamed, expected);
+        assert_eq!(streamed[&(0, b"dup".to_vec(), Reverse(4))], put("new"));
+        // And the GC on top still sees whole version groups.
+        let out = gc_versions(
+            MergeIter::new(runs.iter().map(|r| r.clone().into_iter().map(Ok))),
+            6,
+        )
+        .collect::<Result<BTreeMap<_, _>>>()
+        .unwrap();
+        // Table 0's "a": 7 above the floor, 5 is the floor version; table 1's
+        // lone (1, "a", 3) is its own group and survives as that key's floor.
+        assert_eq!(seqs(&out, "a"), vec![7, 5, 3]);
+        assert!(!out.contains_key(&(0, b"a".to_vec(), Reverse(1))));
+        assert!(out.contains_key(&(1, b"a".to_vec(), Reverse(3))));
+    }
+
+    #[test]
+    fn a_failing_sweep_ends_the_merge_with_its_error() {
+        let good = merged(&[(0, "a", 1, put("x")), (0, "z", 2, put("y"))]);
+        let bad: Vec<Result<(MemKey, Op)>> = vec![
+            Ok(((0, b"m".to_vec(), Reverse(3)), put("m"))),
+            Err(Error::Corrupt("boom".into())),
+        ];
+        let out: Vec<Result<(MemKey, Op)>> = MergeIter::new(vec![
+            good.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
+            bad.into_iter(),
+        ])
+        .collect();
+        let errs = out.iter().filter(|r| r.is_err()).count();
+        assert_eq!(errs, 1, "exactly one error, then the merge ends");
+        assert!(matches!(out.last(), Some(Err(Error::Corrupt(_)))));
+        // Through the GC and into the writer, that error aborts the file.
+        let dir = std::env::temp_dir().join(format!("drs-merge-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = sst::write_sorted(
+            &dir.join("sst-000001"),
+            gc_versions(
+                vec![Err::<(MemKey, Op), _>(Error::Corrupt("boom".into()))].into_iter(),
+                0,
+            ),
+            1,
+            1,
+        );
+        assert!(matches!(r, Err(Error::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -788,7 +1015,7 @@ mod engine_tests {
         let store = e.store.read().unwrap_or_else(|e| e.into_inner());
         let mut all = BTreeMap::new();
         for run in &store.ssts {
-            run.load_into(&mut all).unwrap();
+            all.extend(run.entries().map(|e| e.unwrap()));
         }
         all.keys()
             .filter(|(_, k, _)| k == key)

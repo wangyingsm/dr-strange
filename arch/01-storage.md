@@ -247,6 +247,16 @@ follow from that ordering:
   of `durable_commit`.
 - **Torn tail.** Replay stops at the first short or checksum-failing record
   and truncates the WAL there; every earlier commit is intact.
+- **Compaction streams.** Once more than `COMPACTION_TRIGGER` runs exist the
+  writer merges them all into one: each run is swept block by block
+  (`Sst::entries`, bypassing the block cache so a sweep does not evict what
+  readers are using), a `BinaryHeap` k-way merge yields one `(table, key,
+  seq DESC)` stream — a later run wins a tie — and the version GC runs over
+  that stream one key group at a time straight into the new file. Memory is
+  O(runs × block) plus one key's versions, not the sum of the runs. The
+  merged run is stamped with the newest `max_seq` of its inputs. Range
+  reads still materialise the requested range per run (a `BTreeMap` per
+  call); that is unchanged.
 
 ### 6.2 SST file format
 
@@ -264,7 +274,7 @@ Rules readers honour for either version:
 - **Corruption is `Error::Corrupt`, never "absent".** A block whose CRC does
   not match, whose bytes do not decode to whole entries (v1 has only this
   check), or that lies outside the file per the footer/index, fails the read
-  (`get`/`range`/`load_into`) or the open (index/bloom). Iteration must not
+  (`get`/`range`/`entries`) or the open (index/bloom). Iteration must not
   stop quietly at a broken entry: that reported bit-rot as a missing key,
   and a compaction over such a run would have dropped the tail of the block
   for good. Only verified payloads enter the block cache.

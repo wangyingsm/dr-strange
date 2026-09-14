@@ -26,7 +26,6 @@
 //! readers of one run do not serialize on a file cursor; verified blocks are
 //! kept in the engine's shared block cache.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -165,6 +164,9 @@ pub(super) struct Sst {
     index: Vec<BlockRef>,
     bloom: Bloom,
     pub(super) max_seq: u64,
+    /// Entries in the file (footer count) — sizes the Bloom filter of a run
+    /// this one is merged into, without a counting pass.
+    pub(super) count: u64,
     /// This run's file, so compaction can delete it once merged away.
     pub(super) path: PathBuf,
     /// Unique id (keys this run's blocks in the shared cache) + the cache.
@@ -223,12 +225,48 @@ fn seal_block(block: &mut Vec<u8>) -> Result<u32> {
         .map_err(|_| Error::InvalidArgument("SST block exceeds u32::MAX bytes".into()))
 }
 
-/// Write `entries` (already sorted, as a memtable `BTreeMap` is) to an SST at
-/// `path`, stamped with `max_seq`. Writes to a temp file then renames, so a
-/// crash mid-flush can't leave a half-written SST under the real name.
+/// Write a memtable (already sorted, as a `BTreeMap` is) to an SST at `path`,
+/// stamped with `max_seq`. The flush path; see [`write_sorted`].
 pub(super) fn write(
     path: &Path,
     entries: &std::collections::BTreeMap<MemKey, Op>,
+    max_seq: u64,
+) -> Result<()> {
+    write_sorted(path, entries.iter().map(Ok), entries.len(), max_seq)
+}
+
+/// One entry as the writer consumes it. Implemented for a memtable's borrowed
+/// `(&MemKey, &Op)` and a merge's owned `(MemKey, Op)`, so neither a flush nor
+/// a streamed compaction copies anything to encode.
+pub(super) trait SstEntry {
+    fn parts(&self) -> (u8, &[u8], u64, &Op);
+}
+
+impl SstEntry for (&MemKey, &Op) {
+    fn parts(&self) -> (u8, &[u8], u64, &Op) {
+        let ((t, k, std::cmp::Reverse(s)), op) = self;
+        (*t, k.as_slice(), *s, op)
+    }
+}
+
+impl SstEntry for (MemKey, Op) {
+    fn parts(&self) -> (u8, &[u8], u64, &Op) {
+        let ((t, k, std::cmp::Reverse(s)), op) = self;
+        (*t, k.as_slice(), *s, op)
+    }
+}
+
+/// Write `entries` — already in `(table, key, seq DESC)` order, an error
+/// aborting the file — to an SST at `path`, stamped with `max_seq`. The
+/// entries are consumed as they come, one data block resident at a time, so a
+/// compaction can stream a merge of arbitrarily large runs through here;
+/// `count_hint` sizes the Bloom filter (an over-estimate only costs bits).
+/// Writes to a temp file then renames, so a crash mid-write can't leave a
+/// half-written SST under the real name.
+pub(super) fn write_sorted<E: SstEntry>(
+    path: &Path,
+    entries: impl Iterator<Item = Result<E>>,
+    count_hint: usize,
     max_seq: u64,
 ) -> Result<()> {
     let tmp = path.with_extension("tmp");
@@ -241,7 +279,7 @@ pub(super) fn write(
     let mut cur: Option<(KeyPos, Vec<u8>)> = None;
     let mut offset = 0u64;
     let mut count = 0u64;
-    let mut bloom = Bloom::new(entries.len());
+    let mut bloom = Bloom::new(count_hint);
 
     let flush_block = |cur: &mut Option<(KeyPos, Vec<u8>)>,
                        offset: &mut u64,
@@ -257,17 +295,19 @@ pub(super) fn write(
         Ok(())
     };
 
-    for ((table, key, std::cmp::Reverse(seq)), op) in entries {
+    for entry in entries {
+        let entry = entry?;
+        let (table, key, seq, op) = entry.parts();
         let (_, block) = cur.get_or_insert_with(|| {
             let first = KeyPos {
-                table: *table,
-                key: key.clone(),
-                seq: *seq,
+                table,
+                key: key.to_vec(),
+                seq,
             };
             (first, Vec::with_capacity(BLOCK_TARGET + BLOCK_TARGET / 4))
         });
-        encode_entry(block, *table, key, *seq, op);
-        bloom.add(*table, key);
+        encode_entry(block, table, key, seq, op);
+        bloom.add(table, key);
         count += 1;
         let full = block.len() >= BLOCK_TARGET;
         if full {
@@ -502,7 +542,7 @@ impl Sst {
         let index_len = c.u64().ok_or_else(bad)?;
         let bloom_offset = c.u64().ok_or_else(bad)?;
         let bloom_len = c.u64().ok_or_else(bad)?;
-        let _count = c.u64().ok_or_else(bad)?;
+        let count = c.u64().ok_or_else(bad)?;
         let max_seq = c.u64().ok_or_else(bad)?;
         let magic = c.u32().ok_or_else(bad)?;
         let crc = c.u32().ok_or_else(bad)?;
@@ -550,24 +590,24 @@ impl Sst {
             index,
             bloom,
             max_seq,
+            count,
             path: path.to_path_buf(),
             id,
             cache,
         })
     }
 
-    /// Read every entry of this run into `out` (compaction input). A later run's
-    /// version of a key overwrites an earlier one because `out` is keyed by
-    /// `(table, key, Reverse(seq))` and runs have disjoint sequence ranges.
-    pub(super) fn load_into(&self, out: &mut BTreeMap<MemKey, Op>) -> Result<()> {
-        for block in &self.index {
-            let buf = self.read_block(block)?;
-            let mut c = Cursor::new(&buf);
-            while let Some(e) = next_entry(&mut c)? {
-                out.insert((e.table, e.key.to_vec(), std::cmp::Reverse(e.seq)), e.op());
-            }
+    /// Every entry of this run in file (= memtable) order, one block resident
+    /// at a time — a compaction's input. Blocks are read past the shared cache:
+    /// a full sweep of every run would otherwise evict the blocks live readers
+    /// are using for the sake of bytes that are read exactly once.
+    pub(super) fn entries(&self) -> Entries<'_> {
+        Entries {
+            sst: self,
+            next_block: 0,
+            block: Vec::new(),
+            pos: 0,
         }
-        Ok(())
     }
 
     fn read_block(&self, block: &BlockRef) -> Result<Arc<Vec<u8>>> {
@@ -676,6 +716,65 @@ impl Sst {
     }
 }
 
+/// See [`Sst::entries`]. Yields owned `(MemKey, Op)` pairs; a block that fails
+/// its checksum or ends mid-entry surfaces as the error and ends the sweep.
+pub(super) struct Entries<'a> {
+    sst: &'a Sst,
+    next_block: usize,
+    block: Vec<u8>,
+    pos: usize,
+}
+
+impl Iterator for Entries<'_> {
+    type Item = Result<(MemKey, Op)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pos < self.block.len() {
+                let mut c = Cursor {
+                    buf: &self.block,
+                    pos: self.pos,
+                };
+                let item = match next_entry(&mut c) {
+                    Ok(Some(e)) => {
+                        Ok(((e.table, e.key.to_vec(), std::cmp::Reverse(e.seq)), e.op()))
+                    }
+                    // `pos < len` so `next_entry` never says `None` here; a
+                    // mid-entry end is the Corrupt it already reports.
+                    Ok(None) => Err(Error::Corrupt("SST data block ends mid-entry".into())),
+                    Err(e) => Err(e),
+                };
+                if item.is_err() {
+                    // Do not retry the same bytes forever: the sweep is over.
+                    self.next_block = self.sst.index.len();
+                    self.block.clear();
+                    self.pos = 0;
+                } else {
+                    self.pos = c.pos;
+                }
+                return Some(item);
+            }
+            let block = self.sst.index.get(self.next_block)?;
+            self.next_block += 1;
+            self.pos = 0;
+            self.block = match read_block_at(
+                &self.sst.file,
+                self.sst.version,
+                "data",
+                block.offset,
+                block.len as usize,
+            ) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    self.next_block = self.sst.index.len();
+                    self.block.clear();
+                    return Some(Err(e));
+                }
+            };
+        }
+    }
+}
+
 /// The next unused SST number given the existing files in `dir` (sst-000001…).
 pub(super) fn next_number(dir: &Path) -> u64 {
     let mut max = 0u64;
@@ -717,6 +816,7 @@ pub(super) fn list(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::cmp::Reverse;
+    use std::collections::BTreeMap;
 
     struct Dir(PathBuf);
 
@@ -848,9 +948,26 @@ mod tests {
         let mut out = BTreeMap::new();
         sst.range(1, b"", None, u64::MAX, &mut out).unwrap();
         assert_eq!(out.len() as u64, n);
-        let mut all = BTreeMap::new();
-        sst.load_into(&mut all).unwrap();
+        let all: BTreeMap<MemKey, Op> = sst.entries().collect::<Result<_>>().unwrap();
         assert_eq!(all.len() as u64, n + 1);
+        assert_eq!(sst.count, n + 1);
+        // The sweep yields file order, which is memtable order.
+        let swept: Vec<MemKey> = sst.entries().map(|e| e.unwrap().0).collect();
+        assert!(swept.windows(2).all(|w| w[0] < w[1]), "entries not sorted");
+    }
+
+    /// Drain a sweep, failing the test unless it ends in `Corrupt`.
+    fn sweep_is_corrupt(sst: &Sst, what: &str) {
+        let last = sst
+            .entries()
+            .last()
+            .unwrap_or_else(|| panic!("{what}: empty sweep"));
+        assert_corrupt(last, what);
+        // And a broken sweep stops instead of re-yielding the same error.
+        assert!(
+            sst.entries().filter(|e| e.is_err()).count() == 1,
+            "{what}: sweep must end at the first bad block"
+        );
     }
 
     #[test]
@@ -891,7 +1008,7 @@ mod tests {
             sst.range(1, b"", None, u64::MAX, &mut BTreeMap::new()),
             "range across torn block",
         );
-        assert_corrupt(sst.load_into(&mut BTreeMap::new()), "load torn block");
+        sweep_is_corrupt(&sst, "sweep torn block");
     }
 
     #[test]
@@ -913,7 +1030,7 @@ mod tests {
             "untouched first block still reads"
         );
         assert_corrupt(sst.get(1, b"key-000999", u64::MAX), "get in rotted block");
-        assert_corrupt(sst.load_into(&mut BTreeMap::new()), "load rotted block");
+        sweep_is_corrupt(&sst, "sweep rotted block");
         // Garble the first block's key length (a structural break) as well:
         // the CRC catches it before decoding is even attempted.
         patch(&d.sst(), |b| b[first_off as usize + 1] = 0xff);
