@@ -8,7 +8,7 @@
 //! the ids, then apply the ops to each. A standalone `CREATE` just builds nodes
 //! and edges.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
 use dr_strange_core::{
     Dir, LogicalPlan, NodeId, PlaneHandle, PropDesc, PropValue, Properties, WriteTxn,
@@ -125,8 +125,13 @@ pub fn compile(mut ast: WriteAst, params: crate::Params) -> Result<WriteStatemen
                 },
                 beams: Vec::new(),
                 where_clause: m.where_clause,
+                // One row per matched node, not per path: a pattern that
+                // reaches a node twice (`(a)-->(n)`, two `a`s) would otherwise
+                // delete it twice — the second time a missing node — and the
+                // ops can't tell the rows apart anyway, since only the
+                // terminal variable is theirs to mutate.
                 ret: Return {
-                    distinct: false,
+                    distinct: true,
                     items: vec![ReturnItem::Star],
                 },
                 order_by: Vec::new(),
@@ -189,12 +194,16 @@ fn literal_key(cn: &CreateNode) -> Option<&str> {
     }
 }
 
-/// A MERGE upserts by external key, so every node needs a string `key:`. ON
-/// CREATE/MATCH SET is only for a single-node MERGE and references its variable.
+/// A MERGE upserts by external key, so every node needs a string `key:` —
+/// unless it re-names a node earlier in the path (`(a)-[:R]->(b)<-[:S]-(a)`),
+/// which is already resolved. ON CREATE/MATCH SET is only for a single-node
+/// MERGE and references its variable.
 fn validate_merge(m: &MergeClause) -> Result<(), String> {
     let nodes = std::iter::once(&m.path.first).chain(m.path.rest.iter().map(|(_, n)| n));
+    let mut bound: AHashSet<&str> = AHashSet::new();
     for n in nodes {
-        if n.key.is_none() {
+        let rebound = n.var.as_deref().is_some_and(|v| !bound.insert(v));
+        if n.key.is_none() && !rebound {
             return Err(
                 "MERGE needs a `key:` on every node to upsert on, e.g. MERGE (n:Label {key:\"…\"})"
                     .to_string(),
@@ -300,6 +309,11 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
     // matched rows resolves to one node (node_by_key can't see the uncommitted
     // create). Persists across ops and per-row loops.
     let mut merged: AHashMap<&str, NodeId> = AHashMap::new();
+    // Statement-scoped too: the edges this transaction has created, which the
+    // committed store can't show `ensure_edge` yet. Without it a MERGE that
+    // walks the same edge twice — in one path, or in two clauses — would
+    // create it twice and stop being idempotent.
+    let mut staged = StagedEdges::new();
 
     for op in &stmt.ops {
         match op {
@@ -308,7 +322,15 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                 None => {
                     let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                     for path in paths {
-                        create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
+                        create_path(
+                            &mut txn,
+                            path,
+                            &mut vars,
+                            &mut merged,
+                            &mut staged,
+                            &mut summary,
+                            &stmt.params,
+                        )?;
                     }
                 }
                 // CREATE after MATCH: once per matched row, with the matched
@@ -318,7 +340,15 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                         let mut vars: AHashMap<&str, NodeId> = AHashMap::new();
                         vars.insert(bound.as_str(), *id);
                         for path in paths {
-                            create_path(&mut txn, path, &mut vars, &mut summary, &stmt.params)?;
+                            create_path(
+                                &mut txn,
+                                path,
+                                &mut vars,
+                                &mut merged,
+                                &mut staged,
+                                &mut summary,
+                                &stmt.params,
+                            )?;
                         }
                     }
                 }
@@ -333,6 +363,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                         m,
                         &mut vars,
                         &mut merged,
+                        &mut staged,
                         &mut labels,
                         &mut summary,
                         &stmt.params,
@@ -349,6 +380,7 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
                             m,
                             &mut vars,
                             &mut merged,
+                            &mut staged,
                             &mut labels,
                             &mut summary,
                             &stmt.params,
@@ -469,6 +501,7 @@ fn merge_path<'a>(
     m: &'a MergeClause,
     vars: &mut AHashMap<&'a str, NodeId>,
     merged: &mut AHashMap<&'a str, NodeId>,
+    staged: &mut StagedEdges,
     labels: &mut AHashMap<u64, Vec<String>>,
     summary: &mut WriteSummary,
     params: &crate::Params,
@@ -491,7 +524,7 @@ fn merge_path<'a>(
     let mut prev = first_id;
     for (rel, node) in &m.path.rest {
         let (cur, _) = upsert_merge_node(plane, txn, node, vars, merged, labels, summary, params)?;
-        ensure_edge(plane, txn, prev, cur, rel, summary, params)?;
+        ensure_edge(plane, txn, prev, cur, rel, staged, summary, params)?;
         prev = cur;
     }
     Ok(())
@@ -553,14 +586,22 @@ fn upsert_merge_node<'a>(
     Ok((id, created))
 }
 
+/// The `(src, dst, type)` triples this statement's transaction has created:
+/// what `ensure_edge` must check on top of the committed store, which the
+/// plane's reader reflects and the open transaction does not.
+type StagedEdges = AHashSet<(NodeId, NodeId, String)>;
+
 /// Ensure a directed edge of `rel.ty` exists between `prev` and `cur` — MERGE is
-/// idempotent, so a matching edge is not duplicated.
+/// idempotent, so a matching edge is not duplicated, whether it was committed
+/// earlier or created a clause ago in this same statement.
+#[allow(clippy::too_many_arguments)]
 fn ensure_edge(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     prev: NodeId,
     cur: NodeId,
     rel: &CreateRel,
+    staged: &mut StagedEdges,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(), String> {
@@ -569,6 +610,9 @@ fn ensure_edge(
         Dir::In => (cur, prev),
         _ => (prev, cur),
     };
+    if staged.contains(&(src, dst, rel.ty.clone())) {
+        return Ok(());
+    }
     let existing = plane
         .neighbors(src, Dir::Out, Some(&rel.ty))
         .map_err(|e| e.to_string())?;
@@ -577,6 +621,7 @@ fn ensure_edge(
     }
     txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
         .map_err(|e| e.to_string())?;
+    staged.insert((src, dst, rel.ty.clone()));
     summary.edges_created += 1;
     Ok(())
 }
@@ -587,6 +632,7 @@ fn get_or_create<'a>(
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
     vars: &mut AHashMap<&'a str, NodeId>,
+    merged: &mut AHashMap<&'a str, NodeId>,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<NodeId, String> {
@@ -598,9 +644,15 @@ fn get_or_create<'a>(
     let labels: Vec<&str> = cn.label.as_deref().into_iter().collect();
     let props = props_of(&cn.props, params)?;
     let id = match literal_key(cn) {
-        Some(k) => txn
-            .create_node_with_key(k, &labels, props)
-            .map_err(|e| e.to_string())?,
+        Some(k) => {
+            let id = txn
+                .create_node_with_key(k, &labels, props)
+                .map_err(|e| e.to_string())?;
+            // A MERGE later in this statement upserts on the same key; the
+            // store won't show it the node until commit, so tell it here.
+            merged.insert(k, id);
+            id
+        }
         None => txn.create_node(&labels, props).map_err(|e| e.to_string())?,
     };
     summary.nodes_created += 1;
@@ -614,12 +666,14 @@ fn create_path<'a>(
     txn: &mut WriteTxn<'_>,
     path: &'a CreatePath,
     vars: &mut AHashMap<&'a str, NodeId>,
+    merged: &mut AHashMap<&'a str, NodeId>,
+    staged: &mut StagedEdges,
     summary: &mut WriteSummary,
     params: &crate::Params,
 ) -> Result<(), String> {
-    let mut prev = get_or_create(txn, &path.first, vars, summary, params)?;
+    let mut prev = get_or_create(txn, &path.first, vars, merged, summary, params)?;
     for (rel, node) in &path.rest {
-        let cur = get_or_create(txn, node, vars, summary, params)?;
+        let cur = get_or_create(txn, node, vars, merged, summary, params)?;
         // `->` is prev→cur; `<-` is cur→prev (the parser rejects undirected).
         let (src, dst) = match rel.dir {
             Dir::In => (cur, prev),
@@ -627,6 +681,9 @@ fn create_path<'a>(
         };
         txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
             .map_err(|e| e.to_string())?;
+        // CREATE always adds; it records the edge so a MERGE later in the
+        // same statement sees it.
+        staged.insert((src, dst, rel.ty.clone()));
         summary.edges_created += 1;
         prev = cur;
     }
