@@ -438,6 +438,12 @@ enum Command {
         /// running from — for a `drsg` in a location you cannot write to.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
+        /// Install the archive even when its `.sha256` sidecar is missing or
+        /// does not match. Insecure, as the name says: only for a mirror
+        /// that publishes no checksums. `DRSG_INSECURE_SKIP_CHECKSUM=1` is
+        /// the same.
+        #[arg(long)]
+        insecure_skip_checksum: bool,
     },
     /// Manage preprocessor plugins (ROADMAP §11): sandboxed wasm components
     /// that turn source files into graph facts before any model reads them.
@@ -1256,7 +1262,11 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 out,
             )
         }
-        Command::Update { bin, dir } => {
+        Command::Update {
+            bin,
+            dir,
+            insecure_skip_checksum,
+        } => {
             let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
                 .fetch
                 .allow_private
@@ -1265,7 +1275,13 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                 .iter()
                 .map(|s| dr_strange_web::fetch::Prefix::parse(s))
                 .collect::<Result<_>>()?;
-            update::update(&allow, bin.as_deref(), dir.as_deref(), out)
+            update::update(
+                &allow,
+                bin.as_deref(),
+                dir.as_deref(),
+                insecure_skip_checksum || update::skip_checksum_from_env(),
+                out,
+            )
         }
         #[cfg(feature = "digest")]
         #[cfg(feature = "digest")]
