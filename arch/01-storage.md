@@ -247,6 +247,15 @@ follow from that ordering:
   of `durable_commit`.
 - **Torn tail.** Replay stops at the first short or checksum-failing record
   and truncates the WAL there; every earlier commit is intact.
+- **Flush I/O runs outside the store write lock.** A commit publishes under
+  the write lock and releases it; the flush then writes and fsyncs the SST
+  under the store *read* lock, so readers are served throughout. That is
+  sound because the memtable changes only inside `durable_commit` and the
+  write gate makes this the only one in flight: between publish and the
+  swap the memtable is immutable and the SST is an exact copy with the same
+  sequences. Only the swap (run in, memtable out) takes the write lock; a
+  reader before or after it sees the same versions. A failed flush leaves
+  the memtable and the SST number in place for the next commit's retry.
 - **Compaction streams.** Once more than `COMPACTION_TRIGGER` runs exist the
   writer merges them all into one: each run is swept block by block
   (`Sst::entries`, bypassing the block cache so a sweep does not evict what
