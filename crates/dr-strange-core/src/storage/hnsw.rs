@@ -803,11 +803,22 @@ impl VectorIndex for HnswIndex {
     fn remove(&mut self, id: u64) -> Result<()> {
         if let Some(idx) = self.id_to_idx.remove(&id) {
             self.nodes[idx].deleted = true;
-            // If we tombstoned the entry point, pick any live node as the new
-            // one (search still works; the graph stays connected enough for
-            // recall, and rebuild-from-KV is the real fix — arch/01 §5).
+            // If we tombstoned the entry point, hand the role to the tallest
+            // live node and lower `top_layer` to match. Search and insert
+            // start at `nodes[entry].layers[top_layer]` without a bounds
+            // check (the invariant `is_wellformed` states), so an arbitrary
+            // replacement — ~94% of nodes have only layer 0 — would panic on
+            // the next query. The scan is linear in the live set, paid only
+            // when the entry itself goes; rebuild-from-KV remains the way to
+            // reclaim tombstones (arch/01 §5).
             if self.entry == Some(idx) {
-                self.entry = self.id_to_idx.values().next().copied();
+                let tallest = self
+                    .id_to_idx
+                    .values()
+                    .copied()
+                    .max_by_key(|&i| (self.nodes[i].layers.len(), std::cmp::Reverse(i)));
+                self.entry = tallest;
+                self.top_layer = tallest.map_or(0, |i| self.nodes[i].layers.len() - 1);
             }
         }
         Ok(())
@@ -1019,6 +1030,78 @@ mod tests {
             let hits = idx.search(&q.vec(dim), 10, None).unwrap();
             assert!(hits.iter().all(|h| !removed.contains(&h.id)));
         }
+    }
+
+    /// Removing the entry node must leave `entry`/`top_layer` agreeing with
+    /// a live node: search and insert start at `layers[top_layer]` of the
+    /// entry unchecked, so an arbitrary successor (most nodes are layer-0
+    /// only) used to panic on the next query.
+    #[test]
+    fn removing_the_entry_node_keeps_the_graph_wellformed() {
+        let dim = 8;
+        let mut g = Gen(31);
+        let mut idx = HnswIndex::new(Metric::L2);
+        for id in 0..300u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        assert!(idx.top_layer > 0, "fixture needs a multi-layer graph");
+
+        // Delete whichever node is the entry, repeatedly, so the successor
+        // chain walks down through every layer height.
+        let mut removed = HashSet::new();
+        while let Some(e) = idx.entry {
+            let id = idx.nodes[e].id;
+            idx.remove(id).unwrap();
+            removed.insert(id);
+            assert!(idx.is_wellformed(), "after removing entry {id}");
+            if let Some(ne) = idx.entry {
+                assert!(!idx.nodes[ne].deleted);
+                assert_eq!(idx.nodes[ne].layers.len(), idx.top_layer + 1);
+                // The tallest survivor is chosen, so the top never rises.
+                assert!(
+                    idx.id_to_idx
+                        .values()
+                        .all(|&i| idx.nodes[i].layers.len() <= idx.top_layer + 1)
+                );
+            }
+            let hits = idx.search(&g.vec(dim), 10, None).unwrap();
+            assert!(hits.iter().all(|h| !removed.contains(&h.id)));
+            idx.insert(1_000 + id, &g.vec(dim)).unwrap();
+            assert!(idx.is_wellformed(), "after re-inserting past entry {id}");
+            if removed.len() > 40 {
+                break;
+            }
+        }
+        assert!(!removed.is_empty());
+    }
+
+    /// Deleting every node empties the index cleanly; the next insert
+    /// becomes the new entry and search works again.
+    #[test]
+    fn removing_every_node_then_inserting_recovers() {
+        let dim = 8;
+        let mut g = Gen(32);
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        for id in 0..120u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        for id in 0..120u64 {
+            idx.remove(id).unwrap();
+            assert!(idx.is_wellformed());
+            idx.search(&g.vec(dim), 5, None).unwrap();
+        }
+        assert!(idx.is_empty());
+        assert_eq!(idx.entry, None);
+        assert_eq!(idx.top_layer, 0);
+        assert!(idx.search(&g.vec(dim), 5, None).unwrap().is_empty());
+
+        for id in 200..260u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+            assert!(idx.is_wellformed());
+        }
+        let hits = idx.search(&g.vec(dim), 5, None).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|h| (200..260).contains(&h.id)));
     }
 
     #[test]

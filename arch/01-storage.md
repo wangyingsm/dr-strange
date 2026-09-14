@@ -185,6 +185,13 @@ Notes:
   concern.
 - `search` takes an optional ID filter so the executor can push label/property
   predicates into the ANN search (filtered HNSW) instead of over-fetching.
+- Deletes are tombstones: a removed node stays in the graph for connectivity
+  but is never returned. Removing the entry node hands the role to the
+  tallest live node and lowers `top_layer` to its height, so `entry` and
+  `top_layer` always agree with a live node (the invariant `is_wellformed`
+  checks on load); removing the last node empties the index and the next
+  insert becomes the entry. Tombstones are reclaimed only by a rebuild from
+  the KV.
 
 ## 6. Transactions
 
