@@ -1164,6 +1164,12 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             if follow.is_some() && mode.is_some() {
                 bail!("--follow and a serve subcommand (e.g. `watch`) are mutually exclusive");
             }
+            // The web crate refuses this bind too, but only once it runs —
+            // after a follower has wiped its directory or a watch has begun.
+            // `apply_env` has already folded `[server] token` into the
+            // environment, so the variable is the one reading.
+            let token_configured = std::env::var("DRSG_TOKEN").is_ok_and(|t| !t.is_empty());
+            config::check_serve_bind(cfg, addr, token_configured)?;
             if let Some(upstream) = follow {
                 let follow_opts = dr_strange_web::FollowOptions {
                     upstream,

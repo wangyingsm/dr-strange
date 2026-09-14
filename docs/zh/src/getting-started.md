@@ -321,10 +321,21 @@ $ docker run -p 7700:7700 -v drsg-data:/data \
 `0.0.0.0:7700`，数据库存放在 `/data` 卷中（原生后端下数据库是一个目录，这个卷
 负责把它持久化保存）。提供方密钥通过环境变量传入。
 
-对于持久化部署，`docker-compose.yml` 拉取同一镜像并定义了一个具名卷：
+容器中 **必须** 设置 `DRSG_TOKEN`：镜像绑定 `0.0.0.0`，而 `drsg serve` 在没有令牌时
+拒绝非回环绑定，不会把 API 与仪表盘开放给任何能连到该端口的人（容器会退出并
+打印指出该变量的消息）。所有客户端都出示这个令牌——SDK 与 curl 作为 bearer，
+仪表盘通过它的提示框。在 Docker 宿主机上以 `http://localhost:7700` 打开仪表盘
+无需其他设置；浏览器若以其他名字访问容器——`http://graph.example:7700`——则该
+来源必须列入 `DRSG_ALLOWED_ORIGINS`（逗号分隔，或 `[server] allowed_origins`）：
+离开回环后页面不再携带令牌，未列出的来源会被当作跨站请求拒绝。
+
+对于持久化部署，`docker-compose.yml` 拉取同一镜像并定义了一个具名卷。它把
+`DRSG_TOKEN` 标记为必填，未设置时 `docker compose up` 会带消息停下，而不是启动一个
+随即退出的容器；`DRSG_ALLOWED_ORIGINS` 设置了就会透传：
 
 ```console
 $ DRSG_TOKEN=please-change-me docker compose up
+$ DRSG_TOKEN=please-change-me DRSG_ALLOWED_ORIGINS=http://graph.example:7700 docker compose up
 ```
 
 若想改为在本地构建镜像，仓库提供了一个多阶段 `Dockerfile`：它会编译仪表盘、将其

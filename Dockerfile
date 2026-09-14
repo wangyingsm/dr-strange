@@ -42,4 +42,8 @@ EXPOSE 7700
 
 # Bind to all interfaces inside the container (the default is loopback-only).
 ENTRYPOINT ["drsg"]
+# 0.0.0.0 so the published port reaches the server; `serve` refuses this bind
+# without DRSG_TOKEN (the API and dashboard would otherwise be open to whoever
+# reaches the port), so run the image with -e DRSG_TOKEN=... — see
+# docker-compose.yml for the origins a remote browser also needs.
 CMD ["--db", "/data/graph.drsg", "serve", "--addr", "0.0.0.0:7700"]
