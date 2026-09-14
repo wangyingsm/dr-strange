@@ -17,6 +17,15 @@
 # opening an unrelated directory never digests it. Set
 # DRSG_ENSURE_UNCONDITIONAL=1 to bootstrap a repo that has no .mcp.json yet —
 # that first run performs a full digest and blocks until it finishes.
+#
+# This repository's own .claude/settings.json sets that variable on both the
+# startup and the resume hook, deliberately: this repository *is* drsg, its
+# sessions are the deepest users of the graph they build, and a session that
+# opens it without one is working blind. The cost is one full digest the first
+# time a fresh clone is opened (the hook's 300 s timeout bounds it); after that
+# `drsg init` finds the recorded endpoint and the run is a health probe. Copy
+# the hook into another project *without* the variable — there the guard is
+# what keeps a stray `cd` from digesting whatever it lands in.
 set -u
 
 cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null || exit 0

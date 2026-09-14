@@ -946,10 +946,15 @@ fn write_executable(path: &Path, body: &str) -> Result<()> {
 }
 
 /// Upsert one hook command under `hooks.<event>` of a Claude Code settings
-/// file. An entry whose command already ends in this script's name is
-/// repointed (the data directory may have moved); otherwise one is added,
+/// file. An entry whose command is exactly a path to a script of this name
+/// is repointed (the data directory may have moved); otherwise one is added,
 /// with `matcher` when the event takes one. Every other key is untouched,
 /// and a file that is not there yet is created.
+///
+/// "Exactly a path": the whole command, no arguments, and its last path
+/// component equal to the name — not merely ending in it. A team's own
+/// `/x/my-drsg-shell-guard`, or a wrapper that runs our script with
+/// arguments, is somebody else's hook and stays as it is.
 #[cfg(feature = "digest")]
 fn upsert_claude_hook(
     path: &Path,
@@ -990,7 +995,7 @@ fn upsert_claude_hook(
             let ours = hook
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|c| c.ends_with(&name));
+                .is_some_and(|c| is_our_hook_command(c, &name));
             if ours {
                 hook["command"] = Value::String(command.clone());
                 found = true;
@@ -1006,6 +1011,16 @@ fn upsert_claude_hook(
     }
     let pretty = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
+}
+
+/// Whether `command` is one of our hook scripts by that exact file name — a
+/// bare path (no arguments, no shell syntax) whose last component is `name`.
+#[cfg(feature = "digest")]
+fn is_our_hook_command(command: &str, name: &str) -> bool {
+    let bare = command.trim();
+    !bare.is_empty()
+        && !bare.chars().any(char::is_whitespace)
+        && Path::new(bare).file_name().and_then(|f| f.to_str()) == Some(name)
 }
 
 /// `drsg history` — a repository's history at a glance.
@@ -4766,19 +4781,39 @@ mod tests {
         );
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
 
-        // Someone else's hooks and settings survive untouched.
+        // Someone else's hooks and settings survive untouched — including a
+        // hook whose command merely *ends in* our script's name, or runs our
+        // script with arguments of its own. Only an exact path is ours.
         std::fs::write(
             &settings,
-            r#"{"permissions": {"allow": ["Bash(git:*)"]}, "hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "/x/lint"}]}]}}"#,
+            r#"{"permissions": {"allow": ["Bash(git:*)"]}, "hooks": {"PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/lint"}]},
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "/x/my-drsg-shell-guard"},
+                    {"type": "command", "command": "/x/wrap drsg-shell-guard"}
+                ]}
+            ]}}"#,
         )
         .unwrap();
         assert!(probe_and_write_claude_hooks(&dir, &hooks, true).unwrap());
         let v = read();
         assert_eq!(v["permissions"]["allow"][0], "Bash(git:*)");
-        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/x/lint"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
+            "/x/my-drsg-shell-guard"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1]["hooks"][1]["command"],
+            "/x/wrap drsg-shell-guard"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][2]["hooks"][0]["command"],
+            hooks.join("drsg-shell-guard").display().to_string()
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4836,6 +4871,15 @@ mod tests {
             "rtk grep needle src",
             "/usr/bin/grep needle x",
             "rg needle | head",
+            // A redirect *inside a pattern* is a search, not a write: the
+            // guard used to wave anything with a `>` through.
+            "rg '>' src",
+            "grep -rn \"a -> b\" src",
+            "rg 'impl<T> Foo' src",
+            "rg \\> src",
+            "grep -rn 'x << 1' src",
+            // stderr to /dev/null is still a read.
+            "rg needle src 2>/dev/null",
         ] {
             let (code, err) = run(blocked);
             assert_eq!(code, 2, "`{blocked}` should be redirected");
@@ -4847,6 +4891,9 @@ mod tests {
             "cargo test -p x",
             "DRSG_RAW=1 rg needle src",
             "cat > out.txt <<'EOF'\nhello\nEOF",
+            "cat a.txt > b.txt",
+            "grep -v junk in.txt >> out.txt",
+            "cat <<EOF > notes.md\nx\nEOF",
             "sed -i 's/a/b/' src/lib.rs",
             "echo hi | grep h",
             "ls -la",
