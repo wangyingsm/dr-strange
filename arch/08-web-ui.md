@@ -167,6 +167,14 @@ server enforces where the line is (shipped 2026-09, `server::run`,
 8. **A cost knob has a ceiling the request cannot move.** `plane.ask`'s
    `max_attempts` defaults to and is capped at the llm crate's
    `ASK_DEFAULT_ATTEMPTS` (20), its `limit` at `ASK_MAX_LIMIT` (1000);
+   `digest.run` with `apply: true` is **not** confirm-gated the way the MCP
+   `digest` tool is (arch/06 §3), by decision rather than omission: a
+   JSON-RPC caller is an authenticated program presenting a write token, and
+   `apply` is the explicit choice it made — a second flag would be the same
+   choice spelled twice. The MCP gate exists because there the caller is a
+   model, and the cost of an unintended apply (rewriting a plane) is what
+   the confirmation buys back. The dashboard's own digest page keeps the
+   review-then-apply flow in its UI.
    `digest.run`'s `concurrency` and `chunk_chars` are clamped to
    `DIGEST_MAX_CONCURRENCY` (32) / `DIGEST_MAX_CHUNK_CHARS` (32 000) or the
    operator's own `[digest]` default, whichever is larger. `/export` and

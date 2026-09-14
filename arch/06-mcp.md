@@ -61,6 +61,10 @@ then narrow, then act:
 - **What destroys is confirmed; what adds is not.** `drop_plane`, a `cypher`
   statement carrying `DELETE` or `REMOVE`, and `digest` with `apply: true`
   all require `confirm: true` and refuse without it, naming the flag. The
+  gate is an MCP-surface rule, not a core one: the same digest over JSON-RPC
+  (`digest.run`, arch/08) has no confirm flag, because that caller is an
+  authenticated program holding a write token that chose `apply` itself,
+  where an MCP tool is invoked by a model whose "apply" may be a guess. The
   cypher gate is a keyword scan of the statement (literals, backtick names
   and `.property` excluded) — the compiled statement's ops are the parser's
   own — and errs toward asking. Additive writes (`write_nodes`,
