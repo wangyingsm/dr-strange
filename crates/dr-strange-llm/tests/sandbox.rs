@@ -104,6 +104,7 @@ fn the_memory_bomb_hits_the_limit() {
         Limits {
             fuel: None, // memory is the wall this test is about
             memory_bytes: 64 << 20,
+            ..Limits::default()
         },
     );
     let err = plugin
@@ -118,6 +119,49 @@ fn the_memory_bomb_hits_the_limit() {
     assert!(
         msg.contains("fixture"),
         "the error must name the plugin: {msg}"
+    );
+    assert!(
+        msg.contains("per-call limit is 64 MiB"),
+        "and name the ceiling it hit, not the allocator that gave up: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With fuel off — an operator's choice for a trusted plugin on a huge tree —
+/// nothing counted instructions, and a plugin that never returned held its
+/// thread forever: under `serve watch`, the fold. The wall-clock deadline is
+/// the net under fuel: not deterministic, never reached by honest work, and
+/// the reason a spinning plugin is an error rather than a hang.
+#[test]
+fn the_infinite_loop_is_interrupted_at_the_deadline_when_fuel_is_off() {
+    let (dir, host) = scratch("deadline");
+    let plugin = fixture(
+        "spin",
+        Limits {
+            fuel: None,
+            deadline: Some(std::time::Duration::from_millis(300)),
+            ..Limits::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    let err = plugin
+        .preprocess(
+            &Input::Files {
+                paths: &["a.fix".to_string()],
+            },
+            &host,
+        )
+        .expect_err("an infinite loop with no fuel must still not return");
+    let took = started.elapsed();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("fixture"),
+        "the error must name the plugin: {msg}"
+    );
+    assert!(msg.contains("deadline"), "and say what stopped it: {msg}");
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the deadline must actually end the call: took {took:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
