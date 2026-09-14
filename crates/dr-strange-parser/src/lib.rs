@@ -65,10 +65,12 @@
 //!   external key; edges are directed (`->`/`<-`).
 //! - `MERGE (n:L {key: "…", …}) [ON CREATE SET …] [ON MATCH SET …]` — upsert a
 //!   node by its external key; a path `MERGE (a {key})-[:T]->(b {key})` upserts
-//!   each keyed node and ensures the edge (idempotent, element-wise).
+//!   each keyed node and ensures the edge (idempotent, element-wise — also
+//!   against what earlier clauses of the same statement created).
 //! - `MATCH pattern [WHERE …] SET n.p = v, n:Label, n += {…}` /
 //!   `REMOVE n.p, n:Label` / `[DETACH] DELETE n` — find-then-mutate on the
-//!   pattern's terminal variable (plain `DELETE` refuses a connected node).
+//!   pattern's terminal variable, once per distinct matched node however many
+//!   paths reach it (plain `DELETE` refuses a connected node).
 //! - `MATCH pattern [WHERE …] CREATE (n)-[:T]->(x {…})` /
 //!   `MERGE (n)-[:T]->(x {key})` — once per matched row, with the terminal
 //!   variable pre-bound so `(n)` anchors to the matched node.
