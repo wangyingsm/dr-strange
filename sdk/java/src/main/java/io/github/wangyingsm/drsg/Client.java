@@ -13,12 +13,10 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.CompletionException;
@@ -299,10 +297,11 @@ public class Client implements AutoCloseable {
      */
     public Subscription watch(String plane, String label, ChangeListener listener) throws DrsgException {
         ensureOpen();
-        String url = baseUrl.replaceFirst("^http", "ws") + "/ws"
-                + (token != null && !token.isEmpty()
-                        ? "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)
-                        : "");
+        // The token is a bearer header on the upgrade, the form the server
+        // prefers (arch/08-web-ui §4.1). `?token=` exists only for browsers,
+        // whose WebSocket API cannot set headers; a URL credential would end
+        // up in proxy and access logs, so this client never sends one.
+        String url = baseUrl.replaceFirst("^http", "ws") + "/ws";
 
         WebSocket.Listener wl = new WebSocket.Listener() {
             private final StringBuilder buf = new StringBuilder();
@@ -377,9 +376,11 @@ public class Client implements AutoCloseable {
             // connectTimeout bounds the TCP/TLS connect; orTimeout bounds the
             // whole future so a peer that accepts and then stays silent through
             // the upgrade cannot pin the caller in join().
-            ws = http.newWebSocketBuilder()
-                    .connectTimeout(timeout)
-                    .buildAsync(URI.create(url), wl)
+            WebSocket.Builder wb = http.newWebSocketBuilder().connectTimeout(timeout);
+            if (token != null && !token.isEmpty()) {
+                wb.header("authorization", "Bearer " + token);
+            }
+            ws = wb.buildAsync(URI.create(url), wl)
                     .orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
                     .join();
         } catch (CompletionException e) {

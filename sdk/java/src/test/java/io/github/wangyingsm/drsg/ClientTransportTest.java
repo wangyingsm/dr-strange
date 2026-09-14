@@ -138,6 +138,27 @@ class ClientTransportTest {
         assertTrue(warning.getMessage().contains("seq 1"), warning.getMessage());
     }
 
+    // The token travels as a bearer header on the upgrade, never in the URL: a
+    // query-string credential lands in proxy and access logs, and the server
+    // prefers the header (arch/08-web-ui §4.1; ?token= is for browsers only).
+    @Test
+    @Timeout(10)
+    void watchSendsBearerHeaderNotQueryToken() throws Exception {
+        CountDownLatch peerSawEof = new CountDownLatch(1);
+        try (FakeWebSocketServer srv = new FakeWebSocketServer(true, c -> {
+                    while (c.readFrameOpcode() >= 0) {
+                        // keep reading
+                    }
+                    peerSawEof.countDown();
+                });
+                Client client = new Client(new Client.Options().baseUrl(srv.baseUrl()).token("s3cret"))) {
+            client.watch("p", null, ev -> { }).close();
+            assertTrue(peerSawEof.await(5, TimeUnit.SECONDS));
+            assertEquals("GET /ws HTTP/1.1", srv.lastRequestLine);
+            assertEquals("Bearer s3cret", srv.lastAuthorization);
+        }
+    }
+
     @Test
     @Timeout(10)
     void closeEndsSubscriptionsAndRefusesFurtherUse() throws Exception {

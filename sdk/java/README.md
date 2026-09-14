@@ -89,7 +89,8 @@ default) and the subscription continues.
 ### Auth
 
 The whole surface is authenticated. Pass a token to the constructor or set
-`DRSG_TOKEN`; it rides each request as `Authorization: Bearer …`. On a
+`DRSG_TOKEN`; it rides each request — the WebSocket upgrade behind `watch`
+included — as `Authorization: Bearer …`, never in a URL. On a
 missing/invalid credential the call throws `DrsgAuthException` (a
 `DrsgException` with `code() == -32001`).
 

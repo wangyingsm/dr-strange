@@ -126,14 +126,24 @@ final class FakeWebSocketServer implements AutoCloseable {
         return "http://127.0.0.1:" + listener.getLocalPort();
     }
 
-    private static void handshake(Socket socket) throws Exception {
+    /** The request line of the last upgrade seen ("GET /ws HTTP/1.1"). */
+    volatile String lastRequestLine;
+    /** The Authorization header of the last upgrade, or null if it sent none. */
+    volatile String lastAuthorization;
+
+    private void handshake(Socket socket) throws Exception {
         BufferedReader r = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.ISO_8859_1));
         String key = null;
+        String authorization = null;
+        lastRequestLine = r.readLine();
         for (String line = r.readLine(); line != null && !line.isEmpty(); line = r.readLine()) {
             if (line.regionMatches(true, 0, "Sec-WebSocket-Key:", 0, 18)) {
                 key = line.substring(18).trim();
+            } else if (line.regionMatches(true, 0, "Authorization:", 0, 14)) {
+                authorization = line.substring(14).trim();
             }
         }
+        lastAuthorization = authorization;
         if (key == null) {
             throw new IllegalStateException("no Sec-WebSocket-Key in the upgrade request");
         }
