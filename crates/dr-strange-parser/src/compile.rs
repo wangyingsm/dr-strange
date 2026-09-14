@@ -973,7 +973,11 @@ fn compile_expr(
             rhs: sub(rhs)?,
         },
         PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
-        PExpr::Not(x) => Expr::Not(sub(x)?),
+        // `NOT` over a missing property: core's evaluator is two-valued (a
+        // missing value makes the inner predicate false, so its negation
+        // true), openCypher's is not (NOT null = null, which no filter
+        // keeps). Guard with the leaves so both agree.
+        PExpr::Not(x) => null_guarded(Expr::Not(sub(x)?), &[x], embedder, params, scope)?,
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).
         PExpr::Neg(x) => match compile_expr(x, embedder, params, scope)? {
             Expr::Literal(PropValue::Int(n)) => Expr::Literal(PropValue::Int(-n)),
@@ -984,11 +988,26 @@ fn compile_expr(
                 rhs: Box::new(other),
             },
         },
-        PExpr::Compare { op, lhs, rhs } => Expr::Compare {
-            op: *op,
-            lhs: sub(lhs)?,
-            rhs: sub(rhs)?,
-        },
+        PExpr::Compare { op, lhs, rhs } => {
+            let cmp = Expr::Compare {
+                op: *op,
+                lhs: sub(lhs)?,
+                rhs: sub(rhs)?,
+            };
+            match op {
+                // `<>` against a missing value is true in core and null in
+                // openCypher; `=` differs only when *both* sides can be
+                // missing (Null = Null holds in core). The ordered
+                // comparisons are already false on a missing operand.
+                CmpOp::Ne => null_guarded(cmp, &[lhs, rhs], embedder, params, scope)?,
+                CmpOp::Eq
+                    if !is_non_null_constant(lhs, params) && !is_non_null_constant(rhs, params) =>
+                {
+                    null_guarded(cmp, &[lhs, rhs], embedder, params, scope)?
+                }
+                _ => cmp,
+            }
+        }
         PExpr::Logic { op, lhs, rhs } => Expr::Logic {
             op: *op,
             lhs: sub(lhs)?,
@@ -1027,5 +1046,96 @@ fn compile_expr(
                 metric: *metric,
             },
         )?,
+    })
+}
+
+/// A literal or parameter that is not `null` — an operand that can never be
+/// missing, so needs no guard.
+fn is_non_null_constant(e: &PExpr, params: &crate::Params) -> bool {
+    match e {
+        PExpr::Lit(v) => !matches!(v, PropValue::Null),
+        PExpr::Param(name) => !matches!(
+            crate::resolve_param(params, name),
+            Ok(PropValue::Null) | Err(_)
+        ),
+        _ => false,
+    }
+}
+
+/// The sub-expressions of `roots` that can evaluate to `Null`: property reads,
+/// the external key, the row channels that may be unset, and a literal
+/// `null` itself. Each distinct one once, in first-seen order.
+fn nullable_leaves<'e>(roots: &[&'e PExpr]) -> Vec<&'e PExpr> {
+    fn go<'e>(e: &'e PExpr, out: &mut Vec<&'e PExpr>) {
+        match e {
+            PExpr::Prop { .. }
+            | PExpr::ExternalKey { .. }
+            | PExpr::Score
+            | PExpr::Similarity { .. }
+            | PExpr::Distance { .. }
+            | PExpr::Lit(PropValue::Null)
+            | PExpr::Param(_) => {
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+            // Never null: a non-null literal, a label test, a hop count, and
+            // `IS NULL` itself (which is how null is asked about).
+            PExpr::Lit(_) | PExpr::HasLabel { .. } | PExpr::Hops | PExpr::IsNull(_) => {}
+            PExpr::In { lhs, list } => {
+                go(lhs, out);
+                for e in list {
+                    go(e, out);
+                }
+            }
+            PExpr::InValue { lhs, haystack } => {
+                go(lhs, out);
+                go(haystack, out);
+            }
+            PExpr::StringMatch { lhs, rhs, .. }
+            | PExpr::Compare { lhs, rhs, .. }
+            | PExpr::Logic { lhs, rhs, .. }
+            | PExpr::Arith { lhs, rhs, .. } => {
+                go(lhs, out);
+                go(rhs, out);
+            }
+            PExpr::Not(x) | PExpr::Neg(x) => go(x, out),
+        }
+    }
+    let mut out = Vec::new();
+    for r in roots {
+        go(r, &mut out);
+    }
+    out
+}
+
+/// `pred`, true only where every nullable leaf under `roots` is present:
+/// `l1 IS NOT NULL AND l2 IS NOT NULL AND pred`. This is how the compiler
+/// meets openCypher's null semantics on the predicates where a two-valued
+/// evaluator says *true* for a missing value — `<>` and `NOT` — without
+/// teaching the executor three-valued logic. It is exact for a predicate
+/// over one property (the common case) and stricter than openCypher for a
+/// compound one under `NOT`, where a false branch would have absorbed the
+/// null: `NOT (n.a = 1 AND n.b = 2)` keeps a node with `b = 3` and no `a` in
+/// openCypher, and drops it here. `lib.rs` documents that divergence.
+fn null_guarded(
+    pred: Expr,
+    roots: &[&PExpr],
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+    scope: &Scope,
+) -> Result<Expr, String> {
+    let mut out: Option<Expr> = None;
+    for leaf in nullable_leaves(roots) {
+        // A param that doesn't resolve fails here as it would anywhere.
+        let present = compile_expr(leaf, embedder, params, scope)?.is_null().not();
+        out = Some(match out {
+            None => present,
+            Some(acc) => acc.and(present),
+        });
+    }
+    Ok(match out {
+        None => pred,
+        Some(guards) => guards.and(pred),
     })
 }
