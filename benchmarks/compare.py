@@ -84,6 +84,40 @@ def query_vectors(data):
             for line in read_lines(data / "queries/vector_queries.csv")]
 
 
+def exact_topk(data):
+    """The exact top-K oracle `drsg-bench gen` wrote: row i is the ids of
+    vector query i's true cosine top-K, nearest first. `None` for a dataset
+    generated before the oracle existed (no recall row then)."""
+    path = data / "queries/vector_exact_topk.txt"
+    if not path.exists():
+        return None
+    return [[int(t) for t in line.split()] for line in read_lines(path)]
+
+
+def recall_at_k(exact, got):
+    """Share of the exact top-k the engine returned. Scored against len(exact)
+    so an index that returns fewer than k rows is penalised, not rewarded."""
+    if not exact:
+        return 1.0
+    want = set(exact)
+    return sum(1 for g in got if g in want) / len(exact)
+
+
+def op_recall(engine, k, exact, answers, total_ms):
+    """The `vector_recall` row, same shape as drsg-bench's: `answers` is the
+    engine's top-k id list per sampled query, aligned with `exact`."""
+    scores = [recall_at_k(e[:k], got) for e, got in zip(exact, answers)]
+    r = op_throughput(engine, "vector_recall", len(scores), total_ms)
+    r["recall"] = sum(scores) / len(scores) if scores else 1.0
+    r["k"] = k
+    return r
+
+
+def key_id(key):
+    """`v123` → 123: the row index vectors.csv gave the embedding node."""
+    return int(key[1:])
+
+
 # ---- SQLite ---------------------------------------------------------------
 
 def run_sqlite(data, k):
@@ -268,15 +302,29 @@ def run_kuzu_vectors(con, data, k, results, engine):
     results.append(op_throughput(engine, "vector_build", n_vecs, (time.perf_counter() - t0) * 1000))
 
     q_vec = "CALL QUERY_VECTOR_INDEX('Item', 'emb_idx', $q, $k) RETURN node.key ORDER BY distance"
+    qvecs = query_vectors(data)
     micros = []
     t0 = time.perf_counter()
-    for q in query_vectors(data):
+    for q in qvecs:
         s = time.perf_counter()
         res = con.execute(q_vec, {"q": q, "k": k})
         while res.has_next():
             res.get_next()
         micros.append((time.perf_counter() - s) * 1e6)
     results.append(op_latency(engine, "vector_topk", micros, time.perf_counter() - t0))
+
+    # recall@k on the sampled queries, untimed, against the shared oracle.
+    exact = exact_topk(data)
+    if exact:
+        t0 = time.perf_counter()
+        answers = []
+        for q in qvecs[:len(exact)]:
+            res = con.execute(q_vec, {"q": q, "k": k})
+            got = []
+            while res.has_next():
+                got.append(key_id(res.get_next()[0]))
+            answers.append(got)
+        results.append(op_recall(engine, k, exact, answers, (time.perf_counter() - t0) * 1000))
 
 
 # ---- Neo4j ----------------------------------------------------------------
@@ -382,16 +430,23 @@ def run_neo4j_vectors(ses, data, k, results, engine):
     ses.run("CALL db.awaitIndexes()")
     results.append(op_throughput(engine, "vector_build", len(vecs), (time.perf_counter() - t0) * 1000))
 
+    q_vec = "CALL db.index.vector.queryNodes('item_emb', $k, $q) YIELD node RETURN node.key"
+    qvecs = query_vectors(data)
     micros = []
     t0 = time.perf_counter()
-    for q in query_vectors(data):
+    for q in qvecs:
         s = time.perf_counter()
-        list(ses.run(
-            "CALL db.index.vector.queryNodes('item_emb', $k, $q) YIELD node RETURN node.key",
-            k=k, q=q,
-        ))
+        list(ses.run(q_vec, k=k, q=q))
         micros.append((time.perf_counter() - s) * 1e6)
     results.append(op_latency(engine, "vector_topk", micros, time.perf_counter() - t0))
+
+    # recall@k on the sampled queries, untimed, against the shared oracle.
+    exact = exact_topk(data)
+    if exact:
+        t0 = time.perf_counter()
+        answers = [[key_id(rec[0]) for rec in ses.run(q_vec, k=k, q=q)]
+                   for q in qvecs[:len(exact)]]
+        results.append(op_recall(engine, k, exact, answers, (time.perf_counter() - t0) * 1000))
 
 
 def chunks(seq, n):
@@ -421,7 +476,10 @@ def aggregate_passes(passes):
             r["median_us"] = med([x["median_us"] for x in rows])
             r["p95_us"] = med([x["p95_us"] for x in rows])
         r["throughput_per_s"] = med([x["throughput_per_s"] for x in rows])
-        primary = [x.get("median_us", x["throughput_per_s"]) for x in rows]
+        if "recall" in first:
+            r["recall"] = med([x["recall"] for x in rows])
+            r["k"] = first["k"]
+        primary = [x.get("median_us", x.get("recall", x["throughput_per_s"])) for x in rows]
         m = med(primary)
         r["runs"] = len(passes)
         r["spread_pct"] = (max(primary) - min(primary)) / m * 100 if m else 0.0
@@ -435,7 +493,10 @@ def write_results(out_path, results):
     print(f"wrote {len(results)} results → {out_path}")
     for r in results:
         spread = f"  ±{r['spread_pct']:.1f}%" if "spread_pct" in r else ""
-        if "median_us" in r:
+        if "recall" in r:
+            print(f"  {r['op']:<14} n={r['n']:<7} {r['total_ms']:>9.2f} ms  "
+                  f"recall@{r['k']} {r['recall']:.4f}{spread}")
+        elif "median_us" in r:
             print(f"  {r['op']:<14} n={r['n']:<7} {r['total_ms']:>9.2f} ms  "
                   f"median {r['median_us']:>8.2f} µs  {r['throughput_per_s']:>12.0f}/s{spread}")
         else:

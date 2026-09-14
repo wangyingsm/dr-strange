@@ -24,6 +24,10 @@ OPS = [
     ("traverse_2hop", "latency", "µs", "2-hop reachable set — median", "lower"),
     ("vector_build", "throughput", "vec/s", "Vector index build", "higher"),
     ("vector_topk", "latency", "µs", "Vector top-k query — median", "lower"),
+    # Recall is scored against the exact top-K oracle `drsg-bench gen` writes;
+    # the row is rendered only once some engine has reported it, so a report
+    # from an older dataset does not show a row of dashes.
+    ("vector_recall", "recall", "", "Vector top-k recall@k (vs exact)", "higher"),
 ]
 
 # Column order + display names.
@@ -77,6 +81,8 @@ def cell(kind, r):
         return "—"
     if kind == "throughput":
         return fmt_throughput(r["throughput_per_s"])
+    if kind == "recall":
+        return f"{r.get('recall', 0.0):.3f} @{r.get('k', '?')}"
     return fmt_latency(r.get("median_us", 0.0))
 
 
@@ -111,6 +117,8 @@ def main():
     lines.append(header)
     lines.append(sep)
     for op, kind, unit, label, better in OPS:
+        if kind == "recall" and not any(op in data.get(k, {}) for k, _ in present):
+            continue
         cells = [cell(kind, data.get(k, {}).get(op)) for k, _ in present]
         arrow = "↑" if better == "higher" else "↓"
         lines.append(f"| {label} ({arrow} better) | " + " | ".join(cells) + " |")
@@ -120,7 +128,12 @@ def main():
     lines.append(
         "- **↑ better** rows are throughput (bigger is faster); **↓ better** rows "
         "are median latency per operation (smaller is faster).\n"
-        "- SQLite has no native vectors, so it sits out the two vector rows.\n"
+        "- SQLite has no native vectors, so it sits out the vector rows.\n"
+        "- **Recall@k** is the share of the exact cosine top-k (brute force, "
+        "written once by `drsg-bench gen` for the first 100 vector queries) "
+        "that the engine's ANN index returned, averaged over those queries — "
+        "a latency row without its recall row is not a result. It is scored "
+        "untimed, after the timed top-k pass.\n"
         "- Every figure is the **median of repeated measurement passes** (3 by "
         "default; the min→max spread per op is recorded in "
         "`benchmarks/results/*.json`), with every engine pinned to the same "

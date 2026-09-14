@@ -1315,6 +1315,7 @@ dependencies = [
 name = "drsg-bench"
 version = "2.7.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "clap",
  "dr-strange-core",

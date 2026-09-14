@@ -17,7 +17,8 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 
 † The Neo4j build figure in this table was measured while `compare.py` still timed the vector load together with the index build; the accounting has since been fixed to index-build-only for every engine, and Neo4j's number will rise on the next run. It is kept rather than dropped so the table stays a record of what was actually measured.
 - **↑ better** rows are throughput (bigger is faster); **↓ better** rows are median latency per operation (smaller is faster).
-- SQLite has no native vectors, so it sits out the two vector rows.
+- SQLite has no native vectors, so it sits out the vector rows.
+- **Recall@k** is the share of the exact cosine top-k (brute force, written once by `drsg-bench gen` for the first 100 vector queries) that the engine's ANN index returned, averaged over those queries — a latency row without its recall row is not a result. It is scored untimed, after the timed top-k pass. This table predates the recall row: no recall was measured for the numbers above, so the vector top-k latencies here are unaccompanied; the next `just bench-compare` adds the row for every engine.
 - Every figure is the **median of repeated measurement passes** (3 by default; the min→max spread per op is recorded in `benchmarks/results/*.json`), with every engine pinned to the same P-cores — one machine, **indicative, not a leaderboard**. Re-run with `just bench-compare`.
 
 ## Methodology
