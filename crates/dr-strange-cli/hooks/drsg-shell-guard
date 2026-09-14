@@ -48,7 +48,7 @@ first=${first##*/}
 
 case "$first" in
   rg|grep|egrep|fgrep|ugrep|ug|ag|ack|cat|head|tail|less|more|bat) ;;
-  sed) case "$CMD" in *'sed -n'*|*'sed -En'*|*'sed -ne'*) ;; *) exit 0 ;; esac ;;
+  sed) case "$CMD" in *'sed -n'*|*'sed -En'*) ;; *) exit 0 ;; esac ;;
   git)
     case "$CMD" in
       *'git show '*:*|*'git grep'*|*'git log'*' -p'*|*'git log'*' --patch'*|*'git log'*' -L'*) ;;
