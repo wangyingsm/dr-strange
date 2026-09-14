@@ -237,6 +237,7 @@ max_concurrent = 256                        # 并发请求上限
 retain_commits = 20                         # 时间旅行可回溯的提交数；更早的版本在压缩时回收（0 表示全部保留）。对每个打开数据库的 drsg 命令生效，不只是 serve
 source_root = "/srv/myrepo"                 # grep/snippet 智能体工具读取的源码树（serve watch 会用 --dir 设置它）
 allowed_origins = ["https://app.example.com"]  # 额外允许的浏览器来源
+# 把 /mcp 放到域名后面：DRSG_ALLOWED_HOSTS=memory.example.com（环境变量；仅在设置了 token 时生效，见 MCP 一章）
 
 [server.tls]                                # 存在此节 ⇒ 以 HTTPS 提供服务
 cert = "/etc/drsg/cert.pem"                 # PEM 证书链

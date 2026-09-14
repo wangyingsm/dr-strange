@@ -186,6 +186,16 @@ server enforces where the line is (shipped 2026-09, `server::run`,
     same-origin UI, and a rebinding page impersonating it is what a
     loopback-only `Host` defeats. The list is never empty — rmcp reads an
     empty list as "any host".
+11. **Background work is bounded and single-flight.** A stale plugin
+    catalog starts one refresh (`methods::refresh_catalog_once`, a flag
+    plus the runtime's blocking pool), however many panels ask while it
+    runs. A follower's replication queue holds `follow::REPLICATION_QUEUE`
+    (1024) batches; when it is full the socket reader waits, the master's
+    broadcast lags the follower out, and the design's answer — a full
+    resync — happens visibly instead of after memory runs out. The fetch
+    guard judges an IPv6 address carrying an IPv4 one (v4-mapped, 6to4,
+    Teredo, NAT64 `64:ff9b::/96`) as that IPv4 address, and refuses the
+    local-use NAT64 block `64:ff9b:1::/48` whole.
 
 ### 4.2 v2 — many agents, many machines, one database
 

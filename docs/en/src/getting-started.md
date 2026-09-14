@@ -274,6 +274,7 @@ max_concurrent = 256                        # ceiling on in-flight requests
 retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all). Applies to every drsg command, not only serve
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins
+# /mcp behind a hostname: DRSG_ALLOWED_HOSTS=memory.example.com (env; honoured only with a token — see the MCP chapter)
 
 [server.tls]                                # present ⇒ serve HTTPS
 cert = "/etc/drsg/cert.pem"                 # PEM certificate chain
@@ -313,7 +314,8 @@ network is usually the more privileged one, so every non-routable address is
 refused: loopback, RFC-1918 private space, link-local (`169.254.0.0/16`, where
 cloud instance metadata services answer credentials), and the rest. The check is
 made on the **resolved address**, not the hostname, and repeated at every
-redirect hop.
+redirect hop; an IPv6 address that carries an IPv4 one inside it (v4-mapped,
+6to4, Teredo, NAT64's `64:ff9b::/96`) is judged as that IPv4 address.
 
 `allow_private` re-permits specific CIDR blocks — `["10.0.0.0/8"]` to read an
 intranet wiki — and is the one deliberate exception to that. It is not a switch
