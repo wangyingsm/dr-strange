@@ -74,6 +74,21 @@ All three questions this doc opened with are settled.
    path. `openai.rs` takes a configurable `base_url`, so any
    OpenAI-compatible endpoint works — a gateway, `ollama`, or `llama.cpp`.
 3. **NL → plan safety** — settled: yes, and it is *enforced*, not merely
-   intended. `dr-strange-parser`'s `read_only()` rejects any statement that
-   would mutate before it can become a `ReadQuery`, so the NL interface
-   cannot write even if the model emits a mutation.
+   intended. `ask` never goes through Cypher: the model's answer is
+   deserialized straight into `dr-strange-core`'s `LogicalPlan`, an algebra
+   with **no mutation** in it — every `Source` and every `Step` reads — so
+   there is no write for the model to emit. (`dr-strange-parser`'s
+   `read_only()` is the analogous guard on the *Cypher* surface; it plays no
+   part in `ask`.) Two things are enforced on top of that, because a plan is
+   the model's and a document can steer a model:
+   - an **allowlist** of the grammar the prompt teaches — `ScanAll`,
+     `ScanLabel`, `SeekKeys`; `Expand`, `ExpandVar`, `Filter`, `Distinct`,
+     `Sort`, `Skip`, `Limit`. Vector, keyword, hybrid and algorithm sources
+     and the similarity steps are rejected and sent back as a repair, as is
+     any variant the (`#[non_exhaustive]`) core grows later;
+   - a **row ceiling**: every `Limit` the model wrote, the caller's cap, and a
+     projection's `limit` are clamped to `ASK_MAX_LIMIT` (1 000), and a plan
+     that declares none gets the caller's cap (default `ASK_DEFAULT_LIMIT`,
+     100) appended. No plan runs unbounded; `limit: 0` means the ceiling.
+   Both constants and `ASK_DEFAULT_ATTEMPTS` (20 model turns) are public so
+   the RPC and MCP surfaces validate requests against the same numbers.

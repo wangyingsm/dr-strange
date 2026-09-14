@@ -17,30 +17,53 @@
 
 use anyhow::{Result, bail};
 use dr_strange_core::{
-    CatalogSnapshot, EdgeRecord, LogicalPlan, Metric, NodeRecord, PlaneHandle, PropValue, Step,
+    CatalogSnapshot, EdgeRecord, LogicalPlan, Metric, NodeRecord, PlaneHandle, PropValue, Source,
+    Step,
 };
 use serde::Serialize;
 
 use crate::provider::{Chat, Embedder};
 
+/// Model turns an [`ask`] gets by default — tool calls, decomposition and
+/// repairs included. Twenty because the tool loop spends a turn per
+/// sub-question on `find_edge` and another on `find_entity` before it ever
+/// plans; a compound question needs most of them.
+pub const ASK_DEFAULT_ATTEMPTS: u32 = 20;
+
+/// The `Limit` appended to a plan that declares none, by default.
+pub const ASK_DEFAULT_LIMIT: u64 = 100;
+
+/// The most rows any plan run by [`ask`] may return, whatever the model or
+/// the caller asked for. A model-emitted `Limit`, the caller's
+/// [`AskOptions::limit`], and a projection's `limit` are all clamped to it.
+///
+/// A hard ceiling rather than a default because the plan is the model's: a
+/// document can talk a model into `{"Limit": 1000000000000}`, and `ask` is
+/// reachable from the Read tier of the RPC surface. A thousand rows is far
+/// past what a natural-language answer is read for; anything larger is a
+/// Cypher query.
+pub const ASK_MAX_LIMIT: u64 = 1_000;
+
 /// Knobs for [`ask`].
 #[derive(Debug, Clone, Copy)]
 pub struct AskOptions {
-    /// Total model turns, including tool calls and repairs (default 6).
+    /// Total model turns, including tool calls and repairs (default
+    /// [`ASK_DEFAULT_ATTEMPTS`]).
     pub max_attempts: u32,
     /// Validate + return the plan without executing it.
     pub dry_run: bool,
     /// A safety cap appended as a final `Limit` when the plan has none
-    /// (default 100; 0 disables).
+    /// (default [`ASK_DEFAULT_LIMIT`]). Clamped to [`ASK_MAX_LIMIT`]; `0`
+    /// asks for the maximum, not for no limit — there is no unbounded plan.
     pub limit: u64,
 }
 
 impl Default for AskOptions {
     fn default() -> Self {
         Self {
-            max_attempts: 20,
+            max_attempts: ASK_DEFAULT_ATTEMPTS,
             dry_run: false,
-            limit: 100,
+            limit: ASK_DEFAULT_LIMIT,
         }
     }
 }
@@ -168,8 +191,18 @@ pub fn ask(
         // object, or {"plans": [ … ]} for a compound question.
         match parse_plans(&json) {
             Ok(mut plans) if !plans.is_empty() => {
+                // The grammar first: a plan outside it is sent back as a
+                // repair, exactly like one that fails to run.
+                if let Err(e) = plans.iter().try_for_each(check_read_only) {
+                    last_err = format!("{e}");
+                    trace.push(format!("plan rejected: {last_err}"));
+                    transcript.push_str(&format!(
+                        "\n\nYour previous answer:\n{json}\nIt failed — {last_err}\nTry again."
+                    ));
+                    continue;
+                }
                 for p in &mut plans {
-                    ensure_limit(p, opts.limit);
+                    bound_limits(p, opts.limit);
                 }
                 // Require a find_edge per sub-question first, so the model saw
                 // the ranked candidates (and every fitting edge) instead of
@@ -423,13 +456,74 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 // ---- plan helpers ---------------------------------------------------------
 
-/// Append a final `Limit` cap when the plan declares none.
-fn ensure_limit(plan: &mut LogicalPlan, limit: u64) {
-    if limit == 0 {
-        return;
+/// The plan grammar `ask` runs — the one its prompt teaches, and nothing the
+/// prompt does not.
+///
+/// Every variant of [`Source`] and [`Step`] is read-only: the algebra has no
+/// mutation, which is what makes `ask` safe by construction (arch/07 §3.3).
+/// This check exists for the other half of the promise. Both enums are
+/// `#[non_exhaustive]`, so the core may grow a variant this loop has never
+/// heard of, and a model can already emit the ones the prompt forbids: a
+/// `VectorTopK` with an invented query vector, an `Algo` that runs PageRank
+/// over the whole plane on a Read-tier RPC call, an `ExpandBeam` nobody asked
+/// for. An allowlist rejects all of those today and whatever arrives
+/// tomorrow, and the rejection goes back to the model as a repair.
+fn check_read_only(plan: &LogicalPlan) -> Result<()> {
+    let source_ok = matches!(
+        plan.source,
+        Source::ScanAll | Source::ScanLabel(_) | Source::SeekIds(_) | Source::SeekKeys(_)
+    );
+    if !source_ok {
+        bail!(
+            "the plan's source is not one of ScanAll, ScanLabel or SeekKeys — \
+             vector, keyword, hybrid and algorithm sources are not available here"
+        );
     }
-    if !plan.steps.iter().any(|s| matches!(s, Step::Limit(_))) {
-        plan.push(Step::Limit(limit));
+    for step in &plan.steps {
+        let ok = matches!(
+            step,
+            Step::Expand { .. }
+                | Step::ExpandVar { .. }
+                | Step::Filter(_)
+                | Step::Skip(_)
+                | Step::Limit(_)
+                | Step::Distinct
+                | Step::Sort(_)
+        );
+        if !ok {
+            bail!(
+                "the plan uses a step outside Expand, ExpandVar, Filter, Distinct, Sort, Skip \
+                 and Limit — vector and similarity operators are not available here"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Bound what a plan may return: every `Limit` the model wrote — as a step or
+/// on a projection — is clamped to [`ASK_MAX_LIMIT`], and a plan that
+/// declares none gets `requested` appended, clamped the same way (`0` means
+/// the maximum). No plan leaves here unbounded.
+fn bound_limits(plan: &mut LogicalPlan, requested: u64) {
+    let mut declared = false;
+    for step in &mut plan.steps {
+        if let Step::Limit(n) = step {
+            *n = (*n).min(ASK_MAX_LIMIT);
+            declared = true;
+        }
+    }
+    if let Some(p) = &mut plan.project
+        && let Some(n) = &mut p.limit
+    {
+        *n = (*n).min(ASK_MAX_LIMIT);
+    }
+    if !declared {
+        let cap = if requested == 0 {
+            ASK_MAX_LIMIT
+        } else {
+            requested.min(ASK_MAX_LIMIT)
+        };
+        plan.push(Step::Limit(cap));
     }
 }
 
@@ -779,7 +873,89 @@ mod tests {
         let res = ask(&chat, None, &plane, "recent papers", &opts).unwrap();
         assert!(!res.ran && res.nodes.is_empty());
         assert_eq!(res.plans.len(), 1);
-        assert!(matches!(res.plans[0].steps.last(), Some(Step::Limit(100))));
+        assert!(matches!(
+            res.plans[0].steps.last(),
+            Some(Step::Limit(ASK_DEFAULT_LIMIT))
+        ));
+    }
+
+    /// The plan is the model's, and a document can talk a model into
+    /// `Limit(10^12)`. Whatever the model or the caller asks for, no plan
+    /// leaves `ask` able to return more than [`ASK_MAX_LIMIT`] rows — and
+    /// `limit: 0` now means the ceiling, not "no ceiling".
+    #[test]
+    fn every_limit_is_clamped_and_no_plan_is_unbounded() {
+        let db = seeded();
+        let plane = db.plane("startup").unwrap();
+        let dry = |plan: &str, limit: u64| {
+            let chat = MockProvider::new(vec![plan.to_string()], 4);
+            let opts = AskOptions {
+                dry_run: true,
+                limit,
+                ..Default::default()
+            };
+            ask(&chat, None, &plane, "q", &opts)
+                .unwrap()
+                .plans
+                .remove(0)
+        };
+        // A model-emitted limit is clamped in place, not appended to.
+        let huge = r#"{"source":"ScanAll","steps":[{"Limit":1000000000000}]}"#;
+        let plan = dry(huge, 100);
+        assert_eq!(plan.steps, vec![Step::Limit(ASK_MAX_LIMIT)]);
+        // A modest one is the model's to choose.
+        let plan = dry(r#"{"source":"ScanAll","steps":[{"Limit":5}]}"#, 100);
+        assert_eq!(plan.steps, vec![Step::Limit(5)]);
+        // The caller's cap is clamped too, and zero is the ceiling.
+        let plan = dry(PLAN_2020, 5_000);
+        assert!(matches!(
+            plan.steps.last(),
+            Some(Step::Limit(ASK_MAX_LIMIT))
+        ));
+        let plan = dry(PLAN_2020, 0);
+        assert!(matches!(
+            plan.steps.last(),
+            Some(Step::Limit(ASK_MAX_LIMIT))
+        ));
+        // A projection's own limit is bounded the same way.
+        let projected = r#"{"source":"ScanAll","steps":[],
+            "project":{"items":[],"distinct":false,"order_by":[],"skip":null,"limit":99999}}"#;
+        let plan = dry(projected, 100);
+        assert_eq!(plan.project.unwrap().limit, Some(ASK_MAX_LIMIT));
+    }
+
+    /// The prompt forbids vector, keyword and algorithm sources and the
+    /// similarity steps; a model that emits one anyway is sent back to try
+    /// again rather than run — PageRank over the plane is not an answer to a
+    /// question, and on a shared server it is a cost anyone with Read can
+    /// impose.
+    #[test]
+    fn a_plan_outside_the_grammar_is_rejected_and_repaired() {
+        let db = seeded();
+        let plane = db.plane("startup").unwrap();
+        let algo = r#"{"source":{"Algo":{"label":null,"algo":{"PageRank":{"damping":0.85,"max_iters":20,"tolerance":0.001}}}},"steps":[]}"#;
+        let keyword = r#"{"source":{"KeywordTopK":{"label":"Paper","property":"title","query":"x","k":5}},"steps":[]}"#;
+        let beam = r#"{"source":"ScanAll","steps":[{"FrontierTopK":{"property":"embedding","query":[0.1],"metric":"Cosine","k":5}}]}"#;
+        let chat = MockProvider::new(
+            vec![
+                algo.to_string(),
+                keyword.to_string(),
+                beam.to_string(),
+                PLAN_2020.to_string(),
+            ],
+            4,
+        );
+        let res = ask(&chat, None, &plane, "recent papers", &AskOptions::default()).unwrap();
+        assert_eq!(res.attempts, 4, "three rejections, then the plan");
+        assert_eq!(res.nodes.len(), 2);
+        assert_eq!(
+            res.trace.iter().filter(|t| t.contains("rejected")).count(),
+            3,
+            "{:?}",
+            res.trace
+        );
+        // Nothing outside the grammar ever ran or was returned.
+        assert!(res.plans.iter().all(|p| check_read_only(p).is_ok()));
     }
 
     #[test]

@@ -22,7 +22,7 @@ mod reconcile;
 mod refine;
 mod vectorize;
 
-pub use ask::{AskOptions, AskResult, ask};
+pub use ask::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT, AskOptions, AskResult, ask};
 pub use digest::{
     ApplyStats, CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport,
     DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, embeddable_text,
