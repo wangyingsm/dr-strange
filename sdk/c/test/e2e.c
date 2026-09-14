@@ -329,9 +329,11 @@ int main(void) {
 
     /* Hostile peer (test/fake_ws.py): a frame header claiming 2^40 bytes must
      * be refused with a typed error rather than allocated; a 101 whose
-     * Sec-WebSocket-Accept is wrong must not be trusted; a token with URL
-     * metacharacters must arrive percent-encoded (the fake answers 400 to any
-     * other spelling, so the watch only ends cleanly when it was escaped). */
+     * Sec-WebSocket-Accept is wrong must not be trusted; the token must ride
+     * the upgrade as an Authorization: Bearer header, verbatim, with nothing
+     * in the URL (the fake answers 400 to a query string or any other
+     * spelling, so the watch only ends cleanly when the header was right);
+     * a token that could end the header line is refused before any I/O. */
     if (getenv("DRSG_FAKE_URL")) {
         drsg_error ferr;
         int rc = fake_watch("big", &ferr);
@@ -345,10 +347,15 @@ int main(void) {
               "forged handshake: Sec-WebSocket-Accept mismatch is rejected");
 
         rc = fake_watch("a&b=c#d", &ferr);
-        CHECK(rc == 0, "token with URL metacharacters is percent-encoded");
+        CHECK(rc == 0, "token rides the upgrade as a bearer header, not the URL");
         if (rc != 0) {
             fprintf(stderr, "  (fake peer said: %s)\n", ferr.message);
         }
+
+        rc = fake_watch("x\r\nX-Forged: 1", &ferr);
+        CHECK(rc == -1 && ferr.code == DRSG_TRANSPORT_ERROR_CODE
+                  && strstr(ferr.message, "control character") != NULL,
+              "token with a control character is refused before the handshake");
     } else {
         CHECK(0, "DRSG_FAKE_URL not set (run via test/run.sh)");
     }

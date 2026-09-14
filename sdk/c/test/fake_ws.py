@@ -3,27 +3,26 @@
 
 The real `drsg serve` is well-behaved, so the client's defences against a
 hostile or broken peer cannot be exercised against it. This server picks a
-script from the `?token=` query:
+script from the `Authorization: Bearer` header of the upgrade:
 
   big         valid handshake, then a frame whose header claims 2^40 bytes
   bad-accept  a 101 whose Sec-WebSocket-Accept does not match the key
-  a&b=c#d     must arrive as `token=a%26b%3Dc%23d`; then a valid handshake
-              and a clean close, so the client returns 0
+  a&b=c#d     must arrive verbatim in the header, with a bare `/ws` target;
+              then a valid handshake and a clean close, so the client returns 0
 
 On `big` it also refuses to play if the client's subscribe frame still uses
-the old fixed mask key, so the test fails if masking regresses. For the
-escaping check the decision is made on the raw request target *before* the
-upgrade: a target that names token `a` in any form other than the exact
-percent-encoded one (a raw `token=a&b=c#d` parses back to plain `a`, since
-`&` splits the query and `#` starts a fragment) is answered with `400 Bad
-Request`, which the client reports as "websocket upgrade refused" (-1). The
-e2e's `rc == 0` therefore only holds when the token really was escaped.
+the old fixed mask key, so the test fails if masking regresses. The header
+check is made on the raw request *before* the upgrade: a target carrying any
+query string (the old `?token=` form, which the server keeps only for
+browsers — arch/08-web-ui §4.1), or a header that does not spell the token
+exactly, is answered with `400 Bad Request`, which the client reports as
+"websocket upgrade refused" (-1). The e2e's `rc == 0` therefore only holds
+when the token really travelled as a header and nowhere else.
 """
 import base64
 import hashlib
 import socket
 import sys
-import urllib.parse
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 OLD_FIXED_MASK = bytes([0x37, 0xFA, 0x21, 0x3D])
@@ -65,17 +64,19 @@ def serve_one(conn):
         return
     request_line = head.split(b"\r\n", 1)[0].decode()
     target = request_line.split(" ")[1]
-    query = urllib.parse.urlparse(target).query
-    token = urllib.parse.parse_qs(query).get("token", [""])[0]
     key = b""
+    token = ""
     for line in head.split(b"\r\n")[1:]:
         name, _, value = line.partition(b":")
         if name.strip().lower() == b"sec-websocket-key":
             key = value.strip()
-    raw_query = target.partition("?")[2]
-    if raw_query.startswith("token=a") and raw_query != "token=a%26b%3Dc%23d":
-        # Unescaped (or differently escaped) metacharacter token: refuse
-        # before upgrading so drsg_watch fails instead of ending cleanly.
+        elif name.strip().lower() == b"authorization":
+            token = value.strip().decode()
+            token = token[len("Bearer "):] if token.startswith("Bearer ") else ""
+    if target != "/ws" or token.startswith("a") and token != "a&b=c#d":
+        # A credential in the URL, or a metacharacter token that did not
+        # arrive verbatim in the header: refuse before upgrading so drsg_watch
+        # fails instead of ending cleanly.
         conn.sendall(
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
             b"Connection: close\r\n\r\n"

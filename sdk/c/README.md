@@ -85,8 +85,9 @@ drsg_watch_ctl_free(ctl);            /* after the watch has returned */
 ```
 
 The client checks the server's `Sec-WebSocket-Accept`, masks every frame with
-a fresh key, percent-encodes the token in the `?token=` query, and refuses any
-message larger than `DRSG_WS_MAX_MESSAGE_BYTES` (64 MiB) before allocating for
+a fresh key, sends the token as an `Authorization: Bearer` header on the
+upgrade (never in the URL; a token holding a control character is refused
+before any I/O), and refuses any message larger than `DRSG_WS_MAX_MESSAGE_BYTES` (64 MiB) before allocating for
 it; each of those failures ends the watch with `-1` and
 `err.code == DRSG_TRANSPORT_ERROR_CODE` (`-32000`) and a message that says why.
 

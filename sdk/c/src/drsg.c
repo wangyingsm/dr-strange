@@ -594,19 +594,21 @@ static int ws_connect(const char *base_url, const char *token, struct ws_rd *rd,
         return set_err(err, -32000, "connection failed");
     }
 
-    /* The token rides the query string (browsers cannot set headers on a
-     * WebSocket, so the server accepts it there); percent-encode it so a token
-     * containing '&', '#' or '%' cannot rewrite the request line. */
-    char *escaped = NULL;
+    /* The token is an `Authorization: Bearer` header on the upgrade, the form
+     * the server prefers (arch/08-web-ui §4.1); `?token=` exists only for
+     * browsers, whose WebSocket API cannot set headers, and a URL credential
+     * would end up in proxy and access logs. A header is written verbatim, so
+     * a token carrying a control byte (CR, LF) could end the header line and
+     * forge another; refuse it here rather than send a malformed request. */
     if (token && token[0]) {
-        /* NULL handle: libcurl does not use it for escaping, and this keeps
-         * the watch thread off the client's one easy handle, which another
-         * thread may be using for RPCs (drsg.h documents that contract). */
-        escaped = curl_easy_escape(NULL, token, 0);
-        if (!escaped) {
-            close(fd);
-            return set_err(err, -32000, "out of memory");
+        for (const unsigned char *p = (const unsigned char *)token; *p; p++) {
+            if (*p < 0x20 || *p == 0x7f) {
+                close(fd);
+                return set_err(err, -32000, "token contains a control character");
+            }
         }
+    } else {
+        token = NULL;
     }
 
     /* A fresh 16-byte nonce per handshake (RFC 6455 §4.1); the server must
@@ -624,22 +626,22 @@ static int ws_connect(const char *base_url, const char *token, struct ws_rd *rd,
     char expect[29];
     base64_encode(digest, sizeof digest, expect);
 
-    size_t req_cap = 512 + (escaped ? strlen(escaped) : 0) + strlen(host) + strlen(port);
+    size_t req_cap = 512 + (token ? strlen(token) : 0) + strlen(host) + strlen(port);
     char *req = malloc(req_cap);
     if (!req) {
-        curl_free(escaped);
         close(fd);
         return set_err(err, -32000, "out of memory");
     }
     int rn = snprintf(req, req_cap,
-                      "GET /ws%s%s HTTP/1.1\r\n"
+                      "GET /ws HTTP/1.1\r\n"
                       "Host: %s:%s\r\n"
+                      "%s%s%s"
                       "Upgrade: websocket\r\n"
                       "Connection: Upgrade\r\n"
                       "Sec-WebSocket-Key: %s\r\n"
                       "Sec-WebSocket-Version: 13\r\n\r\n",
-                      escaped ? "?token=" : "", escaped ? escaped : "", host, port, key);
-    curl_free(escaped);
+                      host, port, token ? "Authorization: Bearer " : "", token ? token : "",
+                      token ? "\r\n" : "", key);
     int sent = rn < 0 || rn >= (int)req_cap ? -1 : (int)send(fd, req, (size_t)rn, MSG_NOSIGNAL);
     free(req);
     if (sent != rn) {
