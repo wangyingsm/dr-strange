@@ -25,7 +25,9 @@ Dr Strange 提供**六种语言**的客户端库：TypeScript、Python、Go、Ja
 ## 连接与调用
 
 客户端由一个基地址与一个令牌构造；令牌默认取自 `DRSG_TOKEN` 环境变量，并以
-`Authorization: Bearer` 凭据的形式随每个请求一同发送。方法名与 RPC 方法一一对应，
+`Authorization: Bearer` 凭据的形式随每个请求（包括变更流背后的 WebSocket 升级请求）
+一同发送，绝不放在 URL 中。（只有在浏览器里，TypeScript 客户端才会在套接字上回退到
+`?token=`，因为浏览器的 WebSocket API 无法设置请求头。）方法名与 RPC 方法一一对应，
 并适配各语言的命名习惯：
 
 | 语言 | 构造客户端 | 调用示例 |

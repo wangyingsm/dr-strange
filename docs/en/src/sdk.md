@@ -28,8 +28,10 @@ Each directory's `README.md` gives the exact steps for its language.
 ## Connecting and calling
 
 A client is constructed from a base URL and a token; the token defaults to the
-`DRSG_TOKEN` environment variable and rides each request as an
-`Authorization: Bearer` credential. Method names mirror the RPC method one to
+`DRSG_TOKEN` environment variable and rides each request — the WebSocket
+upgrade behind the change feed included — as an `Authorization: Bearer`
+credential, never in a URL. (The TypeScript client falls back to `?token=` on
+the socket only in a browser, whose WebSocket API cannot set headers.) Method names mirror the RPC method one to
 one, adapted to each language's convention:
 
 | Language | Construct a client | Example call |
