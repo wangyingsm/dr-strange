@@ -102,6 +102,20 @@ Builder methods mirror plan operators one-to-one (`ScanLabel`, `Expand*`,
 builder is a thin, type-checked plan constructor, not a DSL with its own
 semantics. The v2 query language compiles to the same plans.
 
+Time travel: `plane.as_of(AsOf::Seq(s) | AsOf::Time(ms))?` returns a handle
+whose every read is pinned to that snapshot (native backend only). The
+vector and keyword registries are not versioned — they describe the latest
+commit — so index-backed terminals are answered from the snapshot instead:
+vector searches brute-force the pinned records (exact, unindexed) and keyword
+searches take the live BM25 postings, over-fetch, and keep only nodes the
+snapshot holds under the searched label. A historical keyword or hybrid
+result therefore never names a node created, deleted or relabelled after the
+pinned point, but carries the live index's scores and may hold fewer than `k`
+rows. The same filter runs on live reads: a writer publishes its KV commit
+before it updates the registries, so an index can briefly name a node the
+snapshot cannot decode; the reader drops such ids rather than surfacing a
+phantom row (02 §3).
+
 Row values: `Row` exposes bound variables by name → `NodeRef`/`EdgeRef` with
 `id()`, `labels()`, `prop(key)`, `prop_desc(key)` (value + description),
 `score()`.
