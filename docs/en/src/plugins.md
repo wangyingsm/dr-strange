@@ -64,7 +64,10 @@ under the digested root, *sorted* — unsorted directory order would vary the
 output between runs, and re-ingesting a tree is meant to yield the same graph.
 `read` returns one file's bytes, refusing any path that resolves outside the
 root (the check is on the resolved path, so `..` and symlinks do not walk
-through it). `label` names the input when its contents cannot.
+through it) — and any path inside it that `%list` would not have named: the
+same `.gitignore`, dotfile and build-directory rules apply to both, so a
+plugin cannot read a `.env` or an ignored credentials file just by asking for
+it. `label` names the input when its contents cannot.
 
 A plugin's `output` is nodes, edges, prose, and a **report** — counts of facts,
 prose characters, and skipped inputs, plus notes in words for whatever could
