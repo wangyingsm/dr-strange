@@ -323,6 +323,56 @@ fn the_host_refuses_to_read_outside_its_root() {
     );
 }
 
+/// `read` and `list` answer the same question. A plugin used to be able to
+/// read what the listing withheld — `.env` above all — because `read` checked
+/// only the root and `list` alone applied the ignore policy; the listing was
+/// a suggestion. Now a path the policy hides is refused however it is spelt,
+/// and only a host that hides nothing (the history reader's, over `.git`)
+/// answers for a dotfile.
+#[test]
+fn the_host_will_not_read_what_it_would_not_list() {
+    let t = Tree::new("read-policy");
+    t.write(".env", "API_KEY=sk-secret")
+        .write(".gitignore", "credentials.json\n")
+        .write("credentials.json", "{\"token\":\"t\"}")
+        .write("target/debug/out.txt", "derived")
+        .write("src/lib.rs", "pub fn a() {}");
+    let host = t.host();
+
+    // A hostile plugin does not call `list` first; `read` must still know.
+    for hidden in [".env", "credentials.json", "target/debug/out.txt"] {
+        assert!(host.read(hidden).is_err(), "{hidden} must be refused");
+    }
+    let msg = host
+        .read(".env")
+        .expect_err(".env must be refused")
+        .to_string();
+    assert!(msg.contains("ignore policy"), "{msg}");
+    // Spelling does not get around it: the check is on the resolved path.
+    assert!(host.read("./src/../.env").is_err());
+    assert!(host.read("src/./../credentials.json").is_err());
+    // What the listing names is readable, and so spelt oddly.
+    assert_eq!(host.read("src/lib.rs").unwrap(), b"pub fn a() {}");
+    assert!(host.read("./src/../src/lib.rs").is_ok());
+    assert!(!host.list("").unwrap().iter().any(|p| p.contains(".env")));
+
+    // A host that hides nothing reads everything under its root — the
+    // history reader depends on it — and still only regular files.
+    let open = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            gitignore: false,
+            dockerignore: false,
+            hidden: false,
+            builtin_dirs: false,
+            extra: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(open.read(".env").unwrap(), b"API_KEY=sk-secret");
+    assert!(open.read("src").is_err(), "a directory is not a file");
+}
+
 // ---- sync (watch mode) ----------------------------------------------------
 
 use dr_strange_core::Properties;

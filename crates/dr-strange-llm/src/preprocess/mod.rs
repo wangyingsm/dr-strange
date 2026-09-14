@@ -53,7 +53,9 @@ mod wasm;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use ahash::AHashSet;
 use anyhow::{Context, Result, bail};
 use dr_strange_core::{PropDesc, PropValue};
 use ignore::WalkBuilder;
@@ -233,6 +235,14 @@ pub trait Host: Sync {
     /// repository is supposed to yield the same graph.
     fn list(&self, suffix: &str) -> Result<Vec<String>>;
 
+    /// One file's bytes — and only a file [`list`](Self::list) would name.
+    ///
+    /// The two answer the same question. A path outside the root is refused,
+    /// and so is a path inside it that the host's ignore policy hides: a
+    /// `.env`, a `.gitignore`d credentials file, a build directory. Those are
+    /// exactly what a project's own ignore files exist to keep out of a
+    /// reader's hands, and a plugin that could `read` what `list` withheld
+    /// would make the listing a suggestion rather than the grant.
     fn read(&self, path: &str) -> Result<Vec<u8>>;
 
     /// What to call the thing being read, when its own contents do not say.
@@ -309,11 +319,34 @@ impl Default for IgnorePolicy {
     }
 }
 
+impl IgnorePolicy {
+    /// Whether this policy withholds anything at all. One that does not —
+    /// the history reader's, rooted at a `.git` directory — makes every
+    /// regular file under the root readable, and the walk that would say so
+    /// is not worth taking.
+    fn filters(&self) -> bool {
+        self.gitignore
+            || self.dockerignore
+            || self.hidden
+            || self.builtin_dirs
+            || !self.extra.is_empty()
+    }
+}
+
 /// A [`Host`] over one directory on disk, refusing to answer for anything
-/// outside it.
+/// outside it — or anything inside it the ignore policy hides.
 pub struct LocalFiles {
     root: PathBuf,
     policy: IgnorePolicy,
+    /// The files the policy admits, root-relative, as the most recent walk
+    /// saw the tree. `read` checks against this rather than re-deriving the
+    /// policy per path: the `ignore` crate's precedence between nested
+    /// ignore files, negations, overrides and hidden ancestors is exactly
+    /// what a hand-rolled per-path check gets subtly wrong, and the walk is
+    /// the one implementation of it this crate has. Filled by every `list`
+    /// — routing lists before any plugin reads, so the common case costs
+    /// nothing extra — and by the first `read` otherwise. `None` until then.
+    readable: Mutex<Option<Arc<AHashSet<PathBuf>>>>,
 }
 
 impl LocalFiles {
@@ -326,44 +359,21 @@ impl LocalFiles {
         let root = root
             .canonicalize()
             .with_context(|| format!("resolving {}", root.display()))?;
-        Ok(Self { root, policy })
+        Ok(Self {
+            root,
+            policy,
+            readable: Mutex::new(None),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Resolve `rel` inside the root, or refuse.
-    ///
-    /// The check is on the *resolved* path rather than the string, because `..`
-    /// segments and symlinks both walk straight through a textual one. This is
-    /// the line between "the plugin reads the repository it was pointed at" and
-    /// "the plugin reads the filesystem".
-    fn resolve(&self, rel: &str) -> Result<PathBuf> {
-        let resolved = self
-            .root
-            .join(rel)
-            .canonicalize()
-            .with_context(|| format!("resolving {rel}"))?;
-        if !resolved.starts_with(&self.root) {
-            bail!("{rel} is outside the directory this preprocessor was given");
-        }
-        Ok(resolved)
-    }
-}
-
-impl Host for LocalFiles {
-    /// The directory's own name — or its parent's, when it is the `src` of
-    /// something, since `src` names nothing and the directory holding it does.
-    fn label(&self) -> Option<String> {
-        let name = |p: &Path| p.file_name()?.to_str().map(str::to_string);
-        match name(&self.root).as_deref() {
-            Some("src") => name(self.root.parent()?).or_else(|| name(&self.root)),
-            _ => name(&self.root),
-        }
-    }
-
-    fn list(&self, suffix: &str) -> Result<Vec<String>> {
+    /// Every regular file under the root the policy admits, root-relative,
+    /// in the walker's sorted order — the one walk both `list` and `read`
+    /// are answered from.
+    fn walk(&self) -> Result<Vec<PathBuf>> {
         let p = &self.policy;
         let mut builder = WalkBuilder::new(&self.root);
         builder
@@ -403,19 +413,99 @@ impl Host for LocalFiles {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(&self.root) else {
-                continue;
-            };
-            let rel = rel.to_string_lossy().into_owned();
-            if suffix.is_empty() || rel.ends_with(suffix) {
-                out.push(rel);
+            if let Ok(rel) = entry.path().strip_prefix(&self.root) {
+                out.push(rel.to_path_buf());
             }
         }
         Ok(out)
     }
 
+    /// Remember what the walk admitted, for `read` to check against.
+    fn remember(&self, files: &[PathBuf]) -> Arc<AHashSet<PathBuf>> {
+        let set = Arc::new(files.iter().cloned().collect::<AHashSet<_>>());
+        *self.readable.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&set));
+        set
+    }
+
+    /// The admitted set, walking for it if no `list` has yet.
+    fn readable(&self) -> Result<Arc<AHashSet<PathBuf>>> {
+        let known = self
+            .readable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match known {
+            Some(set) => Ok(set),
+            None => Ok(self.remember(&self.walk()?)),
+        }
+    }
+
+    /// Resolve `rel` inside the root, or refuse.
+    ///
+    /// The check is on the *resolved* path rather than the string, because `..`
+    /// segments and symlinks both walk straight through a textual one. This is
+    /// the line between "the plugin reads the repository it was pointed at" and
+    /// "the plugin reads the filesystem".
+    fn resolve(&self, rel: &str) -> Result<PathBuf> {
+        let resolved = self
+            .root
+            .join(rel)
+            .canonicalize()
+            .with_context(|| format!("resolving {rel}"))?;
+        if !resolved.starts_with(&self.root) {
+            bail!("{rel} is outside the directory this preprocessor was given");
+        }
+        Ok(resolved)
+    }
+}
+
+impl Host for LocalFiles {
+    /// The directory's own name — or its parent's, when it is the `src` of
+    /// something, since `src` names nothing and the directory holding it does.
+    fn label(&self) -> Option<String> {
+        let name = |p: &Path| p.file_name()?.to_str().map(str::to_string);
+        match name(&self.root).as_deref() {
+            Some("src") => name(self.root.parent()?).or_else(|| name(&self.root)),
+            _ => name(&self.root),
+        }
+    }
+
+    fn list(&self, suffix: &str) -> Result<Vec<String>> {
+        let files = self.walk()?;
+        // Every `list` refreshes what `read` may answer: a watch fold lists
+        // the tree before it routes, so a host that outlives one fold still
+        // reads each fold's tree and not the first one's.
+        if self.policy.filters() {
+            self.remember(&files);
+        }
+        Ok(files
+            .iter()
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .filter(|rel| suffix.is_empty() || rel.ends_with(suffix))
+            .collect())
+    }
+
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        std::fs::read(self.resolve(path)?).with_context(|| format!("reading {path}"))
+        let resolved = self.resolve(path)?;
+        // A regular file or nothing: a FIFO would block the read — and the
+        // sandbox with it, since no deadline reaches a host call — and a
+        // directory or device is not a file a plugin was promised.
+        let meta = std::fs::metadata(&resolved).with_context(|| format!("reading {path}"))?;
+        if !meta.is_file() {
+            bail!("{path} is not a regular file");
+        }
+        // Checked on the resolved path, like the root itself: `./a/../.env`
+        // and a symlink to an ignored file both resolve to what they name.
+        if self.policy.filters() {
+            let rel = resolved.strip_prefix(&self.root).unwrap_or(&resolved);
+            if !self.readable()?.contains(rel) {
+                bail!(
+                    "{path} is not a file this preprocessor may read — the ignore policy \
+                     hides it, so `list` never named it"
+                );
+            }
+        }
+        std::fs::read(&resolved).with_context(|| format!("reading {path}"))
     }
 }
 
