@@ -1,6 +1,7 @@
 // Minimal JSON-RPC 2.0 client for the drsg web backend (arch/08 §1).
 
 import { bearerHeaders, forgetToken, rememberToken, resolveToken, shouldPrompt, wsUrl } from './auth.js'
+import { chunk, pairBatch } from './batch.js'
 
 let nextId = 1
 
@@ -73,6 +74,42 @@ export async function rpc(method, params = undefined) {
     if (!msg.error) return msg.result
     if (attempt === 0 && shouldPrompt(source, msg.error.code) && (await login())) continue
     throw new Error(`${msg.error.message} (code ${msg.error.code})`)
+  }
+}
+
+/**
+ * Call many methods in JSON-RPC batches, at most `MAX_BATCH` a request and one
+ * request in flight at a time. `calls` is `[{ method, params }]`; the answer
+ * is one `{ result }` or `{ error }` per call, in the same order — a failed
+ * call does not reject the rest, since the caller of a batch usually wants
+ * whatever came back and a count of what did not.
+ *
+ * One request at a time is deliberate: a batch is already the server doing
+ * many things for one round trip, and a frontier of three hundred nodes fired
+ * as three hundred connections was what this replaces.
+ */
+export async function rpcBatch(calls) {
+  const out = []
+  for (const run of chunk(calls)) {
+    const requests = run.map(({ method, params }) => ({ jsonrpc: '2.0', method, params, id: nextId++ }))
+    out.push(...pairBatch(requests, await postBatch(requests)))
+  }
+  return out
+}
+
+/** POST one batch; on a refused token, ask once and retry, as `rpc` does. */
+async function postBatch(requests) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch('/rpc', {
+      method: 'POST',
+      headers: authHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify(requests),
+    })
+    const msg = await res.json()
+    // A whole-batch refusal (unauthorized, too large) is a single error object.
+    const code = !Array.isArray(msg) && msg?.error ? msg.error.code : null
+    if (code != null && attempt === 0 && shouldPrompt(source, code) && (await login())) continue
+    return msg
   }
 }
 

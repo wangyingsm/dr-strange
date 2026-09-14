@@ -90,6 +90,13 @@ the **skeleton** and lets you ask for the rest.
   around it in arcs by label, so a ring reads as regions rather than a smear.
 - **Importance opens the layout.** Edges touching a well-connected node are
   laid out longer, so a busy neighbourhood has room to be read.
+- **A large layout runs off the main thread.** Past 400 nodes — *Show all*
+  on a real plane — the force layout runs in a web worker for a bounded few
+  seconds while the page stays responsive; the picture converges in view and
+  settles when the run ends.
+- **Expand one hop is batched.** Growing the frontier asks for at most 300
+  nodes a click, in JSON-RPC batches of 64, and says how many were left for
+  a second click and how many calls failed.
 - **Selection focuses.** The selection and its immediate neighbours stay at
   full strength, the next ring dims, and everything beyond recedes and drops
   its label. Selecting an **edge** focuses both of its endpoints, since an edge
