@@ -285,14 +285,13 @@ impl FailedAuthLimiter {
     /// caused it.
     fn make_room(peers: &mut AHashMap<IpAddr, Strikes>, now: Instant) {
         peers.retain(|_, s| now.duration_since(s.last_seen) < FORGET_AFTER);
-        if peers.len() >= TRACKED_PEERS {
-            if let Some(oldest) = peers
+        if peers.len() >= TRACKED_PEERS
+            && let Some(oldest) = peers
                 .iter()
                 .min_by_key(|(_, s)| s.last_seen)
                 .map(|(ip, _)| *ip)
-            {
-                peers.remove(&oldest);
-            }
+        {
+            peers.remove(&oldest);
         }
     }
 
