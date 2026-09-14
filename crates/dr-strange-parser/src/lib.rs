@@ -50,7 +50,8 @@
 //!   each optionally `DISTINCT`, grouped by every column that isn't one.
 //! - `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n` — steps over node rows;
 //!   on the projection tail otherwise, where `ORDER BY` names a returned column
-//!   (by alias, or by the expression it returned).
+//!   (by alias, by the expression it returned, or by the aggregate it folds:
+//!   `ORDER BY count(*)`).
 //! - **`AS OF <seq|"RFC-3339"|TIME <ms>>`** — last clause; reads a past
 //!   snapshot (native backend). Not a plan node: it rides on [`ReadQuery`] for
 //!   the surface to apply with `PlaneHandle::as_of`.
@@ -74,9 +75,16 @@
 //!
 //! # Parameters
 //! `$name` placeholders in value positions (WHERE/ORDER literals, SET/CREATE/
-//! MERGE props) are resolved from a caller-supplied [`Params`] map via
-//! [`parse_statement_full`] — the SDK-safe way to pass values (no string
-//! interpolation).
+//! MERGE props, and a node's `key:`) are resolved from a caller-supplied
+//! [`Params`] map via [`parse_statement_full`] — the SDK-safe way to pass
+//! values (no string interpolation).
+//!
+//! # Lexical rules
+//! Keywords and function names are case-insensitive. Identifiers are Unicode
+//! words, or anything between backticks. Strings take either quote with the
+//! escapes `\'` `\"` `\\` `\n` `\t` `\r` `\b` `\f` `\uXXXX`; numbers are
+//! ints or floats (`1.5`, `1e9`). Expressions nest at most
+//! `parse::MAX_NESTING` levels; deeper is a syntax error, not a stack overflow.
 //!
 //! # Not yet (each is a clear error, never a silent mis-compile)
 //! - cross-variable predicates (`p.year < q.year`);
@@ -255,6 +263,12 @@ fn parse_statement_inner(
 
 fn describe(e: nom::Err<nom::error::Error<&str>>) -> String {
     match e {
+        // The one failure that is about the query's shape, not its text.
+        nom::Err::Failure(er) if er.code == nom::error::ErrorKind::TooLarge => format!(
+            "expression nested deeper than {} levels near `{}`",
+            parse::MAX_NESTING,
+            snippet(er.input.trim())
+        ),
         nom::Err::Error(er) | nom::Err::Failure(er) => {
             let at = er.input.trim();
             if at.is_empty() {

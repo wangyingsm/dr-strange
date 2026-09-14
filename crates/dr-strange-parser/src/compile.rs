@@ -316,12 +316,22 @@ fn compile_sort(
 ) -> Result<Vec<SortKey>, String> {
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        let SortTarget::Expr(e) = &key.target else {
-            return Err(format!(
-                "ORDER BY `{}`: a bare name orders by a RETURN alias, and this query \
-                 returns nodes rather than columns",
-                key.text
-            ));
+        let e = match &key.target {
+            SortTarget::Expr(e) => e,
+            SortTarget::Name(_) => {
+                return Err(format!(
+                    "ORDER BY `{}`: a bare name orders by a RETURN alias, and this query \
+                     returns nodes rather than columns",
+                    key.text
+                ));
+            }
+            SortTarget::Agg { .. } => {
+                return Err(format!(
+                    "ORDER BY `{}`: an aggregate orders a projection, and this query \
+                     returns nodes rather than columns (`RETURN n.name, {}`)",
+                    key.text, key.text
+                ));
+            }
         };
         for v in referenced_vars(e) {
             let slot = *var_slot
@@ -364,10 +374,34 @@ fn order_columns(
         let column = match (by_name, &key.target) {
             (Some(i), _) => i,
             (None, SortTarget::Expr(e)) => {
-                let compiled = compile_expr(e, embedder, params, scope)?;
+                let compiled = ProjExpr::Value(compile_expr(e, embedder, params, scope)?);
                 items
                     .iter()
-                    .position(|c| c.expr == ProjExpr::Value(compiled.clone()))
+                    .position(|c| c.expr == compiled)
+                    .ok_or_else(|| unknown_column(&key.text, items))?
+            }
+            // `ORDER BY count(*)` when the column was aliased (or spelled
+            // `COUNT(*)`): the same fold is the same column.
+            (
+                None,
+                SortTarget::Agg {
+                    func,
+                    arg,
+                    distinct,
+                },
+            ) => {
+                let arg = arg
+                    .as_ref()
+                    .map(|e| compile_expr(e, embedder, params, scope))
+                    .transpose()?;
+                let compiled = ProjExpr::Agg(Agg {
+                    func: *func,
+                    arg,
+                    distinct: *distinct,
+                });
+                items
+                    .iter()
+                    .position(|c| c.expr == compiled)
                     .ok_or_else(|| unknown_column(&key.text, items))?
             }
             (None, SortTarget::Name(_)) => return Err(unknown_column(&key.text, items)),
@@ -549,9 +583,8 @@ fn compile_algo(c: &CallClause, params: &crate::Params) -> Result<Algo, String> 
                 damping: args.float("damping")?.unwrap_or(d.damping),
                 // `iterations` reads better in a query than the API's field name.
                 max_iters: args
-                    .int("iterations")?
-                    .or(args.int("max_iters")?)
-                    .map(|n| n as u32)
+                    .u32("iterations")?
+                    .or(args.u32("max_iters")?)
                     .unwrap_or(d.max_iters),
                 tolerance: args.float("tolerance")?.unwrap_or(d.tolerance),
             }
@@ -560,17 +593,20 @@ fn compile_algo(c: &CallClause, params: &crate::Params) -> Result<Algo, String> 
         "louvain" => {
             let d = LouvainOptions::default();
             Algo::Louvain {
-                max_levels: args
-                    .int("max_levels")?
-                    .map(|n| n as u32)
-                    .unwrap_or(d.max_levels),
+                max_levels: args.u32("max_levels")?.unwrap_or(d.max_levels),
                 min_gain: args.float("min_gain")?.unwrap_or(d.min_gain),
             }
         }
         "shortest_path" => Algo::ShortestPath {
             from: args.node_ref("from")?,
             to: args.node_ref("to")?,
-            dir: match args.string("dir")?.as_deref() {
+            // The direction is a keyword-like choice, so its case is free; the
+            // weight names a property, whose case is the user's.
+            dir: match args
+                .string("dir")?
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
                 None | Some("out") => Dir::Out,
                 Some("in") => Dir::In,
                 Some("both") => Dir::Both,
@@ -636,10 +672,22 @@ impl AlgoArgs {
         }
     }
 
+    /// A whole-number argument that must fit the option it sets: `1e12`
+    /// iterations is refused, not silently truncated to whatever its low
+    /// 32 bits spell.
+    fn u32(&mut self, name: &str) -> Result<Option<u32>, String> {
+        match self.int(name)? {
+            None => Ok(None),
+            Some(n) => u32::try_from(n)
+                .map(Some)
+                .map_err(|_| format!("`{name}` must be at most {}, got {n}", u32::MAX)),
+        }
+    }
+
     fn string(&mut self, name: &str) -> Result<Option<String>, String> {
         match self.take(name) {
             None => Ok(None),
-            Some(PropValue::Str(s)) => Ok(Some(s.to_ascii_lowercase())),
+            Some(PropValue::Str(s)) => Ok(Some(s)),
             Some(other) => Err(format!("`{name}` must be a string, got {other:?}")),
         }
     }

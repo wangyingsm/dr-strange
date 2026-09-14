@@ -2,10 +2,12 @@
 //! token (each `symbol`/`kw`/`ident`/number leads with `multispace0`), so the
 //! grammar rules read without threading whitespace explicitly.
 
+use std::cell::Cell;
+
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while};
-use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
+use nom::character::complete::{char, digit1, multispace0, one_of, satisfy};
 use nom::combinator::{consumed, cut, map, map_res, not, opt, recognize, value, verify};
 use nom::multi::{many0, many1, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
@@ -31,19 +33,82 @@ fn kw<'a>(word: &'static str) -> impl Fn(&'a str) -> IResult<&'a str, ()> {
     move |i: &'a str| {
         let (i, _) = multispace0(i)?;
         let (i, _) = tag_no_case(word)(i)?;
-        let (i, _) = not(alt((alphanumeric1, tag("_"))))(i)?;
+        let (i, _) = not(satisfy(is_ident_char))(i)?;
         Ok((i, ()))
     }
 }
 
-/// An identifier (variable / label / type / property key).
+/// Identifier characters are Unicode alphanumerics (plus `_`), not ASCII:
+/// a label named in Chinese or a property named `café` is an identifier too.
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// An identifier (variable / label / type / property key): a plain word, or
+/// anything at all between backticks (`` `order` ``, `` `has space` ``), the
+/// openCypher escape for names the plain form cannot spell.
 fn ident(i: &str) -> IResult<&str, String> {
     let (i, _) = multispace0(i)?;
-    let (i, s) = recognize(pair(
-        alt((alpha1, tag("_"))),
-        many0(alt((alphanumeric1, tag("_")))),
-    ))(i)?;
-    Ok((i, s.to_string()))
+    alt((
+        map(
+            recognize(pair(satisfy(is_ident_start), take_while(is_ident_char))),
+            str::to_string,
+        ),
+        map(
+            delimited(
+                char('`'),
+                verify(take_while(|c| c != '`'), |s: &str| !s.is_empty()),
+                char('`'),
+            ),
+            str::to_string,
+        ),
+    ))(i)
+}
+
+// ---- nesting depth ----------------------------------------------------------
+//
+// The expression grammar recurses (parentheses, `NOT` chains, unary minus), and
+// a `nom` parser recurses on the machine stack. Without a bound, ten thousand
+// `(` overflow the stack and abort the process — a denial of service from one
+// query. The bound is far above any query a person or model writes, and well
+// inside what a 2 MiB thread holds even unoptimised (where a level costs
+// ~16 KiB of `nom` frames and ~120 levels overflow). A guard per recursive
+// descent keeps the count exact even when a branch backtracks.
+
+/// The deepest expression nesting the parser accepts.
+pub const MAX_NESTING: usize = 64;
+
+thread_local! {
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Holds one level of nesting for as long as it lives.
+struct Nesting;
+
+impl Drop for Nesting {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Enter one level of nesting; past [`MAX_NESTING`] this is a hard failure
+/// (`ErrorKind::TooLarge`, which [`crate`] names in its message) rather than a
+/// soft error, so no enclosing `alt` re-descends the same input looking for
+/// another reading.
+fn descend(i: &str) -> IResult<&str, Nesting> {
+    let depth = DEPTH.with(|d| d.get());
+    if depth >= MAX_NESTING {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    DEPTH.with(|d| d.set(depth + 1));
+    Ok((i, Nesting))
 }
 
 fn uint(i: &str) -> IResult<&str, u64> {
@@ -91,21 +156,32 @@ fn str_op(i: &str) -> IResult<&str, StrOp> {
 
 // ---- literals -------------------------------------------------------------
 
+/// An unsigned number: `42`, `3.5`, `1e9`, `2.5E-3`. A fraction or an
+/// exponent makes it a float; a bare run of digits is an int.
 fn number(i: &str) -> IResult<&str, PropValue> {
     let (i, _) = multispace0(i)?;
-    let float = map_res(recognize(tuple((digit1, char('.'), digit1))), |s: &str| {
-        s.parse::<f64>().map(PropValue::Float)
-    });
-    let int = map_res(digit1, |s: &str| s.parse::<i64>().map(PropValue::Int));
-    alt((float, int))(i)
+    let (rest, text) = recognize(tuple((
+        digit1,
+        opt(pair(char('.'), digit1)),
+        opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
+    )))(i)?;
+    let parsed = if text.bytes().all(|b| b.is_ascii_digit()) {
+        text.parse::<i64>().map(PropValue::Int).ok()
+    } else {
+        text.parse::<f64>().map(PropValue::Float).ok()
+    };
+    match parsed {
+        Some(v) => Ok((rest, v)),
+        // Out of range for the type (an int past i64) — not a number we hold.
+        None => Err(nom::Err::Error(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Digit,
+        ))),
+    }
 }
 
 fn quoted<'a>(q: char) -> impl Fn(&'a str) -> IResult<&'a str, PropValue> {
-    move |i: &'a str| {
-        let (i, _) = multispace0(i)?;
-        let (i, s) = delimited(char(q), take_while(|c| c != q), char(q))(i)?;
-        Ok((i, PropValue::Str(s.to_string())))
-    }
+    move |i: &'a str| map(quoted_str(q), PropValue::Str)(i)
 }
 
 fn literal(i: &str) -> IResult<&str, PExpr> {
@@ -124,6 +200,7 @@ fn literal(i: &str) -> IResult<&str, PExpr> {
 // or < and < not < comparison < additive < multiplicative < unary < primary
 
 fn expr(i: &str) -> IResult<&str, PExpr> {
+    let (i, _nesting) = descend(i)?;
     or_expr(i)
 }
 
@@ -157,6 +234,7 @@ fn and_expr(i: &str) -> IResult<&str, PExpr> {
 
 fn not_expr(i: &str) -> IResult<&str, PExpr> {
     if let Ok((rest, _)) = kw("not")(i) {
+        let (rest, _nesting) = descend(rest)?;
         let (rest, e) = not_expr(rest)?;
         return Ok((rest, PExpr::Not(Box::new(e))));
     }
@@ -277,6 +355,7 @@ fn multiplicative(i: &str) -> IResult<&str, PExpr> {
 
 fn unary(i: &str) -> IResult<&str, PExpr> {
     if let Ok((rest, _)) = symbol("-")(i) {
+        let (rest, _nesting) = descend(rest)?;
         let (rest, e) = unary(rest)?;
         return Ok((rest, PExpr::Neg(Box::new(e))));
     }
@@ -328,9 +407,11 @@ fn func_or_var(i: &str) -> IResult<&str, PExpr> {
 
 /// The recognized scoring functions: `score()`, `hops()`,
 /// `similarity(v.prop, <vector>[, metric])`, `distance(v.prop, <vector>[, metric])`.
+/// Names are case-insensitive, like keywords: `Score()` is `score()`.
 fn func_call<'a>(name: &str, i: &'a str) -> IResult<&'a str, PExpr> {
     let (i, _) = symbol("(")(i)?;
-    match name {
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
         "score" => {
             let (i, _) = symbol(")")(i)?;
             Ok((i, PExpr::Score))
@@ -404,13 +485,62 @@ fn vec_arg(i: &str) -> IResult<&str, VecArg> {
     ))(i)
 }
 
-/// A quoted string's contents (no escapes in this cut).
+/// A quoted string's contents, in either quote style, with the openCypher
+/// escapes: `\'`, `\"`, `\\`, `\n`, `\t`, `\r`, `\b`, `\f`, `\uXXXX`.
+/// An escaped quote is part of the string, never its end — so a value
+/// containing a quote cannot break out of the literal and into the grammar.
 fn quoted_str<'a>(q: char) -> impl Fn(&'a str) -> IResult<&'a str, String> {
     move |i: &'a str| {
         let (i, _) = multispace0(i)?;
-        let (i, s) = delimited(char(q), take_while(|c| c != q), char(q))(i)?;
-        Ok((i, s.to_string()))
+        let (mut i, _) = char(q)(i)?;
+        let mut out = String::new();
+        loop {
+            // The plain run up to the next quote or backslash, copied whole.
+            let run = i.find([q, '\\']).unwrap_or(i.len());
+            out.push_str(&i[..run]);
+            i = &i[run..];
+            match i.chars().next() {
+                Some(c) if c == q => return Ok((&i[c.len_utf8()..], out)),
+                Some(_) => {
+                    let (rest, c) = escape(&i[1..])?;
+                    out.push(c);
+                    i = rest;
+                }
+                // Unterminated: the string ran to the end of the query.
+                None => {
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        i,
+                        nom::error::ErrorKind::Char,
+                    )));
+                }
+            }
+        }
     }
+}
+
+/// The character an escape (after its backslash) stands for. An unknown
+/// escape is a hard failure: the string can't be read any other way, so
+/// backtracking would only blame something else.
+fn escape(i: &str) -> IResult<&str, char> {
+    let fail = || nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::Escaped));
+    let c = i.chars().next().ok_or_else(fail)?;
+    let rest = &i[c.len_utf8()..];
+    let out = match c {
+        '\\' | '\'' | '"' => c,
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        'b' => '\u{8}',
+        'f' => '\u{c}',
+        'u' => {
+            let hex = rest.get(..4).ok_or_else(fail)?;
+            let code = u32::from_str_radix(hex, 16).map_err(|_| fail())?;
+            let c = char::from_u32(code).ok_or_else(fail)?;
+            return Ok((&rest[4..], c));
+        }
+        _ => return Err(fail()),
+    };
+    Ok((rest, out))
 }
 
 fn f32_num(i: &str) -> IResult<&str, f32> {
@@ -611,6 +741,12 @@ fn is_clause_word(word: &str) -> bool {
 
 fn order_key(i: &str) -> IResult<&str, OrderKey> {
     let (i, (text, target)) = consumed(alt((
+        // `count(*)` first: not one of the expression language's functions.
+        map(agg_call, |(func, arg, distinct)| SortTarget::Agg {
+            func,
+            arg,
+            distinct,
+        }),
         map(expr, SortTarget::Expr),
         // A bare name is a RETURN alias.
         map(
@@ -1108,13 +1244,13 @@ fn create_node(i: &str) -> IResult<&str, CreateNode> {
     let (i, raw) = opt(prop_map)(i)?;
     let (i, _) = symbol(")")(i)?;
 
-    // A literal string `key` sets the external key; everything else is a
-    // property. (A `$param` key stays a property — keys must be literals.)
+    // A string `key` — literal or `$param` — sets the external key; everything
+    // else is a property. (The param's type is checked once it resolves.)
     let mut key = None;
     let mut props = Vec::new();
     for (k, v) in raw.unwrap_or_default() {
         match (k.as_str(), &v) {
-            ("key", Val::Lit(PropValue::Str(s))) => key = Some(s.clone()),
+            ("key", Val::Lit(PropValue::Str(_)) | Val::Param(_)) => key = Some(v),
             _ => props.push((k, v)),
         }
     }

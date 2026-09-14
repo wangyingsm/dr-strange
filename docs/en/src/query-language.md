@@ -185,11 +185,13 @@ answers `0` rather than nothing when the match found nothing.
 
 In a projecting query, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` apply to the
 projected rows: `DISTINCT` compares whole tuples (two nodes sharing a file are
-one row), and `ORDER BY` names a column — by its alias, or by the expression it
-returned.
+one row), and `ORDER BY` names a column — by its alias, by the expression it
+returned, or by the aggregate it folds (`ORDER BY count(*) DESC` finds the
+count column however the `RETURN` spelled or aliased it).
 
 ```text
 MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) ORDER BY count(*) DESC
 ```
 
 A node cannot share a `RETURN` with columns, since a node is not a value:
@@ -216,11 +218,27 @@ CREATE (a)-[:KNOWS {since: 1936}]->(b)
 ```
 
 Values may be supplied as `$name` parameters rather than interpolated into the
-query text, which keeps the query stable and avoids escaping:
+query text, which keeps the query stable and avoids escaping. A `key:` may be
+a parameter too — `MERGE (n:Person {key: $k})` upserts on the string `$k`
+resolves to (a non-string is an error, not a property):
 
 ```text
 MATCH (p:Person) WHERE p.age >= $min RETURN p
+MERGE (n:Person {key: $k}) ON CREATE SET n.seen = 1
 ```
+
+### Literals and identifiers
+
+Strings take either quote and the usual escapes — `\'`, `\"`, `\\`, `\n`,
+`\t`, `\r`, `\uXXXX` — so a value that contains a quote is written inside the
+literal, never around it; an unknown escape or an unterminated string is a
+syntax error. Numbers are ints (`42`) or floats (`3.5`, `1e9`, `2.5E-3`).
+Identifiers (variables, labels, types, property keys) are Unicode words
+(`n.名字`, `café`), or anything between backticks when the plain form cannot
+spell the name (`` n.`first name` ``, `` (:`order`) ``). Keywords and function
+names are case-insensitive (`COUNT(*)`, `Score()`). Expressions may nest at
+most 64 levels deep (parentheses, `NOT`, unary `-`); deeper is a syntax error
+rather than a crash.
 
 ## Similarity search in a query
 

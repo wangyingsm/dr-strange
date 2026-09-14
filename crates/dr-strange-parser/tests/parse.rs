@@ -1591,3 +1591,236 @@ fn committing_a_read_clause_does_not_break_writes() {
         );
     }
 }
+
+// ---- lexical surface: aggregates in ORDER BY, escapes, identifiers, depth --
+
+#[test]
+fn order_by_an_aggregate_finds_the_column_that_folds_the_same_way() {
+    // Unaliased and spelled the same, aliased, and spelled in another case:
+    // each names the count column.
+    for query in [
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) ORDER BY count(*) DESC",
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) AS n ORDER BY count(*) DESC",
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, COUNT(*) AS n ORDER BY count(*) DESC",
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) AS n ORDER BY COUNT(*) DESC",
+    ] {
+        let proj = plan(query).project.expect("projected");
+        assert_eq!(
+            proj.items[1],
+            ProjItem::agg(proj.items[1].name.clone(), Agg::count())
+        );
+        assert_eq!(
+            proj.order_by,
+            vec![TupleSortKey {
+                column: 1,
+                descending: true,
+            }],
+            "{query}"
+        );
+    }
+    // A fold with an argument, and DISTINCT, must match exactly.
+    let proj = plan(
+        "MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, sum(p.year) AS s, \
+         collect(DISTINCT p.year) AS ys ORDER BY collect(DISTINCT p.year), sum(p.year) DESC",
+    )
+    .project
+    .expect("projected");
+    assert_eq!(
+        proj.order_by,
+        vec![
+            TupleSortKey {
+                column: 2,
+                descending: false,
+            },
+            TupleSortKey {
+                column: 1,
+                descending: true,
+            },
+        ]
+    );
+    // An aggregate the query did not return is not a column.
+    let said = err("MATCH (n:Paper) RETURN n.year AS y ORDER BY count(*)").to_string();
+    assert!(said.contains("must name a returned column: y"), "{said}");
+    // Over node rows there are no columns to fold.
+    let said = err("MATCH (n:Paper) RETURN n ORDER BY count(*)").to_string();
+    assert!(
+        said.contains("aggregate") && said.contains("nodes"),
+        "{said}"
+    );
+}
+
+#[test]
+fn function_names_are_case_insensitive_like_keywords() {
+    assert_eq!(
+        plan("MATCH (n:Fn) RETURN COUNT(*) AS c")
+            .project
+            .unwrap()
+            .items,
+        vec![ProjItem::agg("c", Agg::count())]
+    );
+    assert_eq!(
+        plan(r#"SEARCH (d:Doc) ON body MATCHING "rust" RETURN d ORDER BY Score() DESC"#).steps,
+        vec![Step::Sort(vec![SortKey {
+            expr: score(),
+            descending: true,
+        }])]
+    );
+    assert!(
+        plan("MATCH (a)-[:R*1..3]->(b) WHERE HOPS() > 1 RETURN b")
+            .steps
+            .contains(&Step::Filter(hops().gt(1)))
+    );
+    assert_eq!(
+        plan(r#"MATCH (n) WHERE KEY(n) = "k" RETURN n"#).source,
+        Source::SeekKeys(vec!["k".into()])
+    );
+}
+
+#[test]
+fn string_escapes_in_both_quote_styles() {
+    let cases: [(&str, &str); 7] = [
+        (r#""a\"b""#, "a\"b"),
+        (r#"'a\'b'"#, "a'b"),
+        (r#""a\\b""#, "a\\b"),
+        (r#""a\nb\tc""#, "a\nb\tc"),
+        (r#""été""#, "été"),
+        (r#"'say \"hi\"'"#, "say \"hi\""),
+        (r#""it\'s""#, "it's"),
+    ];
+    for (literal, want) in cases {
+        assert_eq!(
+            plan(&format!("MATCH (n) WHERE n.s = {literal} RETURN n")).steps,
+            vec![Step::Filter(p("s").eq(want))],
+            "{literal}"
+        );
+    }
+    // An unknown escape, a short `\u`, and an unterminated string are syntax
+    // errors — never a silently different string.
+    for bad in [r#""a\qb""#, r#""\u12""#, r#""abc\""#] {
+        assert!(
+            matches!(
+                err(&format!("MATCH (n) WHERE n.s = {bad} RETURN n")),
+                ParseError::Syntax(_)
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn an_escaped_quote_cannot_break_out_of_a_literal() {
+    // The audit's injection: the value `x" OR 1 = 1` — quote escaped — must be
+    // compared whole, not end the string and add a predicate.
+    let value = r#"x\" OR 1 = 1"#;
+    assert_eq!(
+        plan(&format!(r#"MATCH (n) WHERE key(n) = "{value}" RETURN n"#)).source,
+        Source::SeekKeys(vec!["x\" OR 1 = 1".into()])
+    );
+    assert_eq!(
+        plan(&format!(r#"MATCH (n) WHERE n.s = "{value}" RETURN n"#)).steps,
+        vec![Step::Filter(p("s").eq("x\" OR 1 = 1"))]
+    );
+}
+
+#[test]
+fn identifiers_may_be_non_ascii_or_backticked() {
+    assert_eq!(
+        plan("MATCH (n:人物) WHERE n.名字 = \"李\" RETURN n"),
+        LogicalPlan {
+            source: Source::ScanLabel("人物".into()),
+            steps: vec![Step::Filter(p("名字").eq("李"))],
+            project: None,
+        }
+    );
+    assert_eq!(
+        plan("MATCH (café:Städte) RETURN café").source,
+        Source::ScanLabel("Städte".into())
+    );
+    // Backticks spell what a plain identifier can't: a keyword, a space, a dash.
+    assert_eq!(
+        plan("MATCH (n:`order`) WHERE n.`first name` = \"a\" RETURN n"),
+        LogicalPlan {
+            source: Source::ScanLabel("order".into()),
+            steps: vec![Step::Filter(p("first name").eq("a"))],
+            project: None,
+        }
+    );
+    assert_eq!(
+        plan("MATCH (a)-[:`has-part`]->(b) RETURN b").steps[0],
+        Step::Expand {
+            dir: Dir::Out,
+            edge_type: Some("has-part".into()),
+        }
+    );
+    // Empty backticks name nothing.
+    assert!(matches!(
+        err("MATCH (n:``) RETURN n"),
+        ParseError::Syntax(_)
+    ));
+}
+
+#[test]
+fn floats_take_an_exponent() {
+    for (text, want) in [("1e3", 1e3), ("2.5E-3", 2.5e-3), ("7e+2", 7e2)] {
+        assert_eq!(
+            plan(&format!("MATCH (n) WHERE n.x > {text} RETURN n")).steps,
+            vec![Step::Filter(p("x").gt(lit(want)))],
+            "{text}"
+        );
+    }
+    // A bare run of digits is still an int, and one past i64 is refused.
+    assert_eq!(
+        plan("MATCH (n) WHERE n.x > 1000 RETURN n").steps,
+        vec![Step::Filter(p("x").gt(1000))]
+    );
+    assert!(matches!(
+        err("MATCH (n) WHERE n.x > 99999999999999999999 RETURN n"),
+        ParseError::Syntax(_)
+    ));
+}
+
+#[test]
+fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
+    // Parentheses, NOT chains and unary minus each recurse; ten thousand
+    // levels of any must fail cleanly. Well within the bound they parse.
+    let deep = |open: &str, close: &str, n: usize| {
+        format!(
+            "MATCH (n) WHERE {}n.x = 1{} RETURN n",
+            open.repeat(n),
+            close.repeat(n)
+        )
+    };
+    for (open, close) in [("(", ")"), ("NOT ", ""), ("-", "")] {
+        let said = err(&deep(open, close, 10_000)).to_string();
+        assert!(said.contains("nested deeper than"), "{open}: {said}");
+        plan(&deep(open, close, 60));
+    }
+    // A failed deep query leaves the next one unaffected.
+    plan("MATCH (n) WHERE ((n.x = 1)) RETURN n");
+}
+
+#[test]
+fn algorithm_arguments_keep_property_case_and_refuse_oversized_counts() {
+    assert_eq!(
+        plan(
+            r#"CALL shortest_path(from: "a", to: "b", dir: "BOTH", weight: "Cost") ON (n) RETURN n"#
+        )
+        .source,
+        Source::Algo {
+            label: None,
+            algo: Algo::ShortestPath {
+                from: NodeRef::Key("a".into()),
+                to: NodeRef::Key("b".into()),
+                dir: Dir::Both,
+                weight: Some("Cost".into()),
+            },
+        }
+    );
+    for q in [
+        "CALL pagerank(iterations: 4294967296) ON (n) RETURN n",
+        "CALL louvain(max_levels: 4294967296) ON (n) RETURN n",
+    ] {
+        let said = err(q).to_string();
+        assert!(said.contains("at most 4294967295"), "{q}: {said}");
+    }
+}

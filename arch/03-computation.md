@@ -15,7 +15,13 @@ addressable (`Expr::At`), since the trail was carrying them all along.
 (`LogicalPlan::project`): a projection turns node rows into value rows, so it
 ends the pipeline rather than sitting inside it as a `Step`. The tail also
 **aggregates** (`count`/`sum`/`avg`/`min`/`max`/`collect`), grouping by every
-column that isn't an aggregate — Cypher's implicit `GROUP BY`.
+column that isn't an aggregate — Cypher's implicit `GROUP BY`. A projection's
+`order_by` is a column index, so the parser resolves `ORDER BY` by name (an
+alias, or an unaliased item's own text) and then by structural equality of the
+compiled `ProjExpr` — an `Expr` or an `Agg` — which is what lets
+`ORDER BY count(*)` find a column returned as `COUNT(*) AS n`. The parser also
+bounds its own recursion (64 expression levels) so a hostile query is a
+`Syntax` error, never a stack overflow in the executor's thread.
 
 **M3 landed** the AI-native surface: the hybrid operators of §4 —
 `Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed
