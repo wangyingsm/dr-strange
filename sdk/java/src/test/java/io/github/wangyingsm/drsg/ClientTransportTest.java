@@ -153,6 +153,19 @@ class ClientTransportTest {
     }
 
     @Test
+    @Timeout(10)
+    void typedClientAcceptsOptions() throws Exception {
+        // The generated Drsg must expose the Options constructor: Client.call is
+        // protected, so without it timeout/httpClient are unreachable from the
+        // typed API.
+        try (FakeWebSocketServer srv = new FakeWebSocketServer(false, c -> { });
+             Drsg db = new Drsg(new Client.Options().baseUrl(srv.baseUrl()).timeout(Duration.ofMillis(300)))) {
+            DrsgException ex = assertThrows(DrsgException.class, () -> db.watch("p", null, ev -> { }));
+            assertTrue(ex.getMessage().contains("PT0.3S"), ex.getMessage());
+        }
+    }
+
+    @Test
     void optionsRejectNonPositiveTimeout() {
         assertThrows(IllegalArgumentException.class, () -> new Client.Options().timeout(Duration.ZERO));
         assertThrows(IllegalArgumentException.class, () -> new Client.Options().timeout(null));

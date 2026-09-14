@@ -20,6 +20,10 @@ public class Drsg extends Client {
         super(baseUrl, token);
     }
 
+    public Drsg(Client.Options options) {
+        super(options);
+    }
+
     public record NodeRecord(
             long id,
             String externalKey,

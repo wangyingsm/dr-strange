@@ -75,6 +75,9 @@ public final class Codegen {
         b.append("    public Drsg() {\n        super();\n    }\n\n");
         b.append("    public Drsg(String baseUrl) {\n        super(baseUrl);\n    }\n\n");
         b.append("    public Drsg(String baseUrl, String token) {\n        super(baseUrl, token);\n    }\n\n");
+        // Options (timeout, shared HttpClient) must be reachable from the typed
+        // class too; Client.call is protected, so a bare Client cannot issue RPCs.
+        b.append("    public Drsg(Client.Options options) {\n        super(options);\n    }\n\n");
 
         for (String def : typeDefs.values()) {
             b.append(def).append("\n");

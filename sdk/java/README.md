@@ -72,12 +72,10 @@ var options = new Client.Options()
         .token(token)
         .timeout(Duration.ofSeconds(5))
         .httpClient(sharedHttpClient);
-Client client = new Client(options);
+try (Drsg db = new Drsg(options)) {
+    // typed methods as usual
+}
 ```
-
-> `Drsg` currently exposes only the positional constructors; the
-> `Options` constructor is reachable on `Client` until the generated
-> `Drsg.java` gains a `Drsg(Client.Options)` overload.
 
 ### Change feed
 
