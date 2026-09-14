@@ -1449,6 +1449,42 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
 mod tests {
     use super::*;
 
+    /// A chat that fails every call and counts them.
+    struct Dead(AtomicUsize);
+
+    impl Chat for Dead {
+        fn complete(&self, _system: &str, _user: &str) -> Result<crate::provider::ChatReply> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            bail!("provider is down")
+        }
+    }
+
+    /// The first failed chunk stops the workers: a dead provider costs the
+    /// calls in flight, not one per chunk. With one worker that is exactly
+    /// one call for however many chunks were queued — and the error is the
+    /// failed chunk's, not the "abandoned" filler of the ones never started.
+    #[test]
+    fn extract_all_stops_after_the_first_failure() {
+        let chunks: Vec<String> = (0..50).map(|i| format!("chunk {i}")).collect();
+        let blocks = vec![None; chunks.len()];
+        let dead = Dead(AtomicUsize::new(0));
+        let err = match extract_all(&dead, "system", &chunks, &blocks, 1) {
+            Ok(_) => panic!("a dead provider cannot extract"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("provider is down"), "{err:#}");
+        assert_eq!(
+            dead.0.load(Ordering::Relaxed),
+            1,
+            "the remaining chunks must not be sent to a provider that just failed"
+        );
+        // With more workers, at most one call per worker is in flight when
+        // the flag goes up, so the count is bounded by the width, not by n.
+        let dead = Dead(AtomicUsize::new(0));
+        assert!(extract_all(&dead, "system", &chunks, &blocks, 4).is_err());
+        assert!(dead.0.load(Ordering::Relaxed) <= 4);
+    }
+
     #[test]
     fn prompt_is_document_driven_with_no_preset_labels() {
         let p = system_prompt(false);
