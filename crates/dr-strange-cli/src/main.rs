@@ -816,7 +816,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
         #[cfg(not(feature = "digest"))]
         Command::Init => commands::init(&cli.db, out),
         Command::Plane(cmd) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             match cmd {
                 PlaneCmd::List => commands::plane_list(&db, out),
                 PlaneCmd::Create { name } => commands::plane_create(&db, &name, out),
@@ -829,20 +829,20 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             on_conflict,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let reader = BufReader::new(std::fs::File::open(&file)?);
             commands::import(&db, &plane, reader, on_conflict, out)
         }
         Command::Export { plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::export(&db, &plane, out)
         }
         Command::Get { node, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::get(&db, &plane, &node, out)
         }
         Command::Query { plan, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let plan = if plan == "-" {
                 io::read_to_string(io::stdin())?
             } else {
@@ -857,7 +857,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             param,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             // A saved query brings its own plane with it: it was written
             // against one, and re-running it against `startup` would be
             // running a different query. An explicit `--plane` still wins.
@@ -881,11 +881,11 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             commands::cypher(&db, &plane, &query, embed.as_deref(), &param, out)
         }
         Command::Queries { id, limit } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::queries(&db, id, limit, out)
         }
         Command::Context { name, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::context, out)
         }
         #[cfg(feature = "digest")]
@@ -896,7 +896,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed_model,
             k,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let embedder =
                 dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
             write!(
@@ -912,17 +912,17 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
              rebuild with default features"
         ),
         Command::Describe { name, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::compact(&db, &plane, &name, dr_strange_core::compact::describe, out)
         }
         Command::Trace { from, to, plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let p = db.plane(&plane)?;
             write!(out, "{}", dr_strange_core::compact::trace(&p, &from, &to)?)?;
             Ok(())
         }
         Command::Impact { name, plane, depth } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let p = db.plane(&plane)?;
             write!(
                 out,
@@ -940,7 +940,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             lines,
             root,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             // `--root` is only the fallback: a plane that records the tree it
             // was parsed from already knows better.
             let rendered = dr_strange_mcp::snippet_logic(
@@ -961,7 +961,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             max_results,
             root,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             // The tree a plane was parsed from is the one to search; `--root`
             // overrides, and the cwd is the last resort.
             let root = match root {
@@ -992,7 +992,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             min,
             max,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let plane_name = plane.clone();
             let rendered = dr_strange_mcp::traverse_logic(
                 &db,
@@ -1021,7 +1021,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Command::Fathom { name, plane, depth } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let p = db.plane(&plane)?;
             write!(
                 out,
@@ -1031,15 +1031,15 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Command::History { plane, limit } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::history(&db, &plane, limit, out)
         }
         Command::Catalog { plane } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::catalog(&db, plane.as_deref(), out)
         }
         Command::Algo(cmd) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             match cmd {
                 AlgoCmd::Pagerank {
                     plane,
@@ -1094,7 +1094,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             embed_model,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::hybrid(
                 &db,
                 &plane,
@@ -1116,7 +1116,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             metric,
         }) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             match second {
                 Some(property) => {
                     commands::index_ensure(&db, &plane, &first, &property, metric.into(), out)
@@ -1130,7 +1130,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             plane,
             lang,
         }) => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let language = lang.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             match second {
                 Some(property) => {
@@ -1140,19 +1140,19 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             }
         }
         Command::Stats => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::stats(&db, out)
         }
         Command::Check => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::check(&db, out)
         }
         Command::Snapshot { out: path } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::snapshot(&db, &path, out)
         }
         Command::Restore { input } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::restore(&db, &input, out)
         }
         Command::Serve {
@@ -1190,7 +1190,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
                     }
                 }
             } else {
-                let db = commands::open(&cli.db)?;
+                let db = commands::open(&cli.db, config::retain_commits(cfg))?;
                 #[allow(unused_mut)]
                 let mut opts = config::serve_options(cfg, addr);
                 #[cfg(feature = "digest")]
@@ -1230,7 +1230,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed_model,
             metric,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             let embedder =
                 dr_strange_llm::build_provider(&embed, embed_model.as_deref(), None, None, true)?;
             commands::vectorize(&db, &plane, &embedder, metric.into(), out)
@@ -1247,7 +1247,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             embed,
             embed_model,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             commands::ask(
                 &db,
                 &plane,
@@ -1331,7 +1331,7 @@ fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
             no_git,
             git_plane,
         } => {
-            let db = commands::open(&cli.db)?;
+            let db = commands::open(&cli.db, config::retain_commits(cfg))?;
             // The `[plugins]` section, with the legacy flag folded in on top.
             let mut plugin_config = config::plugin_config(cfg)?;
             if plugin_source {

@@ -263,6 +263,18 @@ pub fn apply_env(cfg: &Config) {
     }
 }
 
+/// The history retention every command opens the database with: `[server]
+/// retain_commits`, or the server's default when the file does not say;
+/// `0` is unbounded (`None`). One reading shared by `serve` and the rest of
+/// the CLI, so a store sees one policy however it is reached.
+pub fn retain_commits(cfg: &Config) -> Option<u64> {
+    match cfg.server.retain_commits {
+        // 0 means "keep everything", the engine's own encoding of unbounded.
+        Some(commits) => (commits > 0).then_some(commits),
+        None => Some(dr_strange_web::DEFAULT_RETAIN_COMMITS),
+    }
+}
+
 /// Build the web crate's [`ServeOptions`] from the `[server]` section, with an
 /// explicit CLI `--addr` overriding the file's `addr`.
 pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions {
@@ -284,10 +296,7 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     if let Some(secs) = cfg.server.query_timeout_secs {
         opts.query_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
-    if let Some(commits) = cfg.server.retain_commits {
-        // 0 means "keep everything", the engine's own encoding of unbounded.
-        opts.retain_commits = (commits > 0).then_some(commits);
-    }
+    opts.retain_commits = retain_commits(cfg);
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {
             cert: tls.cert.clone(),
@@ -439,5 +448,18 @@ mod tests {
         assert_eq!(set.retain_commits, Some(7));
         let unbounded = serve_options(&parse("[server]\nretain_commits = 0\n"), None);
         assert_eq!(unbounded.retain_commits, None);
+        // The rest of the CLI reads the same value the server does.
+        assert_eq!(
+            retain_commits(&parse("")),
+            Some(dr_strange_web::DEFAULT_RETAIN_COMMITS)
+        );
+        assert_eq!(
+            retain_commits(&parse("[server]\nretain_commits = 7\n")),
+            Some(7)
+        );
+        assert_eq!(
+            retain_commits(&parse("[server]\nretain_commits = 0\n")),
+            None
+        );
     }
 }
