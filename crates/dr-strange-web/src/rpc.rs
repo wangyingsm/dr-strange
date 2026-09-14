@@ -343,6 +343,7 @@ mod tests {
             digest: crate::DigestDefaults::default(),
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: None,
         };
         handle(&ctx, &Auth::allow_all(), body.as_bytes())
     }
@@ -356,6 +357,7 @@ mod tests {
             digest: crate::DigestDefaults::default(),
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: None,
         };
         handle(&ctx, auth, body.as_bytes())
     }
@@ -572,9 +574,78 @@ mod tests {
             resp["result"]["note"]
                 .as_str()
                 .unwrap()
-                .contains("semantic unavailable")
+                .contains("semantic search unavailable")
         );
         assert_eq!(resp["result"]["nodes"][0]["external_key"], "alice");
+    }
+
+    /// The SSRF guard at the wire: a provider that is a URL is refused as
+    /// the client's error before any provider is built, on every method
+    /// that takes one.
+    #[test]
+    fn a_raw_url_provider_is_invalid_params_on_every_method() {
+        let db = seeded();
+        let url = "http://169.254.169.254/latest";
+        let cases = [
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.find","params":{{"plane":"startup","q":"ali","semantic":true,"provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.hybrid","params":{{"plane":"startup","q":"ali","vector_prop":"embedding","provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.ask","params":{{"plane":"startup","question":"who?","provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.ask","params":{{"plane":"startup","question":"who?","provider":"deepseek","embed_provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.cypher","params":{{"plane":"startup","query":"MATCH (n) RETURN n","embed":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.vectorize","params":{{"plane":"startup","embed":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"digest.run","params":{{"plane":"startup","text":"x","chat":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"digest.run","params":{{"plane":"startup","text":"x","chat":"deepseek","embed":"{url}"}},"id":1}}"#
+            ),
+        ];
+        for body in &cases {
+            let resp = call(&db, body).unwrap();
+            assert_eq!(err_code(&resp), -32602, "{body}\n{resp}");
+            assert!(!resp["error"]["message"].as_str().unwrap().contains(url));
+        }
+    }
+
+    /// The configured provider is the one non-preset name a request may use.
+    #[test]
+    fn the_configured_provider_passes_the_guard() {
+        let db = seeded();
+        let ctx = Ctx {
+            db: &db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+            deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: Some("http://embed.internal/v1"),
+        };
+        // A configured URL has no default embedding model, so the build fails
+        // *after* the guard — a -32000 with the model complaint, not -32602.
+        let resp = handle(
+            &ctx,
+            &Auth::allow_all(),
+            br#"{"jsonrpc":"2.0","method":"plane.vectorize","params":{"plane":"startup","embed":"http://embed.internal/v1"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32000, "{resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("embedding model")
+        );
     }
 
     #[test]

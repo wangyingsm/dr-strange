@@ -97,6 +97,10 @@ pub struct AppState {
     pub query_timeout: Option<Duration>,
     /// How many queries the history keeps.
     pub history_limit: usize,
+    /// The provider the operator configured (`ServeOptions::embed_provider`'s
+    /// name), the one non-preset name a request may use — see
+    /// [`methods::provider_for`].
+    pub configured_provider: Option<String>,
     /// The completion vocabulary last built, and what it was built from —
     /// see [`AppState::vocab`].
     vocab_cache: Mutex<Option<CachedVocab>>,
@@ -155,6 +159,7 @@ impl AppState {
             // *this* call may run, so it starts when the call does.
             deadline: self.query_timeout.map(|d| Instant::now() + d),
             history_limit: self.history_limit,
+            configured_provider: self.configured_provider.as_deref(),
         }
     }
 }
@@ -864,7 +869,7 @@ async fn cypher_http(
         Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
     };
     let plane = q.plane.clone();
-    let embed = q.embed.clone().unwrap_or_else(|| "openai".to_string());
+    let embed = q.embed.clone();
 
     let built = tokio::task::spawn_blocking({
         let state = state.clone();
@@ -875,7 +880,7 @@ async fn cypher_http(
                 &state.ctx(),
                 &plane,
                 &query,
-                &embed,
+                embed.as_deref(),
                 &Default::default(),
                 q.lean.unwrap_or(true),
                 methods::Page {
@@ -1189,6 +1194,7 @@ pub async fn run(
             fetch: opts.fetch.clone(),
             query_timeout: opts.query_timeout,
             history_limit: opts.history_limit,
+            configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
             vocab_cache: Mutex::new(None),
         });
         return run_app(state, opts, &resync_needed, &follow_lost).await;
@@ -1206,6 +1212,7 @@ pub async fn run(
         fetch: opts.fetch.clone(),
         query_timeout: opts.query_timeout,
         history_limit: opts.history_limit,
+        configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
         vocab_cache: Mutex::new(None),
     });
     run_app(state, opts, &resync_needed, &follow_lost).await

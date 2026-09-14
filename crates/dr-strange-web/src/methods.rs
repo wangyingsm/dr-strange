@@ -35,6 +35,10 @@ pub struct Ctx<'a> {
     pub deadline: Option<std::time::Instant>,
     /// How many queries the history keeps.
     pub history_limit: usize,
+    /// The one provider the operator configured by name or URL (`[server]
+    /// embed_provider`), if any. The only non-preset provider a request may
+    /// name — see [`provider_for`].
+    pub configured_provider: Option<&'a str>,
 }
 
 impl Ctx<'_> {
@@ -60,13 +64,64 @@ fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
 
 /// Core errors are the caller's fault far more often than ours (unknown plane,
 /// bad plan), so they ride the server-error code, not `-32603 internal`.
-fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
-    r.map_err(|e| match e {
+pub(crate) fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
+    r.map_err(core_err)
+}
+
+/// The client-facing form of a core error. Client-fault variants (unknown
+/// plane, bad plan, conflict) name the caller's own inputs and go through
+/// verbatim; the storage-side ones carry an `io::Error` with the database's
+/// path or a backend's internals, which the operator wants and the client
+/// has no business seeing — those become an [`opaque`] reference.
+pub(crate) fn core_err(e: dr_strange_core::Error) -> RpcError {
+    use dr_strange_core::Error as E;
+    match e {
         // The one core error a client should retry unchanged rather than treat
         // as its own fault: it never got the writer, so nothing was attempted.
-        dr_strange_core::Error::Timeout(_) => RpcError::timeout(e.to_string()),
+        E::Timeout(_) => RpcError::timeout(e.to_string()),
+        E::Io(_) | E::Backend(_) | E::Corrupt(_) => opaque("storage error", format!("{e:#}")),
         _ => RpcError::server(e.to_string()),
-    })
+    }
+}
+
+/// Resolve the provider a request may use. A provider name is either one of
+/// the llm crate's presets or exactly the one the operator configured; any
+/// other string is a base URL this process would POST to from its own
+/// network, on behalf of whoever holds a read credential — a server-side
+/// request forgery (the audit's third finding). `build_provider` itself takes
+/// a URL because the CLI at an operator's terminal legitimately means one;
+/// the wire surface must never hand it one. Every call site that turns a
+/// request field into a provider goes through here — the same
+/// single-chokepoint reasoning as [`Ctx::plane`] and the `Access` at every
+/// dispatch arm. `None` means the request named nothing and gets `openai`.
+pub(crate) fn provider_for<'a>(
+    ctx: &Ctx<'a>,
+    requested: Option<&'a str>,
+) -> Result<&'a str, RpcError> {
+    let name = requested.unwrap_or("openai");
+    if dr_strange_llm::is_preset(name) || ctx.configured_provider == Some(name) {
+        return Ok(name);
+    }
+    Err(RpcError::invalid_params(format!(
+        "provider must be a preset ({}) or the server's configured provider; \
+         a base URL is not accepted over the wire",
+        dr_strange_llm::PRESET_NAMES.join(", ")
+    )))
+}
+
+/// An error whose text is for the operator, not the client: filesystem
+/// paths, upstream bodies, backend internals. The detail goes to the log
+/// under a reference the client message carries, so a user can quote the
+/// message and the operator can find the line, and nothing about the
+/// server's disk layout or its provider's reply crosses the wire.
+pub(crate) fn opaque(kind: &str, detail: impl std::fmt::Display) -> RpcError {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // A counter rather than a random id: it only has to be unique within one
+    // process's log, and it must not be guessable *into* anything.
+    let reference = format!("{:06x}", NEXT.fetch_add(1, Ordering::Relaxed));
+    tracing::warn!(reference = %reference, error = %detail, "{kind}");
+    RpcError::server(format!("{kind} (ref {reference})"))
 }
 
 /// Optional time-travel address on a read request (ROADMAP §4): pin the read to
@@ -516,15 +571,15 @@ pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         }
     };
     let embedder = dr_strange_llm::build_provider(
-        req.embed.as_deref().unwrap_or("openai"),
+        provider_for(_ctx, req.embed.as_deref())?,
         req.embed_model.as_deref(),
         None,
         None,
         true,
     )
-    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-    let stats = dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric)
-        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    .map_err(build_err)?;
+    let stats =
+        dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric).map_err(llm_err)?;
     serde_json::to_value(stats).map_err(|e| RpcError::server(e.to_string()))
 }
 
@@ -548,7 +603,7 @@ pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
     const CAP: usize = 256 << 20;
     let bytes = crate::fetch::fetch_bytes(&req.url, CAP, &[])
-        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+        .map_err(|e| opaque("plugin download failed", format!("{e:#}")))?;
     let store = plugin_store()?;
     let (entry, replaced) = store.install(&bytes, &req.url).map_err(plug)?;
     Ok(jval!({ "installed": entry, "replaced": replaced }))
@@ -571,8 +626,9 @@ fn plugin_store() -> Result<dr_strange_llm::PluginStore, RpcError> {
     dr_strange_llm::PluginStore::open_default().map_err(plug)
 }
 
+/// Plugin-store errors name the store directory and the files in it.
 fn plug(e: anyhow::Error) -> RpcError {
-    RpcError::server(format!("{e:#}"))
+    opaque("plugin store error", format!("{e:#}"))
 }
 
 /// `db.catalog` — the soft schema across every plane.
@@ -936,10 +992,12 @@ fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> Result<Value, RpcError> 
 struct LlmEmbedder(Box<dyn Embedder>);
 impl dr_strange_parser::Embedder for LlmEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        // The parser folds this text into its own error, which reaches the
+        // client verbatim: keep the upstream body out of it.
         let reply = self
             .0
             .embed(&[text.to_string()])
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| opaque("embedding failed", format!("{e:#}")).message)?;
         reply
             .vectors
             .into_iter()
@@ -948,13 +1006,18 @@ impl dr_strange_parser::Embedder for LlmEmbedder {
     }
 }
 
-/// Build an embedder from a provider preset/URL (`None` if it can't be
+/// Build an embedder from a request's provider name (`None` if it can't be
 /// configured — e.g. the provider has no embedding model; a text SEARCH then
-/// errors clearly, while MATCH / literal-vector queries still work).
-fn make_embedder(provider: &str) -> Option<LlmEmbedder> {
-    dr_strange_llm::build_provider(provider, None, None, None, true)
-        .ok()
-        .map(|p| LlmEmbedder(Box::new(p)))
+/// errors clearly, while MATCH / literal-vector queries still work). A name
+/// that is neither a preset nor the configured provider is an error, not a
+/// `None`: silently running the query without it would hide the refusal.
+fn make_embedder(ctx: &Ctx<'_>, provider: Option<&str>) -> Result<Option<LlmEmbedder>, RpcError> {
+    let provider = provider_for(ctx, provider)?;
+    Ok(
+        dr_strange_llm::build_provider(provider, None, None, None, true)
+            .ok()
+            .map(|p| LlmEmbedder(Box::new(p))),
+    )
 }
 
 #[derive(Deserialize)]
@@ -995,7 +1058,7 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         ctx,
         &req.plane,
         &req.query,
-        req.embed.as_deref().unwrap_or("openai"),
+        req.embed.as_deref(),
         &params,
         req.lean,
         // An SDK caller asked for a query, not for a screenful of it.
@@ -1074,12 +1137,12 @@ pub fn cypher_subgraph(
     ctx: &Ctx<'_>,
     plane_name: &str,
     query: &str,
-    embed_provider: &str,
+    embed_provider: Option<&str>,
     params: &dr_strange_parser::Params,
     lean: bool,
     page: Page,
 ) -> Result<Value, RpcError> {
-    let embedder = make_embedder(embed_provider);
+    let embedder = make_embedder(ctx, embed_provider)?;
     let stmt = dr_strange_parser::parse_statement_full(
         query,
         embedder
@@ -1360,7 +1423,8 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     // back to the text scan below, surfacing why via `note`.
     let mut note: Option<String> = None;
     if req.semantic {
-        match semantic_find(&plane, &req, limit) {
+        let provider = provider_for(ctx, req.provider.as_deref())?;
+        match semantic_find(&plane, &req, provider, limit) {
             Ok(hits) if !hits.is_empty() => {
                 let n = hits.len();
                 return Ok(jval!({
@@ -1373,7 +1437,12 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 }));
             }
             Ok(_) => note = Some("no embedded nodes in this plane — showing text matches".into()),
-            Err(e) => note = Some(format!("semantic unavailable ({e}) — showing text matches")),
+            // The note is shown in the dashboard, so it gets the same
+            // operator/client split as an error would.
+            Err(e) => {
+                let why = opaque("semantic search unavailable", format!("{e:#}")).message;
+                note = Some(format!("{why} — showing text matches"));
+            }
         }
     }
 
@@ -1620,13 +1689,13 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         builder = builder.label(label.clone());
     }
     if let Some(prop) = &req.vector_prop {
-        let provider = req.provider.as_deref().unwrap_or("openai");
+        let provider = provider_for(ctx, req.provider.as_deref())?;
         let embedder =
             dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)
-                .map_err(|e| RpcError::server(format!("embedding provider: {e}")))?;
+                .map_err(build_err)?;
         let reply = embedder
             .embed(std::slice::from_ref(&req.q))
-            .map_err(|e| RpcError::server(format!("embedding failed: {e}")))?;
+            .map_err(llm_err)?;
         let query = reply
             .vectors
             .into_iter()
@@ -1680,10 +1749,13 @@ pub struct Ask {
     /// Return the generated plan without executing it.
     #[serde(default)]
     dry_run: bool,
-    /// Total model attempts including repairs (default 3).
+    /// Total model attempts including repairs — default and ceiling
+    /// `ASK_DEFAULT_ATTEMPTS` (20): each attempt is a chat call on the
+    /// server's key, so a request cannot ask for more than the default.
     #[serde(default)]
     max_attempts: Option<u32>,
-    /// Safety row cap appended when the plan declares none (default 100).
+    /// Safety row cap appended when the plan declares none (default
+    /// `ASK_DEFAULT_LIMIT`, 100; at most `ASK_MAX_LIMIT`, 1000).
     #[serde(default)]
     limit: Option<u64>,
     /// Chat provider (preset or base URL); key from the server env.
@@ -1699,6 +1771,20 @@ pub struct Ask {
     embed_model: Option<String>,
 }
 
+/// The attempt and row budgets a `plane.ask` actually gets: the llm crate's
+/// defaults when the request is silent, and never more than its ceilings —
+/// `ASK_DEFAULT_ATTEMPTS` doubles as the attempt ceiling because every
+/// attempt is a chat call on the server's key.
+pub(crate) fn ask_knobs(max_attempts: Option<u32>, limit: Option<u64>) -> (u32, u64) {
+    use dr_strange_llm::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT};
+    (
+        max_attempts
+            .unwrap_or(ASK_DEFAULT_ATTEMPTS)
+            .min(ASK_DEFAULT_ATTEMPTS),
+        limit.unwrap_or(ASK_DEFAULT_LIMIT).min(ASK_MAX_LIMIT),
+    )
+}
+
 /// `plane.ask` — natural-language query (ROADMAP §3): an LLM turns `question`
 /// into a read-only LogicalPlan, which is run (unless `dry_run`). With
 /// `embed_provider` the model can call embedding tools to ground the plan in
@@ -1707,17 +1793,24 @@ pub struct Ask {
 pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Ask = params(p)?;
     let plane = ctx.plane(&req.plane)?;
-    let provider = req.provider.as_deref().unwrap_or("openai");
+    let provider = provider_for(ctx, req.provider.as_deref())?;
     let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)
-        .map_err(|e| RpcError::server(format!("chat provider: {e}")))?;
-    // Embedding tools are enabled when an embed provider is configured and builds.
-    let embedder = req.embed_provider.as_deref().and_then(|ep| {
-        dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
-    });
+        .map_err(build_err)?;
+    // Embedding tools are enabled when an embed provider is named and builds.
+    // The name is validated even though a build failure is tolerated: a
+    // refused URL is the client's error, not a missing model.
+    let embedder = match req.embed_provider.as_deref() {
+        Some(ep) => {
+            let ep = provider_for(ctx, Some(ep))?;
+            dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
+        }
+        None => None,
+    };
+    let (max_attempts, limit) = ask_knobs(req.max_attempts, req.limit);
     let opts = dr_strange_llm::AskOptions {
-        max_attempts: req.max_attempts.unwrap_or(20),
+        max_attempts,
         dry_run: req.dry_run,
-        limit: req.limit.unwrap_or(100),
+        limit,
     };
     let res = dr_strange_llm::ask(
         &chat,
@@ -1728,7 +1821,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         &req.question,
         &opts,
     )
-    .map_err(|e| RpcError::server(e.to_string()))?;
+    .map_err(llm_err)?;
     let plans = serde_json::to_value(&res.plans).map_err(|e| RpcError::server(e.to_string()))?;
     // The matched subgraph: nodes + the edges among them (union of all plans),
     // so the answer plots connected, not as disconnected endpoints.
@@ -1838,9 +1931,9 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 fn semantic_find(
     plane: &dr_strange_core::PlaneHandle<'_>,
     req: &Find,
+    provider: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
-    let provider = req.provider.as_deref().unwrap_or("openai");
     let embedder =
         dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)?;
     let reply = embedder.embed(std::slice::from_ref(&req.q))?;
@@ -1988,8 +2081,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A provider *call* failed: the chain carries the upstream reply body,
+/// which may quote the request, the account, or whatever the provider felt
+/// like saying. Operator-facing.
 fn llm_err(e: anyhow::Error) -> RpcError {
-    RpcError::server(e.to_string())
+    opaque("provider request failed", format!("{e:#}"))
+}
+
+/// A provider could not be *built*: no key in the environment, no embedding
+/// model, unknown name. Decided before any network call from strings this
+/// process composed, and the fix is the client's (or the operator's env), so
+/// the message goes through as written.
+fn build_err(e: anyhow::Error) -> RpcError {
+    RpcError::server(format!("provider: {e:#}"))
 }
 
 #[derive(Deserialize)]
@@ -2022,11 +2126,13 @@ pub struct DigestRun {
     #[serde(default)]
     link: Option<bool>,
     /// Per-chunk extraction chat calls to run concurrently. Omit to use the
-    /// server default (`[digest].concurrency`, else 8).
+    /// server default (`[digest].concurrency`, else 8). Capped at
+    /// `DIGEST_MAX_CONCURRENCY` or the server default, whichever is larger.
     #[serde(default)]
     concurrency: Option<usize>,
     /// Target chunk size in characters. Omit to use the server default
-    /// (`[digest].chunk_chars`, else 4000).
+    /// (`[digest].chunk_chars`, else 4000). Capped at `DIGEST_MAX_CHUNK_CHARS`
+    /// or the server default, whichever is larger.
     #[serde(default)]
     chunk_chars: Option<usize>,
     /// How thoroughly to clean up the extraction: `coarse` reconciles the
@@ -2037,19 +2143,43 @@ pub struct DigestRun {
     mode: Option<String>,
 }
 
+/// The concurrency and chunk size a `digest.run` actually gets. A request
+/// may lower either below the server default freely; raising them is bounded
+/// by [`crate::DIGEST_MAX_CONCURRENCY`] / [`crate::DIGEST_MAX_CHUNK_CHARS`]
+/// (or the operator's own default, if they set it higher — their config is
+/// their ceiling). Both spend the server's provider key and memory, which
+/// is why a read credential does not get to name them freely; zero is
+/// rounded up to one because neither means anything at zero.
+pub(crate) fn digest_knobs(
+    defaults: &crate::DigestDefaults,
+    concurrency: Option<usize>,
+    chunk_chars: Option<usize>,
+) -> (usize, usize) {
+    let conc_cap = defaults.concurrency.max(crate::DIGEST_MAX_CONCURRENCY);
+    let chunk_cap = defaults.chunk_chars.max(crate::DIGEST_MAX_CHUNK_CHARS);
+    (
+        concurrency
+            .unwrap_or(defaults.concurrency)
+            .clamp(1, conc_cap),
+        chunk_chars
+            .unwrap_or(defaults.chunk_chars)
+            .clamp(1, chunk_cap),
+    )
+}
+
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
 /// keys come from the server's environment, never params. Blocking work runs
 /// on the /rpc handler's blocking task.
 pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestRun = params(p)?;
-    let chat_provider = req.chat.as_deref().unwrap_or("openai");
-    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let chat_provider = provider_for(ctx, req.chat.as_deref())?;
+    let embed_provider = provider_for(ctx, req.embed.as_deref().or(Some(chat_provider)))?;
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
     let chat =
         dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
-            .map_err(llm_err)?;
+            .map_err(build_err)?;
     // Opt-in only: unset leaves the request body byte-for-byte what it was, so
     // providers with no such field are unaffected. Embedding calls never carry
     // it — there is nothing to reason about.
@@ -2065,15 +2195,16 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         None,
         embed,
     )
-    .map_err(llm_err)?;
+    .map_err(build_err)?;
 
+    let (concurrency, chunk_chars) = digest_knobs(&ctx.digest, req.concurrency, req.chunk_chars);
     let opts = dr_strange_llm::DigestOptions {
         source: req.source.unwrap_or_else(|| "web-digest".into()),
         model: chat_model,
         run_id: format!("web-{}", now_secs()),
-        chunk_chars: req.chunk_chars.unwrap_or(ctx.digest.chunk_chars),
+        chunk_chars,
         embed,
-        concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
+        concurrency,
         mode: match req.mode.as_deref() {
             None => dr_strange_llm::DigestMode::default(),
             Some(m) => dr_strange_llm::DigestMode::parse(m).ok_or_else(|| {
@@ -2674,5 +2805,141 @@ mod change_feed_tests {
         let c = &v["params"]["changes"][0];
         assert_eq!(c["op"], "deleted");
         assert!(c.get("record").is_none(), "a delete carries no record");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    //! The request-side guards: which provider a request may name, how far
+    //! it may raise a cost knob, and what an internal error is allowed to say.
+    use super::*;
+
+    fn ctx<'a>(db: &'a Database, configured: Option<&'a str>) -> Ctx<'a> {
+        Ctx {
+            db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+            deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: configured,
+        }
+    }
+
+    #[test]
+    fn provider_for_accepts_a_preset_and_defaults_to_openai() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, None);
+        assert_eq!(provider_for(&c, None).unwrap(), "openai");
+        for name in dr_strange_llm::PRESET_NAMES {
+            assert_eq!(provider_for(&c, Some(name)).unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn provider_for_rejects_a_raw_url_as_the_clients_error() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, None);
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://internal.corp:8443/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let err = provider_for(&c, Some(url)).unwrap_err();
+            assert_eq!(err.code, -32602, "{url} must be invalid params");
+            assert!(err.message.contains("preset"), "{}", err.message);
+            // The message names what is allowed, never echoes the URL.
+            assert!(!err.message.contains(url));
+        }
+    }
+
+    #[test]
+    fn provider_for_accepts_exactly_the_configured_provider() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, Some("http://embed.internal:8080/v1"));
+        assert_eq!(
+            provider_for(&c, Some("http://embed.internal:8080/v1")).unwrap(),
+            "http://embed.internal:8080/v1"
+        );
+        // Same host, different path: not the configured value, not allowed.
+        assert_eq!(
+            provider_for(&c, Some("http://embed.internal:8080/v2"))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        // Presets still work alongside a configured URL.
+        assert_eq!(provider_for(&c, Some("ollama")).unwrap(), "ollama");
+    }
+
+    #[test]
+    fn digest_knobs_are_capped_and_never_zero() {
+        let d = crate::DigestDefaults::default();
+        assert_eq!(digest_knobs(&d, None, None), (d.concurrency, d.chunk_chars));
+        assert_eq!(
+            digest_knobs(&d, Some(10_000), Some(usize::MAX)),
+            (crate::DIGEST_MAX_CONCURRENCY, crate::DIGEST_MAX_CHUNK_CHARS)
+        );
+        assert_eq!(digest_knobs(&d, Some(0), Some(0)), (1, 1));
+        assert_eq!(digest_knobs(&d, Some(2), Some(500)), (2, 500));
+        // An operator default above the built-in ceiling is its own ceiling.
+        let big = crate::DigestDefaults {
+            concurrency: 64,
+            chunk_chars: 100_000,
+        };
+        assert_eq!(
+            digest_knobs(&big, Some(1_000), Some(1_000_000)),
+            (64, 100_000)
+        );
+        assert_eq!(digest_knobs(&big, None, None), (64, 100_000));
+    }
+
+    #[test]
+    fn ask_knobs_follow_the_llm_crate_constants() {
+        use dr_strange_llm::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT};
+        assert_eq!(
+            ask_knobs(None, None),
+            (ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT)
+        );
+        assert_eq!(
+            ask_knobs(Some(u32::MAX), Some(u64::MAX)),
+            (ASK_DEFAULT_ATTEMPTS, ASK_MAX_LIMIT)
+        );
+        assert_eq!(ask_knobs(Some(2), Some(5)), (2, 5));
+    }
+
+    #[test]
+    fn a_storage_error_crosses_the_wire_without_its_path() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/srv/secret/graph.drsg: permission denied",
+        );
+        let err = core_err(dr_strange_core::Error::Io(io));
+        assert_eq!(err.code, -32000);
+        assert!(!err.message.contains("/srv/secret"), "{}", err.message);
+        assert!(
+            err.message.starts_with("storage error (ref "),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_client_fault_keeps_its_message() {
+        let err = core_err(dr_strange_core::Error::NotFound("plane `nope`".into()));
+        assert_eq!(err.message, "not found: plane `nope`");
+        let err = core_err(dr_strange_core::Error::Timeout("writer busy".into()));
+        assert_eq!(err.code, -32002);
+    }
+
+    #[test]
+    fn opaque_references_are_distinct_and_carry_no_detail() {
+        let a = opaque(
+            "provider request failed",
+            "POST /v1/chat → HTTP 402: {\"error\":\"billing\"}",
+        );
+        let b = opaque("provider request failed", "same");
+        assert_ne!(a.message, b.message);
+        assert!(!a.message.contains("billing"));
+        assert!(!a.message.contains("HTTP 402"));
     }
 }
