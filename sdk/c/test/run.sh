@@ -36,7 +36,15 @@ fake_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0
 export DRSG_FAKE_URL="http://127.0.0.1:$fake_port"
 python3 "$here/fake_ws.py" "$fake_port" &
 fake=$!
-trap 'kill "$server" "$fake" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+# Wait for the server to exit before removing its directory: a dying
+# `drsg serve` may still be flushing files there, and rm -rf racing it
+# fails with "Directory not empty" and turns a green run red.
+cleanup() {
+    kill "$server" "$fake" 2>/dev/null || true
+    wait "$server" "$fake" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 for p in "$port" "$fake_port"; do
     for _ in $(seq 1 100); do
