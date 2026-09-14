@@ -543,7 +543,7 @@ static int ws_header_value(const unsigned char *head, size_t n, const char *name
 }
 
 /* Open a ws:// connection to <base_url>/ws and complete the handshake. */
-static int ws_connect(CURL *curl, const char *base_url, const char *token, struct ws_rd *rd,
+static int ws_connect(const char *base_url, const char *token, struct ws_rd *rd,
                       drsg_error *err) {
     if (strncmp(base_url, "http://", 7) != 0) {
         return set_err(err, -32000, "drsg_watch supports ws:// (http://) endpoints only");
@@ -599,7 +599,10 @@ static int ws_connect(CURL *curl, const char *base_url, const char *token, struc
      * containing '&', '#' or '%' cannot rewrite the request line. */
     char *escaped = NULL;
     if (token && token[0]) {
-        escaped = curl_easy_escape(curl, token, 0);
+        /* NULL handle: libcurl does not use it for escaping, and this keeps
+         * the watch thread off the client's one easy handle, which another
+         * thread may be using for RPCs (drsg.h documents that contract). */
+        escaped = curl_easy_escape(NULL, token, 0);
         if (!escaped) {
             close(fd);
             return set_err(err, -32000, "out of memory");
@@ -775,7 +778,7 @@ int drsg_watch_cancellable(drsg_client *c, const char *plane, const char *label,
     }
 
     struct ws_rd rd = {.fd = -1};
-    if (ws_connect(c->curl, c->base_url, c->token, &rd, err)) {
+    if (ws_connect(c->base_url, c->token, &rd, err)) {
         return -1;
     }
     if (ctl_set_fd(ctl, rd.fd)) {

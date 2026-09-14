@@ -127,8 +127,10 @@ var sub = db.watch("social", null, event -> {
 
 **C** — a callback; `drsg_watch` blocks until the callback returns non-zero (run
 it on a thread if needed; `drsg_watch_cancellable` takes a `drsg_watch_ctl`
-that another thread can `drsg_watch_ctl_cancel`). A message over
-`DRSG_WS_MAX_MESSAGE_BYTES` ends the watch with `DRSG_TRANSPORT_ERROR_CODE`.
+that another thread can `drsg_watch_ctl_cancel`). A `drsg_client` wraps one
+libcurl handle and must not be used by two threads at once, so the watch thread
+needs a client of its own. A message over `DRSG_WS_MAX_MESSAGE_BYTES` ends the
+watch with `DRSG_TRANSPORT_ERROR_CODE`.
 
 ```c
 static int on_change(struct json_object *event, void *userdata) {

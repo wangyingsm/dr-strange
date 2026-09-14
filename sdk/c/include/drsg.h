@@ -49,6 +49,13 @@ typedef struct {
 /*
  * Create a client. base_url NULL -> DRSG_DEFAULT_BASE_URL; token NULL ->
  * the DRSG_TOKEN environment variable. Returns NULL on allocation/curl failure.
+ *
+ * Threading: a client owns one libcurl easy handle, which libcurl forbids
+ * sharing between threads, so a drsg_client must not be used by two threads
+ * at once — give each thread its own. drsg_watch blocks its caller, so run it
+ * on a client of its own (the one-time library initialisation and the
+ * drsg_watch_ctl handle are the only parts that are safe to touch from
+ * several threads).
  */
 drsg_client *drsg_client_new(const char *base_url, const char *token);
 

@@ -61,6 +61,13 @@ each request as `Authorization: Bearer …`. On a missing/invalid credential the
 call returns `NULL` with `err.code == -32001`; test it with
 `drsg_is_auth_error(&err)`.
 
+### Threads
+
+A `drsg_client` wraps one libcurl easy handle, which must not be used by two
+threads at once: use one client per thread. `drsg_watch` blocks its caller, so
+run it on a dedicated thread with a client of its own; only the one-time
+library initialisation and `drsg_watch_ctl` are safe to share.
+
 ### Change feed
 
 `drsg_watch(c, plane, label, cb, userdata, &err)` opens a WebSocket to
