@@ -526,9 +526,17 @@ impl Database {
     /// batch's own commit sequence rather than allocating a new one — so a
     /// replica's KV content converges byte-for-byte with its source
     /// (`serve --follow`, arch/01 §9). Native-only.
+    ///
+    /// The batch may change graph data without moving the commit sequence the
+    /// cache stamps with (a replicated restore lands the source's sequence,
+    /// which this replica may already have stamped entries at), so the cache
+    /// is dropped after every applied batch: a replica's cache is warm between
+    /// batches, never across one.
     #[cfg(feature = "native-backend")]
     pub fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
-        self.engine.apply_replicated(batch)
+        self.engine.apply_replicated(batch)?;
+        self.cache.invalidate_all();
+        Ok(())
     }
 
     /// Register a replication observer, invoked synchronously right after
