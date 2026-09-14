@@ -2579,7 +2579,11 @@ impl ServerHandler for DrStrange {
              (no tree, no such symbol) says so and what to do instead.\n\
              A digested repository has two planes. `<name>` holds the code as \
              it is now — ask `context`, `trace`, `impact`, `fathom`, \
-             `snippet`, `grep`. \
+             `snippet`, `grep`. `recall` reads the same code as it was at \
+             any commit of that history — a file, a directory, a symbol's \
+             declaration then, a search of the old tree (`pattern`), or what \
+             changed since an older revision (`vs`) — in place of `git show \
+             <rev>:<path>`, `git grep <rev>` or `git log -p`. \
              `<name>_git` holds the same repository's history — Commit (also \
              Merge), Branch, Tag and Rebase nodes, joined by PARENT (with \
              `order`, so a merge's first parent is the line it was made on), \
