@@ -1375,7 +1375,7 @@
         {#if asOf == null}
           Live · commit {history.latest}
         {:else}
-          commit {sliderSeq} / {history.latest} · {history.latest - sliderSeq} back
+          commit {sliderSeq} / {history.latest} · {history.latest - sliderSeq} back · {history.latest - history.oldest} kept
         {/if}
       </span>
       <span class="algo-sep"></span>

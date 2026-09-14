@@ -102,6 +102,9 @@ pub struct AppState {
     /// name), the one non-preset name a request may use — see
     /// [`methods::provider_for`].
     pub configured_provider: Option<String>,
+    /// The retention the engine was given (`ServeOptions::retain_commits`),
+    /// echoed by `db.stats`.
+    pub retain_commits: Option<u64>,
     /// Per-peer brute-force throttle on the bearer check — see
     /// [`auth_throttle`].
     pub auth_limiter: FailedAuthLimiter,
@@ -164,6 +167,7 @@ impl AppState {
             deadline: self.query_timeout.map(|d| Instant::now() + d),
             history_limit: self.history_limit,
             configured_provider: self.configured_provider.as_deref(),
+            retain_commits: self.retain_commits,
         }
     }
 }
@@ -1496,6 +1500,7 @@ pub async fn run(
             query_timeout: opts.query_timeout,
             history_limit: opts.history_limit,
             configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+            retain_commits: opts.retain_commits,
             auth_limiter: FailedAuthLimiter::new(),
             vocab_cache: Mutex::new(None),
         });
@@ -1515,6 +1520,7 @@ pub async fn run(
         query_timeout: opts.query_timeout,
         history_limit: opts.history_limit,
         configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+        retain_commits: opts.retain_commits,
         auth_limiter: FailedAuthLimiter::new(),
         vocab_cache: Mutex::new(None),
     });

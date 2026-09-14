@@ -353,16 +353,20 @@ mod tests {
         (db, alice.0, bob.0)
     }
 
-    fn call(db: &Database, body: &str) -> Option<Value> {
-        let ctx = Ctx {
+    fn ctx_for(db: &Database) -> Ctx<'_> {
+        Ctx {
             db,
             db_path: None,
             digest: crate::DigestDefaults::default(),
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
             configured_provider: None,
-        };
-        handle(&ctx, &Auth::allow_all(), body.as_bytes())
+            retain_commits: Some(crate::DEFAULT_RETAIN_COMMITS),
+        }
+    }
+
+    fn call(db: &Database, body: &str) -> Option<Value> {
+        handle(&ctx_for(db), &Auth::allow_all(), body.as_bytes())
     }
 
     /// Dispatch `body` under an explicit authorizer + credentials (for the auth
@@ -375,6 +379,7 @@ mod tests {
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
             configured_provider: None,
+            retain_commits: Some(crate::DEFAULT_RETAIN_COMMITS),
         };
         handle(&ctx, auth, body.as_bytes())
     }
@@ -647,6 +652,7 @@ mod tests {
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
             configured_provider: Some("http://embed.internal/v1"),
+            retain_commits: None,
         };
         // A configured URL has no default embedding model, so the build fails
         // *after* the guard — a -32000 with the model complaint, not -32602.
@@ -682,6 +688,61 @@ mod tests {
         assert_eq!(edges[0]["match"], "type");
         assert_eq!(edges[0]["src"], alice);
         assert_eq!(edges[0]["dst"], bob);
+    }
+
+    /// `db.stats` says how deep the history the server keeps goes — the
+    /// slider's depth, in one number a dashboard can show.
+    #[test]
+    fn db_stats_reports_the_retention() {
+        let db = seeded();
+        let resp = call(&db, r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#).unwrap();
+        assert_eq!(
+            resp["result"]["retain_commits"],
+            crate::DEFAULT_RETAIN_COMMITS
+        );
+        let mut ctx = ctx_for(&db);
+        ctx.retain_commits = None;
+        let resp = handle(
+            &ctx,
+            &Auth::allow_all(),
+            br#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"]["retain_commits"].is_null());
+    }
+
+    /// On the native backend the window `plane.history` reports starts at
+    /// the retained floor: with `retain_commits` = 3 and more commits than
+    /// that, `oldest` is three back from `latest`, never the first commit.
+    /// This is what keeps the slider from advertising depth retention has
+    /// reclaimed.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn plane_history_spans_only_the_retained_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.drsg")).unwrap();
+        let plane = db.plane("startup").unwrap();
+        for i in 0..6 {
+            let mut txn = plane.write().unwrap();
+            txn.create_node_with_key(&format!("n{i}"), &["N"], Properties::new())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let unbounded = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.history","params":{},"id":1}"#,
+        )
+        .unwrap();
+        let latest = unbounded["result"]["latest"].as_u64().unwrap();
+        assert!(latest - unbounded["result"]["oldest"].as_u64().unwrap() >= 5);
+        db.set_retention(Some(3));
+        let bounded = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.history","params":{},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(bounded["result"]["latest"], latest);
+        assert_eq!(bounded["result"]["oldest"], latest - 3, "{bounded}");
     }
 
     #[test]
