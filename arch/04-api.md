@@ -61,6 +61,13 @@ txn.commit()?;
   `bulk()` mainly needs to batch *commits*, not ids.
 - Vector index management: `paper.ensure_vector_index("Person", "embedding",
   Metric::Cosine)?` — declarative, idempotent, per plane.
+- The change feed (`Database::on_change`) is bounded at the source: a write
+  txn tracks at most 256 distinct entities; a mutation of a further entity
+  is not buffered, only noted, and the delivered `ChangeSet` is flagged
+  `truncated` (possibly with an empty list) so a subscriber knows that seq
+  changed more than it can see. Entities within the cap still collapse
+  (create-then-delete cancels). A bulk load of a million nodes buffers 256
+  tuples, not a million.
 
 ## 3. Reads and queries
 

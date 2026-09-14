@@ -104,7 +104,14 @@ users, documented as unavailable over the wire.
 
 - **Pull-based iterator model** over a stable snapshot: one read transaction
   + one `GraphReader` per query. Simple, streaming, cancellable; `Arc`-shared
-  cache entries make repeated visits to hub nodes cheap.
+  cache entries make repeated visits to hub nodes cheap. Every non-barrier
+  step is lazy, `ExpandVar` included: a variable-length walk is pulled one
+  row at a time off its DFS stack (preorder, children in reverse neighbour
+  order), so a `Limit` stops an exponential walk after its n rows and the
+  deadline sees rows as they are produced. Only `Sort`, `FrontierTopK` and
+  `ExpandBeam` drain their input.
+- Plan counts (`Skip`, `Limit`, `k`) are `u64` on the wire and saturate to
+  `usize` on the executing machine: an oversized count means "all".
 - Batched (morsel-style) execution only where profiling shows it pays —
   likely `Expand` over hot adjacency segments and the vectorizable distance
   loops in hybrid operators. Start scalar; batch later.
@@ -147,6 +154,12 @@ a whole label. The executor picks a strategy per call, adaptively:
   supports filtered search precisely for this);
 - the crossover threshold is a tunable, benchmarked at M3.
 
+The frontier is ranked as a **set of nodes**: a node several walks reach is
+one candidate holding one of the k slots, and the row it keeps (trail,
+origin) is the first walk that reached it — k means k distinct nodes,
+each with a real path. Callers wanting one row per walk keep the walks
+upstream of the rerank.
+
 This operator is what makes API aggregation unnecessary: without it, the
 caller would pull the whole frontier out, run a separate vector query, and
 intersect — two passes, two snapshots, no ranking guarantee.
@@ -181,6 +194,24 @@ same binding, the rewrite pushes the predicate into the ANN call as an
 top-k′ ≫ k and post-filtering. Over-fetch-with-retry remains the fallback for
 non-indexed predicates.
 
+### 4.7 Channel fusion — `plane.hybrid()` / `Source::Hybrid`
+Besides fusion inside a plan, a single `HybridSpec` fuses up to three
+*channels* — vector distance, BM25 keyword, graph proximity — by weighted,
+min-max-normalized sum (`compute::hybrid`): each channel is normalized to
+`[0, 1]` (best = 1) and a node absent from a channel contributes 0. The
+graph channel seeds from the strongest primary hits, expands `hops`
+outward over any edge and scores `decay^distance`. Rules:
+
+- **`label` scopes every channel.** The keyword channel requires it (its
+  index is keyed on the label); the vector channel restricts its search to
+  it; the graph channel *walks* through any node (an intermediate of
+  another label is a legitimate bridge) but *scores* only nodes carrying
+  the label, so a `Doc` query never surfaces the `Author` it bridged through.
+- **Non-finite raw scores are dropped** from their channel before
+  normalization — a NaN distance would poison the channel's min/max — so
+  the node simply lacks that channel's contribution, every fused score is
+  finite, and the final sort (`total_cmp`, ties by node id) is total.
+
 ## 5. Soft-schema catalog
 
 The catalog is the *descriptive* view of the data that makes "no DDL" usable.
@@ -197,6 +228,9 @@ across planes:
 - Served through the API as `plane.catalog()` (and `db.catalog()` roll-up).
   This is exactly what the MCP layer presents to LLMs as "schema" —
   descriptive, never prescriptive.
+- The full-scan build (`catalog::compute`) decodes each node once: the
+  node pass remembers every node's labels (interned), and the edge pass
+  resolves both endpoints from that map rather than re-reading the records.
 - Persistence: catalog tables live in the KV, updated in the same write
   transaction as the data they describe; the latest snapshot is published to
   readers via the cache layer.
@@ -237,7 +271,8 @@ plan/executor decisions don't preclude it.
    **edge-property access**, which needs the richer binding model.
 2. **`ExpandVar`/`ExpandBeam` path semantics** — **v0 chose walk semantics**
    for `ExpandVar`: bounded by depth `min..=max`, nodes/edges may repeat, one
-   row per distinct walk; callers add `Distinct` for uniqueness. Trail /
+   row per distinct walk, produced lazily in DFS preorder (§3); callers add
+   `Distinct` for uniqueness. Trail /
    simple-path modes and the `ExpandBeam` revisit-vs-dedup question are
    revisited when the richer binding model + `ExpandBeam` land (M3).
 3. ~~**Score channel: one or many?**~~ **Resolved (M3): a single channel.**
