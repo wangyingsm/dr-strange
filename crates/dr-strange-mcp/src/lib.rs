@@ -342,6 +342,12 @@ struct Digest {
     /// nodes/edges for inspection (arch/07 §2: proposals, not mutations).
     #[serde(default)]
     apply: bool,
+    /// Must be `true` alongside `apply` — applying a digest rewrites the
+    /// plane against the document, which on a mirrored plane overwrites
+    /// parser-owned nodes, so it is confirmed the way `drop_plane` is
+    /// (arch/06 §3). A dry-run needs no confirmation.
+    #[serde(default)]
+    confirm: bool,
     /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or a base
     /// URL. API keys are read from the server's environment, never params.
     #[serde(default)]
@@ -438,6 +444,11 @@ struct Cypher {
     #[serde(default)]
     #[schemars(with = "crate::JsonObject")]
     params: serde_json::Map<String, Value>,
+    /// Must be `true` for a statement that destroys — `DELETE` or `REMOVE` —
+    /// as `drop_plane` requires (arch/06 §3). Additive writes (`CREATE`,
+    /// `MERGE`, `SET`) need no confirmation.
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// Free-form JSON object. Rendered as a full Schema object (`{"type":
@@ -574,6 +585,48 @@ fn dir_within(root: &std::path::Path, dir: &std::path::Path) -> bool {
         (Ok(root), Ok(dir)) => dir.starts_with(&root),
         _ => false,
     }
+}
+
+/// Whether a cypher statement carries a `DELETE` or `REMOVE` clause — the
+/// two that destroy, and so want the confirmation `drop_plane` wants.
+///
+/// A keyword scan over the text rather than the compiled statement, whose
+/// ops are private to the parser. String literals and backtick names are
+/// skipped so a value that says "delete" is not a clause, and a word after
+/// `.` is a property, not a keyword. The scan errs toward asking: a stray
+/// `remove` outside a literal costs one confirmed retry, while a missed one
+/// would cost data.
+fn destroys(query: &str) -> bool {
+    let mut word = String::new();
+    let mut after_dot = false;
+    let mut quote: Option<char> = None;
+    let mut chars = query.chars().peekable();
+    let is_keyword = |w: &str| w.eq_ignore_ascii_case("delete") || w.eq_ignore_ascii_case("remove");
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            if !after_dot && is_keyword(&word) {
+                return true;
+            }
+            word.clear();
+        }
+        after_dot = c == '.';
+        if matches!(c, '"' | '\'' | '`') {
+            quote = Some(c);
+        }
+    }
+    !after_dot && is_keyword(&word)
 }
 
 /// The file `file` names under `root`, or an error when it would land outside.
@@ -1537,6 +1590,18 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
             }
         }
         dr_strange_parser::Statement::Write(w) => {
+            // The same bar `drop_plane` sets: what destroys is confirmed, what
+            // adds is not. Checked before the mirror test so the answer to a
+            // destructive statement is one refusal, not two in turn.
+            if !req.confirm && destroys(&req.query) {
+                anyhow::bail!(
+                    "refusing to run a DELETE/REMOVE on plane `{}` without \
+                     `confirm: true` — it destroys nodes, edges, labels or \
+                     properties; pass confirm=true to run it (CREATE/MERGE/SET \
+                     need no confirmation)",
+                    req.plane
+                );
+            }
             if let Some(commit) = mirrored_commit(&plane)? {
                 anyhow::bail!(
                     "plane `{}` mirrors a source tree (synced at commit {}); \
@@ -1716,6 +1781,19 @@ fn digest_logic(
         })
     };
     let handler = req.handler.as_deref();
+
+    // Applying rewrites the plane, so it is confirmed as `drop_plane` is —
+    // and refused here, before the document is read or a provider called,
+    // so a missing confirmation costs nothing but the retry.
+    if req.apply && !req.confirm {
+        anyhow::bail!(
+            "refusing to apply a digest to plane `{}` without `confirm: true` — \
+             apply writes the extraction into the plane (and on a mirrored \
+             plane reconciles it against the tree); dry-run first if unsure, \
+             then call again with apply=true and confirm=true",
+            req.plane
+        );
+    }
 
     // Resolve the input before anything else: a refused `path` should cost
     // no provider call.
@@ -2443,8 +2521,9 @@ impl DrStrange {
         clause it broke on — no need to guess twice. Writes \
         (CREATE/MERGE/SET/REMOVE/DELETE) mutate a plane of your own and are \
         refused on a plane that mirrors a source tree, where the next fold \
-        would undo them; annotate those with write_nodes/write_edges. \
-        Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
+        would undo them; annotate those with write_nodes/write_edges. A \
+        DELETE or REMOVE destroys and requires `confirm: true`, as drop_plane \
+        does; CREATE/MERGE/SET do not. Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
         RETURN f`; `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) \
         AS calls ORDER BY calls DESC LIMIT 10`.")]
     async fn cypher(
@@ -2529,7 +2608,8 @@ impl DrStrange {
         plane nodes via vector retrieval (set link=false to propose everything as new), embed \
         them, and — \
         only when apply=true — write them with provenance. Dry-run (the default) returns the \
-        proposed nodes/edges for review; call again with apply=true to commit. Provider API keys \
+        proposed nodes/edges for review; call again with apply=true and confirm=true to \
+        commit (apply rewrites the plane, so it is confirmed as drop_plane is). Provider API keys \
         come from the server's environment (e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / \
         DASHSCOPE_API_KEY), never from params."
     )]
@@ -3143,6 +3223,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(n.labels.iter().any(|l| l == "Person"));
+    }
+
+    /// What destroys is confirmed, as `drop_plane` is; what adds is not.
+    #[test]
+    fn cypher_destructive_statements_need_confirm() {
+        let db = Database::in_memory().unwrap();
+        cypher_logic(
+            &db,
+            from_value(
+                jval!({"query": r#"CREATE (a:Person {key:"x", age:40, note:"delete me"})"#}),
+            )
+            .unwrap(),
+        )
+        .expect("an additive write with a literal saying delete is not gated");
+        cypher_logic(
+            &db,
+            from_value(jval!({"query": r#"MATCH (a:Person) WHERE key(a) = "x" SET a.age = 41"#}))
+                .unwrap(),
+        )
+        .expect("SET is additive");
+
+        for q in [
+            r#"MATCH (a:Person) WHERE key(a) = "x" REMOVE a.age"#,
+            r#"MATCH (a:Person) WHERE key(a) = "x" DETACH DELETE a"#,
+            r#"match (a:Person) where key(a) = "x" delete a"#,
+        ] {
+            let err = cypher_logic(&db, from_value(jval!({"query": q})).unwrap())
+                .expect_err("a destructive statement without confirm must be refused")
+                .to_string();
+            assert!(err.contains("confirm: true"), "{q}: {err}");
+        }
+        let plane = db.plane("startup").unwrap();
+        assert!(
+            plane.node_by_key("x").unwrap().is_some(),
+            "refused means untouched"
+        );
+
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": r#"MATCH (a:Person) WHERE key(a) = "x" DETACH DELETE a"#,
+                "confirm": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["nodes_deleted"], jval!(1));
+        assert!(plane.node_by_key("x").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_keyword_is_told_from_a_literal_and_a_property() {
+        assert!(destroys("MATCH (n) DELETE n"));
+        assert!(destroys("MATCH (n) remove n:Label"));
+        assert!(destroys("MATCH (n) WHERE n.x = 'a' REMOVE n.x"));
+        assert!(!destroys(r#"CREATE (n {note: "please delete"})"#));
+        assert!(!destroys("MATCH (n) WHERE n.remove = 1 RETURN n"));
+        assert!(!destroys("MATCH (n) RETURN n.delete"));
+        assert!(!destroys("MATCH (n:`delete`) RETURN n"));
+        assert!(!destroys(
+            "MATCH (n) WHERE n.x = 'it''s' SET n.deleted = true"
+        ));
+    }
+
+    /// Applying is confirmed before anything is read or any provider called.
+    #[test]
+    fn digest_apply_needs_confirm() {
+        let db = Database::in_memory().unwrap();
+        let req: Digest =
+            from_value(jval!({"text": "Ada wrote the first program.", "apply": true})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), true)
+            .expect_err("apply without confirm must be refused")
+            .to_string();
+        assert!(err.contains("confirm: true"), "{err}");
+        // A dry-run over the same text is not gated: it stops later, at the
+        // provider, which is the point — nothing destructive was asked.
+        let req: Digest = from_value(jval!({"text": "Ada wrote the first program."})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), true)
+            .expect_err("no provider in tests")
+            .to_string();
+        assert!(!err.contains("confirm"), "{err}");
     }
 
     /// Stamp the fixture's plane as a digest would: it now mirrors a commit.
