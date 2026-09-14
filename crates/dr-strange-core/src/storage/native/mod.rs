@@ -296,6 +296,10 @@ pub struct NativeEngine {
     /// failure cannot be reported through `commit` without lying about a
     /// write that did land; it is logged and kept here for `check`/stats.
     last_maintenance_error: Mutex<Option<String>>,
+    /// Test seam: parks a flush after its SST is written but before the swap,
+    /// so a test can prove readers get through that window.
+    #[cfg(test)]
+    flush_pause: test_hooks::Pause,
 }
 
 impl NativeEngine {
@@ -384,6 +388,8 @@ impl NativeEngine {
             read_only,
             wal_observer: Mutex::new(None),
             last_maintenance_error: Mutex::new(None),
+            #[cfg(test)]
+            flush_pause: test_hooks::Pause::default(),
         })
     }
 
@@ -400,20 +406,42 @@ impl NativeEngine {
     }
 
     /// Flush the memtable to a new SST and rotate the WAL, if the memtable is
-    /// over threshold. Called from `commit` while holding the store write lock
-    /// (so single-writer). The SST is made durable before the WAL is truncated.
-    fn maybe_flush(&self, store: &mut Store) -> Result<()> {
-        if store.mem_bytes < self.flush_threshold || store.mem.is_empty() {
-            return Ok(());
-        }
-        let n = store.next_sst;
-        store.next_sst += 1;
-        let path = self.dir.join(format!("sst-{n:06}"));
-        sst::write(&path, &store.mem, store.committed_seq)?;
+    /// over threshold. Called from `commit` after the batch is published and
+    /// the store write lock released, still under the write gate.
+    ///
+    /// The SST is written under the store *read* lock, so readers keep going
+    /// through the write+fsync. That is sound because the memtable only ever
+    /// changes inside `durable_commit`, and the gate makes this the only
+    /// `durable_commit` in flight: between publish and the swap below the
+    /// memtable is effectively immutable, and the SST is an exact copy of it
+    /// stamped with the same sequences. The swap itself — run in, memtable
+    /// out — is the only step that takes the write lock, and it is a few
+    /// pointer moves; a reader before or after it sees the same versions. The
+    /// SST is made durable before the WAL is truncated.
+    fn maybe_flush(&self) -> Result<()> {
+        let (path, n) = {
+            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+            if store.mem_bytes < self.flush_threshold || store.mem.is_empty() {
+                return Ok(());
+            }
+            let n = store.next_sst;
+            let path = self.dir.join(format!("sst-{n:06}"));
+            sst::write(&path, &store.mem, store.committed_seq)?;
+            #[cfg(test)]
+            self.flush_pause.wait();
+            (path, n)
+        };
         let s = self.open_sst(&path)?;
-        store.ssts.push(s);
-        store.mem.clear();
-        store.mem_bytes = 0;
+        {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            // A failed attempt (write error above, or open_sst) leaves the
+            // number unclaimed and the memtable in place; the retry the next
+            // commit makes overwrites the same name via rename.
+            store.next_sst = n + 1;
+            store.ssts.push(s);
+            store.mem.clear();
+            store.mem_bytes = 0;
+        }
 
         // The flushed records are now durable in the SST → drop them from the
         // WAL. Losing the truncation itself would be harmless (the next open
@@ -803,6 +831,35 @@ fn emit_group(
 }
 
 #[cfg(test)]
+mod test_hooks {
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
+
+    /// An optional rendezvous a code path waits at when armed. Arriving there
+    /// is announced on a channel first, so a test can learn the path is parked
+    /// without touching any lock the path might be holding.
+    #[derive(Default)]
+    pub(super) struct Pause(Mutex<Option<(mpsc::Sender<()>, Arc<Barrier>)>>);
+
+    impl Pause {
+        /// Arm the pause; the returned receiver fires when it is reached, and
+        /// `b.wait()` from the test then releases it.
+        pub(super) fn arm(&self, b: Arc<Barrier>) -> mpsc::Receiver<()> {
+            let (tx, rx) = mpsc::channel();
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((tx, b));
+            rx
+        }
+
+        pub(super) fn wait(&self) {
+            let armed = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some((tx, b)) = armed {
+                let _ = tx.send(());
+                b.wait();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod gc_tests {
     use super::*;
 
@@ -1167,6 +1224,48 @@ mod engine_tests {
             assert_eq!(get(&e, b"b"), Some(b"2".to_vec()));
             assert_eq!(get(&e, b"c"), Some(b"3".to_vec()));
         }
+    }
+
+    #[test]
+    fn a_reader_is_served_while_a_flush_writes_its_sst() {
+        // The flush's write+fsync used to run under the store write lock, so
+        // every reader stalled for the whole of it. Park a flush right after
+        // its SST write (the point where that lock used to be held) and check
+        // a reader on another thread completes — and sees the just-committed
+        // value — while the flush is parked.
+        let dir = Dir::new("flush-readers");
+        let e = Arc::new(NativeEngine::open_with_threshold(&dir.0, 1).unwrap());
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let parked = e.flush_pause.arm(gate.clone());
+
+        let writer = {
+            let e = e.clone();
+            std::thread::spawn(move || commit(&e, b"k", b"v")) // parks inside its flush
+        };
+        // Learn the flush is parked without taking any store lock ourselves
+        // (that would hang, not fail, if the flush still held the writer).
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the commit reached its flush");
+
+        let (rtx, rrx) = mpsc::channel();
+        {
+            let e = e.clone();
+            std::thread::spawn(move || {
+                rtx.send(get(&e, b"k")).unwrap();
+            });
+        }
+        let read = rrx.recv_timeout(Duration::from_secs(2));
+        gate.wait(); // release the flush whatever happened, so nothing hangs
+        assert_eq!(writer.join().unwrap(), 1);
+        assert_eq!(
+            read.ok(),
+            Some(Some(b"v".to_vec())),
+            "a reader must not wait on a flush's I/O"
+        );
+        // And the flush completed normally once released.
+        let store = e.store.read().unwrap_or_else(|e| e.into_inner());
+        assert!(store.mem.is_empty() && store.ssts.len() == 1);
     }
 
     #[test]
@@ -1540,18 +1639,18 @@ impl NativeEngine {
             }
         }
 
-        // Publish to the memtable, advance the sequence, then flush if large.
-        let flushed = {
+        // Publish to the memtable and advance the sequence.
+        {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
             for ((t, k), op) in ops {
                 store.mem_bytes += 1 + k.len() + 8 + op.value_len();
                 store.mem.insert((t, k, Reverse(seq)), op);
             }
             store.committed_seq = seq;
-            self.maybe_flush(&mut store)
-        };
-        // Compact outside the store lock (heavy merge I/O shouldn't block reads).
-        let maintained = flushed.and_then(|()| self.maybe_compact());
+        }
+        // Flush and compact outside the store write lock (their I/O shouldn't
+        // block reads); both are safe there because the gate is still held.
+        let maintained = self.maybe_flush().and_then(|()| self.maybe_compact());
         self.record_maintenance(seq, maintained);
         Ok(seq)
     }
