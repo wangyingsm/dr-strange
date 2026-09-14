@@ -72,8 +72,12 @@ txn.commit()?;
   cache in invalidate-only mode) used by CLI import and MCP ingest tools.
   Node/edge id allocation is already batched under the hood (arch/01 §2) —
   `bulk()` mainly needs to batch *commits*, not ids.
-- Vector index management: `paper.ensure_vector_index("Person", "embedding",
-  Metric::Cosine)?` — declarative, idempotent, per plane.
+- Index management: `paper.ensure_vector_index("Person", "embedding",
+  Metric::Cosine)?` and `paper.ensure_keyword_index("Doc", "body",
+  Language::English)?` — declarative, idempotent, per plane. Only the
+  declaration is durable (a `meta` row); the index itself is rebuilt from the
+  KV on open unless a sidecar stamped with the current commit sequence is
+  found (01 §5).
 - `commit()` returns `Ok` exactly when the KV commit is durable. Everything
   it does afterwards — mirroring buffered events into the in-memory vector
   and keyword registries, building the change-feed set — is applied in full,
