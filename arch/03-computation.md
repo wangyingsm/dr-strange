@@ -21,7 +21,12 @@ alias, or an unaliased item's own text) and then by structural equality of the
 compiled `ProjExpr` — an `Expr` or an `Agg` — which is what lets
 `ORDER BY count(*)` find a column returned as `COUNT(*) AS n`. The parser also
 bounds its own recursion (64 expression levels) so a hostile query is a
-`Syntax` error, never a stack overflow in the executor's thread.
+`Syntax` error, never a stack overflow in the executor's thread. Its `WHERE`
+is split on top-level `AND` and each conjunct becomes a `Filter` at the slot
+of the one variable it names; a conjunct naming none (a constant, `score()`,
+`hops()`) is filtered on the *last* slot, because the row channels are only
+settled once the path has been walked — `hops()` counts the hops so far, and
+a beam rewrites `score()`.
 
 **M3 landed** the AI-native surface: the hybrid operators of §4 —
 `Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed

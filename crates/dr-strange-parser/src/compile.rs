@@ -90,7 +90,13 @@ pub fn compile(
         for conj in split_and(w) {
             let vars = referenced_vars(&conj);
             let slot = match vars.len() {
-                0 => 0, // constant predicate — evaluate at the source
+                // No variable: a constant, or the row channels `score()` /
+                // `hops()`. Those are only settled once the whole path has
+                // been walked — `hops()` counts the hops taken so far, and a
+                // BEAM rewrites `score()` — so the predicate goes on the last
+                // slot. At the source it would read hops() = 0 and a score no
+                // MATCH has yet, and silently drop every row.
+                0 => last,
                 1 => {
                     let v = vars.iter().next().unwrap();
                     *var_slot
