@@ -1675,6 +1675,25 @@ impl WriteTransaction for NativeWriteTxn<'_> {
     }
 }
 
+impl NativeWriteTxn<'_> {
+    /// Commit at `max(snapshot + 1, floor)`: the freshly allocated sequence
+    /// unless the caller needs the store to stand at (at least) `floor`
+    /// afterwards. Snapshot restore on a replica is the caller: it lands the
+    /// master's data at the master's own sequence, so that the master's next
+    /// live batch — stamped one past that — is above this store's
+    /// `committed_seq` and [`NativeEngine::apply_replicated`] accepts it
+    /// rather than refusing it as a replay. Sequences still only advance:
+    /// the floor can only lift the commit, never lower it below the next
+    /// free sequence.
+    pub(crate) fn commit_at_least(self, floor: u64) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let seq = (self.snapshot + 1).max(floor);
+        self.engine.durable_commit(seq, self.buf).map(|_| ())
+    }
+}
+
 impl NativeEngine {
     /// Append `ops` as one WAL batch at `seq`, fsync, notify a registered
     /// replication observer, then publish to the memtable and flush/compact

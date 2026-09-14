@@ -246,7 +246,14 @@ impl Database {
         let mut stats = SnapshotStats::default();
 
         // One transaction, no automatic commit-seq bump — we land the source's
-        // exact sequence so the sidecars (stamped with it) stay valid.
+        // exact sequence so the sidecars (stamped with it) stay valid — and
+        // the engine's own sequence is lifted to it too: a replica that
+        // restores its master's snapshot must stand where the master stood,
+        // or the master's next live batch is refused as a replay (arch/01
+        // §9). A source sequence at or below this store's own (the master
+        // never wrote past its bootstrap) cannot be adopted without moving
+        // sequences backwards; the restore then lands at the next free one
+        // and a follower converges after one more resync.
         self.engine.with_write_raw(|txn| {
             while let Some(frame) = read_frame(&mut input)? {
                 match frame {
@@ -342,7 +349,7 @@ impl Database {
                 manifest.ok_or_else(|| Error::Corrupt("snapshot has no manifest".into()))?;
             graph::set_id_counters(txn, counters)?;
             graph::set_commit_seq(txn, seq)?;
-            Ok::<(), Error>(())
+            Ok::<((), u64), Error>(((), seq))
         })?;
 
         let seq = stats.seq;
@@ -681,6 +688,145 @@ mod tests {
         replica.apply_replicated(restore).unwrap();
         assert_eq!(replica.commit_seq().unwrap(), seq, "a restore moves no seq");
         assert_eq!(hops_of_node_1(&replica), vec![NodeId(2)]);
+    }
+
+    /// The replica flow end to end (arch/01 §9): a fresh follower opens
+    /// read-only (its bootstrap commit takes engine sequence 1), restores the
+    /// master's snapshot, then applies the master's live batches. The restore
+    /// must leave the follower's store at the master's sequence — not at
+    /// "one past its own bootstrap" — or the master's very next batch is at
+    /// or below the follower's `committed_seq` and `apply_replicated` refuses
+    /// it, which the follow loop answers with a full resync.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_fresh_replica_adopts_the_snapshot_sequence_and_accepts_the_next_batch() {
+        use std::sync::Mutex;
+        let master_dir = tempfile::tempdir().unwrap();
+        let master = Database::open(master_dir.path().join("db")).unwrap();
+        // Young master: bootstrap plus two data writes, so its sequence (3)
+        // is above what a fresh replica's own bootstrap + restore would
+        // allocate (2) — the case where a restore that allocates its own
+        // sequence leaves the replica *behind* the master.
+        for key in ["a", "b"] {
+            let mut w = master
+                .plane(graph::DEFAULT_PLANE_NAME)
+                .unwrap()
+                .write()
+                .unwrap();
+            w.create_node_with_key(key, &["Doc"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        let mut buf = Vec::new();
+        master.snapshot(&mut buf).unwrap();
+        let (_, master_seq) = master.engine.snapshot_window().unwrap();
+        assert_eq!(master_seq, 3);
+
+        // Live batches from here on, as `/ws/wal` would ship them.
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = batches.clone();
+        master
+            .on_wal_commit(move |b| sink.lock().unwrap().push(b))
+            .unwrap();
+
+        let replica_dir = tempfile::tempdir().unwrap();
+        let replica = Database::open_read_only(replica_dir.path().join("db")).unwrap();
+        let (_, before) = replica.engine.snapshot_window().unwrap();
+        assert_eq!(before, 1, "a fresh replica's bootstrap took sequence 1");
+        let stats = replica.restore(&mut buf.as_slice()).unwrap();
+        assert_eq!(stats.seq, master_seq);
+        let (_, after) = replica.engine.snapshot_window().unwrap();
+        assert_eq!(
+            after, master_seq,
+            "the restore landed at the snapshot's sequence, not at the replica's next free one"
+        );
+
+        // The master's next commit is the follower's first live batch.
+        {
+            let mut w = master
+                .plane(graph::DEFAULT_PLANE_NAME)
+                .unwrap()
+                .write()
+                .unwrap();
+            w.create_node_with_key("c", &["Doc"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        let batch = batches.lock().unwrap().pop().expect("one live batch");
+        assert_eq!(batch.seq, master_seq + 1);
+        replica
+            .apply_replicated(batch)
+            .expect("the first live batch after a bootstrap is accepted");
+        assert_eq!(replica.commit_seq().unwrap(), master.commit_seq().unwrap());
+        assert_eq!(
+            replica
+                .plane(graph::DEFAULT_PLANE_NAME)
+                .unwrap()
+                .catalog()
+                .unwrap()
+                .node_count,
+            3
+        );
+    }
+
+    /// The one sequence a restore cannot adopt: a master that never wrote
+    /// past its bootstrap has sequence 1, the same as the fresh replica's
+    /// own bootstrap, so the restore lands at 2 and the master's first batch
+    /// (2) is refused. The follow loop then resyncs from scratch — and the
+    /// resync converges, because the snapshot it pulls now includes that
+    /// batch and stands at 2, which the replica adopts. This pins that the
+    /// refusal is a single extra round trip and not a loop.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_never_written_master_costs_a_fresh_replica_one_resync_not_a_loop() {
+        use std::sync::Mutex;
+        let master_dir = tempfile::tempdir().unwrap();
+        let master = Database::open(master_dir.path().join("db")).unwrap();
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = batches.clone();
+        master
+            .on_wal_commit(move |b| sink.lock().unwrap().push(b))
+            .unwrap();
+        let write = |key: &str| {
+            let mut w = master
+                .plane(graph::DEFAULT_PLANE_NAME)
+                .unwrap()
+                .write()
+                .unwrap();
+            w.create_node_with_key(key, &["Doc"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        };
+        let fresh_replica = |buf: &[u8]| {
+            let dir = tempfile::tempdir().unwrap();
+            let replica = Database::open_read_only(dir.path().join("db")).unwrap();
+            replica.restore(&mut &*buf).unwrap();
+            (dir, replica)
+        };
+
+        // First attempt: snapshot at sequence 1, restore lands at 2, the
+        // master's first write (2) is refused.
+        let mut buf = Vec::new();
+        master.snapshot(&mut buf).unwrap();
+        let (_dir, replica) = fresh_replica(&buf);
+        write("a");
+        let batch = batches.lock().unwrap().pop().unwrap();
+        assert_eq!(batch.seq, 2);
+        assert!(matches!(
+            replica.apply_replicated(batch),
+            Err(Error::Conflict(_))
+        ));
+
+        // The resync: a new snapshot (sequence 2, the refused write inside),
+        // a fresh replica that adopts it, and the next batch is accepted.
+        let mut buf = Vec::new();
+        master.snapshot(&mut buf).unwrap();
+        let (_dir, replica) = fresh_replica(&buf);
+        write("b");
+        let batch = batches.lock().unwrap().pop().unwrap();
+        assert_eq!(batch.seq, 3);
+        replica.apply_replicated(batch).unwrap();
+        assert_eq!(replica.commit_seq().unwrap(), master.commit_seq().unwrap());
     }
 
     #[test]

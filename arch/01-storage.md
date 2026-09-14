@@ -390,13 +390,21 @@ key.
   replica's own write path, landing a batch at its master's exact `seq`)
   bypasses it entirely, since it isn't the gate this flag exists for. It
   does enforce §6.1's ordering rule: a batch at or below the replica's
-  `committed_seq` is `Error::Conflict`, and the follower resyncs. Known
-  gap: a fresh replica's own bootstrap (two `Database::init` commits) and
-  `restore` (one more) consume engine sequences 1–3, so against a master
-  whose snapshot `seq` is ≤ 2 (no data writes yet) the master's first live
-  batch is refused and the follower resyncs once more before converging.
-  The fix is API-side — the bootstrap/restore path should land the replica
-  at the snapshot's sequence rather than allocating its own.
+  `committed_seq` is `Error::Conflict`, and the follower resyncs. So that
+  this never fires on a healthy follow, `restore` lands its one commit at
+  the snapshot's own sequence (`max(next free, snapshot seq)`, via
+  `NativeWriteTxn::commit_at_least`) rather than allocating the replica's
+  next one: a fresh replica's bootstrap takes engine sequence 1, the restore
+  lifts it to the master's sequence, and the master's next live batch —
+  one past that — is accepted. The one sequence a restore cannot adopt is
+  one at or below the replica's own (a master that never wrote past its
+  bootstrap, sequence 1): moving sequences backwards is exactly what the
+  rule forbids, so the restore lands at 2, the master's first batch (2) is
+  refused, and the follower resyncs once — the snapshot it pulls then
+  includes that batch and stands at 2, which it adopts. Pinned by
+  `a_fresh_replica_adopts_the_snapshot_sequence_and_accepts_the_next_batch`
+  and `a_never_written_master_costs_a_fresh_replica_one_resync_not_a_loop`
+  in `api/snapshot.rs`.
 - `Database::init`'s one-time-per-open plane/counters bootstrap, and
   `restore`, both need to succeed on a read-only-opened engine — they're the
   engine's own setup, not a caller's write. Both go through a

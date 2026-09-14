@@ -7,6 +7,15 @@
 //! uses for `plane.watch` — so nothing committed on the master during the
 //! pull is ever missed: any batch that arrives before the snapshot's own
 //! commit sequence is already reflected in it and is simply skipped.
+//!
+//! Sequences: `Database::restore` lands the replica's store at the
+//! snapshot's sequence (arch/01 §9), so the master's next batch is above the
+//! replica's `committed_seq` and `apply_replicated` accepts it. A refusal
+//! (`Error::Conflict`) ends [`run_live_tail`], which asks for a resync; the
+//! CLI's outer loop wipes the directory, sleeps, and bootstraps again from a
+//! newer snapshot that includes the refused batch — so a refusal costs one
+//! round trip, never a loop: each resync's snapshot stands at least where
+//! the refused batch did, and a fresh replica adopts that.
 
 use std::io::Read;
 use std::sync::Arc;

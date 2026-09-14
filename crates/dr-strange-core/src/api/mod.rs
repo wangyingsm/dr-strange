@@ -179,24 +179,38 @@ impl Engine {
     /// (native-only, via `begin_write_unchecked`) since restoring a snapshot
     /// is precisely how a `serve --follow` replica (arch/01 §9) bootstraps —
     /// the one write path a read-only-opened database is meant to accept.
+    ///
+    /// `f` also returns the sequence the write should land at (or above): on
+    /// the native engine the batch is committed at `max(next, that)`, so a
+    /// replica's store stands at its master's sequence once the restore is
+    /// in and the master's next live batch is accepted by `apply_replicated`
+    /// instead of being refused as a replay. The other engines have no
+    /// replication and allocate as usual.
     fn with_write_raw<T>(
         &self,
-        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
+        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<(T, u64)>,
     ) -> Result<T> {
-        macro_rules! run {
-            ($begin:expr) => {{
-                let mut txn = $begin?;
-                let out = f(&mut txn)?;
+        match self {
+            Engine::Memory(e) => {
+                let mut txn = e.begin_write()?;
+                let (out, _) = f(&mut txn)?;
                 txn.commit()?;
                 Ok(out)
-            }};
-        }
-        match self {
-            Engine::Memory(e) => run!(e.begin_write()),
+            }
             #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
-            Engine::Redb(e) => run!(e.begin_write()),
+            Engine::Redb(e) => {
+                let mut txn = e.begin_write()?;
+                let (out, _) = f(&mut txn)?;
+                txn.commit()?;
+                Ok(out)
+            }
             #[cfg(feature = "native-backend")]
-            Engine::Native(e) => run!(e.begin_write_unchecked()),
+            Engine::Native(e) => {
+                let mut txn = e.begin_write_unchecked()?;
+                let (out, land_at) = f(&mut txn)?;
+                txn.commit_at_least(land_at)?;
+                Ok(out)
+            }
         }
     }
 
