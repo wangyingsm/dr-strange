@@ -300,6 +300,14 @@ pub struct NativeEngine {
     /// so a test can prove readers get through that window.
     #[cfg(test)]
     flush_pause: test_hooks::Pause,
+    /// Test seam: makes the next flush's SST write fail, standing in for a
+    /// disk that still takes the log but refuses a new file.
+    #[cfg(test)]
+    sst_write_fault: test_hooks::Fault,
+    /// Test seam: makes the next WAL truncation's fsync fail, after the
+    /// truncate itself took effect.
+    #[cfg(test)]
+    wal_sync_fault: test_hooks::Fault,
 }
 
 impl NativeEngine {
@@ -390,6 +398,10 @@ impl NativeEngine {
             last_maintenance_error: Mutex::new(None),
             #[cfg(test)]
             flush_pause: test_hooks::Pause::default(),
+            #[cfg(test)]
+            sst_write_fault: test_hooks::Fault::default(),
+            #[cfg(test)]
+            wal_sync_fault: test_hooks::Fault::default(),
         })
     }
 
@@ -426,6 +438,8 @@ impl NativeEngine {
             }
             let n = store.next_sst;
             let path = self.dir.join(format!("sst-{n:06}"));
+            #[cfg(test)]
+            self.sst_write_fault.trip()?;
             sst::write(&path, &store.mem, store.committed_seq)?;
             #[cfg(test)]
             self.flush_pause.wait();
@@ -453,8 +467,15 @@ impl NativeEngine {
         wal.flush()?;
         let f = wal.get_mut();
         f.set_len(0)?;
-        f.sync_all()?;
+        // The cursor moves the instant the file is cut, before anything that
+        // can fail: a commit is Ok even when its maintenance fails, so were the
+        // fsync below to fail with the cursor still at the old end, every later
+        // batch would be appended behind a zero-filled hole that replay reads
+        // as an empty torn tail — durable commits, lost on the next open.
         f.seek(SeekFrom::Start(0))?;
+        f.sync_all()?;
+        #[cfg(test)]
+        self.wal_sync_fault.trip()?;
         sync_dir(&self.dir)?;
         Ok(())
     }
@@ -832,6 +853,7 @@ fn emit_group(
 
 #[cfg(test)]
 mod test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
 
     /// An optional rendezvous a code path waits at when armed. Arriving there
@@ -855,6 +877,26 @@ mod test_hooks {
                 let _ = tx.send(());
                 b.wait();
             }
+        }
+    }
+
+    /// A one-shot injected I/O failure: once armed, the next `trip` returns
+    /// an error and disarms, so a test can fail a chosen step of a code path
+    /// deterministically on every platform and uid (unlike permission bits,
+    /// which root ignores).
+    #[derive(Default)]
+    pub(super) struct Fault(AtomicBool);
+
+    impl Fault {
+        pub(super) fn arm(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        pub(super) fn trip(&self) -> crate::Result<()> {
+            if self.0.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected fault").into());
+            }
+            Ok(())
         }
     }
 }
@@ -1174,56 +1216,97 @@ mod engine_tests {
     fn a_commit_is_ok_once_durable_even_when_the_flush_it_triggers_fails() {
         // A commit's batch is durable (WAL fsync) and visible (published) before
         // any flush runs, so a flush failure must not turn into an `Err` that a
-        // caller reads as "nothing landed".
+        // caller reads as "nothing landed". The SST write is failed through the
+        // injection seam rather than directory permissions, which root ignores
+        // and non-unix lacks: the WAL is already open, so its append + fsync
+        // is unaffected — the shape of a disk that still takes the log but
+        // refuses a new file.
         let dir = Dir::new("maint");
         let e = NativeEngine::open_with_threshold(&dir.0, 1).unwrap();
         commit(&e, b"a", b"1");
         assert_eq!(e.last_maintenance_error(), None);
 
-        // Fail the SST write via directory permissions, which only unix
-        // honours; skip (rather than pretend) elsewhere or as root, who
-        // ignores permission bits. Note that the WAL is already open, so its
-        // append + fsync is unaffected: exactly the shape of a disk that still
-        // takes the log but refuses a new file.
-        #[cfg(unix)]
+        e.sst_write_fault.arm();
+        let mut w = e.begin_write().unwrap();
+        w.put(TableId::Nodes, b"b", b"2").unwrap();
+        w.commit()
+            .expect("the batch is durable and published; commit is Ok");
+        assert_eq!(get(&e, b"b"), Some(b"2".to_vec()), "published");
+        assert_eq!(e.committed_seq(), 2);
+        let err = e
+            .last_maintenance_error()
+            .expect("the failed flush is remembered");
+        assert!(err.contains("injected fault"), "{err}");
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
-            if File::create(dir.0.join("probe")).is_ok() {
-                let _ = std::fs::remove_file(dir.0.join("probe"));
-                return; // root: permissions don't bite, nothing to test here
-            }
-
-            let mut w = e.begin_write().unwrap();
-            w.put(TableId::Nodes, b"b", b"2").unwrap();
-            w.commit()
-                .expect("the batch is durable and published; commit is Ok");
-            assert_eq!(get(&e, b"b"), Some(b"2".to_vec()), "published");
-            assert_eq!(e.committed_seq(), 2);
-            let err = e
-                .last_maintenance_error()
-                .expect("the failed flush is remembered");
-            assert!(err.contains("ermission"), "{err}");
-
-            // Once the cause clears, the next commit retries maintenance and
-            // the slot resets.
-            std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
-            commit(&e, b"c", b"3");
-            assert_eq!(e.last_maintenance_error(), None);
             let store = e.store.read().unwrap_or_else(|e| e.into_inner());
-            assert!(
-                store.mem.is_empty(),
-                "the retried flush emptied the memtable"
-            );
-            assert!(!store.ssts.is_empty());
-            drop(store);
-
-            // And nothing was lost across a reopen.
-            drop(e);
-            let e = NativeEngine::open(&dir.0).unwrap();
-            assert_eq!(get(&e, b"b"), Some(b"2".to_vec()));
-            assert_eq!(get(&e, b"c"), Some(b"3".to_vec()));
+            assert!(!store.mem.is_empty(), "the memtable stays for the retry");
+            assert_eq!(store.ssts.len(), 1, "only the first commit's run exists");
         }
+
+        // Once the cause clears, the next commit retries maintenance and
+        // the slot resets.
+        commit(&e, b"c", b"3");
+        assert_eq!(e.last_maintenance_error(), None);
+        let store = e.store.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            store.mem.is_empty(),
+            "the retried flush emptied the memtable"
+        );
+        assert_eq!(store.ssts.len(), 2);
+        drop(store);
+
+        // And nothing was lost across a reopen.
+        drop(e);
+        let e = NativeEngine::open(&dir.0).unwrap();
+        assert_eq!(get(&e, b"b"), Some(b"2".to_vec()));
+        assert_eq!(get(&e, b"c"), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn commits_after_a_failed_wal_truncation_fsync_start_at_offset_zero() {
+        // The flush cuts the WAL once its SST is durable. If the fsync of that
+        // cut fails, the commit that triggered the flush is still Ok and the
+        // engine keeps taking commits — so the write cursor must already be
+        // at 0, or every later batch lands behind a hole of zeros that replay
+        // reads as an empty torn tail and the next open discards.
+        let dir = Dir::new("wal-cursor");
+        // Threshold so that one big value flushes and a small one does not.
+        let e = NativeEngine::open_with_threshold(&dir.0, 64).unwrap();
+        e.wal_sync_fault.arm();
+        commit(&e, b"big", &[7u8; 128]); // flushes; the truncate's fsync fails
+        let err = e
+            .last_maintenance_error()
+            .expect("the failed truncation fsync is remembered");
+        assert!(err.contains("injected fault"), "{err}");
+        assert_eq!(get(&e, b"big"), Some(vec![7u8; 128]));
+
+        commit(&e, b"small", b"v"); // no flush: lives only in the WAL
+        assert_eq!(e.last_maintenance_error(), None);
+        {
+            let mut wal = e.wal.lock().unwrap_or_else(|e| e.into_inner());
+            wal.flush().unwrap();
+            let f = wal.get_mut();
+            let len = f.metadata().unwrap().len();
+            let mut head = [0u8; 4];
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_exact(&mut head).unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            assert!(
+                len < 64,
+                "the WAL holds one small record, not a hole: {len}"
+            );
+            assert_ne!(head, [0u8; 4], "the record's length prefix is at offset 0");
+        }
+
+        drop(e);
+        let e = NativeEngine::open(&dir.0).unwrap();
+        assert_eq!(get(&e, b"big"), Some(vec![7u8; 128]), "from the run");
+        assert_eq!(
+            get(&e, b"small"),
+            Some(b"v".to_vec()),
+            "the commit after the failed fsync survives a reopen"
+        );
+        assert_eq!(e.committed_seq(), 2);
     }
 
     #[test]
