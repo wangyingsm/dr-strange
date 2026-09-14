@@ -58,8 +58,13 @@ the cross-engine harness live in `benchmarks/` — `just benchmark` /
   `drsg query 'MATCH ...'`.
 - Import formats: JSONL of `{labels, external_key?, properties}` node lines
   and `{src_key, dst_key, type, properties}` edge lines; property values may
-  be `{"$desc": "...", "$value": ...}` to carry `PropDesc` descriptions. CSV
-  with a column-mapping flag for tabular sources.
+  be `{"$desc": "...", "$value": ...}` to carry `PropDesc` descriptions. The
+  dialect's escape objects are exactly `$vector`, `$desc`/`$value`, `$bytes`
+  and `$map` (a nested map whose own keys begin with `$`, so a literal
+  `$value` key is data, not an escape); any other object is a nested map,
+  and an integer beyond `i64` is rejected rather than rounded — the list in
+  `dr-strange-core/src/json.rs` is the contract. CSV with a column-mapping
+  flag for tabular sources.
 - Output: human tables by default (TTY), `--json` for scripts; descriptions
   shown with `--verbose`, elided otherwise.
 - Exit codes map from `dr_strange_core::Error` variants; `drsg check` is the harness

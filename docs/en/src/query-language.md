@@ -244,7 +244,7 @@ MERGE (n:Person {key: $k}) ON CREATE SET n.seen = 1
 ### Literals and identifiers
 
 Strings take either quote and the usual escapes — `\'`, `\"`, `\\`, `\n`,
-`\t`, `\r`, `\uXXXX` — so a value that contains a quote is written inside the
+`\t`, `\r`, `\b`, `\f`, `\uXXXX` — so a value that contains a quote is written inside the
 literal, never around it; an unknown escape or an unterminated string is a
 syntax error. Numbers are ints (`42`) or floats (`3.5`, `1e9`, `2.5E-3`).
 Identifiers (variables, labels, types, property keys) are Unicode words

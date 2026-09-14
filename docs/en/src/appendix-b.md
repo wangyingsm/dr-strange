@@ -179,12 +179,16 @@ a type. `MATCH … mutate-op` operates on the pattern's terminal variable.
 ## Terminals
 
 ```text
-ident          ::= ( letter | '_' ) { letter | digit | '_' }
+ident          ::= ( letter | '_' ) { letter | digit | '_' }     (* Unicode letters *)
+                 | '`' { any character except '`' } '`'
 uint           ::= digit { digit }
 int            ::= [ '-' ] uint
-number         ::= [ '-' ] digit { digit } [ '.' digit { digit } ]
-string         ::= '"' { any character except '"' } '"'
-                 | "'" { any character except "'" } "'"
+number         ::= [ '-' ] digit { digit } [ '.' digit { digit } ] [ exponent ]
+exponent       ::= ( 'e' | 'E' ) [ '+' | '-' ] digit { digit }
+string         ::= '"' { string-char | escape } '"'
+                 | "'" { string-char | escape } "'"
+string-char    ::= any character except the closing quote or '\\'
+escape         ::= '\\' ( '\'' | '"' | '\\' | 'n' | 't' | 'r' | 'b' | 'f' | 'u' hex hex hex hex )
 vector         ::= '[' [ number { ',' number } ] ']'
 vec-arg        ::= string | vector
 metric         ::= 'cosine' | 'dot' | 'l2'
@@ -193,9 +197,12 @@ literal        ::= number | string | 'true' | 'false' | 'null' | vector
 value          ::= param | literal
 ```
 
-Strings have no escape sequences in this cut, so a quote cannot appear inside a
-string of the same kind. Whitespace between tokens is insignificant; there are
-no comments. A `$name` parameter stands where a value does, resolved from the
+Inside a string a backslash starts an escape — `\'`, `\"`, `\\`, `\n`, `\t`,
+`\r`, `\b`, `\f`, `\uXXXX` — so a quote of the same kind is written escaped, a literal
+backslash is written `\\` (a Windows path is `"C:\\data"`), and an unknown
+escape or an unterminated string is a syntax error. Identifiers are Unicode
+words, or anything between backticks when the plain form cannot spell the name.
+Whitespace between tokens is insignificant; there are no comments. A `$name` parameter stands where a value does, resolved from the
 caller's parameter map at parse time — the injection-safe way to pass values.
 
 ## Defaults
@@ -246,4 +253,4 @@ Each of these is a clear error, never a silent mis-compile:
 - branching patterns — one linear path per statement.
 - unbounded variable-length relationships — `*`, `*2..`.
 - undirected or untyped created edges.
-- comments, string escapes, and `WITH`.
+- comments and `WITH`.

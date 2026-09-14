@@ -170,12 +170,16 @@ prop-entry     ::= ident ':' value
 ## 终结符
 
 ```text
-ident          ::= ( letter | '_' ) { letter | digit | '_' }
+ident          ::= ( letter | '_' ) { letter | digit | '_' }     (* Unicode 字母 *)
+                 | '`' { 除 '`' 外的任意字符 } '`'
 uint           ::= digit { digit }
 int            ::= [ '-' ] uint
-number         ::= [ '-' ] digit { digit } [ '.' digit { digit } ]
-string         ::= '"' { 除 '"' 外的任意字符 } '"'
-                 | "'" { 除 "'" 外的任意字符 } "'"
+number         ::= [ '-' ] digit { digit } [ '.' digit { digit } ] [ exponent ]
+exponent       ::= ( 'e' | 'E' ) [ '+' | '-' ] digit { digit }
+string         ::= '"' { string-char | escape } '"'
+                 | "'" { string-char | escape } "'"
+string-char    ::= 除闭合引号与 '\\' 外的任意字符
+escape         ::= '\\' ( '\'' | '"' | '\\' | 'n' | 't' | 'r' | 'b' | 'f' | 'u' hex hex hex hex )
 vector         ::= '[' [ number { ',' number } ] ']'
 vec-arg        ::= string | vector
 metric         ::= 'cosine' | 'dot' | 'l2'
@@ -184,8 +188,10 @@ literal        ::= number | string | 'true' | 'false' | 'null' | vector
 value          ::= param | literal
 ```
 
-目前字符串不支持转义序列，因此同类引号不能出现在字符串内部。记号之间的空白没有
-意义，也不支持注释。`$name` 参数写在值的位置上，解析时会从调用方的参数映射里取值，
+字符串内部的反斜杠开始一个转义——`\'`、`\"`、`\\`、`\n`、`\t`、`\r`、`\b`、`\f`、`\uXXXX`——
+因此同类引号以转义写出，字面反斜杠写作 `\\`（Windows 路径写作 `"C:\\data"`），
+未知转义或未闭合的字符串是语法错误。标识符是 Unicode 单词，或当普通写法拼不出该
+名字时放在反引号之间的任何内容。记号之间的空白没有意义，也不支持注释。`$name` 参数写在值的位置上，解析时会从调用方的参数映射里取值，
 这样传值就不必担心注入问题。
 
 ## 默认值
@@ -234,4 +240,4 @@ CALL 'shortest_path' ( from: key-or-id , to: key-or-id [ , dir: string ]
 - 分支模式——每条语句只允许一条线性路径。
 - 无界的可变长度关系——`*`、`*2..`。
 - 无向或未指明类型的新建边。
-- 注释、字符串转义，以及 `WITH`。
+- 注释，以及 `WITH`。

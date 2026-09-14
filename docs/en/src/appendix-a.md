@@ -9,8 +9,9 @@ Each entry shows the method, its **access** tier (`read` / `write` / `admin`;
 under the single shared token all three require the same token), a one-line
 summary, and its parameters. A parameter is written `name` type; **`!` marks a
 required parameter**. Types are JSON values; `Properties` is the property-map
-dialect (`{"$vector":[…]}`, `{"$desc":…,"$value":…}`), and `NodeRef` is a node id
-or an external key.
+dialect (`{"$vector":[…]}`, `{"$desc":…,"$value":…}`, `{"$bytes":[…]}`, and
+`{"$map":{…}}` for a nested map whose own keys begin with `$`; integers must fit
+a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
 ## Discovery and database
 
