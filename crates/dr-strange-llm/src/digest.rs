@@ -22,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{AHashMap, AHashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use dr_strange_core::json;
 use dr_strange_core::{
     BulkEdge, BulkNode, BulkStats, Metric, PropDesc, PropValue, Properties, WriteTxn,
@@ -1239,7 +1239,15 @@ struct ChunkExtract {
 /// Runs every chunk's extraction chat call, up to `concurrency` at once, and
 /// returns the results in chunk order. A bounded scoped-thread pool over an
 /// atomic cursor; the chat provider is `Sync` and only immutable data is shared,
-/// so no locks are held across a request. The first chunk to error aborts.
+/// so no locks are held across a request.
+///
+/// The first chunk to fail aborts the run — and *stops the others*: a worker
+/// checks the flag before taking another chunk, so a dead key or a provider
+/// that is down costs the calls already in flight and nothing after them,
+/// where a hundred-chunk document used to make its hundred doomed requests
+/// before reporting the first. The error returned is the earliest failed
+/// chunk's, in chunk order, so the report is the same however the workers
+/// interleaved.
 fn extract_all(
     chat: &(dyn Chat + Sync),
     system: &str,
@@ -1251,27 +1259,46 @@ fn extract_all(
     let slots: Vec<Mutex<Option<Result<ChunkExtract>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let cursor = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
     let workers = concurrency.clamp(1, n.max(1));
-    let slots_ref = &slots;
-    let cursor_ref = &cursor;
+    let (slots_ref, cursor_ref, aborted_ref) = (&slots, &cursor, &aborted);
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(move || {
                 loop {
+                    if aborted_ref.load(Ordering::Acquire) {
+                        break;
+                    }
                     let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
                     let out = extract_chunk(chat, system, blocks[i].as_deref(), &chunks[i]);
-                    *slots_ref[i].lock().unwrap() = Some(out);
+                    if out.is_err() {
+                        aborted_ref.store(true, Ordering::Release);
+                    }
+                    *slots_ref[i]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
                 }
             });
         }
     });
-    slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().expect("every chunk was processed"))
-        .collect()
+    let mut out = Vec::with_capacity(n);
+    for slot in slots {
+        match slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(Ok(extract)) => out.push(extract),
+            Some(Err(e)) => return Err(e),
+            // Never started: a failure before it aborted the run, and that
+            // failure is in an earlier slot, so this arm is unreachable in
+            // practice — but a hole is not a result, so it is not one here.
+            None => bail!("extraction was abandoned after an earlier chunk failed"),
+        }
+    }
+    Ok(out)
 }
 
 /// Extracts one chunk. On a truncated reply (the chunk is too dense to fit the

@@ -31,7 +31,7 @@ pub use digest::{
 };
 pub use document::to_markdown;
 pub use identity::IdentityReport;
-pub use openai::{OpenAiProvider, build_provider};
+pub use openai::{CHAT_OMIT_ENV, OpenAiProvider, build_provider};
 /// The official plugin catalog — data fetched from the extensions repository,
 /// not a constant of this binary.
 #[cfg(feature = "plugins")]
