@@ -207,6 +207,41 @@ Inherited from redb in v1:
   cost; the single-writer ceiling is an accepted v1 constraint (revisit if
   ingest throughput demands a RocksDB backend or group-commit machinery).
 
+### 6.1 Native engine commit contract
+
+The native LSM (`storage/native`) commits a transaction as one
+length+CRC-prefixed WAL batch, `fsync`s it, notifies the replication observer,
+then publishes it to the memtable under the store write lock. The rules that
+follow from that ordering:
+
+- **`commit` returns `Ok` exactly when the batch is durable and visible.** The
+  flush and compaction a commit may trigger run *after* publication, so their
+  failure is not the commit's failure: it is logged (`tracing::error!`) and
+  kept in `NativeEngine::last_maintenance_error` for `check`/stats to report,
+  and the next commit retries naturally (a failed flush leaves the memtable
+  over threshold, a failed compaction leaves the runs in place). Callers —
+  the API layer applies index/keyword events only after `Ok` — may rely on
+  `Err` meaning "nothing landed".
+- **Directory metadata is fsynced.** An SST's temp+fsync+rename is followed
+  by an fsync of the directory, and so is the WAL truncation that depends on
+  it; otherwise the SST's name could be lost in a crash after the WAL that
+  held its records was already cut. No-op on non-unix.
+- **A WAL record body is at most `u32::MAX` bytes.** A larger serialized
+  batch is refused with `Error::InvalidArgument` before a byte is written;
+  the alternative (a wrapped length prefix) would be a record replay treats
+  as a torn tail — a commit reported durable, then lost.
+- **Replicated sequences only advance.** `apply_replicated` lands a batch at
+  its master's own `seq`; a `seq` at or below the replica's `committed_seq`
+  is refused with `Error::Conflict` (the follower treats any error as
+  "resync from a fresh snapshot", which re-captures the batch). Landing it
+  would stamp versions older than ones already visible.
+- **The WAL observer runs outside its registration mutex** (a blocking
+  subscriber cannot wedge `set_wal_observer`); ordering is still strict
+  commit order because every commit path holds the write gate for the whole
+  of `durable_commit`.
+- **Torn tail.** Replay stops at the first short or checksum-failing record
+  and truncates the WAL there; every earlier commit is intact.
+
 ## 7. Testing strategy
 
 - Property-based tests: random operation sequences applied both to the real
