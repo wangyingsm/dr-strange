@@ -135,9 +135,12 @@ type wsConn struct {
 	closeOnce sync.Once
 }
 
-// dialWebSocket opens a WebSocket to <baseURL>/ws, carrying the token in the
-// query string (browsers can't set a header on the handshake, and the server
-// reads ?token= there). Both the TCP/TLS dial and the HTTP upgrade honour ctx:
+// dialWebSocket opens a WebSocket to <baseURL>/ws, carrying the token as an
+// `Authorization: Bearer` header on the upgrade — the form the server prefers
+// (arch/08-web-ui §4.1). The `?token=` query form exists only for browsers,
+// whose WebSocket API cannot set headers; a native client never puts the
+// credential in a URL, where proxies and access logs would keep it. Both the
+// TCP/TLS dial and the HTTP upgrade honour ctx:
 // cancelling it, or reaching its deadline, fails the call promptly.
 func dialWebSocket(ctx context.Context, baseURL, token string) (*wsConn, error) {
 	u, err := url.Parse(baseURL)
@@ -185,15 +188,16 @@ func dialWebSocket(ctx context.Context, baseURL, token string) (*wsConn, error) 
 		return err
 	}
 
-	path := "/ws"
+	authz := ""
 	if token != "" {
-		path += "?token=" + url.QueryEscape(token)
+		authz = "Authorization: Bearer " + token + "\r\n"
 	}
 	var keyBytes [16]byte
 	_, _ = rand.Read(keyBytes[:])
 	key := base64.StdEncoding.EncodeToString(keyBytes[:])
-	handshake := "GET " + path + " HTTP/1.1\r\n" +
+	handshake := "GET /ws HTTP/1.1\r\n" +
 		"Host: " + u.Host + "\r\n" +
+		authz +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +

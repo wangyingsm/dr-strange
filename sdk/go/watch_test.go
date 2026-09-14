@@ -23,8 +23,17 @@ import (
 // fakeWS serves /ws by completing the RFC 6455 upgrade and handing the raw
 // socket to handle; the socket is closed when handle returns.
 func fakeWS(t *testing.T, handle func(conn net.Conn, r *bufio.Reader)) *httptest.Server {
+	return fakeWSInspecting(t, nil, handle)
+}
+
+// fakeWSInspecting is fakeWS with a hook that sees the upgrade request before
+// it is answered, for tests about what the handshake carries.
+func fakeWSInspecting(t *testing.T, inspect func(req *http.Request), handle func(conn net.Conn, r *bufio.Reader)) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if inspect != nil {
+			inspect(req)
+		}
 		key := req.Header.Get("Sec-WebSocket-Key")
 		sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 		hj, ok := w.(http.Hijacker)
@@ -104,6 +113,33 @@ func waitGoroutines(t *testing.T, base int) {
 	buf := make([]byte, 1<<16)
 	n := runtime.Stack(buf, true)
 	t.Fatalf("goroutines did not return to %d (now %d):\n%s", base, runtime.NumGoroutine(), buf[:n])
+}
+
+// The token travels as a bearer header on the upgrade, never in the URL: a
+// query-string credential ends up in proxy and access logs, and the server
+// prefers the header (arch/08-web-ui §4.1; ?token= is for browsers only).
+func TestWatchSendsBearerHeaderNotQueryToken(t *testing.T) {
+	var gotAuth, gotURI string
+	srv := fakeWSInspecting(t, func(req *http.Request) {
+		gotAuth = req.Header.Get("Authorization")
+		gotURI = req.URL.RequestURI()
+	}, func(conn net.Conn, r *bufio.Reader) {
+		_, _ = readClientFrame(r)
+		_, _ = conn.Write([]byte{0x88, 0x00})
+	})
+
+	events, err := New(WithBaseURL(srv.URL), WithToken("s3cret")).Watch(context.Background(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	if gotAuth != "Bearer s3cret" {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer s3cret")
+	}
+	if gotURI != "/ws" {
+		t.Fatalf("request URI = %q, want /ws with no token", gotURI)
+	}
 }
 
 func TestWatchServerClosesFirstLeavesNoGoroutine(t *testing.T) {
