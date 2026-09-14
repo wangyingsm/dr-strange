@@ -116,6 +116,15 @@ thread_local! {
     static SEARCH_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
+/// The largest `visited` buffer a thread keeps between searches. The scratch
+/// lives as long as the thread and only ever grows, so without a cap a big
+/// index would pin `4 * N` bytes on every thread that ever searched it — a
+/// pool of long-lived workers multiplies that. Up to this size (4M nodes) the
+/// buffer is kept and a query costs no allocation; above it the thread's
+/// scratch is dropped after the search, which is the per-query allocation the
+/// scratch replaced — no worse than before, and bounded per thread.
+const RETAINED_SCRATCH_BYTES: usize = 16 << 20;
+
 impl Scratch {
     /// Ready the buffers for a search over `n` nodes: grow `visited`, bump the
     /// generation (clearing on the rare `u32` wrap), and empty the heaps.
@@ -130,6 +139,12 @@ impl Scratch {
         }
         self.cand.clear();
         self.w.clear();
+    }
+
+    /// Whether this scratch is small enough to keep for the thread's next
+    /// search (see [`RETAINED_SCRATCH_BYTES`]).
+    fn retainable(&self) -> bool {
+        self.visited.capacity() * std::mem::size_of::<u32>() <= RETAINED_SCRATCH_BYTES
     }
 }
 
@@ -402,7 +417,9 @@ impl HnswIndex {
         }
 
         let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
-        SEARCH_SCRATCH.with(|c| *c.borrow_mut() = scratch);
+        if scratch.retainable() {
+            SEARCH_SCRATCH.with(|c| *c.borrow_mut() = scratch);
+        }
 
         let hits = top_k(
             w.into_iter()
@@ -868,6 +885,33 @@ mod tests {
     use super::*;
     use crate::storage::vector::BruteForceIndex;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_search_scratch_beyond_the_cap_is_not_kept_for_the_thread() {
+        // A thread that once served a huge index must not pin that index's
+        // visited buffer forever: after a search the scratch is put back only
+        // if it is under the cap. Plant an over-cap scratch on this thread,
+        // search a tiny index, and check the thread now holds nothing.
+        let over = RETAINED_SCRATCH_BYTES / std::mem::size_of::<u32>() + 1;
+        SEARCH_SCRATCH.with(|c| {
+            *c.borrow_mut() = Scratch {
+                visited: Vec::with_capacity(over),
+                ..Scratch::default()
+            }
+        });
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        idx.insert(1, &[1.0, 0.0]).unwrap();
+        idx.insert(2, &[0.0, 1.0]).unwrap();
+        assert_eq!(idx.search(&[1.0, 0.1], 1, None).unwrap()[0].id, 1);
+        let kept = SEARCH_SCRATCH.with(|c| c.borrow().visited.capacity());
+        assert_eq!(kept, 0, "an over-cap scratch is dropped, not retained");
+
+        // Whereas a normal-sized one is kept, so the next query allocates
+        // nothing.
+        assert_eq!(idx.search(&[0.1, 1.0], 1, None).unwrap()[0].id, 2);
+        let kept = SEARCH_SCRATCH.with(|c| c.borrow().visited.capacity());
+        assert!(kept >= 2 && kept * 4 <= RETAINED_SCRATCH_BYTES, "{kept}");
+    }
 
     /// Deterministic vector generator (seeded xorshift → f32 in [-1,1]).
     struct Gen(u64);
