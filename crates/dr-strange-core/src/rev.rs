@@ -187,7 +187,23 @@ pub fn commit_header(commit: &CommitRef, rev: &str) -> String {
             "note: reachable: false — a rewrite left this commit behind, and gc may prune it\n",
         );
     }
+    if let Some(day) = bare_day(rev) {
+        out.push_str(&format!(
+            "note: {day} is read as the end of that day in UTC; the date above is the \
+             committer's own\n"
+        ));
+    }
     out
+}
+
+/// The `YYYY-MM-DD` a revision names as a whole day, when it names one.
+fn bare_day(rev: &str) -> Option<&str> {
+    let base = rev.split(['~', '^']).next()?;
+    let day = base
+        .strip_suffix('}')
+        .and_then(|b| b.split_once("@{"))
+        .map_or(base, |(_, when)| when);
+    date_end_of_day(day).map(|_| day)
 }
 
 /// The commits an ambiguous sha prefix matched, and how to narrow them.
@@ -640,5 +656,12 @@ mod tests {
         };
         assert!(!lost.reachable);
         assert!(commit_header(&lost, LOST).contains("reachable: false"));
+        let RevAnswer::One(dated) = answer(&db, None, "1970-01-01") else {
+            panic!()
+        };
+        let utc = "note: 1970-01-01 is read as the end of that day in UTC";
+        assert!(commit_header(&dated, "1970-01-01").contains(utc));
+        assert!(commit_header(&dated, "origin/main@{1970-01-01}~1").contains(utc));
+        assert!(!commit_header(&dated, "1970-01-01T00:58:20Z").contains("UTC"));
     }
 }
