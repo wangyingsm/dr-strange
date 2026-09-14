@@ -242,6 +242,30 @@ follow from that ordering:
 - **Torn tail.** Replay stops at the first short or checksum-failing record
   and truncates the WAL there; every earlier commit is intact.
 
+### 6.2 SST file format
+
+An SST (`storage/native/sst.rs`) is data blocks, an index block, a Bloom
+block and a fixed 56-byte footer whose magic names the format version:
+
+- **v1 (`DRSS`)** — blocks carry no checksum. Read-only: readers still open
+  v1 files (a v1 run is rewritten as v2 by the next compaction), and the
+  writer never emits it.
+- **v2 (`DRS2`, current)** — every block (data, index, bloom) ends with a
+  CRC-32 of its bytes; the index/footer lengths include the 4-byte trailer.
+
+Rules readers honour for either version:
+
+- **Corruption is `Error::Corrupt`, never "absent".** A block whose CRC does
+  not match, whose bytes do not decode to whole entries (v1 has only this
+  check), or that lies outside the file per the footer/index, fails the read
+  (`get`/`range`/`load_into`) or the open (index/bloom). Iteration must not
+  stop quietly at a broken entry: that reported bit-rot as a missing key,
+  and a compaction over such a run would have dropped the tail of the block
+  for good. Only verified payloads enter the block cache.
+- **Reads are positional.** Blocks are read with `pread` (`seek_read` on
+  Windows) against a shared `File`, never through a seeking cursor under a
+  mutex, so concurrent readers of one run do not serialize.
+
 ## 7. Testing strategy
 
 - Property-based tests: random operation sequences applied both to the real
