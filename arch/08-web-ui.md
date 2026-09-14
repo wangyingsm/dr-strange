@@ -64,6 +64,14 @@ Landing view: the state of the database at a glance.
   JSON-RPC results verbatim; stats granular enough to drive the dashboard.
 - The executor's score channel must be surfaced in rows (done — 03 §2), so
   plots can size/color by score without recomputation.
+- The server's own linear scans are paged and stop early, since they run
+  on a header keystroke. `plane.find` walks the plane `SCAN_PAGE` (2 000)
+  nodes at a time and stops at `limit` hits or `FIND_SCAN_CAP` (20 000)
+  nodes examined; `graph.seed order=degree` measures the degree of at most
+  `SEED_SCAN_CAP` (20 000) nodes into a bounded top-`limit` heap; both take
+  `total` from the transactional counters (03 §5), so no request ever holds
+  the whole plane in one vector. The core keeps no per-node degree, so a
+  degree is one neighbour lookup — the cap is what bounds a degree seed.
 - Nothing in the core may assume a TTY or block indefinitely without a
   cancellation path.
 

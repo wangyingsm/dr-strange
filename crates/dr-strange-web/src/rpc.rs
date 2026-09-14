@@ -715,6 +715,136 @@ mod tests {
         assert_eq!(r["truncated"], true);
     }
 
+    /// A plane wider than one scan page: a hub wired to a leaf on every
+    /// page, plus a rival hub of equal degree created later. Returns the db
+    /// and the ids of (hub, rival) — the two the ranking must place first,
+    /// hub before rival because ties break on id.
+    fn paged_graph() -> (Database, u64, u64) {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let hub = txn
+            .create_node_with_key("hub", &["Hub"], Properties::new())
+            .unwrap();
+        let mut leaves = Vec::new();
+        for i in 0..(crate::methods::SCAN_PAGE as usize + 50) {
+            let leaf = txn
+                .create_node_with_key(&format!("leaf-{i}"), &["Leaf"], Properties::new())
+                .unwrap();
+            leaves.push(leaf);
+            if i % 500 == 0 {
+                txn.create_edge(hub, leaf, "SPOKE", Properties::new())
+                    .unwrap();
+            }
+        }
+        let rival = txn
+            .create_node_with_key("rival", &["Hub"], Properties::new())
+            .unwrap();
+        for leaf in leaves.iter().rev().take(5) {
+            txn.create_edge(rival, *leaf, "SPOKE", Properties::new())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        (db, hub.0, rival.0)
+    }
+
+    /// The bounded, paged degree ranking returns exactly what the previous
+    /// load-everything-and-sort did: descending degree, ties by ascending
+    /// id, `total` from the counters, and the induced edges among the picks.
+    #[test]
+    fn graph_seed_by_degree_ranks_across_pages_like_a_full_sort() {
+        let (db, hub, rival) = paged_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup","order":"degree","limit":4},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        let ids: Vec<u64> = r["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_u64().unwrap())
+            .collect();
+        // Brute force over the whole plane, the way the handler used to.
+        let plane = db.plane("startup").unwrap();
+        let mut expected: Vec<(u64, usize)> = plane
+            .query()
+            .scan_all()
+            .ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| {
+                (
+                    id.0,
+                    plane
+                        .neighbors(id, dr_strange_core::Dir::Both, None)
+                        .unwrap()
+                        .len(),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let expected: Vec<u64> = expected.into_iter().take(4).map(|(id, _)| id).collect();
+        assert_eq!(ids, expected, "{r}");
+        assert_eq!(ids[0], hub);
+        assert_eq!(ids[1], rival);
+        assert_eq!(r["scores"][0]["score"], 5.0);
+        assert_eq!(r["total"], crate::methods::SCAN_PAGE + 52);
+        assert_eq!(r["truncated"], true);
+        // A label filter narrows both the ranking and the counter-backed total.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup","order":"degree","label":"Hub"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(r["total"], 2);
+        assert_eq!(r["truncated"], false);
+    }
+
+    /// A text match on the last page, for a node and for an edge: the paged
+    /// scan reaches both, and reports the plane's full size as `total`.
+    #[test]
+    fn plane_find_reaches_a_match_past_the_first_page() {
+        let (db, _hub, rival) = paged_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"rival"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["nodes"][0]["id"], rival);
+        assert_eq!(r["total"], crate::methods::SCAN_PAGE + 52);
+        assert_eq!(r["truncated"], false);
+        // Edge search by type: no node is called "spoke", so the node pass
+        // walks the whole plane and the edge pass follows it over every page
+        // — five SPOKE edges from the hub, five from rival on the last page.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"spoke","limit":10},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(r["edges"].as_array().unwrap().len(), 10, "{r}");
+        assert_eq!(r["truncated"], true);
+        // The node pass stops on page one at its first hit; the edge pass
+        // still walks every page (nothing matches, and nothing is missed).
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"leaf-0","limit":1},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(r["nodes"][0]["external_key"], "leaf-0");
+        assert_eq!(r["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(r["truncated"], true);
+    }
+
     #[test]
     fn graph_expand_returns_neighbor_and_edge() {
         let (db, alice, bob) = seeded_graph();

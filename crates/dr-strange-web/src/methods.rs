@@ -493,7 +493,7 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     if let Some((catalog, age)) = dr_strange_llm::cached_catalog(&store) {
         let stale = age > CATALOG_TTL;
         if stale {
-            std::thread::spawn(move || {
+            refresh_catalog_once(|| {
                 let Ok(store) = dr_strange_llm::PluginStore::open_default() else {
                     return;
                 };
@@ -516,6 +516,53 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let stale = fetched.source.is_stale();
     let source = serde_json::to_value(&fetched.source).unwrap_or(Value::Null);
     catalog_value(&fetched.catalog, stale, source)
+}
+
+/// Set while one background catalog refresh is running (see
+/// [`refresh_catalog_once`]).
+static CATALOG_REFRESHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Run `refresh` in the background unless a refresh is already running;
+/// returns whether this call started one.
+///
+/// Single-flight, because a stale catalog is stale for *every* request until
+/// the refresh lands: a dashboard polling the Extensions panel, or several
+/// tabs opening it at once, would otherwise start one fetch per request, all
+/// racing GitHub for the same bytes and all rewriting the same cache file.
+/// The work goes on the runtime's blocking pool when there is one — it is a
+/// synchronous HTTP fetch, and the pool is where the server puts every other
+/// blocking unit of work, bounded with them — and on a plain thread only when
+/// no runtime is present (an embedding caller running the handler directly).
+/// The flag is cleared by a guard so a panicking fetch cannot wedge refreshes
+/// off for the life of the process.
+fn refresh_catalog_once(refresh: impl FnOnce() + Send + 'static) -> bool {
+    use std::sync::atomic::Ordering;
+    if CATALOG_REFRESHING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            CATALOG_REFRESHING.store(false, Ordering::Release);
+        }
+    }
+    let work = move || {
+        let _clear = Clear;
+        refresh();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(work);
+        }
+        Err(_) => {
+            std::thread::spawn(work);
+        }
+    }
+    true
 }
 
 /// Where a cached answer came from, in the shape `Source` serializes to.
@@ -1269,6 +1316,15 @@ const EXPAND_LIMIT: u64 = 100;
 const FIND_SCAN_CAP: usize = 20_000;
 /// Default number of matches `plane.find` returns.
 const FIND_LIMIT: usize = 50;
+/// How many nodes one page of a linear scan loads. `plane.find` and a
+/// degree-ordered `graph.seed` walk the plane a page at a time and stop the
+/// moment they have what they came for, so a small plane costs one page and
+/// a hit early in a huge one costs one page — never the whole plane.
+pub(crate) const SCAN_PAGE: u64 = 2_000;
+/// A degree-ordered seed measures the degree of at most this many nodes. The
+/// measurement is a neighbour lookup per node, so on a plane of millions it
+/// would otherwise be the most expensive thing a header click can trigger.
+const SEED_SCAN_CAP: usize = 20_000;
 
 #[derive(Deserialize)]
 pub struct Seed {
@@ -1295,11 +1351,17 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let limit = req.limit.unwrap_or(SEED_LIMIT);
     let plane = plane_at(ctx, &req.plane, &req.at)?;
 
-    let all_ids = match &req.label {
-        Some(label) => app(plane.query().scan_label(label.clone()).ids())?,
-        None => app(plane.query().scan_all().ids())?,
+    // `total` comes from the transactional counters (arch/03 §5) — a point
+    // read — not from materialising every id of the plane on each seed.
+    let counters = app(plane.counters())?;
+    let total = match &req.label {
+        Some(label) => counters.labels.get(label).copied().unwrap_or(0),
+        None => counters.nodes,
+    } as usize;
+    let scan = || match &req.label {
+        Some(label) => plane.query().scan_label(label.clone()),
+        None => plane.query().scan_all(),
     };
-    let total = all_ids.len();
 
     // Ranked seeding: take the *important* nodes, not the first ones the scan
     // reached. A canvas of two hundred arbitrary nodes is a hairball whatever
@@ -1311,16 +1373,7 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         // a hub that points at forty things ranks below the forty — measured on
         // a test plane, a twelve-leaf hub came out under its own leaves. Degree
         // asks the question actually being asked: what is connected to a lot.
-        Some("degree") => {
-            let mut rows = Vec::with_capacity(all_ids.len());
-            for id in &all_ids {
-                let d = app(plane.neighbors(*id, Dir::Both, None))?.len();
-                rows.push((*id, d as f64));
-            }
-            // Descending by degree, ties by id so a re-seed is reproducible.
-            rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
-            Some(rows)
-        }
+        Some("degree") => Some(top_by_degree(&plane, scan, limit as usize)?),
         Some("pagerank") => {
             let mut builder = plane.algo();
             if let Some(label) = &req.label {
@@ -1339,7 +1392,9 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 Some(top.into_iter().map(|(id, s)| (id.0, s)).collect()),
             )
         }
-        None => (all_ids.into_iter().take(limit as usize).collect(), None),
+        // Scan order: ask for `limit` ids and no more — the executor stops
+        // at the limit instead of this handler discarding the rest.
+        None => (app(scan().limit(limit).ids())?, None),
     };
     let set: std::collections::BTreeSet<u64> = ids.iter().map(|n| n.0).collect();
 
@@ -1380,6 +1435,61 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 .collect::<Vec<_>>()
         }),
     }))
+}
+
+/// The `limit` highest-degree nodes among the first [`SEED_SCAN_CAP`] the
+/// scan reaches, descending by degree and ascending by id within a degree so
+/// a re-seed is reproducible.
+///
+/// The core keeps no per-node degree, so degree is a neighbour lookup per
+/// node; what this bounds is everything around it. Ids arrive a page at a
+/// time (never the whole plane in one vector), the scan ends at the cap, and
+/// the ranking is a bounded min-heap of `limit` entries rather than a sort of
+/// every node — so the cost is `cap` lookups and `limit` memory, whatever the
+/// plane's size.
+fn top_by_degree<'db>(
+    plane: &PlaneHandle<'db>,
+    scan: impl Fn() -> dr_strange_core::QueryBuilder<'db>,
+    limit: usize,
+) -> Result<Vec<(NodeId, f64)>, RpcError> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // Ordered so the heap's top is the *weakest* candidate: lowest degree,
+    // and among equals the highest id (which the final order puts last).
+    let mut heap: BinaryHeap<Reverse<(usize, Reverse<u64>)>> = BinaryHeap::with_capacity(limit + 1);
+    let mut examined = 0usize;
+    let mut skip = 0u64;
+    'scan: loop {
+        let page = app(scan().skip(skip).limit(SCAN_PAGE).ids())?;
+        let short = (page.len() as u64) < SCAN_PAGE;
+        for id in page {
+            if examined >= SEED_SCAN_CAP {
+                break 'scan;
+            }
+            examined += 1;
+            let d = app(plane.neighbors(id, Dir::Both, None))?.len();
+            let entry = Reverse((d, Reverse(id.0)));
+            if heap.len() < limit {
+                heap.push(entry);
+            } else if let Some(weakest) = heap.peek()
+                && entry < *weakest
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+        if short {
+            break;
+        }
+        skip += SCAN_PAGE;
+    }
+    let mut rows: Vec<(NodeId, f64)> = heap
+        .into_iter()
+        .map(|Reverse((d, Reverse(id)))| (NodeId(id), d as f64))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
+    Ok(rows)
 }
 
 #[derive(Deserialize)]
@@ -1447,61 +1557,100 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
 
     let needle = req.q.trim().to_lowercase();
-    let all = app(plane.query().scan_all().nodes())?;
-    let total = all.len();
+    // `total` is the counters' figure (a point read), not the length of a
+    // vector holding every node — the scan below never builds one.
+    let total = app(plane.counters())?.nodes as usize;
 
     // ---- nodes ----
+    // A page at a time, stopping at `limit` hits or [`FIND_SCAN_CAP`] nodes.
+    // This runs on every header keystroke: a match near the front of the
+    // plane costs one page, and a miss costs the cap — never the plane.
     let mut node_hits = Vec::new();
     let mut examined = 0usize;
-    for n in &all {
-        if examined >= FIND_SCAN_CAP {
+    // Ids the node pass loaded, kept so the edge pass below need not read
+    // the same records twice; past this prefix it fetches ids alone.
+    let mut walked: Vec<NodeId> = Vec::new();
+    let mut skip = 0u64;
+    // True only once a page came back short with every node on it walked;
+    // an early break (limit reached, cap hit) leaves it false so the edge
+    // pass knows the remainder of that page is still unvisited.
+    let mut exhausted = false;
+    'nodes: loop {
+        let page = app(plane.query().scan_all().skip(skip).limit(SCAN_PAGE).nodes())?;
+        let short = (page.len() as u64) < SCAN_PAGE;
+        for n in &page {
+            if examined >= FIND_SCAN_CAP {
+                break 'nodes;
+            }
+            examined += 1;
+            walked.push(n.id);
+            if let Some(hint) = match_node(n, &needle) {
+                let mut obj = node_json(n);
+                if let Value::Object(map) = &mut obj {
+                    map.insert("match".into(), Value::String(hint));
+                }
+                node_hits.push(obj);
+                if node_hits.len() >= limit {
+                    break 'nodes;
+                }
+            }
+        }
+        if short {
+            exhausted = true;
             break;
         }
-        examined += 1;
-        if let Some(hint) = match_node(n, &needle) {
-            let mut obj = node_json(n);
-            if let Value::Object(map) = &mut obj {
-                map.insert("match".into(), Value::String(hint));
-            }
-            node_hits.push(obj);
-            if node_hits.len() >= limit {
-                break;
-            }
-        }
+        skip += SCAN_PAGE;
     }
     let nodes_truncated = examined < total;
 
     // ---- edges ----
     // The core has no edge scan, so walk each node's outgoing hops (as
-    // `graph.seed` does), dedup by edge id, and match the edge record.
+    // `graph.seed` does), dedup by edge id, and match the edge record. The
+    // walk covers the nodes the pass above loaded first, then continues from
+    // where it stopped with ids alone, until `limit` edge hits or the cap.
     let mut edge_hits = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut edges_examined = 0usize;
     let mut edges_truncated = false;
-    'walk: for n in &all {
-        for hop in app(plane.neighbors(n.id, Dir::Out, None))? {
-            if !seen.insert(hop.edge.0) {
-                continue;
-            }
-            if edges_examined >= FIND_SCAN_CAP {
-                edges_truncated = true;
-                break 'walk;
-            }
-            edges_examined += 1;
-            if let Some(edge) = app(plane.edge(hop.edge))?
-                && let Some(hint) = match_edge(&edge, &needle)
-            {
-                let mut obj = edge_to_json(&edge);
-                if let Value::Object(map) = &mut obj {
-                    map.insert("match".into(), Value::String(hint));
+    let mut sources = walked;
+    let mut next_skip = sources.len() as u64;
+    'walk: loop {
+        for n in &sources {
+            for hop in app(plane.neighbors(*n, Dir::Out, None))? {
+                if !seen.insert(hop.edge.0) {
+                    continue;
                 }
-                edge_hits.push(obj);
-                if edge_hits.len() >= limit {
+                if edges_examined >= FIND_SCAN_CAP {
                     edges_truncated = true;
                     break 'walk;
                 }
+                edges_examined += 1;
+                if let Some(edge) = app(plane.edge(hop.edge))?
+                    && let Some(hint) = match_edge(&edge, &needle)
+                {
+                    let mut obj = edge_to_json(&edge);
+                    if let Value::Object(map) = &mut obj {
+                        map.insert("match".into(), Value::String(hint));
+                    }
+                    edge_hits.push(obj);
+                    if edge_hits.len() >= limit {
+                        edges_truncated = true;
+                        break 'walk;
+                    }
+                }
             }
         }
+        if exhausted {
+            break;
+        }
+        sources = app(plane
+            .query()
+            .scan_all()
+            .skip(next_skip)
+            .limit(SCAN_PAGE)
+            .ids())?;
+        exhausted = (sources.len() as u64) < SCAN_PAGE;
+        next_skip += sources.len() as u64;
     }
 
     Ok(jval!({
@@ -2959,5 +3108,43 @@ mod guard_tests {
         assert_ne!(a.message, b.message);
         assert!(!a.message.contains("billing"));
         assert!(!a.message.contains("HTTP 402"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// Two stale hits while a refresh is in flight start one refresh, not
+    /// two; once it finishes, the next stale hit starts another.
+    #[test]
+    fn a_catalog_refresh_is_single_flight() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        assert!(refresh_catalog_once(move || {
+            let _ = release_rx.recv();
+            let _ = done_tx.send(());
+        }));
+        // Still running: a second stale hit does not start another.
+        assert!(!refresh_catalog_once(|| unreachable!(
+            "a second refresh must not start"
+        )));
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the refresh runs to completion");
+        // The flag clears when the work returns, so the next stale hit may
+        // refresh again. The guard drops after `done_tx` fires, so poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if refresh_catalog_once(|| {}) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flag never cleared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
