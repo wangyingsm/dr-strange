@@ -375,6 +375,13 @@ pub struct Database {
     sidecar: Option<PathBuf>,
     /// The `.bm25` keyword sidecar beside the database, or `None` in-memory.
     keyword_sidecar: Option<PathBuf>,
+    /// Set when a vector-index event could not be applied after its commit
+    /// was already durable (see [`WriteTxn::commit`]). The KV is still the
+    /// truth; the in-memory HNSW registry is not, so it must not be persisted
+    /// as a sidecar stamped with the current sequence — a later open would
+    /// load the divergence back instead of rebuilding from the KV. Sticky
+    /// for the life of this handle; the next open rebuilds and clears it.
+    indexes_diverged: std::sync::atomic::AtomicBool,
     /// A commit-time change observer (ROADMAP §5), set by a host that wants a
     /// change feed (the web layer forwards it to WebSocket subscribers). `None`
     /// ⇒ commits skip building change sets entirely.
@@ -438,10 +445,25 @@ impl Database {
             Ok(seq) => seq,
             Err(_) => return, // no meta ⇒ nothing coherent to stamp
         };
-        if let Some(path) = self.sidecar.clone()
-            && let Err(e) = self.indexes().save_sidecar(&path, seq)
-        {
-            tracing::warn!(error = %e, path = %path.display(), "failed to write HNSW sidecar");
+        if let Some(path) = self.sidecar.clone() {
+            if self.indexes_diverged() {
+                // A diverged registry must not be persisted at this seq. The
+                // file on disk (if any) carries an older stamp and would be
+                // rejected anyway; removing it makes the rebuild certain
+                // rather than an accident of stamping.
+                tracing::warn!(
+                    path = %path.display(),
+                    "HNSW registry diverged from the KV after a commit; not saving the \
+                     sidecar so the next open rebuilds it"
+                );
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(error = %e, path = %path.display(), "failed to remove stale HNSW sidecar");
+                }
+            } else if let Err(e) = self.indexes().save_sidecar(&path, seq) {
+                tracing::warn!(error = %e, path = %path.display(), "failed to write HNSW sidecar");
+            }
         }
         if let Some(path) = self.keyword_sidecar.clone()
             && let Err(e) = self.keywords().save_sidecar(&path, seq)
@@ -618,6 +640,7 @@ impl Database {
             cache: GraphCache::new(CACHE_BYTES),
             sidecar,
             keyword_sidecar,
+            indexes_diverged: std::sync::atomic::AtomicBool::new(false),
             change_observer: RwLock::new(None),
         })
     }
@@ -785,6 +808,23 @@ impl Database {
             }
         }
         Ok(lo)
+    }
+
+    /// Whether a vector-index event failed to apply after its commit was
+    /// durable, leaving the in-memory HNSW registry behind the KV.
+    pub(crate) fn indexes_diverged(&self) -> bool {
+        self.indexes_diverged
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that the in-memory HNSW registry no longer mirrors the KV. From
+    /// here the registry is served as-is (it is still the better answer than
+    /// none) but never persisted: `save_sidecars` withholds the sidecar and
+    /// `snapshot` embeds a fresh rebuild, so no later open can inherit the
+    /// divergence.
+    pub(crate) fn note_index_divergence(&self) {
+        self.indexes_diverged
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn indexes(&self) -> std::sync::RwLockReadGuard<'_, VectorRegistry> {
@@ -1922,8 +1962,6 @@ impl WriteTxn<'_> {
         } = self;
         let index_events = events.len();
         // Commit the KV first; only then mirror into the in-memory indexes.
-        // If applying events somehow failed, the KV is still the source of
-        // truth and rebuild-from-KV on next open restores coherence.
         match inner {
             TxnInner::Memory(t) => (*t).commit()?,
             #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
@@ -1931,10 +1969,29 @@ impl WriteTxn<'_> {
             #[cfg(feature = "native-backend")]
             TxnInner::Native(t) => (*t).commit()?,
         }
+        // From here the commit is durable and visible to other readers, so
+        // nothing below may turn into an `Err`: the caller would take a
+        // committed write for a failed one (and retry it, or roll back its
+        // own state). Every pending event is applied — one failure does not
+        // skip the rest — failures are logged, and a failed vector event
+        // marks the registry diverged so it is never persisted at this seq;
+        // the KV stays the source of truth and the next open rebuilds.
         if !events.is_empty() {
             let mut registry = db.indexes_mut();
+            let mut failed = 0usize;
             for event in events {
-                apply_index_event(&mut registry, plane, event)?;
+                if let Err(e) = apply_index_event(&mut registry, plane, event) {
+                    failed += 1;
+                    tracing::error!(
+                        plane = plane.0,
+                        error = %e,
+                        "vector index event failed after a durable commit; the HNSW \
+                         registry has diverged from the KV and will be rebuilt on the next open"
+                    );
+                }
+            }
+            if failed > 0 {
+                db.note_index_divergence();
             }
         }
         if !kw_events.is_empty() {
@@ -3366,5 +3423,100 @@ mod cache_stamp_tests {
             db.record_query("startup", "q", 10),
             Err(Error::ReadOnly(_))
         ));
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod index_divergence_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    fn embed(v: f32) -> Properties {
+        let mut p = Properties::new();
+        p.insert(
+            "embedding".into(),
+            PropDesc::new(PropValue::Vector(vec![v, 0.0])),
+        );
+        p
+    }
+
+    fn declared(db: &Database) -> Vec<(String, String, Metric)> {
+        db.plane("startup").unwrap().vector_indexes()
+    }
+
+    #[test]
+    fn a_diverged_registry_is_never_persisted_and_the_next_open_rebuilds() {
+        // A vector-index event that fails after its commit is durable leaves
+        // the in-memory registry behind the KV. That registry must not reach
+        // the sidecar (or a snapshot) stamped with the current sequence, or
+        // the next open would load the divergence back instead of rebuilding.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Database::open(&path).unwrap();
+            let plane = db.plane("startup").unwrap();
+            plane
+                .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+                .unwrap();
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], embed(1.0)).unwrap();
+            w.commit().unwrap();
+        }
+        assert!(
+            sidecar_path(&path).exists(),
+            "a clean close saves the sidecar"
+        );
+
+        let restored_path = dir.path().join("restored");
+        {
+            let db = Database::open(&path).unwrap();
+            let plane = db.plane("startup").unwrap();
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], embed(0.9)).unwrap();
+            w.commit().unwrap();
+            // Stand in for the failed event: the live registry is now wrong
+            // (here: empty) and the database knows it.
+            *db.indexes_mut() = VectorRegistry::new();
+            db.note_index_divergence();
+            assert!(
+                declared(&db).is_empty(),
+                "the live registry really is diverged"
+            );
+
+            // A snapshot taken now embeds a rebuild from the KV, not the
+            // diverged registry: the restored database knows the index.
+            let mut bytes = Vec::new();
+            db.snapshot(&mut bytes).unwrap();
+            let restored = Database::open(&restored_path).unwrap();
+            restored.restore(bytes.as_slice()).unwrap();
+            assert_eq!(
+                declared(&restored).len(),
+                1,
+                "snapshot carried a fresh registry"
+            );
+        }
+        assert!(
+            !sidecar_path(&path).exists(),
+            "the diverged registry was not saved and the stale sidecar was removed"
+        );
+
+        {
+            let db = Database::open(&path).unwrap();
+            assert_eq!(
+                declared(&db).len(),
+                1,
+                "reopen rebuilt the index from the KV"
+            );
+            let hits = db
+                .plane("startup")
+                .unwrap()
+                .query()
+                .vector_top_k(Some("Doc"), "embedding", vec![1.0, 0.0], Metric::Cosine, 10)
+                .ids()
+                .unwrap();
+            assert_eq!(hits.len(), 2, "both committed nodes are indexed again");
+            assert!(!db.indexes_diverged(), "a fresh open starts clean");
+        }
+        assert!(sidecar_path(&path).exists(), "a clean handle saves again");
     }
 }

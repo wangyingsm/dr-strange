@@ -117,7 +117,16 @@ impl Database {
         let keywords = self.keywords();
 
         let mut stats = SnapshotStats::default();
+        // A registry that diverged from the KV after a durable commit must not
+        // be embedded — a restore would load it verbatim. Rebuild from the KV
+        // inside the same read snapshot instead (the KV is the truth).
+        let mut rebuilt: Option<VectorRegistry> = None;
         self.engine.with_read(|txn| {
+            if self.indexes_diverged() {
+                let mut fresh = VectorRegistry::new();
+                fresh.rebuild_from(txn)?;
+                rebuilt = Some(fresh);
+            }
             let seq = graph::read_commit_seq(txn)?;
             stats.seq = seq;
             write_frame(
@@ -202,7 +211,8 @@ impl Database {
 
         // The built sidecars, serialized from the live registries stamped at the
         // dump's sequence — a restore loads them directly (ids are preserved).
-        write_frame(&mut out, &Frame::Hnsw(registry.to_bytes(stats.seq)?))?;
+        let hnsw = rebuilt.as_ref().unwrap_or(&registry);
+        write_frame(&mut out, &Frame::Hnsw(hnsw.to_bytes(stats.seq)?))?;
         write_frame(&mut out, &Frame::Bm25(keywords.to_bytes(stats.seq)?))?;
         out.flush()?;
         Ok(stats)
