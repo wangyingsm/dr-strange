@@ -1305,6 +1305,15 @@ fn extract_all(
 /// model's output-token cap), splits the chunk and extracts each piece,
 /// recursing until the pieces are small enough — or the chunk can no longer be
 /// divided, in which case the truncation error is surfaced.
+///
+/// A reply that is not the JSON asked for gets **one** more turn, with the
+/// complaint appended: a model that answered in prose, or wrapped the object
+/// in commentary the extractor cannot strip, nearly always answers the nudge
+/// correctly, and the alternative was to abort the whole run — every chunk's
+/// extraction gone over one reply — where the reconcile, identity and refine
+/// passes had always shrugged a garbled reply off. Once only: a model that
+/// fails the nudge is not going to be argued into JSON, and the abort then
+/// says so with both attempts' cost counted.
 fn extract_chunk(
     chat: &(dyn Chat + Sync),
     system: &str,
@@ -1315,35 +1324,56 @@ fn extract_chunk(
         Some(b) => format!("{b}\n---\n{text}"),
         None => text.to_string(),
     };
-    match chat.complete(system, &user) {
-        Ok(reply) => {
-            let extraction = parse_extraction(&reply.text)?;
-            Ok(ChunkExtract {
-                entities: extraction.entities,
-                relations: extraction.relations,
-                input_tokens: reply.input_tokens,
-                output_tokens: reply.output_tokens,
-                chat_requests: 1,
-            })
-        }
-        Err(e) if e.downcast_ref::<OutputTruncated>().is_some() => {
-            let pieces = chunk(text, text.chars().count() / 2);
-            if pieces.len() < 2 {
-                return Err(e); // indivisible — surface the truncation
+    let mut acc = ChunkExtract::default();
+    let mut prompt = user.clone();
+    for nudged in [false, true] {
+        match chat.complete(system, &prompt) {
+            Ok(reply) => {
+                acc.input_tokens += reply.input_tokens;
+                acc.output_tokens += reply.output_tokens;
+                acc.chat_requests += 1;
+                match parse_extraction(&reply.text) {
+                    Ok(extraction) => {
+                        acc.entities = extraction.entities;
+                        acc.relations = extraction.relations;
+                        return Ok(acc);
+                    }
+                    Err(e) if !nudged => {
+                        tracing::warn!(error = %e, "extraction reply was not JSON; asking once more");
+                        prompt = nudge(&user, &e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            let mut acc = ChunkExtract::default();
-            for piece in &pieces {
-                let sub = extract_chunk(chat, system, block, piece)?;
-                acc.entities.extend(sub.entities);
-                acc.relations.extend(sub.relations);
-                acc.input_tokens += sub.input_tokens;
-                acc.output_tokens += sub.output_tokens;
-                acc.chat_requests += sub.chat_requests;
+            Err(e) if e.downcast_ref::<OutputTruncated>().is_some() => {
+                let pieces = chunk(text, text.chars().count() / 2);
+                if pieces.len() < 2 {
+                    return Err(e); // indivisible — surface the truncation
+                }
+                for piece in &pieces {
+                    let sub = extract_chunk(chat, system, block, piece)?;
+                    acc.entities.extend(sub.entities);
+                    acc.relations.extend(sub.relations);
+                    acc.input_tokens += sub.input_tokens;
+                    acc.output_tokens += sub.output_tokens;
+                    acc.chat_requests += sub.chat_requests;
+                }
+                return Ok(acc);
             }
-            Ok(acc)
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
+    unreachable!("the nudged attempt returns either way")
+}
+
+/// The second, and last, ask for a chunk whose first reply was not JSON: the
+/// same text, with what was wrong with the answer and what is wanted instead.
+fn nudge(user: &str, why: &anyhow::Error) -> String {
+    format!(
+        "{user}\n\n---\nYour previous reply could not be used: {why}\n\
+         Reply again with ONLY the JSON object in the shape described — no prose before or \
+         after it, no markdown fences, nothing else."
+    )
 }
 
 /// Opens a paragraph that names where the text after it came from, e.g.
@@ -1479,6 +1509,13 @@ fn existing_block(cands: &[ExistingEntity]) -> Option<String> {
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
 /// leading/trailing prose.
+///
+/// An object that names neither `entities` nor `relations` is refused unless
+/// it is empty: `{}` is an unambiguous "nothing here", but `{"key":"a"}` —
+/// which is what the first-brace-to-last-brace cut makes of a reply that was
+/// a list, or an entity on its own — is not an extraction, and accepting it
+/// as an empty one would lose the chunk without a word. Refused, it earns
+/// the nudge instead.
 fn parse_extraction(raw: &str) -> Result<Extraction> {
     let t = raw.trim();
     let t = t
@@ -1490,12 +1527,19 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
         (Some(a), Some(b)) if b >= a => &t[a..=b],
         _ => t,
     };
-    serde_json::from_str(body).with_context(|| {
-        format!(
-            "model reply was not valid extraction JSON: {}…",
-            &body[..body.len().min(160)]
-        )
-    })
+    let complaint = || {
+        let head: String = body.chars().take(160).collect();
+        format!("model reply was not valid extraction JSON: {head}…")
+    };
+    let value: Value = serde_json::from_str(body).with_context(complaint)?;
+    let shaped = match value.as_object() {
+        Some(o) => o.is_empty() || o.contains_key("entities") || o.contains_key("relations"),
+        None => false,
+    };
+    if !shaped {
+        return Err(anyhow::anyhow!(complaint()));
+    }
+    serde_json::from_value(value).with_context(complaint)
 }
 
 #[cfg(test)]
@@ -1675,6 +1719,44 @@ mod tests {
             !model_may_set(" role", &s),
             "a name with padding is not a name"
         );
+    }
+
+    /// What the extractor forgives and what it does not: fences and prose
+    /// around the object are stripped; anything that is not the object is an
+    /// error, never an empty extraction that would silently lose a chunk.
+    #[test]
+    fn parse_extraction_forgives_wrapping_and_refuses_everything_else() {
+        let object = r#"{"entities":[{"key":"a","label":"L"}],"relations":[]}"#;
+        for ok in [
+            object.to_string(),
+            format!("```json\n{object}\n```"),
+            format!("```\n{object}\n```"),
+            format!("Here is the graph:\n{object}\nHope this helps!"),
+        ] {
+            let parsed = parse_extraction(&ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+            assert_eq!(parsed.entities.len(), 1, "{ok:?}");
+        }
+        // An empty object is a valid, empty extraction — not an error.
+        assert!(parse_extraction("{}").unwrap().entities.is_empty());
+
+        for bad in [
+            "",
+            "   ",
+            "I'm sorry, I can't extract anything from that.",
+            r#"{"entities":[{"key":"a","#, // cut off mid-object
+            r#"[{"key":"a"}]"#,            // an array, not the object
+            r#"{"key":"a","label":"L"}"#,  // one entity, not an extraction
+            r#"{"entities":"none"}"#,      // wrong type
+            r#"{"entities":[{"label":"no key"}]}"#, // a required field missing
+        ] {
+            let Err(e) = parse_extraction(bad) else {
+                panic!("{bad:?} must not parse");
+            };
+            assert!(
+                e.to_string().contains("not valid extraction JSON"),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     #[test]
