@@ -4,6 +4,22 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`recall` reads code as it was at any commit.** The `_git` plane named
+  every commit a repository ever had, but reading one meant leaving the tools
+  for `git show`. `recall` (MCP, and `drsg recall`) reads a file, a line range,
+  a directory or a symbol at a revision named by sha, branch, tag, date or
+  `HEAD~n`; `pattern` searches that tree and `vs` diffs a name from an older
+  revision. A symbol is found by parsing its file as it was, so the answer is
+  the declaration then rather than today's line numbers — and a symbol that
+  commit did not declare is reported as absent, with what the file did hold.
+- **Agents are pointed at it.** The server's instructions name `recall` for
+  old code, and the shell hook redirects `git show <rev>:<path>`, `git grep`
+  and `git log -p` / `-L` to it.
+
 ## [2.7.1] - 2026-09-10
 
 ### Fixed

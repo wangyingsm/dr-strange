@@ -31,6 +31,7 @@
 | `grep <模式> --plane [--regex] [--path]` | 在该树上做文本检索；每个命中都标出所在的符号 |
 | `traverse <键> --plane [--edge-type]` | 一跳（或数跳）之外的邻居 |
 | `history --plane [--limit]` | 平面背后的代码仓库：HEAD、分支与标签指向、变基、最新的提交 |
+| `recall <名称> --at <修订> --plane [--vs <修订>] [--pattern]` | 某个修订版本时的代码：文件、行区间、目录或符号；在那棵树上检索；或相对更早修订版本的差异 |
 | `queries [<id>] [--limit]` | 已经运行过的 Cypher 查询；`cypher --history <id>` 可再跑一次 |
 | `vectorize --plane` | 为一个平面的节点生成向量嵌入，以供相似度检索 |
 | `plugin install \| list \| remove` | 管理预处理插件（沙箱化的 wasm 解析器） |

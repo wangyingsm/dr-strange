@@ -35,6 +35,7 @@ access, and the CLI for offline operations.
 | `grep <pattern> --plane [--regex] [--path]` | text search over that tree; each hit names the symbol it falls in |
 | `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
 | `history --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits |
+| `recall <name> --at <rev> --plane [--vs <rev>] [--pattern]` | code as it was at a revision: a file, a range, a directory or a symbol; a search of that tree; or a diff from an older revision |
 | `queries [<id>] [--limit]` | the Cypher queries that have run; `cypher --history <id>` runs one again |
 | `vectorize --plane` | embed a plane's nodes for similarity search |
 | `plugin install \| list \| remove` | manage preprocessor plugins (sandboxed wasm parsers) |

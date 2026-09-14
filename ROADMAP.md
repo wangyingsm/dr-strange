@@ -1099,6 +1099,43 @@ now makes expressible and only pushdown *placement* still holds back.
 
 ---
 
+## 14. Recall — code as it was at any commit  *(shipped)*
+
+**Status.** ✅ Shipped (2026-09-14). `recall` reads a repository's code as it
+was at a git revision, over MCP and as `drsg recall`: a file, a line range, a
+directory, or a symbol's declaration at that commit; a search of that tree
+(`pattern`); or what changed in a name since an older revision (`vs`).
+
+- **Revisions resolve over the history plane** (`core::rev`) — a sha or a
+  prefix of four or more digits, a tag, a branch, a remote branch, `HEAD`, a
+  date (`YYYY-MM-DD` or RFC-3339) and `<rev>@{<date>}`, each with `~n` / `^n`,
+  walked over `PARENT` and its `order`. A ref outranks a sha prefix, as in git.
+  A checkout with no `_git` plane falls back to git's own resolution and says
+  so.
+- **The bytes come from git's object store** (`llm::git::GitTree`) — the `git`
+  CLI, run with no shell and with a caller's `GIT_DIR` cleared, over one
+  commit's tree under the plane's root, served to the preprocessors as a
+  `Host`.
+- **A symbol is located by parsing its file as it was** — today's graph names
+  the key and the file; the installed plugin parses that file at the commit;
+  a file renamed since is followed back through `git diff -M`, and a key absent
+  at that commit is reported with what the file did declare.
+- **Diffs** — git's own for a file or a directory; declaration against
+  declaration for a symbol, by a bounded longest-common-subsequence.
+
+**Fork settled — why not the graph's own `AS OF`.** Time travel (§4) addresses
+the database's commit sequences, not git commits, and a server keeps a bounded
+window of them (twenty by default). The `_git` plane already holds every
+commit from the first: it names the revision, and git's object store supplies
+the bytes, however old.
+
+**Follow-ups.** `drsg serve` handing its `[plugins]` store to `recall`, which
+reads the default store today; a `cat-file --batch` reader, should a plugin that
+pulls many files make one process per read slow; `git grep --max-count` once
+git 2.38 is a safe floor.
+
+---
+
 ## Low priority (deferred — not first-class for now)
 
 These are real graph-DB table stakes but explicitly **not** a current priority.

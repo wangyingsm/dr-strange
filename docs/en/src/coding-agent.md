@@ -109,10 +109,10 @@ open files, read, infer who calls what, repeat. A digested plane has already
 done that work, once, with a parser — so structural questions become **one
 round trip** instead of a search-and-read loop.
 
-Eight verbs carry the workload, identical over MCP
-([Chapter 8](./mcp.md)) and the CLI ([Chapter 7](./embedded-cli.md); `grep`
-and `snippet` read the tree the plane was parsed from, which `--root` names
-when the plane records none of its own):
+Nine verbs carry the workload, identical over MCP
+([Chapter 8](./mcp.md)) and the CLI ([Chapter 7](./embedded-cli.md); `grep`,
+`snippet` and `recall` read the tree the plane was parsed from, which `--root`
+names when the plane records none of its own):
 
 | Verb | The question it answers |
 |---|---|
@@ -124,6 +124,7 @@ when the plane records none of its own):
 | `impact` | blast radius: everything reaching a symbol, grouped by distance |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
+| `recall` | the code as it was at a commit — a file, a symbol's declaration then, a search of that tree, or a diff between two revisions — the `git show` and `git log -p` an agent no longer needs |
 
 Every answer is compact one-fact-per-line text, sized for a model's context
 window rather than a terminal, and `context` keeps itself within a fixed
@@ -136,6 +137,14 @@ re-digest would build. Each answer opens with `synced: commit <sha>`, so an
 agent knows *which* code it is reasoning about; the working tree's uncommitted
 edits are invisible until committed, and the answer says so by naming the
 commit.
+
+History is the other half. A digest of a git checkout also writes
+`<name>_git`, and `recall` reads the code as it was at any commit that plane
+names — by sha, branch, tag, date or `HEAD~n` — so "what did this function look
+like before the refactor" is one call rather than a checkout. A symbol is
+located by parsing its file as it was at that commit, not by today's line
+numbers, and a symbol the commit did not declare is reported as absent, with
+what its file did declare.
 
 ## Honesty is the load-bearing feature
 
