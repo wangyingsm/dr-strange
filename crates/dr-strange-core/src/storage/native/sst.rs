@@ -269,6 +269,12 @@ pub(super) fn write(
 
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
+    // The rename is a directory-entry change; without this the file's bytes
+    // are durable but its name may not be, and a WAL truncated on the strength
+    // of this SST would then lose the records on a crash.
+    if let Some(dir) = path.parent() {
+        super::sync_dir(dir)?;
+    }
     Ok(())
 }
 

@@ -290,6 +290,12 @@ pub struct NativeEngine {
     /// contract as `api::ChangeObserver` ("cheap and non-blocking — the web
     /// layer just forwards into a broadcast channel").
     wal_observer: Mutex<Option<WalObserver>>,
+    /// The error from the most recent post-commit maintenance pass
+    /// (flush/compaction) that failed, cleared once a later pass succeeds.
+    /// Maintenance runs after the batch is durable and published, so its
+    /// failure cannot be reported through `commit` without lying about a
+    /// write that did land; it is logged and kept here for `check`/stats.
+    last_maintenance_error: Mutex<Option<String>>,
 }
 
 impl NativeEngine {
@@ -377,7 +383,20 @@ impl NativeEngine {
             retain_commits: AtomicU64::new(0),
             read_only,
             wal_observer: Mutex::new(None),
+            last_maintenance_error: Mutex::new(None),
         })
+    }
+
+    /// The error from the latest failed flush/compaction, if the most recent
+    /// maintenance pass failed. A commit whose batch is durable returns `Ok`
+    /// even when the maintenance it triggered fails (the write is safe; the
+    /// memtable/WAL just stay larger than intended until the next commit
+    /// retries), so this is where that failure is surfaced.
+    pub fn last_maintenance_error(&self) -> Option<String> {
+        self.last_maintenance_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Flush the memtable to a new SST and rotate the WAL, if the memtable is
@@ -397,13 +416,18 @@ impl NativeEngine {
         store.mem_bytes = 0;
 
         // The flushed records are now durable in the SST → drop them from the
-        // WAL. (Not fsynced: if the truncation is lost, the next open just
-        // replays records already captured by the SST, which is idempotent.)
+        // WAL. Losing the truncation itself would be harmless (the next open
+        // would replay records already captured by the SST, which is
+        // idempotent), but the truncate is a metadata change and the SST
+        // rename before it another, so the directory is fsynced to make the
+        // new file list durable in the same order the code produced it.
         let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
         wal.flush()?;
         let f = wal.get_mut();
         f.set_len(0)?;
+        f.sync_all()?;
         f.seek(SeekFrom::Start(0))?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -547,6 +571,23 @@ impl NativeEngine {
     }
 }
 
+/// Make a directory's entry list durable: on unix a rename or truncate is
+/// only guaranteed to survive a crash once the *directory* is fsynced too,
+/// otherwise a just-renamed SST can vanish while the WAL that held its records
+/// has already been cut. Windows has no directory fsync (NTFS journals
+/// metadata), so this is a no-op there.
+pub(super) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// Reclaim dead versions from a merged run. Processing each key newest-first,
 /// keep versions down to and including the first at or below `min_snapshot`
 /// (the "floor" a reader at that snapshot would see); drop everything older. A
@@ -683,6 +724,267 @@ mod gc_tests {
         assert_eq!(out.len(), 2, "the same key in two tables is two keys");
         assert_eq!(out[&(0, b"a".to_vec(), Reverse(2))], put("n"));
         assert_eq!(out[&(1, b"a".to_vec(), Reverse(2))], put("e"));
+    }
+
+    #[test]
+    fn an_unbounded_retention_floor_of_zero_keeps_every_version() {
+        // `retain_commits = 0` ⇒ `retention_floor` = 0 ⇒ compaction's floor is
+        // 0. Sequences start at 1, so nothing is at/below it: every version
+        // and every tombstone must survive, or time-travel to an old commit
+        // would silently read the wrong value.
+        let m = merged(&[
+            (0, "k", 9, put("v9")),
+            (0, "k", 6, put("v6")),
+            (0, "k", 1, put("v1")),
+            (0, "gone", 3, Op::Del),
+            (0, "gone", 1, put("x")),
+        ]);
+        let before = m.clone();
+        let out = gc_versions(m, 0);
+        assert_eq!(out, before, "floor 0 must be a no-op");
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("drsg-native-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn commit(e: &NativeEngine, key: &[u8], value: &[u8]) -> u64 {
+        let mut w = e.begin_write().unwrap();
+        w.put(TableId::Nodes, key, value).unwrap();
+        let seq = w.snapshot + 1;
+        w.commit().unwrap();
+        seq
+    }
+
+    fn get(e: &NativeEngine, key: &[u8]) -> Option<Vec<u8>> {
+        e.begin_read().unwrap().get(TableId::Nodes, key).unwrap()
+    }
+
+    /// Every version of `key` across the on-disk runs, newest first.
+    fn sst_versions(e: &NativeEngine, key: &[u8]) -> Vec<u64> {
+        let store = e.store.read().unwrap_or_else(|e| e.into_inner());
+        let mut all = BTreeMap::new();
+        for run in &store.ssts {
+            run.load_into(&mut all).unwrap();
+        }
+        all.keys()
+            .filter(|(_, k, _)| k == key)
+            .map(|(_, _, Reverse(s))| *s)
+            .collect()
+    }
+
+    #[test]
+    fn a_small_retention_window_reclaims_versions_below_it_on_compaction() {
+        let dir = Dir::new("retention");
+        // 1-byte threshold: every commit becomes its own SST, so the fifth
+        // trips compaction (`> COMPACTION_TRIGGER` runs).
+        let e = NativeEngine::open_with_threshold(&dir.0, 1).unwrap();
+        e.set_retention(Some(2));
+        let mut last = 0;
+        for i in 1..=6u8 {
+            last = commit(&e, b"k", &[i]);
+        }
+        let floor = last - 2;
+        // The compaction ran at commit 5 with floor 3: versions 1 and 2 were
+        // below what any reader (or retention) could reach.
+        let versions = sst_versions(&e, b"k");
+        assert!(
+            !versions.contains(&1) && !versions.contains(&2),
+            "versions below the retention floor must be reclaimed, got {versions:?}"
+        );
+        assert!(
+            versions.contains(&(last - 1)) && versions.contains(&last),
+            "recent versions stay, got {versions:?}"
+        );
+        // What retention promises is still readable.
+        let at = e.begin_read_at(floor).unwrap();
+        assert_eq!(
+            at.get(TableId::Nodes, b"k").unwrap(),
+            Some(vec![floor as u8])
+        );
+        assert!(matches!(
+            e.begin_read_at(floor - 1),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(get(&e, b"k"), Some(vec![6]));
+    }
+
+    #[test]
+    fn a_torn_wal_tail_is_ignored_and_earlier_commits_survive() {
+        let dir = Dir::new("torn");
+        {
+            let e = NativeEngine::open(&dir.0).unwrap();
+            commit(&e, b"a", b"1");
+            commit(&e, b"b", b"2");
+        }
+        // A crash mid-append: a header promising 100 body bytes, of which only
+        // a handful made it to disk.
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.0.join("wal"))
+                .unwrap();
+            f.write_all(&100u32.to_le_bytes()).unwrap();
+            f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap();
+            f.write_all(b"partial").unwrap();
+        }
+        let torn_len = std::fs::metadata(dir.0.join("wal")).unwrap().len();
+
+        let e = NativeEngine::open(&dir.0).unwrap();
+        assert_eq!(e.committed_seq(), 2, "both intact commits replayed");
+        assert_eq!(get(&e, b"a"), Some(b"1".to_vec()));
+        assert_eq!(get(&e, b"b"), Some(b"2".to_vec()));
+        assert!(
+            std::fs::metadata(dir.0.join("wal")).unwrap().len() < torn_len,
+            "the torn tail is cut so the next append starts on a record boundary"
+        );
+
+        // Writing after recovery appends cleanly, and a second reopen sees
+        // everything.
+        commit(&e, b"c", b"3");
+        drop(e);
+        let e = NativeEngine::open(&dir.0).unwrap();
+        assert_eq!(e.committed_seq(), 3);
+        assert_eq!(get(&e, b"c"), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn wal_record_len_rejects_a_body_the_prefix_cannot_describe() {
+        assert_eq!(wal_record_len(0).unwrap(), 0);
+        assert_eq!(wal_record_len(MAX_WAL_RECORD_LEN).unwrap(), u32::MAX);
+        #[cfg(target_pointer_width = "64")]
+        {
+            // Without the check this would wrap to 0 and write a record whose
+            // prefix lies about its body.
+            let err = wal_record_len(MAX_WAL_RECORD_LEN + 1).unwrap_err();
+            assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+            let err = wal_record_len(1 << 33).unwrap_err();
+            assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_commit_is_ok_once_durable_even_when_the_flush_it_triggers_fails() {
+        // A commit's batch is durable (WAL fsync) and visible (published) before
+        // any flush runs, so a flush failure must not turn into an `Err` that a
+        // caller reads as "nothing landed".
+        let dir = Dir::new("maint");
+        let e = NativeEngine::open_with_threshold(&dir.0, 1).unwrap();
+        commit(&e, b"a", b"1");
+        assert_eq!(e.last_maintenance_error(), None);
+
+        // Fail the SST write via directory permissions, which only unix
+        // honours; skip (rather than pretend) elsewhere or as root, who
+        // ignores permission bits. Note that the WAL is already open, so its
+        // append + fsync is unaffected: exactly the shape of a disk that still
+        // takes the log but refuses a new file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if File::create(dir.0.join("probe")).is_ok() {
+                let _ = std::fs::remove_file(dir.0.join("probe"));
+                return; // root: permissions don't bite, nothing to test here
+            }
+
+            let mut w = e.begin_write().unwrap();
+            w.put(TableId::Nodes, b"b", b"2").unwrap();
+            w.commit()
+                .expect("the batch is durable and published; commit is Ok");
+            assert_eq!(get(&e, b"b"), Some(b"2".to_vec()), "published");
+            assert_eq!(e.committed_seq(), 2);
+            let err = e
+                .last_maintenance_error()
+                .expect("the failed flush is remembered");
+            assert!(err.contains("ermission"), "{err}");
+
+            // Once the cause clears, the next commit retries maintenance and
+            // the slot resets.
+            std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+            commit(&e, b"c", b"3");
+            assert_eq!(e.last_maintenance_error(), None);
+            let store = e.store.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                store.mem.is_empty(),
+                "the retried flush emptied the memtable"
+            );
+            assert!(!store.ssts.is_empty());
+            drop(store);
+
+            // And nothing was lost across a reopen.
+            drop(e);
+            let e = NativeEngine::open(&dir.0).unwrap();
+            assert_eq!(get(&e, b"b"), Some(b"2".to_vec()));
+            assert_eq!(get(&e, b"c"), Some(b"3".to_vec()));
+        }
+    }
+
+    #[test]
+    fn the_wal_observer_runs_outside_its_slots_mutex() {
+        // An observer that blocks (a slow subscriber) must not wedge
+        // `set_wal_observer`, which previously waited on the same mutex the
+        // observer was invoked under.
+        let dir = Dir::new("observer");
+        let e = Arc::new(NativeEngine::open(&dir.0).unwrap());
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        e.set_wal_observer(Some(Arc::new(move |_batch| {
+            let _ = entered_tx.send(());
+            let _ = go_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+        })));
+
+        let committer = {
+            let e = e.clone();
+            std::thread::spawn(move || commit(&e, b"a", b"1"))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the observer is reached");
+
+        // While the observer is parked mid-callback, re-registering must go
+        // through; the deadline is what turns the old deadlock into a failure.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let swapper = {
+            let e = e.clone();
+            std::thread::spawn(move || {
+                e.set_wal_observer(None);
+                let _ = done_tx.send(());
+            })
+        };
+        let swapped = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Release the observer either way so the threads can be joined.
+        let _ = go_tx.send(());
+        committer.join().unwrap();
+        swapper.join().unwrap();
+        assert!(
+            swapped,
+            "set_wal_observer blocked behind a running observer"
+        );
+        assert_eq!(get(&e, b"a"), Some(b"1".to_vec()));
     }
 }
 
@@ -932,7 +1234,7 @@ impl WriteTransaction for NativeWriteTxn<'_> {
             return Ok(());
         }
         let seq = self.snapshot + 1;
-        self.engine.durable_commit(seq, self.buf)
+        self.engine.durable_commit(seq, self.buf).map(|_| ())
     }
 }
 
@@ -943,7 +1245,16 @@ impl NativeEngine {
     /// a freshly allocated sequence) and [`Self::apply_replicated`] (`seq`
     /// taken verbatim from the source it's replicating, so a replica's
     /// commit sequence matches its master's exactly).
-    fn durable_commit(&self, seq: u64, ops: BTreeMap<(u8, Vec<u8>), Op>) -> Result<()> {
+    ///
+    /// Returns `Ok(seq)` as soon as the batch is durable *and* published: from
+    /// that point the write has happened, and a caller that treated an `Err`
+    /// as "nothing landed" (the API layer applies index/keyword events only
+    /// after `Ok`) would drift from the KV. So the maintenance that follows
+    /// (flush, compaction) never fails the commit; its error is logged and
+    /// parked in [`Self::last_maintenance_error`], and the next commit simply
+    /// retries — a failed flush leaves the memtable over threshold, a failed
+    /// compaction leaves the runs in place.
+    fn durable_commit(&self, seq: u64, ops: BTreeMap<(u8, Vec<u8>), Op>) -> Result<u64> {
         let batch = WalBatchRef {
             seq,
             ops: ops
@@ -970,10 +1281,19 @@ impl NativeEngine {
         // Notify a replication subscriber, if any, before publishing — same
         // "durable before visible" ordering as the WAL fsync itself. Skipped
         // entirely (no clone of `ops`) when nobody's registered, so a master
-        // with no followers pays nothing for this.
+        // with no followers pays nothing for this. The observer is called with
+        // its slot's mutex *released*: an observer that blocks (a full channel,
+        // a slow subscriber) must not wedge `set_wal_observer`, and one that
+        // re-registers from inside the callback must not deadlock. Batches
+        // still reach it strictly in commit order because every caller of
+        // `durable_commit` holds the write gate for the whole call.
         {
-            let observer = self.wal_observer.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(obs) = observer.as_ref() {
+            let observer = self
+                .wal_observer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(obs) = observer {
                 let replicated = ReplicatedBatch {
                     seq,
                     ops: ops
@@ -994,17 +1314,41 @@ impl NativeEngine {
         }
 
         // Publish to the memtable, advance the sequence, then flush if large.
-        {
+        let flushed = {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
             for ((t, k), op) in ops {
                 store.mem_bytes += 1 + k.len() + 8 + op.value_len();
                 store.mem.insert((t, k, Reverse(seq)), op);
             }
             store.committed_seq = seq;
-            self.maybe_flush(&mut store)?;
-        }
+            self.maybe_flush(&mut store)
+        };
         // Compact outside the store lock (heavy merge I/O shouldn't block reads).
-        self.maybe_compact()
+        let maintained = flushed.and_then(|()| self.maybe_compact());
+        self.record_maintenance(seq, maintained);
+        Ok(seq)
+    }
+
+    /// Log and remember a post-publish maintenance failure (or clear the slot
+    /// on success) — see [`Self::durable_commit`] for why it never fails the
+    /// commit that triggered it.
+    fn record_maintenance(&self, seq: u64, outcome: Result<()>) {
+        let mut slot = self
+            .last_maintenance_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(()) => *slot = None,
+            Err(e) => {
+                tracing::error!(
+                    seq,
+                    error = %e,
+                    "post-commit flush/compaction failed; the commit is durable, \
+                     maintenance is retried on the next commit"
+                );
+                *slot = Some(e.to_string());
+            }
+        }
     }
 
     /// The guts of `begin_write`, minus the `read_only` check — used by
@@ -1044,6 +1388,26 @@ impl NativeEngine {
         let _gate = self
             .write_gate
             .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
+        // Under the gate, so the comparison is against a sequence no other
+        // writer can move. Sequences must only advance: a batch landing at or
+        // below `committed_seq` would be stamped older than versions already
+        // visible (its ops would lose to them in the memtable, and a reader
+        // pinned at the current sequence would see it appear mid-snapshot).
+        // Refusing is safer than skipping — the follower treats an error as
+        // "resync from a fresh snapshot", which re-captures the batch, while a
+        // silent skip could drop it for good.
+        let committed = self
+            .store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed_seq;
+        if batch.seq <= committed {
+            return Err(Error::Conflict(format!(
+                "cannot apply replicated batch {}: this replica has already committed \
+                 sequence {committed}; sequences must only advance (a full resync is needed)",
+                batch.seq
+            )));
+        }
         let ops: BTreeMap<(u8, Vec<u8>), Op> = batch
             .ops
             .into_iter()
@@ -1054,7 +1418,7 @@ impl NativeEngine {
                 )
             })
             .collect();
-        self.durable_commit(batch.seq, ops)
+        self.durable_commit(batch.seq, ops).map(|_| ())
     }
 
     /// Register (or clear, with `None`) the replication observer invoked
@@ -1105,9 +1469,28 @@ struct WalOpRef<'a> {
     value: Option<&'a [u8]>,
 }
 
+/// Largest WAL record body the `u32` length prefix can describe.
+const MAX_WAL_RECORD_LEN: usize = u32::MAX as usize;
+
+/// The length-prefix value for a record body of `len` bytes, or a typed error
+/// when it does not fit: `len as u32` would silently wrap for a >4 GiB batch
+/// and write a record whose prefix disagrees with its body, which replay would
+/// then treat as a torn tail — losing the commit *after* reporting it durable.
+fn wal_record_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "transaction too large for one WAL record: {len} bytes serialized, \
+             the limit is {MAX_WAL_RECORD_LEN} bytes; split the write into smaller batches"
+        ))
+    })
+}
+
 fn append_batch(w: &mut impl Write, batch: &WalBatchRef<'_>) -> Result<()> {
     let body = postcard::to_stdvec(batch).map_err(backend)?;
-    w.write_all(&(body.len() as u32).to_le_bytes())?;
+    // Checked before the first byte is written, so an oversize batch leaves
+    // the WAL exactly as it was.
+    let len = wal_record_len(body.len())?;
+    w.write_all(&len.to_le_bytes())?;
     w.write_all(&crc32(&body).to_le_bytes())?;
     w.write_all(&body)?;
     Ok(())
