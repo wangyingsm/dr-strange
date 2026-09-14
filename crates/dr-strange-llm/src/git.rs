@@ -312,6 +312,29 @@ impl GitTree {
             .collect())
     }
 
+    /// The unified diff of `path` (a file or a directory, `""` for the root)
+    /// from commit `from` to this tree's commit.
+    pub fn diff(&self, from: &Sha, path: &RelPath) -> Result<String> {
+        let scope = match path.as_str() {
+            "" => ".".to_string(),
+            p => format!(":(literal){p}"),
+        };
+        let raw = self.git.run(&[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-M",
+            "-U3",
+            "--relative",
+            from.as_str(),
+            self.sha.as_str(),
+            "--",
+            &scope,
+        ])?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    }
+
     /// `path`'s object name at this commit.
     fn spec(&self, path: &RelPath) -> String {
         format!("{}:{}{}", self.sha.as_str(), self.prefix, path.as_str())
@@ -697,6 +720,26 @@ mod tests {
             tree.grep(&broken).is_err(),
             "a bad regex is git's error, not an empty answer"
         );
+    }
+
+    #[test]
+    fn a_diff_runs_from_an_older_commit_to_this_one() {
+        let repo = Repo::new("diff");
+        let one = repo
+            .write("src/a.rs", "one\ntwo\n")
+            .write("b.txt", "b\n")
+            .commit("one");
+        let two = repo.write("src/a.rs", "one\n2\n").commit("two");
+        let tree = GitTree::open(&repo.0, two).unwrap();
+        let path = |p: &str| RelPath::parse(p).unwrap();
+        let file = tree.diff(&one, &path("src/a.rs")).unwrap();
+        assert!(file.contains("-two\n+2\n"), "{file}");
+        let whole = tree.diff(&one, &path("")).unwrap();
+        assert!(
+            whole.contains("src/a.rs") && !whole.contains("b.txt"),
+            "{whole}"
+        );
+        assert!(tree.diff(&one, &path("b.txt")).unwrap().is_empty());
     }
 
     #[test]

@@ -28,6 +28,12 @@ const GREP_DEFAULT: usize = 50;
 const GREP_CAP: usize = 200;
 /// Lines either side of a hit that the suggested follow-up read covers.
 const GREP_AROUND: usize = 5;
+/// Diff lines an answer shows when the caller names no `lines`.
+const DIFF_DEFAULT: usize = 200;
+/// Unchanged lines either side of a change that a symbol diff's hunk shows.
+const HUNK_CONTEXT: usize = 3;
+/// Largest `old × new` line table a symbol diff computes.
+const LCS_CELLS: usize = 4_000_000;
 
 /// `recall`'s request: something in a repository, read as it was at a revision.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -45,9 +51,14 @@ pub struct RecallReq {
     /// (YYYY-MM-DD or RFC-3339) or `<rev>@{<date>}`, each optionally followed
     /// by `~n` / `^n`.
     pub at: String,
-    /// Lines returned (default 40 for a file, a symbol's own extent; capped at
-    /// 400); a `path:start-end` range returns its own lines. The answer says
-    /// how to read on.
+    /// An older revision, in the same forms as `at`: the answer is what changed
+    /// in `name` from `vs` to `at` — git's diff for a file or directory, the
+    /// declaration against the declaration for a symbol.
+    #[serde(default)]
+    pub vs: Option<String>,
+    /// Lines returned (default 40 for a file, a symbol's own extent, 200 for a
+    /// diff; capped at 400); a `path:start-end` range returns its own lines.
+    /// The answer says how to read on.
     #[serde(default)]
     pub lines: Option<usize>,
     /// Search the tree at `at` for this text instead of reading `name`: literal
@@ -79,6 +90,8 @@ enum Mode<'a> {
     Read,
     /// Search the tree for a pattern.
     Grep(&'a str),
+    /// Diff a path or a symbol from an older revision.
+    Diff(&'a str),
 }
 
 impl RecallReq {
@@ -95,7 +108,13 @@ impl RecallReq {
                 if let Some((field, _)) = stray.into_iter().find(|(_, set)| *set) {
                     bail!("`{field}` applies to a `pattern` search, not to reading `name`");
                 }
-                Ok(Mode::Read)
+                Ok(match &self.vs {
+                    Some(vs) => Mode::Diff(vs),
+                    None => Mode::Read,
+                })
+            }
+            (None, Some(_)) if self.vs.is_some() => {
+                bail!("`vs` diffs `name` between two revisions; a search reads one revision")
             }
             (None, Some(_)) if self.lines.is_some() => {
                 bail!(
@@ -150,7 +169,7 @@ pub fn recall_logic(
             req.plane
         );
     };
-    let (commit, note) = resolve(db, &plane, &root, &req)?;
+    let (commit, note) = resolve(db, &plane, &root, &req, &req.at)?;
     let tree = GitTree::open(&root, commit.sha.clone()).map_err(|e| {
         if commit.reachable {
             e
@@ -163,16 +182,28 @@ pub fn recall_logic(
     out.push_str(&match mode {
         Mode::Read => read(&plane, &tree, parsers, &req)?,
         Mode::Grep(pattern) => search(&tree, &req, pattern)?,
+        Mode::Diff(vs) => {
+            let ctx = Ctx {
+                db,
+                plane: &plane,
+                root: &root,
+                tree: &tree,
+                parsers,
+                req: &req,
+            };
+            diff(&ctx, vs)?
+        }
     });
     Ok(Value::String(out))
 }
 
-/// The commit `req.at` names, and a note when git rather than the history plane named it.
+/// The commit `rev` names, and a note when git rather than the history plane named it.
 fn resolve(
     db: &Database,
     plane: &PlaneHandle<'_>,
     root: &Path,
     req: &RecallReq,
+    rev: &str,
 ) -> AnyResult<(CommitRef, String)> {
     let history_name = compact::history_plane_name(&req.plane);
     let Ok(history) = db.plane(&history_name) else {
@@ -180,11 +211,11 @@ fn resolve(
             "note: no `{history_name}` plane — git resolved the revision; a digest of this \
              checkout records its history\n"
         );
-        return Ok((resolve_with_git(root, &req.at)?, note));
+        return Ok((resolve_with_git(root, rev)?, note));
     };
-    match rev::resolve_rev(&history, synced_commit(plane).as_ref(), &req.at)? {
+    match rev::resolve_rev(&history, synced_commit(plane).as_ref(), rev)? {
         RevAnswer::One(commit) => Ok((commit, String::new())),
-        RevAnswer::Many(commits) => bail!("{}", rev::ambiguous(&req.at, &commits).trim_end()),
+        RevAnswer::Many(commits) => bail!("{}", rev::ambiguous(rev, &commits).trim_end()),
         RevAnswer::None(why) => bail!(
             "{why} (`history {}` lists the branches, tags and newest commits)",
             req.plane
@@ -449,6 +480,272 @@ fn not_declared(key: &str, file: &str, at: &str, parsed: &Preprocessed) -> anyho
     }
     msg.push_str(&format!("\nrecall {file} at {at} reads the whole file"));
     anyhow!(msg)
+}
+
+/// What a diff reads from: the plane, its checkout, the tree at `at`, the parsers and the request.
+struct Ctx<'a> {
+    db: &'a Database,
+    plane: &'a PlaneHandle<'a>,
+    root: &'a Path,
+    tree: &'a GitTree,
+    parsers: &'a dyn Parsers,
+    req: &'a RecallReq,
+}
+
+/// What changed in the request's name from revision `vs` to the tree's commit.
+fn diff(ctx: &Ctx<'_>, vs: &str) -> AnyResult<String> {
+    let name = ctx.req.name();
+    if parse_range(name).is_some() {
+        bail!("a line range names lines of one revision — diff the file or the symbol instead");
+    }
+    let (base, note) = resolve(ctx.db, ctx.plane, ctx.root, ctx.req, vs)?;
+    let old = GitTree::open(ctx.root, base.sha.clone())?;
+    let mut out = format!(
+        "vs {}{note}",
+        rev::commit_header(&base, vs).trim_start_matches("at ")
+    );
+    let path = match RelPath::parse(name) {
+        Ok(rel) => {
+            let exists = ctx.tree.kind(&rel)?.is_some() || old.kind(&rel)?.is_some();
+            exists.then_some(rel)
+        }
+        Err(_) if name.starts_with("::") => None,
+        Err(e) => return Err(e),
+    };
+    out.push_str(&match path {
+        Some(rel) => path_diff(ctx, &old, &rel)?,
+        None => symbol_diff(ctx, &old)?,
+    });
+    Ok(out)
+}
+
+/// Git's own diff of a file or a directory between the two trees.
+fn path_diff(ctx: &Ctx<'_>, old: &GitTree, rel: &RelPath) -> AnyResult<String> {
+    let (from, to) = (old.sha().short(), ctx.tree.sha().short());
+    let shown = match rel.as_str() {
+        "" => "./",
+        p => p,
+    };
+    let text = ctx.tree.diff(old.sha(), rel)?;
+    if text.is_empty() {
+        return Ok(format!("no change to {shown} between {from} and {to}\n"));
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let (added, gone) = counts(&lines);
+    let mut out = format!("diff {shown}  {from} → {to}: +{added} −{gone}\n");
+    out.push_str(&capped(&lines, ctx.req.lines));
+    out.push_str(&format!("recall {shown} at {from} reads the older side\n"));
+    Ok(out)
+}
+
+/// A symbol's declaration at the older tree against the one at the tree's commit.
+fn symbol_diff(ctx: &Ctx<'_>, old: &GitTree) -> AnyResult<String> {
+    let (from, to) = (old.sha().short(), ctx.tree.sha().short());
+    let sym = symbol(ctx.plane, ctx.req, to)?;
+    let mut notes = String::new();
+    let mut present = |found: AnyResult<Side>, at: &str| match found {
+        Ok(side) => Some(side),
+        Err(e) => {
+            let why = format!("{e:#}");
+            notes.push_str(&format!(
+                "note: at {at}: {}\n",
+                why.lines().next().unwrap_or("")
+            ));
+            None
+        }
+    };
+    let before = present(side(old, ctx.parsers, &sym), from);
+    let after = present(side(ctx.tree, ctx.parsers, &sym), to);
+    if before.is_none() && after.is_none() {
+        bail!(
+            "`{}` is declared at neither revision\n{}",
+            sym.key,
+            notes.trim_end()
+        );
+    }
+    let absent = Side::default();
+    let (b, a) = (
+        before.as_ref().unwrap_or(&absent),
+        after.as_ref().unwrap_or(&absent),
+    );
+    let old_lines: Vec<&str> = b.lines.iter().map(String::as_str).collect();
+    let new_lines: Vec<&str> = a.lines.iter().map(String::as_str).collect();
+    let Some(script) = edits(&old_lines, &new_lines) else {
+        bail!(
+            "`{}` is too long at both revisions to diff here — recall it at each and compare",
+            sym.key
+        );
+    };
+    let added = script.iter().filter(|(e, _)| *e == Edit::Added).count();
+    let gone = script.iter().filter(|(e, _)| *e == Edit::Gone).count();
+    if added + gone == 0 {
+        return Ok(format!(
+            "no change to `{}` between {from} and {to}\n",
+            sym.key
+        ));
+    }
+    let mut out = format!(
+        "diff {}  {} at {from} → {} at {to}: +{added} −{gone}\n{notes}",
+        sym.key, b.place, a.place
+    );
+    let body = hunks(&script, b.first, a.first);
+    out.push_str(&capped(&body.lines().collect::<Vec<_>>(), ctx.req.lines));
+    out.push_str(&format!(
+        "recall {} at {from} reads the older side; context {} — what it is now\n",
+        sym.key, sym.key
+    ));
+    Ok(out)
+}
+
+/// One side of a symbol diff: where the declaration is, and its lines.
+struct Side {
+    place: String,
+    first: usize,
+    lines: Vec<String>,
+}
+
+impl Default for Side {
+    fn default() -> Self {
+        Self {
+            place: "(absent)".into(),
+            first: 1,
+            lines: Vec::new(),
+        }
+    }
+}
+
+fn side(tree: &GitTree, parsers: &dyn Parsers, sym: &Symbol) -> AnyResult<Side> {
+    let found = locate(tree, parsers, sym)?;
+    let text = match text_at(tree, &found.file)? {
+        Text::Shown(text) => text,
+        Text::Withheld(why) => bail!("{}", why.trim_end()),
+    };
+    let end = found.declared.unwrap_or(found.line + DEFAULT_LINES - 1);
+    let lines: Vec<String> = text
+        .lines()
+        .skip(found.line - 1)
+        .take(end + 1 - found.line)
+        .map(str::to_string)
+        .collect();
+    let last = found.line + lines.len().saturating_sub(1);
+    Ok(Side {
+        place: format!("{}:{}-{last}", found.file, found.line),
+        first: found.line,
+        lines,
+    })
+}
+
+/// `+` and `−` line counts of a unified diff, file headers excluded.
+fn counts(lines: &[&str]) -> (usize, usize) {
+    lines.iter().fold((0, 0), |(added, gone), l| {
+        if l.starts_with('+') && !l.starts_with("+++") {
+            (added + 1, gone)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            (added, gone + 1)
+        } else {
+            (added, gone)
+        }
+    })
+}
+
+/// The first `want` lines of a diff (default 200, capped at 400), and what was cut.
+fn capped(lines: &[&str], want: Option<usize>) -> String {
+    let cap = want.unwrap_or(DIFF_DEFAULT).clamp(1, SNIPPET_CAP);
+    let mut out: String = lines.iter().take(cap).map(|l| format!("{l}\n")).collect();
+    if lines.len() > cap {
+        out.push_str(&format!(
+            "… {} more diff line(s); raise `lines` (at most 400) or narrow `name`\n",
+            lines.len() - cap
+        ));
+    }
+    out
+}
+
+/// One line of an edit script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Same,
+    Gone,
+    Added,
+}
+
+/// The edit script turning `old` into `new` by longest common subsequence,
+/// removals before additions; `None` when the table would pass [`LCS_CELLS`].
+fn edits<'a>(old: &[&'a str], new: &[&'a str]) -> Option<Vec<(Edit, &'a str)>> {
+    let (n, m) = (old.len(), new.len());
+    if (n + 1).saturating_mul(m + 1) > LCS_CELLS {
+        return None;
+    }
+    let cell = |i: usize, j: usize| i * (m + 1) + j;
+    let mut len = vec![0u32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            len[cell(i, j)] = if old[i] == new[j] {
+                len[cell(i + 1, j + 1)] + 1
+            } else {
+                len[cell(i + 1, j)].max(len[cell(i, j + 1)])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut script = Vec::with_capacity(n + m);
+    while i < n || j < m {
+        if i < n && j < m && old[i] == new[j] {
+            script.push((Edit::Same, old[i]));
+            (i, j) = (i + 1, j + 1);
+        } else if i < n && (j == m || len[cell(i + 1, j)] >= len[cell(i, j + 1)]) {
+            script.push((Edit::Gone, old[i]));
+            i += 1;
+        } else {
+            script.push((Edit::Added, new[j]));
+            j += 1;
+        }
+    }
+    Some(script)
+}
+
+/// `script` as unified hunks, numbering old lines from `old_first` and new ones from `new_first`.
+fn hunks(script: &[(Edit, &str)], old_first: usize, new_first: usize) -> String {
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in script
+        .iter()
+        .enumerate()
+        .filter(|(_, (e, _))| *e != Edit::Same)
+    {
+        let (lo, hi) = (
+            i.saturating_sub(HUNK_CONTEXT),
+            (i + HUNK_CONTEXT).min(script.len() - 1),
+        );
+        match groups.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = hi,
+            _ => groups.push((lo, hi)),
+        }
+    }
+    let (mut old_no, mut new_no, mut next) = (old_first, new_first, 0);
+    let mut out = String::new();
+    for (lo, hi) in groups {
+        let skipped = lo - next;
+        (old_no, new_no) = (old_no + skipped, new_no + skipped);
+        let (old_at, new_at) = (old_no, new_no);
+        let mut body = String::new();
+        for (edit, text) in &script[lo..=hi] {
+            let mark = match edit {
+                Edit::Same => ' ',
+                Edit::Gone => '-',
+                Edit::Added => '+',
+            };
+            body.push_str(&format!("{mark}{text}\n"));
+            old_no += usize::from(*edit != Edit::Added);
+            new_no += usize::from(*edit != Edit::Gone);
+        }
+        out.push_str(&format!(
+            "@@ -{old_at},{} +{new_at},{} @@\n{body}",
+            old_no - old_at,
+            new_no - new_at
+        ));
+        next = hi + 1;
+    }
+    out
 }
 
 /// Lines matching `pattern` in the tree at its commit, one `file:line: text` each.
@@ -1070,6 +1367,103 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(none.contains("`zzz` is neither a path at"), "{none}");
+    }
+
+    #[test]
+    fn a_file_diff_shows_what_changed_between_two_revisions() {
+        let f = fixture(true);
+        let (one, two) = (&f.one[..12], &f.two[..12]);
+        let ask = |name: &str, lines: Option<usize>| {
+            let mut req = json!({"plane": "repo", "name": name, "at": "main", "vs": "v1"});
+            if let Some(n) = lines {
+                req["lines"] = json!(n);
+            }
+            recall(&f.db, req).unwrap()
+        };
+        let file = ask("src/sym.rs", None);
+        assert!(
+            file.contains(&format!("vs {one}  2026-08-01  Ada  one  (via v1)\n")),
+            "{file}"
+        );
+        assert!(
+            file.contains(&format!("diff src/sym.rs  {one} → {two}: +")),
+            "{file}"
+        );
+        assert!(
+            file.contains("-  b1\n") && file.contains("+  b2\n"),
+            "{file}"
+        );
+        let dir = ask("src", None);
+        assert!(dir.contains("src/new.rs"), "{dir}");
+        let same = ask("docs/a.md", None);
+        assert!(
+            same.contains(&format!("no change to docs/a.md between {one} and {two}")),
+            "{same}"
+        );
+        let cut = ask("src/lib.rs", Some(5));
+        assert!(cut.contains("more diff line(s)"), "{cut}");
+    }
+
+    #[test]
+    fn a_symbol_diff_compares_declaration_with_declaration() {
+        let f = fixture(true);
+        let (one, two) = (&f.one[..12], &f.two[..12]);
+        let ask = |name: &str| {
+            recall(
+                &f.db,
+                json!({"plane": "repo", "name": name, "at": "main", "vs": "v1"}),
+            )
+            .unwrap()
+        };
+        let beta = ask("m::beta");
+        assert!(
+            beta.contains(&format!(
+                "diff m::beta  src/sym.rs:3-4 at {one} → src/sym.rs:1-3 at {two}: +2 −1\n"
+            )),
+            "{beta}"
+        );
+        assert!(
+            beta.contains("@@ -3,2 +1,3 @@\n fn beta\n-  b1\n+  b2\n+  b2 more\n"),
+            "{beta}"
+        );
+        let gamma = ask("m::gamma");
+        assert!(
+            gamma.contains(&format!("note: at {one}: `m::gamma` is not declared")),
+            "{gamma}"
+        );
+        assert!(gamma.contains("+fn gamma\n+  g\n"), "{gamma}");
+        let moved = ask("m::moved");
+        assert!(
+            moved.contains(&format!("no change to `m::moved` between {one} and {two}")),
+            "{moved}"
+        );
+    }
+
+    #[test]
+    fn a_diff_refuses_a_line_range_and_a_search() {
+        let f = fixture(true);
+        let refused = |req: serde_json::Value| recall(&f.db, req).unwrap_err().to_string();
+        let range =
+            refused(json!({"plane": "repo", "name": "src/lib.rs:1-3", "at": "main", "vs": "v1"}));
+        assert!(
+            range.contains("a line range names lines of one revision"),
+            "{range}"
+        );
+        let search = refused(json!({"plane": "repo", "pattern": "fn", "at": "main", "vs": "v1"}));
+        assert!(search.contains("`vs` diffs `name`"), "{search}");
+    }
+
+    #[test]
+    fn edits_and_hunks_render_a_unified_diff() {
+        let script = edits(&["a", "b", "c"], &["a", "x", "c", "d"]).unwrap();
+        assert_eq!(
+            hunks(&script, 10, 20),
+            "@@ -10,3 +20,4 @@\n a\n-b\n+x\n c\n+d\n"
+        );
+        assert!(
+            edits(&[""; 3000], &[""; 3000]).is_none(),
+            "past the table cap"
+        );
     }
 
     #[test]
