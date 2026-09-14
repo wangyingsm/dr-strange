@@ -749,41 +749,158 @@ async fn export_http(
     }
 
     let plane = q.plane;
-    let built = tokio::task::spawn_blocking({
+    // Resolve the plane before the status line goes out, then stream the
+    // lines as they are produced: a plane's export used to be built as one
+    // `String` in memory, which for a large plane was the plane twice over.
+    let (started, body) = stream_body("export", {
         let state = state.clone();
         let plane = plane.clone();
-        move || methods::export_plane(&state.ctx(), &plane)
-    })
-    .await;
-
-    match built {
-        Ok(Ok(jsonl)) => {
-            tracing::info!(plane = %plane, bytes = jsonl.len(), "exported plane as JSONL");
+        move |out, ready| {
+            let ctx = state.ctx();
+            let export = methods::export_plane(&ctx, &plane)?;
+            ready.ok();
+            export.write_to(out)
+        }
+    });
+    match started.await {
+        Ok(()) => {
+            tracing::info!(plane = %plane, "exporting plane as JSONL");
             Response::builder()
                 .header("content-type", "application/x-ndjson")
                 .header(
                     "content-disposition",
                     format!("attachment; filename=\"{}.jsonl\"", safe_filename(&plane)),
                 )
-                .body(Body::from(jsonl))
-                .unwrap()
+                .body(body)
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export failed").into_response()
+                })
         }
-        Ok(Err(e)) => {
-            tracing::warn!(plane = %plane, error = %e.message, "export failed");
+        Err(Started::Refused(e)) => {
+            tracing::warn!(plane = %plane, error = %e.message, "export refused");
             (StatusCode::BAD_REQUEST, e.message).into_response()
         }
-        Err(_) => {
+        Err(Started::Panicked) => {
             tracing::error!(plane = %plane, "export task panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response()
         }
     }
 }
 
+/// Why a streamed response never started: the producer refused the request
+/// (a client error, with the message a handler may forward), or its task
+/// died before deciding.
+enum Started {
+    Refused(rpc::RpcError),
+    Panicked,
+}
+
+/// Bytes per chunk handed to the HTTP body by [`stream_body`]. Large enough
+/// that a chunk is a syscall's worth, small enough that a slow reader holds
+/// little: with the channel's depth, at most a megabyte is in flight.
+const STREAM_CHUNK: usize = 64 << 10;
+
+/// Run a blocking producer on its own task and stream what it writes as a
+/// chunked HTTP body, without ever holding the whole of it. The producer
+/// validates the request first and then calls [`Ready::ok`] — that resolves
+/// the returned future, so the handler can still answer a 400 for an error
+/// returned before it — and writes into a [`BodyWriter`] whose bounded
+/// channel applies backpressure to a slow reader. A failure after `ok` is
+/// logged under the same operator/client split as an RPC error and ends
+/// the body early, which a chunked transfer reports to the client as a
+/// truncated response — the one honest signal left once the status line
+/// has gone out.
+fn stream_body<F>(
+    what: &'static str,
+    produce: F,
+) -> (impl std::future::Future<Output = Result<(), Started>>, Body)
+where
+    F: FnOnce(&mut BodyWriter, &mut Ready) -> Result<(), rpc::RpcError> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<Result<(), rpc::RpcError>>();
+    tokio::task::spawn_blocking(move || {
+        let mut out = BodyWriter {
+            tx,
+            buf: Vec::with_capacity(STREAM_CHUNK),
+        };
+        let mut ready = Ready(Some(started_tx));
+        let res = produce(&mut out, &mut ready).and_then(|()| {
+            std::io::Write::flush(&mut out)
+                .map_err(|e| rpc::RpcError::server(format!("{what} stream closed: {e}")))
+        });
+        match (ready.0.take(), res) {
+            // Never signalled: the producer decided against the request
+            // (or produced nothing and returned) before the status line.
+            (Some(started), Err(e)) => {
+                let _ = started.send(Err(e));
+            }
+            (Some(started), Ok(())) => {
+                let _ = started.send(Ok(()));
+            }
+            (None, Err(e)) => {
+                let e = methods::opaque(&format!("{what} failed mid-stream"), e.message);
+                let _ = out.tx.blocking_send(Err(std::io::Error::other(e.message)));
+            }
+            (None, Ok(())) => {}
+        }
+    });
+    let started = async move {
+        match started_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Started::Refused(e)),
+            Err(_) => Err(Started::Panicked),
+        }
+    };
+    (started, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+/// The producer's "the request is valid, start the response" signal — see
+/// [`stream_body`]. Calling it twice is harmless.
+struct Ready(Option<tokio::sync::oneshot::Sender<Result<(), rpc::RpcError>>>);
+
+impl Ready {
+    fn ok(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+}
+
+/// The `Write` end of [`stream_body`]: buffers to [`STREAM_CHUNK`] and hands
+/// each chunk to the body's channel, blocking when the reader is behind.
+struct BodyWriter {
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for BodyWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= STREAM_CHUNK {
+            self.flush()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_CHUNK));
+        self.tx
+            .blocking_send(Ok(Bytes::from(chunk)))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
 /// `GET /snapshot` — the one-shot bootstrap bundle for `serve --follow`
 /// (arch/01 §9): the whole database, id-faithful, at one commit sequence
-/// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire). Same
-/// full-buffer-then-respond shape as `export_http`: this project's scale
-/// doesn't yet need chunked transfer.
+/// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire).
+/// Streamed as it is written, like `/export`: the core writes frame by
+/// frame into any `Write`, so the follower reads the first frame while the
+/// master is still on the last, and neither holds the database in memory a
+/// second time.
 async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let creds = match resolve_credentials(&state, &headers, None) {
         Ok(c) => c,
@@ -792,28 +909,32 @@ async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     if !state.authorizer.allows(Access::Read, &creds) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let built = tokio::task::spawn_blocking({
+    let (started, body) = stream_body("snapshot", {
         let state = state.clone();
-        move || -> Result<Vec<u8>, dr_strange_core::Error> {
-            let mut buf = Vec::new();
-            state.db.snapshot(&mut buf)?;
-            Ok(buf)
+        move |out, ready| {
+            ready.ok();
+            state
+                .db
+                .snapshot(&mut *out)
+                .map(|_| ())
+                .map_err(methods::core_err)
         }
-    })
-    .await;
-    match built {
-        Ok(Ok(bytes)) => {
-            tracing::info!(bytes = bytes.len(), "served a replication snapshot");
+    });
+    match started.await {
+        Ok(()) => {
+            tracing::info!("serving a replication snapshot");
             Response::builder()
                 .header("content-type", "application/octet-stream")
-                .body(Body::from(bytes))
-                .unwrap()
+                .body(body)
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
+                })
         }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "snapshot export failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        Err(Started::Refused(e)) => {
+            tracing::warn!(error = %e.message, "snapshot export refused");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response()
         }
-        Err(_) => {
+        Err(Started::Panicked) => {
             tracing::error!("snapshot export task panicked");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
