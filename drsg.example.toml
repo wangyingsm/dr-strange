@@ -5,14 +5,22 @@
 # here are folded into the process environment at startup, so an environment
 # variable that is already set ALWAYS wins over the file — handy for injecting
 # secrets at launch without editing this file.
+#
+# Because they become environment variables, `token` and every `[llm]` key are
+# inherited by any process drsg starts (the `serve watch` that `drsg init`
+# spawns, plugin hosts, the editor a shell hook opens). Keep this file out of
+# version control when it holds secrets, and prefer exporting them in the
+# launching environment when other processes must not see them.
 
 [server]
 # Listen address. A `--addr` on the command line overrides this.
 addr = "0.0.0.0:7700"
 # Shared API token (→ DRSG_TOKEN). When set, every request must carry it
 # (`Authorization: Bearer <token>`; WebSocket via `?token=<token>`). When unset,
-# the API is reachable only from the local browser UI.
-token = "change-me"
+# the API is reachable only from the local browser UI. Left unset here on
+# purpose: a copied example must not ship a well-known token — generate one
+# (`openssl rand -hex 20`) or export DRSG_TOKEN at launch.
+# token = "..."
 # Maximum requests processed at once; excess requests queue. Default 1024.
 max_concurrent = 1024
 # How long a write waits for the single writer slot before failing with a
@@ -48,7 +56,10 @@ dir = "logs"
 
 # LLM API keys, by environment-variable name → secret. These feed the provider
 # layer (used by `digest` and text-`SEARCH`), which looks keys up by env-var
-# name. Keys stay server-side and never travel from a client.
+# name. Keys stay server-side and never travel from a client — but each one
+# becomes a process environment variable, visible to every child process drsg
+# starts and in /proc to other users on the machine; a key already exported
+# in the launching environment is never overwritten by the file.
 [llm]
 # OPENAI_API_KEY = "sk-..."
 # DEEPSEEK_API_KEY = "..."
