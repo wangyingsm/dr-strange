@@ -60,7 +60,8 @@ console.log(stats.nodes, stats.edges);
 
 应用级失败（未知平面、非法计划）是一个 JSON-RPC 错误；被拒绝的凭据对应错误码
 `-32001`。各 SDK 都会把它包装成带类型的错误：TypeScript 与 Python 中的 `DrsgError` /
-`DrsgAuthError`，Go 中带 `IsAuthError` 的 `*drsg.Error`，Java 中的 `DrsgException` /
+`DrsgAuthError`（此外 TypeScript 客户端中超过 `timeoutMs` 的请求抛出 `DrsgTimeoutError`，Python 中
+非 JSON-RPC 的响应或畸形的变更流帧抛出 `DrsgProtocolError`），Go 中带 `IsAuthError` 的 `*drsg.Error`，Java 中的 `DrsgException` /
 `DrsgAuthException`，以及 C 中一个填充好的 `drsg_error`（配 `drsg_is_auth_error`）。
 
 ## 变更流

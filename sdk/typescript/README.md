@@ -21,7 +21,7 @@ this repository the examples import the source directly (`../src/index.ts`).
 ## Use
 
 ```ts
-import { Drsg, DrsgError, DrsgAuthError } from "drsg";
+import { Drsg, DrsgError, DrsgAuthError, DrsgTimeoutError } from "drsg";
 
 // token defaults to $DRSG_TOKEN; baseUrl defaults to http://127.0.0.1:7700
 const db = new Drsg({ baseUrl: "http://127.0.0.1:7700", token: "…" });
@@ -47,6 +47,19 @@ The whole surface is authenticated. Pass `token` or set `DRSG_TOKEN`; it rides
 each request as `Authorization: Bearer …`. A missing/invalid credential rejects
 with `DrsgAuthError` (code `-32001`); other server errors reject with
 `DrsgError` carrying a `.code`.
+
+A request that outlives `timeoutMs` (default 30 s) rejects with
+`DrsgTimeoutError`, a `DrsgError` (code `-32000`) distinct from the
+`connection failed: …` a refused or dropped connection produces.
+
+### Platform types
+
+The declarations reference no ambient `fetch`/`WebSocket` type: `DrsgOptions.fetch`
+is a structural `FetchLike` and `WatchOptions.WebSocket` a `WebSocketConstructor`,
+which the platform globals of Bun, Node and browsers (and the `ws` package)
+satisfy — so the package type-checks in a project without `lib: DOM` or
+`@types/bun`.
+
 
 ## Discover
 

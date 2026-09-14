@@ -1,6 +1,8 @@
 // Minimal dr-strange quickstart — run against a `drsg serve` on :7700.
 //   DRSG_TOKEN=… bun examples/quickstart.ts
-import { Drsg } from "drsg";
+// Inside this repository the source is imported directly; a consumer that
+// installed the package writes `import { Drsg } from "drsg";` instead.
+import { Drsg } from "../src/index";
 
 const db = new Drsg(); // base http://127.0.0.1:7700; token from $DRSG_TOKEN
 

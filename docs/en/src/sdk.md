@@ -65,7 +65,10 @@ out-parameter.
 
 An application-level failure (an unknown plane, a malformed plan) is a JSON-RPC
 error; a rejected credential is code `-32001`. The SDKs surface this as a typed
-error: `DrsgError` / `DrsgAuthError` in TypeScript and Python, a `*drsg.Error`
+error: `DrsgError` / `DrsgAuthError` in TypeScript and Python (plus
+`DrsgTimeoutError` for a request that outlives the TypeScript client's
+`timeoutMs`, and `DrsgProtocolError` for a non-JSON-RPC reply or a malformed
+change-feed frame in Python), a `*drsg.Error`
 with `IsAuthError` in Go, `DrsgException` / `DrsgAuthException` in Java, and a
 filled `drsg_error` (with `drsg_is_auth_error`) in C.
 
