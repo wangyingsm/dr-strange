@@ -200,7 +200,11 @@ Notes:
   the KV.
 - Search is `&self` and uses a per-thread scratch (generation-stamped visited
   set plus heaps) rather than allocating per query; the build path uses the
-  index-owned scratch.
+  index-owned scratch. The scratch costs 4 bytes per node on every thread
+  that searches, for the thread's lifetime, so it is kept between searches
+  only while under `RETAINED_SCRATCH_BYTES` (16 MiB, 4M nodes); a thread
+  that served a larger index drops it after the search and that query
+  allocates as before the scratch existed.
 
 ## 6. Transactions
 
@@ -223,15 +227,30 @@ follow from that ordering:
 - **`commit` returns `Ok` exactly when the batch is durable and visible.** The
   flush and compaction a commit may trigger run *after* publication, so their
   failure is not the commit's failure: it is logged (`tracing::error!`) and
-  kept in `NativeEngine::last_maintenance_error` for `check`/stats to report,
-  and the next commit retries naturally (a failed flush leaves the memtable
-  over threshold, a failed compaction leaves the runs in place). Callers —
-  the API layer applies index/keyword events only after `Ok` — may rely on
-  `Err` meaning "nothing landed".
+  kept in `NativeEngine::last_maintenance_error`, and the next commit retries
+  naturally (a failed flush leaves the memtable over threshold, a failed
+  compaction leaves the runs in place). That accessor is the only surface
+  today — `Database::check`/stats do not yet read it, so a persistently
+  failing compaction (e.g. one rotted block in any run, which fails every
+  merge with `Corrupt`) shows up only in the log while the run count grows;
+  wiring it into `check` is API-layer work still to do. Callers — the API
+  layer applies index/keyword events only after `Ok` — may rely on `Err`
+  meaning "nothing landed".
+- **A failed flush never moves the WAL cursor off the truncated file.** The
+  truncation is `set_len(0)`, seek to 0, then fsync, in that order: since the
+  engine keeps committing after a failed fsync, a cursor left at the old end
+  would put every later batch behind a zero-filled hole that replay reads as
+  an empty torn tail. A cfg(test) fault seam (`sst_write_fault`,
+  `wal_sync_fault`) fails these steps deterministically in tests.
 - **Directory metadata is fsynced.** An SST's temp+fsync+rename is followed
   by an fsync of the directory, and so is the WAL truncation that depends on
   it; otherwise the SST's name could be lost in a crash after the WAL that
-  held its records was already cut. No-op on non-unix.
+  held its records was already cut. Compaction unlinks the runs it merged
+  newest first and then fsyncs the directory, so a crash cannot bring back
+  an old run's put without the newer run's tombstone that the merged run
+  GC'd away. A brand-new store fsyncs the directory once after creating its
+  `wal`, so the commits before the first flush are not durable in a file
+  whose name is not. No-op on non-unix.
 - **A WAL record body is at most `u32::MAX` bytes.** A larger serialized
   batch is refused with `Error::InvalidArgument` before a byte is written;
   the alternative (a wrapped length prefix) would be a record replay treats
@@ -316,8 +335,10 @@ Rules readers honour for either version:
   and a write is copy-on-write — no longer a full deep copy per read.
 - **Native engine invariants are tested where they live** (`native/mod.rs`,
   `native/sst.rs`, `conformance_tests.rs`): a torn WAL tail, an oversized
-  WAL record, a commit whose flush fails (directory made read-only), a
-  reader served while a flush is parked mid-I/O, the streaming merge
+  WAL record, a commit whose flush fails and a commit after a WAL
+  truncation whose fsync failed (both via the injected-fault seam), a
+  reader served while a flush is parked mid-I/O, the HNSW scratch cap, the
+  streaming merge
   against the map union, a sweep over a rotted block ending in `Corrupt`,
   v1 files still opening, retention reclaiming versions on compaction, and
   a reader pinned through compaction. The HNSW entry-point rule is checked
@@ -369,7 +390,13 @@ key.
   replica's own write path, landing a batch at its master's exact `seq`)
   bypasses it entirely, since it isn't the gate this flag exists for. It
   does enforce §6.1's ordering rule: a batch at or below the replica's
-  `committed_seq` is `Error::Conflict`, and the follower resyncs.
+  `committed_seq` is `Error::Conflict`, and the follower resyncs. Known
+  gap: a fresh replica's own bootstrap (two `Database::init` commits) and
+  `restore` (one more) consume engine sequences 1–3, so against a master
+  whose snapshot `seq` is ≤ 2 (no data writes yet) the master's first live
+  batch is refused and the follower resyncs once more before converging.
+  The fix is API-side — the bootstrap/restore path should land the replica
+  at the snapshot's sequence rather than allocating its own.
 - `Database::init`'s one-time-per-open plane/counters bootstrap, and
   `restore`, both need to succeed on a read-only-opened engine — they're the
   engine's own setup, not a caller's write. Both go through a
