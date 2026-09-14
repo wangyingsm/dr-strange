@@ -351,21 +351,50 @@ impl Database {
         // very number, read from its own (empty) state before the restore.
         // Exact-seq matching would serve them as current, so drop everything.
         self.cache.invalidate_all();
-        // Persist + load the sidecars. Ids are preserved, so they match; loading
-        // them into the live registries means this database (and its drop-time
-        // save) stays coherent without a rebuild-from-KV.
-        if let (Some(bytes), Some(path)) = (&hnsw, self.sidecar.as_deref()) {
-            std::fs::write(path, bytes)?;
-            if let Some(reg) = VectorRegistry::from_bytes(bytes, seq) {
-                *self.indexes_mut() = reg;
+        // Load the shipped sidecars into the live registries — ids are
+        // preserved, so they match — and persist them where this database
+        // keeps its own. The live registries are what every search reads, so
+        // they are loaded whether or not a sidecar path exists: an in-memory
+        // database has none, and before this it kept its pre-restore (empty)
+        // registries and searched nothing. A snapshot with no usable sidecar
+        // (a frame missing, or stamped with another seq) falls back to the
+        // KV, which is always the source of truth.
+        let vectors = hnsw
+            .as_deref()
+            .and_then(|bytes| VectorRegistry::from_bytes(bytes, seq));
+        let vectors = match vectors {
+            Some(reg) => {
+                if let (Some(bytes), Some(path)) = (&hnsw, self.sidecar.as_deref()) {
+                    std::fs::write(path, bytes)?;
+                }
+                reg
             }
-        }
-        if let (Some(bytes), Some(path)) = (&bm25, self.keyword_sidecar.as_deref()) {
-            std::fs::write(path, bytes)?;
-            if let Some(reg) = KeywordRegistry::from_bytes(bytes, seq) {
-                *self.keywords_mut() = reg;
+            None => {
+                let mut reg = VectorRegistry::new();
+                self.engine.with_read(|txn| reg.rebuild_from(txn))?;
+                tracing::info!("rebuilt vector indexes from the restored KV (no usable sidecar)");
+                reg
             }
-        }
+        };
+        let keywords = bm25
+            .as_deref()
+            .and_then(|bytes| KeywordRegistry::from_bytes(bytes, seq));
+        let keywords = match keywords {
+            Some(reg) => {
+                if let (Some(bytes), Some(path)) = (&bm25, self.keyword_sidecar.as_deref()) {
+                    std::fs::write(path, bytes)?;
+                }
+                reg
+            }
+            None => {
+                let mut reg = KeywordRegistry::new();
+                self.engine.with_read(|txn| reg.rebuild_from(txn))?;
+                tracing::info!("rebuilt keyword indexes from the restored KV (no usable sidecar)");
+                reg
+            }
+        };
+        *self.indexes_mut() = vectors;
+        *self.keywords_mut() = keywords;
         Ok(stats)
     }
 }
@@ -455,6 +484,98 @@ mod tests {
             c
         };
         assert!(c.0 > a.0 && c.0 > b.0, "new id past restored ids");
+    }
+
+    /// A source with one vector index and one keyword index over two Docs,
+    /// dumped to a snapshot; returns the snapshot and the ids.
+    fn indexed_snapshot() -> (Vec<u8>, NodeId, NodeId) {
+        let src = Database::in_memory().unwrap();
+        let plane = src.create_plane("p", Properties::new()).unwrap();
+        plane
+            .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+            .unwrap();
+        plane
+            .ensure_keyword_index("Doc", "title", crate::Language::English)
+            .unwrap();
+        let (a, b) = {
+            let mut w = plane.write().unwrap();
+            let mut pa = doc(0.1);
+            pa.insert(
+                "title".into(),
+                PropDesc::new(PropValue::Str("graph databases".into())),
+            );
+            let mut pb = doc(0.9);
+            pb.insert(
+                "title".into(),
+                PropDesc::new(PropValue::Str("vector search".into())),
+            );
+            let a = w.create_node_with_key("a", &["Doc"], pa).unwrap();
+            let b = w.create_node_with_key("b", &["Doc"], pb).unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+        let mut buf = Vec::new();
+        src.snapshot(&mut buf).unwrap();
+        (buf, a, b)
+    }
+
+    /// Both index-backed searches answer on `db` after a restore of
+    /// [`indexed_snapshot`].
+    fn assert_indexes_serve(db: &Database, a: NodeId, b: NodeId) {
+        let dp = db.plane("p").unwrap();
+        let hits = dp
+            .query()
+            .vector_top_k(
+                Some("Doc"),
+                "embedding",
+                vec![0.85, 0.15],
+                Metric::Cosine,
+                5,
+            )
+            .ids()
+            .unwrap();
+        assert_eq!(hits, vec![b, a], "vector search after restore");
+        let hits = dp.keyword_search("Doc", "title", "graph", 5);
+        assert_eq!(
+            hits.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![a],
+            "keyword search after restore"
+        );
+    }
+
+    /// An in-memory database has no sidecar files, but the live registries
+    /// are what searches read: a restore must still load the shipped indexes.
+    #[test]
+    fn in_memory_restore_loads_the_shipped_indexes() {
+        let (buf, a, b) = indexed_snapshot();
+        let dst = Database::in_memory().unwrap();
+        dst.restore(&mut buf.as_slice()).unwrap();
+        assert_indexes_serve(&dst, a, b);
+    }
+
+    /// A snapshot carrying no sidecar frames (or unusable ones) still restores
+    /// working indexes: they are rebuilt from the restored KV.
+    #[test]
+    fn restore_without_sidecars_rebuilds_the_indexes_from_the_kv() {
+        let (buf, a, b) = indexed_snapshot();
+        // Re-serialize the snapshot minus its index frames.
+        let mut stripped = Vec::new();
+        let mut input = buf.as_slice();
+        while let Some(frame) = read_frame(&mut input).unwrap() {
+            if !matches!(frame, Frame::Hnsw(_) | Frame::Bm25(_)) {
+                write_frame(&mut stripped, &frame).unwrap();
+            }
+        }
+        assert!(stripped.len() < buf.len());
+
+        let dst = Database::in_memory().unwrap();
+        dst.restore(&mut stripped.as_slice()).unwrap();
+        assert_indexes_serve(&dst, a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = Database::open(dir.path().join("db")).unwrap();
+        on_disk.restore(&mut stripped.as_slice()).unwrap();
+        assert_indexes_serve(&on_disk, a, b);
     }
 
     /// Adjacency of node 1 in the startup plane, read through the query
