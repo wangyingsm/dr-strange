@@ -57,7 +57,12 @@ from the same file. Two readers would mean two vector spaces for one corpus.
   rather than a policy document beside it that can drift.
 - Provider abstraction is minimal: `trait Embedder` and `trait Chat` with
   plain HTTP implementations (JSON-RPC where the provider supports it, REST
-  otherwise); no agent-framework dependency.
+  otherwise); no agent-framework dependency. Chat completions send
+  `temperature: 0` and `max_tokens`; a provider that rejects either is
+  served by naming it in `DRSG_CHAT_OMIT` (`temperature,max_tokens`), read
+  where the key is. A `Retry-After` is obeyed up to sixty seconds. No log
+  line or error ever renders a provider URL's query string or userinfo —
+  that is where a key goes when an operator was told "give a base URL".
 - Cost controls: token/request budgets per digest run, surfaced in progress
   output; embedding cache keyed by content hash to avoid re-embedding
   unchanged text.

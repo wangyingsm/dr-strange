@@ -392,6 +392,49 @@ fn re_splits_a_chunk_that_overflows_the_output_limit() {
     );
 }
 
+/// One hard failure ends the run without making the calls it would have
+/// made: a dead key against a hundred-chunk document used to cost a hundred
+/// refusals before the first was reported.
+#[test]
+fn a_failed_chunk_stops_the_remaining_extractions() {
+    use dr_strange_llm::{Chat, ChatReply};
+    use std::sync::Mutex;
+
+    struct Dead {
+        calls: Mutex<usize>,
+    }
+    impl Chat for Dead {
+        fn complete(&self, _system: &str, _user: &str) -> Result<ChatReply> {
+            *self.calls.lock().unwrap() += 1;
+            anyhow::bail!("HTTP 401: bad key")
+        }
+    }
+
+    // Twelve paragraphs that cannot share a chunk (the chunker floors its
+    // size at 200 characters and each is 150), so twelve extraction calls
+    // would be made if nothing stopped them.
+    let document: Vec<String> = (0..12).map(|_| "a".repeat(150)).collect();
+    let document = document.join("\n\n");
+    let dead = Dead {
+        calls: Mutex::new(0),
+    };
+    let mock = MockProvider::new(vec![], 8);
+    let opts = DigestOptions {
+        chunk_chars: 1,
+        ..opts(false)
+    };
+
+    let Err(err) = digest(&document, &dead, &mock, None, &opts) else {
+        panic!("a dead provider must fail the digest");
+    };
+    assert!(err.to_string().contains("bad key"), "{err}");
+    assert_eq!(
+        *dead.calls.lock().unwrap(),
+        1,
+        "the first failure must be the last request"
+    );
+}
+
 // ---- vocabulary reconciliation (ROADMAP §8 stage 1) -----------------------
 
 /// Two chunks reading the same material independently, exactly as the real
