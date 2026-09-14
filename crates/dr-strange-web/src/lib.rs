@@ -105,6 +105,9 @@ pub struct ServeOptions {
     /// The source tree behind the graph, when one is attached — enables the
     /// MCP `grep` tool. `serve watch` sets it to its `--dir`.
     pub source_root: Option<std::path::PathBuf>,
+    /// The preprocessors `/mcp`'s `recall` locates a symbol with, when the
+    /// operator configured a plugin store; `None` reads the default store.
+    pub recall_parsers: Option<std::sync::Arc<dyn dr_strange_mcp::Parsers>>,
     /// Run once on a background thread after the server is up, with a handle
     /// to the same database the server writes through — how `drsg serve
     /// watch` runs its repository watcher against the one open database
@@ -198,6 +201,7 @@ impl Default for ServeOptions {
             retain_commits: Some(DEFAULT_RETAIN_COMMITS),
             embed_provider: None,
             source_root: None,
+            recall_parsers: None,
             on_start: None,
             follow: None,
         }

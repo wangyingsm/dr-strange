@@ -269,6 +269,7 @@ fn mcp_router(
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
+    parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -289,6 +290,9 @@ fn mcp_router(
             let mut svc = DrStrange::with_digest(db.clone(), digest).with_tool_gate(tools.clone());
             if let Some(root) = &source_root {
                 svc = svc.with_source_root(root.clone());
+            }
+            if let Some(parsers) = &parsers {
+                svc = svc.with_parsers(parsers.clone());
             }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
@@ -320,6 +324,7 @@ fn router(
     max_concurrent: usize,
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
+    parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -348,6 +353,7 @@ fn router(
             max_concurrent,
             embed,
             source_root,
+            parsers,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -1194,6 +1200,7 @@ async fn run_app(
         opts.max_concurrent,
         opts.embed_provider.clone(),
         opts.source_root.clone(),
+        opts.recall_parsers.clone(),
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths

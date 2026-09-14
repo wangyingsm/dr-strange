@@ -1369,6 +1369,7 @@ fn run_services(
                         .with_context(|| format!("opening replica at {}", db_path.display()))?;
                     let mut opts = config::serve_options(cfg, addr);
                     opts.follow = Some(follow_opts.clone());
+                    opts.recall_parsers = Some(recall_parsers(cfg)?);
                     match dr_strange_web::serve(db, Some(db_path.to_path_buf()), opts)? {
                         dr_strange_web::ServeOutcome::Stopped => break Ok(()),
                         dr_strange_web::ServeOutcome::ResyncNeeded => {
@@ -1381,8 +1382,8 @@ fn run_services(
                 }
             } else {
                 let db = commands::open(db_path)?;
-                #[allow(unused_mut)]
                 let mut opts = config::serve_options(cfg, addr);
+                opts.recall_parsers = Some(recall_parsers(cfg)?);
                 #[cfg(feature = "digest")]
                 if let Some(ServeMode::Watch {
                     dir,
