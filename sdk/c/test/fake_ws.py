@@ -7,10 +7,17 @@ script from the `?token=` query:
 
   big         valid handshake, then a frame whose header claims 2^40 bytes
   bad-accept  a 101 whose Sec-WebSocket-Accept does not match the key
-  a&b=c#d     (arrives percent-encoded) valid handshake, then a clean close
+  a&b=c#d     must arrive as `token=a%26b%3Dc%23d`; then a valid handshake
+              and a clean close, so the client returns 0
 
 On `big` it also refuses to play if the client's subscribe frame still uses
-the old fixed mask key, so the test fails if masking regresses.
+the old fixed mask key, so the test fails if masking regresses. For the
+escaping check the decision is made on the raw request target *before* the
+upgrade: a target that names token `a` in any form other than the exact
+percent-encoded one (a raw `token=a&b=c#d` parses back to plain `a`, since
+`&` splits the query and `#` starts a fragment) is answered with `400 Bad
+Request`, which the client reports as "websocket upgrade refused" (-1). The
+e2e's `rc == 0` therefore only holds when the token really was escaped.
 """
 import base64
 import hashlib
@@ -65,6 +72,15 @@ def serve_one(conn):
         name, _, value = line.partition(b":")
         if name.strip().lower() == b"sec-websocket-key":
             key = value.strip()
+    raw_query = target.partition("?")[2]
+    if raw_query.startswith("token=a") and raw_query != "token=a%26b%3Dc%23d":
+        # Unescaped (or differently escaped) metacharacter token: refuse
+        # before upgrading so drsg_watch fails instead of ending cleanly.
+        conn.sendall(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        return
     accept = accept_for(key)
     if token == "bad-accept":
         accept = accept_for(b"not-the-key")
@@ -86,10 +102,6 @@ def serve_one(conn):
             conn.recv(1)  # wait for the client to hang up
         except OSError:
             pass
-        return
-    if token == "a&b=c#d" and "token=a%26b%3Dc%23d" not in target:
-        # Unescaped token: refuse loudly so the client reports an error.
-        conn.sendall(bytes([0x88, 0]))
         return
     conn.sendall(bytes([0x88, 0]))  # clean close
 

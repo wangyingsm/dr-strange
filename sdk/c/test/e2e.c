@@ -301,8 +301,8 @@ int main(void) {
     /* Hostile peer (test/fake_ws.py): a frame header claiming 2^40 bytes must
      * be refused with a typed error rather than allocated; a 101 whose
      * Sec-WebSocket-Accept is wrong must not be trusted; a token with URL
-     * metacharacters must arrive percent-encoded (the fake refuses otherwise
-     * and the watch would not end cleanly). */
+     * metacharacters must arrive percent-encoded (the fake answers 400 to any
+     * other spelling, so the watch only ends cleanly when it was escaped). */
     if (getenv("DRSG_FAKE_URL")) {
         drsg_error ferr;
         int rc = fake_watch("big", &ferr);
@@ -317,6 +317,9 @@ int main(void) {
 
         rc = fake_watch("a&b=c#d", &ferr);
         CHECK(rc == 0, "token with URL metacharacters is percent-encoded");
+        if (rc != 0) {
+            fprintf(stderr, "  (fake peer said: %s)\n", ferr.message);
+        }
     } else {
         CHECK(0, "DRSG_FAKE_URL not set (run via test/run.sh)");
     }
