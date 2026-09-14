@@ -1592,6 +1592,145 @@ fn committing_a_read_clause_does_not_break_writes() {
     }
 }
 
+#[test]
+fn a_typo_late_in_a_write_is_reported_near_the_typo() {
+    // The read grammar used to have the last word: every mistyped CREATE was
+    // "near `CREATE …`", because that is where a MATCH failed to appear.
+    let cases = [
+        // A missing colon deep inside the third path's property map.
+        (
+            r#"CREATE (a:P {key:"a"}), (b:P {key:"b"}), (a)-[:R {since 2020}]->(b)"#,
+            "since 2020",
+        ),
+        // A missing colon in a node's map.
+        (r#"CREATE (a:P {key:"a", age 30})"#, "age 30"),
+        // An edge without a type.
+        (
+            r#"CREATE (a:P {key:"a"}), (b:P {key:"b"}), (a)-[R]->(b)"#,
+            "R]->(b)",
+        ),
+        // A MERGE with a broken ON clause.
+        (
+            r#"MERGE (n:P {key:"k"}) ON CREATE SET n.x = "#,
+            "unexpected end",
+        ),
+        // A SET item with no value, after a MATCH.
+        (
+            "MATCH (n:P) WHERE n.age > 30 SET n.flag = ",
+            "unexpected end",
+        ),
+        // A DELETE with a bad target list, after a MATCH.
+        ("MATCH (n:P) DETACH DELETE n, 42", "42"),
+    ];
+    for (q, want) in cases {
+        let m = err_at(q);
+        assert!(m.contains(want), "`{q}`: {m}");
+        assert!(!m.contains("near `CREATE"), "blamed token 0 for `{q}`: {m}");
+        assert!(!m.contains("near `MERGE"), "blamed token 0 for `{q}`: {m}");
+        assert!(!m.contains("near `MATCH"), "blamed token 0 for `{q}`: {m}");
+    }
+}
+
+#[test]
+fn a_mistyped_return_is_reported_from_the_reading_that_got_furthest() {
+    // Both readings of a MATCH fail; the read one reached the typo.
+    let m = err_at("MATCH (n:P) WHERE n.age > 30 RETRUN n");
+    assert!(m.starts_with("near `RETRUN"), "{m}");
+    // A read whose source is not MATCH still reports at its own fault.
+    let m = err_at(r#"SEARCH (d:Doc) ON body MATCHING "x" RETRUN d"#);
+    assert!(m.starts_with("near `RETRUN"), "{m}");
+}
+
+// ---- unsupported openCypher shapes are named, with the rewrite --------------
+
+/// The message of an unsupported-query error.
+fn unsupported(q: &str) -> String {
+    match err(q) {
+        ParseError::Compile(m) => m,
+        other => panic!("expected an unsupported-query error for `{q}`, got {other}"),
+    }
+}
+
+#[test]
+fn clauses_this_cut_lacks_are_refused_by_name() {
+    let cases = [
+        ("OPTIONAL MATCH (a:P) RETURN a", "OPTIONAL MATCH"),
+        (
+            "MATCH (a:P) OPTIONAL MATCH (a)-[:R]->(b) RETURN b",
+            "OPTIONAL MATCH",
+        ),
+        ("MATCH (a:P) MATCH (b:Q) RETURN b", "second MATCH"),
+        (
+            "MATCH (a:P) WHERE a.x = 1 MATCH (b:Q) RETURN b",
+            "second MATCH",
+        ),
+        ("MATCH (a:P) WITH a RETURN a", "WITH"),
+        ("MATCH (a:P) RETURN a UNION MATCH (b:Q) RETURN b", "UNION"),
+        ("MATCH (a:P) UNWIND [1, 2] AS x RETURN x", "UNWIND"),
+        ("MATCH (a:P)-->(b), (a)-->(c) RETURN c", "several paths"),
+        ("MATCH (a:P), (b:Q) RETURN b", "several paths"),
+        // Writes hit the same wall.
+        ("MATCH (a:P) MATCH (b:Q) SET b.x = 1", "second MATCH"),
+        ("MATCH (a:P) WITH a SET a.x = 1", "WITH"),
+    ];
+    for (q, want) in cases {
+        let m = unsupported(q);
+        assert!(m.contains(want), "`{q}`: {m}");
+    }
+}
+
+#[test]
+fn a_relationship_variable_is_refused_with_the_form_that_works() {
+    for q in [
+        "MATCH (a:P)-[r:R]->(b) RETURN b",
+        "MATCH (a:P)-[r]->(b) RETURN b",
+        "MATCH (a:P)<-[r:R*1..2]-(b) RETURN b",
+        "MATCH (a:P)-[r:R]->(b) SET b.x = 1",
+    ] {
+        let m = unsupported(q);
+        assert!(m.contains("relationship variables"), "`{q}`: {m}");
+        assert!(m.contains("`-[:T]->`"), "`{q}`: {m}");
+    }
+    // The form that works still does.
+    assert!(parse("MATCH (a:P)-[:R]->(b) RETURN b").is_ok());
+}
+
+#[test]
+fn inline_properties_in_a_match_pattern_point_at_where() {
+    let m = unsupported(r#"MATCH (n:P {name: "x"}) RETURN n"#);
+    assert!(m.contains("WHERE n.name"), "{m}");
+    let m = unsupported(r#"MATCH (a:P)-[:R]->(:Q {k: 1}) RETURN a"#);
+    assert!(m.contains("WHERE"), "{m}");
+    // In a CREATE the same map is a value, as before.
+    assert!(matches!(
+        parse_statement(r#"CREATE (n:P {name: "x"})"#),
+        Ok(Statement::Write(_))
+    ));
+}
+
+#[test]
+fn list_and_map_literals_outside_in_are_refused() {
+    let m = unsupported("MATCH (n:P) RETURN [1, 2]");
+    assert!(m.contains("list literal"), "{m}");
+    let m = unsupported(r#"MATCH (n:P) WHERE n.tags = ["a"] RETURN n"#);
+    assert!(m.contains("list literal"), "{m}");
+    let m = unsupported("MATCH (n:P) WHERE n.x = {a: 1} RETURN n");
+    assert!(m.contains("map literal"), "{m}");
+    // The supported positions are untouched.
+    assert!(parse(r#"MATCH (n:P) WHERE n.x IN ["a", "b"] RETURN n"#).is_ok());
+    assert!(parse("MATCH (n:P) WHERE similarity(n.emb, [1.0, 0.0]) > 0.5 RETURN n").is_ok());
+}
+
+#[test]
+fn modulo_and_power_are_refused_by_name() {
+    let m = unsupported("MATCH (n:P) WHERE n.x % 2 = 0 RETURN n");
+    assert!(m.contains("`%`"), "{m}");
+    let m = unsupported("MATCH (n:P) RETURN n.x ^ 2");
+    assert!(m.contains("`^`"), "{m}");
+    let m = unsupported("MATCH (n:P) RETURN n ORDER BY n.x % 3");
+    assert!(m.contains("`%`"), "{m}");
+}
+
 // ---- lexical surface: aggregates in ORDER BY, escapes, identifiers, depth --
 
 #[test]

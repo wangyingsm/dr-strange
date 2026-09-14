@@ -86,12 +86,26 @@
 //! ints or floats (`1.5`, `1e9`). Expressions nest at most
 //! `parse::MAX_NESTING` levels; deeper is a syntax error, not a stack overflow.
 //!
-//! # Not yet (each is a clear error, never a silent miscompile)
+//! # Not yet (each a clear error naming the rewrite, never a silent miscompile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning the *rows* of a non-terminal variable (`RETURN p` after a hop);
 //!   its values project (`RETURN p.name`);
 //! - `WITH` pipelining: a projection is a tail, so nothing follows it;
-//! - unbounded variable-length (`*`, `*n..`).
+//! - unbounded variable-length (`*`, `*n..`);
+//! - a second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, and a pattern with
+//!   several paths (`(a)-->(b), (a)-->(c)`): a query holds one linear path —
+//!   run one query per pattern or branch;
+//! - relationship variables (`-[r:T]->`): an edge can't be bound, returned or
+//!   filtered on — drop the variable;
+//! - inline property predicates in a `MATCH` node (`(n {name: "x"})`): write
+//!   them in `WHERE`;
+//! - list and map literals as values (`RETURN [1, 2]`, `n.x = {a: 1}`); a
+//!   list is only sugar after `IN` (and a vector after `NEAR`), a map only a
+//!   `CREATE`/`SET` property map;
+//! - the `%` and `^` operators.
+//!
+//! Errors point at the fault: a mistyped clause is reported from the reading
+//! of the statement that got furthest, not from the first token.
 //!
 //! # Completing a prefix
 //! [`complete`] answers the other question an editor asks: not "is this a
@@ -166,9 +180,11 @@ pub trait Embedder {
 pub enum ParseError {
     /// The text didn't match the grammar.
     Syntax(String),
-    /// The text parsed, but the pattern/clauses can't map onto a `LogicalPlan`
-    /// (e.g. a cross-variable predicate, an unbounded `*`, or a text `NEAR`
-    /// with no embedder configured).
+    /// The text is understood, but the pattern/clauses can't map onto a
+    /// `LogicalPlan` (e.g. a cross-variable predicate, an unbounded `*`, a
+    /// text `NEAR` with no embedder configured) — or it uses an openCypher
+    /// clause this cut recognises and refuses (`WITH`, `UNION`, `OPTIONAL
+    /// MATCH`, …). The message names the rewrite that works.
     Compile(String),
 }
 
@@ -240,7 +256,7 @@ fn parse_statement_inner(
     embedder: Option<&dyn Embedder>,
     params: &Params,
 ) -> Result<Statement, ParseError> {
-    let (rest, stmt) = parse::statement(input).map_err(|e| ParseError::Syntax(describe(e)))?;
+    let (rest, stmt) = parse::statement(input).map_err(diagnose)?;
     // Everything must be consumed — trailing tokens mean a mistyped clause.
     let rest = rest.trim_start();
     if !rest.trim_end().is_empty() {
@@ -259,6 +275,19 @@ fn parse_statement_inner(
             Statement::Write(write::compile(w, params.clone()).map_err(ParseError::Compile)?)
         }
     })
+}
+
+/// Turn the grammar's failure into the error a caller sees. A recognised but
+/// unsupported shape (`parse::unsupported`) is a `Compile` error carrying its
+/// rewrite hint; anything else is a `Syntax` error located by `describe`.
+fn diagnose(e: nom::Err<nom::error::Error<&str>>) -> ParseError {
+    if let nom::Err::Failure(er) = &e
+        && er.code == nom::error::ErrorKind::Fail
+        && let Some(msg) = parse::take_unsupported()
+    {
+        return ParseError::Compile(msg);
+    }
+    ParseError::Syntax(describe(e))
 }
 
 fn describe(e: nom::Err<nom::error::Error<&str>>) -> String {

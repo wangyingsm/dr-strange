@@ -533,7 +533,10 @@ fn a_hop_is_completed_from_however_much_of_it_is_written() {
     assert_eq!(best("MATCH (n:Function)-[r"), ":CALLS]->(m:Function)");
     assert_eq!(best("MATCH (n:Function)-[:"), "CALLS]->(m:Function)");
 
-    // And each one parses, spliced in exactly where it was offered.
+    // And each one parses, spliced in exactly where it was offered. (`-[r`
+    // is not in this list: the relationship variable the user already typed
+    // is what the parser refuses, with a hint to drop it, so the completion
+    // after it is the natural continuation but not a parsable statement.)
     let vocab = code();
     for prefix in [
         "MATCH (n:Function)-",
@@ -541,7 +544,6 @@ fn a_hop_is_completed_from_however_much_of_it_is_written() {
         "MATCH (n:Function)<-",
         "MATCH (n:Function)-[",
         "MATCH (n:Function)<-[",
-        "MATCH (n:Function)-[r",
         "MATCH (n:Function)-[:",
     ] {
         let insert = complete(prefix, &vocab).best.expect(prefix);
