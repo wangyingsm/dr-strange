@@ -37,7 +37,14 @@ from the same file. Two readers would mean two vector spaces for one corpus.
   plane by default. A preprocessor's facts carry `_generated_by` (`rust@1`)
   instead of `_model`, so a parsed fact is always distinguishable from a
   model's guess; where both claim one key, **the fact wins** and the model's is
-  dropped and counted.
+  dropped and counted. The line is enforced on the way in as well as stamped on
+  the way out: a model's extraction or refinement may set no `_`-prefixed
+  property, no `embedding`, and no vector under any name — those are dropped
+  and counted (`reserved_props`) before provenance is stamped — and an entity
+  or relation whose key is empty, blank, control-laden or absurdly long is
+  dropped and counted (`rejected`). Otherwise a document written to steer the
+  model could mint a node `_generated_by` a parser, which the next watch fold
+  would then own and delete.
 - **Preprocessing is local-only**: what makes parsing worth its cost is a
   plugin pulling the files *around* the one it was handed — and that pull is
   exactly what a shared server must not offer, since the only filesystem it
