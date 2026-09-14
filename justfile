@@ -209,6 +209,7 @@ gate-sdk: _drsg-for-sdk
     cd sdk/go && DRSG_BIN="{{drsg_bin}}" go test ./...
     cd sdk/java && DRSG_BIN="{{drsg_bin}}" ./mvnw -q -B test
     cd sdk/c && DRSG_BIN="{{drsg_bin}}" make test
+    cd sdk/zig && zig build && DRSG_BIN="{{drsg_bin}}" test/run.sh
 
 # RUSTFLAGS matches gate-rust because it is part of cargo's unit fingerprint:
 # flip it and the whole graph recompiles. CI sets it job-wide, so its `Build

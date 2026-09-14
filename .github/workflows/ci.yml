@@ -239,6 +239,35 @@ jobs:
         run: make test
         working-directory: sdk/c
 
+  sdk-zig:
+    name: SDK — Zig
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      # The Zig client compiles the C client's sources and links the same
+      # system libraries through pkg-config, so it needs what sdk-c needs.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev pkg-config
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build
+        working-directory: sdk/zig
+      - name: Test (e2e against a real drsg serve)
+        run: test/run.sh
+        working-directory: sdk/zig
   # What no compiler answers: licences, RUSTSEC advisories and the registries a
   # crate may come from (`deny.toml`), dependencies a refactor stopped using,
   # and the Python SDK's lint — the one member no job above compiles.
