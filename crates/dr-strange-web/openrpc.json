@@ -2099,6 +2099,13 @@
           "plugin_bytes": {
             "type": "integer",
             "description": "Bytes the loaded preprocessor plugins hold right now: every compiled plugin image plus the linear memory of every instance mid-call. Zero when no plugin is loaded."
+          },
+          "maintenance_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The error from the storage engine's most recent post-commit flush/compaction when that pass failed; null when the last pass succeeded. A commit is acknowledged once durable, so a persistently failing flush shows only here."
           }
         },
         "required": [

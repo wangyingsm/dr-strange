@@ -295,7 +295,7 @@ pub struct NativeEngine {
     /// Maintenance runs after the batch is durable and published, so its
     /// failure cannot be reported through `commit` without lying about a
     /// write that did land; it is logged and kept here, readable through
-    /// `last_maintenance_error` (not yet surfaced by `Database::check`).
+    /// `last_maintenance_error` and `Database::last_maintenance_error`.
     last_maintenance_error: Mutex<Option<String>>,
     /// Test seam: parks a flush after its SST is written but before the swap,
     /// so a test can prove readers get through that window.
@@ -425,6 +425,14 @@ impl NativeEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Test seam for the `api` layer: fail the next SST write, so a test
+    /// above this module can produce a remembered maintenance failure
+    /// without reaching into the engine's private hooks.
+    #[cfg(test)]
+    pub(crate) fn arm_sst_write_fault(&self) {
+        self.sst_write_fault.arm();
     }
 
     /// Flush the memtable to a new SST and rotate the WAL, if the memtable is

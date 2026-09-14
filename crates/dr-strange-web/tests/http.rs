@@ -106,6 +106,15 @@ async fn serves_dashboard_and_rpc() {
     // JSON-RPC: db.stats reflects the seeded node.
     let stats = rpc(&client, &base, "db.stats", Value::Null).await;
     assert_eq!(stats["result"]["nodes"], 1);
+    // The maintenance slot is always present (null on a healthy store), so a
+    // client can distinguish "fine" from "a server too old to report it".
+    assert!(
+        stats["result"]
+            .as_object()
+            .unwrap()
+            .contains_key("maintenance_error")
+    );
+    assert!(stats["result"]["maintenance_error"].is_null());
 
     // plane.list surfaces the startup plane.
     let planes = rpc(&client, &base, "plane.list", Value::Null).await;

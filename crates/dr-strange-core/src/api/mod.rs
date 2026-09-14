@@ -693,6 +693,27 @@ impl Database {
         self.engine.with_read(|txn| graph::read_commit_seq(txn))
     }
 
+    /// The error from the native engine's most recent post-commit
+    /// maintenance pass (memtable flush / compaction), if that pass failed —
+    /// `None` when the last pass succeeded or the backend has no such pass.
+    ///
+    /// A commit whose batch is durable returns `Ok` even when the maintenance
+    /// it triggers fails (arch/01 §3: the write landed; the WAL and memtable
+    /// just stay larger than intended until the next commit retries), so a
+    /// disk that keeps taking the log but refuses new files is invisible to
+    /// writers. This is where it becomes visible: `drsg check` / `drsg
+    /// stats` print it and the dashboard's `db.stats` carries it, so a
+    /// persistently failing flush is an operator's problem rather than a log
+    /// line nobody reads.
+    pub fn last_maintenance_error(&self) -> Option<String> {
+        match &self.engine {
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => e.last_maintenance_error(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Records a query that ran, so it can be run again — the dashboard's
     /// history list and the CLI's `history`.
     ///
@@ -3662,5 +3683,61 @@ mod index_divergence_tests {
             assert!(!db.indexes_diverged(), "a fresh open starts clean");
         }
         assert!(sidecar_path(&path).exists(), "a clean handle saves again");
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod maintenance_tests {
+    use super::*;
+
+    /// A flush that fails after its commit is durable is remembered by the
+    /// engine; the `Database` surfaces it, and a later successful pass clears
+    /// it. Without the surface, `drsg check` and `db.stats` would report a
+    /// healthy database whose memtable and WAL grow without bound.
+    #[test]
+    fn a_failed_flush_is_visible_through_the_database_until_one_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        // Threshold 1: every commit flushes, so the injected SST fault is hit
+        // by the first write after it is armed.
+        let engine = NativeEngine::open_with_threshold(&path, 1).unwrap();
+        let db = Database::init(
+            Engine::Native(Box::new(engine)),
+            Some(sidecar_path(&path)),
+            Some(keyword_sidecar_path(&path)),
+        )
+        .unwrap();
+        assert_eq!(
+            db.last_maintenance_error(),
+            None,
+            "a fresh database is clean"
+        );
+
+        let plane = db.plane("startup").unwrap();
+        match &db.engine {
+            Engine::Native(e) => e.arm_sst_write_fault(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("n1", &["Doc"], Properties::new())
+                .unwrap();
+            w.commit()
+                .expect("the batch is durable and published; commit is Ok");
+        }
+        let err = db
+            .last_maintenance_error()
+            .expect("the failed flush is remembered");
+        assert!(err.contains("injected fault"), "{err}");
+
+        // The next commit retries maintenance; once it succeeds the slot clears.
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("n2", &["Doc"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        assert_eq!(db.last_maintenance_error(), None);
     }
 }

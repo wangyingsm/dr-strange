@@ -378,6 +378,10 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         // is retained. What the dashboard's slider can reach is bounded by
         // it, and this is how the dashboard says so.
         "retain_commits": ctx.retain_commits,
+        // The latest failed flush/compaction, or null: a commit is Ok once
+        // durable even when the maintenance it triggers fails, so this is the
+        // only place a client learns the store is not keeping up with itself.
+        "maintenance_error": ctx.db.last_maintenance_error(),
     }))
 }
 
