@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server",
+            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server # unconditional on purpose: this repository is drsg itself, so a first session here bootstraps its own graph (a full digest, once); the hook script explains the guard it lifts",
             "timeout": 300,
             "statusMessage": "Ensuring the drsg MCP server is up..."
           }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server",
+            "command": "DRSG_ENSURE_UNCONDITIONAL=1 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/drsg-ensure-server # unconditional on purpose: this repository is drsg itself, so a first session here bootstraps its own graph (a full digest, once); the hook script explains the guard it lifts",
             "timeout": 300,
             "statusMessage": "Ensuring the drsg MCP server is up..."
           }
