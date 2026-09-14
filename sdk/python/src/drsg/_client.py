@@ -229,9 +229,9 @@ class _WebSocket:
         """The next complete text message, or ``None`` when the socket closes.
 
         A socket that closes cleanly between frames yields ``None``; one that
-        closes in the middle of a frame, or announces a frame larger than
-        ``max_frame_bytes``, raises ``DrsgProtocolError`` so the caller can tell
-        a finished feed from a broken one.
+        closes in the middle of a frame, or announces a frame (or a fragmented
+        message) larger than ``max_frame_bytes``, raises ``DrsgProtocolError``
+        so the caller can tell a finished feed from a broken one.
         """
         message = b""
         while True:
@@ -251,6 +251,14 @@ class _WebSocket:
                 raise DrsgProtocolError(
                     f"websocket frame of {length} bytes exceeds the "
                     f"{self.max_frame_bytes}-byte limit"
+                )
+            # The cap bounds the reassembled message, not just one frame:
+            # a peer fragmenting a message into many small FIN-clear frames
+            # would otherwise grow ``message`` without limit.
+            if len(message) + length > self.max_frame_bytes:
+                raise DrsgProtocolError(
+                    f"websocket message of {len(message) + length}+ bytes "
+                    f"exceeds the {self.max_frame_bytes}-byte limit"
                 )
             mask = self._read(4) if masked else b""
             data = self._read(length) if length else b""

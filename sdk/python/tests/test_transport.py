@@ -116,6 +116,18 @@ def test_cap_is_per_instance_tunable(pair):
         ws.recv_text()
 
 
+def test_fragmented_message_is_bounded_by_the_same_cap(pair):
+    client, server = pair
+    ws = _WebSocket(client)
+    ws.max_frame_bytes = 8
+    # Two FIN-clear fragments each under the cap, whose sum is over it: the
+    # reader must refuse the message when the second header arrives rather
+    # than keep appending until FIN.
+    server.sendall(b"\x01\x05hello" + b"\x00\x05world")
+    with pytest.raises(DrsgProtocolError, match="exceeds"):
+        ws.recv_text()
+
+
 def test_protocol_error_is_a_drsg_error():
     err = DrsgProtocolError("boom")
     assert isinstance(err, DrsgError)
