@@ -167,3 +167,30 @@ fn bulk_rejects_duplicate_key_in_batch() {
     ];
     assert!(txn.bulk_load(nodes, vec![]).is_err());
 }
+
+#[test]
+fn bulk_rejects_key_already_owned_by_a_live_node() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.plane("startup").unwrap();
+    let mut txn = plane.write().unwrap();
+    let owner = txn
+        .create_node_with_key("taken", &["Person"], Properties::new())
+        .unwrap();
+    txn.commit().unwrap();
+
+    let mut txn = plane.write().unwrap();
+    let nodes = vec![BulkNode {
+        external_key: Some("taken"),
+        labels: &["Person"],
+        props: Properties::new(),
+    }];
+    assert!(matches!(
+        txn.bulk_load(nodes, vec![]),
+        Err(dr_strange_core::Error::Conflict(_))
+    ));
+    drop(txn);
+
+    // The original owner still resolves, and deleting it afterwards is the
+    // ordinary case — its lookup row goes with it.
+    assert_eq!(plane.node_by_key("taken").unwrap().unwrap().id, owner);
+}

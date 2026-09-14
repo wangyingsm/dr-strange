@@ -60,7 +60,13 @@ and property-based testing against a model.
   external keys are also the identity thread for cross-plane entity
   resolution. The key is also carried inline in the node's own record, so
   deleting a node can find (and remove) its `ext_keys` entry without a
-  reverse index.
+  reverse index. **Ownership rule:** within a plane a key belongs to at most
+  one live node. Every creation path — `create_node_with_key` and the bulk
+  loader alike — refuses a key the plane's `ext_keys` table already maps
+  (`Error::Conflict`; the bulk loader also rejects a key repeated within its
+  own batch, and writes nothing on failure). Deletion removes the `ext_keys`
+  row only if it still points at the node being deleted, so a stale inline
+  key can never strip another live node's lookup entry.
 - Label names and edge-type names are interned to `u32`s in a dictionary
   table shared across planes; all keys store interned IDs, not strings.
   Dictionaries are small and cached in memory.
