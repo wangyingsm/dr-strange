@@ -109,6 +109,13 @@ struct Scratch {
     w: BinaryHeap<(Dist, usize)>,
 }
 
+thread_local! {
+    /// The read path's [`Scratch`]: `search` takes `&self`, so it cannot use
+    /// the index-owned buffers the build path reuses. One per thread keeps
+    /// the visited set's allocation (and its zeroing) off every query.
+    static SEARCH_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 impl Scratch {
     /// Ready the buffers for a search over `n` nodes: grow `visited`, bump the
     /// generation (clearing on the rare `u32` wrap), and empty the heaps.
@@ -376,7 +383,13 @@ impl HnswIndex {
             vec: query,
             norm: dot(query, query).sqrt(),
         };
-        let mut scratch = Scratch::default();
+        // `search` is `&self`, so it cannot use the index-owned `scratch`;
+        // borrow the thread's instead of zeroing a fresh N-slot visited set
+        // per query. Taken out of the cell (not borrowed across the search)
+        // so a re-entrant call from a filter could never hit a `RefCell`
+        // panic; the generation stamp makes the buffer safe to share between
+        // indexes of different sizes.
+        let mut scratch = SEARCH_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
 
         let mut ep = entry;
         let mut lc = self.top_layer;
@@ -389,6 +402,7 @@ impl HnswIndex {
         }
 
         let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
+        SEARCH_SCRATCH.with(|c| *c.borrow_mut() = scratch);
 
         let hits = top_k(
             w.into_iter()
@@ -1102,6 +1116,40 @@ mod tests {
         let hits = idx.search(&g.vec(dim), 5, None).unwrap();
         assert_eq!(hits.len(), 5);
         assert!(hits.iter().all(|h| (200..260).contains(&h.id)));
+    }
+
+    /// The thread-local search scratch is shared by every index a thread
+    /// queries; the generation stamp must keep a small index's search from
+    /// seeing a larger index's marks (and vice versa) — results equal a
+    /// fresh-scratch run.
+    #[test]
+    fn shared_search_scratch_does_not_leak_between_indexes() {
+        let dim = 8;
+        let mut g = Gen(33);
+        let mut big = HnswIndex::new(Metric::L2);
+        for id in 0..400u64 {
+            big.insert(id, &g.vec(dim)).unwrap();
+        }
+        let mut small = HnswIndex::new(Metric::L2);
+        for id in 0..20u64 {
+            small.insert(id, &g.vec(dim)).unwrap();
+        }
+        let q = g.vec(dim);
+        let fresh = std::thread::spawn({
+            let small = small.clone();
+            let q = q.clone();
+            move || small.search(&q, 10, None).unwrap()
+        })
+        .join()
+        .unwrap();
+        for _ in 0..3 {
+            big.search(&q, 10, None).unwrap();
+            let got = small.search(&q, 10, None).unwrap();
+            assert_eq!(
+                got.iter().map(|h| h.id).collect::<Vec<_>>(),
+                fresh.iter().map(|h| h.id).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

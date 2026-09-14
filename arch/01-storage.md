@@ -192,6 +192,9 @@ Notes:
   checks on load); removing the last node empties the index and the next
   insert becomes the entry. Tombstones are reclaimed only by a rebuild from
   the KV.
+- Search is `&self` and uses a per-thread scratch (generation-stamped visited
+  set plus heaps) rather than allocating per query; the build path uses the
+  index-owned scratch.
 
 ## 6. Transactions
 
