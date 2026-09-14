@@ -247,7 +247,7 @@ fn case_insensitive_keywords() {
     assert_eq!(a, b);
 }
 
-// ---- rejected (clear errors, not silent mis-compiles) ---------------------
+// ---- rejected (clear errors, not silent miscompiles) ----------------------
 
 fn err(q: &str) -> ParseError {
     parse(q).expect_err(&format!("expected `{q}` to be rejected"))

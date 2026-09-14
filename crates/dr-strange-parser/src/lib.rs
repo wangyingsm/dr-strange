@@ -78,7 +78,7 @@
 //! [`parse_statement_full`] — the SDK-safe way to pass values (no string
 //! interpolation).
 //!
-//! # Not yet (each is a clear error, never a silent mis-compile)
+//! # Not yet (each is a clear error, never a silent miscompile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning the *rows* of a non-terminal variable (`RETURN p` after a hop);
 //!   its values project (`RETURN p.name`);

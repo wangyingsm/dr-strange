@@ -7,7 +7,7 @@
 //! the *i*-th `Expand`), so a predicate that mentions exactly one variable is
 //! placed at that variable's slot — where it *is* the current node. A predicate
 //! spanning two variables can't be evaluated in this model, so it's rejected
-//! with a clear message rather than silently mis-scoped.
+//! with a clear message rather than silently given the wrong scope.
 
 use std::collections::BTreeSet;
 

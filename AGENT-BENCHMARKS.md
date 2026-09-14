@@ -69,7 +69,7 @@ straight through the same-named-symbol trap.
 |---|---|---|---|
 | drsg | 4 (2 doing the work) | 30.8k | first `trace` on the bare name returned candidates (by design); the exact-name retry returned the whole chain, with files and lines, in one call |
 | codegraph | 9 | 41.1k | its trace tool failed with a false explanation — "breaks at dynamic dispatch" on a fully static chain (the real cause was same-name aggregation); the agent recovered the chain by seven calls of manual forensics |
-| codebase-memory-mcp | 13 | 50.3k | the graph mis-bound one hop and recorded another as empty; the agent rebuilt the chain by reading source snippets at every hop — the answer came from the source, not the graph |
+| codebase-memory-mcp | 13 | 50.3k | the graph bound one hop wrongly and recorded another as empty; the agent rebuilt the chain by reading source snippets at every hop — the answer came from the source, not the graph |
 
 ## Task 4 — compound audit
 
@@ -125,7 +125,7 @@ home ground. drsg's `grep` needs a served plane with a source tree attached.
 Across the four tasks, drsg completed every cell at 2–4 tool calls and the
 lowest marginal token cost, and was the only tool whose answers state their
 own bounds. The recurring competitor failures were one family: same-name
-discipline — aggregating or mis-binding identically-named symbols — plus
+discipline — aggregating or wrongly binding identically-named symbols — plus
 string blindness on the census. Both are exactly the cases the parser
 family's rules (qualified-name resolution, declared-facts-only typing,
 stamped edges, unresolved-ref ledger) were written to close.

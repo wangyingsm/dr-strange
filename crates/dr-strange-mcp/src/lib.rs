@@ -1221,7 +1221,7 @@ impl GrepOut<'_> {
             }
             // A regex-shaped pattern sent to a literal search fails exactly like a
             // real absence: both say "no matches". That silence is what turns a
-            // mis-typed pattern into "I checked, it isn't there" in someone's
+            // mistyped pattern into "I checked, it isn't there" in someone's
             // conclusion. Only when `regex` was not asked for — having asked, an
             // empty result means what it says.
             if !req.regex.unwrap_or(false)
@@ -1716,7 +1716,7 @@ fn write_nodes_logic(
             // cost one of them rather than fifty.
             let reply = embedder.embed(&texts)?;
             // Positional: vector `n` belongs to text `n`. A provider returning a
-            // different count would silently mis-assign every vector after the
+            // different count would silently misassign every vector after the
             // gap, so refuse rather than zip and hope.
             if reply.vectors.len() != texts.len() {
                 anyhow::bail!(
@@ -2631,7 +2631,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.texts.lock().unwrap().extend_from_slice(texts);
             Ok(dr_strange_llm::EmbedReply {
-                // Distinct per text, so a mis-assignment would be visible.
+                // Distinct per text, so a misassignment would be visible.
                 vectors: (0..texts.len()).map(|i| vec![i as f32, 1.0]).collect(),
                 tokens: texts.len() as u64,
             })
@@ -3700,7 +3700,7 @@ mod snippet_tests {
     /// repository's file at the same relative path — plausible text, no error.
     /// So the assertion is on content, not on success.
     #[test]
-    fn reads_the_planes_own_root_not_the_processs() {
+    fn reads_the_planes_own_root_not_the_servers() {
         let (a, b) = two_repos("own-root");
         let db = Database::in_memory().unwrap();
         plane_with(&db, "repo-b", Some(&b));

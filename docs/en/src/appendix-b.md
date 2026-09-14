@@ -235,7 +235,7 @@ argument name is an error, never a silently ignored setting.
 
 ## Not supported
 
-Each of these is a clear error, never a silent mis-compile:
+Each of these is a clear error, never a silent miscompile:
 
 - `WITH` pipelining — a projection is a tail, so nothing follows it.
 - returning the *rows* of any variable but the pattern's last (`RETURN p` after

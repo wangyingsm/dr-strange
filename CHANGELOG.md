@@ -600,7 +600,7 @@ All notable changes to Dr Strange are documented here. The format is based on
 ### Fixed
 - **A `RETURN` this subset does not have now says so.** Appendix B promises
   projections and aggregation are "a clear error, never a silent
-  mis-compile", but `RETURN f.file, f.line, key(f)` stopped the parse at the
+  miscompile", but `RETURN f.file, f.line, key(f)` stopped the parse at the
   first dot and surfaced as `unexpected trailing input near \`.file, …\`` — a
   position, not an answer, and it reads like a typo in a query that has none.
   Each shape now names itself and says what to write instead: a projection, a
