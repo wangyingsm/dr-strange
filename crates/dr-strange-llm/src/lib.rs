@@ -53,7 +53,10 @@ pub use preprocess::{
 /// Reading a repository's history beside its code — see [`preprocess::repo`].
 pub use preprocess::{PLANE_SUFFIX as GIT_PLANE_SUFFIX, REPO_PLUGIN, plane_name as git_plane_name};
 pub use preprocess::{WriteStats as GitWriteStats, write_history};
-pub use preset::{PRESET_NAMES, ProviderPreset, is_preset, preset};
+pub use preset::{
+    ConfiguredProvider, PRESET_NAMES, ProviderPreset, WireProviderError, is_preset, preset,
+    wire_provider,
+};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;
 pub use refine::RefineReport;

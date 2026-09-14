@@ -77,6 +77,88 @@ pub fn is_preset(name: &str) -> bool {
     preset(name).is_some()
 }
 
+/// A provider the operator configured out of band — in `drsg.toml` or on the
+/// command line — that a remote request may name in addition to the presets.
+/// `key_env` is the variable the operator bound its key to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfiguredProvider<'a> {
+    pub name: &'a str,
+    pub key_env: Option<&'a str>,
+}
+
+/// Why a provider named over the wire was refused — see [`wire_provider`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireProviderError {
+    /// Not a preset and not the configured provider: a base URL, or a typo.
+    NotAllowed { requested: String },
+    /// The request tried to pick the environment variable the key is read
+    /// from; that choice belongs to the operator.
+    ForeignKeyEnv { provider: String, requested: String },
+}
+
+impl std::fmt::Display for WireProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAllowed { requested } => write!(
+                f,
+                "provider '{requested}' is not allowed over the wire: name a preset ({}) or \
+                 the server's configured provider; a base URL is not accepted",
+                PRESET_NAMES.join(", ")
+            ),
+            Self::ForeignKeyEnv {
+                provider,
+                requested,
+            } => write!(
+                f,
+                "key_env '{requested}' is not accepted over the wire: provider '{provider}' \
+                 reads its key from the variable the server configured for it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WireProviderError {}
+
+/// The one rule every **remote** surface applies before a request-supplied
+/// provider reaches [`build_provider`](crate::build_provider): the name must
+/// be a preset or exactly the operator-configured provider (never a base URL
+/// — that would make the server POST wherever a client says, a server-side
+/// request forgery), and the request may not choose which environment
+/// variable the key is read from (a request that could name `AWS_SECRET_KEY`
+/// as `key_env` would send that secret as a bearer token to whichever
+/// allowed provider it named). `requested_key_env` is therefore accepted only
+/// when it repeats the provider's own default, and the returned pair is what
+/// the caller hands to `build_provider`: the name and the key variable the
+/// operator (or the preset) chose. A `None` request names `openai`.
+///
+/// Shared by the JSON-RPC methods of dr-strange-web and the MCP tools of
+/// dr-strange-mcp so the two surfaces cannot drift apart on this.
+pub fn wire_provider<'a>(
+    requested: Option<&'a str>,
+    requested_key_env: Option<&str>,
+    configured: Option<ConfiguredProvider<'a>>,
+) -> Result<(&'a str, Option<&'a str>), WireProviderError> {
+    let name = requested.unwrap_or("openai");
+    let default_key_env = match (preset(name), configured) {
+        (Some(p), _) => Some(p.key_env),
+        (None, Some(c)) if c.name == name => c.key_env,
+        _ => {
+            return Err(WireProviderError::NotAllowed {
+                requested: name.to_string(),
+            });
+        }
+    };
+    if let Some(k) = requested_key_env {
+        if Some(k) != default_key_env {
+            return Err(WireProviderError::ForeignKeyEnv {
+                provider: name.to_string(),
+                requested: k.to_string(),
+            });
+        }
+    }
+    Ok((name, default_key_env))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +186,66 @@ mod tests {
         assert!(!is_preset("https://api.openai.com/v1"));
         assert!(!is_preset("OpenAI"), "names are exact, as `preset` is");
         assert!(!is_preset(""));
+    }
+
+    /// The wire rule: presets and the configured provider pass, a URL does
+    /// not, and a request never picks the key's environment variable.
+    #[test]
+    fn wire_provider_admits_presets_and_the_configured_one_with_their_own_key_env() {
+        assert_eq!(
+            wire_provider(None, None, None),
+            Ok(("openai", Some("OPENAI_API_KEY")))
+        );
+        assert_eq!(
+            wire_provider(Some("deepseek"), None, None),
+            Ok(("deepseek", Some("DEEPSEEK_API_KEY")))
+        );
+        // Repeating the default is harmless.
+        assert_eq!(
+            wire_provider(Some("deepseek"), Some("DEEPSEEK_API_KEY"), None),
+            Ok(("deepseek", Some("DEEPSEEK_API_KEY")))
+        );
+        let configured = ConfiguredProvider {
+            name: "http://embed.internal/v1",
+            key_env: Some("EMBED_KEY"),
+        };
+        assert_eq!(
+            wire_provider(Some("http://embed.internal/v1"), None, Some(configured)),
+            Ok(("http://embed.internal/v1", Some("EMBED_KEY")))
+        );
+        assert_eq!(
+            wire_provider(
+                Some("http://169.254.169.254/latest"),
+                None,
+                Some(configured)
+            ),
+            Err(WireProviderError::NotAllowed {
+                requested: "http://169.254.169.254/latest".into()
+            })
+        );
+        assert_eq!(
+            wire_provider(Some("http://169.254.169.254/latest"), None, None),
+            Err(WireProviderError::NotAllowed {
+                requested: "http://169.254.169.254/latest".into()
+            })
+        );
+        assert_eq!(
+            wire_provider(Some("openai"), Some("AWS_SECRET_ACCESS_KEY"), None),
+            Err(WireProviderError::ForeignKeyEnv {
+                provider: "openai".into(),
+                requested: "AWS_SECRET_ACCESS_KEY".into()
+            })
+        );
+        assert_eq!(
+            wire_provider(
+                Some(configured.name),
+                Some("OPENAI_API_KEY"),
+                Some(configured)
+            ),
+            Err(WireProviderError::ForeignKeyEnv {
+                provider: configured.name.into(),
+                requested: "OPENAI_API_KEY".into()
+            })
+        );
     }
 }
