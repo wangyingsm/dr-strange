@@ -138,3 +138,57 @@ fn weights_shift_the_ranking() {
         "BM25-only ranks the graph-dense doc first"
     );
 }
+
+#[test]
+fn graph_channel_scores_only_the_queried_label() {
+    // d0 → (Author a) → d4: the walk may bridge through the Author, but the
+    // query is scoped to `Doc`, so the Author must never be a hit — only d4,
+    // the Doc two hops away, is boosted through it.
+    let (db, [d0, _d1, _d2, _d3]) = setup();
+    let plane = db.plane("startup").unwrap();
+    let (author, d4) = {
+        let mut txn = plane.write().unwrap();
+        let author = txn.create_node(&["Author"], Properties::new()).unwrap();
+        let d4 = txn
+            .create_node(&["Doc"], doc("nothing in common", vec![9.0, 9.0]))
+            .unwrap();
+        txn.create_edge(d0, author, "WROTE_BY", Properties::new())
+            .unwrap();
+        txn.create_edge(author, d4, "WROTE", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        (author, d4)
+    };
+
+    let hits = plane
+        .hybrid()
+        .label("Doc")
+        .vector("emb", vec![0.0, 0.0], Metric::L2)
+        .graph(2, 0.5)
+        .k(10)
+        .run()
+        .unwrap();
+
+    assert!(
+        !hits.iter().any(|h| h.node == author),
+        "a Doc query must not surface an Author: {hits:?}"
+    );
+    let d4hit = hits
+        .iter()
+        .find(|h| h.node == d4)
+        .expect("d4 reached via the Author");
+    assert!(
+        d4hit.graph.is_some(),
+        "the bridge through the Author still counts"
+    );
+
+    // Unscoped, the same walk scores the Author too.
+    let hits = plane
+        .hybrid()
+        .vector("emb", vec![0.0, 0.0], Metric::L2)
+        .graph(2, 0.5)
+        .k(10)
+        .run()
+        .unwrap();
+    assert!(hits.iter().any(|h| h.node == author));
+}
