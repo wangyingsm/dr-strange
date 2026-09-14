@@ -16,6 +16,7 @@
 //! is the simplest correct thing. Subgraph/seeded scoping and property
 //! materialization are follow-ups (see ROADMAP §1 forks).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -279,16 +280,18 @@ pub fn shortest_path<R: GraphReader + ?Sized>(
         return Ok(None);
     };
 
-    // Successor adjacency for the requested direction.
-    let succ: Vec<Vec<(usize, EdgeId)>> = match opts.dir {
-        Dir::Out => frame.out.clone(),
-        Dir::In => frame.transpose(),
+    // Successor adjacency for the requested direction. The frame already
+    // holds the out-lists, so `Dir::Out` borrows them; only the other two
+    // directions need a derived copy.
+    let succ: Cow<'_, [Vec<(usize, EdgeId)>]> = match opts.dir {
+        Dir::Out => Cow::Borrowed(&frame.out),
+        Dir::In => Cow::Owned(frame.transpose()),
         Dir::Both => {
             let mut merged = frame.out.clone();
             for (j, adj) in frame.transpose().into_iter().enumerate() {
                 merged[j].extend(adj);
             }
-            merged
+            Cow::Owned(merged)
         }
     };
 

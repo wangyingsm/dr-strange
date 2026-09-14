@@ -6,8 +6,12 @@
 //! - `{"$vector": [f32, …]}` → [`PropValue::Vector`] (embeddings)
 //! - `{"$desc": "…", "$value": <json>}` → a described property ([`PropDesc`])
 //! - `{"$bytes": [u8, …]}` → [`PropValue::Bytes`]
+//! - `{"$map": {…}}` → a nested `Map` whose own keys start with `$` (so a
+//!   literal `$value` or `$vector` key is data, not an escape)
 //!
 //! Any other JSON object is a nested `Map`; a plain array is a `List`.
+//! Integers must fit `i64` — the only integer [`PropValue`] has — so a
+//! larger JSON number is rejected rather than wrapped or rounded.
 
 use serde_json::{Value, json};
 
@@ -27,8 +31,10 @@ pub fn json_to_value(v: &Value) -> Result<PropValue> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 PropValue::Int(i)
-            } else if let Some(u) = n.as_u64() {
-                PropValue::Int(u as i64)
+            } else if n.as_u64().is_some() {
+                // Above i64::MAX: no PropValue holds it losslessly (Int would
+                // wrap negative, Float would round past 2^53), so refuse it.
+                return Err(invalid(format!("integer {n} is out of the i64 range")));
             } else {
                 PropValue::Float(n.as_f64().unwrap_or(f64::NAN))
             }
@@ -40,15 +46,24 @@ pub fn json_to_value(v: &Value) -> Result<PropValue> {
                 PropValue::Vector(json_to_f32_vec(vec)?)
             } else if let Some(bytes) = o.get("$bytes") {
                 PropValue::Bytes(json_to_u8_vec(bytes)?)
+            } else if let Some(inner) = o.get("$map") {
+                let Value::Object(inner) = inner else {
+                    return Err(invalid("`$map` must be a JSON object"));
+                };
+                json_object_to_map(inner)?
             } else {
-                let mut map = std::collections::BTreeMap::new();
-                for (k, val) in o {
-                    map.insert(k.clone(), json_to_propdesc(val)?);
-                }
-                PropValue::Map(map)
+                json_object_to_map(o)?
             }
         }
     })
+}
+
+fn json_object_to_map(o: &serde_json::Map<String, Value>) -> Result<PropValue> {
+    let mut map = std::collections::BTreeMap::new();
+    for (k, val) in o {
+        map.insert(k.clone(), json_to_propdesc(val)?);
+    }
+    Ok(PropValue::Map(map))
 }
 
 /// A property value, optionally wrapped with a `$desc` description.
@@ -115,11 +130,21 @@ pub fn value_to_json(v: &PropValue) -> Value {
         PropValue::Bytes(b) => json!({ "$bytes": b }),
         PropValue::Vector(v) => json!({ "$vector": v }),
         PropValue::List(items) => Value::Array(items.iter().map(value_to_json).collect()),
-        PropValue::Map(m) => Value::Object(
-            m.iter()
-                .map(|(k, p)| (k.clone(), propdesc_to_json(p)))
-                .collect(),
-        ),
+        PropValue::Map(m) => {
+            let obj = Value::Object(
+                m.iter()
+                    .map(|(k, p)| (k.clone(), propdesc_to_json(p)))
+                    .collect(),
+            );
+            // A key starting with `$` would read back as one of the escape
+            // objects above (a literal `$value` key becomes a described
+            // property), so such a map travels inside its own escape.
+            if m.keys().any(|k| k.starts_with('$')) {
+                json!({ "$map": obj })
+            } else {
+                obj
+            }
+        }
     }
 }
 
@@ -316,6 +341,65 @@ mod tests {
     fn integer_vs_float_inference() {
         assert_eq!(json_to_value(&json!(30)).unwrap(), PropValue::Int(30));
         assert_eq!(json_to_value(&json!(30.0)).unwrap(), PropValue::Float(30.0));
+    }
+
+    #[test]
+    fn integers_past_i64_are_rejected_not_wrapped() {
+        // Wire-format pin: i64::MAX is the largest integer the dialect
+        // accepts; one more is an InvalidArgument, never a negative Int.
+        assert_eq!(
+            json_to_value(&json!(i64::MAX)).unwrap(),
+            PropValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            json_to_value(&json!(i64::MIN)).unwrap(),
+            PropValue::Int(i64::MIN)
+        );
+        let too_big = json!(i64::MAX as u64 + 1);
+        assert!(matches!(
+            json_to_value(&too_big),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            json_to_value(&json!(u64::MAX)),
+            Err(Error::InvalidArgument(_))
+        ));
+        // Inside a property object the error surfaces the same way.
+        assert!(json_to_properties(&json!({"n": u64::MAX})).is_err());
+    }
+
+    #[test]
+    fn a_map_with_dollar_keys_round_trips_through_its_own_escape() {
+        // Wire-format pin: a literal `$value` (or any `$`-key) inside a map
+        // is emitted as `{"$map": {...}}`, so reading it back yields the map
+        // — not a described property — and the inner keys are untouched.
+        let inner: std::collections::BTreeMap<String, PropDesc> = [
+            ("$value".to_string(), PropDesc::new(PropValue::Int(1))),
+            (
+                "$desc".to_string(),
+                PropDesc::new(PropValue::Str("d".into())),
+            ),
+            ("plain".to_string(), PropDesc::new(PropValue::Bool(true))),
+        ]
+        .into_iter()
+        .collect();
+        let v = PropValue::Map(inner);
+        let j = value_to_json(&v);
+        assert_eq!(
+            j,
+            json!({"$map": {"$value": 1, "$desc": "d", "plain": true}})
+        );
+        assert_eq!(json_to_value(&j).unwrap(), v);
+        // As a described property the escape nests as any other value does.
+        let p = PropDesc::described("why", v.clone());
+        assert_eq!(json_to_propdesc(&propdesc_to_json(&p)).unwrap(), p);
+        // A map without `$` keys is unchanged on the wire.
+        let plain = PropValue::Map(
+            [("a".to_string(), PropDesc::new(PropValue::Int(1)))]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(value_to_json(&plain), json!({"a": 1}));
     }
 
     #[test]
