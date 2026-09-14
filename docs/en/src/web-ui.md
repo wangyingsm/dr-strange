@@ -28,6 +28,23 @@ Every response carries a `Content-Security-Policy` under which scripts and style
 load only from the server itself; the dashboard is built to satisfy it, and a
 reverse proxy in front should pass it through rather than replace it.
 
+A wrong token may be presented five times; after that the server answers the
+peer `429 Too Many Requests` with a `Retry-After` that doubles per further
+failure, up to five minutes, until a correct token is presented. Requests with
+no token are not counted, so a tokenless local dashboard never trips it. A
+JSON-RPC batch holds at most 64 requests.
+
+Wherever the interface asks for a provider — semantic search, natural-language
+queries, AIgest — it offers the presets (`openai`, `deepseek`, `qwen`,
+`ollama`), and the API accepts exactly those, or the one provider the server was
+configured with (`[server] embed_provider`). A base URL is refused over the
+wire, because the server would be calling it from its own network on behalf of
+whoever holds a credential; an operator who wants a local or self-hosted
+endpoint configures it on the server. Errors that would describe the server's
+own disk or its provider's reply come back as a category and a reference
+(`storage error (ref 00002a)`); the detail is in the server's log under that
+reference.
+
 The interface has three views, selected from the header: **Dashboard**,
 **Explore**, and **AIgest**.
 

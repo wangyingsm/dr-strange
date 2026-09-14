@@ -251,6 +251,13 @@ own origin must be named in `allowed_origins`. Send the token as
 `Authorization: Bearer <token>` on HTTP and, preferably, on the WebSocket
 upgrade as well; `?token=` on `/ws` exists for browsers, which cannot set
 headers there, and a query string is what proxies and browsers tend to log.
+A peer that presents a wrong token more than five times is answered `429`
+with a `Retry-After` that doubles up to five minutes; a correct token clears
+it.
+
+Over the API a provider name is one of the presets or exactly the server's
+configured `embed_provider`; a base URL is accepted from the CLI and the
+configuration file, never from a request.
 
 ### Configuration file
 

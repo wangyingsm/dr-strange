@@ -79,7 +79,9 @@ channels), algorithms, snapshot/restore, and `serve` — is unchanged.
 
 The model features do not require a hosted API. A provider is either a **preset**
 name or a **base URL**, so any OpenAI-compatible endpoint — including a local one
-— can serve chat and embeddings.
+— can serve chat and embeddings. A base URL is an operator's setting — the CLI
+flags and the configuration file take one; a request to `drsg serve`'s JSON-RPC
+API may name only a preset, or the URL the server was configured with.
 
 ### Ollama
 

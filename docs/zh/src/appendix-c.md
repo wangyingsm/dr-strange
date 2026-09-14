@@ -67,7 +67,9 @@ $ cargo build --release -p dr-strange-cli --no-default-features --features nativ
 
 ## 使用本地 LLM / 模型
 
-模型功能并不要求托管 API。一个提供方要么是一个**预设**名，要么是一个**base URL**，
+模型功能并不要求托管 API。一个提供方要么是一个**预设**名，要么是一个**base URL**
+（base URL 是运维者的设置——CLI 参数与配置文件接受它；发给 `drsg serve` JSON-RPC API 的
+请求只能指定预设，或服务端已配置的那个 URL），
 因此任何 OpenAI 兼容的端点都可以提供对话与嵌入，本地端点也不例外。
 
 ### Ollama
