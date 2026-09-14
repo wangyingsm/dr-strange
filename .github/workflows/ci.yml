@@ -96,10 +96,12 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Install
-        # Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2
-        # (written by a bun canary) which setup-bun's stable bun can't parse;
-        # let it resolve fresh instead of failing to read the lock.
-        run: bun install
+        # --frozen-lockfile: CI builds exactly the dependency set the committed
+        # bun.lock names and fails if package.json has drifted from it, so a
+        # resolver change or an upstream re-publish cannot slip a different
+        # tree into the dashboard. Regenerate the lock with `bun install`
+        # locally when a dependency is meant to change.
+        run: bun install --frozen-lockfile
         working-directory: crates/dr-strange-web/frontend
       # `no-undef` specifically: neither vite nor bun errors on a reference to
       # an identifier that does not exist, so a function lost in a refactor
@@ -143,7 +145,7 @@ jobs:
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-      - run: bun install # not --frozen: the committed lock is a bun-canary format
+      - run: bun install --frozen-lockfile # the committed lock is the contract
         working-directory: sdk/typescript
       - name: Test (drift + e2e)
         run: bun test
