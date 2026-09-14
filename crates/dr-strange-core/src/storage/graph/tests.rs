@@ -624,6 +624,81 @@ fn unknown_external_key_is_none_not_error() {
     );
 }
 
+#[test]
+fn deleting_a_node_leaves_another_nodes_ext_key_row_alone() {
+    // Two nodes claiming one key inline can only arise from a bypassed
+    // uniqueness check (an older file, a hand-written batch); model that by
+    // repointing the `ext_keys` row at a second node directly. Deleting the
+    // stale claimant must not strip the live owner's lookup row.
+    let eng = MemoryEngine::new();
+    let mut txn = eng.begin_write().unwrap();
+    init(&mut txn).unwrap();
+    let old =
+        create_node_with_key(&mut txn, PlaneId::STARTUP, "k", &[], &Properties::new()).unwrap();
+    let new = create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+    txn.put(
+        TableId::ExtKeys,
+        &keys::ext_key_key(PlaneId::STARTUP, "k"),
+        &new.0.to_be_bytes(),
+    )
+    .unwrap();
+
+    delete_node(&mut txn, PlaneId::STARTUP, old).unwrap();
+    assert!(get_node(&txn, PlaneId::STARTUP, old).unwrap().is_none());
+    assert_eq!(
+        node_id_by_external_key(&txn, PlaneId::STARTUP, "k").unwrap(),
+        Some(new)
+    );
+
+    // The ordinary case is unchanged: a node whose inline key matches the row
+    // takes the row with it.
+    let owner =
+        create_node_with_key(&mut txn, PlaneId::STARTUP, "j", &[], &Properties::new()).unwrap();
+    delete_node(&mut txn, PlaneId::STARTUP, owner).unwrap();
+    assert_eq!(
+        node_id_by_external_key(&txn, PlaneId::STARTUP, "j").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn bulk_load_rejects_external_key_owned_by_existing_node() {
+    let eng = MemoryEngine::new();
+    let mut txn = eng.begin_write().unwrap();
+    init(&mut txn).unwrap();
+    let owner =
+        create_node_with_key(&mut txn, PlaneId::STARTUP, "k", &[], &Properties::new()).unwrap();
+    let nodes = [
+        BulkNode {
+            external_key: Some("fresh"),
+            labels: &[],
+            props: Properties::new(),
+        },
+        BulkNode {
+            external_key: Some("k"),
+            labels: &[],
+            props: Properties::new(),
+        },
+    ];
+    assert!(matches!(
+        bulk_load(&mut txn, PlaneId::STARTUP, &nodes, &[]),
+        Err(Error::Conflict(_))
+    ));
+    // Nothing from the failed batch landed: the owner still holds "k" and
+    // "fresh" was never written.
+    assert_eq!(
+        node_id_by_external_key(&txn, PlaneId::STARTUP, "k").unwrap(),
+        Some(owner)
+    );
+    assert_eq!(
+        node_id_by_external_key(&txn, PlaneId::STARTUP, "fresh").unwrap(),
+        None
+    );
+    // Same key in another plane is fine, as for the per-record path.
+    let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
+    assert!(bulk_load(&mut txn, p2, &nodes[1..], &[]).is_ok());
+}
+
 // ---- deletes -------------------------------------------------------
 
 #[test]

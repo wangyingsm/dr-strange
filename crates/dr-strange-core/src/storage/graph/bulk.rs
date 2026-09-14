@@ -14,9 +14,13 @@
 //!   B-tree inserts).
 //!
 //! It is a *loader*, not a general mutation API: endpoint keys must resolve
-//! within this batch or already exist in the plane, and external keys are
-//! assumed fresh (uniqueness is checked within the batch, not against the KV —
-//! that's the per-record path's job).
+//! within this batch or already exist in the plane, and external keys must be
+//! fresh — uniqueness is checked both within the batch (in memory) and against
+//! the plane's existing `ext_keys` rows (one point `get` per keyed node, the
+//! same check `create_node_with_key` makes). A duplicate is `Error::Conflict`
+//! and nothing is written: silently overwriting the `ext_keys` row would leave
+//! the older node still carrying the key inline, so a later delete of either
+//! node could strip the other's lookup entry (arch/01 §2).
 
 // aHash, not std's SipHash: `key_to_id` sees one insert per node and two
 // lookups per edge, all short string keys — the hot path of a bulk load. The
@@ -134,6 +138,15 @@ fn stage_nodes<'a>(
             if staged.key_to_id.insert(key, id).is_some() {
                 return Err(Error::Conflict(format!(
                     "duplicate external key '{key}' in bulk batch"
+                )));
+            }
+            // Against the KV too: the batch is staged before anything is
+            // written, so `txn` still sees exactly the pre-batch plane, and a
+            // hit here is a key some live node already owns.
+            if node_id_by_external_key(txn, plane, key)?.is_some() {
+                return Err(Error::Conflict(format!(
+                    "external key '{key}' already exists in plane {}",
+                    plane.0
                 )));
             }
             staged.ext_keys.push((
