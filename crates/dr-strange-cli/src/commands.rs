@@ -4923,14 +4923,26 @@ mod tests {
             "rtk grep needle src",
             "/usr/bin/grep needle x",
             "rg needle | head",
+            "git show HEAD~3:src/lib.rs",
+            "rtk git show v1:README.md",
+            "git grep needle v1",
+            "git log -p src/a.rs",
+            "git log -L 10,20:src/a.rs",
+            "git log --patch -3",
         ] {
             let (code, err) = run(blocked);
             assert_eq!(code, 2, "`{blocked}` should be redirected");
             assert!(err.contains("snippet(name | path:start-end)"), "{err}");
+            assert!(err.contains("recall(name | pattern, at, vs?)"), "{err}");
             assert!(err.contains("DRSG_RAW=1"), "{err}");
         }
         for allowed in [
             "git status",
+            "git log --oneline -5",
+            "git log --pretty=oneline",
+            "git show --stat HEAD",
+            "git commit -m 'fix: the thing'",
+            "git diff HEAD~1",
             "cargo test -p x",
             "DRSG_RAW=1 rg needle src",
             "cat > out.txt <<'EOF'\nhello\nEOF",

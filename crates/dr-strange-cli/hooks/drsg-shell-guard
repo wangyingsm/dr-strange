@@ -6,8 +6,9 @@
 # to the drsg-watch MCP server, whose verbs read and search them: grep (text,
 # regex, path scope, context lines — each hit placed in its symbol), snippet
 # (a symbol's body, or any file's line range), context (what a symbol is and
-# who calls it), search (by meaning). Given both, an agent still reaches for
-# `rg` and `sed -n` out of habit; this hook meets that habit at the moment of
+# who calls it), search (by meaning), recall (the code as it was at any commit).
+# Given both, an agent still reaches for `rg`, `sed -n` or `git show <rev>:<path>`
+# out of habit; this hook meets that habit at the moment of
 # the call and names the verb that answers instead. It is a redirect, not a
 # wall: `DRSG_RAW=1 <command>` runs any command untouched, for the file no
 # plane holds or the one case where the shell really is the tool.
@@ -48,6 +49,11 @@ first=${first##*/}
 case "$first" in
   rg|grep|egrep|fgrep|ugrep|ug|ag|ack|cat|head|tail|less|more|bat) ;;
   sed) case "$CMD" in *'sed -n'*|*'sed -En'*|*'sed -ne'*) ;; *) exit 0 ;; esac ;;
+  git)
+    case "$CMD" in
+      *'git show '*:*|*'git grep'*|*'git log'*' -p'*|*'git log'*' --patch'*|*'git log'*' -L'*) ;;
+      *) exit 0 ;;
+    esac ;;
   *) exit 0 ;;
 esac
 
@@ -57,6 +63,7 @@ drsg: this repository's graph and source tree are attached to the drsg-watch MCP
   snippet(name | path:start-end)            a symbol's body, or a range of any file
   context(name)                             what a symbol is, who calls it, what it calls
   search(query)                             find by meaning when no name is known
+  recall(name | pattern, at, vs?)           code as it was at a revision: a file, a symbol, a search, a diff
 For a file no plane holds, or when the shell command is really the tool, run it as: DRSG_RAW=1 <command>
 MSG
 exit 2
