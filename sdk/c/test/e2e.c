@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -294,6 +295,34 @@ int main(void) {
             }
         } else {
             CHECK(0, "pthread_create for cancel");
+        }
+        drsg_watch_ctl_free(ca.ctl);
+    }
+
+    /* Cancellation that lands before the watch has connected: the watch must
+     * return 0 as soon as it connects, and a second cancel (documented as
+     * harmless) must not touch whatever socket has since reused that fd. The
+     * socketpair takes the lowest free descriptors, so with the fd still
+     * published the second cancel would shutdown() one of its ends. */
+    {
+        struct cancel_args ca = {getenv("DRSG_BASE_URL"), getenv("DRSG_TOKEN"),
+                                 drsg_watch_ctl_new(), 0, -2, {0}};
+        pthread_t cth;
+        CHECK(ca.ctl, "drsg_watch_ctl_new (early)");
+        drsg_watch_ctl_cancel(ca.ctl);
+        if (ca.ctl && pthread_create(&cth, NULL, cancel_thread, &ca) == 0) {
+            pthread_join(cth, NULL);
+            CHECK(ca.rc == 0, "early cancel: returns 0 without subscribing");
+            int sp[2] = {-1, -1};
+            char byte = 0;
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "early cancel: socketpair");
+            drsg_watch_ctl_cancel(ca.ctl); /* second cancel: must be inert */
+            CHECK(send(sp[0], "x", 1, MSG_NOSIGNAL) == 1 && recv(sp[1], &byte, 1, 0) == 1 && byte == 'x',
+                  "early cancel: second cancel leaves an unrelated socket alone");
+            close(sp[0]);
+            close(sp[1]);
+        } else {
+            CHECK(0, "pthread_create for early cancel");
         }
         drsg_watch_ctl_free(ca.ctl);
     }

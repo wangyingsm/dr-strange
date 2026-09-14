@@ -779,6 +779,10 @@ int drsg_watch_cancellable(drsg_client *c, const char *plane, const char *label,
         return -1;
     }
     if (ctl_set_fd(ctl, rd.fd)) {
+        /* Withdraw the fd before closing it, as the other exits do: a later
+         * (harmless by contract) cancel must not shutdown() whatever socket
+         * inherits this descriptor number. */
+        ctl_set_fd(ctl, -1);
         ws_close(&rd);
         return 0; /* cancelled before we got here */
     }
