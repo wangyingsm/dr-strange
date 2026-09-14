@@ -42,7 +42,8 @@ A runnable version is [`examples/quickstart.py`](examples/quickstart.py) — `py
 ### Auth
 
 The whole surface is authenticated. Pass `token=` or set `DRSG_TOKEN`; it rides
-each request as `Authorization: Bearer …`. A missing/invalid credential raises
+each request — the WebSocket upgrade behind `watch()` included — as
+`Authorization: Bearer …`, never in a URL. A missing/invalid credential raises
 `DrsgAuthError` (code `-32001`); other server errors raise `DrsgError` with a
 `.code`. A reply that is not JSON-RPC at all, or a change-feed frame that is
 truncated or larger than `drsg._client.MAX_FRAME_BYTES` (64 MiB), raises

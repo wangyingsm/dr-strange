@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7700"
 
@@ -174,7 +174,11 @@ class _WebSocket:
         secure = parts.scheme == "https"
         host = parts.hostname or "127.0.0.1"
         port = parts.port or (443 if secure else 80)
-        path = "/ws" + (f"?token={quote(token)}" if token else "")
+        # The token is a bearer header on the upgrade, the form the server
+        # prefers (arch/08-web-ui §4.1). `?token=` exists only for browsers,
+        # whose WebSocket API cannot set headers; a URL credential would end
+        # up in proxy and access logs, so a native client never sends one.
+        authz = f"Authorization: Bearer {token}\r\n" if token else ""
 
         raw = socket.create_connection((host, port), timeout=timeout)
         sock = (
@@ -184,8 +188,9 @@ class _WebSocket:
         )
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
-            f"GET {path} HTTP/1.1\r\n"
+            "GET /ws HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
+            f"{authz}"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"

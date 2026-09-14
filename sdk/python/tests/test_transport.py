@@ -37,6 +37,55 @@ def _frame(payload: bytes, *, opcode: int = 0x1, mask: bytes | None = None) -> b
     return bytes(head) + payload
 
 
+def test_connect_sends_bearer_header_and_a_bare_path():
+    """The token travels as `Authorization: Bearer` on the upgrade, never in
+    the URL: a query-string credential lands in proxy and access logs, and the
+    server prefers the header (arch/08-web-ui §4.1; `?token=` is for browsers
+    only)."""
+    import base64
+    import hashlib
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    seen: dict[str, bytes] = {}
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += conn.recv(4096)
+            seen["head"] = head
+            key = next(
+                line.split(b":", 1)[1].strip()
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"sec-websocket-key:")
+            )
+            accept = base64.b64encode(
+                hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
+            )
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            conn.sendall(bytes([0x88, 0]))  # clean close
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    port = srv.getsockname()[1]
+    try:
+        ws = _WebSocket.connect(f"http://127.0.0.1:{port}", "s3cret", 5.0)
+        ws.close()
+    finally:
+        t.join(5)
+        srv.close()
+    lines = seen["head"].split(b"\r\n")
+    assert lines[0] == b"GET /ws HTTP/1.1"
+    assert b"Authorization: Bearer s3cret" in lines[1:]
+
+
 @pytest.fixture
 def pair():
     a, b = socket.socketpair()
