@@ -94,7 +94,37 @@ trusted and every programmatic client is denied *even for reads* — so a deskto
 install doesn't quietly expose an open API on localhost.
 
 This model is sound while `drsg serve` is a loopback tool. It does not survive
-contact with §4.2, and the fallback becomes actively dangerous there.
+contact with §4.2, and the fallback becomes actively dangerous there — so the
+server enforces where the line is (shipped 2026-09, `server::run`,
+`assets.rs`, `auth.rs`):
+
+1. **A non-loopback bind requires a token.** `run()` refuses to start on
+   any address that is not loopback unless `DRSG_TOKEN` is configured, and
+   the error names the variable and the `--addr` way back. Without a token
+   the only credential left is an `Origin` header any client can type.
+2. **The fallback is gated on a loopback bind.** `SharedToken` knows whether
+   its listener is loopback-bound, and `resolve_credentials` never sets
+   `local_ui` otherwise; an allowed `Origin` on a LAN bind still passes the
+   CSRF guard but authorizes nothing by itself. Invariant 2 of §4.2, closed.
+3. **The page carries the token only to a local human.** `GET /` is
+   unauthenticated (it must be — it is how the browser gets the page that
+   will authenticate), so whatever is in the page is public to whoever can
+   fetch it. The token is spliced into `index.html` only when the bind *and*
+   the peer address are both loopback; on any other deployment the page is
+   served bare, and the SPA asks for the token the first time the server
+   answers unauthorized, keeping it in the tab's `sessionStorage`.
+4. **The token is data, not code.** It rides a `<meta name="drsg-token">`
+   element, never an inline `<script>`, and every response carries a
+   `Content-Security-Policy` of `script-src 'self'` (and `style-src 'self'` —
+   Svelte and sigma style through the CSSOM, which CSP does not govern) with
+   `worker-src blob:` for the layout worker and `img-src data:` for the
+   inlined logo. An injected script cannot run, whatever else goes wrong.
+5. **The WebSocket takes a header first.** `/ws` accepts `Authorization:
+   Bearer` on the upgrade — the form every non-browser client should use,
+   since a header reaches neither access logs nor browser history — and
+   `?token=` only because the browser WebSocket API cannot set headers. The
+   header wins when both are present. Nothing in the server logs a request
+   target, so a query-string token never reaches a log line.
 
 ### 4.2 v2 — many agents, many machines, one database
 
@@ -163,9 +193,11 @@ concept.
    access when no token is configured, and it keys off *allowed origin*, not
    *loopback*. Once an operator adds the LAN UI to `DRSG_ALLOWED_ORIGINS` — which
    requirement 1 forces — an unset `DRSG_TOKEN` means any LAN browser has
-   unauthenticated write access. Gate the fallback on a loopback bind.
+   unauthenticated write access. *Shipped* (§4.1): the fallback is gated on a
+   loopback bind, and a tokenless server refuses to bind anywhere else.
 3. **`DRSG_ALLOWED_ORIGINS` must name the ops UI origin**, or the dashboard
-   cannot call its own backend.
+   cannot call its own backend. The page the LAN UI loads carries no token
+   (§4.1); the browser asks for it and sends it as a bearer credential.
 
 **Accepted limits.** One process owns the database, so it is a single point of
 failure and a throughput ceiling for *writes* — `write_gate` serializes them,

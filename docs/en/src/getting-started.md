@@ -242,6 +242,16 @@ authorized to call the API. To permit programmatic access from the SDKs or
 $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```
 
+A token is *required* for any bind address other than loopback: `drsg serve
+--addr 0.0.0.0:7700` without `DRSG_TOKEN` (or `[server] token`) refuses to
+start, because off loopback the same-origin check is no protection at all. On
+such an address the served dashboard does not carry the token either — the
+browser asks for it once per tab (see the Web UI chapter) — and the dashboard's
+own origin must be named in `allowed_origins`. Send the token as
+`Authorization: Bearer <token>` on HTTP and, preferably, on the WebSocket
+upgrade as well; `?token=` on `/ws` exists for browsers, which cannot set
+headers there, and a query string is what proxies and browsers tend to log.
+
 ### Configuration file
 
 Server, logging, and provider settings may be supplied through a TOML

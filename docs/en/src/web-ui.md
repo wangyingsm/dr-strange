@@ -8,11 +8,25 @@ rendering is local.
 
 ## Access and authentication
 
-Open the address reported by `drsg serve` (default `http://127.0.0.1:7700`). When
-a token is configured, the server injects it into the served page, so the
-same-origin UI authenticates automatically; when no token is configured, the
-same-origin origin check authorizes the local UI. Cross-origin requests are
-refused regardless.
+Open the address reported by `drsg serve` (default `http://127.0.0.1:7700`). On a
+loopback address, the UI needs no setup: with no token configured, the
+same-origin check authorizes it; with `DRSG_TOKEN` set, the server writes the
+token into the page it serves to a loopback browser (as a `<meta>` element the
+app reads — never as a script), and the UI presents it as a bearer credential.
+Cross-origin requests are refused regardless.
+
+Served on any other address (`--addr 0.0.0.0:7700`, the container image), the
+server requires a token to start at all and never writes it into the page,
+because that page goes to anyone who can reach the port. The first request the
+server answers *unauthorized* opens a prompt; paste `DRSG_TOKEN` there. It is
+kept in the tab's session storage (gone when the tab closes) and sent as
+`Authorization: Bearer` on every call and as `?token=` on the WebSocket, the only
+form a browser socket can carry. The dashboard's own origin must also be listed
+in `allowed_origins` / `DRSG_ALLOWED_ORIGINS` there, since it is not loopback.
+
+Every response carries a `Content-Security-Policy` under which scripts and styles
+load only from the server itself; the dashboard is built to satisfy it, and a
+reverse proxy in front should pass it through rather than replace it.
 
 The interface has three views, selected from the header: **Dashboard**,
 **Explore**, and **AIgest**.

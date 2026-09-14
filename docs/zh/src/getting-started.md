@@ -216,6 +216,13 @@ $ drsg --db graph.drsg serve
 $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```
 
+监听回环以外的任何地址时令牌是*必需*的：未设置 `DRSG_TOKEN`（或 `[server] token`）
+的 `drsg serve --addr 0.0.0.0:7700` 会拒绝启动，因为离开回环后同源检查不再构成任何
+保护。在这类地址上，提供的仪表盘页面也不携带令牌——浏览器每个标签页会询问一次
+（见 Web 界面一章），且仪表盘自身的来源须列入 `allowed_origins`。HTTP 上以
+`Authorization: Bearer <token>` 发送令牌，WebSocket 升级请求也优先如此；`/ws` 上的
+`?token=` 仅为无法设置请求头的浏览器而设，查询字符串往往会被代理和浏览器记录。
+
 ### 配置文件
 
 服务、日志与提供方设置也可以通过一个 TOML 配置文件提供，而非逐个使用命令行标志与
