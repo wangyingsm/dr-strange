@@ -90,13 +90,26 @@ final class FakeWebSocketServer implements AutoCloseable {
      *     accepts TCP and then says nothing models a stalled handshake
      */
     FakeWebSocketServer(boolean upgrade, Script script) throws IOException {
+        this(upgrade ? 0 : 10_000, script);
+    }
+
+    /**
+     * @param handshakeDelayMs how long to sit on the accepted socket before
+     *     answering the upgrade; 10 s or more models a peer that never does
+     *     (the accepted socket is dropped instead), anything in between a
+     *     peer that upgrades after the client has given up
+     */
+    FakeWebSocketServer(long handshakeDelayMs, Script script) throws IOException {
         listener = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress());
         acceptor = new Thread(() -> {
             try (Socket socket = listener.accept()) {
                 socket.setSoTimeout(10_000);
-                if (!upgrade) {
+                if (handshakeDelayMs >= 10_000) {
                     Thread.sleep(10_000); // outlive any client timeout under test
                     return;
+                }
+                if (handshakeDelayMs > 0) {
+                    Thread.sleep(handshakeDelayMs);
                 }
                 handshake(socket);
                 script.run(new Conn(socket));

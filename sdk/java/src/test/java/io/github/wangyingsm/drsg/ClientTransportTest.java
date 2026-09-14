@@ -40,6 +40,29 @@ class ClientTransportTest {
     }
 
     @Test
+    @Timeout(15)
+    void aHandshakeThatCompletesAfterTheTimeoutIsAbortedNotLeaked() throws Exception {
+        // The caller has already been told the connect failed; when the 101
+        // arrives anyway the upgraded socket belongs to nobody and must be
+        // closed, which the peer observes as EOF. This pins behaviour the JDK
+        // provides today (the abandoned exchange is torn down on completion);
+        // if a runtime ever leaks it, the fix is to keep the buildAsync future
+        // and abort() the WebSocket it eventually yields.
+        CountDownLatch peerSawEof = new CountDownLatch(1);
+        try (FakeWebSocketServer srv = new FakeWebSocketServer(600, c -> {
+                    while (c.readFrameOpcode() >= 0) {
+                        // keep reading until the client hangs up
+                    }
+                    peerSawEof.countDown();
+                });
+             Client client = new Client(new Client.Options().baseUrl(srv.baseUrl()).timeout(Duration.ofMillis(300)))) {
+            DrsgException ex = assertThrows(DrsgException.class, () -> client.watch("p", null, ev -> { }));
+            assertTrue(ex.getMessage().contains("PT0.3S"), ex.getMessage());
+            assertTrue(peerSawEof.await(5, TimeUnit.SECONDS), "the late-upgraded socket was left open");
+        }
+    }
+
+    @Test
     @Timeout(10)
     void subscriptionCloseAbortsAPeerThatIgnoresTheCloseHandshake() throws Exception {
         CountDownLatch peerSawEof = new CountDownLatch(1);
