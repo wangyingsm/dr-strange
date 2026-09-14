@@ -348,13 +348,21 @@ public class Client implements AutoCloseable {
                     LOG.log(System.Logger.Level.DEBUG, "drsg change feed: undecodable frame ignored", e);
                     return;
                 }
+                if (event == null) {
+                    // convertValue(null) is null, not an exception: a
+                    // plane.change with absent or null params has nothing to
+                    // deliver, and must not reach a listener as null.
+                    LOG.log(System.Logger.Level.DEBUG, "drsg change feed: plane.change without params ignored");
+                    return;
+                }
+                long seq = event.seq();
                 try {
                     listener.onChange(event);
                 } catch (RuntimeException e) {
                     // The listener runs on the HttpClient's thread; letting
                     // the throw escape would kill the WebSocket silently.
                     LOG.log(System.Logger.Level.WARNING,
-                            "drsg change feed: listener threw on seq " + event.seq() + "; subscription continues", e);
+                            "drsg change feed: listener threw on seq " + seq + "; subscription continues", e);
                 }
             }
 

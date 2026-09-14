@@ -154,6 +154,36 @@ class ClientTransportTest {
 
     @Test
     @Timeout(10)
+    void changeWithoutParamsDoesNotReachTheListenerOrEndTheFeed() throws Exception {
+        // convertValue(null) yields null rather than throwing, so a params-less
+        // plane.change must be dropped before the listener, and the warning
+        // path must not dereference a null event.
+        CountDownLatch realEvent = new CountDownLatch(1);
+        List<ChangeEvent> seen = new CopyOnWriteArrayList<>();
+        try (FakeWebSocketServer srv = new FakeWebSocketServer(true, c -> {
+                    c.readFrameOpcode(); // the subscribe request
+                    c.sendText("{\"jsonrpc\":\"2.0\",\"method\":\"plane.change\"}");
+                    c.sendText("{\"jsonrpc\":\"2.0\",\"method\":\"plane.change\",\"params\":null}");
+                    c.sendText(String.format(CHANGE, 1));
+                    while (c.readFrameOpcode() >= 0) {
+                        // until the client hangs up
+                    }
+                });
+             Client client = new Client(new Client.Options().baseUrl(srv.baseUrl()))) {
+            Client.Subscription sub = client.watch("p", null, ev -> {
+                seen.add(ev);
+                if (ev.seq() == 1) { // NPE here if a null event ever got through
+                    realEvent.countDown();
+                }
+            });
+            assertTrue(realEvent.await(5, TimeUnit.SECONDS), "feed died before the real event: " + seen);
+            assertEquals(1, seen.size(), String.valueOf(seen));
+            sub.close();
+        }
+    }
+
+    @Test
+    @Timeout(10)
     void typedClientAcceptsOptions() throws Exception {
         // The generated Drsg must expose the Options constructor: Client.call is
         // protected, so without it timeout/httpClient are unreachable from the
