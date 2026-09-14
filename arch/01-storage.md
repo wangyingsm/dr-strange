@@ -314,6 +314,15 @@ Rules readers honour for either version:
 - The in-memory `StorageEngine` keeps the upper-layer suite fast. Its
   committed snapshot is `Arc`-shared (M5), so a read is an O(1) pointer clone
   and a write is copy-on-write — no longer a full deep copy per read.
+- **Native engine invariants are tested where they live** (`native/mod.rs`,
+  `native/sst.rs`, `conformance_tests.rs`): a torn WAL tail, an oversized
+  WAL record, a commit whose flush fails (directory made read-only), a
+  reader served while a flush is parked mid-I/O, the streaming merge
+  against the map union, a sweep over a rotted block ending in `Corrupt`,
+  v1 files still opening, retention reclaiming versions on compaction, and
+  a reader pinned through compaction. The HNSW entry-point rule is checked
+  by `is_wellformed` after removals (`hnsw.rs`), and the external-key
+  ownership rule by the graph-layer and `tests/bulk.rs` tests.
 
 ## 9. Replication (`serve --follow`)
 
@@ -358,7 +367,9 @@ key.
   replica never gets promoted, so this needs no runtime setter.
   `begin_write` refuses immediately when set; `apply_replicated` (the
   replica's own write path, landing a batch at its master's exact `seq`)
-  bypasses it entirely, since it isn't the gate this flag exists for.
+  bypasses it entirely, since it isn't the gate this flag exists for. It
+  does enforce §6.1's ordering rule: a batch at or below the replica's
+  `committed_seq` is `Error::Conflict`, and the follower resyncs.
 - `Database::init`'s one-time-per-open plane/counters bootstrap, and
   `restore`, both need to succeed on a read-only-opened engine — they're the
   engine's own setup, not a caller's write. Both go through a
