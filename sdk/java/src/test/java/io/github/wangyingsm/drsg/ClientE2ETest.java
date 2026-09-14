@@ -24,8 +24,16 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 
+/**
+ * The class shares one server, so every test works in its own plane and
+ * asserts on deltas, never on global state another test may have touched.
+ * Random ordering keeps that honest.
+ */
+@TestMethodOrder(MethodOrderer.Random.class)
 class ClientE2ETest {
 
     private static final String TOKEN = "test-token";
@@ -90,93 +98,102 @@ class ClientE2ETest {
     @Test
     void crudRoundtrip() throws Exception {
         assumeTrue(baseUrl != null, "drsg binary not found; run `cargo build -p dr-strange-cli`");
-        Drsg db = new Drsg(baseUrl, TOKEN);
+        try (Drsg db = new Drsg(baseUrl, TOKEN)) {
+            db.planeCreate(Drsg.PlaneCreateParams.of("crud"));
+            Drsg.DbStats before = db.dbStats();
 
-        assertEquals(0, db.dbStats().nodes());
+            Drsg.NodeRecord alice = db.nodeCreate(
+                    Drsg.NodeCreateParams.of("crud").withKey("alice").withLabels(List.of("Person")));
+            assertEquals("alice", alice.externalKey());
+            db.nodeCreate(Drsg.NodeCreateParams.of("crud").withKey("bob").withLabels(List.of("Person")));
 
-        Drsg.NodeRecord alice = db.nodeCreate(
-                Drsg.NodeCreateParams.of("startup").withKey("alice").withLabels(List.of("Person")));
-        assertEquals("alice", alice.externalKey());
-        db.nodeCreate(Drsg.NodeCreateParams.of("startup").withKey("bob").withLabels(List.of("Person")));
+            Drsg.EdgeRecord edge = db.edgeCreate(
+                    Drsg.EdgeCreateParams.of("crud", "alice", "bob", "KNOWS"));
+            assertEquals("KNOWS", edge.type());
 
-        Drsg.EdgeRecord edge = db.edgeCreate(
-                Drsg.EdgeCreateParams.of("startup", "alice", "bob", "KNOWS"));
-        assertEquals("KNOWS", edge.type());
+            // Property patch: set then unset, with types preserved.
+            Drsg.NodeRecord upd = db.nodeUpdate(
+                    Drsg.NodeUpdateParams.of("crud").withKey("alice").withSet(Map.of("age", 41, "city", "NYC")));
+            assertEquals(41, ((Number) upd.properties().get("age")).intValue());
+            upd = db.nodeUpdate(Drsg.NodeUpdateParams.of("crud").withKey("alice").withUnset(List.of("city")));
+            assertFalse(upd.properties().containsKey("city"));
 
-        // Property patch: set then unset, with types preserved.
-        Drsg.NodeRecord upd = db.nodeUpdate(
-                Drsg.NodeUpdateParams.of("startup").withKey("alice").withSet(Map.of("age", 41, "city", "NYC")));
-        assertEquals(41, ((Number) upd.properties().get("age")).intValue());
-        upd = db.nodeUpdate(Drsg.NodeUpdateParams.of("startup").withKey("alice").withUnset(List.of("city")));
-        assertFalse(upd.properties().containsKey("city"));
+            Drsg.NodeRecord got = db.nodeGet(Drsg.NodeGetParams.of("crud").withKey("alice"));
+            assertNotNull(got);
+            assertEquals(41, ((Number) got.properties().get("age")).intValue());
 
-        Drsg.NodeRecord got = db.nodeGet(Drsg.NodeGetParams.of("startup").withKey("alice"));
-        assertNotNull(got);
-        assertEquals(41, ((Number) got.properties().get("age")).intValue());
-
-        // Delete cascades the edge; the graph is left consistent.
-        assertTrue(db.nodeDelete(Drsg.NodeDeleteParams.of("startup").withKey("alice")).deleted());
-        Drsg.DbStats stats = db.dbStats();
-        assertEquals(1, stats.nodes());
-        assertEquals(0, stats.edges());
+            // Delete cascades the edge; the graph is left consistent. Counts
+            // are relative to the start because other tests share the server.
+            assertTrue(db.nodeDelete(Drsg.NodeDeleteParams.of("crud").withKey("alice")).deleted());
+            Drsg.DbStats after = db.dbStats();
+            assertEquals(before.nodes() + 1, after.nodes());
+            assertEquals(before.edges(), after.edges());
+        }
     }
 
     @Test
     void planeAdmin() throws Exception {
         assumeTrue(baseUrl != null, "drsg binary not found");
-        Drsg db = new Drsg(baseUrl, TOKEN);
-        assertEquals("notes", db.planeCreate(Drsg.PlaneCreateParams.of("notes")).name());
-        assertEquals("archive", db.planeRename(Drsg.PlaneRenameParams.of("notes", "archive")).name());
-        assertTrue(db.planeDelete(Drsg.PlaneDeleteParams.of("archive")).deleted());
+        try (Drsg db = new Drsg(baseUrl, TOKEN)) {
+            assertEquals("notes", db.planeCreate(Drsg.PlaneCreateParams.of("notes")).name());
+            assertEquals("archive", db.planeRename(Drsg.PlaneRenameParams.of("notes", "archive")).name());
+            assertTrue(db.planeDelete(Drsg.PlaneDeleteParams.of("archive")).deleted());
+        }
     }
 
     @Test
     void discover() throws Exception {
         assumeTrue(baseUrl != null, "drsg binary not found");
-        Drsg db = new Drsg(baseUrl, TOKEN);
-        Map<String, Object> doc = db.rpcDiscover();
-        assertEquals("1.2.6", doc.get("openrpc"));
+        try (Drsg db = new Drsg(baseUrl, TOKEN)) {
+            Map<String, Object> doc = db.rpcDiscover();
+            assertEquals("1.2.6", doc.get("openrpc"));
+        }
     }
 
     @Test
     void changeFeedOverWebSocket() throws Exception {
         assumeTrue(baseUrl != null, "drsg binary not found");
-        Drsg db = new Drsg(baseUrl, TOKEN);
+        try (Drsg db = new Drsg(baseUrl, TOKEN)) {
+            db.planeCreate(Drsg.PlaneCreateParams.of("feed"));
+            List<ChangeEvent> events = new CopyOnWriteArrayList<>();
+            CountDownLatch latch = new CountDownLatch(1);
+            try (Client.Subscription sub = db.watch("feed", "Widget", ev -> {
+                        events.add(ev);
+                        latch.countDown();
+                    })) {
+                Thread.sleep(300); // let the server register the subscription
+                db.nodeCreate(Drsg.NodeCreateParams.of("feed").withKey("ws-widget").withLabels(List.of("Widget")));
 
-        List<ChangeEvent> events = new CopyOnWriteArrayList<>();
-        CountDownLatch latch = new CountDownLatch(1);
-        Client.Subscription sub = db.watch("startup", "Widget", ev -> {
-            events.add(ev);
-            latch.countDown();
-        });
-        try {
-            Thread.sleep(300); // let the server register the subscription
-            db.nodeCreate(Drsg.NodeCreateParams.of("startup").withKey("ws-widget").withLabels(List.of("Widget")));
-
-            assertTrue(latch.await(3, TimeUnit.SECONDS), "no change event received over the websocket");
-            ChangeEvent ev = events.get(0);
-            assertTrue(ev.seq() > 0);
-            ChangeEvent.Change c = ev.changes().stream()
-                    .filter(x -> x.record() != null && "ws-widget".equals(x.record().get("external_key")))
-                    .findFirst()
-                    .orElseThrow();
-            assertEquals("node", c.kind());
-            assertEquals("created", c.op());
-            assertTrue(c.labels().contains("Widget"));
-
-            // Leave the graph as we found it — crudRoundtrip asserts on the
-            // global node count and the class shares one server.
-            db.nodeDelete(Drsg.NodeDeleteParams.of("startup").withKey("ws-widget"));
-        } finally {
-            sub.close();
+                assertTrue(latch.await(3, TimeUnit.SECONDS), "no change event received over the websocket");
+                ChangeEvent ev = events.get(0);
+                assertTrue(ev.seq() > 0);
+                ChangeEvent.Change c = ev.changes().stream()
+                        .filter(x -> x.record() != null && "ws-widget".equals(x.record().get("external_key")))
+                        .findFirst()
+                        .orElseThrow();
+                assertEquals("node", c.kind());
+                assertEquals("created", c.op());
+                assertTrue(c.labels().contains("Widget"));
+            }
         }
+    }
+
+    @Test
+    void closedClientRefusesCalls() throws Exception {
+        assumeTrue(baseUrl != null, "drsg binary not found");
+        Drsg db = new Drsg(baseUrl, TOKEN);
+        assertNotNull(db.dbStats());
+        db.close();
+        DrsgException ex = assertThrows(DrsgException.class, db::dbStats);
+        assertEquals(-32000, ex.code());
     }
 
     @Test
     void badTokenRaisesAuthError() throws Exception {
         assumeTrue(baseUrl != null, "drsg binary not found");
-        Drsg db = new Drsg(baseUrl, "wrong");
-        DrsgAuthException ex = assertThrows(DrsgAuthException.class, db::dbStats);
-        assertEquals(Client.AUTH_ERROR_CODE, ex.code());
+        try (Drsg db = new Drsg(baseUrl, "wrong")) {
+            DrsgAuthException ex = assertThrows(DrsgAuthException.class, db::dbStats);
+            assertEquals(Client.AUTH_ERROR_CODE, ex.code());
+        }
     }
 }

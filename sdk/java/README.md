@@ -49,6 +49,45 @@ a `String` key. Types are nested in the `Drsg` class (`Drsg.NodeRecord`).
 
 A runnable version is [`examples/Quickstart.java`](examples/Quickstart.java) (compile with the built classes + Jackson on the classpath).
 
+### Lifecycle and configuration
+
+A client is `AutoCloseable`. It owns the threads behind its JDK `HttpClient`
+and any open change-feed `Subscription`, so close it when done (or use
+try-with-resources):
+
+```java
+try (Drsg db = new Drsg("http://127.0.0.1:7700", token)) {
+    db.dbStats();
+}
+```
+
+`Client.Options` sets the per-call timeout (default 30 s, also bounding the
+WebSocket handshake of `watch`) and lets several clients share one
+`HttpClient` — its connection pool, proxy and TLS settings — which `close()`
+then leaves running:
+
+```java
+var options = new Client.Options()
+        .baseUrl("http://127.0.0.1:7700")
+        .token(token)
+        .timeout(Duration.ofSeconds(5))
+        .httpClient(sharedHttpClient);
+Client client = new Client(options);
+```
+
+> `Drsg` currently exposes only the positional constructors; the
+> `Options` constructor is reachable on `Client` until the generated
+> `Drsg.java` gains a `Drsg(Client.Options)` overload.
+
+### Change feed
+
+`db.watch(plane, label, listener)` returns a `Subscription`; `close()` sends a
+close frame and then aborts the socket, so it returns promptly even if the peer
+never answers the close handshake. The listener runs on the `HttpClient`'s
+executor; if it throws, the exception is logged at `WARNING` under the logger
+`io.github.wangyingsm.drsg.Client` (`System.Logger`, so java.util.logging by
+default) and the subscription continues.
+
 ### Auth
 
 The whole surface is authenticated. Pass a token to the constructor or set

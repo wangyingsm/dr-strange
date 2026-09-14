@@ -99,7 +99,7 @@ for e := range events {
 }
 ```
 
-**Java** —— 一个监听器；返回的 `Subscription` 关闭它。
+**Java** —— 一个监听器；返回的 `Subscription` 关闭它（先发送关闭帧，再中止套接字，沉默的对端无法让它悬着）。监听器抛出的异常以 `WARNING` 记录日志，订阅继续。客户端本身是 `AutoCloseable` 的：`close()` 结束其订阅并回收自建的 `HttpClient`（通过 `Client.Options` 共享的除外）。
 
 ```java
 var sub = db.watch("social", null, event -> {

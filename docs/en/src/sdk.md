@@ -112,7 +112,11 @@ for e := range events {
 }
 ```
 
-**Java** — a listener; the returned `Subscription` closes it.
+**Java** — a listener; the returned `Subscription` closes it (sending a close
+frame, then aborting the socket so a silent peer cannot hold it open). A
+listener that throws is logged at `WARNING` and the feed continues. The client
+itself is `AutoCloseable`: `close()` ends its subscriptions and reaps the
+`HttpClient` it built, unless one was shared through `Client.Options`.
 
 ```java
 var sub = db.watch("social", null, event -> {
