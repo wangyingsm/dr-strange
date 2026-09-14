@@ -204,3 +204,9 @@ $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve --addr 0.0.0.0:7700
 See [Chapter 2](./getting-started.md#running-the-server) for the server and its
 configuration, [Chapter 5](./web-ui.md) for the dashboard, and [Chapter
 6](./sdk.md) for the clients.
+
+One setting from that configuration is not the server's alone: `[server]
+retain_commits` — how many commits of history time-travel can reach — is
+applied by every command above that opens the database, so a store fed by
+`import` or `cypher` from the shell keeps the same window (20 by default, `0`
+for unbounded) as it would under `serve`.

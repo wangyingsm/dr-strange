@@ -96,12 +96,23 @@ that has just been overwritten.
 ```console
 $ drsg update
 drsg 2.8.1 -> 2.9.0
-$ curl -fsSL .../install.sh | sh -s -- --bin drsg --dir '/home/me/.local/bin'
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.9.0/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.9.0' --dir '/home/me/.local/bin'
 Dr Strange v2.9.0 (x86_64-unknown-linux-gnu)
   downloading dr-strange-v2.9.0-x86_64-unknown-linux-gnu.tar.gz
   checksum verified
   installed /home/me/.local/bin/drsg
 ```
+
+The installer it runs is the one **tagged with the release being installed**,
+not the copy on `master`, and the release is passed along as `--version`: the
+script that verifies the archive is the script reviewed and shipped with it,
+and moving a branch cannot change what an upgrade executes. The archive's
+`.sha256` sidecar is required by both installers — a missing, malformed or
+mismatching checksum is a hard failure, as is having no `sha256sum`/`shasum`
+to check with. `--insecure-skip-checksum` (`-InsecureSkipChecksum` in
+PowerShell; `DRSG_INSECURE_SKIP_CHECKSUM=1` for either, and for `drsg update`)
+installs anyway, with a warning: it exists for a mirror that publishes no
+sidecar, and its name says what it costs.
 
 The destination is the directory the running binary is in, not the installer's
 default — an upgrade must replace the copy on the `PATH`, not add a newer one
@@ -241,11 +252,11 @@ if present. Unknown keys are rejected.
 ```toml
 [server]
 addr = "0.0.0.0:7700"                       # bind address (CLI --addr overrides)
-token = "please-change-me"                  # shared API token (→ DRSG_TOKEN)
+token = "please-change-me"                  # shared API token (→ DRSG_TOKEN); prefer exporting it, see below
 max_concurrent = 1024                       # ceiling on in-flight requests
 write_timeout_secs = 30                     # how long a write waits for the single writer slot before failing retryably (0 waits forever)
 query_timeout_secs = 60                     # how long one request's queries may run before stopping the same way (0 runs to completion)
-retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all)
+retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all). Applies to every drsg command, not only serve
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins
 
@@ -298,6 +309,22 @@ Precedence is fixed: an environment variable already set in the process always
 takes precedence over the corresponding file value, and the `--addr` flag
 overrides `[server].addr`. Providing `[server.tls]` switches the server to
 HTTPS.
+
+**Secrets in the file become process environment.** `token` and every `[llm]`
+key are applied with `setenv` at startup, so they are inherited by every
+process drsg starts — the detached `serve watch` that `drsg init` spawns,
+plugin hosts, anything a hook runs — and are readable in `/proc` by the same
+user. That is what makes the provider layer's "look the key up by env-var
+name" work, and it is why the shipped `drsg.example.toml` leaves `token`
+commented out: a copied example with a well-known token is a server with no
+token. Keep a `drsg.toml` holding secrets out of version control, or export
+them in the launching environment and leave them out of the file.
+
+`retain_commits` is read by **every** `drsg` command that opens the database,
+not only `serve`: a store driven from the command line — `import`, `cypher`,
+`digest`, `vectorize` — lives by the same window (and the same default of 20)
+as it would under the server, so its history is reclaimed at compaction rather
+than kept forever.
 
 ## Read-only replicas (`serve --follow`)
 
