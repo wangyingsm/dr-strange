@@ -537,6 +537,42 @@ pub struct PluginConfig {
     pub memory_bytes: Option<usize>,
 }
 
+/// The wall-clock deadline per sandbox call, in whole seconds; `0` disables
+/// it. Read by [`Plugins::load`] on top of the config file.
+pub const ENV_PLUGIN_DEADLINE_SECS: &str = "DRSG_PLUGINS_DEADLINE_SECS";
+/// The linear memory every sandbox call in the process may hold together,
+/// in MiB. Read by [`Plugins::load`] on top of the config file.
+pub const ENV_PLUGIN_TOTAL_MEMORY_MB: &str = "DRSG_PLUGINS_TOTAL_MEMORY_MB";
+
+/// Apply the two environment knobs to `limits`.
+///
+/// The environment rather than [`PluginConfig`] fields: these are the net
+/// under the budgets the config file already names, and an embedder that
+/// wants them exactly sets them on [`Limits`] directly. A value that is not
+/// a number is an error naming the variable, not a silently kept default —
+/// an operator who typed it meant it.
+#[cfg(feature = "plugins")]
+fn apply_env_limits(limits: &mut Limits) -> Result<()> {
+    fn read(name: &str) -> Result<Option<u64>> {
+        match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!("{name}={v:?} is not a whole number: {e}")),
+            _ => Ok(None),
+        }
+    }
+    if let Some(secs) = read(ENV_PLUGIN_DEADLINE_SECS)? {
+        limits.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+    if let Some(mb) = read(ENV_PLUGIN_TOTAL_MEMORY_MB)? {
+        // A zero budget would let no store run; treat it as "the default".
+        limits.total_memory_bytes = (mb > 0).then(|| (mb as usize) << 20);
+    }
+    Ok(())
+}
+
 /// The handlers a routing call can dispatch to, resolved once by the caller.
 ///
 /// A handle rather than a per-call lookup because loading a wasm plugin
@@ -591,6 +627,7 @@ impl Plugins {
         if let Some(bytes) = config.memory_bytes {
             limits.memory_bytes = bytes;
         }
+        apply_env_limits(&mut limits)?;
         for plugin in store.load_all(&config.options, &limits)? {
             plugins.handlers.push(Box::new(plugin));
         }

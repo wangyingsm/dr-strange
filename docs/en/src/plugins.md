@@ -112,7 +112,9 @@ Every plugin is a `wasm32-wasip2` component running under a deny-everything
 grant. A guest runtime may *import* `wasi:filesystem` — Go's does, before the
 plugin's first line runs — but the preopen table behind it is empty;
 `wasi:sockets` is refused at load, by name; clocks are frozen; entropy is
-fixed; and each call runs under instruction and memory budgets. A trapped
+fixed; and each call runs under instruction and memory budgets, with a
+wall-clock deadline as the net beneath them and a process-wide memory budget
+across the calls running at once. A trapped
 guest's stderr is captured into the error the operator sees, along with the
 trap code itself. Whatever a plugin produces comes back as a **return value** —
 only the host writes to the database.
@@ -147,6 +149,18 @@ memory_mb = 3072       # linear memory per call, MiB (wasm32 itself allows at mo
 [plugins.rust]         # a plugin's own settings pass through untouched
 include_source = true
 ```
+
+Two more are read from the environment. `DRSG_PLUGINS_DEADLINE_SECS` is the
+wall-clock ceiling on one call (default 300; `0` disables it) — not a budget
+for work, which fuel is and deterministically so, but what stops a plugin
+that never returns once fuel has been switched off. `DRSG_PLUGINS_TOTAL_MEMORY_MB`
+is what every call in the process may hold *together* (default twice
+`memory_mb`): `parse` runs one call per core, and a per-call ceiling alone
+would let a wide machine be filled a store at a time. A refusal names the
+ceiling it hit, so the operator knows which knob it was. Turning fuel off
+also switches the sandbox to compiling each plugin from its wasm on every
+load, since the precompiled artifacts carry the fuel instrumentation; the
+first load says so once.
 
 One boundary follows from the pull model: preprocessing runs where the files
 are. The CLI and the stdio MCP server route through it; bytes sent to a shared

@@ -167,6 +167,9 @@ impl PluginStore {
             );
         }
 
+        // The version becomes the other half of the filename.
+        checked_version(&manifest.version)?;
+
         let sha256 = hex_sha256(bytes);
         let file = format!("{}-{}.wasm", manifest.name, manifest.version);
         let path = self.dir.join(&file);
@@ -281,6 +284,19 @@ impl PluginStore {
         limits: &Limits,
     ) -> Result<Vec<WasmPlugin>> {
         let mut registry = self.read()?;
+        if limits.fuel.is_none() && registry.plugins.iter().any(|p| p.compiled.is_some()) {
+            // Once per process, not once per load: `serve watch` loads on
+            // every commit, and the operator who chose this should hear the
+            // price once, not read it in every fold's log.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "fuel is off (`[plugins] fuel = 0`), so the precompiled plugins do not apply: \
+                     every load compiles each plugin from its wasm — seconds and hundreds of MiB \
+                     apiece"
+                );
+            });
+        }
         let mut out = Vec::with_capacity(registry.plugins.len());
         let mut recompiled = false;
         for entry in &mut registry.plugins {
@@ -439,6 +455,9 @@ impl PluginStore {
         version: &str,
         plugin: &WasmPlugin,
     ) -> Result<(String, String)> {
+        // Install checked this; a record hand-edited since is checked again
+        // here, before its version becomes a path.
+        checked_version(version)?;
         let bytes = plugin.serialize()?;
         let file = format!("{name}-{version}.cwasm");
         let path = self.dir.join(&file);
@@ -469,6 +488,36 @@ impl PluginStore {
     }
 }
 
+/// The longest version string a plugin may declare.
+const MAX_VERSION_CHARS: usize = 64;
+
+/// A plugin version fit to be half a filename: non-empty, bounded, drawn
+/// from `[A-Za-z0-9._+-]`, and not led by a dot or a dash.
+///
+/// The name is already held to a safe charset because it becomes a filename;
+/// the version becomes the other half of the same filename and was held to
+/// nothing. A component is the plugin author's to write, and `describe()`
+/// could answer `../../.bashrc` or `1/../../x` — a path separator, or a
+/// leading dot that names a hidden file or the parent directory. A version
+/// is a version, and this is what one looks like.
+pub(super) fn checked_version(version: &str) -> Result<&str> {
+    let ok = !version.is_empty()
+        && version.chars().count() <= MAX_VERSION_CHARS
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        && !version.starts_with(['.', '-']);
+    if !ok {
+        bail!(
+            "plugin version `{}` may only contain letters, digits, `.`, `_`, `+` and `-`, \
+             not start with `.` or `-`, and be at most {MAX_VERSION_CHARS} characters — it \
+             becomes part of a filename",
+            version.chars().take(80).collect::<String>()
+        );
+    }
+    Ok(version)
+}
+
 /// `$XDG_DATA_HOME/drsg/plugins`, or `~/.local/share/drsg/plugins`.
 fn default_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
@@ -493,4 +542,41 @@ pub(super) fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A version is half a filename, so it is held to what a filename can
+    /// safely be — the same discipline the name already had.
+    #[test]
+    fn a_version_string_is_held_to_a_filename_safe_charset() {
+        for ok in [
+            "1",
+            "2",
+            "1.6.0",
+            "1.6.0-rc.1",
+            "2024.09+build.7",
+            "v3_beta",
+        ] {
+            assert!(checked_version(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "..",
+            ".hidden",
+            "-flag",
+            "1/../../x",
+            "1\\2",
+            "1 2",
+            "1;rm -rf",
+            "版本",
+            "a\u{0}b",
+        ] {
+            assert!(checked_version(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(checked_version(&"9".repeat(MAX_VERSION_CHARS)).is_ok());
+        assert!(checked_version(&"9".repeat(MAX_VERSION_CHARS + 1)).is_err());
+    }
 }

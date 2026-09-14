@@ -1366,3 +1366,42 @@ mod manifests {
         );
     }
 }
+
+/// The two environment knobs land on the limits, `0` disables what it can,
+/// and a value that is not a number is refused by name rather than kept as
+/// a default the operator did not choose. One test rather than three so the
+/// process-wide variables are set and cleared in one place.
+#[cfg(feature = "plugins")]
+#[test]
+fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
+    // SAFETY: nothing else in this test binary reads these variables, and
+    // they are cleared before the test returns.
+    unsafe {
+        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, " 7 ");
+        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "512");
+    }
+    let mut limits = Limits::default();
+    apply_env_limits(&mut limits).unwrap();
+    assert_eq!(limits.deadline, Some(std::time::Duration::from_secs(7)));
+    assert_eq!(limits.total_memory_bytes, Some(512 << 20));
+
+    unsafe {
+        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "0");
+        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "0");
+    }
+    apply_env_limits(&mut limits).unwrap();
+    assert_eq!(limits.deadline, None, "0 switches the deadline off");
+    assert_eq!(
+        limits.total_memory_bytes, None,
+        "0 means the default budget"
+    );
+
+    unsafe { std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "soon") };
+    let err = apply_env_limits(&mut limits).unwrap_err().to_string();
+    assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
+
+    unsafe {
+        std::env::remove_var(ENV_PLUGIN_DEADLINE_SECS);
+        std::env::remove_var(ENV_PLUGIN_TOTAL_MEMORY_MB);
+    }
+}
