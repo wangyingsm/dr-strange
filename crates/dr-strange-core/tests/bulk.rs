@@ -106,8 +106,11 @@ fn bulk_matches_incremental_memory() {
     assert_eq!(dump(&inc), dump(&bulk));
 }
 
+// `Database::open` uses whichever on-disk backend the build selected (native by
+// default, redb under `--features redb-backend`), so this is `_on_disk`, not
+// `_redb`: the name must not promise a backend the default build never runs.
 #[test]
-fn bulk_matches_incremental_redb() {
+fn bulk_matches_incremental_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let inc = Database::open(dir.path().join("inc.drsg")).unwrap();
     build_incremental(&inc);
