@@ -22,6 +22,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use ahash::AHashSet;
+
 use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
 use std::collections::BTreeMap;
@@ -298,7 +300,7 @@ pub enum AsOf {
 }
 
 /// Whether a [`Change`] is a node or an edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChangeKind {
     Node,
     Edge,
@@ -354,6 +356,37 @@ type ChangeObserver = Arc<dyn Fn(ChangeSet) + Send + Sync>;
 /// set is truncated (best-effort — a bulk load shouldn't read back thousands of
 /// records at commit just to notify).
 const CHANGE_DETAIL_CAP: usize = 256;
+
+/// A write txn's buffered change-feed mutations (ROADMAP §5), bounded at the
+/// source: once [`CHANGE_DETAIL_CAP`] distinct entities are tracked, a
+/// mutation of a *new* entity is not buffered at all — only `overflowed` is
+/// set — so a million-node bulk load buffers 256 tuples, not a million that
+/// commit would collapse and then throw away. Entities already tracked keep
+/// receiving their later ops, so a create-then-delete within the cap still
+/// cancels correctly.
+#[derive(Default)]
+struct ChangeBuffer {
+    entries: Vec<(ChangeKind, u64, ChangeOp)>,
+    tracked: AHashSet<(ChangeKind, u64)>,
+    overflowed: bool,
+}
+
+impl ChangeBuffer {
+    fn push(&mut self, kind: ChangeKind, id: u64, op: ChangeOp) {
+        if self.tracked.contains(&(kind, id)) {
+            self.entries.push((kind, id, op));
+        } else if self.tracked.len() < CHANGE_DETAIL_CAP {
+            self.tracked.insert((kind, id));
+            self.entries.push((kind, id, op));
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && !self.overflowed
+    }
+}
 
 pub struct Database {
     engine: Engine,
@@ -1345,7 +1378,7 @@ impl<'db> PlaneHandle<'db> {
             events: Vec::new(),
             kw_decls,
             kw_events: Vec::new(),
-            changes: Vec::new(),
+            changes: ChangeBuffer::default(),
             counters: CounterDelta::default(),
         })
     }
@@ -1479,10 +1512,11 @@ pub struct WriteTxn<'db> {
     kw_decls: Vec<(String, String, Language)>,
     /// Buffered keyword-index coherence events, applied at commit.
     kw_events: Vec<KwEvent>,
-    /// Node/edge mutations this txn made, in order (ROADMAP §5 change feed).
-    /// Collapsed per entity and resolved to full records at commit — only when
-    /// a change observer is registered, so it's free otherwise.
-    changes: Vec<(ChangeKind, u64, ChangeOp)>,
+    /// Node/edge mutations this txn made, in order (ROADMAP §5 change feed),
+    /// capped at [`CHANGE_DETAIL_CAP`] entities. Collapsed per entity and
+    /// resolved to full records at commit — only when a change observer is
+    /// registered, so it's free otherwise.
+    changes: ChangeBuffer,
     /// Running counter changes, folded into the plane's stored
     /// [`PlaneCounters`] row at commit (arch/03 §5).
     counters: CounterDelta,
@@ -1546,7 +1580,7 @@ impl WriteTxn<'_> {
     /// buffers `(kind, id, op)`; the full record is resolved at commit, and only
     /// if a change observer is registered.
     fn record_change(&mut self, kind: ChangeKind, id: u64, op: ChangeOp) {
-        self.changes.push((kind, id, op));
+        self.changes.push(kind, id, op);
     }
 
     pub fn create_node(&mut self, labels: &[&str], props: Properties) -> Result<NodeId> {
@@ -1627,7 +1661,12 @@ impl WriteTxn<'_> {
         // contiguous id range. Edges are omitted (bulk assigns their ids
         // internally and the endpoints-by-key path doesn't surface them);
         // subscribers on a bulk ingest can time-travel the seq for the edges.
+        // The buffer caps itself; past the cap every further node is one
+        // overflow flag, so there is no point walking the whole range.
         for i in 0..stats.nodes {
+            if self.changes.overflowed {
+                break;
+            }
             self.record_change(ChangeKind::Node, stats.node_start + i, ChangeOp::Created);
         }
 
@@ -2094,21 +2133,23 @@ fn sanitized_properties(props: &Properties) -> Properties {
 
 /// Resolve a write txn's buffered `(kind, id, op)` mutations into a
 /// [`ChangeSet`] (ROADMAP §5): collapse repeats per entity (a create-then-delete
-/// cancels), cap the detail, and read back each surviving created/updated record
-/// at the just-committed snapshot (sanitized). Returns `None` if nothing
-/// survived collapsing.
+/// cancels) and read back each surviving created/updated record at the
+/// just-committed snapshot (sanitized). The buffer was already capped at
+/// [`CHANGE_DETAIL_CAP`] entities as it was written; a set whose txn touched
+/// more is flagged `truncated`. Returns `None` if nothing survived collapsing
+/// and nothing overflowed.
 fn build_change_set(
     db: &Database,
     plane: PlaneId,
     seq: u64,
-    buffered: &[(ChangeKind, u64, ChangeOp)],
+    buffered: &ChangeBuffer,
 ) -> Result<Option<ChangeSet>> {
     use std::collections::BTreeMap;
     // Collapse per (kind, id) preserving first-seen order, tracking whether the
     // entity was created / updated / deleted in this txn.
     let mut order: Vec<(ChangeKind, u64)> = Vec::new();
     let mut flags: BTreeMap<(ChangeKind, u64), (bool, bool, bool)> = BTreeMap::new();
-    for &(kind, id, op) in buffered {
+    for &(kind, id, op) in &buffered.entries {
         let entry = flags.entry((kind, id)).or_insert_with(|| {
             order.push((kind, id));
             (false, false, false)
@@ -2133,12 +2174,12 @@ fn build_change_set(
         };
         resolved.push((kind, id, op));
     }
-    if resolved.is_empty() {
+    // An overflowed buffer is worth a (possibly empty) set: the subscriber
+    // learns that this seq changed more than it can see and can re-read.
+    let truncated = buffered.overflowed;
+    if resolved.is_empty() && !truncated {
         return Ok(None);
     }
-
-    let truncated = resolved.len() > CHANGE_DETAIL_CAP;
-    resolved.truncate(CHANGE_DETAIL_CAP);
 
     // Read the surviving created/updated records at the committed snapshot.
     let changes = db.engine.with_read(|txn| {
@@ -3135,6 +3176,49 @@ mod change_feed_tests {
             p.insert((*k).into(), PropDesc::new(v.clone()));
         }
         p
+    }
+
+    /// A bulk load of more entities than the detail cap yields exactly the
+    /// cap, in id order, flagged truncated — and the txn buffered no more
+    /// than that: entities past the cap are never tracked, while entities
+    /// within it still collapse (a create-then-delete cancels).
+    #[test]
+    fn a_large_commit_is_capped_at_the_source_and_flagged_truncated() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let sink = collector(&db);
+
+        let nodes: Vec<BulkNode<'_>> = (0..CHANGE_DETAIL_CAP + 44)
+            .map(|_| BulkNode {
+                external_key: None,
+                labels: &["Doc"],
+                props: Properties::new(),
+            })
+            .collect();
+        let first = {
+            let mut w = plane.write().unwrap();
+            let stats = w.bulk_load(nodes, Vec::new()).unwrap();
+            assert_eq!(w.changes.tracked.len(), CHANGE_DETAIL_CAP);
+            assert_eq!(w.changes.entries.len(), CHANGE_DETAIL_CAP);
+            assert!(w.changes.overflowed);
+            // Deleting a tracked node in the same txn cancels its create;
+            // deleting an untracked one changes nothing in the buffer.
+            w.delete_node(NodeId(stats.node_start)).unwrap();
+            w.delete_node(NodeId(stats.node_start + stats.nodes - 1))
+                .unwrap();
+            assert_eq!(w.changes.entries.len(), CHANGE_DETAIL_CAP + 1);
+            w.commit().unwrap();
+            stats.node_start
+        };
+
+        let sets = sink.lock().unwrap();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].truncated);
+        assert_eq!(sets[0].changes.len(), CHANGE_DETAIL_CAP - 1);
+        let ids: Vec<u64> = sets[0].changes.iter().map(|c| c.id).collect();
+        let expected: Vec<u64> = (first + 1..first + CHANGE_DETAIL_CAP as u64).collect();
+        assert_eq!(ids, expected, "the first cap-many entities, in order");
+        assert!(sets[0].changes.iter().all(|c| c.op == ChangeOp::Created));
     }
 
     #[test]
