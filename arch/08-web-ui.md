@@ -42,10 +42,19 @@ Landing view: the state of the database at a glance.
 
 - **Interactive plot canvas**: force-directed layout, WebGL-rendered so
   thousands of visible nodes stay smooth; pan/zoom, node color by label,
-  edge color by type, size by degree or score.
+  edge color by type, size by degree or score. Up to 400 nodes the layout
+  runs synchronously (a fixed iteration count finishes before a worker could
+  spawn); above that it runs in graphology's ForceAtlas2 web worker for a
+  bounded wall-clock budget (2 ms a node, 0.5–4 s — `layoutPlan` in
+  `frontend/src/layout.js`), so "show all" on a large plane converges in
+  view instead of freezing the tab. Sectoring, packing and focus follow once
+  the forces stop; a new layout, or leaving the page, kills a run in flight.
 - **Hub-safe incremental expansion**: click-to-expand neighborhoods with
   bounded fan-out and "N more…" affordances — the UI never asks the core for
-  an unbounded dump (cursors throughout).
+  an unbounded dump (cursors throughout). *Expand one hop* takes at most 300
+  frontier nodes a click and asks for them in JSON-RPC batches (`rpcBatch`
+  in `frontend/src/rpc.js`: `MAX_BATCH` a request, one request in flight),
+  so a click is a handful of round trips rather than one socket per node.
 - **Hybrid search overlay**: search box → embedding (via `dr-strange-llm` if
   configured) → `VectorTopK`/`FrontierTopK`; hits highlighted on the plot
   with similarity scores; `ExpandBeam` walks animate the traversal path.

@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
-  import { rpc, liveChanges } from './rpc.js'
+  import { rpc, rpcBatch, liveChanges } from './rpc.js'
   import { loadPref, savePref } from './prefs.js'
   import { Plot } from './plot.js'
   import { renderMarkdown } from './markdown.js'
@@ -473,23 +473,20 @@
       const take = leaves.slice(0, EXPAND_FRONTIER_CAP)
       // `Number(id)`: graphology keys nodes by string, and `graph.expand` takes
       // a u64 — a string id is refused outright rather than coerced.
-      let failures = 0
-      const parts = await Promise.all(
-        take.map((id) =>
-          rpc('graph.expand', {
-            plane,
-            id: Number(id),
-            direction: 'both',
-            ...atParams(),
-          }).catch(() => {
-            // One unreachable node must not sink the ring, but a silent catch
-            // turns "every call failed" into a cheerful "+0 nodes" — so they
-            // are counted and reported.
-            failures += 1
-            return null
-          }),
-        ),
+      // Batched (rpc.js: 64 a request, one request at a time) rather than
+      // fired as one connection per node: a frontier of three hundred is five
+      // round trips, not three hundred sockets contending for the server.
+      const answers = await rpcBatch(
+        take.map((id) => ({
+          method: 'graph.expand',
+          params: { plane, id: Number(id), direction: 'both', ...atParams() },
+        })),
       )
+      // One unreachable node must not sink the ring, but a silent skip turns
+      // "every call failed" into a cheerful "+0 nodes" — so they are counted
+      // and reported.
+      const failures = answers.filter((a) => a.error).length
+      const parts = answers.map((a) => a.result ?? null)
 
       // Merged and added **once**: every `addSubgraph` unfolds the beads,
       // re-folds them and runs the force layout, so doing it per node would
