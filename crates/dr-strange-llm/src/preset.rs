@@ -148,13 +148,13 @@ pub fn wire_provider<'a>(
             });
         }
     };
-    if let Some(k) = requested_key_env {
-        if Some(k) != default_key_env {
-            return Err(WireProviderError::ForeignKeyEnv {
-                provider: name.to_string(),
-                requested: k.to_string(),
-            });
-        }
+    if let Some(k) = requested_key_env
+        && Some(k) != default_key_env
+    {
+        return Err(WireProviderError::ForeignKeyEnv {
+            provider: name.to_string(),
+            requested: k.to_string(),
+        });
     }
     Ok((name, default_key_env))
 }
