@@ -20,6 +20,7 @@
 pub mod relay;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
@@ -56,6 +57,9 @@ pub struct DrStrange {
     /// The source tree behind the graph, when the host attached one — what
     /// the `grep` tool searches. `serve watch` attaches its `--dir`.
     source_root: Option<std::path::PathBuf>,
+    /// Longest one tool call may take, queue included — see
+    /// [`DrStrange::with_tool_deadline`]. `None` waits and runs without limit.
+    deadline: Option<Duration>,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -102,6 +106,33 @@ impl Default for DigestTuning {
 /// the HTTP request ceiling, which counts cheap requests too.
 pub const DEFAULT_TOOL_CONCURRENCY: usize = 16;
 
+/// Longest one tool call may take — waiting for a slot and running — when the
+/// host sets nothing. Generous, because a `digest` over a directory fans out
+/// to a provider and legitimately runs for minutes; the point is that a call
+/// ends, not that it ends quickly.
+pub const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Environment override for [`DEFAULT_TOOL_DEADLINE`], in whole seconds; `0`
+/// disables the deadline. Read when a [`DrStrange`] is built, so the stdio
+/// binary — which has no config file — can be tuned the same way a served one
+/// is through its host.
+pub const ENV_TOOL_DEADLINE_SECS: &str = "DRSG_MCP_TOOL_DEADLINE_SECS";
+
+/// The deadline the environment asks for, else the default. An unparsable
+/// value is the default too: a typo should not silently remove the bound.
+pub fn tool_deadline_from_env() -> Option<Duration> {
+    deadline_from(std::env::var(ENV_TOOL_DEADLINE_SECS).ok().as_deref())
+}
+
+/// [`tool_deadline_from_env`] on a value already read.
+fn deadline_from(value: Option<&str>) -> Option<Duration> {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(DEFAULT_TOOL_DEADLINE),
+    }
+}
+
 impl DrStrange {
     pub fn new(db: Arc<Database>) -> Self {
         Self::with_digest(db, DigestTuning::default())
@@ -116,7 +147,22 @@ impl DrStrange {
             embed: None,
             local_files: false,
             source_root: None,
+            deadline: tool_deadline_from_env(),
         }
+    }
+
+    /// Bound one tool call, queue included; `None` removes the bound.
+    ///
+    /// Without it a call behind a full gate waits for as long as the calls
+    /// ahead of it run, and a body that never returns holds its slot for
+    /// good — the agent sees neither, only a call that does not come back.
+    /// Past the deadline the call answers with a tool error naming it, so
+    /// the agent can retry or do something else. A body already running is
+    /// not cut short — blocking work cannot be — but it keeps its slot until
+    /// it finishes, so the gate still counts it.
+    pub fn with_tool_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Let `digest` read a document path the caller names.
@@ -698,16 +744,55 @@ impl DrStrange {
         // Held for the tool's whole body: this is the only thing bounding tool
         // work, since the transport releases its own permit once the call is
         // merely queued (see `with_tool_gate`). Queues rather than rejects — a
-        // busy server should make an agent wait, not fail it.
-        let _permit = self
-            .tools
-            .acquire()
-            .await
-            .map_err(|_| McpError::internal_error("tool gate closed", None))?;
+        // busy server should make an agent wait, not fail it — but not for
+        // ever: past the deadline the wait is a tool error the agent can act
+        // on, where an open-ended queue looks like a server that hung.
+        let started = std::time::Instant::now();
+        let closed = |_| McpError::internal_error("tool gate closed", None);
+        let acquire = self.tools.clone().acquire_owned();
+        let permit = match self.deadline {
+            Some(limit) => match tokio::time::timeout(limit, acquire).await {
+                Ok(permit) => permit.map_err(closed)?,
+                Err(_) => {
+                    tracing::warn!(tool, ?limit, "mcp tool waited past its deadline");
+                    return Ok(tool_error(format!(
+                        "{tool}: the server is busy — no tool slot freed within \
+                         {}s; retry in a moment, or narrow the calls in flight",
+                        limit.as_secs()
+                    )));
+                }
+            },
+            None => acquire.await.map_err(closed)?,
+        };
         let db = self.db.clone();
-        let joined = tokio::task::spawn_blocking(move || f(&db))
-            .await
-            .map_err(|e| McpError::internal_error(format!("task join failed: {e}"), None))?;
+        // The permit travels with the body, not with this future: a body that
+        // outlives its deadline keeps its slot until it returns, so the gate
+        // still counts the work that is actually running.
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&db)
+        });
+        let joined = match self.deadline {
+            Some(limit) => {
+                let left = limit.saturating_sub(started.elapsed());
+                match tokio::time::timeout(left, task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        tracing::warn!(tool, ?limit, "mcp tool ran past its deadline");
+                        return Ok(tool_error(format!(
+                            "{tool}: did not finish within {}s; it keeps running \
+                             to completion but this call is abandoned — narrow \
+                             the request (a smaller `limit`, `depth` or \
+                             document), or raise {ENV_TOOL_DEADLINE_SECS}",
+                            limit.as_secs()
+                        )));
+                    }
+                }
+            }
+            None => task.await,
+        };
+        let joined =
+            joined.map_err(|e| McpError::internal_error(format!("task join failed: {e}"), None))?;
         Ok(match joined {
             Ok(value) => {
                 tracing::debug!(tool, "mcp tool ok");
@@ -2676,7 +2761,6 @@ impl ServerHandler for DrStrange {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use super::*;
     use serde_json::from_value;
@@ -2853,6 +2937,62 @@ mod tests {
             .await
             .expect("the tool should run once a permit frees")
             .expect("list_planes");
+    }
+
+    /// The queue is bounded: a call that cannot get a slot within its deadline
+    /// comes back as a tool error, not as a call that never returns. The
+    /// error is tool-level — the session is fine, this one call was not.
+    #[tokio::test]
+    async fn a_call_behind_a_full_gate_fails_at_its_deadline() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let svc = DrStrange::new(db)
+            .with_tool_gate(gate.clone())
+            .with_tool_deadline(Some(Duration::from_millis(100)));
+
+        let _held = gate.clone().acquire_owned().await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), svc.list_planes())
+            .await
+            .expect("the deadline must end the wait")
+            .expect("a deadline is a tool error, not a protocol error");
+        assert_eq!(answered.is_error, Some(true), "{answered:?}");
+        let text = format!("{:?}", answered.content);
+        assert!(text.contains("busy"), "{text}");
+    }
+
+    /// A body that runs past the deadline is abandoned by the call — and keeps
+    /// its slot until it actually finishes, so the gate still bounds it.
+    #[tokio::test]
+    async fn a_body_past_its_deadline_is_a_tool_error_and_keeps_its_slot() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let svc = DrStrange::new(db)
+            .with_tool_gate(gate.clone())
+            .with_tool_deadline(Some(Duration::from_millis(50)));
+
+        let answered = svc
+            .blocking("slow", |_| {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(jval!(null))
+            })
+            .await
+            .expect("a deadline is a tool error, not a protocol error");
+        assert_eq!(answered.is_error, Some(true), "{answered:?}");
+        assert!(format!("{:?}", answered.content).contains("did not finish"));
+        // Abandoned, not released: the body is still running with the slot.
+        assert_eq!(gate.available_permits(), 0, "the slot was released early");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(gate.available_permits(), 1, "the slot outlived the body");
+    }
+
+    /// Unset and unparsable both mean the default — a typo must not silently
+    /// remove the bound — and only an explicit `0` removes it.
+    #[test]
+    fn the_deadline_is_read_in_seconds_with_zero_disabling_it() {
+        assert_eq!(deadline_from(None), Some(DEFAULT_TOOL_DEADLINE));
+        assert_eq!(deadline_from(Some("nonsense")), Some(DEFAULT_TOOL_DEADLINE));
+        assert_eq!(deadline_from(Some(" 30 ")), Some(Duration::from_secs(30)));
+        assert_eq!(deadline_from(Some("0")), None);
     }
 
     /// The gate is only useful if every session shares one — MCP puts no limit
