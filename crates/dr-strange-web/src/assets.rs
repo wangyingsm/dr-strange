@@ -3,10 +3,11 @@
 //! is compiled into the binary via `rust-embed`; `build.rs` guarantees the
 //! folder exists so `cargo build` works without the JS toolchain.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{StatusCode, Uri, header};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
@@ -46,16 +47,43 @@ fn cache_control_for(path: &str) -> &'static str {
     }
 }
 
+/// Whether the page served to this peer may carry the bootstrap token.
+///
+/// `GET /` is unauthenticated — it has to be, it is how the browser obtains
+/// the page that will authenticate — so whatever is in the page is public to
+/// whoever can fetch it. That is acceptable only when "whoever" is a process
+/// on this machine: the listener is loopback-bound *and* the connection came
+/// from a loopback address. Both, not either — a loopback bind reached
+/// through a forwarded port still shows a loopback peer, and a LAN bind
+/// reached from the same host shows a loopback peer too, while the same page
+/// is also being served to the network. An unknown peer counts as remote.
+pub(crate) fn may_inject_token(bind_is_loopback: bool, peer: Option<IpAddr>) -> bool {
+    bind_is_loopback && peer.is_some_and(|ip| ip.is_loopback())
+}
+
 /// Serves an embedded asset by path, falling back to `index.html` for any
 /// unknown *route* so client-side routing (deep links, refresh) works. The HTML
-/// entry point gets the auth bootstrap token spliced in (see [`inject_token`]).
-pub async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
+/// entry point gets the auth bootstrap token spliced in (see [`inject_token`])
+/// when [`may_inject_token`] allows; otherwise the SPA asks the user for it.
+pub async fn static_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
+    // Read from the extensions rather than the `ConnectInfo` extractor: the
+    // extractor fails the whole request (a 500) when the service was built
+    // without connect info, whereas "unknown peer" has a safe answer here.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let token = if may_inject_token(state.bind_is_loopback, peer) {
+        state.bootstrap_token.as_deref()
+    } else {
+        None
+    };
 
     if let Some(content) = Assets::get(path) {
         if path.ends_with(".html") {
-            return html_response(&content.data, state.bootstrap_token.as_deref());
+            return html_response(&content.data, token);
         }
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         return (
@@ -75,7 +103,7 @@ pub async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Res
 
     // SPA fallback: hand back index.html for unmatched routes.
     match Assets::get("index.html") {
-        Some(content) => html_response(&content.data, state.bootstrap_token.as_deref()),
+        Some(content) => html_response(&content.data, token),
         None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
     }
 }
@@ -99,37 +127,60 @@ fn html_response(bytes: &[u8], token: Option<&str>) -> Response {
         .into_response()
 }
 
-/// Splice `<script>window.__DRSG_TOKEN__=…</script>` before `</head>` so the
-/// SPA can read the shared token synchronously at load and send it as a bearer
-/// credential (arch/08 security model).
+/// The element the token rides in. The SPA reads
+/// `document.querySelector('meta[name="drsg-token"]').content`.
+pub const TOKEN_META_NAME: &str = "drsg-token";
+
+/// Splice `<meta name="drsg-token" content="…">` before `</head>` so the SPA
+/// can read the shared token synchronously at load and send it as a bearer
+/// credential (arch/08 security model). A `<meta>` rather than an inline
+/// `<script>`, so the page runs under a `script-src 'self'` policy with no
+/// `'unsafe-inline'` — the one thing that keeps an injected script from
+/// running should any renderer ever slip.
 ///
 /// Handing the token to our own same-origin page is safe: the only thing it
 /// unlocks is `/rpc` + `/ws`, both behind the Origin guard, so a page from any
 /// other origin — including a DNS-rebinding attacker that reads this HTML — is
 /// refused when it tries to *use* the token (its `Origin` isn't loopback). The
-/// value is JSON-encoded (a valid JS string literal) with `<` escaped so a
-/// token can't break out of the script element.
+/// value is attribute-escaped so a token cannot close the element.
 fn inject_token(html: &str, token: &str) -> String {
-    let encoded = serde_json::to_string(token)
-        .unwrap_or_else(|_| "null".into())
-        .replace('<', "\\u003c");
-    let script = format!("<script>window.__DRSG_TOKEN__={encoded};</script>");
+    let encoded = attr_escape(token);
+    let meta = format!("<meta name=\"{TOKEN_META_NAME}\" content=\"{encoded}\">");
     match html.find("</head>") {
         Some(i) => {
-            let mut out = String::with_capacity(html.len() + script.len());
+            let mut out = String::with_capacity(html.len() + meta.len());
             out.push_str(&html[..i]);
-            out.push_str(&script);
+            out.push_str(&meta);
             out.push_str(&html[i..]);
             out
         }
-        // No <head> (a degenerate/placeholder doc) — prepend so it still runs.
-        None => format!("{script}{html}"),
+        // No <head> (a degenerate/placeholder doc) — prepend so it is still
+        // in the document.
+        None => format!("{meta}{html}"),
     }
+}
+
+/// Escape a string for a double-quoted HTML attribute value.
+fn attr_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_control_for, inject_token, is_asset_request};
+    use std::net::IpAddr;
+
+    use super::{cache_control_for, inject_token, is_asset_request, may_inject_token};
 
     #[test]
     fn a_built_asset_is_told_apart_from_a_client_side_route() {
@@ -158,22 +209,41 @@ mod tests {
     fn token_is_spliced_before_head_close() {
         let html = "<html><head><title>x</title></head><body></body></html>";
         let out = inject_token(html, "s3cret");
-        assert!(out.contains(r#"window.__DRSG_TOKEN__="s3cret";"#));
+        assert!(out.contains(r#"<meta name="drsg-token" content="s3cret">"#));
         // Inserted inside <head>, before its close.
-        assert!(out.find("__DRSG_TOKEN__").unwrap() < out.find("</head>").unwrap());
+        assert!(out.find("drsg-token").unwrap() < out.find("</head>").unwrap());
+        // Never as script: the page runs under `script-src 'self'`.
+        assert!(!out.contains("<script"));
     }
 
     #[test]
-    fn token_cannot_break_out_of_the_script() {
-        // A hostile token can't close the <script> or the JS string.
-        let out = inject_token("<head></head>", "a\"</script><b>");
-        assert!(!out.contains("</script><b>"));
-        assert!(out.contains("\\u003c/script>"));
+    fn token_cannot_break_out_of_the_element() {
+        // A hostile token can't close the attribute or open an element.
+        let out = inject_token("<head></head>", "a\"><script>x</script><b>");
+        assert!(!out.contains("<script>"));
+        assert!(out.contains("content=\"a&quot;&gt;&lt;script&gt;x&lt;/script&gt;&lt;b&gt;\">"));
     }
 
     #[test]
-    fn no_head_prepends_script() {
+    fn no_head_prepends_the_element() {
         let out = inject_token("<body>hi</body>", "t");
-        assert!(out.starts_with("<script>window.__DRSG_TOKEN__=\"t\";</script>"));
+        assert!(out.starts_with("<meta name=\"drsg-token\" content=\"t\">"));
+    }
+
+    #[test]
+    fn the_token_is_handed_only_to_a_loopback_peer_of_a_loopback_listener() {
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let local6: IpAddr = "::1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(may_inject_token(true, Some(local)));
+        assert!(may_inject_token(true, Some(local6)));
+        // A LAN bind never injects, even to a peer on this machine — the
+        // same page is being served to the network.
+        assert!(!may_inject_token(false, Some(local)));
+        // A loopback bind reached from elsewhere (a forwarded port shows
+        // a loopback peer, so this is the tunnelled/proxied shape) doesn't.
+        assert!(!may_inject_token(true, Some(lan)));
+        // No peer address at all is treated as remote.
+        assert!(!may_inject_token(true, None));
     }
 }

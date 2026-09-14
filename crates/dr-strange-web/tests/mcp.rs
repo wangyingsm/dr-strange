@@ -366,3 +366,70 @@ async fn two_sessions_share_one_database_over_mcp() {
     let _ = b.cancel().await;
     let _ = c.cancel().await;
 }
+
+/// The page a local browser loads carries the token, and carries it as data,
+/// not code: a `<meta>` element the SPA reads, never an inline `<script>`,
+/// so the response's `script-src 'self'` policy holds for the page itself.
+/// This server is loopback-bound and the client is a loopback peer — the one
+/// configuration in which the token is handed out at all (see `bind.rs` for
+/// the other).
+#[tokio::test]
+async fn the_page_hands_its_token_to_a_loopback_browser_as_data_not_code() {
+    let addr = spawn_server();
+    wait_ready(addr).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let csp = resp.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("script-src 'self'"), "{csp}");
+    let html = resp.text().await.unwrap();
+    assert!(
+        html.contains(&format!(r#"<meta name="drsg-token" content="{TOKEN}">"#)),
+        "{html}"
+    );
+    assert!(!html.contains("__DRSG_TOKEN__"), "{html}");
+}
+
+/// `/ws` takes the bearer token either way: `Authorization: Bearer` on the
+/// upgrade (the preferred form — a header is not written to access logs or
+/// browser history) or `?token=` (the only form a browser's WebSocket API
+/// can send). With neither, there is no socket at all.
+#[tokio::test]
+async fn the_websocket_takes_the_token_in_a_header_or_the_query() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let addr = spawn_server();
+    wait_ready(addr).await;
+
+    // Header.
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
+    assert!(first.contains("db.stats"), "{first}");
+
+    // Query string.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={TOKEN}"))
+        .await
+        .unwrap();
+    let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
+    assert!(first.contains("db.stats"), "{first}");
+
+    // Neither: the upgrade is refused with 401.
+    match tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status().as_u16(), 401);
+        }
+        Err(other) => panic!("expected an HTTP 401, got {other:?}"),
+        Ok(_) => panic!("no credential, no socket"),
+    }
+}

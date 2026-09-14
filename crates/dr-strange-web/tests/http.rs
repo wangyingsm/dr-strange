@@ -78,8 +78,21 @@ async fn serves_dashboard_and_rpc() {
     // Hardening: every response carries the static defensive headers.
     assert_eq!(index.headers()["x-content-type-options"], "nosniff");
     assert_eq!(index.headers()["x-frame-options"], "DENY");
+    // …and a Content-Security-Policy the bundle satisfies: scripts only from
+    // the bundle (no inline), so the page carries no inline script at all.
+    let csp = index.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.starts_with("default-src 'self'"), "{csp}");
+    assert!(csp.contains("script-src 'self';"), "{csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
     let html = index.text().await.unwrap();
     assert!(html.contains("<div id=\"app\">") || html.contains("dr-strange"));
+    assert!(
+        !html.contains("<script>"),
+        "inline script under script-src 'self': {html}"
+    );
 
     // /health is an unauthenticated liveness probe — no Origin, no token.
     let health = client.get(format!("{base}/health")).send().await.unwrap();
@@ -835,4 +848,23 @@ async fn history_is_addressable(client: &reqwest::Client, base: &str, rows: &[Va
         .await
         .unwrap();
     assert_eq!(recent.as_array().unwrap().len(), 1);
+}
+
+/// With no token, the only credential left is the same-origin browser check,
+/// and that is meaningless once the port faces a network: anyone who can
+/// reach it can also load the page. So a tokenless `serve` refuses a
+/// non-loopback bind up front, naming what to set.
+#[test]
+fn a_tokenless_server_refuses_to_bind_off_loopback() {
+    let db = Database::in_memory().unwrap();
+    let opts = dr_strange_web::ServeOptions {
+        addr: "0.0.0.0:0".parse().unwrap(),
+        ..Default::default()
+    };
+    let err = dr_strange_web::serve(db, None, opts)
+        .err()
+        .expect("must not start")
+        .to_string();
+    assert!(err.contains("DRSG_TOKEN"), "{err}");
+    assert!(err.contains("--addr"), "{err}");
 }

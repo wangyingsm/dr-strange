@@ -72,6 +72,12 @@ pub struct AppState {
     /// authenticate (see [`crate::assets`]). `None` when unset. Same value the
     /// `authorizer` checks against, so the injected token always works.
     pub bootstrap_token: Option<String>,
+    /// Whether the listener is bound to a loopback address. Decides two
+    /// things: whether `index.html` may carry the token at all (and then only
+    /// to a loopback peer — see [`crate::assets`]), and whether the Origin
+    /// guard's "allowed origin" still means "the local human's own UI" (it
+    /// does not on a LAN bind, so `local_ui` is never set there).
+    pub bind_is_loopback: bool,
     /// Commit-time change feed (ROADMAP §5): the core observer publishes each
     /// committed `ChangeSet` here, and every `/ws` subscriber that ran
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
@@ -176,8 +182,13 @@ fn resolve_credentials(
     headers: &HeaderMap,
     ws_token: Option<String>,
 ) -> Result<Credentials, Box<Response>> {
+    // An allowed Origin is only "our own local UI" when the listener is
+    // loopback-bound: on any other bind the same page is served to whoever
+    // can reach the port, so the zero-config fallback must not key off it
+    // (arch/08 §4.2 invariant 2). The 403 for a *disallowed* Origin stands
+    // regardless — that is the CSRF guard, not the fallback.
     let local_ui = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) if state.origins.allows(origin) => true,
+        Some(origin) if state.origins.allows(origin) => state.bind_is_loopback,
         Some(_) => {
             return Err(Box::new(
                 (
@@ -237,6 +248,44 @@ const MCP_SESSION_IDLE: Duration = Duration::from_secs(600);
 /// How long a session may exist before its `initialize` must arrive. Bounds
 /// the same leak for a connection that opens and then goes silent.
 const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
+
+/// The policy every response carries. Written for the built dashboard, which
+/// is fully self-contained (arch/08 §1): scripts come only from the bundle,
+/// so an injected `<script>` never runs — the reason the bootstrap token is a
+/// `<meta>` element rather than inline JS. No `'unsafe-inline'` for styles
+/// either: Vite emits one stylesheet, Svelte 5 applies a dynamic `style="…"`
+/// through `element.style.cssText` (CSSOM, which CSP does not govern), and
+/// sigma styles its canvases the same way — verified against the bundle,
+/// which holds no `style=` attribute, `<style>` element or
+/// `setAttribute("style")`. `img-src data:` covers the inlined SVG logo,
+/// `worker-src blob:` the ForceAtlas2 layout worker graphology builds from a
+/// blob URL. `ws:`/`wss:` are spelled out because older engines did not count
+/// a same-origin socket as `'self'`. Frame ancestors mirror `X-Frame-Options`.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self'; \
+    style-src 'self'; \
+    img-src 'self' data: blob:; \
+    font-src 'self'; \
+    connect-src 'self' ws: wss:; \
+    worker-src 'self' blob:; \
+    object-src 'none'; \
+    base-uri 'self'; \
+    form-action 'self'; \
+    frame-ancestors 'none'";
+
+/// Whether a listener may start at all: a non-loopback bind serves the API and
+/// the dashboard to whoever can reach the port, and without a token the only
+/// remaining credential is an `Origin` header any client can type. So the
+/// server refuses, naming what to set, rather than starting open.
+pub fn check_bind_policy(addr: std::net::SocketAddr, token_configured: bool) -> anyhow::Result<()> {
+    if addr.ip().is_loopback() || token_configured {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
+        addr.port()
+    )
+}
 
 /// How long shutdown waits for in-flight connections before giving up. Both
 /// listeners use it, so Ctrl-C behaves the same with and without TLS.
@@ -345,6 +394,10 @@ fn router(
         .layer(SetResponseHeaderLayer::if_not_present(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
@@ -1030,12 +1083,14 @@ pub enum ServeOutcome {
 /// never disagree. `serve --follow` (arch/01 §9) then refuses every write RPC
 /// regardless of token — a third, orthogonal layer alongside the Origin guard
 /// and the bearer token itself.
-fn build_authorizer(opts: &ServeOptions) -> (Arc<dyn Authorizer>, Option<String>) {
+fn build_authorizer(opts: &ServeOptions) -> anyhow::Result<Authorization> {
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
-    let shared_token = SharedToken::new(token.clone());
+    let bind_is_loopback = opts.addr.ip().is_loopback();
+    let shared_token = SharedToken::new(token.clone()).bound_to_loopback(bind_is_loopback);
+    check_bind_policy(opts.addr, shared_token.is_configured())?;
     if shared_token.is_configured() {
         tracing::info!(
-            "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
+            "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>, on the WebSocket upgrade too; browsers use ?token=<token>)"
         );
     } else {
         tracing::warn!(
@@ -1048,7 +1103,22 @@ fn build_authorizer(opts: &ServeOptions) -> (Arc<dyn Authorizer>, Option<String>
     } else {
         Arc::new(shared_token)
     };
-    (authorizer, token)
+    Ok(Authorization {
+        authorizer,
+        token,
+        bind_is_loopback,
+    })
+}
+
+/// What the bind and the environment settle before a request is served: who
+/// may do what, the copy of the token the SPA is handed, and whether this
+/// listener is local enough to hand it out at all.
+struct Authorization {
+    authorizer: Arc<dyn Authorizer>,
+    token: Option<String>,
+    /// Loopback binds alone may splice the token into the page or honour the
+    /// zero-config local-UI fallback.
+    bind_is_loopback: bool,
 }
 
 /// History retention (see `ServeOptions::retain_commits`): bound how far back
@@ -1082,7 +1152,11 @@ pub async fn run(
     opts: ServeOptions,
 ) -> anyhow::Result<ServeOutcome> {
     startup_banner();
-    let (authorizer, token) = build_authorizer(&opts);
+    let Authorization {
+        authorizer,
+        token,
+        bind_is_loopback,
+    } = build_authorizer(&opts)?;
     // Change feed (ROADMAP §5): publish every committed ChangeSet to a
     // broadcast channel that `/ws` subscribers drain. Registered before the db
     // is shared, and best-effort — `send` failing (no live subscriber) is fine.
@@ -1147,6 +1221,7 @@ pub async fn run(
             authorizer,
             origins: AllowedOrigins::from_env(),
             bootstrap_token: token,
+            bind_is_loopback,
             changes,
             wal_changes,
             digest: opts.digest,
@@ -1163,6 +1238,7 @@ pub async fn run(
         authorizer,
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
+        bind_is_loopback,
         changes,
         wal_changes,
         digest: opts.digest,
@@ -1228,7 +1304,13 @@ async fn run_app(
             // lifetime, so no replacement can start until this one dies.
             let (fired_tx, fired_rx) = tokio::sync::oneshot::channel();
             let serve = std::future::IntoFuture::into_future(
-                axum::serve(listener, app).with_graceful_shutdown(async move {
+                // With connect info, so the SPA handler can see the peer
+                // address it is about to hand the bootstrap token to.
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     let _ = fired_tx.send(());
                 }),
@@ -1302,7 +1384,7 @@ async fn serve_tls(
     });
     let serve = axum_server::from_tcp_rustls(listener, config)?
         .handle(handle)
-        .serve(app.into_make_service());
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
     tokio::select! {
         res = serve => res?,
         // `--follow` losing its replication stream: same immediate-not-
@@ -1368,8 +1450,12 @@ async fn rpc_http(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
 
 // ---- WebSocket ------------------------------------------------------------
 
-/// The WebSocket carries its bearer token in the query string (`/ws?token=…`)
-/// because the browser WebSocket API can't set request headers.
+/// The WebSocket's query-string credential (`/ws?token=…`), for the browser
+/// WebSocket API, which can't set request headers. Any other client should
+/// send `Authorization: Bearer` on the upgrade instead — a header is neither
+/// written to access logs nor kept in a browser's history — and the header
+/// wins when both are present. Nothing here logs a request target, so the
+/// query value never reaches a log line; keep it that way.
 #[derive(serde::Deserialize)]
 struct WsQuery {
     #[serde(default)]
@@ -1544,4 +1630,23 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
         .ok()
         .flatten()?;
     Some(json!({ "jsonrpc": "2.0", "method": "db.stats", "params": stats }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_bind_policy;
+
+    #[test]
+    fn a_tokenless_listener_may_only_be_loopback() {
+        let lan: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        let local6: std::net::SocketAddr = "[::1]:7700".parse().unwrap();
+        assert!(check_bind_policy(local, false).is_ok());
+        assert!(check_bind_policy(local6, false).is_ok());
+        assert!(check_bind_policy(lan, true).is_ok());
+        // The refusal names the knob to set and the way back to loopback.
+        let err = check_bind_policy(lan, false).unwrap_err().to_string();
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        assert!(err.contains("--addr 127.0.0.1:7700"), "{err}");
+    }
 }
