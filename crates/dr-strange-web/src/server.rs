@@ -463,6 +463,7 @@ fn mcp_router(
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -486,6 +487,11 @@ fn mcp_router(
             }
             if let Some(parsers) = &parsers {
                 svc = svc.with_parsers(parsers.clone());
+            }
+            // The file's deadline over the environment's, when the file
+            // says; `DrStrange::new` already read the variable otherwise.
+            if let Some(deadline) = tool_deadline {
+                svc = svc.with_tool_deadline(deadline);
             }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
@@ -522,6 +528,7 @@ fn router(
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -557,6 +564,7 @@ fn router(
             source_root,
             parsers,
             allowed_hosts,
+            tool_deadline,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -1585,6 +1593,7 @@ async fn run_app(
         opts.source_root.clone(),
         opts.recall_parsers.clone(),
         allowed_hosts,
+        opts.mcp_tool_deadline,
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths

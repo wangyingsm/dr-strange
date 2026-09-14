@@ -535,6 +535,14 @@ pub struct PluginConfig {
     /// Linear-memory bound per sandbox call, in bytes; `None` keeps the
     /// default. No value can lift the 4 GiB ceiling wasm32 itself imposes.
     pub memory_bytes: Option<usize>,
+    /// Wall-clock deadline per sandbox call, in whole seconds; `None` keeps
+    /// the default and `Some(0)` switches it off. The config file's spelling
+    /// of [`ENV_PLUGIN_DEADLINE_SECS`], which still overrides it.
+    pub deadline_secs: Option<u64>,
+    /// Linear memory every sandbox call in the process may hold together, in
+    /// MiB; `None` or `Some(0)` keeps the default. The config file's spelling
+    /// of [`ENV_PLUGIN_TOTAL_MEMORY_MB`], which still overrides it.
+    pub total_memory_mb: Option<u64>,
 }
 
 /// The wall-clock deadline per sandbox call, in whole seconds; `0` disables
@@ -618,6 +626,19 @@ impl Plugins {
     pub fn load(config: &PluginConfig) -> Result<Self> {
         let mut plugins = Self::with_options(&config.options);
         let store = Self::store(config)?;
+        let limits = Self::limits_for(config)?;
+        for plugin in store.load_all(&config.options, &limits)? {
+            plugins.handlers.push(Box::new(plugin));
+        }
+        Ok(plugins)
+    }
+
+    /// The sandbox limits `config` asks for: the file's budgets over the
+    /// defaults, then the environment knobs over the file — an operator at
+    /// the shell overrides what `drsg.toml` says, the same precedence every
+    /// other `DRSG_*` variable has.
+    #[cfg(feature = "plugins")]
+    fn limits_for(config: &PluginConfig) -> Result<Limits> {
         let mut limits = Limits::default();
         match config.fuel {
             Some(0) => limits.fuel = None,
@@ -627,11 +648,16 @@ impl Plugins {
         if let Some(bytes) = config.memory_bytes {
             limits.memory_bytes = bytes;
         }
-        apply_env_limits(&mut limits)?;
-        for plugin in store.load_all(&config.options, &limits)? {
-            plugins.handlers.push(Box::new(plugin));
+        if let Some(secs) = config.deadline_secs {
+            limits.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
         }
-        Ok(plugins)
+        if let Some(mb) = config.total_memory_mb {
+            // Same reading as the environment's: a zero budget would let no
+            // store run, so it means "the default".
+            limits.total_memory_bytes = (mb > 0).then_some((mb as usize) << 20);
+        }
+        apply_env_limits(&mut limits)?;
+        Ok(limits)
     }
 
     /// The store `config` names, or the per-user default.

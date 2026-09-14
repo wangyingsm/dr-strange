@@ -1371,6 +1371,39 @@ mod manifests {
     }
 }
 
+/// The `[plugins]` file knobs reach the limits the way the environment's do:
+/// a deadline in seconds (`0` off) and a shared budget in MiB (`0` default),
+/// with the variables unset so the file alone decides.
+#[cfg(feature = "plugins")]
+#[test]
+fn the_config_knobs_set_the_deadline_and_the_shared_budget() {
+    let limits = Plugins::limits_for(&PluginConfig::default()).unwrap();
+    let defaults = Limits::default();
+    assert_eq!(limits.deadline, defaults.deadline);
+    assert_eq!(limits.total_memory_bytes, defaults.total_memory_bytes);
+
+    let limits = Plugins::limits_for(&PluginConfig {
+        deadline_secs: Some(7),
+        total_memory_mb: Some(512),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(limits.deadline, Some(std::time::Duration::from_secs(7)));
+    assert_eq!(limits.total_memory_bytes, Some(512 << 20));
+
+    let limits = Plugins::limits_for(&PluginConfig {
+        deadline_secs: Some(0),
+        total_memory_mb: Some(0),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(limits.deadline, None, "0 switches the deadline off");
+    assert_eq!(
+        limits.total_memory_bytes, None,
+        "0 means the default budget"
+    );
+}
+
 /// The two environment knobs land on the limits, `0` disables what it can,
 /// and a value that is not a number is refused by name rather than kept as
 /// a default the operator did not choose. One test rather than three so the
