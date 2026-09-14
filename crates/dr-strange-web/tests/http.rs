@@ -868,3 +868,63 @@ fn a_tokenless_server_refuses_to_bind_off_loopback() {
     assert!(err.contains("DRSG_TOKEN"), "{err}");
     assert!(err.contains("--addr"), "{err}");
 }
+
+/// `/export` and `/snapshot` stream: a chunked body that a reader can consume
+/// as it arrives, not a file built in memory first. What the wire carries
+/// must still be exactly what it was — JSONL `drsg import` reads, and a
+/// snapshot `Database::restore` accepts — and a bad plane name is still a
+/// 400, decided before the status line goes out.
+#[tokio::test]
+async fn export_and_snapshot_stream_the_same_bytes_as_before() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let resp = client
+        .post(format!("{base}/export?plane=startup"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/x-ndjson");
+    assert_eq!(
+        resp.headers()["transfer-encoding"],
+        "chunked",
+        "the export is streamed, not sized up front"
+    );
+    let jsonl = resp.text().await.unwrap();
+    let lines: Vec<Value> = jsonl
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{jsonl}");
+    assert_eq!(lines[0]["external_key"], "alice");
+
+    let missing = client
+        .post(format!("{base}/export?plane=nope"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 400);
+    assert!(missing.text().await.unwrap().contains("nope"));
+
+    let snap = client
+        .get(format!("{base}/snapshot"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    assert_eq!(snap.headers()["transfer-encoding"], "chunked");
+    let bytes = snap.bytes().await.unwrap();
+    let restored = Database::in_memory().unwrap();
+    let stats = restored.restore(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(stats.nodes, 1);
+    let plane = restored.plane("startup").unwrap();
+    let nodes = plane.query().scan_all().nodes().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].external_key.as_deref(), Some("alice"));
+}

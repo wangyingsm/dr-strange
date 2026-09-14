@@ -21,9 +21,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::FollowOptions;
 
-/// Generous: a snapshot is a whole-database dump, buffered fully in memory on
-/// both ends (matching `/export`'s existing convention) before this project
-/// needs chunked transfer.
+/// Generous: a snapshot is a whole-database dump. The master streams it frame
+/// by frame; this end still reads the whole body before restoring, since
+/// `Database::restore` refuses a non-empty target and a half-applied
+/// snapshot would be one.
 const SNAPSHOT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn token_query(token: &Option<String>) -> String {

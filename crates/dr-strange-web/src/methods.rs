@@ -2501,23 +2501,41 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// exact format `drsg import` reads back. Backs the Dashboard's per-plane
 /// Export download. Not an RPC method (it returns a file, not JSON-RPC data);
 /// the `/export` HTTP endpoint calls it directly.
-pub fn export_plane(ctx: &Ctx<'_>, plane_name: &str) -> Result<String, RpcError> {
-    let plane = ctx.plane(plane_name)?;
-    let mut out = String::new();
-    for node in app(plane.query().scan_all().nodes())? {
-        out.push_str(&node_json(&node).to_string());
-        out.push('\n');
-    }
-    // Edges: walk each node's out-adjacency and emit each edge once.
-    for node in app(plane.query().scan_all().nodes())? {
-        for hop in app(plane.neighbors(node.id, Dir::Out, None))? {
-            if let Some(edge) = app(plane.edge(hop.edge))? {
-                out.push_str(&edge_to_json(&edge).to_string());
-                out.push('\n');
+///
+/// Two phases, so the endpoint can answer a bad plane name with a 400 and
+/// stream a good one: resolving the plane returns a [`PlaneExport`], and
+/// [`PlaneExport::write_to`] emits the lines into `out` as it walks — one
+/// node record in memory at a time, never the whole plane as a string.
+pub fn export_plane<'a>(ctx: &'a Ctx<'a>, plane_name: &str) -> Result<PlaneExport<'a>, RpcError> {
+    Ok(PlaneExport(ctx.plane(plane_name)?))
+}
+
+/// A plane resolved for export — see [`export_plane`].
+pub struct PlaneExport<'a>(PlaneHandle<'a>);
+
+impl PlaneExport<'_> {
+    /// Write the plane as JSONL. An `io::Error` from `out` means the reader
+    /// went away; it is returned as a server error for the log and nothing
+    /// else, since there is no one left to tell.
+    pub fn write_to(&self, out: &mut dyn std::io::Write) -> Result<(), RpcError> {
+        let plane = &self.0;
+        let gone = |e: std::io::Error| RpcError::server(format!("export stream closed: {e}"));
+        for node in app(plane.query().scan_all().nodes())? {
+            serde_json::to_writer(&mut *out, &node_json(&node)).map_err(|e| gone(e.into()))?;
+            out.write_all(b"\n").map_err(gone)?;
+        }
+        // Edges: walk each node's out-adjacency and emit each edge once.
+        for node in app(plane.query().scan_all().nodes())? {
+            for hop in app(plane.neighbors(node.id, Dir::Out, None))? {
+                if let Some(edge) = app(plane.edge(hop.edge))? {
+                    serde_json::to_writer(&mut *out, &edge_to_json(&edge))
+                        .map_err(|e| gone(e.into()))?;
+                    out.write_all(b"\n").map_err(gone)?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(out)
 }
 
 #[derive(Deserialize)]
