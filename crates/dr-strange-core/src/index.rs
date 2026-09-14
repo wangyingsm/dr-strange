@@ -252,6 +252,14 @@ impl VectorRegistry {
         }
         Ok(())
     }
+
+    /// Forget every index declared on `plane` (plane drop). The declarations
+    /// go with the plane's KV rows; this keeps the live registry — and the
+    /// sidecar saved from it — from carrying an index for a plane that no
+    /// longer exists.
+    pub fn drop_plane(&mut self, plane: PlaneId) {
+        self.entries.retain(|(p, _, _), _| *p != plane);
+    }
 }
 
 // ---- Sidecar wire form -----------------------------------------------------

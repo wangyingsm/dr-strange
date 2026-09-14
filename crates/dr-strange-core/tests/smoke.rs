@@ -480,6 +480,84 @@ fn drop_plane_via_database_wipes_the_plane() {
     db.drop_plane(PlaneId(999_999)).unwrap();
 }
 
+fn declare_both_indexes(db: &Database, plane_name: &str) {
+    let plane = db.plane(plane_name).unwrap();
+    plane
+        .ensure_vector_index("Doc", "embedding", dr_strange_core::Metric::Cosine)
+        .unwrap();
+    plane
+        .ensure_keyword_index("Doc", "body", dr_strange_core::Language::English)
+        .unwrap();
+    assert_eq!(plane.vector_indexes().len(), 1);
+    assert_eq!(plane.keyword_indexes().len(), 1);
+}
+
+#[test]
+fn drop_plane_forgets_its_index_declarations() {
+    // Index declarations live in `meta` outside the plane's key prefix, so
+    // a plane drop has to remove them itself — in the KV and in the live
+    // registries — or a recreated plane of the same name, and every catalog,
+    // would still show the dead plane's indexes.
+    let db = Database::in_memory().unwrap();
+    let plane = db.create_plane("scratch", Properties::new()).unwrap();
+    declare_both_indexes(&db, "scratch");
+    let startup = db.plane("startup").unwrap();
+    declare_both_indexes(&db, "startup");
+
+    db.drop_plane(plane.id()).unwrap();
+    assert!(plane.vector_indexes().is_empty(), "registry entry gone");
+    assert!(plane.keyword_indexes().is_empty(), "registry entry gone");
+    let again = db.create_plane("scratch", Properties::new()).unwrap();
+    assert!(again.vector_indexes().is_empty());
+    assert!(again.keyword_indexes().is_empty());
+    // The other plane's declarations are untouched.
+    assert_eq!(startup.vector_indexes().len(), 1);
+    assert_eq!(startup.keyword_indexes().len(), 1);
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn drop_plane_does_not_resurrect_indexes_on_reopen() {
+    use dr_strange_core::storage::engine::StorageEngine;
+    use dr_strange_core::storage::graph;
+    use dr_strange_core::storage::native::NativeEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drop.drsg");
+    let plane_id = {
+        let db = Database::open(&path).unwrap();
+        let plane = db.create_plane("scratch", Properties::new()).unwrap();
+        declare_both_indexes(&db, "scratch");
+        db.drop_plane(plane.id()).unwrap();
+        plane.id()
+    };
+    {
+        let db = Database::open(&path).unwrap();
+        assert!(matches!(db.plane("scratch"), Err(Error::NotFound(_))));
+        let again = db.create_plane("scratch", Properties::new()).unwrap();
+        assert_ne!(again.id(), plane_id, "plane ids are never reused");
+        assert!(again.vector_indexes().is_empty());
+        assert!(again.keyword_indexes().is_empty());
+        // The startup plane's declarations are the only ones that may exist.
+        declare_both_indexes(&db, "startup");
+    }
+    // Nothing under the dropped id survived in `meta` to be rebuilt on open.
+    let engine = NativeEngine::open(&path).unwrap();
+    let txn = engine.begin_read().unwrap();
+    let vidx = graph::list_vector_indexes(&txn).unwrap();
+    let kidx = graph::list_keyword_indexes(&txn).unwrap();
+    assert!(
+        vidx.iter().all(|(p, ..)| *p != plane_id),
+        "vector declaration leaked: {vidx:?}"
+    );
+    assert!(
+        kidx.iter().all(|(p, ..)| *p != plane_id),
+        "keyword declaration leaked: {kidx:?}"
+    );
+    assert_eq!(vidx.len(), 1);
+    assert_eq!(kidx.len(), 1);
+}
+
 #[test]
 fn set_prop_on_missing_node_is_not_found() {
     let db = Database::in_memory().unwrap();

@@ -886,10 +886,32 @@ impl Database {
     /// already-absent plane id. Errors with `InvalidArgument` for
     /// `PlaneId::STARTUP`, which always exists.
     pub fn drop_plane(&self, id: PlaneId) -> Result<()> {
+        use crate::storage::keys;
         self.engine.with_write(|txn| {
             graph::drop_plane(txn, id)?;
-            txn.delete(TableId::Meta, &crate::storage::keys::counters_key(id))
+            // The plane's `meta` rows live under their own prefixes, not the
+            // plane key prefix the graph-level drop sweeps: the summary
+            // counters and the vector/keyword index declarations. Left
+            // behind, a declaration would resurrect an index on the next
+            // open — rebuilt over nothing, forever — and an id that is never
+            // reused would still be "indexed" in every catalog.
+            txn.delete(TableId::Meta, &keys::counters_key(id))?;
+            for (plane, label, property, _) in graph::list_vector_indexes(txn)? {
+                if plane == id {
+                    txn.delete(TableId::Meta, &keys::vindex_decl_key(id, &label, &property))?;
+                }
+            }
+            for (plane, label, property, _) in graph::list_keyword_indexes(txn)? {
+                if plane == id {
+                    txn.delete(TableId::Meta, &keys::kindex_decl_key(id, &label, &property))?;
+                }
+            }
+            Ok(())
         })?;
+        // The live registries mirror the declarations; plane ids are never
+        // reused, so a straggler could only waste memory and sidecar bytes.
+        self.indexes_mut().drop_plane(id);
+        self.keywords_mut().drop_plane(id);
         tracing::info!(id = id.0, "dropped plane");
         Ok(())
     }

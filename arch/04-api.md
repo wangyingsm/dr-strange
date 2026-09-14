@@ -23,6 +23,11 @@ let paper = db.create_plane("paper-2406.01234", props! {
 `Database` root carries only plane lifecycle (`create_plane`, `drop_plane`,
 `planes()`), cross-plane operations (`copy`, `move_`, stack reads), global
 catalog roll-up, and `stats()`. Everything else hangs off a `PlaneHandle`.
+`drop_plane` removes everything the plane owns, including the `meta` rows
+that sit outside its key prefix — the summary counters and the vector and
+keyword index declarations — and the matching live registry entries, so a
+dropped plane's indexes are neither listed nor rebuilt on the next open.
+Plane ids are never reused.
 
 ## 2. Writes
 

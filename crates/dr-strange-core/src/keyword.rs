@@ -256,6 +256,12 @@ impl KeywordRegistry {
         }
     }
 
+    /// Forget every index declared on `plane` (plane drop) — see
+    /// [`VectorRegistry::drop_plane`](crate::index::VectorRegistry::drop_plane).
+    pub fn drop_plane(&mut self, plane: PlaneId) {
+        self.entries.retain(|(p, _, _), _| *p != plane);
+    }
+
     /// Serialize the whole registry to `path`, stamped with `seq`. Best-effort:
     /// a failure only costs a rebuild-from-KV on the next open.
     pub fn save_sidecar(&self, path: &Path, seq: u64) -> Result<()> {
