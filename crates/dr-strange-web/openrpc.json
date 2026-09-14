@@ -2,7 +2,7 @@
   "openrpc": "1.2.6",
   "info": {
     "title": "dr-strange JSON-RPC",
-    "version": "0.1.0",
+    "version": "2.7.0",
     "description": "The wire protocol served by `drsg serve` (arch/08). Every method maps 1:1 to the core API. This document is the source of truth for the language SDKs and doubles as the RPC reference; the server returns it verbatim from `rpc.discover`.\n\nAuth: the whole surface is authenticated. Send the shared token as `Authorization: Bearer <DRSG_TOKEN>` over HTTP (or `?token=` on the WebSocket). With no token configured on the server, only the same-origin browser UI may call it. An unauthenticated call fails with error code -32001.\n\nEach method carries an `x-access` tag (read | write | admin): the tier a scoped key would need. Under the single shared token all three tiers require the same token.\n\nA write may fail with -32002 when it waited out `[server] write_timeout_secs` for the single writer slot, which one long import or digest can hold. It is the one error worth retrying unchanged: nothing was attempted and the request was not wrong.",
     "x-error-codes": {
       "-32700": "parse error",
@@ -114,7 +114,8 @@
             }
           }
         }
-      }
+      },
+      "x-access": "read"
     },
     {
       "name": "plugin.catalog",
@@ -182,7 +183,8 @@
             "plugins"
           ]
         }
-      }
+      },
+      "x-access": "read"
     },
     {
       "name": "plugin.install",
@@ -212,7 +214,8 @@
             }
           }
         }
-      }
+      },
+      "x-access": "write"
     },
     {
       "name": "plugin.remove",
@@ -236,7 +239,8 @@
             }
           }
         }
-      }
+      },
+      "x-access": "write"
     },
     {
       "name": "plane.list",
@@ -269,13 +273,15 @@
           "schema": {
             "type": "string",
             "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
-          }
+          },
+          "required": false
         },
         {
           "name": "embed_model",
           "schema": {
             "type": "string"
-          }
+          },
+          "required": false
         },
         {
           "name": "metric",
@@ -287,7 +293,8 @@
               "l2"
             ],
             "description": "Index metric (default cosine)"
-          }
+          },
+          "required": false
         }
       ],
       "result": {
@@ -318,7 +325,8 @@
             }
           }
         }
-      }
+      },
+      "x-access": "write"
     },
     {
       "name": "plane.catalog",
@@ -371,7 +379,8 @@
           "schema": {
             "type": "boolean",
             "description": "Vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. **Default true** — nothing that reads a node renders an embedding, and a thousand floats per node is the difference between a hundred-kilobyte answer and a hundred-megabyte one. Pass false to ask for the embeddings themselves."
-          }
+          },
+          "required": false
         }
       ],
       "result": {
@@ -448,14 +457,16 @@
           "schema": {
             "type": "boolean",
             "description": "Return full records per hop: {node: {…}, edge: {id, type, properties}} instead of id pairs. With node.get, answers callers/callees in two calls, call-site lines included. Default false."
-          }
+          },
+          "required": false
         },
         {
           "name": "lean",
           "schema": {
             "type": "boolean",
             "description": "With hydrate: vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. Default true; pass false for the embeddings themselves."
-          }
+          },
+          "required": false
         }
       ],
       "result": {
@@ -652,7 +663,8 @@
           "schema": {
             "type": "boolean",
             "description": "Vector-valued properties as the marker `$vector(N dims, omitted)` rather than their floats. **Default true** — nothing that reads a node renders an embedding, and a thousand floats per node is the difference between a hundred-kilobyte answer and a hundred-megabyte one. Pass false to ask for the embeddings themselves."
-          }
+          },
+          "required": false
         }
       ],
       "result": {
@@ -701,7 +713,7 @@
         {
           "name": "provider",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
@@ -932,7 +944,7 @@
           "required": false,
           "schema": {
             "type": "number",
-            "default": 1.0
+            "default": 1
           }
         },
         {
@@ -940,7 +952,7 @@
           "required": false,
           "schema": {
             "type": "number",
-            "default": 1.0
+            "default": 1
           }
         },
         {
@@ -970,7 +982,7 @@
         {
           "name": "provider",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
@@ -1041,7 +1053,7 @@
         {
           "name": "provider",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
@@ -1056,7 +1068,7 @@
         {
           "name": "embed_provider",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment. Omit to disable the grounding tools."
           }
@@ -1204,7 +1216,8 @@
             ],
             "default": "scan"
           },
-          "summary": "`degree` or `pagerank` seed the plane's important nodes instead of the first ones the scan reaches, and return their scores. Prefer `degree` for a skeleton: PageRank pools rank in sinks, so a hub can rank below its own neighbours."
+          "summary": "`degree` or `pagerank` seed the plane's important nodes instead of the first ones the scan reaches, and return their scores. Prefer `degree` for a skeleton: PageRank pools rank in sinks, so a hub can rank below its own neighbours.",
+          "required": false
         },
         {
           "name": "as_of",
@@ -1323,7 +1336,7 @@
         {
           "name": "chat",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Chat provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
@@ -1331,7 +1344,7 @@
         {
           "name": "embed",
           "required": false,
-"schema": {
+          "schema": {
             "type": "string",
             "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Defaults to the chat provider; the API key comes from the server's environment."
           }

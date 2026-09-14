@@ -1416,6 +1416,26 @@ mod tests {
             in_schema, declared,
             "OpenRPC doc and the dispatch surface disagree"
         );
+        // Every method names its tier and every param says whether it is
+        // required: the SDK generators read both, and one that is missing
+        // becomes a silently wrong signature in six languages.
+        for m in doc["methods"].as_array().unwrap() {
+            let name = m["name"].as_str().unwrap();
+            assert!(
+                matches!(m["x-access"].as_str(), Some("read" | "write" | "admin")),
+                "`{name}` has no x-access tier"
+            );
+            for p in m["params"].as_array().unwrap() {
+                assert!(
+                    p["required"].is_boolean(),
+                    "`{name}` param `{}` has no `required`",
+                    p["name"]
+                );
+            }
+        }
+        // The document's version is the crate's: `rpc.discover` says which
+        // server a client is talking to.
+        assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
