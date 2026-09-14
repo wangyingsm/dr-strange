@@ -113,3 +113,18 @@ fn history_survives_a_reopen() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].query, "MATCH (n:Fn) RETURN n");
 }
+
+/// Recording a query is bookkeeping, not a graph write: the commit sequence
+/// (the graph cache's version stamp, arch/02 §3) must not move, or every
+/// query run would flush the cache the next query wants.
+#[test]
+fn recording_a_query_does_not_advance_the_commit_seq() {
+    let db = Database::in_memory().unwrap();
+    let before = db.commit_seq().unwrap();
+    db.record_query("startup", "MATCH (n) RETURN n", 200)
+        .unwrap();
+    db.record_query("startup", "MATCH (m) RETURN m", 200)
+        .unwrap();
+    assert_eq!(db.commit_seq().unwrap(), before);
+    assert_eq!(db.query_history(10).unwrap().len(), 2);
+}
