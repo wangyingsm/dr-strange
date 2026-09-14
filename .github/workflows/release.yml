@@ -38,9 +38,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # Swatinem/rust-cache's default key does not vary by target, only by OS —
       # so two matrix legs on one runner (the two macOS targets share
@@ -51,10 +52,10 @@ jobs:
       # surfaces as "can't find crate" for something deep in the graph
       # (wasmtime, here) rather than as a cache-miss. `key` scopes the cache
       # to this matrix leg exactly.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       # Build the real dashboard so it is embedded into the release binary
       # rather than the build.rs placeholder.
       - name: Build frontend
@@ -92,7 +93,7 @@ jobs:
           else
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -107,8 +108,8 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: dist-*
           merge-multiple: true
@@ -126,7 +127,7 @@ jobs:
           ' CHANGELOG.md > RELEASE_NOTES.md
           echo "----- release body -----"; cat RELEASE_NOTES.md
       - name: Publish
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             dist/dr-strange-*.tar.gz
@@ -146,8 +147,8 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: dist-*-linux-gnu # the two linux targets only
           merge-multiple: true
@@ -159,15 +160,15 @@ jobs:
           tar -xzf dist/dr-strange-*-aarch64-unknown-linux-gnu.tar.gz -C /tmp/a
           install -Dm755 /tmp/x/*/drsg bin/amd64/drsg
           install -Dm755 /tmp/a/*/drsg bin/arm64/drsg
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
           # `v1.2.3` → tags 1.2.3, 1.2, and latest.
@@ -176,7 +177,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile.release
