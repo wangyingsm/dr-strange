@@ -60,3 +60,44 @@ test("a well-formed reply returns its result", async () => {
   const c = new Client({ token: "t", fetch: ok });
   expect(await c["_call"]("db.stats")).toEqual({ nodes: 3 });
 });
+
+// The change feed's credential is a bearer header on the upgrade, never in
+// the URL, outside a browser: a query-string token lands in proxy and access
+// logs, and the server prefers the header (arch/08-web-ui §4.1). Only the
+// browser WebSocket API cannot set headers, so `tokenInQuery` (defaulting to
+// "is there a document?") keeps `?token=` for that one runtime.
+class RecordingSocket {
+  static calls: Array<{ url: string; init?: { headers?: Record<string, string> } }> = [];
+  onopen: ((ev: unknown) => void) | null = null;
+  onmessage: ((ev: { data: unknown }) => void) | null = null;
+  onclose: ((ev: unknown) => void) | null = null;
+  onerror: ((ev: unknown) => void) | null = null;
+  constructor(url: string, init?: { headers?: Record<string, string> }) {
+    RecordingSocket.calls.push({ url, init });
+  }
+  send(): void {}
+  close(): void {}
+}
+
+test("watch sends the token as a bearer header and a bare /ws URL", () => {
+  RecordingSocket.calls = [];
+  const c = new Client({ baseUrl: "http://127.0.0.1:1", token: "s3cret" });
+  const sub = c.watch("p", () => {}, { WebSocket: RecordingSocket, reconnect: false });
+  sub.close();
+  expect(RecordingSocket.calls.length).toBe(1);
+  expect(RecordingSocket.calls[0].url).toBe("ws://127.0.0.1:1/ws");
+  expect(RecordingSocket.calls[0].init?.headers).toEqual({ authorization: "Bearer s3cret" });
+});
+
+test("watch keeps ?token= only when asked for the browser form", () => {
+  RecordingSocket.calls = [];
+  const c = new Client({ baseUrl: "http://127.0.0.1:1", token: "a&b" });
+  const sub = c.watch("p", () => {}, {
+    WebSocket: RecordingSocket,
+    reconnect: false,
+    tokenInQuery: true,
+  });
+  sub.close();
+  expect(RecordingSocket.calls[0].url).toBe("ws://127.0.0.1:1/ws?token=a%26b");
+  expect(RecordingSocket.calls[0].init).toBeUndefined();
+});

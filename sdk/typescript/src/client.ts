@@ -98,8 +98,28 @@ export interface WebSocketLike {
   onerror: Handler<unknown> | null;
 }
 
-/** A WebSocket constructor: the global one, or e.g. the `ws` package's. */
+/** Handshake options a non-browser WebSocket accepts (Bun, Node >= 22's
+ *  undici, the `ws` package): extra headers on the upgrade request. */
+export interface WebSocketInit {
+  headers?: Record<string, string>;
+}
+
+/** A WebSocket constructor: the global one, or e.g. the `ws` package's.
+ *  Outside a browser the client also passes a second `WebSocketInit`
+ *  argument carrying the bearer header; the type names only the first
+ *  parameter so the browser's `(url, protocols?)` constructor still fits. */
 export type WebSocketConstructor = new (url: string) => WebSocketLike;
+
+/** The two-argument form the client actually invokes when it has a header to
+ *  send (see `WebSocketConstructor`). */
+type WebSocketConstructorWithInit = new (url: string, init: WebSocketInit) => WebSocketLike;
+
+/** Whether this runtime's WebSocket is the browser's — the one API that cannot
+ *  set headers on the upgrade. Anything with a `document` is treated as a
+ *  browser; Bun, Node and Deno have none. */
+function isBrowserRuntime(): boolean {
+  return typeof (globalThis as { document?: unknown }).document !== "undefined";
+}
 
 export interface DrsgOptions {
   /** Endpoint base, default `http://127.0.0.1:7700`. */
@@ -145,6 +165,11 @@ export interface WatchOptions {
   reconnect?: boolean;
   /** WebSocket implementation, when there is no global one (Node < 21). */
   WebSocket?: WebSocketConstructor;
+  /** Send the token as `?token=` on the URL instead of an `Authorization`
+   *  header. Defaults to `true` only in a browser (its WebSocket API cannot
+   *  set headers); set it explicitly for a custom `WebSocket` implementation
+   *  that ignores the `headers` init. */
+  tokenInQuery?: boolean;
 }
 
 /** A live change-feed subscription; call `close()` to stop it. */
@@ -245,12 +270,16 @@ export class Client {
     if (typeof WS !== "function") {
       throw new Error("no global WebSocket; pass one via `WebSocket` in WatchOptions");
     }
-    // http→ws, https→wss; the browser WS API can't set headers, so the token
-    // rides the query string (the server reads `?token=` there).
-    const url =
-      this.baseUrl.replace(/^http/, "ws") +
-      "/ws" +
-      (this.token ? `?token=${encodeURIComponent(this.token)}` : "");
+    // http→ws, https→wss. The server prefers `Authorization: Bearer` on the
+    // upgrade (arch/08-web-ui §4.1) and a URL credential lands in proxy and
+    // access logs, so under Bun/Node/Deno the token is a header and the URL
+    // is bare. Only the browser WebSocket API cannot set headers; there the
+    // token rides the query string, which the server accepts for that reason.
+    const base = this.baseUrl.replace(/^http/, "ws") + "/ws";
+    const inBrowser = opts.tokenInQuery ?? isBrowserRuntime();
+    const url = this.token && inBrowser ? `${base}?token=${encodeURIComponent(this.token)}` : base;
+    const init: WebSocketInit | undefined =
+      this.token && !inBrowser ? { headers: { authorization: `Bearer ${this.token}` } } : undefined;
 
     const reconnect = opts.reconnect ?? true;
     let closed = false;
@@ -258,7 +287,7 @@ export class Client {
     let backoff = 500;
 
     const open = (): void => {
-      const ws = new WS(url);
+      const ws = init ? new (WS as unknown as WebSocketConstructorWithInit)(url, init) : new WS(url);
       sock = ws;
       ws.onopen = (): void => {
         backoff = 500;

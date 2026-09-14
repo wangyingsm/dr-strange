@@ -44,7 +44,10 @@ A runnable version is [`examples/quickstart.ts`](examples/quickstart.ts) — `bu
 ### Auth
 
 The whole surface is authenticated. Pass `token` or set `DRSG_TOKEN`; it rides
-each request as `Authorization: Bearer …`. A missing/invalid credential rejects
+each request as `Authorization: Bearer …` — the WebSocket upgrade behind
+`watch()` included, under Bun, Node and Deno. Only in a browser, whose
+WebSocket API cannot set headers, does the token ride the URL as `?token=`
+(`WatchOptions.tokenInQuery` forces either form). A missing/invalid credential rejects
 with `DrsgAuthError` (code `-32001`); other server errors reject with
 `DrsgError` carrying a `.code`.
 
