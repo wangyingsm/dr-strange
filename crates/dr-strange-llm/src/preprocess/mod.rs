@@ -568,7 +568,7 @@ fn apply_env_limits(limits: &mut Limits) -> Result<()> {
     }
     if let Some(mb) = read(ENV_PLUGIN_TOTAL_MEMORY_MB)? {
         // A zero budget would let no store run; treat it as "the default".
-        limits.total_memory_bytes = (mb > 0).then(|| (mb as usize) << 20);
+        limits.total_memory_bytes = (mb > 0).then_some((mb as usize) << 20);
     }
     Ok(())
 }
