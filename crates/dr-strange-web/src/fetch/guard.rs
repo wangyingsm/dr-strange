@@ -79,15 +79,21 @@ impl Prefix {
 }
 
 /// The v4 address carried inside a v6 one, for the forms that carry one:
-/// v4-mapped (`::ffff:a.b.c.d`), v4-compatible (`::a.b.c.d`), 6to4
-/// (`2002:AABB:CCDD::/16`) and Teredo (`2001:0::/32`, where the client address
-/// is stored inverted). Each is a route to an address the v6 rules alone would
-/// wave through — `::ffff:127.0.0.1` is loopback however it is spelled.
+/// v4-mapped (`::ffff:a.b.c.d`), v4-compatible (`::a.b.c.d`), NAT64
+/// (`64:ff9b::/96`, RFC 6052), 6to4 (`2002:AABB:CCDD::/16`) and Teredo
+/// (`2001:0::/32`, where the client address is stored inverted). Each is a
+/// route to an address the v6 rules alone would wave through —
+/// `::ffff:127.0.0.1` is loopback however it is spelled, and on a host with
+/// a NAT64 gateway `64:ff9b::a9fe:a9fe` reaches the metadata service.
 fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = ip.segments();
     let o = ip.octets();
     if let Some(v4) = ip.to_ipv4_mapped() {
         return Some(v4);
+    }
+    // NAT64 well-known prefix: the v4 address is the last 32 bits.
+    if s[0..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
     // v4-compatible ::a.b.c.d (deprecated, still routable by some stacks).
     if s[0..6] == [0, 0, 0, 0, 0, 0] && (s[6] != 0 || s[7] != 0) {
@@ -155,6 +161,10 @@ fn classify_v6(ip: Ipv6Addr) -> Option<&'static str> {
         // Unique-local fc00::/7 and link-local fe80::/10.
         _ if s[0] & 0xfe00 == 0xfc00 => "a unique-local address",
         _ if s[0] & 0xffc0 == 0xfe80 => "link-local",
+        // Local-use NAT64 (64:ff9b:1::/48, RFC 8215): a site's own translator,
+        // whose prefix length inside the /48 is the site's choice, so the
+        // embedded v4 cannot be read out — the whole block is refused.
+        _ if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 => "local-use NAT64 space",
         _ if s[0] == 0x2001 && s[1] == 0x0db8 => "documentation space",
         _ => return None,
     })
@@ -255,6 +265,11 @@ mod tests {
             ("::1", "loopback"),
             ("fe80::1", "link-local"),
             ("fd00::1", "unique-local"),
+            ("64:ff9b:1::1", "local-use NAT64"),
+            (
+                "64:ff9b:1:ffff::5db8:d822",
+                "local-use NAT64, public v4 inside",
+            ),
         ] {
             let why = classify(ip(addr));
             assert!(why.is_some(), "{addr} ({hint}) should be refused");
@@ -269,6 +284,8 @@ mod tests {
             "::ffff:127.0.0.1", // v4-mapped
             "::ffff:169.254.169.254",
             "::127.0.0.1",              // v4-compatible
+            "64:ff9b::a9fe:a9fe",       // NAT64 well-known prefix, metadata
+            "64:ff9b::7f00:1",          // NAT64 wrapping 127.0.0.1
             "2002:7f00:1::",            // 6to4 wrapping 127.0.0.1
             "2001:0:0:0:0:0:a9fe:a9fe", // Teredo — inverted, so not metadata
         ] {
@@ -285,7 +302,14 @@ mod tests {
 
     #[test]
     fn ordinary_public_addresses_pass() {
-        for addr in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+        // The NAT64 well-known prefix around a public address is fine: it is
+        // that address, reached through the translator.
+        for addr in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700::1111",
+            "64:ff9b::5db8:d822",
+        ] {
             assert_eq!(classify(ip(addr)), None, "{addr} should be fetchable");
         }
     }
