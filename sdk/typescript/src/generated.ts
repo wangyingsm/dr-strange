@@ -73,6 +73,7 @@ export interface DbStats {
   file_size?: number | null;
   rss_bytes?: number | null;
   plugin_bytes: number;
+  maintenance_error?: string | null;
 }
 
 /** A dr-strange server client — one method per JSON-RPC method. */
@@ -92,22 +93,22 @@ export class Drsg extends Client {
     return this._call("db.catalog") as Promise<Record<string, unknown>>;
   }
 
-  /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+  /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). (access: read) */
   pluginList(): Promise<Array<{ name?: string; version?: string; file?: string; sha256?: string; source?: string; extensions?: Array<string> }>> {
     return this._call("plugin.list") as Promise<Array<{ name?: string; version?: string; file?: string; sha256?: string; source?: string; extensions?: Array<string> }>>;
   }
 
-  /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
+  /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. (access: read) */
   pluginCatalog(): Promise<{ stale: boolean; schema?: number; source?: Record<string, unknown>; plugins: Array<{ name: string; version: string; claims: string; url: string; sha256: string; compat: string }> }> {
     return this._call("plugin.catalog") as Promise<{ stale: boolean; schema?: number; source?: Record<string, unknown>; plugins: Array<{ name: string; version: string; claims: string; url: string; sha256: string; compat: string }> }>;
   }
 
-  /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+  /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. (access: write) */
   pluginInstall(params: { url: string }): Promise<{ installed?: Record<string, unknown>; replaced?: string | null }> {
     return this._call("plugin.install", params) as Promise<{ installed?: Record<string, unknown>; replaced?: string | null }>;
   }
 
-  /** Uninstall a plugin by name. Write-gated. */
+  /** Uninstall a plugin by name. Write-gated. (access: write) */
   pluginRemove(params: { name: string }): Promise<{ removed?: Record<string, unknown> }> {
     return this._call("plugin.remove", params) as Promise<{ removed?: Record<string, unknown> }>;
   }
@@ -117,7 +118,7 @@ export class Drsg extends Client {
     return this._call("plane.list") as Promise<Array<PlaneCard>>;
   }
 
-  /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+  /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. (access: write) */
   planeVectorize(params: { plane: string; embed?: string; embed_model?: string; metric?: "cosine" | "dot" | "l2" }): Promise<{ embedded?: number; unique?: number; tokens?: number; current?: number; empty?: number; labels?: Array<string> }> {
     return this._call("plane.vectorize", params) as Promise<{ embedded?: number; unique?: number; tokens?: number; current?: number; empty?: number; labels?: Array<string> }>;
   }

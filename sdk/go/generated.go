@@ -5,17 +5,18 @@ package drsg
 import "context"
 
 type DbStats struct {
-	CommitSeq   int64  `json:"commit_seq"`
-	EdgeTypes   int64  `json:"edge_types"`
-	Edges       int64  `json:"edges"`
-	FileSize    *int64 `json:"file_size,omitempty"`
-	Indexes     int64  `json:"indexes"`
-	Labels      int64  `json:"labels"`
-	Nodes       int64  `json:"nodes"`
-	Persistent  bool   `json:"persistent"`
-	Planes      int64  `json:"planes"`
-	PluginBytes int64  `json:"plugin_bytes"`
-	RssBytes    *int64 `json:"rss_bytes,omitempty"`
+	CommitSeq        int64   `json:"commit_seq"`
+	EdgeTypes        int64   `json:"edge_types"`
+	Edges            int64   `json:"edges"`
+	FileSize         *int64  `json:"file_size,omitempty"`
+	Indexes          int64   `json:"indexes"`
+	Labels           int64   `json:"labels"`
+	MaintenanceError *string `json:"maintenance_error,omitempty"`
+	Nodes            int64   `json:"nodes"`
+	Persistent       bool    `json:"persistent"`
+	Planes           int64   `json:"planes"`
+	PluginBytes      int64   `json:"plugin_bytes"`
+	RssBytes         *int64  `json:"rss_bytes,omitempty"`
 }
 
 type Deleted struct {
@@ -389,28 +390,28 @@ func (c *Client) DbCatalog(ctx context.Context) (map[string]any, error) {
 	return out, err
 }
 
-// PluginList Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11).
+// PluginList Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). (access: read)
 func (c *Client) PluginList(ctx context.Context) ([]PluginListItem, error) {
 	var out []PluginListItem
 	err := c.call(ctx, "plugin.list", nil, &out)
 	return out, err
 }
 
-// PluginCatalog The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept.
+// PluginCatalog The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. (access: read)
 func (c *Client) PluginCatalog(ctx context.Context) (*PluginCatalogResult, error) {
 	var out *PluginCatalogResult
 	err := c.call(ctx, "plugin.catalog", nil, &out)
 	return out, err
 }
 
-// PluginInstall Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC.
+// PluginInstall Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. (access: write)
 func (c *Client) PluginInstall(ctx context.Context, p PluginInstallParams) (*PluginInstallResult, error) {
 	var out *PluginInstallResult
 	err := c.call(ctx, "plugin.install", p, &out)
 	return out, err
 }
 
-// PluginRemove Uninstall a plugin by name. Write-gated.
+// PluginRemove Uninstall a plugin by name. Write-gated. (access: write)
 func (c *Client) PluginRemove(ctx context.Context, p PluginRemoveParams) (*PluginRemoveResult, error) {
 	var out *PluginRemoveResult
 	err := c.call(ctx, "plugin.remove", p, &out)
@@ -424,7 +425,7 @@ func (c *Client) PlaneList(ctx context.Context) ([]PlaneCard, error) {
 	return out, err
 }
 
-// PlaneVectorize Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment.
+// PlaneVectorize Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. (access: write)
 func (c *Client) PlaneVectorize(ctx context.Context, p PlaneVectorizeParams) (*PlaneVectorizeResult, error) {
 	var out *PlaneVectorizeResult
 	err := c.call(ctx, "plane.vectorize", p, &out)

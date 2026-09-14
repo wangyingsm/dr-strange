@@ -88,7 +88,8 @@ public class Drsg extends Client {
             boolean persistent,
             Long fileSize,
             Long rssBytes,
-            long pluginBytes) {
+            long pluginBytes,
+            String maintenanceError) {
     }
 
     public record PluginListItem(
@@ -897,22 +898,22 @@ public class Drsg extends Client {
         return call("db.catalog", null, new TypeReference<Map<String, Object>>() {});
     }
 
-    /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+    /** Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). (access: read) */
     public List<PluginListItem> pluginList() throws DrsgException {
         return call("plugin.list", null, new TypeReference<List<PluginListItem>>() {});
     }
 
-    /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
+    /** The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. (access: read) */
     public PluginCatalogResult pluginCatalog() throws DrsgException {
         return call("plugin.catalog", null, new TypeReference<PluginCatalogResult>() {});
     }
 
-    /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+    /** Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. (access: write) */
     public PluginInstallResult pluginInstall(PluginInstallParams params) throws DrsgException {
         return call("plugin.install", params, new TypeReference<PluginInstallResult>() {});
     }
 
-    /** Uninstall a plugin by name. Write-gated. */
+    /** Uninstall a plugin by name. Write-gated. (access: write) */
     public PluginRemoveResult pluginRemove(PluginRemoveParams params) throws DrsgException {
         return call("plugin.remove", params, new TypeReference<PluginRemoveResult>() {});
     }
@@ -922,7 +923,7 @@ public class Drsg extends Client {
         return call("plane.list", null, new TypeReference<List<PlaneCard>>() {});
     }
 
-    /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+    /** Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. (access: write) */
     public PlaneVectorizeResult planeVectorize(PlaneVectorizeParams params) throws DrsgException {
         return call("plane.vectorize", params, new TypeReference<PlaneVectorizeResult>() {});
     }
