@@ -349,6 +349,20 @@ impl Database {
                 manifest.ok_or_else(|| Error::Corrupt("snapshot has no manifest".into()))?;
             graph::set_id_counters(txn, counters)?;
             graph::set_commit_seq(txn, seq)?;
+            // The per-plane summary counters (arch/03 §5) are maintained by
+            // `WriteTxn::commit`, which this path does not go through: the
+            // frames were written with the raw graph inserts. Recount each
+            // plane from what was just written, or the target keeps the
+            // zero row its bootstrap wrote and `db.stats` / `drsg stats`
+            // report an empty database over a full one.
+            for (plane, _name) in graph::list_planes(txn)? {
+                let counted = catalog::count(txn, plane)?;
+                txn.put(
+                    TableId::Meta,
+                    &crate::storage::keys::counters_key(plane),
+                    &counted.encode(),
+                )?;
+            }
             Ok::<((), u64), Error>(((), seq))
         })?;
 
@@ -445,6 +459,8 @@ mod tests {
         let mut buf = Vec::new();
         let stats = src.snapshot(&mut buf).unwrap();
         assert_eq!((stats.nodes, stats.edges, stats.seq), (2, 1, src_seq));
+        let src_counters = src.counters().unwrap();
+        assert_eq!(src_counters.nodes, 2);
         drop(src);
 
         // Restore into a fresh database.
@@ -453,6 +469,9 @@ mod tests {
         let rstats = dst.restore(&mut buf.as_slice()).unwrap();
         assert_eq!((rstats.nodes, rstats.edges), (2, 1));
         assert_eq!(dst.commit_seq().unwrap(), src_seq, "commit seq restored");
+        // The summary counters are recounted from the restored frames, not
+        // left at the target's bootstrap zeros.
+        assert_eq!(dst.counters().unwrap(), src_counters);
 
         let dp = dst.plane("p").unwrap();
         // Ids are preserved byte-for-byte.
