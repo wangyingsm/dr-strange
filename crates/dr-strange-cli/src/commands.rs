@@ -126,7 +126,12 @@ const GITIGNORE_PATTERNS: &[&str] = &[
     "*.drsg.hnsw",
     "*.drsg.bm25",
     "logs/",
+    // The two files `init` writes a literal bearer token into. Cursor is a
+    // desktop app: it is launched from a dock with no shell environment to
+    // read a token out of, so its config has to carry the token itself —
+    // and must therefore never be committed.
     ".mcp.json",
+    ".cursor/mcp.json",
 ];
 
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
@@ -438,17 +443,21 @@ fn write_agent_configs(
             dir.join(".cursor/mcp.json").display()
         )?;
     }
-    if probe_and_write_opencode(dir, addr, token)? {
+    // The terminal clients' files predate `init` and are probably committed:
+    // they get an environment reference, never the token itself.
+    if probe_and_write_opencode(dir, addr)? {
         writeln!(
             out,
-            "  + OpenCode: wrote {}",
+            "  + OpenCode: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
+             before launching `opencode` here)",
             dir.join(".opencode.json").display()
         )?;
     }
-    if probe_and_write_gemini(dir, addr, token)? {
+    if probe_and_write_gemini(dir, addr)? {
         writeln!(
             out,
-            "  + Gemini CLI: wrote {}",
+            "  + Gemini CLI: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
+             before launching `gemini` here)",
             dir.join(".gemini/settings.json").display()
         )?;
     }
@@ -685,7 +694,7 @@ fn ensure_gitignore_patterns(dir: &Path) -> Result<()> {
         content.push('\n');
     }
     content.push_str(
-        "# drsg — local database, logs, and the MCP config carrying a live bearer token\n",
+        "# drsg — local database, logs, and the MCP configs carrying a live bearer token\n",
     );
     for p in missing {
         content.push_str(p);
@@ -761,8 +770,13 @@ fn probe_and_write_cursor(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
 /// rules/config dir it creates unprompted) — the only honest signal that
 /// this repo's contributors already use it is a pre-existing
 /// `.opencode.json`, so that's the marker, not something created fresh.
+///
+/// That file existed before `init` and is very likely committed, so no
+/// token goes into it: OpenCode substitutes `{env:NAME}` in its config, and
+/// the entry names [`CODEX_TOKEN_ENV_VAR`] the way the Codex entry does.
+/// The caller exports it before launching `opencode` here.
 #[cfg(feature = "digest")]
-fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool> {
     if !dir.join(".opencode.json").is_file() {
         return Ok(false);
     }
@@ -773,7 +787,7 @@ fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str
         json!({
             "type": "remote",
             "url": format!("http://{addr}/mcp"),
-            "headers": { "Authorization": format!("Bearer {token}") },
+            "headers": { "Authorization": format!("Bearer {{env:{CODEX_TOKEN_ENV_VAR}}}") },
             "enabled": true,
         }),
     )?;
@@ -783,8 +797,13 @@ fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str
 /// Gemini CLI shares Claude Code's `mcpServers` key but names the URL field
 /// `httpUrl` instead of `url`, and has no `type` discriminator. Written
 /// only when `.gemini/` already exists.
+///
+/// `.gemini/settings.json` is a project's shared Gemini settings, committed
+/// as often as not, so the token is not written into it: Gemini CLI resolves
+/// `$NAME` in its settings from the environment, and the entry names
+/// [`CODEX_TOKEN_ENV_VAR`] as the Codex and OpenCode entries do.
 #[cfg(feature = "digest")]
-fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool> {
     if !dir.join(".gemini").is_dir() {
         return Ok(false);
     }
@@ -794,16 +813,18 @@ fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
         MCP_SERVER_NAME,
         json!({
             "httpUrl": format!("http://{addr}/mcp"),
-            "headers": { "Authorization": format!("Bearer {token}") },
+            "headers": { "Authorization": format!("Bearer ${CODEX_TOKEN_ENV_VAR}") },
         }),
     )?;
     Ok(true)
 }
 
-/// The env var Codex CLI reads its bearer token from at its *own* launch
-/// time — Codex's schema takes `bearer_token_env_var` (a variable name),
-/// never a literal token, so the secret never lands in `.codex/config.toml`
-/// itself. The caller still has to export it before running `codex` here.
+/// The env var the terminal clients read the bearer token from at their own
+/// launch time. Codex's schema takes `bearer_token_env_var` (a variable
+/// name), never a literal; OpenCode and Gemini CLI substitute environment
+/// references in their config files. In all three the secret stays out of a
+/// file that is probably committed, and the caller exports it before running
+/// the client here — `init` prints the line to paste.
 #[cfg(feature = "digest")]
 const CODEX_TOKEN_ENV_VAR: &str = "DRSG_TOKEN";
 
@@ -4843,8 +4864,8 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         assert!(!probe_and_write_cursor(&dir, &addr, "tok").unwrap());
-        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
-        assert!(!probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_opencode(&dir, &addr).unwrap());
+        assert!(!probe_and_write_gemini(&dir, &addr).unwrap());
         assert!(!probe_and_write_codex(&dir, &addr).unwrap());
         assert!(!dir.join(".cursor").exists());
         assert!(!dir.join(".opencode.json").exists());
@@ -5034,6 +5055,11 @@ mod tests {
             v["mcpServers"]["drsg-watch"]["url"],
             "http://127.0.0.1:12345/mcp"
         );
+        // Cursor's file carries the token itself (a desktop app has no shell
+        // environment to read one from), so `init`'s .gitignore block covers
+        // it — every file written with a literal token is in that block.
+        assert!(GITIGNORE_PATTERNS.contains(&".cursor/mcp.json"));
+        assert!(GITIGNORE_PATTERNS.contains(&".mcp.json"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5045,17 +5071,23 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         // No pre-existing `.opencode.json`: nothing is created.
-        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_opencode(&dir, &addr).unwrap());
         assert!(!dir.join(".opencode.json").exists());
 
         // Once it exists, the entry is upserted under `mcp`, not `mcpServers`.
         std::fs::write(dir.join(".opencode.json"), "{}").unwrap();
-        assert!(probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(probe_and_write_opencode(&dir, &addr).unwrap());
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".opencode.json")).unwrap())
                 .unwrap();
         assert_eq!(v["mcp"]["drsg-watch"]["type"], "remote");
         assert_eq!(v["mcp"]["drsg-watch"]["url"], "http://127.0.0.1:12345/mcp");
+        // A file that predates `init` is probably committed: it carries an
+        // environment reference in OpenCode's own syntax, never the token.
+        assert_eq!(
+            v["mcp"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer {env:DRSG_TOKEN}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5067,7 +5099,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".gemini")).unwrap();
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        assert!(probe_and_write_gemini(&dir, &addr).unwrap());
         let v: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join(".gemini/settings.json")).unwrap(),
         )
@@ -5075,6 +5107,12 @@ mod tests {
         assert_eq!(
             v["mcpServers"]["drsg-watch"]["httpUrl"],
             "http://127.0.0.1:12345/mcp"
+        );
+        // Gemini resolves `$NAME` from the environment; the shared settings
+        // file never holds the token itself.
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer $DRSG_TOKEN"
         );
         assert!(
             v["mcpServers"]["drsg-watch"]["url"].is_null(),
