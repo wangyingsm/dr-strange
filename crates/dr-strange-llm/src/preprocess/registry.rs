@@ -86,12 +86,21 @@ pub struct InstalledPlugin {
     pub compiled_sha256: Option<String>,
 }
 
-/// What [`PluginStore::stamp`] saw: the registry's length and modification
-/// time. Equal stamps mean the store has not changed in between.
+/// What [`PluginStore::stamp`] saw: the registry's length, modification
+/// time, and a hash of its bytes. Equal stamps mean the store has not
+/// changed in between.
+///
+/// The hash is there because length and mtime are not enough on their own:
+/// an install that swaps one pinned hash for another of the same length,
+/// within the filesystem's timestamp granularity (a whole second on some),
+/// would leave both untouched and the watcher serving the old plugin. The
+/// registry is a few hundred bytes of TOML, so hashing it costs less than
+/// the `stat` beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    content: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -129,14 +138,16 @@ impl PluginStore {
     /// when its loaded plugins are behind the store.
     pub fn stamp(&self) -> Result<StoreStamp> {
         let path = self.dir.join("registry.toml");
-        match std::fs::metadata(&path) {
-            Ok(meta) => Ok(StoreStamp {
-                len: meta.len(),
-                modified: meta.modified().ok(),
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(StoreStamp {
+                len: bytes.len() as u64,
+                modified: std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+                content: ahash::RandomState::with_seeds(1, 2, 3, 4).hash_one(&bytes),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreStamp {
                 len: 0,
                 modified: None,
+                content: 0,
             }),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -547,6 +558,33 @@ pub(super) fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry rewritten to the same length within the same timestamp —
+    /// one pinned hash swapped for another — is still a changed store: the
+    /// stamp reads the bytes, not just the inode's account of them.
+    #[test]
+    fn a_same_length_same_mtime_rewrite_still_moves_the_stamp() {
+        let dir = std::env::temp_dir().join(format!("drsg-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PluginStore::open(dir.clone()).unwrap();
+        let path = dir.join("registry.toml");
+        std::fs::write(&path, "sha256 = \"aaaa\"\n").unwrap();
+        let first = store.stamp().unwrap();
+        let when = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "sha256 = \"bbbb\"\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let second = store.stamp().unwrap();
+        assert_eq!(first.len, second.len);
+        assert_eq!(first.modified, second.modified);
+        assert_ne!(first, second, "the bytes changed, so the stamp must");
+        assert_eq!(second, store.stamp().unwrap(), "and it is stable otherwise");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A version is half a filename, so it is held to what a filename can
     /// safely be — the same discipline the name already had.
