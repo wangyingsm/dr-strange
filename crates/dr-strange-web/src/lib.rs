@@ -22,7 +22,7 @@ mod server;
 
 pub use auth::{FREE_FAILURES, MAX_LOCKOUT, TRACKED_PEERS};
 pub use rpc::MAX_BATCH;
-pub use server::ServeOutcome;
+pub use server::{ServeOutcome, check_bind_policy};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

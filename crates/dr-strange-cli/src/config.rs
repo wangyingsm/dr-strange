@@ -292,6 +292,25 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
     }
 }
 
+/// The web crate's bind rule, applied to the resolved `[server] addr` /
+/// `--addr` before the database is opened: a non-loopback bind without a
+/// token is refused with the same message `serve` itself would give. Here so
+/// a `drsg.toml` that says `addr = "0.0.0.0:7700"` and no token fails at
+/// config time, before a replica wipes its directory or a watch starts
+/// folding a tree, rather than a few seconds later inside the web crate.
+/// `token_configured` is the caller's reading of `[server] token` and
+/// `DRSG_TOKEN` (after [`apply_env`] the two agree).
+pub fn check_serve_bind(
+    cfg: &Config,
+    cli_addr: Option<SocketAddr>,
+    token_configured: bool,
+) -> Result<()> {
+    let addr = cli_addr
+        .or(cfg.server.addr)
+        .unwrap_or_else(|| ServeOptions::default().addr);
+    dr_strange_web::check_bind_policy(addr, token_configured)
+}
+
 /// Build the web crate's [`ServeOptions`] from the `[server]` section, with an
 /// explicit CLI `--addr` overriding the file's `addr`.
 pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions {
@@ -459,6 +478,25 @@ mod tests {
     #[test]
     fn no_tls_section_means_plain_http() {
         assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
+    }
+
+    /// A non-loopback `[server] addr` (or `--addr`) without a token is refused
+    /// at config time with the web crate's own message; a token, or a
+    /// loopback bind, passes.
+    #[test]
+    fn a_non_loopback_addr_without_a_token_is_refused_at_config_time() {
+        let lan = parse("[server]\naddr = \"0.0.0.0:7700\"\n");
+        let err = check_serve_bind(&lan, None, false).unwrap_err().to_string();
+        assert!(err.contains("refusing to listen on 0.0.0.0:7700"), "{err}");
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        check_serve_bind(&lan, None, true).expect("a token makes the bind acceptable");
+        check_serve_bind(&parse(""), None, false).expect("the default bind is loopback");
+        check_serve_bind(&parse(""), Some("127.0.0.1:7701".parse().unwrap()), false)
+            .expect("an explicit loopback --addr passes");
+        let err = check_serve_bind(&parse(""), Some("[::]:7700".parse().unwrap()), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to listen"), "{err}");
     }
 
     /// The `[server]` knobs that reach `/mcp`: `allowed_hosts` lands on the
