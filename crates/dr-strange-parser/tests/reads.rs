@@ -135,3 +135,71 @@ fn score_predicate_after_a_beam_reads_the_beam_score() {
         vec!["x", "y"]
     );
 }
+
+// ---- NULL: a missing property never satisfies a negated predicate ----------
+
+/// Three docs: `a` has year 2020 and tag "x"; `b` has year 2021 and tag "y";
+/// `c` has neither property.
+fn docs(db: &Database) {
+    write(
+        db,
+        r#"CREATE (a:Doc {key:"a", year:2020, tag:"x"}), (b:Doc {key:"b", year:2021, tag:"y"}),
+                 (c:Doc {key:"c"})"#,
+    );
+}
+
+#[test]
+fn a_missing_property_fails_not_equal_and_not() {
+    let db = Database::in_memory().unwrap();
+    docs(&db);
+    let cases: [(&str, &[&str]); 9] = [
+        // `<>` in both spellings: c has no year, so it is neither equal nor unequal.
+        ("MATCH (d:Doc) WHERE d.year <> 2020 RETURN d", &["b"]),
+        ("MATCH (d:Doc) WHERE d.year != 2020 RETURN d", &["b"]),
+        // NOT over an equality, a membership, an ordering, a string predicate.
+        ("MATCH (d:Doc) WHERE NOT d.year = 2020 RETURN d", &["b"]),
+        (
+            "MATCH (d:Doc) WHERE NOT d.year IN [2020, 2019] RETURN d",
+            &["b"],
+        ),
+        ("MATCH (d:Doc) WHERE NOT d.year > 2020 RETURN d", &["a"]),
+        (
+            r#"MATCH (d:Doc) WHERE NOT d.tag STARTS WITH "x" RETURN d"#,
+            &["b"],
+        ),
+        // NOT NOT is the predicate again.
+        ("MATCH (d:Doc) WHERE NOT NOT d.year = 2020 RETURN d", &["a"]),
+        // `= null` is never true; IS NULL is the way to ask.
+        ("MATCH (d:Doc) WHERE d.year = null RETURN d", &[]),
+        ("MATCH (d:Doc) WHERE d.year IS NULL RETURN d", &["c"]),
+    ];
+    for (q, want) in cases {
+        assert_eq!(keys(&db, q), want, "for `{q}`");
+    }
+}
+
+#[test]
+fn the_positive_forms_and_is_null_are_unchanged() {
+    let db = Database::in_memory().unwrap();
+    docs(&db);
+    let cases: [(&str, &[&str]); 5] = [
+        ("MATCH (d:Doc) WHERE d.year = 2020 RETURN d", &["a"]),
+        (
+            "MATCH (d:Doc) WHERE d.year IN [2020, 2021] RETURN d",
+            &["a", "b"],
+        ),
+        ("MATCH (d:Doc) WHERE d.year >= 2020 RETURN d", &["a", "b"]),
+        // An explicit IS NULL still reaches the absent rows through OR.
+        (
+            "MATCH (d:Doc) WHERE d.year <> 2020 OR d.year IS NULL RETURN d",
+            &["b", "c"],
+        ),
+        (
+            "MATCH (d:Doc) WHERE NOT d.year IS NULL RETURN d",
+            &["a", "b"],
+        ),
+    ];
+    for (q, want) in cases {
+        assert_eq!(keys(&db, q), want, "for `{q}`");
+    }
+}

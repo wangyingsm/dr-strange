@@ -118,9 +118,23 @@ stored `7.0`. A map is tested by **key**, not value. A literal list on the right
 is expanded into equalities at compile time; any other right-hand side is
 evaluated per row.
 
-> A predicate that does not match and a property that is absent are
-> indistinguishable, so `NOT (d.title CONTAINS "x")` is true for a document with
-> no `title` at all. Use `d.title IS NULL` when the difference matters.
+### Missing properties
+
+A predicate over a property the node lacks is not satisfied — and neither is
+its negation. `d.year <> 2020`, `NOT d.year = 2020`, `NOT d.year IN [2020]`
+and `NOT (d.title CONTAINS "x")` all skip a node without the property, as in
+openCypher; `d.year = null` matches nothing. Ask about absence with `IS NULL`
+/ `IS NOT NULL`, and combine when both are wanted:
+
+```text
+MATCH (d:Doc) WHERE d.year <> 2020 OR d.year IS NULL RETURN d
+```
+
+The engine reaches this by guarding `<>` and `NOT` with `IS NOT NULL` on the
+properties they read, rather than with three-valued logic, so one case is
+stricter than openCypher: under `NOT`, a compound predicate whose false branch
+would have absorbed the null — `NOT (d.a = 1 AND d.b = 2)` keeps a node with
+`b = 3` and no `a` in openCypher, and drops it here.
 
 ### Anchoring on a known entity
 

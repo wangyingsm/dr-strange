@@ -26,7 +26,10 @@ is split on top-level `AND` and each conjunct becomes a `Filter` at the slot
 of the one variable it names; a conjunct naming none (a constant, `score()`,
 `hops()`) is filtered on the *last* slot, because the row channels are only
 settled once the path has been walked — `hops()` counts the hops so far, and
-a beam rewrites `score()`.
+a beam rewrites `score()`. The evaluator stays two-valued (a missing value ⇒
+predicate false, §4 item 1); openCypher's null semantics for `<>` and `NOT`
+are the *compiler's* job, which guards those predicates with `IS NOT NULL`
+on the properties they read.
 
 **M3 landed** the AI-native surface: the hybrid operators of §4 —
 `Source::VectorTopK`, `Step::FrontierTopK`, `Step::ExpandBeam` — executed

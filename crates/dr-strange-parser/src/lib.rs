@@ -81,6 +81,21 @@
 //! [`Params`] map via [`parse_statement_full`] — the SDK-safe way to pass
 //! values (no string interpolation).
 //!
+//! # Null
+//! Core's evaluator is two-valued: a missing property makes a predicate
+//! false, so left alone `n.p <> 1`, `NOT n.p = 1` and `NOT n.p IN [..]` would
+//! be *true* for a node with no `p`. The compiler guards those — `<>`, `NOT`,
+//! and `=` with no constant side — with `IS NOT NULL` on every property (or
+//! channel, or literal `null`) they read, so for a predicate over one
+//! property the rows match openCypher: a missing value satisfies neither the
+//! test nor its negation, `n.p = null` keeps nothing, and `IS [NOT] NULL` is
+//! how absence is asked about. Where this is stricter than openCypher: under
+//! `NOT`, a compound predicate whose false branch would have absorbed a null
+//! (`NOT (n.a = 1 AND n.b = 2)` keeps a node with `b = 3` and no `a` there,
+//! not here); and `x IN [1, null]` is null here even when `x = 1`. Ordered
+//! comparisons, `IN` and the string predicates are already false on a
+//! missing value and stay unguarded.
+//!
 //! # Lexical rules
 //! Keywords and function names are case-insensitive. Identifiers are Unicode
 //! words, or anything between backticks. Strings take either quote with the

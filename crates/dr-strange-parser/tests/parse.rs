@@ -193,7 +193,12 @@ fn where_logic_arithmetic_and_isnull() {
         pl.steps,
         vec![
             Step::Filter(p("a").ge(1)),
-            Step::Filter(p("b").lt(2).or(p("c").eq(3).not())),
+            // `NOT` is guarded: a node with no `c` must not pass it.
+            Step::Filter(
+                p("b")
+                    .lt(2)
+                    .or(p("c").is_null().not().and(p("c").eq(3).not()))
+            ),
             Step::Filter(p("d").is_null()),
         ]
     );
@@ -530,9 +535,18 @@ fn false_and_null_literals() {
         plan("MATCH (n) WHERE n.active = false RETURN n").steps,
         vec![Step::Filter(p("active").eq(lit(false)))]
     );
+    // `= null` is guarded like any equality with no constant side, and the
+    // guard on the literal null never holds — so, as in openCypher, the
+    // predicate keeps nothing (`IS NULL` is how absence is asked about).
     assert_eq!(
         plan("MATCH (n) WHERE n.x = null RETURN n").steps,
-        vec![Step::Filter(p("x").eq(lit(PropValue::Null)))]
+        vec![Step::Filter(
+            p("x")
+                .is_null()
+                .not()
+                .and(lit(PropValue::Null).is_null().not())
+                .and(p("x").eq(lit(PropValue::Null)))
+        )]
     );
 }
 

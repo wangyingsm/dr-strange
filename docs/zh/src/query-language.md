@@ -108,8 +108,20 @@ MATCH (n) WHERE n.year IN [2020, 2021] RETURN n   -- 字面量列表
 列表按元素判断，所用相等语义与 `=` 相同，因此 `7` 可匹配存储的 `7.0`。映射按**键**
 判断，而非按值。右侧为字面量列表时会在编译期展开为若干等值判断；其余形式则逐行求值。
 
-> 谓词不匹配与属性缺失这两种情形无法区分，因此对于一份根本没有 `title` 的文档，
-> `NOT (d.title CONTAINS "x")` 同样成立。若需要区分，请使用 `d.title IS NULL`。
+### 缺失的属性
+
+针对节点所没有的属性的谓词不成立——它的否定同样不成立。`d.year <> 2020`、
+`NOT d.year = 2020`、`NOT d.year IN [2020]` 与 `NOT (d.title CONTAINS "x")`
+都会跳过没有该属性的节点，与 openCypher 一致；`d.year = null` 不匹配任何节点。
+用 `IS NULL` / `IS NOT NULL` 询问缺失，两者都要时组合使用：
+
+```text
+MATCH (d:Doc) WHERE d.year <> 2020 OR d.year IS NULL RETURN d
+```
+
+引擎通过在 `<>` 与 `NOT` 所读取的属性上加 `IS NOT NULL` 守卫来做到这一点，而非三值逻辑，
+因此有一种情形比 openCypher 更严格：`NOT` 之下、某个为假的分支本可吸收 null 的复合谓词——
+`NOT (d.a = 1 AND d.b = 2)` 在 openCypher 中保留 `b = 3` 且没有 `a` 的节点，这里会丢弃它。
 
 ### 锚定到某个已知实体
 
