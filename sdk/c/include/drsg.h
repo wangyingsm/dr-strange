@@ -21,6 +21,23 @@ extern "C" {
 /* JSON-RPC error code for a missing/invalid credential. */
 #define DRSG_AUTH_ERROR_CODE (-32001)
 
+/*
+ * Error code the client itself mints for failures that never reached a
+ * JSON-RPC handler: connection refused, a non-2xx status, an unparseable
+ * reply, a refused or forged WebSocket handshake, an oversized change-feed
+ * message. It shares the server's generic application-error code so callers
+ * that only branch on "auth or not" keep working; the message says which.
+ */
+#define DRSG_TRANSPORT_ERROR_CODE (-32000)
+
+/*
+ * Largest WebSocket message the change feed will buffer. A frame header can
+ * claim a 64-bit length; without a ceiling a hostile or confused peer could
+ * make the client allocate whatever it asked for. A change event that exceeds
+ * this bound ends drsg_watch with DRSG_TRANSPORT_ERROR_CODE.
+ */
+#define DRSG_WS_MAX_MESSAGE_BYTES ((size_t)64 * 1024 * 1024)
+
 typedef struct drsg_client drsg_client;
 
 /* Filled on failure. code is the JSON-RPC error code; message is a copy. */
@@ -67,6 +84,25 @@ typedef int (*drsg_change_cb)(struct json_object *event, void *userdata);
  */
 int drsg_watch(drsg_client *client, const char *plane, const char *label,
                drsg_change_cb cb, void *userdata, drsg_error *err);
+
+/*
+ * Cancellation handle for a watch running on another thread. Create one,
+ * hand it to drsg_watch_cancellable, and call drsg_watch_ctl_cancel from any
+ * thread to make the watch return 0 promptly (it shuts the socket down, which
+ * wakes the blocked read). Cancelling before the watch starts makes it return
+ * as soon as it has connected; cancelling twice is harmless. Free it only
+ * after drsg_watch_cancellable has returned.
+ */
+typedef struct drsg_watch_ctl drsg_watch_ctl;
+
+drsg_watch_ctl *drsg_watch_ctl_new(void);
+void drsg_watch_ctl_cancel(drsg_watch_ctl *ctl);
+void drsg_watch_ctl_free(drsg_watch_ctl *ctl);
+
+/* drsg_watch with a cancellation handle (may be NULL, which is drsg_watch). */
+int drsg_watch_cancellable(drsg_client *client, const char *plane, const char *label,
+                           drsg_change_cb cb, void *userdata, drsg_watch_ctl *ctl,
+                           drsg_error *err);
 
 #include "drsg_generated.h"
 

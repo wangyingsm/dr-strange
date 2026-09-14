@@ -109,7 +109,9 @@ var sub = db.watch("social", null, event -> {
 ```
 
 **C** —— 一个回调；`drsg_watch` 阻塞，直到回调返回非零值（如有需要，请在一个线程上
-运行它）。
+运行它；`drsg_watch_cancellable` 接受一个 `drsg_watch_ctl`，其他线程可通过
+`drsg_watch_ctl_cancel` 取消）。超过 `DRSG_WS_MAX_MESSAGE_BYTES` 的消息会以
+`DRSG_TRANSPORT_ERROR_CODE` 结束该 watch。
 
 ```c
 static int on_change(struct json_object *event, void *userdata) {

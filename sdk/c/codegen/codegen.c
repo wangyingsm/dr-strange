@@ -136,7 +136,11 @@ int main(int argc, char **argv) {
             access = json_object_get_string(node);
         }
 
-        struct param req[16], opt[16];
+        /* Fixed-size because the schema is ours and small; the check below
+         * turns a future method with more params into a build failure with a
+         * name in it rather than a silent stack overwrite. */
+        enum { MAX_PARAMS = 32 };
+        struct param req[MAX_PARAMS], opt[MAX_PARAMS];
         int nreq = 0, nopt = 0;
         struct json_object *params;
         if (json_object_object_get_ex(m, "params", &params)) {
@@ -149,6 +153,15 @@ int main(int argc, char **argv) {
                 int required = json_object_object_get_ex(p, "required", &pr)
                         && json_object_get_boolean(pr);
                 struct param entry = {json_object_get_string(pn), classify(ps), required};
+                if ((required ? nreq : nopt) >= MAX_PARAMS) {
+                    fprintf(stderr, "codegen: method %s has more than %d %s params; raise MAX_PARAMS\n",
+                            wire, MAX_PARAMS, required ? "required" : "optional");
+                    free(id);
+                    fclose(fh);
+                    fclose(fc);
+                    json_object_put(doc);
+                    return 1;
+                }
                 if (required) {
                     req[nreq++] = entry;
                 } else {

@@ -18,8 +18,11 @@ make            # builds libdrsg.a
 Link against `libdrsg.a` plus the two libraries:
 
 ```bash
-cc myapp.c libdrsg.a $(pkg-config --cflags --libs json-c libcurl) -Iinclude -o myapp
+cc myapp.c libdrsg.a $(pkg-config --cflags --libs json-c libcurl) -pthread -Iinclude -o myapp
 ```
+
+(`-pthread`: the library serialises its one-time libcurl initialisation and
+guards the watch cancellation handle with pthreads.)
 
 ## Use
 
@@ -58,6 +61,28 @@ each request as `Authorization: Bearer …`. On a missing/invalid credential the
 call returns `NULL` with `err.code == -32001`; test it with
 `drsg_is_auth_error(&err)`.
 
+### Change feed
+
+`drsg_watch(c, plane, label, cb, userdata, &err)` opens a WebSocket to
+`<base_url>/ws` and calls `cb` for each committed change event until `cb`
+returns non-zero or the server closes. To stop it from another thread, use the
+cancellable form:
+
+```c
+drsg_watch_ctl *ctl = drsg_watch_ctl_new();
+/* on the watch thread: */
+drsg_watch_cancellable(c, "startup", NULL, on_change, NULL, ctl, &err);
+/* from anywhere else, later: */
+drsg_watch_ctl_cancel(ctl);          /* the watch returns 0 promptly */
+drsg_watch_ctl_free(ctl);            /* after the watch has returned */
+```
+
+The client checks the server's `Sec-WebSocket-Accept`, masks every frame with
+a fresh key, percent-encodes the token in the `?token=` query, and refuses any
+message larger than `DRSG_WS_MAX_MESSAGE_BYTES` (64 MiB) before allocating for
+it; each of those failures ends the watch with `-1` and
+`err.code == DRSG_TRANSPORT_ERROR_CODE` (`-32000`) and a message that says why.
+
 ## Discover
 
 `drsg_rpc_discover(c, &err)` returns the server's live OpenRPC document.
@@ -72,5 +97,8 @@ make test          # drift check + e2e against a real drsg serve
 ```
 
 `make check-drift` fails if the committed client has drifted from the schema.
+Besides the real server, the e2e suite runs the client against
+`test/fake_ws.py`, a deliberately misbehaving WebSocket peer (oversized frame
+header, forged `Sec-WebSocket-Accept`, token needing URL escaping).
 The e2e suite skips (does not fail) if no `drsg` binary is found; point it at
 one with `$DRSG_BIN`, or build with `cargo build -p dr-strange-cli`.

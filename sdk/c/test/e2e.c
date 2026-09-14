@@ -14,6 +14,12 @@
 
 static int failures = 0;
 
+static int set_fail(drsg_error *err) {
+    err->code = 0;
+    snprintf(err->message, sizeof err->message, "client_new returned NULL");
+    return -1;
+}
+
 #define CHECK(cond, msg)                              \
     do {                                              \
         if (!(cond)) {                                \
@@ -81,6 +87,47 @@ static void *watch_thread(void *arg) {
         drsg_client_free(wc);
     }
     return NULL;
+}
+
+/* ---- hostile-peer and cancellation scaffolding --------------------------- */
+
+static int on_change_never(struct json_object *event, void *userdata) {
+    (void)event;
+    (void)userdata;
+    return 0;
+}
+
+struct cancel_args {
+    const char *base;
+    const char *token;
+    drsg_watch_ctl *ctl;
+    volatile int returned;
+    int rc;
+    drsg_error err;
+};
+
+/* Watches the real server with a ctl; nothing is ever committed, so only a
+ * cancel from the main thread can make this return. */
+static void *cancel_thread(void *arg) {
+    struct cancel_args *ca = arg;
+    drsg_client *wc = drsg_client_new(ca->base, ca->token);
+    if (wc) {
+        ca->rc = drsg_watch_cancellable(wc, "startup", NULL, on_change_never, NULL, ca->ctl, &ca->err);
+        drsg_client_free(wc);
+    }
+    ca->returned = 1;
+    return NULL;
+}
+
+/* Run drsg_watch against fake_ws.py with a token that selects its script. */
+static int fake_watch(const char *token, drsg_error *err) {
+    drsg_client *fc = drsg_client_new(getenv("DRSG_FAKE_URL"), token);
+    if (!fc) {
+        return set_fail(err);
+    }
+    int rc = drsg_watch(fc, "startup", NULL, on_change_never, NULL, err);
+    drsg_client_free(fc);
+    return rc;
 }
 
 int main(void) {
@@ -223,6 +270,55 @@ int main(void) {
         json_object_put(wd);
     } else {
         CHECK(0, "pthread_create for watch");
+    }
+
+    /* Cancellation from another thread: the watch blocks on a feed that never
+     * fires, and drsg_watch_ctl_cancel must make it return 0 promptly. */
+    {
+        struct cancel_args ca = {getenv("DRSG_BASE_URL"), getenv("DRSG_TOKEN"),
+                                 drsg_watch_ctl_new(), 0, -2, {0}};
+        pthread_t cth;
+        CHECK(ca.ctl, "drsg_watch_ctl_new");
+        if (ca.ctl && pthread_create(&cth, NULL, cancel_thread, &ca) == 0) {
+            usleep(300000); /* let it connect and subscribe */
+            drsg_watch_ctl_cancel(ca.ctl);
+            for (int i = 0; i < 150 && !ca.returned; i++) {
+                usleep(20000); /* up to ~3s */
+            }
+            CHECK(ca.returned, "cancel: drsg_watch_cancellable returned after cancel");
+            if (ca.returned) {
+                pthread_join(cth, NULL);
+                CHECK(ca.rc == 0, "cancel: returns 0 (clean stop)");
+            } else {
+                pthread_detach(cth);
+            }
+        } else {
+            CHECK(0, "pthread_create for cancel");
+        }
+        drsg_watch_ctl_free(ca.ctl);
+    }
+
+    /* Hostile peer (test/fake_ws.py): a frame header claiming 2^40 bytes must
+     * be refused with a typed error rather than allocated; a 101 whose
+     * Sec-WebSocket-Accept is wrong must not be trusted; a token with URL
+     * metacharacters must arrive percent-encoded (the fake refuses otherwise
+     * and the watch would not end cleanly). */
+    if (getenv("DRSG_FAKE_URL")) {
+        drsg_error ferr;
+        int rc = fake_watch("big", &ferr);
+        CHECK(rc == -1 && ferr.code == DRSG_TRANSPORT_ERROR_CODE,
+              "oversized frame: watch fails with DRSG_TRANSPORT_ERROR_CODE");
+        CHECK(rc == -1 && strstr(ferr.message, "DRSG_WS_MAX_MESSAGE_BYTES") != NULL,
+              "oversized frame: message names the limit");
+
+        rc = fake_watch("bad-accept", &ferr);
+        CHECK(rc == -1 && strstr(ferr.message, "Sec-WebSocket-Accept") != NULL,
+              "forged handshake: Sec-WebSocket-Accept mismatch is rejected");
+
+        rc = fake_watch("a&b=c#d", &ferr);
+        CHECK(rc == 0, "token with URL metacharacters is percent-encoded");
+    } else {
+        CHECK(0, "DRSG_FAKE_URL not set (run via test/run.sh)");
     }
 
     /* Bad token -> auth error (-32001). */

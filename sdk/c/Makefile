@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+CFLAGS ?= -O2 -Wall -Wextra -std=gnu11 -pthread
 
 JSONC_CFLAGS := $(shell pkg-config --cflags json-c)
 JSONC_LIBS   := $(shell pkg-config --libs json-c)

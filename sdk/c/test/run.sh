@@ -30,13 +30,21 @@ export DRSG_BASE_URL="http://127.0.0.1:$port"
 
 "$bin" --db "$tmp/sdk-test.drsg" serve --addr "127.0.0.1:$port" >/dev/null 2>&1 &
 server=$!
-trap 'kill "$server" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 
-for _ in $(seq 1 100); do
-    if python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$port))==0 else 1)"; then
-        break
-    fi
-    sleep 0.05
+# A misbehaving WebSocket peer for the client's hostile-input checks.
+fake_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+export DRSG_FAKE_URL="http://127.0.0.1:$fake_port"
+python3 "$here/fake_ws.py" "$fake_port" &
+fake=$!
+trap 'kill "$server" "$fake" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+
+for p in "$port" "$fake_port"; do
+    for _ in $(seq 1 100); do
+        if python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$p))==0 else 1)"; then
+            break
+        fi
+        sleep 0.05
+    done
 done
 
 "$here/e2e"
