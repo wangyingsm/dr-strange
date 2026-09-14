@@ -243,45 +243,67 @@ pub fn init_bootstrap(
     // A recorded endpoint that stopped answering is the one worth restoring
     // verbatim: agents already hold that URL and token. An explicit flag
     // still wins over it.
-    let (addr, token, mut force) = match recorded {
-        Some((recorded_addr, recorded_token)) => (
-            match addr {
-                Some(explicit) => explicit,
+    // `picked` records that nobody asked for this port — it came out of
+    // `pick_free_port`, and if something else grabs it before the child
+    // binds, another pick is as good as the first. An explicit `--addr` or
+    // a recorded address is a promise to agents and is never swapped.
+    let (addr, picked, token, mut force) = match recorded {
+        Some((recorded_addr, recorded_token)) => {
+            let (addr, picked) = match addr {
+                Some(explicit) => (explicit, false),
                 // The recorded port was an arbitrary one the OS handed out,
                 // and after a reboot it may belong to something else — which
                 // the health probe already ruled out as being drsg. Moving is
                 // then the only way to come up at all; agents pick the new
                 // address up from the rewritten configs.
-                None if addr_bindable(recorded_addr) => recorded_addr,
+                None if addr_bindable(recorded_addr) => (recorded_addr, false),
                 None => {
                     let moved = pick_free_port()?;
                     writeln!(
                         out,
                         "note: {recorded_addr} is taken by another process — moving to {moved}"
                     )?;
-                    moved
+                    (moved, true)
                 }
-            },
-            token.unwrap_or(recorded_token),
-            // The plane already exists and records where it left off; `serve
-            // watch` catches it up from there. Re-parsing the whole tree here
-            // would make every restart cost a full digest.
-            false,
-        ),
-        None => (
-            match addr {
-                Some(addr) => addr,
-                None => pick_free_port()?,
-            },
-            token.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)),
-            true,
-        ),
+            };
+            (
+                addr,
+                picked,
+                token.unwrap_or(recorded_token),
+                // The plane already exists and records where it left off;
+                // `serve watch` catches it up from there. Re-parsing the
+                // whole tree here would make every restart cost a full
+                // digest.
+                false,
+            )
+        }
+        None => {
+            let (addr, picked) = match addr {
+                Some(addr) => (addr, false),
+                None => (pick_free_port()?, true),
+            };
+            (
+                addr,
+                picked,
+                token.unwrap_or_else(|| {
+                    Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)
+                }),
+                true,
+            )
+        }
     };
     // Whatever the plane's state, `--rebuild` re-reads the tree.
     force |= rebuild;
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
 
-    let pid = spawn_watcher(&dir, &db_path, &plane_name, addr, &token, force)?;
+    let watch = Watch {
+        dir: &dir,
+        db_path: &db_path,
+        plane: &plane_name,
+        token: &token,
+        force,
+    };
+    let (pid, addr) = spawn_watcher(&watch, addr, picked, out)?;
 
     let what = match (rebuild, force) {
         (true, _) => "rebuilt",
@@ -296,70 +318,64 @@ pub fn init_bootstrap(
     write_agent_configs(&dir, &addr, &token, out)
 }
 
+/// What a `serve watch` child is started for: the tree it follows, the
+/// database and plane it writes, and how it should come up.
+///
+/// One value because a retry re-spawns the same watcher on another port —
+/// only the address changes between attempts.
+#[cfg(feature = "digest")]
+struct Watch<'a> {
+    dir: &'a Path,
+    db_path: &'a Path,
+    plane: &'a str,
+    token: &'a str,
+    force: bool,
+}
+
 /// Spawn `serve watch` detached, and wait until it is actually listening.
 ///
 /// Detached in its own session so it outlives this process: `init` returns as
 /// soon as the endpoint answers, and the watcher keeps folding commits after
-/// the shell that started it has gone.
+/// the shell that started it has gone. Returns the address it settled on,
+/// which is not the one asked for when a picked port was lost to a race.
 #[cfg(feature = "digest")]
 fn spawn_watcher(
-    dir: &Path,
-    db_path: &Path,
-    plane_name: &str,
+    watch: &Watch<'_>,
     addr: std::net::SocketAddr,
-    token: &str,
-    force: bool,
-) -> Result<u32> {
+    picked: bool,
+    out: &mut dyn Write,
+) -> Result<(u32, std::net::SocketAddr)> {
     let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.current_dir(dir)
-        .arg("--db")
-        .arg(db_path)
-        .arg("serve")
-        .arg("--addr")
-        .arg(addr.to_string())
-        .arg("watch")
-        .arg("--dir")
-        .arg(dir)
-        .arg("--plane")
-        .arg(plane_name)
-        .env("DRSG_TOKEN", token)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if force {
-        cmd.arg("--force");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid()` is async-signal-safe and touches only the child's
-        // own process state; this runs in the forked child before exec, per
-        // `pre_exec`'s contract.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    // A picked port is free when picked and bound by the child some
+    // milliseconds later; in between, anything may take it. When the child
+    // dies before listening on a port that was only ever our pick, pick
+    // again rather than report a failure the next try would not have.
+    let mut addr = addr;
+    let mut attempt = 1;
+    loop {
+        let mut child = spawn_serve_watch(&exe, watch, addr)?;
+        let pid = child.id();
+        match wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
+            Listener::Up => return Ok((pid, addr)),
+            Listener::ChildExited if picked && attempt < INIT_SPAWN_ATTEMPTS => {
+                let next = pick_free_port()?;
+                writeln!(
+                    out,
+                    "note: `drsg serve watch` exited before listening on {addr} — retrying on {next}"
+                )?;
+                addr = next;
+                attempt += 1;
+            }
+            Listener::ChildExited | Listener::TimedOut => {
+                let log_tail = tail_recent_log(watch.dir)
+                    .unwrap_or_else(|| "(no log file found under logs/)".to_string());
+                let _ = child.kill();
+                bail!(
+                    "`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}"
+                );
+            }
         }
     }
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "spawning `{} serve watch` for {}",
-            exe.display(),
-            dir.display()
-        )
-    })?;
-    let pid = child.id();
-    if !wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
-        let log_tail =
-            tail_recent_log(dir).unwrap_or_else(|| "(no log file found under logs/)".to_string());
-        let _ = child.kill();
-        bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
-    }
-    Ok(pid)
 }
 
 /// Say what will become of this repository's history — one line, and only
@@ -569,6 +585,16 @@ const INIT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// database lock goes at the same moment.
 #[cfg(feature = "digest")]
 fn stop_server(pid: u32, addr: std::net::SocketAddr) -> Result<()> {
+    // The pid came out of an HTTP body. `/health` answered like drsg, but a
+    // stale recorded port could be answering for anyone; before a signal
+    // goes anywhere, the process is checked to be a drsg where the system
+    // lets us look.
+    if !process_is_drsg(pid) {
+        bail!(
+            "pid {pid} (from {addr}'s /health) is not a drsg process — refusing to stop it. \
+             Stop the server holding {addr} by hand and run this again."
+        );
+    }
     terminate(pid)?;
     let deadline = std::time::Instant::now() + INIT_STOP_TIMEOUT;
     while std::time::Instant::now() < deadline {
@@ -581,6 +607,28 @@ fn stop_server(pid: u32, addr: std::net::SocketAddr) -> Result<()> {
         "drsg (pid {pid}) was asked to stop but still holds {addr} after {}s",
         INIT_STOP_TIMEOUT.as_secs()
     )
+}
+
+/// Whether `pid` runs a drsg binary, read from `/proc/<pid>/cmdline`: the
+/// first argument's file name starts with `drsg`. Where there is no `/proc`
+/// to read, or the entry cannot be read, the answer is "yes" — the check
+/// refuses what it can see is wrong, it does not demand proof.
+#[cfg(all(feature = "digest", target_os = "linux"))]
+fn process_is_drsg(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return true;
+    };
+    let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+    let name = Path::new(std::str::from_utf8(argv0).unwrap_or_default())
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default();
+    name.starts_with("drsg")
+}
+
+#[cfg(all(feature = "digest", not(target_os = "linux")))]
+fn process_is_drsg(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(all(feature = "digest", unix))]
@@ -627,24 +675,101 @@ fn pick_free_port() -> Result<std::net::SocketAddr> {
     listener.local_addr().context("reading the picked port")
 }
 
+/// How many ports `init` will pick before giving up on a child that dies
+/// before listening. Losing one race is plausible; losing three in a row
+/// means the child is dying for a reason a new port will not cure.
+#[cfg(feature = "digest")]
+const INIT_SPAWN_ATTEMPTS: usize = 3;
+
+/// Start `drsg serve watch` for `dir` on `addr`, detached from this process.
+#[cfg(feature = "digest")]
+fn spawn_serve_watch(
+    exe: &Path,
+    watch: &Watch<'_>,
+    addr: std::net::SocketAddr,
+) -> Result<std::process::Child> {
+    let Watch {
+        dir,
+        db_path,
+        plane,
+        token,
+        force,
+    } = *watch;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.current_dir(dir)
+        .arg("--db")
+        .arg(db_path)
+        .arg("serve")
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("watch")
+        .arg("--dir")
+        .arg(dir)
+        .arg("--plane")
+        .arg(plane)
+        .env("DRSG_TOKEN", token)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if force {
+        cmd.arg("--force");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid()` is async-signal-safe and touches only the
+        // child's own process state; this runs in the forked child before
+        // exec, per `pre_exec`'s contract.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn().with_context(|| {
+        format!(
+            "spawning `{} serve watch` for {}",
+            exe.display(),
+            dir.display()
+        )
+    })
+}
+
+/// How a wait for the spawned server ended.
+#[cfg(feature = "digest")]
+#[derive(Debug, PartialEq, Eq)]
+enum Listener {
+    /// Something accepts connections on the address.
+    Up,
+    /// The child exited before anything listened — a port it could not
+    /// bind, or a start-up failure of its own.
+    ChildExited,
+    /// The child is alive but nothing listens yet.
+    TimedOut,
+}
+
 /// Polls `addr` until something accepts a TCP connection, the child exits
-/// first, or `timeout` elapses.
+/// first, or `timeout` elapses. The two failures are told apart because only
+/// the first is worth retrying on another port.
 #[cfg(feature = "digest")]
 fn wait_for_listener(
     addr: std::net::SocketAddr,
     child: &mut std::process::Child,
     timeout: std::time::Duration,
-) -> bool {
+) -> Listener {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if std::net::TcpStream::connect(addr).is_ok() {
-            return true;
+            return Listener::Up;
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return false;
+            return Listener::ChildExited;
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return Listener::TimedOut;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -4704,6 +4829,56 @@ mod tests {
         assert_ne!(addr.port(), 0);
         // The picked port is actually free to bind again immediately after.
         std::net::TcpListener::bind(addr).unwrap();
+    }
+
+    /// The two ways a spawn fails are told apart, because only a child that
+    /// died — a port lost to a race — is worth a second port.
+    #[cfg(all(feature = "digest", unix))]
+    #[test]
+    fn wait_for_listener_tells_a_dead_child_from_a_slow_one() {
+        let addr = pick_free_port().unwrap();
+        let short = std::time::Duration::from_millis(300);
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut dead, short),
+            Listener::ChildExited
+        );
+        let mut slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut slow, short),
+            Listener::TimedOut
+        );
+        let _ = slow.kill();
+        let _ = slow.wait();
+    }
+
+    /// A pid read out of an HTTP body is not signalled until the system
+    /// confirms it is a drsg: this test binary is one, a `sleep` is not.
+    #[cfg(all(feature = "digest", target_os = "linux"))]
+    #[test]
+    fn only_a_drsg_process_is_stopped() {
+        assert!(process_is_drsg(std::process::id()));
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Between fork and exec the child still wears this binary's cmdline;
+        // give it a moment to become `sleep`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_drsg(other.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!process_is_drsg(other.id()));
+        let _ = other.kill();
+        let _ = other.wait();
+        // A pid nobody has: nothing to see, so nothing to refuse.
+        assert!(process_is_drsg(u32::MAX - 1));
     }
 
     #[cfg(feature = "digest")]
