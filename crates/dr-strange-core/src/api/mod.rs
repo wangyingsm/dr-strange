@@ -566,27 +566,36 @@ impl Database {
         keyword_sidecar: Option<PathBuf>,
     ) -> Result<Self> {
         // The commit sequence of the data as last persisted — read BEFORE
-        // `graph::init`, since that runs a write transaction and every write
-        // bumps the sequence (arch/02 §3). This is the value the sidecar was
-        // stamped with on the previous drop. A brand-new database has no meta
-        // yet (read errors) and no sidecar to match anyway → `None`.
+        // any bootstrap write, since every write bumps the sequence (arch/02
+        // §3). This is the value the sidecar was stamped with on the previous
+        // drop. A brand-new database has no meta yet (read errors) and no
+        // sidecar to match anyway → `None`.
         let prior_seq = engine.with_read(|txn| graph::read_commit_seq(txn)).ok();
-        engine.with_write_bootstrap(|txn| graph::init(txn))?;
-        // Backfill: a database written before summary counters existed has
-        // no rows — count each such plane once, here, so every later
-        // dashboard read is a point lookup (arch/03 §5). A fresh database
-        // pays nothing (its planes are empty); an already-migrated one pays
-        // one row read per plane.
-        engine.with_write_bootstrap(|txn| {
-            for (plane, _name) in graph::list_planes(txn)? {
-                let key = crate::storage::keys::counters_key(plane);
-                if txn.get(TableId::Meta, &key)?.is_none() {
-                    let counted = catalog::count(txn, plane)?;
-                    txn.put(TableId::Meta, &key, &counted.encode())?;
+        // Open is idempotent: a database that is already initialised, at the
+        // current format, with a counters row per plane, is opened without a
+        // single write, so its commit sequence is exactly what the last
+        // writer left. That matters for a replica (`serve --follow`): its
+        // sequence is the master's, landed by `apply_replicated`, and a local
+        // bootstrap commit per open would run it ahead of the master's, so
+        // that the next replicated batch moves it backwards. Only what a
+        // read shows to be missing is written, in one commit.
+        let needs_bootstrap = engine.with_read(|txn| Self::needs_bootstrap(txn))?;
+        if needs_bootstrap {
+            engine.with_write_bootstrap(|txn| {
+                graph::init(txn)?;
+                // Backfill: a database written before summary counters
+                // existed has no rows — count each such plane once, here, so
+                // every later dashboard read is a point lookup (arch/03 §5).
+                for (plane, _name) in graph::list_planes(txn)? {
+                    let key = crate::storage::keys::counters_key(plane);
+                    if txn.get(TableId::Meta, &key)?.is_none() {
+                        let counted = catalog::count(txn, plane)?;
+                        txn.put(TableId::Meta, &key, &counted.encode())?;
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
         // Vector indexes (arch/01 §5): load the HNSW sidecar when it is fresh
         // (its stamped commit sequence equals the data's), else rebuild from
         // the KV — the KV is always the source of truth, the sidecar only a
@@ -808,6 +817,35 @@ impl Database {
             }
         }
         Ok(lo)
+    }
+
+    /// Whether opening this database has anything to write: no meta yet
+    /// (fresh), a format that is not the current one (bad magic and
+    /// unsupported versions included — `graph::init` is left to report
+    /// those from the write path), or a plane without a counters row. A
+    /// `false` means `init` commits nothing.
+    fn needs_bootstrap(txn: &dyn ReadTransaction) -> Result<bool> {
+        use crate::storage::keys;
+        if txn.get(TableId::Meta, keys::META_MAGIC)?.as_deref() != Some(keys::MAGIC) {
+            return Ok(true);
+        }
+        let current = graph::FORMAT_VERSION.to_be_bytes();
+        if txn
+            .get(TableId::Meta, keys::META_FORMAT_VERSION)?
+            .as_deref()
+            != Some(&current[..])
+        {
+            return Ok(true);
+        }
+        for (plane, _name) in graph::list_planes(txn)? {
+            if txn
+                .get(TableId::Meta, &keys::counters_key(plane))?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether a vector-index event failed to apply after its commit was

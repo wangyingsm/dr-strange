@@ -9,9 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use dr_strange_core::ReplicatedBatch;
 use dr_strange_core::storage::engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
 use dr_strange_core::storage::native::NativeEngine;
+use dr_strange_core::{Database, Properties, ReplicatedBatch};
 
 /// A scratch directory that cleans up after itself.
 struct Dir(std::path::PathBuf);
@@ -180,4 +180,102 @@ fn apply_replicated_refuses_a_sequence_that_does_not_advance() {
     assert_eq!(e.committed_seq(), 4);
     let txn = e.begin_read().unwrap();
     assert_eq!(txn.get(TableId::Nodes, &[1]).unwrap(), Some(vec![0xff]));
+}
+
+/// Wire up a `Database` master so every commit's batch lands in a shared
+/// `Vec`, in order — the `Database`-level twin of [`capture`].
+fn capture_db(src: &Database) -> Arc<Mutex<Vec<ReplicatedBatch>>> {
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let sink = batches.clone();
+    src.on_wal_commit(move |batch| sink.lock().unwrap().push(batch))
+        .unwrap();
+    batches
+}
+
+fn apply_all(replica: &Database, batches: &Mutex<Vec<ReplicatedBatch>>) {
+    for batch in batches.lock().unwrap().drain(..) {
+        replica.apply_replicated(batch).unwrap();
+    }
+}
+
+#[test]
+fn reopening_a_replica_writes_nothing_so_its_sequence_stays_the_masters() {
+    // A replica's commit sequence is the master's, landed verbatim by
+    // `apply_replicated`. If opening the database ran bootstrap commits of
+    // its own, every restart of `serve --follow` would push the replica's
+    // sequence past the master's, and the next replicated batch would move
+    // it backwards (or, once the engine refuses regressions, be rejected).
+    // So an open of an already-initialised database must commit nothing.
+    let dir_m = Dir::new("reopen-master");
+    let dir_r = Dir::new("reopen-replica");
+    let master = Database::open(&dir_m.0).unwrap();
+    let batches = capture_db(&master);
+
+    // The very first open of the replica is the only one allowed to write:
+    // it lays down the meta the master's batches will then overwrite.
+    let bootstrapped = {
+        let replica = Database::open_read_only(&dir_r.0).unwrap();
+        replica.commit_seq().unwrap()
+    };
+    {
+        let replica = Database::open_read_only(&dir_r.0).unwrap();
+        assert_eq!(
+            replica.commit_seq().unwrap(),
+            bootstrapped,
+            "a second open must not advance the sequence"
+        );
+    }
+
+    let plane = master.plane("startup").unwrap();
+    let first = {
+        let mut w = plane.write().unwrap();
+        let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+        w.commit().unwrap();
+        id
+    };
+    {
+        let replica = Database::open_read_only(&dir_r.0).unwrap();
+        apply_all(&replica, &batches);
+        assert_eq!(replica.commit_seq().unwrap(), master.commit_seq().unwrap());
+    }
+
+    // Reopen twice more, then keep following: the replica's sequence must
+    // still be the master's before and after every further batch.
+    for _ in 0..2 {
+        let replica = Database::open_read_only(&dir_r.0).unwrap();
+        assert_eq!(
+            replica.commit_seq().unwrap(),
+            master.commit_seq().unwrap(),
+            "reopening the replica ran it ahead of the master"
+        );
+    }
+    let second = {
+        let mut w = plane.write().unwrap();
+        let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+        w.commit().unwrap();
+        id
+    };
+    let replica = Database::open_read_only(&dir_r.0).unwrap();
+    apply_all(&replica, &batches);
+    assert_eq!(replica.commit_seq().unwrap(), master.commit_seq().unwrap());
+    let seen = replica.plane("startup").unwrap();
+    assert!(seen.node(first).unwrap().is_some());
+    assert!(seen.node(second).unwrap().is_some());
+}
+
+#[test]
+fn reopening_a_database_commits_nothing() {
+    let dir = Dir::new("reopen-plain");
+    let seq = {
+        let db = Database::open(&dir.0).unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], Properties::new()).unwrap();
+        w.commit().unwrap();
+        db.commit_seq().unwrap()
+    };
+    for _ in 0..3 {
+        let db = Database::open(&dir.0).unwrap();
+        assert_eq!(db.commit_seq().unwrap(), seq, "open is not a write");
+    }
 }

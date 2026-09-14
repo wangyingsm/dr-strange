@@ -20,6 +20,14 @@ let paper = db.create_plane("paper-2406.01234", props! {
 })?;
 ```
 
+Opening is not a write. `Database::open` (and `open_read_only`) commits
+only what a read shows to be missing — the initial meta of a fresh database,
+a format migration, a counters row for a plane that predates them — and
+otherwise leaves the commit sequence exactly where the last writer put it.
+A replica (`serve --follow`) depends on this: its sequence is the master's,
+landed by `apply_replicated`, and a bootstrap commit per open would run it
+ahead so that the next replicated batch moved it backwards.
+
 `Database` root carries only plane lifecycle (`create_plane`, `drop_plane`,
 `planes()`), cross-plane operations (`copy`, `move_`, stack reads), global
 catalog roll-up, and `stats()`. Everything else hangs off a `PlaneHandle`.
