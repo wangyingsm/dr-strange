@@ -369,12 +369,21 @@ impl NativeEngine {
 
         // Then the WAL tail (records not yet folded into an SST).
         let wal_path = dir.join("wal");
+        let fresh = !wal_path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&wal_path)?;
+        // A brand-new store's directory entries (LOCK, wal) are made durable
+        // now: each commit fsyncs the WAL file itself, but on a filesystem that
+        // does not journal the parent on a file fsync the entry could still be
+        // lost in a crash before the first flush, which is the first time the
+        // directory is otherwise fsynced — every commit until then with it.
+        if fresh {
+            sync_dir(&dir)?;
+        }
         let valid_len = replay(&mut file, &mut store)?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
@@ -613,12 +622,22 @@ impl NativeEngine {
         };
 
         // Delete the merged runs' files. Their `Arc`s drop here (readers never
-        // retain a run across a call), closing the handles first.
-        let paths: Vec<PathBuf> = old.iter().map(|s| s.path.clone()).collect();
+        // retain a run across a call), closing the handles first. Newest run
+        // first, then the directory is fsynced: the merged run may have GC'd a
+        // key whose put sits in an old run and whose tombstone in a newer one,
+        // so were the older unlink to reach disk without the newer, a crash
+        // would bring the put back with nothing shadowing it. A journal that
+        // persists unlinks in order can then never leave that shape, and the
+        // fsync makes the whole removal durable rather than a crash's choice.
+        let paths: Vec<PathBuf> = old.iter().rev().map(|s| s.path.clone()).collect();
         drop(old);
         for p in paths {
-            let _ = std::fs::remove_file(p);
+            std::fs::remove_file(&p).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })?;
         }
+        sync_dir(&self.dir)?;
         Ok(())
     }
 }
