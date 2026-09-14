@@ -57,6 +57,15 @@ The whole surface is authenticated. Set a token via `WithToken` or the
 `Authorization: Bearer …`. On a missing/invalid credential the call returns a
 `*drsg.Error` with `Code == -32001`; test it with `drsg.IsAuthError(err)`.
 
+### Change feed
+
+`db.Watch(ctx, plane, drsg.WithLabel(...))` returns a channel of `ChangeEvent`.
+The dial and WebSocket upgrade honour `ctx` (with a 30 s bound when it carries
+no deadline); the channel closes when `ctx` is cancelled, when the server hangs
+up, or when a message exceeds `drsg.MaxFrameBytes` (16 MiB). Nothing lingers
+after the channel closes, so a `Watch` on `context.Background()` whose server
+goes away is fully reclaimed.
+
 ## Discover
 
 `db.RpcDiscover(ctx)` returns the server's live OpenRPC document.

@@ -18,7 +18,21 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
+
+// MaxFrameBytes bounds a single WebSocket message the change feed will
+// buffer. The frame header carries a 64-bit length that the peer controls; the
+// server never sends a change event anywhere near this size, so a larger claim
+// is treated as a protocol error and ends the subscription rather than being
+// allocated.
+const MaxFrameBytes = 16 << 20
+
+// handshakeTimeout bounds the dial and upgrade of a Watch whose ctx carries no
+// deadline of its own, so a server that accepts the TCP connection but never
+// answers cannot hang the caller indefinitely.
+const handshakeTimeout = 30 * time.Second
 
 // Change is one node or edge that changed in a commit.
 type Change struct {
@@ -65,7 +79,7 @@ func (c *Client) Watch(ctx context.Context, plane string, opts ...WatchOption) (
 		o(&cfg)
 	}
 
-	ws, err := dialWebSocket(c.baseURL, c.token)
+	ws, err := dialWebSocket(ctx, c.baseURL, c.token)
 	if err != nil {
 		return nil, err
 	}
@@ -80,15 +94,16 @@ func (c *Client) Watch(ctx context.Context, plane string, opts ...WatchOption) (
 		return nil, &Error{Code: -32000, Message: "websocket subscribe failed: " + err.Error()}
 	}
 
-	// Closing the conn on ctx.Done unblocks the read loop below.
-	go func() {
-		<-ctx.Done()
-		ws.close()
-	}()
+	// Closing the conn on ctx.Done unblocks the read loop below. AfterFunc
+	// rather than a goroutine parked on ctx.Done: when the server closes first
+	// the read loop exits and stops the callback, so nothing lingers until the
+	// caller's ctx (often context.Background) is cancelled.
+	stop := context.AfterFunc(ctx, ws.close)
 
 	out := make(chan ChangeEvent)
 	go func() {
 		defer close(out)
+		defer stop()
 		defer ws.close()
 		for {
 			msg, err := ws.readText()
@@ -115,14 +130,16 @@ func (c *Client) Watch(ctx context.Context, plane string, opts ...WatchOption) (
 // ---- minimal RFC 6455 client ----------------------------------------------
 
 type wsConn struct {
-	conn net.Conn
-	r    *bufio.Reader
+	conn      net.Conn
+	r         *bufio.Reader
+	closeOnce sync.Once
 }
 
 // dialWebSocket opens a WebSocket to <baseURL>/ws, carrying the token in the
 // query string (browsers can't set a header on the handshake, and the server
-// reads ?token= there).
-func dialWebSocket(baseURL, token string) (*wsConn, error) {
+// reads ?token= there). Both the TCP/TLS dial and the HTTP upgrade honour ctx:
+// cancelling it, or reaching its deadline, fails the call promptly.
+func dialWebSocket(ctx context.Context, baseURL, token string) (*wsConn, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, &Error{Code: -32000, Message: "bad base URL: " + err.Error()}
@@ -137,14 +154,35 @@ func dialWebSocket(baseURL, token string) (*wsConn, error) {
 		}
 	}
 
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, handshakeTimeout)
+		defer cancel()
+	}
+
 	var conn net.Conn
 	if secure {
-		conn, err = tls.Dial("tcp", host, nil)
+		conn, err = (&tls.Dialer{}).DialContext(ctx, "tcp", host)
 	} else {
-		conn, err = net.Dial("tcp", host)
+		conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", host)
 	}
 	if err != nil {
 		return nil, &Error{Code: -32000, Message: "connection failed: " + err.Error()}
+	}
+	// The handshake below is plain blocking I/O; let ctx interrupt it by
+	// closing the socket, and clear that hook (and the deadline) once the
+	// upgrade has completed so the long-lived read loop is governed only by
+	// the caller's own cancellation.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	ctxErr := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
 	}
 
 	path := "/ws"
@@ -162,12 +200,16 @@ func dialWebSocket(baseURL, token string) (*wsConn, error) {
 		"Sec-WebSocket-Version: 13\r\n\r\n"
 	if _, err := conn.Write([]byte(handshake)); err != nil {
 		conn.Close()
-		return nil, &Error{Code: -32000, Message: "handshake write failed: " + err.Error()}
+		return nil, &Error{Code: -32000, Message: "handshake write failed: " + ctxErr(err).Error()}
 	}
 
 	r := bufio.NewReader(conn)
 	status, err := r.ReadString('\n')
-	if err != nil || !strings.Contains(status, " 101 ") {
+	if err != nil {
+		conn.Close()
+		return nil, &Error{Code: -32000, Message: "handshake read failed: " + ctxErr(err).Error()}
+	}
+	if !strings.Contains(status, " 101 ") {
 		conn.Close()
 		return nil, &Error{Code: -32000, Message: "websocket upgrade refused: " + strings.TrimSpace(status)}
 	}
@@ -176,12 +218,20 @@ func dialWebSocket(baseURL, token string) (*wsConn, error) {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			conn.Close()
-			return nil, &Error{Code: -32000, Message: "handshake read failed: " + err.Error()}
+			return nil, &Error{Code: -32000, Message: "handshake read failed: " + ctxErr(err).Error()}
 		}
 		if line == "\r\n" || line == "\n" {
 			break
 		}
 	}
+	if !stop() {
+		// ctx fired between the last read and here; the socket is already
+		// closed under us, so report the cancellation rather than hand back a
+		// dead connection.
+		conn.Close()
+		return nil, &Error{Code: -32000, Message: "handshake read failed: " + ctx.Err().Error()}
+	}
+	_ = conn.SetDeadline(time.Time{})
 	return &wsConn{conn: conn, r: r}, nil
 }
 
@@ -238,6 +288,11 @@ func (w *wsConn) readText() ([]byte, error) {
 			}
 			length = binary.BigEndian.Uint64(b[:])
 		}
+		if length > MaxFrameBytes || uint64(len(message))+length > MaxFrameBytes {
+			// Do not allocate what the peer asks for; drop the connection so
+			// the subscription ends visibly instead of silently stalling.
+			return nil, errFrameTooLarge
+		}
 		var mask [4]byte
 		if masked {
 			if _, err := io.ReadFull(w.r, mask[:]); err != nil {
@@ -270,7 +325,16 @@ func (w *wsConn) readText() ([]byte, error) {
 	}
 }
 
+// errFrameTooLarge ends a subscription whose peer announced a frame beyond
+// MaxFrameBytes.
+var errFrameTooLarge = &Error{Code: -32000, Message: "websocket frame exceeds MaxFrameBytes"}
+
+// close sends a best-effort close frame and tears down the socket. It is safe
+// to call more than once and from several goroutines: the ctx hook and the
+// read loop both reach it.
 func (w *wsConn) close() {
-	_ = w.writeFrame(0x8, nil) // best-effort close frame
-	_ = w.conn.Close()
+	w.closeOnce.Do(func() {
+		_ = w.writeFrame(0x8, nil)
+		_ = w.conn.Close()
+	})
 }

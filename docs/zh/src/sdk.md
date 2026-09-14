@@ -88,7 +88,7 @@ for event in db.watch("social"):
         print(event["seq"], c["op"], c["kind"], c["id"])
 ```
 
-**Go** —— 一个通道（channel）；取消 context 以停止。
+**Go** —— 一个通道（channel）；取消 context 以停止。拨号与握手同样遵守 context（无截止时间则为 30 秒），服务端断开时通道关闭，超过 `drsg.MaxFrameBytes` 的消息会结束订阅。
 
 ```go
 events, _ := db.Watch(ctx, "social")

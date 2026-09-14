@@ -99,7 +99,9 @@ for event in db.watch("social"):
         print(event["seq"], c["op"], c["kind"], c["id"])
 ```
 
-**Go** — a channel; cancel the context to stop.
+**Go** — a channel; cancel the context to stop. The dial and upgrade honour
+the context too (30 s if it carries no deadline), the channel closes when the
+server hangs up, and a message over `drsg.MaxFrameBytes` ends the watch.
 
 ```go
 events, _ := db.Watch(ctx, "social")
