@@ -392,6 +392,82 @@ fn re_splits_a_chunk_that_overflows_the_output_limit() {
     );
 }
 
+/// A reply that is not JSON gets one more turn, with the complaint and the
+/// same text; the second answer is used and both calls are counted. Every
+/// other pass already shrugged a garbled reply off — extraction alone threw
+/// the whole run away over one.
+#[test]
+fn a_reply_that_is_not_json_is_asked_for_once_more() {
+    use dr_strange_llm::{Chat, ChatReply};
+    use std::sync::Mutex;
+
+    struct Chatty {
+        prompts: Mutex<Vec<String>>,
+    }
+    impl Chat for Chatty {
+        fn complete(&self, _system: &str, user: &str) -> Result<ChatReply> {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(user.to_string());
+            let text = if prompts.len() == 1 {
+                "Certainly! Alice is an engineer who works at Acme.".to_string()
+            } else {
+                REPLY.to_string()
+            };
+            Ok(ChatReply {
+                text,
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        }
+    }
+
+    let chatty = Chatty {
+        prompts: Mutex::new(Vec::new()),
+    };
+    let mock = MockProvider::new(vec![], 8);
+    let result = digest(
+        "Alice is an engineer at Acme.",
+        &chatty,
+        &mock,
+        None,
+        &opts(false),
+    )
+    .unwrap();
+    assert_eq!(result.nodes.len(), 2, "the second reply was used");
+    // Extraction's own cost, apart from the two vocabulary passes that
+    // follow it: both turns are paid for.
+    let r = &result.report;
+    let extraction_calls = r.chat_requests - r.labels.chat_requests - r.edge_types.chat_requests;
+    assert_eq!(extraction_calls, 2, "both turns are paid for");
+
+    let prompts = chatty.prompts.lock().unwrap();
+    assert!(prompts.len() >= 2);
+    assert!(
+        prompts[1].starts_with(&prompts[0]),
+        "the same text, then the complaint"
+    );
+    assert!(
+        prompts[1].contains("ONLY the JSON object"),
+        "{}",
+        prompts[1]
+    );
+    assert!(prompts[1].contains("previous reply"), "{}", prompts[1]);
+}
+
+/// The nudge is one turn, not a loop: a model that fails it is not going to
+/// be argued into JSON, and the run aborts saying what came back.
+#[test]
+fn a_second_non_json_reply_aborts_the_run() {
+    let mock = MockProvider::new(vec!["still prose".to_string()], 8);
+    let Err(err) = digest("Some text.", &mock, &mock, None, &opts(false)) else {
+        panic!("two prose replies must fail the chunk");
+    };
+    assert!(
+        err.to_string().contains("not valid extraction JSON"),
+        "{err}"
+    );
+}
+
 /// One hard failure ends the run without making the calls it would have
 /// made: a dead key against a hundred-chunk document used to cost a hundred
 /// refusals before the first was reported.
