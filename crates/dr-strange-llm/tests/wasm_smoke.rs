@@ -2,7 +2,9 @@
 //! parse + assemble over a real directory, and read the facts back.
 //!
 //! Skips unless `DRSG_PLUGIN_WASM` names a component, so `cargo test` needs no
-//! wasm toolchain; CI and the fixtures of task #17 make it unconditional later.
+//! wasm toolchain. The sandbox's guarantees are proven unconditionally against
+//! the committed fixtures in `tests/sandbox.rs`; this is the optional check
+//! against a *real* plugin build, run by hand or by a CI job that has one.
 #![cfg(feature = "plugins")]
 
 use dr_strange_llm::preprocess::{Host, Limits, LocalFiles, Preprocessor, WasmPlugin};

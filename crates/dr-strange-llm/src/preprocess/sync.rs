@@ -97,6 +97,12 @@ fn content_of(props: &Properties) -> BTreeMap<&str, &PropValue> {
 }
 
 /// Reconcile the tree behind `host` into `plane_name`.
+///
+/// `delta` is accepted and not read: the fold reconciles the whole tree
+/// (the module docs say why — a parser's facts for one file depend on
+/// others), and the delta is what the caller logs and records its sync
+/// point against. It stays in the signature so that a future partial
+/// re-route is a change inside this function and not to every caller.
 pub fn sync_paths(
     db: &Database,
     plane_name: &str,

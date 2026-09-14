@@ -7,8 +7,8 @@
 //! **provenance on everything** written (source, model, run id); a minimal
 //! provider abstraction ([`Chat`] + [`Embedder`]) with a plain-HTTP
 //! OpenAI-compatible implementation and a deterministic mock for tests.
-//!
-//! Still TODO (arch/07 §1, v1.5): entity-resolution proposals.
+//! Entity resolution, once the open item here, is `reconcile` (model-free
+//! folds) and `identity` (model-adjudicated containment) inside the digest.
 
 mod ask;
 mod digest;
