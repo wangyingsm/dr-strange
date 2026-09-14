@@ -240,6 +240,31 @@ names are case-insensitive (`COUNT(*)`, `Score()`). Expressions may nest at
 most 64 levels deep (parentheses, `NOT`, unary `-`); deeper is a syntax error
 rather than a crash.
 
+### What the subset leaves out
+
+Each of these is refused with an error that names the rewrite; none is
+silently mis-read:
+
+- A second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, `WITH`, and a
+  pattern with several paths (`MATCH (a)-->(b), (a)-->(c)`): a query holds
+  one linear path, ending in one `RETURN`. Run one query per pattern or
+  branch and combine the results in the caller.
+- Relationship variables (`-[r:KNOWS]->`): an edge cannot be bound, returned
+  or filtered on. Drop the variable: `-[:KNOWS]->`.
+- Inline property predicates in a `MATCH` node (`(n:Person {name: "x"})`):
+  write them in `WHERE` (`WHERE n.name = "x"`, or `key(n) = "…"`). In
+  `CREATE` and `MERGE` the same map is the node's properties.
+- List and map literals as values (`RETURN [1, 2]`, `n.x = {a: 1}`): a list
+  is only the right side of `IN` (or a vector after `NEAR`), a map only a
+  `CREATE`/`SET` property map.
+- The `%` and `^` operators; arithmetic is `+ - * /`.
+- Cross-variable predicates (`p.year < q.year`), returning the rows of an
+  earlier variable (`RETURN p` after a hop — project `p.name` instead), and
+  unbounded variable-length hops (`*`, `*2..`).
+
+A syntax error is reported near its cause: a typo late in a `CREATE` names
+that spot, not the statement's first word.
+
 ## Similarity search in a query
 
 The `SEARCH` clause makes similarity a source of rows, so a semantic lookup and a
