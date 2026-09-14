@@ -67,28 +67,64 @@ struct ServerEntry {
     headers: BTreeMap<String, String>,
 }
 
-/// The drsg server declared nearest to `start`, walking up.
+/// The drsg server declared nearest to `start`, walking up to the repository
+/// root.
 ///
 /// Up, because `drsg init` writes the file at the repository root while a host
 /// may launch from anywhere inside. The nearest `.mcp.json` is the answer: one
 /// that names no drsg server stops the search rather than deferring to a
-/// parent's, which belongs to a different project.
+/// parent's, which belongs to a different project. The walk ends at the first
+/// directory holding a `.git` — the repository root — for the same reason: a
+/// file above it belongs to nobody this checkout answers to, and what is
+/// found here is *forwarded as a credential*, so it is read only from a file
+/// the current user owns and no one else can write ([`trusted`]).
 pub fn discover(start: &Path) -> Option<Upstream> {
     for dir in start.ancestors() {
         let path = dir.join(MCP_FILE);
-        if !path.is_file() {
-            continue;
+        if path.is_file() && trusted(&path) {
+            // A malformed file falls through to the embedded server.
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(file) = serde_json::from_str::<McpFile>(&text)
+            {
+                return pick(file, &path);
+            }
         }
-        // A malformed file falls through to the embedded server.
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(file) = serde_json::from_str::<McpFile>(&text) else {
-            continue;
-        };
-        return pick(file, &path);
+        // `.git` is a file in a worktree, so existence rather than kind.
+        if dir.join(".git").exists() {
+            break;
+        }
     }
     None
+}
+
+/// Whether a `.mcp.json` may supply an `Authorization` header: owned by the
+/// user running this process and not writable by everyone. A file another
+/// user planted, or one anyone can edit, could redirect the session — token
+/// and all — to a server of their choosing.
+#[cfg(unix)]
+fn trusted(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // SAFETY: `geteuid` reads the process's effective uid; it takes no
+    // arguments, touches no memory and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let ok = meta.uid() == me && meta.mode() & 0o002 == 0;
+    if !ok {
+        tracing::warn!(
+            file = %path.display(),
+            "ignoring .mcp.json: not owned by this user or world-writable"
+        );
+    }
+    ok
+}
+
+/// Ownership and mode bits are Unix notions; elsewhere the walk's stop at the
+/// repository root is the whole of the check.
+#[cfg(not(unix))]
+fn trusted(_path: &Path) -> bool {
+    true
 }
 
 /// The drsg entry among a file's servers: the one `drsg init` writes, else any
@@ -251,6 +287,37 @@ mod tests {
                 source,
             }
         );
+    }
+
+    /// The walk ends at the repository root: a `.mcp.json` above the first
+    /// `.git` belongs to some other tree, and would hand this session — and
+    /// the host's messages — to whatever server it names.
+    #[test]
+    fn the_walk_stops_at_the_repository_root() {
+        let outer = tempfile::tempdir().unwrap();
+        write(outer.path(), WATCH);
+        let repo = outer.path().join("repo");
+        let deep = repo.join("src/inner");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        assert_eq!(discover(&deep), None, "read past the repository root");
+        // The repository's own file, at the root beside `.git`, is found.
+        let own = write(&repo, WATCH);
+        assert_eq!(discover(&deep).map(|u| u.source), Some(own));
+    }
+
+    /// A file anyone can write is not a place to take a credential from.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_writable_file_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = write(root.path(), WATCH);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(discover(root.path()), None, "trusted a world-writable file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(discover(root.path()).is_some());
     }
 
     #[test]

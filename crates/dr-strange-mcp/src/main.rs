@@ -46,7 +46,9 @@ Options:
   -V, --version  Print the version.
 
 With no database named, the nearest .mcp.json is read (walking up, as git
-finds its own directory). If it declares a drsg server and that server
+finds its own directory, and no further than the repository root; a file
+another user owns or anyone can write is passed over). If it declares a
+drsg server and that server
 answers, this process relays the session to it — so a repository prepared by
 `drsg init` is reached through the `drsg serve … watch` already holding its
 database, whose plane is synced to the repository's commits.

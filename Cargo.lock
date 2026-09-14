@@ -1251,6 +1251,7 @@ dependencies = [
  "dr-strange-llm",
  "dr-strange-log",
  "dr-strange-parser",
+ "libc",
  "mimalloc",
  "regex",
  "reqwest 0.13.4",
