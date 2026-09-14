@@ -213,12 +213,14 @@ pub(crate) fn apply(props: &mut Properties, refined: &Refined, report: &mut Refi
         ));
     }
     for (k, v) in incoming {
-        if k.starts_with('_') || k == "embedding" {
-            continue;
-        }
         let Ok(value) = dr_strange_core::json::json_to_value(&v) else {
             continue;
         };
+        // The same rule extraction applies: provenance, the embedding, and
+        // any vector are the pipeline's to write, never a refinement's.
+        if !crate::digest::model_may_set(&k, &value) {
+            continue;
+        }
         match props.get(&k) {
             Some(existing) if existing.value == value => {}
             Some(_) => {
@@ -392,5 +394,26 @@ mod tests {
         assert_eq!(props["_run"].value, PropValue::Str("r1".into()));
         assert_eq!(props["embedding"].value, PropValue::Vector(vec![1.0]));
         assert_eq!(report.props_revised + report.props_added, 0);
+    }
+
+    /// A refinement can name a property anything, so the rule has to be about
+    /// what it *is*: `_generated_by` would make the entity a parser's and so
+    /// the next fold's to delete, and a `$vector` under a fresh name is an
+    /// embedding whatever it is called. A key that is not a name is no key.
+    #[test]
+    fn a_refinement_cannot_claim_provenance_or_plant_a_vector() {
+        use dr_strange_core::{PropValue, Properties};
+        let mut props = Properties::new();
+        let refined: Refined = serde_json::from_str(
+            r#"{"properties":{"_generated_by":"rust@1","stolen":{"$vector":[0.5,0.5]},"":"x","role":"eng"}}"#,
+        )
+        .unwrap();
+        let mut report = RefineReport::default();
+        apply(&mut props, &refined, &mut report);
+        assert!(!props.contains_key("_generated_by"), "{props:?}");
+        assert!(!props.contains_key("stolen"), "{props:?}");
+        assert!(!props.contains_key(""), "{props:?}");
+        assert_eq!(props["role"].value, PropValue::Str("eng".into()));
+        assert_eq!(report.props_added, 1, "only `role` landed");
     }
 }

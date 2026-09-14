@@ -215,6 +215,16 @@ pub struct DigestReport {
     /// and were linked to rather than re-created.
     pub linked: usize,
     pub dropped_relations: usize,
+    /// Entities and relations the model emitted under a key that cannot name
+    /// a node — empty, whitespace, control characters, or longer than
+    /// [`MAX_NAME_CHARS`] — and were dropped before anything downstream saw
+    /// them. A model does not emit these; a document written to steer one
+    /// does, so the count is what makes the attempt visible.
+    pub rejected: usize,
+    /// Properties the model tried to set that only the pipeline may write —
+    /// `_`-prefixed provenance, `embedding`, or a vector under any name —
+    /// and that were dropped instead. See [`model_may_set`].
+    pub reserved_props: usize,
     /// Relations that became the same `(src, dst, type)` once edge types were
     /// reconciled, and so collapsed into one.
     pub merged_relations: usize,
@@ -833,6 +843,16 @@ fn finish(
 
     report.entities = nodes.len();
     report.relations = edges.len();
+    if report.rejected > 0 || report.reserved_props > 0 {
+        // Worth a line of its own: a model does not produce these, a document
+        // written to steer one does, and the operator should hear about it
+        // without reading the report's counters.
+        tracing::warn!(
+            rejected = report.rejected,
+            reserved_props = report.reserved_props,
+            "digest dropped model output that tried to name the unnameable or write provenance",
+        );
+    }
     if report.dropped_relations > 0 {
         tracing::warn!(
             dropped = report.dropped_relations,
@@ -916,23 +936,33 @@ fn merge_extractions(extracts: Vec<ChunkExtract>, report: &mut DigestReport) -> 
         report.input_tokens += extraction.input_tokens;
         report.output_tokens += extraction.output_tokens;
         for e in extraction.entities {
+            // The key becomes a node's external key and a relation endpoint,
+            // so it is checked before it can become either: an empty key would
+            // reach `BulkNode` as a node nothing can name, and an unbounded
+            // one is a document steering the model rather than the model.
+            let Some(key) = model_name(&e.key) else {
+                report.rejected += 1;
+                continue;
+            };
             m.origins
-                .entry(e.key.clone())
+                .entry(key.to_string())
                 .or_default()
                 .insert(chunk_index);
             let node = m
                 .entities
-                .entry(e.key.clone())
+                .entry(key.to_string())
                 .or_insert_with(|| DigestNode {
-                    key: e.key.clone(),
+                    key: key.to_string(),
                     label: String::new(),
                     extra_labels: Vec::new(),
                     props: Properties::new(),
                 });
-            if node.label.is_empty() && !e.label.is_empty() {
-                node.label = e.label;
+            if node.label.is_empty()
+                && let Some(label) = model_name(&e.label)
+            {
+                node.label = label.to_string();
             }
-            merge_props(&mut node.props, &e.properties);
+            report.reserved_props += merge_props(&mut node.props, &e.properties);
             if let Some(d) = e.description {
                 node.props
                     .entry("description".into())
@@ -940,19 +970,22 @@ fn merge_extractions(extracts: Vec<ChunkExtract>, report: &mut DigestReport) -> 
             }
         }
         for r in extraction.relations {
-            if r.ty.is_empty() {
+            let (Some(src), Some(dst), Some(ty)) =
+                (model_name(&r.src), model_name(&r.dst), model_name(&r.ty))
+            else {
+                report.rejected += 1;
                 continue;
-            }
-            if seen_rel.insert((r.src.clone(), r.dst.clone(), r.ty.clone())) {
+            };
+            if seen_rel.insert((src.to_string(), dst.to_string(), ty.to_string())) {
                 let mut props = Properties::new();
-                merge_props(&mut props, &r.properties);
+                report.reserved_props += merge_props(&mut props, &r.properties);
                 if let Some(d) = r.description {
                     props.insert("description".into(), desc_prop(d));
                 }
                 m.edges.push(DigestEdge {
-                    src: r.src,
-                    dst: r.dst,
-                    ty: r.ty,
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                    ty: ty.to_string(),
                     props,
                 });
             }
@@ -977,21 +1010,73 @@ fn desc_prop(text: String) -> PropDesc {
     }
 }
 
+/// Longest key, label, edge type or property name a model may mint, in
+/// characters. Canonical names run to a few dozen; the cap exists so a
+/// document cannot make the model write a paragraph where a key goes.
+pub(crate) const MAX_NAME_CHARS: usize = 512;
+
+/// A model-emitted name fit to become a key, label, edge type or property
+/// name: trimmed, non-empty, bounded, and free of control characters — or
+/// `None`, in which case whatever carried it is dropped and counted.
+///
+/// Checked here rather than at the bulk loader because by then the name has
+/// already been a relation endpoint, an identity candidate and a refinement
+/// subject; the pipeline should never see a name it will not write.
+pub(crate) fn model_name(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    let fits = !s.is_empty()
+        && !s.chars().any(char::is_control)
+        && s.chars().take(MAX_NAME_CHARS + 1).count() <= MAX_NAME_CHARS;
+    fits.then_some(s)
+}
+
+/// Whether a model may set property `name` to `value`.
+///
+/// Three things are the pipeline's to write and nobody else's. `_`-prefixed
+/// names are provenance and bookkeeping: `_generated_by` is what marks a node
+/// as a parser's, and a parser-owned node is one the next watch fold may
+/// delete or rewrite — so a document that got the model to emit it would
+/// hand the graph's ownership to whoever wrote the document. `embedding` is
+/// the vector the pipeline computes from the entity's own text; a model-supplied
+/// one would steer every similarity search that touches the node. And a
+/// vector value under any other name is an embedding by another name.
+///
+/// Applied by extraction and refinement alike, so the two stages that accept
+/// model-named properties cannot disagree about what is settable.
+pub(crate) fn model_may_set(name: &str, value: &PropValue) -> bool {
+    model_name(name) == Some(name)
+        && !name.starts_with('_')
+        && name != "embedding"
+        && !matches!(value, PropValue::Vector(_))
+}
+
 /// Merge JSON properties into a property map, skipping ones that don't convert
-/// and never clobbering an existing key (first chunk wins).
-fn merge_props(into: &mut Properties, from: &serde_json::Map<String, Value>) {
+/// and never clobbering an existing key (first chunk wins). Properties the
+/// model may not set ([`model_may_set`]) are skipped and counted; the count is
+/// returned so the report can say the attempt was made.
+fn merge_props(into: &mut Properties, from: &serde_json::Map<String, Value>) -> usize {
+    let mut reserved = 0;
     for (k, v) in from {
         if into.contains_key(k) {
             continue;
         }
-        if let Ok(value) = json::json_to_value(v) {
-            into.insert(k.clone(), prop(value));
+        let Ok(value) = json::json_to_value(v) else {
+            continue;
+        };
+        if !model_may_set(k, &value) {
+            reserved += 1;
+            continue;
         }
+        into.insert(k.clone(), prop(value));
     }
+    reserved
 }
 
 /// Provenance stamped on everything written (arch/07 §2), as self-describing
-/// `PropDesc`. Underscore-prefixed to sit apart from extracted content.
+/// `PropDesc`. Underscore-prefixed to sit apart from extracted content, and
+/// stamped **after** the model's properties were merged — with
+/// [`model_may_set`] refusing every `_` name, nothing the model said can
+/// survive under these keys, whether or not this overwrote it.
 fn add_provenance(props: &mut Properties, opts: &DigestOptions) {
     let stamp = |props: &mut Properties, key: &str, what: &str, value: &str| {
         props.insert(
@@ -1529,6 +1614,40 @@ mod tests {
             PropDesc::described("year", PropValue::Int(2020)),
         );
         assert!(embeddable_text("k", &[], &doc).contains("year: 2020"));
+    }
+
+    /// What a model may name, and what it may set — the rule extraction and
+    /// refinement share.
+    #[test]
+    fn model_names_are_trimmed_bounded_and_printable() {
+        assert_eq!(model_name("  alice "), Some("alice"));
+        assert_eq!(model_name(""), None);
+        assert_eq!(model_name("   "), None);
+        assert_eq!(model_name("a\u{0}b"), None, "control characters");
+        assert_eq!(model_name("line\nbreak"), None);
+        let fits = "x".repeat(MAX_NAME_CHARS);
+        assert_eq!(model_name(&fits), Some(fits.as_str()));
+        assert_eq!(model_name(&"x".repeat(MAX_NAME_CHARS + 1)), None);
+        // Multi-byte text is measured in characters, not bytes.
+        let cjk = "数".repeat(MAX_NAME_CHARS);
+        assert_eq!(model_name(&cjk), Some(cjk.as_str()));
+    }
+
+    #[test]
+    fn a_model_may_set_content_but_not_provenance_or_vectors() {
+        let s = PropValue::Str("x".into());
+        assert!(model_may_set("role", &s));
+        assert!(model_may_set("year", &PropValue::Int(2020)));
+        for reserved in ["_generated_by", "_source", "_run", "_model", "_anything"] {
+            assert!(!model_may_set(reserved, &s), "{reserved}");
+        }
+        assert!(!model_may_set("embedding", &s));
+        assert!(!model_may_set("anything", &PropValue::Vector(vec![1.0])));
+        assert!(!model_may_set("", &s));
+        assert!(
+            !model_may_set(" role", &s),
+            "a name with padding is not a name"
+        );
     }
 
     #[test]

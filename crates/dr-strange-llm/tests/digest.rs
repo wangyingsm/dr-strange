@@ -145,6 +145,86 @@ fn digests_entities_relations_provenance_and_embeddings() {
     );
 }
 
+/// Top finding of the audit: a document written to steer the model. The
+/// extraction it produces names `_generated_by` (which would make the node a
+/// parser's — and `sync_paths` deletes parser-owned nodes whose facts vanish),
+/// `_source` (forged provenance), an `embedding` and a vector under a fresh
+/// name (a steered similarity search), an empty property name, and entities
+/// and relations under keys that are empty, blank, or a paragraph long.
+/// Every one of those is dropped and counted; the honest content lands.
+#[test]
+fn a_poisoned_extraction_cannot_claim_ownership_or_plant_vectors() {
+    let long_key = "k".repeat(2000);
+    let poisoned = format!(
+        r#"{{
+          "entities": [
+            {{"key":"mallory","label":"Person","properties":{{
+                "_generated_by":"rust@1",
+                "_source":"forged.rs",
+                "_run":"forged",
+                "embedding":{{"$vector":[1.0,0.0,0.0,0.0]}},
+                "stolen":{{"$vector":[0.5,0.5,0.5,0.5]}},
+                "":"nameless",
+                "role":"engineer"}},
+              "description":"Honest content."}},
+            {{"key":"","label":"Ghost","properties":{{}}}},
+            {{"key":"   ","label":"Ghost","properties":{{}}}},
+            {{"key":"{long_key}","label":"Ghost","properties":{{}}}},
+            {{"key":"acme","label":"Company","properties":{{}}}}
+          ],
+          "relations": [
+            {{"src":"mallory","dst":"acme","type":"WORKS_AT"}},
+            {{"src":"mallory","dst":"","type":"KNOWS"}},
+            {{"src":"","dst":"acme","type":"KNOWS"}},
+            {{"src":"mallory","dst":"acme","type":"   "}}
+          ]
+        }}"#
+    );
+    let mock = MockProvider::new(vec![poisoned], 4);
+    let result = digest("Mallory works at Acme.", &mock, &mock, None, &opts(false)).unwrap();
+
+    let keys: Vec<&str> = result.nodes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(keys, vec!["acme", "mallory"], "only nameable entities land");
+    let mallory = result.nodes.iter().find(|n| n.key == "mallory").unwrap();
+    // Provenance is the pipeline's: stamped from the options, never the model.
+    assert!(
+        !mallory.props.contains_key("_generated_by"),
+        "{:?}",
+        mallory.props
+    );
+    assert_eq!(
+        mallory.props["_source"].value,
+        PropValue::Str("doc.txt".into()),
+        "the forged source must not survive under the real one"
+    );
+    assert_eq!(mallory.props["_run"].value, PropValue::Str("run-42".into()));
+    // No vector under any name: `embed: false`, and the model cannot supply one.
+    assert!(
+        !mallory.props.contains_key("embedding"),
+        "{:?}",
+        mallory.props
+    );
+    assert!(!mallory.props.contains_key("stolen"), "{:?}", mallory.props);
+    assert!(!mallory.props.contains_key(""), "{:?}", mallory.props);
+    assert_eq!(
+        mallory.props["role"].value,
+        PropValue::Str("engineer".into())
+    );
+    assert_eq!(
+        mallory.props["description"].value,
+        PropValue::Str("Honest content.".into())
+    );
+    // The honest relation stands; the ones onto nothing never became edges.
+    assert_eq!(result.edges.len(), 1);
+    assert_eq!(result.edges[0].ty, "WORKS_AT");
+    // And the report says the attempt was made.
+    assert_eq!(result.report.rejected, 3 + 3, "3 entities and 3 relations");
+    assert_eq!(
+        result.report.reserved_props, 6,
+        "the six unsettable properties"
+    );
+}
+
 #[test]
 fn apply_writes_the_graph() {
     let mock = MockProvider::new(vec![REPLY.to_string()], 8);
