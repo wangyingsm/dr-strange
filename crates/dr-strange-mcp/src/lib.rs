@@ -1213,11 +1213,6 @@ impl GrepOut<'_> {
     /// The honesty footer: what was not searched, what was cut, and the call
     /// to make next.
     fn finish(mut self, req: &GrepReq) -> String {
-        // Constructs that are near-certainly a reach for a pattern language this
-        // search does not have. `(`, `[` and a lone `.` are deliberately absent:
-        // they are ordinary in a literal code search (`TrimPrefix(`), and a hint
-        // that cries wolf is a hint that gets read past.
-        const REGEX_TELLS: &[&str] = &["|", ".*", ".+", r"\d", r"\w", r"\s", r"\b"];
         if self.hits == 0 {
             self.out.push_str("no matches\n");
             if let Some(f) = req.path.as_deref() {
@@ -1230,7 +1225,7 @@ impl GrepOut<'_> {
             // conclusion. Only when `regex` was not asked for — having asked, an
             // empty result means what it says.
             if !req.regex.unwrap_or(false)
-                && let Some(tell) = REGEX_TELLS.iter().find(|t| req.pattern.contains(**t))
+                && let Some(tell) = regex_tell(&req.pattern)
             {
                 self.out.push_str(&format!(
                     "note: search text contains a regexp pattern ({tell}). it seems to be a pattern match \
@@ -1250,6 +1245,15 @@ impl GrepOut<'_> {
         }
         self.out
     }
+}
+
+/// The construct that gives a literal search pattern away as a regex, if any.
+///
+/// `(`, `[` and a lone `.` are deliberately absent: they are ordinary in a
+/// literal code search (`TrimPrefix(`), and a hint that cries wolf is read past.
+pub(crate) fn regex_tell(pattern: &str) -> Option<&'static str> {
+    const REGEX_TELLS: &[&str] = &["|", ".*", ".+", r"\d", r"\w", r"\s", r"\b"];
+    REGEX_TELLS.iter().copied().find(|t| pattern.contains(t))
 }
 
 /// One line as `grep` prints it: trimmed, and cut at a width past which a
