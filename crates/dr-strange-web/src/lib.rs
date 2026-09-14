@@ -150,6 +150,14 @@ impl Default for DigestDefaults {
 pub const DEFAULT_DIGEST_CONCURRENCY: usize = 8;
 pub const DEFAULT_DIGEST_CHUNK_CHARS: usize = 4000;
 
+/// The most a *request* may raise `digest.run`'s knobs to, unless the
+/// operator's own `[digest]` default is higher (then that is the ceiling).
+/// Concurrency is chat calls in flight on the server's key; chunk size is
+/// prompt tokens per call. Both were the caller's to name without bound, on
+/// a read credential.
+pub const DIGEST_MAX_CONCURRENCY: usize = 32;
+pub const DIGEST_MAX_CHUNK_CHARS: usize = 32_000;
+
 /// Policy for the URL fetcher (ROADMAP §9), from the `[fetch]` config section.
 ///
 /// Fetching ships **enabled**: a database that must be reconfigured before it

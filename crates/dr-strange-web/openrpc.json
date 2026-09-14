@@ -268,7 +268,7 @@
           "name": "embed",
           "schema": {
             "type": "string",
-            "description": "Provider preset or base URL (default openai)"
+            "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
@@ -636,7 +636,7 @@
           "required": false,
           "schema": {
             "type": "string",
-            "description": "Embedding provider for a text SEARCH ... NEAR \"...\" (default openai); key from the server env."
+            "description": "Embedding provider for a text SEARCH ... NEAR \"...\". Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
@@ -701,8 +701,9 @@
         {
           "name": "provider",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
@@ -969,8 +970,9 @@
         {
           "name": "provider",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
@@ -1018,25 +1020,30 @@
         },
         {
           "name": "max_attempts",
+          "summary": "Total model attempts including repairs. Default 20, which is also the ceiling: each attempt is a chat call on the server's key, so a request may lower it but not raise it.",
           "required": false,
           "schema": {
             "type": "integer",
-            "default": 6
+            "default": 20,
+            "maximum": 20
           }
         },
         {
           "name": "limit",
+          "summary": "Row cap appended when the plan declares none. Default 100, at most 1000.",
           "required": false,
           "schema": {
             "type": "integer",
-            "default": 100
+            "default": 100,
+            "maximum": 1000
           }
         },
         {
           "name": "provider",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
@@ -1049,8 +1056,9 @@
         {
           "name": "embed_provider",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment. Omit to disable the grounding tools."
           }
         },
         {
@@ -1315,15 +1323,17 @@
         {
           "name": "chat",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Chat provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Default openai; the API key comes from the server's environment."
           }
         },
         {
           "name": "embed",
           "required": false,
-          "schema": {
-            "type": "string"
+"schema": {
+            "type": "string",
+            "description": "Embedding provider name: one of the presets (openai, deepseek, qwen, ollama) or exactly the provider the server was configured with. A base URL is refused (-32602): the server would be posting to it from its own network. Defaults to the chat provider; the API key comes from the server's environment."
           }
         },
         {
@@ -1365,6 +1375,7 @@
         },
         {
           "name": "concurrency",
+          "summary": "Extraction chat calls in flight at once. Default from the server's [digest] config (else 8); capped at 32 or the server default, whichever is larger. Zero is rounded up to one.",
           "required": false,
           "schema": {
             "type": "integer",
@@ -1373,6 +1384,7 @@
         },
         {
           "name": "chunk_chars",
+          "summary": "Target chunk size in characters. Default from the server's [digest] config (else 4000); capped at 32000 or the server default, whichever is larger.",
           "required": false,
           "schema": {
             "type": "integer",
