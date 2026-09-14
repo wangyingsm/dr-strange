@@ -109,7 +109,7 @@ pub const DEFAULT_TOOL_CONCURRENCY: usize = 16;
 
 /// The preprocessors every session shares unless its host names others: the
 /// default plugin store, loaded on first use and reloaded when it changes.
-fn default_parsers() -> Arc<dyn Parsers> {
+pub fn default_parsers() -> Arc<dyn Parsers> {
     static SHARED: std::sync::OnceLock<Arc<dyn Parsers>> = std::sync::OnceLock::new();
     SHARED
         .get_or_init(|| {

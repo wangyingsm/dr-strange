@@ -289,6 +289,10 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         limit: usize,
     },
+    /// Code as it was at a git revision: a file, a range, a directory or a
+    /// symbol read at `--at`; a search of that tree (`--pattern`); or what
+    /// changed since an older revision (`--vs`).
+    Recall(RecallArgs),
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         #[arg(long)]
@@ -754,6 +758,91 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `drsg recall`'s arguments: the MCP tool's request, as flags.
+#[derive(clap::Args)]
+struct RecallArgs {
+    /// A path, `path:start-end`, a directory, or a symbol (fuzzy). Omit it with `--pattern`.
+    name: Option<String>,
+    /// The revision: a sha, a branch, a tag, HEAD, a date (YYYY-MM-DD or
+    /// RFC-3339) or `<rev>@{<date>}`, each optionally followed by `~n` / `^n`.
+    #[arg(long)]
+    at: String,
+    #[arg(long, default_value = "startup")]
+    plane: String,
+    /// An older revision: print what changed in the name since then.
+    #[arg(long)]
+    vs: Option<String>,
+    /// Lines returned (a file 40, a symbol its extent, a diff 200; max 400).
+    #[arg(long)]
+    lines: Option<usize>,
+    /// Search the tree at `--at` for this text instead of reading a name.
+    #[arg(long)]
+    pattern: Option<String>,
+    /// Treat the pattern as a POSIX extended regex (git's).
+    #[arg(long)]
+    regex: bool,
+    /// Case-insensitive matching.
+    #[arg(long)]
+    ignore_case: bool,
+    /// Only under this directory or file, or with this extension (`.rs`).
+    #[arg(long)]
+    path: Option<String>,
+    /// Max matching lines (default 50, max 200).
+    #[arg(long)]
+    max_results: Option<usize>,
+    /// The checkout to read, when the plane records none of its own.
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
+impl RecallArgs {
+    /// The tool's request these flags spell, and the fallback checkout.
+    fn into_req(self) -> (dr_strange_mcp::RecallReq, Option<PathBuf>) {
+        let req = dr_strange_mcp::RecallReq {
+            plane: self.plane,
+            name: self.name,
+            at: self.at,
+            vs: self.vs,
+            lines: self.lines,
+            pattern: self.pattern,
+            regex: self.regex.then_some(true),
+            ignore_case: self.ignore_case.then_some(true),
+            path: self.path,
+            max_results: self.max_results,
+        };
+        (req, self.root)
+    }
+}
+
+/// The preprocessors `recall` locates a symbol with: the configured plugin store.
+#[cfg(feature = "digest")]
+fn recall_parsers(cfg: &config::Config) -> Result<std::sync::Arc<dyn dr_strange_mcp::Parsers>> {
+    let live = dr_strange_llm::LivePlugins::new(config::plugin_config(cfg)?);
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(live)))
+}
+
+/// The preprocessors `recall` locates a symbol with: the default plugin store,
+/// since this build carries no `[plugins]` configuration of its own.
+#[cfg(not(feature = "digest"))]
+fn recall_parsers(_cfg: &config::Config) -> Result<std::sync::Arc<dyn dr_strange_mcp::Parsers>> {
+    Ok(dr_strange_mcp::default_parsers())
+}
+
+/// `drsg recall`: the MCP tool's body over flags, printed as its text.
+fn run_recall(
+    args: RecallArgs,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let db = commands::open(db_path)?;
+    let (req, root) = args.into_req();
+    let parsers = recall_parsers(cfg)?;
+    let rendered = dr_strange_mcp::recall_logic(&db, root.as_deref(), &*parsers, req)?;
+    write!(out, "{}", as_text(&rendered))?;
+    Ok(())
+}
+
 /// The tree a plane was parsed from, as it recorded at digest time.
 ///
 /// `grep` searches a directory, and the right one is the plane's own — the
@@ -1085,6 +1174,7 @@ fn run_tree_verbs(
             let db = commands::open(db_path)?;
             commands::history(&db, &plane, limit, out)
         }
+        Command::Recall(args) => run_recall(args, db_path, cfg, out),
         other => run_analytics(other, db_path, cfg, out),
     }
 }
@@ -1542,6 +1632,67 @@ mod tests {
             }
             _ => panic!("should parse as Serve(Watch)"),
         }
+    }
+
+    /// `recall` spells the tool's request as flags; the answering half is the
+    /// MCP crate's, and is tested there.
+    #[test]
+    fn recall_parses_into_the_request_its_tool_takes() {
+        let read = Cli::try_parse_from([
+            "drsg",
+            "recall",
+            "src/lib.rs:3-9",
+            "--at",
+            "v1",
+            "--plane",
+            "p",
+        ])
+        .unwrap();
+        let Command::Recall(args) = read.command else {
+            panic!("should parse as Recall")
+        };
+        let (req, root) = args.into_req();
+        assert_eq!(req.name.as_deref(), Some("src/lib.rs:3-9"));
+        assert_eq!((req.at.as_str(), req.plane.as_str()), ("v1", "p"));
+        assert_eq!((req.vs, req.pattern, root), (None, None, None));
+        assert_eq!(
+            (req.regex, req.ignore_case),
+            (None, None),
+            "an unset flag stays unset, so reading a name is not refused"
+        );
+
+        let search = Cli::try_parse_from([
+            "drsg",
+            "recall",
+            "--pattern",
+            "fn (a|b)",
+            "--at",
+            "HEAD~2",
+            "--regex",
+            "--path",
+            ".rs",
+        ])
+        .unwrap();
+        let Command::Recall(args) = search.command else {
+            panic!("should parse as Recall")
+        };
+        let (req, _) = args.into_req();
+        assert_eq!(req.name, None);
+        assert_eq!(req.pattern.as_deref(), Some("fn (a|b)"));
+        assert_eq!((req.regex, req.ignore_case), (Some(true), None));
+        assert_eq!(req.path.as_deref(), Some(".rs"));
+
+        let diff =
+            Cli::try_parse_from(["drsg", "recall", "k::go", "--at", "main", "--vs", "v2.0.0"])
+                .unwrap();
+        let Command::Recall(args) = diff.command else {
+            panic!("should parse as Recall")
+        };
+        assert_eq!(args.into_req().0.vs.as_deref(), Some("v2.0.0"));
+        assert!(
+            Cli::try_parse_from(["drsg", "recall", "src/lib.rs"]).is_err(),
+            "`--at` is required"
+        );
     }
 
     /// The reader's verbs the MCP surface had and the CLI did not. Parsing is
