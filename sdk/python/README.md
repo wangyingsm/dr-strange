@@ -44,7 +44,9 @@ A runnable version is [`examples/quickstart.py`](examples/quickstart.py) — `py
 The whole surface is authenticated. Pass `token=` or set `DRSG_TOKEN`; it rides
 each request as `Authorization: Bearer …`. A missing/invalid credential raises
 `DrsgAuthError` (code `-32001`); other server errors raise `DrsgError` with a
-`.code`.
+`.code`. A reply that is not JSON-RPC at all, or a change-feed frame that is
+truncated or larger than `drsg._client.MAX_FRAME_BYTES` (64 MiB), raises
+`DrsgProtocolError` (a `DrsgError` with code `-32000`).
 
 ## Discover
 

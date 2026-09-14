@@ -12,6 +12,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/drsg"]
+# PEP 561: the package is typed; the marker has to travel in the wheel for
+# consumers' type checkers to read the annotations. `packages` already
+# includes every file under src/drsg, and this keeps it so if that changes.
+artifacts = ["src/drsg/py.typed"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

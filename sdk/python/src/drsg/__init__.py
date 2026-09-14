@@ -11,8 +11,8 @@ The method surface is generated from the server's OpenRPC schema
 (`crates/dr-strange-web/openrpc.json`), so it always matches the wire protocol.
 """
 
-from ._client import DrsgAuthError, DrsgError
+from ._client import DrsgAuthError, DrsgError, DrsgProtocolError
 from ._generated import Drsg
 
-__all__ = ["Drsg", "DrsgError", "DrsgAuthError"]
+__all__ = ["Drsg", "DrsgError", "DrsgAuthError", "DrsgProtocolError"]
 __version__ = "2.7.0"
