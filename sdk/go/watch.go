@@ -142,6 +142,17 @@ type wsConn struct {
 // credential in a URL, where proxies and access logs would keep it. Both the
 // TCP/TLS dial and the HTTP upgrade honour ctx:
 // cancelling it, or reaching its deadline, fails the call promptly.
+// validHeaderToken reports whether token can be written as an HTTP header
+// value: no byte below 0x20 and no DEL, the same rule sdk/c applies.
+func validHeaderToken(token string) bool {
+	for i := 0; i < len(token); i++ {
+		if token[i] < 0x20 || token[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func dialWebSocket(ctx context.Context, baseURL, token string) (*wsConn, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -155,6 +166,14 @@ func dialWebSocket(ctx context.Context, baseURL, token string) (*wsConn, error) 
 		} else {
 			host += ":80"
 		}
+	}
+	// The header below is written verbatim, so a token carrying a control
+	// byte (CR, LF) could end the header line and forge another; refuse it
+	// before dialling, as the C client does, rather than send a malformed
+	// request. The RPC path goes through net/http, which already rejects such
+	// a header value, so the two transports agree on what is sendable.
+	if !validHeaderToken(token) {
+		return nil, &Error{Code: -32000, Message: "token contains a control character"}
 	}
 
 	if _, ok := ctx.Deadline(); !ok {

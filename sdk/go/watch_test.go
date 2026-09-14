@@ -142,6 +142,28 @@ func TestWatchSendsBearerHeaderNotQueryToken(t *testing.T) {
 	}
 }
 
+// A token holding a control character would end the Authorization line and
+// forge another header; it is refused before any connection is dialled.
+func TestWatchRefusesControlCharacterTokenBeforeDialling(t *testing.T) {
+	dialled := make(chan struct{}, 1)
+	srv := fakeWSInspecting(t, func(*http.Request) {
+		dialled <- struct{}{}
+	}, func(conn net.Conn, r *bufio.Reader) {
+		_, _ = conn.Write([]byte{0x88, 0x00})
+	})
+
+	_, err := New(WithBaseURL(srv.URL), WithToken("x\r\nX-Forged: 1")).Watch(context.Background(), "p")
+	var e *Error
+	if !errors.As(err, &e) || e.Code != -32000 || !strings.Contains(e.Message, "control character") {
+		t.Fatalf("err = %v, want -32000 'token contains a control character'", err)
+	}
+	select {
+	case <-dialled:
+		t.Fatal("a request reached the server; the token should have been refused before dialling")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestWatchServerClosesFirstLeavesNoGoroutine(t *testing.T) {
 	srv := fakeWS(t, func(conn net.Conn, r *bufio.Reader) {
 		_, _ = readClientFrame(r) // the subscribe request
