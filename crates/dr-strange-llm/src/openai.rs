@@ -215,6 +215,18 @@ fn looks_like_url(provider: &str) -> bool {
 /// A raw base URL has no preset behind it, so it carries no default key env and
 /// no default model: pass `key_env` when the endpoint needs a key, and `model`
 /// (always, for embeddings — an empty embedding model is rejected below).
+///
+/// # Trust
+///
+/// A raw URL — whether as `provider` or as `url` — is **operator-trusted**:
+/// this function will POST to it, from this process, on the network this
+/// process is on. That is what an operator at their own terminal or config
+/// file means by it, and it is a server-side request forgery when the string
+/// came from anyone else. A remote or unauthenticated request must therefore
+/// never reach this function with a URL: a surface that accepts a provider
+/// name over the wire restricts it with [`is_preset`](crate::is_preset) and
+/// passes no `url`, so the only endpoints reachable are the fixed ones in
+/// [`crate::preset`].
 pub fn build_provider(
     provider: &str,
     model: Option<&str>,
