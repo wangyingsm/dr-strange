@@ -27,6 +27,16 @@ use crate::FollowOptions;
 /// snapshot would be one.
 const SNAPSHOT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How many replicated batches may wait between the socket and the apply
+/// loop. Bounded, because the master writes at its own pace and this end
+/// applies at its own: on a follower that falls behind, an unbounded queue
+/// would hold every batch the master ever sent until memory ran out, when
+/// the design's answer to falling behind is a full resync anyway. When the
+/// queue is full the reader stops pulling from the socket, so the pressure
+/// lands in the TCP window where the master's broadcast can lag the follower
+/// out and force that resync — a bounded, visible failure.
+pub const REPLICATION_QUEUE: usize = 1024;
+
 fn token_query(token: &Option<String>) -> String {
     match token {
         Some(t) => format!(
@@ -54,7 +64,7 @@ fn snapshot_url(opts: &FollowOptions) -> String {
 /// the live tail; it closes when the WAL stream is lost.
 pub struct Bootstrapped {
     pub stats: SnapshotStats,
-    pub batches: mpsc::UnboundedReceiver<ReplicatedBatch>,
+    pub batches: mpsc::Receiver<ReplicatedBatch>,
 }
 
 /// Connect to `opts.upstream`, pull a full snapshot into `db` (which must be
@@ -67,13 +77,14 @@ pub async fn bootstrap(db: &Database, opts: &FollowOptions) -> anyhow::Result<Bo
     // captured in `raw_rx`, even the ones that land before the snapshot pull
     // below finishes. Read-only; the client never sends anything post-upgrade.
     let (_write, mut read) = ws.split();
-    let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<ReplicatedBatch>();
+    let (raw_tx, mut raw_rx) = mpsc::channel::<ReplicatedBatch>(REPLICATION_QUEUE);
     tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Binary(bytes)) => match postcard::from_bytes(&bytes) {
                     Ok(batch) => {
-                        if raw_tx.send(batch).is_err() {
+                        // Waits while the queue is full — see REPLICATION_QUEUE.
+                        if raw_tx.send(batch).await.is_err() {
                             break; // nobody's consuming anymore
                         }
                     }
@@ -103,16 +114,19 @@ pub async fn bootstrap(db: &Database, opts: &FollowOptions) -> anyhow::Result<Bo
     // Drain whatever arrived during the pull: already-covered commits are
     // skipped, anything past the snapshot's cutover is exactly the start of
     // the live tail, so hand it straight through on the same channel.
-    let (tail_tx, tail_rx) = mpsc::unbounded_channel();
+    // Same bound as the raw queue: what was buffered during the pull fits by
+    // construction, and the forwarder below waits on a full tail exactly as
+    // the reader waits on a full raw queue.
+    let (tail_tx, tail_rx) = mpsc::channel(REPLICATION_QUEUE);
     while let Ok(batch) = raw_rx.try_recv() {
         if batch.seq > stats.seq {
-            let _ = tail_tx.send(batch);
+            let _ = tail_tx.send(batch).await;
         }
     }
     // Keep forwarding everything from here on.
     tokio::spawn(async move {
         while let Some(batch) = raw_rx.recv().await {
-            if tail_tx.send(batch).is_err() {
+            if tail_tx.send(batch).await.is_err() {
                 break;
             }
         }
@@ -149,7 +163,7 @@ async fn fetch_snapshot(opts: &FollowOptions) -> anyhow::Result<Vec<u8>> {
 /// CLI's outer loop resyncs from scratch.
 pub async fn run_live_tail(
     db: Arc<Database>,
-    mut batches: mpsc::UnboundedReceiver<ReplicatedBatch>,
+    mut batches: mpsc::Receiver<ReplicatedBatch>,
     resync_needed: Arc<AtomicBool>,
     follow_lost: Arc<Notify>,
 ) {
@@ -172,4 +186,27 @@ pub async fn run_live_tail(
     tracing::warn!("WAL replication stream ended; a full resync is needed");
     resync_needed.store(true, Ordering::Relaxed);
     follow_lost.notify_one();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live tail reads from a bounded queue and, when the queue closes
+    /// (the socket reader gave up), returns having asked for a resync —
+    /// the ordinary end of a follow, not an error.
+    #[tokio::test]
+    async fn the_live_tail_ends_when_the_bounded_queue_closes() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (tx, rx) = mpsc::channel::<ReplicatedBatch>(REPLICATION_QUEUE);
+        let resync = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(Notify::new());
+        drop(tx);
+        run_live_tail(db, rx, resync.clone(), lost.clone()).await;
+        assert!(resync.load(Ordering::Relaxed));
+        // `notify_one` stores a permit, so a late waiter still wakes.
+        tokio::time::timeout(Duration::from_secs(1), lost.notified())
+            .await
+            .expect("the loss is signalled");
+    }
 }
