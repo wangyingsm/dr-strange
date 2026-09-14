@@ -338,14 +338,14 @@ impl GraphReader for CachedReader<'_> {
             return Ok(v.clone()); // L1 (per-query), including a cached miss
         }
         if let Some((cache, seq)) = self.l2
-            && let Some(node) = cache.node(id.0, seq)
+            && let Some(node) = cache.node(self.plane, id.0, seq)
         {
             self.nodes.borrow_mut().insert(id, Some(node.clone()));
             return Ok(Some(node)); // L2 (cross-query, seq-valid)
         }
         let v = graph::get_node(self.txn, self.plane, id)?.map(Arc::new);
         if let (Some((cache, seq)), Some(node)) = (self.l2, &v) {
-            cache.put_node(id.0, seq, node.clone()); // only existing records
+            cache.put_node(self.plane, id.0, seq, node.clone()); // only existing records
         }
         self.nodes.borrow_mut().insert(id, v.clone());
         Ok(v)
@@ -356,14 +356,14 @@ impl GraphReader for CachedReader<'_> {
             return Ok(v.clone());
         }
         if let Some((cache, seq)) = self.l2
-            && let Some(edge) = cache.edge(id.0, seq)
+            && let Some(edge) = cache.edge(self.plane, id.0, seq)
         {
             self.edges.borrow_mut().insert(id, Some(edge.clone()));
             return Ok(Some(edge));
         }
         let v = graph::get_edge(self.txn, self.plane, id)?.map(Arc::new);
         if let (Some((cache, seq)), Some(edge)) = (self.l2, &v) {
-            cache.put_edge(id.0, seq, edge.clone());
+            cache.put_edge(self.plane, id.0, seq, edge.clone());
         }
         self.edges.borrow_mut().insert(id, v.clone());
         Ok(v)
@@ -375,14 +375,14 @@ impl GraphReader for CachedReader<'_> {
             return Ok(v.clone());
         }
         if let Some((cache, seq)) = self.l2
-            && let Some(a) = cache.adj(id.0, dir, ty, seq)
+            && let Some(a) = cache.adj(self.plane, id.0, dir, ty, seq)
         {
             self.adjacency.borrow_mut().insert(key, a.clone());
             return Ok(a);
         }
         let a: Arc<[Neighbor]> = graph::neighbors(self.txn, self.plane, id, dir, ty)?.into();
         if let Some((cache, seq)) = self.l2 {
-            cache.put_adj(id.0, dir, ty, seq, a.clone());
+            cache.put_adj(self.plane, id.0, dir, ty, seq, a.clone());
         }
         self.adjacency.borrow_mut().insert(key, a.clone());
         Ok(a)
