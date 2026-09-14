@@ -34,6 +34,16 @@ matching MCP config for Cursor, OpenCode, Gemini CLI, or Codex CLI, but only
 for a tool whose own marker (a directory it creates, or a config file it
 already owns) is already present in the repository.
 
+Where the token goes follows what each client can do. `.mcp.json` and
+`.cursor/mcp.json` carry it literally — Cursor is a desktop app launched with
+no shell environment to read one from — and both are added to the
+`.gitignore` block `init` maintains (with the database, its sidecars and
+`logs/`). `.opencode.json` and `.gemini/settings.json` existed before `init`
+and are as likely as not committed, so they get an environment reference in
+the client's own syntax (`{env:DRSG_TOKEN}`, `$DRSG_TOKEN`) instead, as the
+Codex entry always has (`bearer_token_env_var`); `init` prints the
+`export DRSG_TOKEN=…` line to run before launching those clients here.
+
 For Claude Code it also installs two hooks, in the repository's
 `.claude/settings.local.json` (the per-user file, so nothing lands in the
 tree a team shares) with the scripts beside the plugin store. A config tells
@@ -42,8 +52,12 @@ an agent where the graph is; the hooks tell it *when* to use it. The
 every code question, shell last — where it survives a resume and a
 compaction. The `PreToolUse` hook meets an `rg`, `grep`, `cat` or `sed -n`
 on code with the verb that answers instead, and `DRSG_RAW=1 <command>` runs
-any command untouched, for the file no plane holds. The other hosts have no
-hooks; they get the same rule from the server's own MCP instructions, which
+any command untouched, for the file no plane holds. A redirect or heredoc is
+a write and passes; a search whose *pattern* holds an arrow (`rg '>'`,
+`grep "a -> b"`) is still a search and is redirected. Re-running `init` after
+the scripts' directory moved repoints the entries — only entries whose
+command is exactly one of drsg's scripts; a team's own hooks, even one named
+`my-drsg-shell-guard`, are left alone. The other hosts have no hooks; they get the same rule from the server's own MCP instructions, which
 every host places in the system prompt.
 
 ```console
@@ -52,6 +66,7 @@ plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mc
   + wrote ./.mcp.json
   + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
+  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=… before launching `gemini` here)
 ```
 
 **Run `drsg init` again whenever the server is gone.** It spawns `serve

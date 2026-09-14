@@ -86,12 +86,20 @@ drsg 2.7.0 is the latest release — nothing to do
 ```console
 $ drsg update
 drsg 2.6.0 -> 2.7.0
-$ curl -fsSL .../install.sh | sh -s -- --bin drsg --dir '/home/me/.local/bin'
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.7.0/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.7.0' --dir '/home/me/.local/bin'
 Dr Strange v2.7.0 (x86_64-unknown-linux-gnu)
   downloading dr-strange-v2.7.0-x86_64-unknown-linux-gnu.tar.gz
   checksum verified
   installed /home/me/.local/bin/drsg
 ```
+
+它运行的安装脚本是**随所装版本一起打了标签的那一份**，而非 `master` 上的副本，
+并把该版本作为 `--version` 一并传入：校验归档的脚本就是与它一同审阅、一同发布的
+脚本，移动分支改变不了升级所执行的内容。两个安装脚本都要求归档的 `.sha256`
+校验文件——缺失、格式不对或不匹配都是硬性失败，没有 `sha256sum`/`shasum` 可用
+也是。`--insecure-skip-checksum`（PowerShell 中为 `-InsecureSkipChecksum`；两者
+及 `drsg update` 均可用 `DRSG_INSECURE_SKIP_CHECKSUM=1`）会带着警告照装不误：它
+是给不发布校验文件的镜像用的，名字已说明代价。
 
 安装目录取的是正在运行的这个二进制所在的目录，而不是安装脚本的默认值——升级必须
 替换 `PATH` 上的那一份，而不是在别处放一份更新的、让旧的继续被运行。若 `drsg`
@@ -217,9 +225,9 @@ $ DRSG_TOKEN=please-change-me drsg --db graph.drsg serve
 ```toml
 [server]
 addr = "0.0.0.0:7700"                       # 监听地址（命令行 --addr 覆盖此项）
-token = "please-change-me"                  # 共享 API 令牌（→ DRSG_TOKEN）
+token = "please-change-me"                  # 共享 API 令牌（→ DRSG_TOKEN）；会成为进程环境变量，建议改为在启动环境中导出
 max_concurrent = 256                        # 并发请求上限
-retain_commits = 20                         # 时间旅行可回溯的提交数；更早的版本在压缩时回收（0 表示全部保留）
+retain_commits = 20                         # 时间旅行可回溯的提交数；更早的版本在压缩时回收（0 表示全部保留）。对每个打开数据库的 drsg 命令生效，不只是 serve
 source_root = "/srv/myrepo"                 # grep/snippet 智能体工具读取的源码树（serve watch 会用 --dir 设置它）
 allowed_origins = ["https://app.example.com"]  # 额外允许的浏览器来源
 

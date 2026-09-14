@@ -46,7 +46,15 @@ plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mc
   + wrote ./.mcp.json
   + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
+  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=… before launching `gemini` here)
 ```
+
+令牌的去向取决于各客户端能做什么：`.mcp.json` 与 `.cursor/mcp.json` 直接写入令牌
+（Cursor 是桌面应用，启动时没有可读取的 shell 环境），并被加入 `init` 维护的
+`.gitignore` 块；`.opencode.json` 与 `.gemini/settings.json` 在 `init` 之前就已存在、
+多半已提交，因此只写入该客户端自身语法的环境变量引用（`{env:DRSG_TOKEN}`、
+`$DRSG_TOKEN`），与 Codex 条目一样——`init` 会打印启动这些客户端前要执行的
+`export DRSG_TOKEN=…`。
 
 **服务进程没了，就再运行一次 `drsg init`。** 它在后台启动 `serve watch`，并把这个
 进程的地址与令牌记录在 `.mcp.json` 里；但没有任何东西会重启它——MCP 的 `http` 条目
