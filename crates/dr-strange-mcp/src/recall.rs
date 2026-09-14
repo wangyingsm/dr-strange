@@ -309,15 +309,28 @@ fn path_lines(
     Ok(out)
 }
 
-/// A symbol's declaration as it was: today's key, its file at the tree's
-/// commit parsed by the installed preprocessors, and the lines they place it on.
-fn symbol_lines(
-    plane: &PlaneHandle<'_>,
-    tree: &GitTree,
-    parsers: &dyn Parsers,
-    req: &RecallReq,
-) -> AnyResult<String> {
-    let at = tree.sha().short();
+/// A symbol as today's graph knows it.
+struct Symbol {
+    key: String,
+    /// Its file as the graph records it.
+    file: String,
+    /// The commit whose tree carries `file` under that name.
+    later: String,
+}
+
+/// Where a symbol's declaration sits in its file at one commit.
+struct Located {
+    /// The file it is in at that commit.
+    file: String,
+    /// Set when the file had another name at that commit.
+    note: String,
+    line: usize,
+    /// The declaration's last line, when the parser recorded one.
+    declared: Option<usize>,
+}
+
+/// Resolve the request's name in today's graph; `at` only words the answer when nothing matches.
+fn symbol(plane: &PlaneHandle<'_>, req: &RecallReq, at: &str) -> AnyResult<Symbol> {
     let node = match compact::resolve(plane, req.name())? {
         Resolved::One(node) => node,
         Resolved::Many(hits) => bail!("{}", compact::candidates(req.name(), &hits).trim_end()),
@@ -335,27 +348,54 @@ fn symbol_lines(
         bail!("`{key}` records no file, so there is nothing of it to read at a revision");
     };
     let later = synced_commit(plane).map_or_else(|| "HEAD".to_string(), |s| s.as_str().to_string());
-    let (file, note) = file_at(tree, &file, &later)?;
+    Ok(Symbol { key, file, later })
+}
+
+/// Where `sym` is declared at the tree's commit, by parsing its file as it was.
+fn locate(tree: &GitTree, parsers: &dyn Parsers, sym: &Symbol) -> AnyResult<Located> {
+    let at = tree.sha().short();
+    let key = &sym.key;
+    let (file, note) = file_at(tree, &sym.file, &sym.later)?;
     let parsed = parsers.parse(tree, &file)?;
-    let Some(fact) = parsed.nodes.iter().find(|n| n.key == key) else {
-        return Err(not_declared(&key, &file, at, &parsed));
+    let Some(fact) = parsed.nodes.iter().find(|n| n.key == *key) else {
+        return Err(not_declared(key, &file, at, &parsed));
     };
     let Some(line) = int_prop(&fact.props, "line") else {
         bail!("the parser placed `{key}` in {file} at {at} but recorded no line for it");
     };
     let declared = int_prop(&fact.props, "end_line").filter(|end| *end >= line);
+    Ok(Located {
+        file,
+        note,
+        line,
+        declared,
+    })
+}
+
+/// A symbol's declaration as it was: today's key, its file at the tree's
+/// commit parsed by the installed preprocessors, and the lines they place it on.
+fn symbol_lines(
+    plane: &PlaneHandle<'_>,
+    tree: &GitTree,
+    parsers: &dyn Parsers,
+    req: &RecallReq,
+) -> AnyResult<String> {
+    let at = tree.sha().short();
+    let sym = symbol(plane, req, at)?;
+    let found = locate(tree, parsers, &sym)?;
+    let (key, file, line, declared) = (&sym.key, &found.file, found.line, found.declared);
     let end = match req.lines {
         Some(n) => line + n.clamp(1, SNIPPET_CAP) - 1,
         None => declared
             .unwrap_or(line + DEFAULT_LINES - 1)
             .min(line + SNIPPET_CAP - 1),
     };
-    let text = match text_at(tree, &file)? {
+    let text = match text_at(tree, file)? {
         Text::Shown(text) => text,
         Text::Withheld(why) => return Ok(why),
     };
-    let cut = excerpt(&file, &text, line, end)?;
-    let mut out = format!("{}in {key}\n{note}{}", cut.header, cut.lines);
+    let cut = excerpt(file, &text, line, end)?;
+    let mut out = format!("{}in {key}\n{}{}", cut.header, found.note, cut.lines);
     if let Some(last) = declared.filter(|last| *last > cut.end) {
         out.push_str(&format!(
             "… `{key}` continues to line {last}; recall {file}:{}-{last} at {at} reads on\n",
