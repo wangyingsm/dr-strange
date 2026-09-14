@@ -39,6 +39,12 @@ pub struct Ctx<'a> {
     /// embed_provider`), if any. The only non-preset provider a request may
     /// name — see [`provider_for`].
     pub configured_provider: Option<&'a str>,
+    /// How many commits back time-travel reaches (`[server] retain_commits`);
+    /// `None` is unbounded. Reported by `db.stats` so a client can say how
+    /// deep the history it offers goes — `plane.history` already spans no
+    /// further than this, since the core's window starts at the retained
+    /// floor.
+    pub retain_commits: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -368,6 +374,10 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         "file_size": file_size,
         "rss_bytes": resident_bytes(),
         "plugin_bytes": dr_strange_llm::plugin_memory_bytes(),
+        // The time-travel depth the operator keeps; null when every version
+        // is retained. What the dashboard's slider can reach is bounded by
+        // it, and this is how the dashboard says so.
+        "retain_commits": ctx.retain_commits,
     }))
 }
 
@@ -2989,6 +2999,7 @@ mod guard_tests {
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
             configured_provider: configured,
+            retain_commits: None,
         }
     }
 

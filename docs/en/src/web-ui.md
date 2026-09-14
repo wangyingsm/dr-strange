@@ -157,6 +157,13 @@ snapshot. A marker on the canvas indicates the pinned commit on every tab, and
 returns the view to live when dismissed. The header search reflects the same
 cursor. On a non-native backend the tab is absent.
 
+The slider spans the *retained* window, not every commit ever made:
+`plane.history` starts at the floor `[server] retain_commits` keeps (20 by
+default; unset it for unbounded history), the readout says how many commits
+that is, and `db.stats` reports the setting as `retain_commits`. Raise it
+before you need the depth — versions past the floor are reclaimed at
+compaction and cannot be reached afterwards.
+
 ## Live feed
 
 Explore's **Live** tab opens a `plane.watch` subscription over the WebSocket and
