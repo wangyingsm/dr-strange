@@ -169,6 +169,17 @@ shared `drsg serve` refuses it: reading any path the caller names would let an
 authenticated remote agent pull arbitrary server files into the graph and query
 them back out. Over `/mcp`, send the document as `text` instead.
 
+The same line runs through `grep` and `snippet`, which read source files.
+Every path they open — an argument like `src/lib.rs:12` or a node's `file`
+property — must resolve inside the tree it belongs to: `..`, an absolute path
+and a symlink pointing out of the checkout are refused, never read. Which trees
+exist depends on the transport. The tree the operator attached (`serve watch`'s
+directory, or `[server] source_root`) is always readable. A plane's own
+`synced_root` is a plane property — data — so the stdio server, running as you,
+reads it wherever it points, while a shared `drsg serve` reads it only when it
+lies inside the attached tree; with no tree attached, `/mcp` reads no file at
+all.
+
 ### Session lifetime
 
 A host that exits cleanly sends `DELETE /mcp` and its session goes away at
@@ -201,7 +212,13 @@ while every tool call is a full-graph scan, a bulk write, or an LLM-fanning
 digest. The transport also answers a tool call as soon as it is *queued*, so the
 request ceiling has already released the call before the work begins and cannot
 bound it. Excess calls queue rather than fail — a busy server makes an agent
-wait, it does not turn it away.
+wait, it does not turn it away — but not without end: every call has one
+deadline covering its wait and its run, **300 s** unless
+`DRSG_MCP_TOOL_DEADLINE_SECS` says otherwise (`0` disables it). A call that
+passes it comes back as a tool error saying whether the server was busy or the
+body was slow, so the agent can retry or narrow the request rather than sit
+behind a call that never returns. A body already running is not cut short, but
+it keeps its slot until it finishes, so the ceiling still counts it.
 
 ## The tools
 
@@ -220,7 +237,7 @@ wait, it does not turn it away.
 | `snippet` | read | a symbol's source text, or a range of a file (`path:start-end`); says which symbol a range opens in and how to read on |
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
-| `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated |
+| `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated; `DELETE`/`REMOVE` require `confirm: true` |
 | `algo` | read | a graph algorithm (pagerank / components / shortest_path / louvain) |
 | `hybrid` | read | fused vector + keyword + graph-proximity search |
 | `ask` | read | a natural-language question, compiled to a plan and run |
@@ -228,7 +245,7 @@ wait, it does not turn it away.
 | `write_edges` | write | create edges (batched) by endpoint keys |
 | `create_plane` | write | create an empty plane |
 | `drop_plane` | write | delete a plane and its contents (requires confirmation) |
-| `digest` | write | ingest a document (dry-run by default; `mode` sets extraction precision) |
+| `digest` | write | ingest a document (dry-run by default; `apply: true` requires `confirm: true`; `mode` sets extraction precision) |
 
 ## Mapping to the rest of the system
 
@@ -246,9 +263,14 @@ ingestion surface. Each is grounded in the plane's soft schema, which
   parameters** — an agent cannot exfiltrate or supply a key through a call.
 - **Reads are non-destructive.** `ask` in particular compiles to a read-only plan
   and cannot mutate the graph.
-- **Destructive writes are guarded.** `drop_plane` requires an explicit
-  confirmation flag, and `digest` defaults to a dry run that returns the proposed
-  nodes and edges for inspection rather than writing them.
+- **Destructive writes are guarded; additive ones are not.** `drop_plane`, a
+  `cypher` statement carrying `DELETE` or `REMOVE`, and `digest` with `apply:
+  true` all require `confirm: true` and refuse without it, naming the flag;
+  `digest` defaults to a dry run that returns the proposed nodes and edges for
+  inspection rather than writing them. `write_nodes`, `write_edges` and
+  `CREATE`/`MERGE`/`SET` need no confirmation: they add what a later delete can
+  remove, and a flag demanded for everything is one a client learns to pass
+  without thinking.
 - **A mirrored plane is not rewritten by hand.** A plane that `digest` or
   `serve watch` keeps in step with a source tree records the commit it
   reflects, and `cypher` refuses `CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE` on

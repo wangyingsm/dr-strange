@@ -3,7 +3,7 @@
 **Status**: shipped — `drsg-mcp` stdio (M4), streamable HTTP on `drsg serve`
 (ROADMAP §10), `digest` tool live, agent verbs landed (§11), stdio relays to a
 declared server when one is running ·
-last revised 2026-09-02
+last revised 2026-09-14
 
 **M4 landed** the `drsg-mcp` stdio server on the **official `rmcp` SDK**
 (resolving arch's hand-rolled-vs-SDK question toward the SDK: spec-correct
@@ -58,11 +58,40 @@ then narrow, then act:
 
 ## 3. Safety
 
-- `drop_plane` and bulk deletes require an explicit `confirm: true` argument
-  and, when called without it, echo what would be destroyed.
+- **What destroys is confirmed; what adds is not.** `drop_plane`, a `cypher`
+  statement carrying `DELETE` or `REMOVE`, and `digest` with `apply: true`
+  all require `confirm: true` and refuse without it, naming the flag. The
+  cypher gate is a keyword scan of the statement (literals, backtick names
+  and `.property` excluded) — the compiled statement's ops are the parser's
+  own — and errs toward asking. Additive writes (`write_nodes`,
+  `write_edges`, `CREATE`/`MERGE`/`SET`) are deliberately ungated: they are
+  undoable by a later delete and are an agent's everyday annotation work,
+  and a flag demanded for everything becomes a flag passed reflexively,
+  which guards nothing. The tool descriptions carry the rule so a client
+  knows when to pass the flag.
+- **Files are read only from a tree, and only inside it.** Every read
+  `grep` and `snippet` make passes one containment check — the path is
+  refused by shape (absolute, `..`, a prefix) and then by where it
+  canonicalizes to, which is what catches a symlink planted in a checkout.
+  Which trees exist is `TreeAccess`: the host-attached tree (`serve watch
+  --dir`, `[server] source_root`) is always readable; a plane's own
+  `synced_root` is data, honoured wherever it points only where the process
+  already runs as the user (stdio, the CLI — `local_files`), and on the
+  shared `/mcp` only when it lies inside the attached tree. Nothing attached
+  and no local files: nothing is read. `digest { path }` remains stdio-only.
+- **Every tool call ends.** The tool gate queues rather than rejects, but
+  under one per-call deadline covering the wait and the run
+  (`with_tool_deadline`; default 300 s; `DRSG_MCP_TOOL_DEADLINE_SECS`, `0`
+  disables). Past it the call is a *tool-level* error saying whether the
+  server was busy or the body was slow. A running body is not cut short —
+  blocking work cannot be — but its permit travels with it, so the gate
+  keeps counting it until it returns. Core query deadlines (03 §8.6) sit
+  beneath this and end most bodies sooner.
+- **The relay takes a credential only from the repository's own file.** The
+  `.mcp.json` walk stops at the first `.git`, and a file not owned by the
+  effective user or writable by everyone is passed over: what it names
+  receives the host's session and the `Authorization` it carries.
 - Optional read-only mode (`--read-only`) for exploration deployments.
-- Per-request deadlines map to executor cancellation (03 §8.6) so a runaway
-  traversal cannot hang the host.
 
 ## 4. Why the catalog matters here
 

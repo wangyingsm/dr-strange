@@ -124,6 +124,12 @@ and `snippet` read the watched source tree, so they live with the server):
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 
+`grep` and `snippet` open files only inside the tree they belong to — the
+directory the server watches, or the one a plane was digested from — and refuse
+a path that leaves it (`..`, an absolute path, a symlink out of the checkout);
+see [Chapter 8](./mcp.md) for how that differs between the stdio and the shared
+server.
+
 Every answer is compact one-fact-per-line text, sized for a model's context
 window rather than a terminal, and `context` keeps itself within a fixed
 budget by tightening its per-group caps and saying what it elided.
