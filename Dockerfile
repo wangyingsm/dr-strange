@@ -11,9 +11,9 @@
 FROM oven/bun:1 AS web
 WORKDIR /web
 COPY crates/dr-strange-web/frontend/package.json crates/dr-strange-web/frontend/bun.lock ./
-# Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2 (bun canary),
-# which this stable bun image can't parse; let it resolve fresh instead.
-RUN bun install
+# --frozen-lockfile: the image builds the dependency set the committed bun.lock
+# names and fails on drift, rather than resolving afresh at image-build time.
+RUN bun install --frozen-lockfile
 COPY crates/dr-strange-web/frontend/ ./
 RUN bun run build
 
