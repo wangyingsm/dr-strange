@@ -20,9 +20,23 @@ use serde_json::{Value, json};
 
 use dr_strange_core::json as jsonio;
 
-/// Opens (creating if needed) the database at `path`.
-pub fn open(path: &Path) -> Result<Database> {
-    Database::open(path).with_context(|| format!("opening database at {}", path.display()))
+/// Opens (creating if needed) the database at `path`, with the configured
+/// history retention applied (`None` keeps every version).
+///
+/// Retention is a property of the opened handle, not of the file, so every
+/// command that writes has to set it — `serve` alone doing so meant a
+/// database driven only by `import`, `cypher` and `digest` from the CLI kept
+/// every version ever written and compacted all of them, forever. The value
+/// comes from the same `[server] retain_commits` (and the same default) the
+/// server uses, so one store sees one policy however it is reached.
+pub fn open(path: &Path, retain_commits: Option<u64>) -> Result<Database> {
+    let db =
+        Database::open(path).with_context(|| format!("opening database at {}", path.display()))?;
+    #[cfg(feature = "native-backend")]
+    db.set_retention(retain_commits);
+    #[cfg(not(feature = "native-backend"))]
+    let _ = retain_commits; // the other engines keep no versions to bound
+    Ok(db)
 }
 
 /// Marker file left in a `serve --follow` replica's directory (arch/01 §9)
@@ -84,7 +98,9 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> Result<Pl
 
 #[cfg(not(feature = "digest"))]
 pub fn init(path: &Path, out: &mut dyn Write) -> Result<()> {
-    open(path)?;
+    // Created and closed again: retention belongs to the handle that writes,
+    // and this one writes nothing.
+    open(path, None)?;
     writeln!(out, "initialized dr-strange database at {}", path.display())?;
     Ok(())
 }
@@ -215,7 +231,9 @@ pub fn init_bootstrap(
         return Ok(());
     }
 
-    open(&db_path)?;
+    // Created and closed again: retention belongs to the handle that writes,
+    // and the `serve watch` spawned below sets its own.
+    open(&db_path, None)?;
 
     // A recorded endpoint that stopped answering is the one worth restoring
     // verbatim: agents already hold that URL and token. An explicit flag
@@ -4597,6 +4615,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retention a CLI command opens with is the one the store lives by:
+    /// a commit below the window is refused, exactly as it would be under
+    /// `serve`. Before, `open` ignored the setting and the CLI-only store
+    /// kept every version ever written.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn open_applies_the_configured_retention() {
+        let dir = std::env::temp_dir().join(format!("drsg-cli-open-retain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir, Some(1)).unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let first = db.commit_seq().unwrap();
+        for i in 0..3 {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key(&format!("n{i}"), &["N"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        assert!(
+            plane.as_of(dr_strange_core::AsOf::Seq(first)).is_err(),
+            "a commit outside the retained window must be refused"
+        );
+        drop(db);
+        // `None` is unbounded: the same store, reopened without a bound,
+        // reaches its first commit again (nothing was compacted away yet).
+        let db = open(&dir, None).unwrap();
+        let plane = db.plane("p").unwrap();
+        assert!(plane.as_of(dr_strange_core::AsOf::Seq(first)).is_ok());
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
