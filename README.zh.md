@@ -228,7 +228,7 @@ web（HTML/CSS）、TOML）外加读取仓库历史的 `git`，它以 `catalog.j
 **对比表现。** 在与 ripgrep 工作流以及两款开源代码图 MCP 工具的智能体任务基准
 中，drsg 完成了每一种任务形态——调用者、影响面、调用链与复合审计——每项任务只需
 2–4 次工具调用，边际 token 开销最低，且是唯一会在回答中明示自身边界的工具。
-方法、任务清单与完整表格见 [AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md)（英文）。
+方法与完整表格见 [AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md)（英文；其背后的提示词与逐臂账本未公开，该文档已如实说明）。
 设计笔记：[arch/07-llm.md](arch/07-llm.md)（图化、插件与监视）与
 [arch/06-mcp.md](arch/06-mcp.md)（MCP 服务）。
 

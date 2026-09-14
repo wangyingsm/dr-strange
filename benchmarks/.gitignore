@@ -1,3 +1,7 @@
+# Generated dataset and scratch databases — regenerate with `just bench-gen`.
 data/
-results/
 *.redb
+# Results are NOT ignored: benchmarks/results/*.json is the evidence behind
+# BENCHMARKS.md (per-op figures, pass count, recorded spread) and is committed
+# with every re-baseline so the published table can be checked and reproduced.
+__pycache__/

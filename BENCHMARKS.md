@@ -19,7 +19,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 - **↑ better** rows are throughput (bigger is faster); **↓ better** rows are median latency per operation (smaller is faster).
 - SQLite has no native vectors, so it sits out the vector rows.
 - **Recall@k** is the share of the exact cosine top-k (brute force, written once by `drsg-bench gen` for the first 100 vector queries) that the engine's ANN index returned, averaged over those queries — a latency row without its recall row is not a result. It is scored untimed, after the timed top-k pass. This table predates the recall row: no recall was measured for the numbers above, so the vector top-k latencies here are unaccompanied; the next `just bench-compare` adds the row for every engine.
-- Every figure is the **median of repeated measurement passes** (3 by default; the min→max spread per op is recorded in `benchmarks/results/*.json`), with every engine pinned to the same P-cores — one machine, **indicative, not a leaderboard**. Re-run with `just bench-compare`.
+- Every figure is the **median of repeated measurement passes** (3 by default; the min→max spread per op is recorded in `benchmarks/results/*.json`, committed alongside this file from the next re-baseline on — the JSON behind the table above was not preserved, so its spreads cannot be checked), with every engine pinned to the same P-cores — one machine, **indicative, not a leaderboard**. Re-run with `just bench-compare`.
 
 ## Methodology
 

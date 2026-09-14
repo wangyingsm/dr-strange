@@ -315,8 +315,9 @@ against it installs and runs in the same sandbox as an official one.
 workflow and two open-source code-graph MCP tools, drsg completed every task
 shape — callers, impact, flow, and a compound audit — in 2–4 tool calls at
 the lowest marginal token cost, and was the only tool whose answers state
-their own bounds. Methodology, ledgers, and the full tables:
-[AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md). Design notes:
+their own bounds. Methodology and the full tables:
+[AGENT-BENCHMARKS.md](AGENT-BENCHMARKS.md) (the prompts and per-arm
+ledgers behind them are not published; that document says so). Design notes:
 [arch/07-llm.md](arch/07-llm.md) (digestion, plugins, watch) and
 [arch/06-mcp.md](arch/06-mcp.md) (the MCP surface).
 

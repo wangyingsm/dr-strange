@@ -136,7 +136,8 @@ def main():
         "untimed, after the timed top-k pass.\n"
         "- Every figure is the **median of repeated measurement passes** (3 by "
         "default; the min→max spread per op is recorded in "
-        "`benchmarks/results/*.json`), with every engine pinned to the same "
+        "`benchmarks/results/*.json`, committed alongside this file), with "
+        "every engine pinned to the same "
         "P-cores — one machine, **indicative, not a leaderboard**. Re-run with "
         "`just bench-compare`.\n"
     )

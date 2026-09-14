@@ -33,6 +33,33 @@ targets.
   contention-shaped; the agent floor is ≈26k tokens per arm regardless of
   tool.
 
+## What is and is not published
+
+Be clear about what this document can and cannot back up. The tables
+below are transcribed from the runs; the artefacts that produced them are
+**not in this repository**:
+
+- **Prompts.** The per-task agent prompts (task text, tool inventory, the
+  ledger format the agent was required to produce) were not checked in.
+- **Ledgers.** The per-arm ledgers — every claim with its `file:line`
+  receipt and every declared gap — exist only as the transcripts of those
+  runs. They are quoted from in the tables, not attached.
+- **Driver.** There is no script in `benchmarks/` that stands up the three
+  tools, runs the arms and collects call and token counts; the arms were
+  run by hand from one agent harness.
+- **Corpora.** The dr-strange core crate at the time of the run is a past
+  commit of this repository; the 760-file Python project is a private
+  working tree and cannot be redistributed.
+
+So these numbers are **reported, not reproducible from this repository**,
+and should be weighted accordingly. The engine benchmark in
+[BENCHMARKS.md](BENCHMARKS.md) is the reproducible one: its dataset
+generator, drivers, results JSON and report script are all under
+`benchmarks/`. Closing this gap for the agent benchmark means checking in
+the prompts, a driver, the ground-truth answer keys and the ledgers for a
+corpus that can be redistributed; until that lands, treat the tables as
+the authors' account of a one-off run.
+
 ## Task 1 — callers, callees, and honesty
 
 *"Who calls `WriteTxn::delete_node`, at which lines, and what in its body
