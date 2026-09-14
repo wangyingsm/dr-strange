@@ -77,8 +77,9 @@ fn is_label_op(op: &WriteOp) -> bool {
 }
 
 /// Validate a parsed write and compile its `MATCH` (if any) into a read plan.
-pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, String> {
+pub fn compile(mut ast: WriteAst, params: crate::Params) -> Result<WriteStatement, String> {
     let has_label_ops = ast.ops.iter().any(is_label_op);
+    resolve_keys(&mut ast.ops, &params)?;
 
     let binding = match ast.match_clause {
         // Standalone: only CREATE / MERGE are allowed with no MATCH.
@@ -145,6 +146,47 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
         has_label_ops,
         params,
     })
+}
+
+/// Resolve every `{key: $param}` to its string now, so a missing or non-string
+/// key is the statement's error rather than one row's, and the run-time path
+/// reads plain literals ([`literal_key`]).
+fn resolve_keys(ops: &mut [WriteOp], params: &crate::Params) -> Result<(), String> {
+    fn resolve_node(cn: &mut CreateNode, params: &crate::Params) -> Result<(), String> {
+        if let Some(Val::Param(name)) = &cn.key {
+            match crate::resolve_param(params, name)? {
+                s @ PropValue::Str(_) => cn.key = Some(Val::Lit(s)),
+                other => {
+                    return Err(format!(
+                        "`key:` must be a string to serve as the external key; `${name}` is {other:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    for op in ops {
+        let paths: Vec<&mut CreatePath> = match op {
+            WriteOp::Create(paths) => paths.iter_mut().collect(),
+            WriteOp::Merge(m) => vec![&mut m.path],
+            _ => continue,
+        };
+        for path in paths {
+            resolve_node(&mut path.first, params)?;
+            for (_, node) in &mut path.rest {
+                resolve_node(node, params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The node's external key, which [`resolve_keys`] has made a literal.
+fn literal_key(cn: &CreateNode) -> Option<&str> {
+    match &cn.key {
+        Some(Val::Lit(PropValue::Str(s))) => Some(s),
+        _ => None,
+    }
 }
 
 /// A MERGE upserts by external key, so every node needs a string `key:`. ON
@@ -534,10 +576,7 @@ fn upsert_merge_node<'a>(
     {
         return Ok((id, false));
     }
-    let key = cn
-        .key
-        .as_deref()
-        .ok_or("MERGE node needs a `key:` to upsert on")?;
+    let key = literal_key(cn).ok_or("MERGE node needs a `key:` to upsert on")?;
 
     if let Some(&id) = merged.get(key) {
         if let Some(v) = &cn.var {
@@ -615,7 +654,7 @@ fn get_or_create<'a>(
     }
     let labels: Vec<&str> = cn.label.as_deref().into_iter().collect();
     let props = props_of(&cn.props, params)?;
-    let id = match &cn.key {
+    let id = match literal_key(cn) {
         Some(k) => txn
             .create_node_with_key(k, &labels, props)
             .map_err(|e| e.to_string())?,

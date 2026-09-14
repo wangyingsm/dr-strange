@@ -167,10 +167,12 @@ LIMIT 10
 
 在投影查询中，`DISTINCT`、`ORDER BY`、`SKIP` 与 `LIMIT` 作用于投影后的行：
 `DISTINCT` 比较的是整个元组（同处一个文件的两个节点在这里是一行），`ORDER BY` 指名
-的是一列——用它的别名，或用它所返回的那个表达式。
+的是一列——用它的别名、用它所返回的那个表达式，或用它所折叠的聚合
+（`ORDER BY count(*) DESC` 能找到计数列，无论 `RETURN` 如何拼写或起了什么别名）。
 
 ```text
 MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) ORDER BY count(*) DESC
 ```
 
 节点不能与列同处一个 `RETURN`，因为节点不是值：改为返回它的属性。各个界面渲染投影
@@ -196,11 +198,23 @@ CREATE (a)-[:KNOWS {since: 1936}]->(b)
 ```
 
 值可以通过 `$name` 参数提供，而不必拼接进查询文本，这样既能保持查询稳定，又省去
-了转义：
+了转义。`key:` 也可以是参数——`MERGE (n:Person {key: $k})` 以 `$k` 解析出的字符串
+为键做 upsert（非字符串是错误，而不会变成属性）：
 
 ```text
 MATCH (p:Person) WHERE p.age >= $min RETURN p
+MERGE (n:Person {key: $k}) ON CREATE SET n.seen = 1
 ```
+
+### 字面量与标识符
+
+字符串可用任一种引号，并支持常见转义——`\'`、`\"`、`\\`、`\n`、`\t`、`\r`、
+`\uXXXX`——因此含引号的值写在字面量之内，而不会终止它；未知转义或未闭合的字符串
+是语法错误。数字是整数（`42`）或浮点数（`3.5`、`1e9`、`2.5E-3`）。标识符（变量、
+标签、类型、属性键）是 Unicode 单词（`n.名字`、`café`），或当普通写法拼不出该名字
+时，放在反引号之间的任何内容（`` n.`first name` ``、`` (:`order`) ``）。关键字与
+函数名不区分大小写（`COUNT(*)`、`Score()`）。表达式最多嵌套 64 层（括号、`NOT`、
+一元 `-`）；更深是语法错误，而不是崩溃。
 
 ## 查询中的相似度检索
 
