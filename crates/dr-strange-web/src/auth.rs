@@ -53,15 +53,37 @@ pub trait Authorizer: Send + Sync {
 /// A single shared secret (the v1 model), read from `DRSG_TOKEN`.
 pub struct SharedToken {
     token: Option<String>,
+    /// Whether the listener this token guards is bound to a loopback address.
+    /// The zero-config fallback (no token, same-origin UI) is only ever
+    /// granted when it is: on any other bind, "our own UI" is a page anyone
+    /// on the network can load, and an allowed `Origin` no longer implies a
+    /// local human (arch/08 §4.2 invariant 2).
+    loopback_bind: bool,
 }
 
 impl SharedToken {
     /// Build from an explicit secret (`None`/empty = no token configured).
     /// Tests use this; production uses [`SharedToken::from_env`].
+    ///
+    /// Assumes a loopback listener — the desktop shape every in-process test
+    /// exercises. [`SharedToken::bound_to_loopback`] narrows it for the real
+    /// server, which knows its bind address.
     pub fn new(token: Option<String>) -> Self {
         Self {
             token: token.filter(|t| !t.is_empty()),
+            loopback_bind: true,
         }
+    }
+
+    /// Record whether the listener is loopback-bound. With `false`, the
+    /// zero-config local-UI fallback is never granted: only a token
+    /// authenticates. `server::run` refuses to start a tokenless non-loopback
+    /// listener at all, so this is the second line behind that check — a
+    /// future code path that builds the state some other way still cannot
+    /// hand a LAN browser unauthenticated write access.
+    pub fn bound_to_loopback(mut self, loopback: bool) -> Self {
+        self.loopback_bind = loopback;
+        self
     }
 
     /// Whether a token is configured — drives the startup banner and the
@@ -92,8 +114,10 @@ impl Authorizer for SharedToken {
         // Zero-config desktop: with NO token set, our own same-origin browser
         // UI is trusted (the Origin guard is its CSRF shield). Any client
         // without the token — even for a read — is denied, so programmatic
-        // (SDK / curl) access requires an explicit DRSG_TOKEN.
-        self.token.is_none() && creds.local_ui
+        // (SDK / curl) access requires an explicit DRSG_TOKEN. Only on a
+        // loopback bind: elsewhere the "own UI" is reachable by anyone who can
+        // reach the port, and an Origin proves nothing about who is behind it.
+        self.loopback_bind && self.token.is_none() && creds.local_ui
     }
 }
 
@@ -146,7 +170,10 @@ impl<'a> Auth<'a> {
     /// reads and writes are both allowed.
     #[cfg(test)]
     pub fn allow_all() -> Auth<'static> {
-        static LOCAL: SharedToken = SharedToken { token: None };
+        static LOCAL: SharedToken = SharedToken {
+            token: None,
+            loopback_bind: true,
+        };
         Auth::new(
             &LOCAL,
             Credentials {
@@ -252,6 +279,21 @@ mod tests {
         // set DRSG_TOKEN to reach the API at all.
         assert!(!open.allows(Access::Read, &native(None)));
         assert!(!open.allows(Access::Write, &native(None)));
+    }
+
+    #[test]
+    fn the_zero_config_fallback_is_only_for_a_loopback_listener() {
+        // arch/08 §4.2 invariant 2: on a non-loopback bind, an allowed Origin
+        // no longer means "the local human's own UI" — anyone on the network
+        // can load the page — so the tokenless fallback is never granted.
+        let open = SharedToken::new(None).bound_to_loopback(false);
+        assert!(!open.allows(Access::Read, &browser(None)));
+        assert!(!open.allows(Access::Write, &browser(None)));
+        // A token still works there, from the browser and from a native client.
+        let guarded = SharedToken::new(Some("s3cret".into())).bound_to_loopback(false);
+        assert!(guarded.allows(Access::Write, &browser(Some("s3cret"))));
+        assert!(guarded.allows(Access::Write, &native(Some("s3cret"))));
+        assert!(!guarded.allows(Access::Read, &browser(None)));
     }
 
     #[test]
