@@ -104,3 +104,41 @@ fn a_barrier_step_is_bounded_too() {
         "expected Timeout: {err:?}"
     );
 }
+
+/// A variable-length expansion over a dense graph has exponentially many
+/// walks; the deadline must see rows as the walk produces them, not after
+/// the whole walk from a start node is materialized.
+#[test]
+fn a_deadline_bounds_a_variable_length_expansion() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.plane("startup").unwrap();
+    let ids: Vec<_> = {
+        let mut txn = plane.write().unwrap();
+        let ids: Vec<_> = (0..6)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        for &a in &ids {
+            for &b in &ids {
+                if a != b {
+                    txn.create_edge(a, b, "E", Properties::new()).unwrap();
+                }
+            }
+        }
+        txn.commit().unwrap();
+        ids
+    };
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let plane = plane.with_deadline(deadline);
+    let started = Instant::now();
+    let err = plane
+        .query()
+        .seek_ids([ids[0]])
+        .expand_var(dr_strange_core::Dir::Out, None, 1, 14)
+        .ids()
+        .expect_err("5^13 walks cannot finish inside the budget");
+    assert!(matches!(err, Error::Timeout(_)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the deadline only fired after the walk was materialized"
+    );
+}
