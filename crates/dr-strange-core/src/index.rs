@@ -187,10 +187,11 @@ impl VectorRegistry {
                 },
             );
         }
-        Some(Self {
-            entries,
-            ..Self::default()
-        })
+        // Built through `new` so the test-only fault seam (when compiled in)
+        // starts disarmed without a cfg-split initializer here.
+        let mut registry = Self::new();
+        registry.entries = entries;
+        Some(registry)
     }
 
     /// Declared indexes on `plane`, as `(label, property, metric)` — the
