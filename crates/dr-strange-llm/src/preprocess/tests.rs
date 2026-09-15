@@ -646,7 +646,11 @@ fn reserved_and_vector_props_survive_the_reload() {
         changed: vec!["a.aa".to_string()],
         ..Default::default()
     };
+    let before = db.commit_seq().unwrap();
     sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    // The reload and the carry-over are one commit: a reader never sees the
+    // re-created node without its vector, and a crash cannot strand it so.
+    assert_eq!(db.commit_seq().unwrap(), before + 1, "one transaction");
     let node = db
         .plane("code")
         .unwrap()

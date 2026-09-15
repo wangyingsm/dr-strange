@@ -320,7 +320,7 @@ pub fn sync_paths(
         })
         .collect();
     let mut edges: Vec<BulkEdge> = Vec::new();
-    for edge in edge_creates {
+    for edge in &edge_creates {
         if resolves(&edge.src)? && resolves(&edge.dst)? {
             edges.push(BulkEdge {
                 src_key: &edge.src,
@@ -334,36 +334,59 @@ pub fn sync_paths(
     }
     stats.nodes_loaded = nodes.len();
     stats.edges_written = edges.len();
-    txn.bulk_load(nodes, edges)?;
-    txn.commit()?;
+    let loaded = txn.bulk_load(nodes, edges)?;
 
-    // Re-attach and carry over in a second transaction: the re-created nodes
-    // are only visible to reads once the load committed.
-    let mut txn = plane.write()?;
+    // Re-attach and carry over in the *same* transaction. A bulk load numbers
+    // its nodes `node_start + i` in the order given, so the re-created nodes
+    // are addressable before anything is committed, and a reader never sees
+    // the replaced node without the edges and vectors it had — nor does a
+    // crash between two commits leave it that way for good.
+    let new_ids: BTreeMap<&str, dr_strange_core::NodeId> = creates
+        .iter()
+        .enumerate()
+        .map(|(i, fact)| {
+            (
+                fact.key.as_str(),
+                dr_strange_core::NodeId(loaded.node_start + i as u64),
+            )
+        })
+        .collect();
+    // A saved edge the facts also asserted this fold is already in the load:
+    // its source key is a standing node whose id is the one we saved from.
+    let asserted = |edge: &SavedEdge| -> Result<bool> {
+        for fact in &edge_creates {
+            if fact.dst != edge.dst_key || fact.ty != edge.ty {
+                continue;
+            }
+            if plane
+                .node_by_key(&fact.src)?
+                .is_some_and(|n| n.id == edge.src)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     for edge in &saved {
-        let Some(dst) = plane.node_by_key(&edge.dst_key)? else {
+        let Some(&dst) = new_ids.get(edge.dst_key.as_str()) else {
             continue; // the symbol vanished; the dangling assertion goes too
         };
-        if plane
-            .neighbors(edge.src, Dir::Out, Some(&edge.ty))?
-            .iter()
-            .any(|n| n.node == dst.id)
-        {
+        if asserted(edge)? {
             continue;
         }
-        txn.create_edge(edge.src, dst.id, &edge.ty, edge.props.clone())?;
+        txn.create_edge(edge.src, dst, &edge.ty, edge.props.clone())?;
         stats.edges_reattached += 1;
     }
     for key in &replaced {
         let node = &stored[*key];
-        let Some(new) = plane.node_by_key(key)? else {
+        let (Some(&new), Some(fact)) = (new_ids.get(key), fresh.get(key)) else {
             continue;
         };
         for (prop_key, prop) in &node.properties {
             let keep = (prop_key.starts_with('_') || matches!(prop.value, PropValue::Vector(_)))
-                && !new.properties.contains_key(prop_key);
+                && !fact.props.contains_key(prop_key);
             if keep {
-                txn.set_prop(new.id, prop_key, prop.clone())?;
+                txn.set_prop(new, prop_key, prop.clone())?;
             }
         }
     }
