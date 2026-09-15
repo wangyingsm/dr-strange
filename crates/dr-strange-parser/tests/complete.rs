@@ -821,12 +821,30 @@ fn a_property_map_is_read_as_part_of_its_node() {
         );
     }
     // And the node closed, the pattern goes on: a hop, or the clause after it.
-    let c = complete("MATCH (n:Module {path: \"a\"}) ", &code());
+    let c = complete("CREATE (n:Module {path: \"a\"}) ", &code());
     assert!(matches!(c.expects, Expect::Hop { .. }), "{:?}", c.expects);
     assert_eq!(
-        best("MATCH (n:Module {path: \"a\"})-[:CONTAINS]->(m:Function) WHERE m."),
+        best("CREATE (n:Module {path: \"a\"})-[:CONTAINS]->(m:Function) WHERE m."),
         "file"
     );
+    // A MATCH node has no property map — the parser refuses one, pointing at
+    // WHERE — so the completer offers nothing there or after it, rather than
+    // steering the author further into a query that cannot run.
+    for prefix in [
+        "MATCH (n:Module {",
+        "MATCH (n:Module {path: \"a\"}) ",
+        "MATCH (n:Module {path: \"a\"})-[:CONTAINS]->(m:Function) WHERE m.",
+        "MATCH (n:Module {path: \"a\"}) RETURN ",
+    ] {
+        let c = complete(prefix, &code());
+        assert_eq!(c.expects, Expect::Nothing, "at `{prefix}`");
+        assert_eq!(c.best, None, "at `{prefix}`");
+    }
+    let said = parse_statement("MATCH (n:Module {path: \"a\"}) RETURN n")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(said.contains("inline properties"), "{said}");
 }
 
 /// A call has an inside: what goes in it is a variable, and the name before

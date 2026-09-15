@@ -117,7 +117,9 @@ pub enum Expect {
     /// `AS OF`. `done` are the ones already written, which cannot come again.
     Clause { done: Vec<String> },
     /// Nothing worth guessing at: inside a string literal, where the words
-    /// typed are data rather than syntax.
+    /// typed are data rather than syntax; or after a shape the grammar
+    /// refuses (inline properties in a `MATCH` node), where every suggestion
+    /// would steer further into a query that cannot run.
     Nothing,
 }
 
@@ -374,6 +376,11 @@ enum Pos {
     Sort,
     /// After a complete clause: `ORDER BY`, `SKIP`, `LIMIT`, `AS OF`.
     Clause,
+    /// After a shape the grammar refuses outright — `{` in a `MATCH` node,
+    /// whose predicates live in WHERE. Nothing that follows mends it, so the
+    /// scan stays here: the three readings of the language must agree, and
+    /// the parser's is a hard error.
+    Refused,
 }
 
 /// What a scan learned: where the caret is, and the variables the pattern
@@ -399,6 +406,9 @@ struct Scan {
     term: Option<String>,
     /// The tail clauses already written — a query has one `LIMIT`.
     done: Vec<String>,
+    /// A `CREATE`/`MERGE` has been written: its nodes carry a property map,
+    /// where a read pattern's may not.
+    writing: bool,
 }
 
 impl Scan {
@@ -476,6 +486,7 @@ fn scan(tokens: &[Tok<'_>]) -> (Expect, bool) {
         star: None,
         term: None,
         done: Vec::new(),
+        writing: false,
     };
     for tok in tokens {
         step(&mut s, tok);
@@ -526,6 +537,7 @@ fn scan(tokens: &[Tok<'_>]) -> (Expect, bool) {
         Pos::Term | Pos::Clause => Expect::Clause {
             done: s.done.clone(),
         },
+        Pos::Refused => Expect::Nothing,
     };
     (expects, closing)
 }
@@ -542,6 +554,12 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
             .find(|(t, _)| t.split(' ').next() == Some(written.as_str()))
         {
             s.done.push((*tail).to_string());
+        }
+        if s.pos == Pos::Refused {
+            return;
+        }
+        if matches!(kw, "CREATE" | "MERGE") {
+            s.writing = true;
         }
         s.pos = match kw {
             "WHERE" | "AND" | "SET" => Pos::Predicate,
@@ -585,8 +603,16 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
         // A write's node carries its key and properties in a map, `{key: $k,
         // p: 1}`. Read as its own region, so that the `:` after a key is not
         // taken for the one that opens a label, and the `}` hands back to the
-        // node it sits in.
-        (Pos::NodeVar | Pos::NodeColon | Pos::NodeClose, Tok::Punct("{")) => s.pos = Pos::PropKey,
+        // node it sits in. A read pattern's node has no map — the parser
+        // refuses one with a pointer at WHERE — so there the scan stops.
+        (Pos::NodeVar | Pos::NodeColon | Pos::NodeClose, Tok::Punct("{")) => {
+            s.pos = if s.writing {
+                Pos::PropKey
+            } else {
+                Pos::Refused
+            };
+        }
+        (Pos::Refused, _) => {}
         (Pos::PropKey, Tok::Word(_)) => s.pos = Pos::PropRest,
         (Pos::PropRest, Tok::Punct(",")) => s.pos = Pos::PropKey,
         (Pos::PropKey | Pos::PropRest, Tok::Punct("}")) => s.pos = Pos::NodeClose,
