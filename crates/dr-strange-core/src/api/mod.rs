@@ -1019,12 +1019,11 @@ impl<'db> PlaneHandle<'db> {
     ///
     /// Index-backed terminals are answered from the snapshot, not the live
     /// indexes: vector searches brute-force the pinned records (exact,
-    /// unindexed), and keyword searches — which have no unindexed path — take
-    /// the live BM25 postings and keep only nodes the snapshot holds under the
-    /// searched label. So a historical keyword or hybrid result never names a
-    /// node created, deleted or relabelled after the pinned point, but its
-    /// scores are the live index's and it may hold fewer than `k` rows when
-    /// most live matches postdate the snapshot.
+    /// unindexed) and keyword searches compute BM25 from the pinned records
+    /// the same way (one label scan and analysis per query). A historical
+    /// keyword or hybrid result is therefore the snapshot's own answer —
+    /// the nodes that matched *then*, on the text they held then, scored
+    /// against that corpus — not a filter over today's index.
     #[cfg(feature = "native-backend")]
     pub fn as_of(mut self, at: AsOf) -> Result<Self> {
         self.as_of = Some(self.db.resolve_as_of(at)?);
@@ -1308,8 +1307,8 @@ impl<'db> PlaneHandle<'db> {
         k: usize,
     ) -> Vec<(NodeId, f32)> {
         // Through the query reader rather than the registry directly, so the
-        // hits are filtered through this handle's snapshot — an AS OF handle
-        // never names a node its snapshot cannot see (arch/04 §3).
+        // hits are this handle's snapshot's: filtered through it on a live
+        // read, computed from it under AS OF (arch/04 §3).
         self.with_reader(|reader| reader.keyword_search(label, property, query, k))
             .unwrap_or_default()
     }
@@ -2289,8 +2288,8 @@ impl<'db> QueryBuilder<'db> {
     /// BM25 keyword search (ROADMAP §2): the `k` nodes whose `property` best
     /// matches `query`, seeded with their relevance score. Needs a keyword
     /// index declared on `(label, property)`; empty without one. Under
-    /// [`PlaneHandle::as_of`] the live postings are filtered through the
-    /// snapshot (see there), so the page may come back short.
+    /// [`PlaneHandle::as_of`] the answer is computed from the pinned
+    /// snapshot rather than the live index (see there).
     pub fn keyword_top_k(mut self, label: &str, property: &str, query: &str, k: u64) -> Self {
         self.plan.source = Source::KeywordTopK {
             label: label.to_string(),
@@ -2990,18 +2989,22 @@ mod time_travel_tests {
     }
 
     #[test]
-    fn as_of_keyword_and_hybrid_results_are_restricted_to_the_snapshot() {
-        // The BM25 registry is only ever the latest commit's; there is no
-        // unindexed keyword path to fall back on. So a time-travelling
-        // keyword (and hybrid-keyword) search must filter the live postings
-        // through the pinned snapshot: nodes created, deleted or relabelled
-        // after the point must not surface, however well they match.
+    fn as_of_keyword_and_hybrid_search_answer_from_the_snapshot() {
+        // The BM25 registry is only ever the latest commit's, so a
+        // time-travelling keyword (and hybrid-keyword) search must compute
+        // its answer from the pinned snapshot, as vector search brute-forces
+        // it: nodes the snapshot held as matching Docs are found — even ones
+        // deleted, relabelled or re-texted since — and nodes that only match
+        // on their later text (or were created later) are not.
         use crate::text::Language;
 
         fn body(text: &str) -> Properties {
             let mut p = Properties::new();
             p.insert("body".into(), PropDesc::new(PropValue::Str(text.into())));
             p
+        }
+        fn text(t: &str) -> PropDesc {
+            PropDesc::new(PropValue::Str(t.into()))
         }
 
         let (_dir, db) = open();
@@ -3010,7 +3013,7 @@ mod time_travel_tests {
             .ensure_keyword_index("Doc", "body", Language::English)
             .unwrap();
 
-        let (a, gone, relabelled) = {
+        let (a, gone, relabelled, retexted, later_match) = {
             let mut w = plane.write().unwrap();
             let a = w
                 .create_node(&["Doc"], body("graph databases store nodes"))
@@ -3021,19 +3024,27 @@ mod time_travel_tests {
             let relabelled = w
                 .create_node(&["Doc"], body("graph databases store planes"))
                 .unwrap();
+            let retexted = w
+                .create_node(&["Doc"], body("graph databases store trees"))
+                .unwrap();
+            let later_match = w.create_node(&["Doc"], body("apples")).unwrap();
             w.commit().unwrap();
-            (a, gone, relabelled)
+            (a, gone, relabelled, retexted, later_match)
         };
         let s1 = db.commit_seq().unwrap();
 
         // After the point: a better-matching node appears, one is deleted,
-        // one loses the indexed label.
+        // one loses the indexed label, one's text stops matching and one's
+        // starts.
         {
             let mut w = plane.write().unwrap();
             w.create_node(&["Doc"], body("graph graph graph databases"))
                 .unwrap();
             w.delete_node(gone).unwrap();
             w.set_labels(relabelled, &["Note"]).unwrap();
+            w.set_prop(retexted, "body", text("apples")).unwrap();
+            w.set_prop(later_match, "body", text("graph databases store fruit"))
+                .unwrap();
             w.commit().unwrap();
         }
 
@@ -3042,26 +3053,36 @@ mod time_travel_tests {
             .keyword_top_k("Doc", "body", "graph databases", 10)
             .ids()
             .unwrap();
-        assert_eq!(live.len(), 2, "live: the survivor and the newcomer");
+        assert_eq!(
+            live.len(),
+            3,
+            "live: the survivor, the newcomer and the node whose text now matches"
+        );
+        assert!(live.contains(&later_match) && !live.contains(&retexted));
 
+        // As of s1 the four equal-length matching bodies tie, so the answer is
+        // in id order — and it is the snapshot's answer, not a filter over the
+        // live one: `gone`, `relabelled` and `retexted` are back, `later_match`
+        // (then "apples") is not.
+        let expected = vec![a, gone, relabelled, retexted];
         let past = plane.as_of(AsOf::Seq(s1)).unwrap();
+        let hits = past.keyword_search("Doc", "body", "graph databases", 10);
+        let ids: Vec<NodeId> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids, expected,
+            "the plane-level search answers from the snapshot"
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].1 == w[1].1),
+            "scores come from the snapshot's corpus, where the four bodies tie: {hits:?}"
+        );
+
         let ids = past
             .query()
             .keyword_top_k("Doc", "body", "graph databases", 10)
             .ids()
             .unwrap();
-        assert_eq!(
-            ids,
-            vec![a],
-            "AS OF: only the node the snapshot holds as a Doc"
-        );
-
-        let direct: Vec<NodeId> = past
-            .keyword_search("Doc", "body", "graph databases", 10)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(direct, vec![a], "the plane-level search obeys AS OF too");
+        assert_eq!(ids, expected, "the query source answers from the snapshot");
 
         let hybrid: Vec<NodeId> = past
             .hybrid()
@@ -3073,7 +3094,10 @@ mod time_travel_tests {
             .into_iter()
             .map(|h| h.node)
             .collect();
-        assert_eq!(hybrid, vec![a], "the hybrid keyword channel obeys AS OF");
+        assert_eq!(
+            hybrid, expected,
+            "the hybrid keyword channel answers from the snapshot"
+        );
     }
 
     #[test]

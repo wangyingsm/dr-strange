@@ -106,14 +106,16 @@ Time travel: `plane.as_of(AsOf::Seq(s) | AsOf::Time(ms))?` returns a handle
 whose every read is pinned to that snapshot (native backend only). The
 vector and keyword registries are not versioned — they describe the latest
 commit — so index-backed terminals are answered from the snapshot instead:
-vector searches brute-force the pinned records (exact, unindexed) and keyword
-searches take the live BM25 postings, over-fetch, and keep only nodes the
-snapshot holds under the searched label. A historical keyword or hybrid
-result therefore never names a node created, deleted or relabelled after the
-pinned point, but carries the live index's scores and may hold fewer than `k`
-rows. The same filter runs on live reads: a writer publishes its KV commit
-before it updates the registries, so an index can briefly name a node the
-snapshot cannot decode; the reader drops such ids rather than surfacing a
+vector searches brute-force the pinned records and keyword searches compute
+BM25 over them (both exact, both unindexed: one label scan per query). A
+historical keyword or hybrid result is the snapshot's own — the nodes that
+matched at the pinned point, on the text they held then, scored against that
+corpus — so a node deleted, relabelled or re-texted afterwards is still found
+and one created or made to match afterwards is not. The uncached reader takes
+the same exact path on every read, which is what makes it the oracle for the
+indexed one. Live reads have a narrower hazard: a writer publishes its KV
+commit before it updates the registries, so an index can briefly name a node
+the snapshot cannot decode; the reader drops such ids rather than surfacing a
 phantom row (02 §3).
 
 Row values: `Row` exposes bound variables by name → `NodeRef`/`EdgeRef` with

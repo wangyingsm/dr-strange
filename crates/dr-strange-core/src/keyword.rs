@@ -68,6 +68,26 @@ impl Entry {
         }
     }
 
+    /// Build an index over every `label` node's `property` text as `txn`
+    /// sees it — the one way an index is ever built from the KV, so the
+    /// open-time rebuild and the snapshot brute force agree exactly.
+    fn from_snapshot(
+        txn: &dyn ReadTransaction,
+        plane: PlaneId,
+        label: &str,
+        property: &str,
+        language: Language,
+    ) -> Result<Self> {
+        let analyzer = Analyzer::new(language);
+        let mut entry = Entry::new(language);
+        for id in graph::scan_label(txn, plane, label)? {
+            if let Some(text) = graph::node_text(txn, plane, id, property)? {
+                entry.add_doc(id.0, &analyzer, &text);
+            }
+        }
+        Ok(entry)
+    }
+
     /// Index (or re-index) one document's text. Empty documents (no terms after
     /// analysis) are not stored, so they don't perturb `avgdl`.
     fn add_doc(&mut self, node: u64, analyzer: &Analyzer, text: &str) {
@@ -179,16 +199,34 @@ impl KeywordRegistry {
         property: &str,
         language: Language,
     ) -> Result<()> {
-        let analyzer = Analyzer::new(language);
-        let mut entry = Entry::new(language);
-        for id in graph::scan_label(txn, plane, label)? {
-            if let Some(text) = graph::node_text(txn, plane, id, property)? {
-                entry.add_doc(id.0, &analyzer, &text);
-            }
-        }
+        let entry = Entry::from_snapshot(txn, plane, label, property, language)?;
         self.entries
             .insert((plane, label.to_string(), property.to_string()), entry);
         Ok(())
+    }
+
+    /// Exact BM25 over one read snapshot, without the live registry: builds
+    /// a throwaway index from `txn`'s own records for `(plane, label,
+    /// property)` and searches it. The unindexed keyword path — the
+    /// counterpart of the vector brute force — used by a time-travelling
+    /// read (the live postings describe the latest commit, not the pinned
+    /// one) and by the uncached oracle the indexed path must agree with.
+    /// Costs one label scan and analysis per query, which is what "correct
+    /// but unindexed" means for AS OF (arch/04 §3).
+    ///
+    /// `language` is the declaration's; the caller resolves it (from the
+    /// snapshot's own declaration, or the live one) so an undeclared pair is
+    /// still answered empty rather than analyzed with a guessed language.
+    pub fn search_snapshot(
+        txn: &dyn ReadTransaction,
+        plane: PlaneId,
+        label: &str,
+        property: &str,
+        language: Language,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        Ok(Entry::from_snapshot(txn, plane, label, property, language)?.search(query, k))
     }
 
     /// Declared indexes on `plane`, as `(label, property, language)` — the

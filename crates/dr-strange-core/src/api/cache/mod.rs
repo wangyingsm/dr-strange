@@ -79,18 +79,19 @@ pub trait GraphReader {
 
     /// BM25 keyword search for `KeywordTopK` and the hybrid keyword channel:
     /// the `k` best-matching nodes on `(label, property)`, as `(id, score)`,
-    /// most-relevant first. Unlike vector search there is no brute-force
-    /// fallback — BM25 needs the inverted index — so a reader with no keyword
-    /// registry (or a pair with no declared index) yields nothing.
+    /// most-relevant first. Only a *declared* pair is searchable — an
+    /// undeclared one yields nothing — but, as with vectors, the declared
+    /// index is an accelerator: a reader without the live registry (or one
+    /// pinned to a past snapshot the registry cannot describe) computes the
+    /// same BM25 exactly from its own snapshot (`snapshot_keyword_search`),
+    /// which is also the oracle the indexed path must match.
     fn keyword_search(
         &self,
-        _label: &str,
-        _property: &str,
-        _query: &str,
-        _k: usize,
-    ) -> Result<Vec<(NodeId, f32)>> {
-        Ok(Vec::new())
-    }
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>>;
 }
 
 /// Exact similarity search by scanning candidate records — the fallback when
@@ -151,10 +152,11 @@ fn indexed_or_brute<R: GraphReader + ?Sized>(
 /// and carrying `label` when one was asked for (arch/02 §3).
 ///
 /// The registries live outside the snapshot: a writer publishes its KV
-/// commit before it takes the registry lock, and a time-travelling handle
-/// pins a past snapshot under a registry built from the latest one. Either
-/// way an index can name a node the snapshot does not hold (not yet
-/// visible, deleted since, relabelled since). Surfacing such an id would
+/// commit before it takes the registry lock, so for the length of that
+/// window an index can name a node the snapshot does not hold (not yet
+/// visible, deleted since, relabelled since). (A time-travelling handle
+/// does not search the live registries at all — see
+/// `with_cache_historical`.) Surfacing such an id would
 /// hand the executor a row it cannot decode — a phantom — so the reader
 /// drops it here, once, for every terminal that searches an index. The
 /// record read is not wasted: the executor decodes the same node next, and
@@ -178,12 +180,41 @@ fn visible_hits<R: GraphReader + ?Sized, T>(
     Ok(out)
 }
 
-/// How many live BM25 postings a historical keyword search asks for per
-/// result it must return. The live index has no notion of the pinned
-/// snapshot, so the reader over-fetches, filters through the snapshot and
-/// truncates; a query whose matches mostly postdate the snapshot can still
-/// come back short, which the builder documents.
-const HISTORICAL_KEYWORD_OVERFETCH: usize = 4;
+/// Exact BM25 over the reader's own snapshot — the keyword counterpart of
+/// [`brute_force_search`]: the fallback when the live registry cannot answer
+/// (a time-travelling read, a reader without one) and the oracle the indexed
+/// path must match. The language comes from the declaration as the snapshot
+/// holds it, or failing that from the live registry (`live`) — an index
+/// declared after the pinned point still names the language its documents
+/// are analyzed in, and the declaration is an accelerator, not data. An
+/// undeclared pair yields nothing, exactly as the indexed path does.
+fn snapshot_keyword_search(
+    txn: &dyn ReadTransaction,
+    plane: PlaneId,
+    live: Option<&KeywordRegistry>,
+    label: &str,
+    property: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<(NodeId, f32)>> {
+    let declared = graph::list_keyword_indexes(txn)?
+        .into_iter()
+        .find(|(p, l, prop, _)| *p == plane && l == label && prop == property)
+        .map(|(_, _, _, language)| language)
+        .or_else(|| {
+            live?
+                .declared(plane)
+                .into_iter()
+                .find(|(l, prop, _)| l == label && prop == property)
+                .map(|(_, _, language)| language)
+        });
+    match declared {
+        Some(language) => {
+            KeywordRegistry::search_snapshot(txn, plane, label, property, language, query, k)
+        }
+        None => Ok(Vec::new()),
+    }
+}
 
 /// Pass-through `GraphReader` over a storage read transaction (arch/02 §2).
 /// Every read hits storage and decodes fresh — the point of comparison the
@@ -269,6 +300,18 @@ impl GraphReader for UncachedReader<'_> {
         )?;
         visible_hits(self, hits, label, |hit| NodeId(hit.id))
     }
+
+    fn keyword_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        // No live registry here, by design: the oracle computes BM25 from the
+        // snapshot alone, so the indexed reader has something exact to match.
+        snapshot_keyword_search(self.txn, self.plane, None, label, property, query, k)
+    }
 }
 
 /// Per-query memoizing [`GraphReader`] (arch/02): decoded `node`/`edge`/
@@ -294,9 +337,9 @@ pub struct CachedReader<'a> {
     /// Optional shared cross-query L2 (arch/02 §3). `None` ⇒ pure per-query
     /// (L1 only) — used by tests and the differential oracle.
     l2: Option<(&'a GraphCache, u64)>,
-    /// This reader pins a past snapshot (AS OF) while the keyword registry
-    /// describes the latest one, so `keyword_search` over-fetches from the
-    /// live postings before filtering through the snapshot.
+    /// This reader pins a past snapshot (AS OF) that the keyword registry
+    /// (built from the latest commit) does not describe, so `keyword_search`
+    /// computes BM25 from the snapshot itself instead of the live postings.
     historical: bool,
     // Per-query L1: fast intra-query hits and negative caching. Bound to this
     // reader's snapshot, dropped at query end.
@@ -333,9 +376,9 @@ impl<'a> CachedReader<'a> {
     /// Like [`with_cache`](Self::with_cache) but for a time-travel read
     /// (ROADMAP §4): no vector index, so every vector search takes the exact
     /// brute-force path over the pinned snapshot — the live HNSW index is
-    /// built from the latest commit and can't answer a past one — and
-    /// keyword searches (which have no unindexed path) filter the live BM25
-    /// postings through the snapshot, over-fetching to compensate.
+    /// built from the latest commit and can't answer a past one — and every
+    /// keyword search likewise computes BM25 from the pinned snapshot rather
+    /// than the live postings (which would match and score on today's text).
     pub(crate) fn with_cache_historical(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
@@ -475,20 +518,28 @@ impl GraphReader for CachedReader<'_> {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeId, f32)>> {
+        // A pinned past snapshot is not what the live postings describe — a
+        // node re-texted since would match and score on its latest text, one
+        // deleted or relabelled since would be missing — so a historical read
+        // computes BM25 from the snapshot, as vector search brute-forces it.
+        if self.historical {
+            return snapshot_keyword_search(
+                self.txn,
+                self.plane,
+                self.keywords,
+                label,
+                property,
+                query,
+                k,
+            );
+        }
         // A live read asks for exactly `k`: the only ids the filter can drop
         // are the skew window's, and a short page there is the honest answer.
-        let fetch = if self.historical {
-            k.saturating_mul(HISTORICAL_KEYWORD_OVERFETCH)
-        } else {
-            k
-        };
         let hits = self
             .keywords
-            .and_then(|reg| reg.search(self.plane, label, property, query, fetch))
+            .and_then(|reg| reg.search(self.plane, label, property, query, k))
             .unwrap_or_default();
-        let mut hits = visible_hits(self, hits, Some(label), |hit| hit.0)?;
-        hits.truncate(k);
-        Ok(hits)
+        visible_hits(self, hits, Some(label), |hit| hit.0)
     }
 }
 
@@ -754,6 +805,113 @@ mod tests {
             .map(|h| h.id)
             .collect();
         assert_eq!(ids, vec![kept.0], "the oracle agrees");
+    }
+
+    #[test]
+    fn indexed_keyword_search_matches_the_snapshot_oracle() {
+        // The uncached reader computes BM25 from the snapshot alone; the
+        // cached reader answers from the live registry, kept in step by the
+        // same incremental mirroring a commit does. Both must agree exactly —
+        // ids, order and scores — after a build and after edits, or the AS OF
+        // path (which is the oracle's) and the live path would disagree.
+        use crate::keyword::KeywordRegistry;
+        use crate::text::Language;
+        use crate::types::{PropDesc, PropValue};
+
+        fn body(text: &str) -> Properties {
+            let mut p = Properties::new();
+            p.insert("body".into(), PropDesc::new(PropValue::Str(text.into())));
+            p
+        }
+        let corpus = [
+            "graph databases store nodes and edges",
+            "vector search over embeddings",
+            "a graph of citations between papers",
+            "databases index text with bm25",
+            "edges connect nodes in a graph graph graph",
+        ];
+        let queries = [
+            "graph",
+            "graph databases",
+            "nodes edges",
+            "bm25 text",
+            "nothing here",
+        ];
+
+        let eng = MemoryEngine::new();
+        let ids: Vec<NodeId> = {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            graph::declare_keyword_index(
+                &mut txn,
+                PlaneId::STARTUP,
+                "Doc",
+                "body",
+                Language::English,
+            )
+            .unwrap();
+            let ids = corpus
+                .iter()
+                .map(|t| {
+                    graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &body(t)).unwrap()
+                })
+                .collect();
+            txn.commit().unwrap();
+            ids
+        };
+        let mut keywords = KeywordRegistry::new();
+        {
+            let txn = eng.begin_read().unwrap();
+            keywords.rebuild_from(&txn).unwrap();
+        }
+
+        let compare = |keywords: &KeywordRegistry, stage: &str| {
+            let txn = eng.begin_read().unwrap();
+            let cached = CachedReader::new(&txn, PlaneId::STARTUP).with_keywords(keywords);
+            let oracle = UncachedReader::new(&txn, PlaneId::STARTUP);
+            for q in queries {
+                let live = cached.keyword_search("Doc", "body", q, 3).unwrap();
+                let exact = oracle.keyword_search("Doc", "body", q, 3).unwrap();
+                assert_eq!(live, exact, "{stage}: {q:?}");
+            }
+            assert!(
+                oracle
+                    .keyword_search("Doc", "title", "graph", 3)
+                    .unwrap()
+                    .is_empty(),
+                "an undeclared pair is empty for the oracle too"
+            );
+            cached.keyword_search("Doc", "body", "graph", 3).unwrap()
+        };
+        assert_eq!(compare(&keywords, "after build").len(), 3);
+
+        // Edit one document's text and delete another, mirroring both the way
+        // a commit does.
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::set_node_prop(
+                &mut txn,
+                PlaneId::STARTUP,
+                ids[1],
+                "body",
+                PropDesc::new(PropValue::Str("graph databases everywhere".into())),
+            )
+            .unwrap();
+            graph::delete_node(&mut txn, PlaneId::STARTUP, ids[4]).unwrap();
+            txn.commit().unwrap();
+        }
+        keywords.upsert(
+            PlaneId::STARTUP,
+            "Doc",
+            "body",
+            ids[1],
+            "graph databases everywhere",
+        );
+        keywords.remove_node(ids[4]);
+        let hits = compare(&keywords, "after edits");
+        assert!(
+            hits.iter().any(|(id, _)| *id == ids[1]) && hits.iter().all(|(id, _)| *id != ids[4])
+        );
     }
 
     /// A chunky property map so postcard decode on read is non-trivial — the
