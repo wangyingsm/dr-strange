@@ -47,18 +47,71 @@ fn cache_control_for(path: &str) -> &'static str {
     }
 }
 
-/// Whether the page served to this peer may carry the bootstrap token.
+/// Request headers whose presence means something stood between the browser
+/// and this listener: a reverse proxy names the client it forwards for, the
+/// host it was asked for, or itself. Any of them on a request from a
+/// loopback peer means the peer is the proxy, not the human.
+const PROXY_HEADERS: [&str; 6] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+];
+
+/// Does the request carry any of [`PROXY_HEADERS`]?
+pub(crate) fn is_forwarded(headers: &axum::http::HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
+/// Where a `GET /` came from, as far as this listener can tell — the inputs
+/// of [`may_inject_token`], separated from the request so the rule is a
+/// pure function.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageRequest<'a> {
+    /// The listener is bound to a loopback address.
+    pub bind_is_loopback: bool,
+    /// The operator has not switched page injection off (`DRSG_PAGE_TOKEN`).
+    pub page_token: bool,
+    /// An allowed origin off loopback is configured — the operator's own
+    /// statement that a proxy serves this dashboard to the network.
+    pub network_origins: bool,
+    /// The TCP peer, when the listener records one.
+    pub peer: Option<IpAddr>,
+    /// The `Host` the browser addressed (`host[:port]`), or the request's
+    /// authority; `None` when the request names neither.
+    pub host: Option<&'a str>,
+    /// Any of [`PROXY_HEADERS`] is present.
+    pub forwarded: bool,
+}
+
+/// Whether the page served for this request may carry the bootstrap token.
 ///
 /// `GET /` is unauthenticated — it has to be, it is how the browser obtains
 /// the page that will authenticate — so whatever is in the page is public to
-/// whoever can fetch it. That is acceptable only when "whoever" is a process
-/// on this machine: the listener is loopback-bound *and* the connection came
-/// from a loopback address. Both, not either — a loopback bind reached
-/// through a forwarded port still shows a loopback peer, and a LAN bind
-/// reached from the same host shows a loopback peer too, while the same page
-/// is also being served to the network. An unknown peer counts as remote.
-pub(crate) fn may_inject_token(bind_is_loopback: bool, peer: Option<IpAddr>) -> bool {
-    bind_is_loopback && peer.is_some_and(|ip| ip.is_loopback())
+/// whoever can fetch it. That is acceptable only when "whoever" is a human
+/// at a browser on this machine, and every sign this listener can read must
+/// say so: the listener is loopback-bound *and* the connection came from a
+/// loopback address (a LAN bind reached from the same host shows a loopback
+/// peer while the same page goes to the network) *and* nothing says a proxy
+/// is the peer. A same-host reverse proxy or a forwarded port shows a
+/// loopback peer for every client on the internet, so a loopback peer alone
+/// proves nothing; what gives a proxy away is what it adds (a `Forwarded` /
+/// `X-Forwarded-*` / `Via` header), the name the browser addressed (a `Host`
+/// that is not this machine), or the operator having listed the proxy's
+/// origin in `DRSG_ALLOWED_ORIGINS` — which a dashboard behind a proxy needs
+/// to work at all. A proxy that shows none of these is indistinguishable from
+/// a local browser here, which is what `DRSG_PAGE_TOKEN=0` is for; the docs
+/// call a proxied loopback bind a network deployment and say to set it. An
+/// unknown peer or an absent host counts as remote.
+pub(crate) fn may_inject_token(req: PageRequest<'_>) -> bool {
+    req.page_token
+        && req.bind_is_loopback
+        && !req.network_origins
+        && !req.forwarded
+        && req.peer.is_some_and(|ip| ip.is_loopback())
+        && req.host.is_some_and(crate::auth::host_header_is_loopback)
 }
 
 /// Serves an embedded asset by path, falling back to `index.html` for any
@@ -75,7 +128,22 @@ pub async fn static_handler(State(state): State<Arc<AppState>>, req: Request) ->
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
-    let token = if may_inject_token(state.bind_is_loopback, peer) {
+    // HTTP/1.1 carries the name in `Host`; HTTP/2 in the `:authority`
+    // pseudo-header, which hyper surfaces on the URI instead.
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let page = PageRequest {
+        bind_is_loopback: state.bind_is_loopback,
+        page_token: state.page_token,
+        network_origins: state.origins.has_network_origins(),
+        peer,
+        host,
+        forwarded: is_forwarded(req.headers()),
+    };
+    let token = if may_inject_token(page) {
         state.bootstrap_token.as_deref()
     } else {
         None
@@ -180,7 +248,7 @@ fn attr_escape(s: &str) -> String {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{cache_control_for, inject_token, is_asset_request, may_inject_token};
+    use super::{PageRequest, cache_control_for, inject_token, is_asset_request, may_inject_token};
 
     #[test]
     fn a_built_asset_is_told_apart_from_a_client_side_route() {
@@ -231,19 +299,67 @@ mod tests {
     }
 
     #[test]
-    fn the_token_is_handed_only_to_a_loopback_peer_of_a_loopback_listener() {
+    fn the_token_is_handed_only_to_a_local_browser_of_a_loopback_listener() {
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         let local6: IpAddr = "::1".parse().unwrap();
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
-        assert!(may_inject_token(true, Some(local)));
-        assert!(may_inject_token(true, Some(local6)));
+        let desktop = PageRequest {
+            bind_is_loopback: true,
+            page_token: true,
+            network_origins: false,
+            peer: Some(local),
+            host: Some("127.0.0.1:7700"),
+            forwarded: false,
+        };
+        assert!(may_inject_token(desktop));
+        assert!(may_inject_token(PageRequest {
+            peer: Some(local6),
+            host: Some("[::1]:7700"),
+            ..desktop
+        }));
+        assert!(may_inject_token(PageRequest {
+            host: Some("localhost:7700"),
+            ..desktop
+        }));
         // A LAN bind never injects, even to a peer on this machine — the
         // same page is being served to the network.
-        assert!(!may_inject_token(false, Some(local)));
-        // A loopback bind reached from elsewhere (a forwarded port shows
-        // a loopback peer, so this is the tunnelled/proxied shape) doesn't.
-        assert!(!may_inject_token(true, Some(lan)));
+        assert!(!may_inject_token(PageRequest {
+            bind_is_loopback: false,
+            ..desktop
+        }));
+        // A loopback bind reached from elsewhere.
+        assert!(!may_inject_token(PageRequest {
+            peer: Some(lan),
+            ..desktop
+        }));
         // No peer address at all is treated as remote.
-        assert!(!may_inject_token(true, None));
+        assert!(!may_inject_token(PageRequest {
+            peer: None,
+            ..desktop
+        }));
+        // The same-host reverse proxy: a loopback peer, but the request says
+        // it was forwarded, or was addressed to a public name, or the
+        // operator listed the proxy's origin. Any one of them is enough.
+        assert!(!may_inject_token(PageRequest {
+            forwarded: true,
+            ..desktop
+        }));
+        assert!(!may_inject_token(PageRequest {
+            host: Some("graph.example.com"),
+            ..desktop
+        }));
+        assert!(!may_inject_token(PageRequest {
+            host: None,
+            ..desktop
+        }));
+        assert!(!may_inject_token(PageRequest {
+            network_origins: true,
+            ..desktop
+        }));
+        // And the operator's switch turns it off outright.
+        assert!(!may_inject_token(PageRequest {
+            page_token: false,
+            ..desktop
+        }));
     }
 }

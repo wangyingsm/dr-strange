@@ -259,6 +259,8 @@ query_timeout_secs = 60                     # how long one request's queries may
 retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all). Applies to every drsg command, not only serve
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins
+# page_token = false                        # never write the token into the page (→ DRSG_PAGE_TOKEN); for a loopback bind behind a reverse proxy, see the Web UI chapter
+# /mcp behind a hostname: DRSG_ALLOWED_HOSTS=memory.example.com (env; honoured only with a token — see the MCP chapter)
 
 [server.tls]                                # present ⇒ serve HTTPS
 cert = "/etc/drsg/cert.pem"                 # PEM certificate chain

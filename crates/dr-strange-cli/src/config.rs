@@ -200,6 +200,10 @@ pub struct ServerCfg {
     pub retain_commits: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
+    /// Whether the page served to a local browser may carry the token
+    /// (→ `DRSG_PAGE_TOKEN`; omitted means yes). `false` for a loopback bind
+    /// behind a reverse proxy the server cannot tell from a local browser.
+    pub page_token: Option<bool>,
     /// Hostnames (or `host:port`) `/mcp` answers at besides loopback and the
     /// bind address — what a proxy or LAN client sends as `Host`. Honoured
     /// only with a token; merged with `DRSG_ALLOWED_HOSTS`.
@@ -272,6 +276,9 @@ pub fn apply_env(cfg: &Config) {
     if let Some(origins) = &cfg.server.allowed_origins {
         set("DRSG_ALLOWED_ORIGINS", &origins.join(","));
     }
+    if let Some(page_token) = cfg.server.page_token {
+        set("DRSG_PAGE_TOKEN", if page_token { "1" } else { "0" });
+    }
     if let Some(dir) = &cfg.logging.dir {
         set("DRSG_LOG_DIR", &dir.to_string_lossy());
     }
@@ -308,7 +315,15 @@ pub fn check_serve_bind(
     let addr = cli_addr
         .or(cfg.server.addr)
         .unwrap_or_else(|| ServeOptions::default().addr);
-    dr_strange_web::check_bind_policy(addr, token_configured)
+    // The origins the server will see: after `apply_env` the file's list is
+    // in the environment unless the variable was already set, so the
+    // variable is the one reading that matches the server's own.
+    let network_origins = std::env::var("DRSG_ALLOWED_ORIGINS")
+        .ok()
+        .into_iter()
+        .chain(cfg.server.allowed_origins.iter().map(|o| o.join(",")))
+        .any(|list| dr_strange_web::origins_off_loopback(&list));
+    dr_strange_web::check_bind_policy(addr, token_configured, network_origins)
 }
 
 /// Build the web crate's [`ServeOptions`] from the `[server]` section, with an
@@ -395,6 +410,7 @@ mod tests {
             max_concurrent = 32
             retain_commits = 5
             allowed_origins = ["https://a.example", "https://b.example"]
+            page_token = false
 
             [logging]
             dir = "/var/log/drsg"
@@ -417,6 +433,7 @@ mod tests {
         assert_eq!(cfg.server.max_concurrent, Some(32));
         assert_eq!(cfg.server.retain_commits, Some(5));
         assert_eq!(cfg.server.allowed_origins.as_ref().unwrap().len(), 2);
+        assert_eq!(cfg.server.page_token, Some(false));
         assert_eq!(cfg.logging.dir.as_deref(), Some(Path::new("/var/log/drsg")));
         assert_eq!(
             cfg.llm.get("OPENAI_API_KEY").map(String::as_str),
@@ -497,6 +514,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to listen"), "{err}");
+        // A loopback bind whose `allowed_origins` names a public origin is
+        // a dashboard served through a proxy: refused without a token too,
+        // while loopback-only origins pass.
+        let proxied = parse("[server]\nallowed_origins = [\"https://graph.example.com\"]\n");
+        let err = check_serve_bind(&proxied, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_origins"), "{err}");
+        check_serve_bind(&proxied, None, true).expect("a token makes the proxied shape acceptable");
+        let local = parse("[server]\nallowed_origins = [\"http://localhost:5173\"]\n");
+        check_serve_bind(&local, None, false).expect("a loopback origin is not a proxy");
     }
 
     /// The `[server]` knobs that reach `/mcp`: `allowed_hosts` lands on the

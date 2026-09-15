@@ -436,6 +436,50 @@ async fn the_page_hands_its_token_to_a_loopback_browser_as_data_not_code() {
     assert!(!html.contains("__DRSG_TOKEN__"), "{html}");
 }
 
+/// The same loopback listener hands no token to a request that a reverse
+/// proxy on this machine forwarded: the peer is loopback either way, so what
+/// tells them apart is what the proxy adds (`X-Forwarded-For`) or the public
+/// name the browser addressed (`Host`). Each alone is enough, and the page
+/// is still served — the SPA asks for the token instead.
+#[tokio::test]
+async fn the_page_hands_no_token_to_a_forwarded_or_publicly_addressed_request() {
+    let addr = spawn_server();
+    wait_ready(addr).await;
+    let client = reqwest::Client::new();
+    let meta = r#"<meta name="drsg-token""#;
+
+    let forwarded = client
+        .get(format!("http://{addr}/"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert!(forwarded.status().is_success());
+    let html = forwarded.text().await.unwrap();
+    assert!(!html.contains(meta), "{html}");
+    assert!(!html.contains(TOKEN), "{html}");
+
+    let public = client
+        .get(format!("http://{addr}/"))
+        .header("host", "graph.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert!(public.status().is_success());
+    let html = public.text().await.unwrap();
+    assert!(!html.contains(meta), "{html}");
+    assert!(!html.contains(TOKEN), "{html}");
+
+    // And the SPA route fallback follows the same rule.
+    let deep = client
+        .get(format!("http://{addr}/explore"))
+        .header("via", "1.1 caddy")
+        .send()
+        .await
+        .unwrap();
+    assert!(!deep.text().await.unwrap().contains(meta));
+}
+
 /// `/ws` takes the bearer token either way: `Authorization: Bearer` on the
 /// upgrade (the preferred form — a header is not written to access logs or
 /// browser history) or `?token=` (the only form a browser's WebSocket API
