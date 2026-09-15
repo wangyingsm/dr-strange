@@ -1321,15 +1321,23 @@ pub fn cypher_subgraph(
 const SEED_LIMIT: u64 = 200;
 /// The default fan-out cap for one click-to-expand (hub-safe expansion).
 const EXPAND_LIMIT: u64 = 100;
-/// Text search stops after examining this many nodes — there is no text index,
-/// so `plane.find` is a linear scan; the cap keeps a huge plane responsive.
-const FIND_SCAN_CAP: usize = 20_000;
+/// Text search stops after examining this many nodes in its node pass, and
+/// again after visiting this many nodes (or examining this many edges) in
+/// its edge pass — there is no text index, so `plane.find` is a linear scan;
+/// the caps keep a huge plane responsive.
+pub(crate) const FIND_SCAN_CAP: usize = 20_000;
 /// Default number of matches `plane.find` returns.
 const FIND_LIMIT: usize = 50;
-/// How many nodes one page of a linear scan loads. `plane.find` and a
-/// degree-ordered `graph.seed` walk the plane a page at a time and stop the
-/// moment they have what they came for, so a small plane costs one page and
-/// a hit early in a huge one costs one page — never the whole plane.
+/// How many node *records* one page of a linear scan loads. `plane.find` and
+/// a degree-ordered `graph.seed` walk the plane a page at a time and stop
+/// the moment they have what they came for, so a small plane costs one page
+/// of records and a hit early in a huge one costs one page — never every
+/// record of the plane. What each page still costs is the core's id scan:
+/// the executor collects the plane's node ids (8 bytes each) before its
+/// skip/limit steps apply (core `compute/exec.rs` `source_rows`), so a page
+/// is O(plane) in ids and O(page) in records, and a walk to the cap is at
+/// most `cap / SCAN_PAGE` such id scans. A resumable id cursor in the core
+/// would remove that term; until then the caps are what bound a keystroke.
 pub(crate) const SCAN_PAGE: u64 = 2_000;
 /// A degree-ordered seed measures the degree of at most this many nodes. The
 /// measurement is a neighbour lookup per node, so on a plane of millions it
@@ -1453,10 +1461,11 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 ///
 /// The core keeps no per-node degree, so degree is a neighbour lookup per
 /// node; what this bounds is everything around it. Ids arrive a page at a
-/// time (never the whole plane in one vector), the scan ends at the cap, and
-/// the ranking is a bounded min-heap of `limit` entries rather than a sort of
-/// every node — so the cost is `cap` lookups and `limit` memory, whatever the
-/// plane's size.
+/// time (each page an id scan in the core, see [`SCAN_PAGE`]; never every
+/// record), the scan ends at the cap, and the ranking is a bounded min-heap
+/// of `limit` entries rather than a sort of every node — so the cost is
+/// `cap` lookups, at most `cap / SCAN_PAGE` id scans, and `limit` memory,
+/// whatever the plane's size.
 fn top_by_degree<'db>(
     plane: &PlaneHandle<'db>,
     scan: impl Fn() -> dr_strange_core::QueryBuilder<'db>,
@@ -1525,8 +1534,9 @@ pub struct Find {
 /// labels, and string property values; edges match on type and string property
 /// values. Both hit `match` hints (which field matched) so the UI can show
 /// *why* something surfaced. There is no text index (arch/03), so this is a
-/// linear scan capped at [`FIND_SCAN_CAP`] nodes / edges and [`limit`] results
-/// each; `truncated` says whether either cap cut the results short.
+/// linear scan capped at [`FIND_SCAN_CAP`] nodes examined (node pass), nodes
+/// visited and edges examined (edge pass), and [`limit`] results each;
+/// `truncated` says whether any cap cut the results short.
 pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Find = params(p)?;
     let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
@@ -1574,7 +1584,9 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     // ---- nodes ----
     // A page at a time, stopping at `limit` hits or [`FIND_SCAN_CAP`] nodes.
     // This runs on every header keystroke: a match near the front of the
-    // plane costs one page, and a miss costs the cap — never the plane.
+    // plane costs one page of records, and a miss costs the cap — never
+    // every record of the plane (each page's id scan is the core's cost,
+    // see [`SCAN_PAGE`]).
     let mut node_hits = Vec::new();
     let mut examined = 0usize;
     // Ids the node pass loaded, kept so the edge pass below need not read
@@ -1624,8 +1636,21 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let mut edges_truncated = false;
     let mut sources = walked;
     let mut next_skip = sources.len() as u64;
+    // Nodes whose out-edges the walk has looked up. A node with no out-edges
+    // examines no edge, so without this second cap a needle matching no edge
+    // on a plane of mostly leaves would look up the neighbours of every node
+    // — the whole plane per keystroke, which is what the cap exists to
+    // prevent.
+    let mut sources_visited = 0usize;
     'walk: loop {
         for n in &sources {
+            if sources_visited >= FIND_SCAN_CAP {
+                // Truncated only if the plane holds nodes the walk never
+                // reached; a cap met exactly at the end missed nothing.
+                edges_truncated = sources_visited < total;
+                break 'walk;
+            }
+            sources_visited += 1;
             for hop in app(plane.neighbors(*n, Dir::Out, None))? {
                 if !seen.insert(hop.edge.0) {
                     continue;
