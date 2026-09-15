@@ -45,6 +45,14 @@ empty database would answer every question with "nothing found", which reads
 exactly like a digest that went wrong, so a path that isn't there is an error
 instead.
 
+The database is opened with the same history retention `drsg serve` and the
+CLI use — the last **20** commits reachable by time travel, older versions
+reclaimed at compaction — so a store an agent writes through `write_nodes`,
+`write_edges`, `cypher` or `digest` does not keep every version forever. This
+binary reads no config file; `DRSG_RETAIN_COMMITS` changes the figure (`0`
+keeps everything, as `[server] retain_commits = 0` does), and a value that is
+not a number is an error at start-up rather than a silent default.
+
 **With no database named, it looks for a server first.** The nearest
 `.mcp.json` is read — walking up, as git finds its own directory, and stopping
 at the repository root (the first `.git`); a file owned by another user or

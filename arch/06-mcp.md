@@ -87,6 +87,13 @@ then narrow, then act:
   already runs as the user (stdio, the CLI — `local_files`), and on the
   shared `/mcp` only when it lies inside the attached tree. Nothing attached
   and no local files: nothing is read. `digest { path }` remains stdio-only.
+- **The stdio binary bounds history like a served one.** `drsg-mcp` opens
+  the database with `DEFAULT_RETAIN_COMMITS` (20; the web crate's constant
+  is this one) unless `DRSG_RETAIN_COMMITS` says otherwise (`0` keeps every
+  version; a non-number is a start-up error, not a silent default). It has
+  no config file, and it writes — `write_nodes`, `write_edges`, `cypher`,
+  `digest` — so without this a store driven only through a stdio host would
+  never reclaim a version (05 §4).
 - **Every tool call ends.** The tool gate queues rather than rejects, but
   under one per-call deadline covering the wait and the run
   (`with_tool_deadline`; default 300 s; `DRSG_MCP_TOOL_DEADLINE_SECS`, `0`

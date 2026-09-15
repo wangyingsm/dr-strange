@@ -237,8 +237,9 @@ const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Enough history for the dashboard's time slider and an agent's "what did
 /// this look like before that change" to have somewhere to go, while keeping
-/// the store close to the size of what it currently holds.
-pub const DEFAULT_RETAIN_COMMITS: u64 = 20;
+/// the store close to the size of what it currently holds. The mcp crate's
+/// figure, so the stdio binary and a served database keep the same history.
+pub const DEFAULT_RETAIN_COMMITS: u64 = dr_strange_mcp::DEFAULT_RETAIN_COMMITS;
 
 /// Serves `db` (whose file lives at `db_path`, if on disk) per `opts` until a
 /// shutdown signal (Ctrl-C / SIGTERM) — or, in `--follow` mode, until the

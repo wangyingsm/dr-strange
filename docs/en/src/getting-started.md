@@ -344,7 +344,9 @@ them in the launching environment and leave them out of the file.
 not only `serve`: a store driven from the command line — `import`, `cypher`,
 `digest`, `vectorize` — lives by the same window (and the same default of 20)
 as it would under the server, so its history is reclaimed at compaction rather
-than kept forever.
+than kept forever. The stdio `drsg-mcp` binary reads no config file but opens
+with the same default; `DRSG_RETAIN_COMMITS` changes it there ([Chapter
+8](./mcp.md)).
 
 ## Read-only replicas (`serve --follow`)
 
