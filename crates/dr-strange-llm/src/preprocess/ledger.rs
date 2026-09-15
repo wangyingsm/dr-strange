@@ -133,17 +133,18 @@ pub fn record_ledger(
         );
     }
 
-    let plane = db.plane(plane_name)?;
-    let mut props = plane.properties()?;
-    props.insert(
-        LEDGER_PROP.into(),
-        described(
-            "what the ingest that wrote this plane could and could not read",
-            PropValue::Map(entries),
-        ),
-    );
-    plane.set_properties(props)?;
-    Ok(())
+    // One property edited under the write lock, not the map read and written
+    // back: `serve watch` stamps the sync point on the same plane, and a
+    // read-modify-write here could put the map back without it.
+    db.plane(plane_name)?.update_properties(|props| {
+        props.insert(
+            LEDGER_PROP.into(),
+            described(
+                "what the ingest that wrote this plane could and could not read",
+                PropValue::Map(entries),
+            ),
+        );
+    })
 }
 
 #[cfg(test)]
@@ -260,6 +261,41 @@ mod tests {
 
         let props = db.plane("code").unwrap().properties().unwrap();
         assert!(props.contains_key("synced_commit"));
+        assert!(props.contains_key(LEDGER_PROP));
+    }
+
+    /// The account is written under the plane's write lock, so a property
+    /// another writer sets at the same moment is not lost: many threads each
+    /// stamping their own property while the ledger is recorded over and
+    /// over, and every stamp is still there at the end.
+    #[test]
+    fn a_property_stamped_while_the_account_is_written_is_kept() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 25;
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let db = &db;
+                s.spawn(move || {
+                    for r in 0..ROUNDS {
+                        let plane = db.plane("code").unwrap();
+                        plane
+                            .update_properties(|props| {
+                                props.insert(
+                                    format!("stamp_{w}_{r}"),
+                                    PropDesc::new(PropValue::Int(r as i64)),
+                                );
+                            })
+                            .unwrap();
+                        record_ledger(db, "code", &report(), &[manifest()]).unwrap();
+                    }
+                });
+            }
+        });
+        let props = db.plane("code").unwrap().properties().unwrap();
+        let stamps = props.keys().filter(|k| k.starts_with("stamp_")).count();
+        assert_eq!(stamps, WRITERS * ROUNDS, "every writer's stamp survives");
         assert!(props.contains_key(LEDGER_PROP));
     }
 }
