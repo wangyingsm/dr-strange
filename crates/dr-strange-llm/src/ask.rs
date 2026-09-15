@@ -515,7 +515,7 @@ fn check_read_only(plan: &LogicalPlan) -> Result<()> {
     );
     if !source_ok {
         bail!(
-            "the plan's source is not one of ScanAll, ScanLabel or SeekKeys — \
+            "the plan's source is not one of ScanAll, ScanLabel, SeekIds or SeekKeys — \
              vector, keyword, hybrid and algorithm sources are not available here"
         );
     }
@@ -541,15 +541,19 @@ fn check_read_only(plan: &LogicalPlan) -> Result<()> {
 }
 
 /// Bound what a plan may return: every `Limit` the model wrote — as a step or
-/// on a projection — is clamped to [`ASK_MAX_LIMIT`], and a plan that
-/// declares none gets `requested` appended, clamped the same way (`0` means
-/// the maximum). No plan leaves here unbounded.
+/// on a projection — is clamped to [`ASK_MAX_LIMIT`], and a plan whose
+/// *last* step is not a `Limit` gets `requested` appended, clamped the same
+/// way (`0` means the maximum). No plan leaves here unbounded.
+///
+/// The last step, not any step: a `Limit` applies where it stands, and the
+/// prompt lists it among steps that go "in order", so a model can write
+/// `[Limit(1), ExpandVar(1..50)]` — one seed, then every walk from it. That
+/// plan declared a limit and returned an unbounded number of rows. The cap
+/// at the end is what the executor's streaming `take` stops on.
 fn bound_limits(plan: &mut LogicalPlan, requested: u64) {
-    let mut declared = false;
     for step in &mut plan.steps {
         if let Step::Limit(n) = step {
             *n = (*n).min(ASK_MAX_LIMIT);
-            declared = true;
         }
     }
     if let Some(p) = &mut plan.project
@@ -557,6 +561,7 @@ fn bound_limits(plan: &mut LogicalPlan, requested: u64) {
     {
         *n = (*n).min(ASK_MAX_LIMIT);
     }
+    let declared = matches!(plan.steps.last(), Some(Step::Limit(_)));
     if !declared {
         let cap = if requested == 0 {
             ASK_MAX_LIMIT
@@ -957,6 +962,14 @@ mod tests {
             plan.steps.last(),
             Some(Step::Limit(ASK_MAX_LIMIT))
         ));
+        // A limit that stands before an expansion bounds the seeds, not the
+        // rows: the plan still ends in a cap.
+        let seeded_walk = r#"{"source":"ScanAll","steps":[{"Limit":1},
+            {"ExpandVar":{"dir":"Both","edge_type":null,"min":1,"max":6}}]}"#;
+        let plan = dry(seeded_walk, 100);
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0], Step::Limit(1));
+        assert!(matches!(plan.steps[2], Step::Limit(100)));
         // A projection's own limit is bounded the same way.
         let projected = r#"{"source":"ScanAll","steps":[],
             "project":{"items":[],"distinct":false,"order_by":[],"skip":null,"limit":99999}}"#;
