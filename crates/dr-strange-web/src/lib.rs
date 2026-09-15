@@ -24,6 +24,16 @@ pub use auth::{FREE_FAILURES, MAX_LOCKOUT, TRACKED_PEERS};
 pub use rpc::MAX_BATCH;
 pub use server::{ServeOutcome, check_bind_policy};
 
+/// Whether a comma-separated origin list (the `DRSG_ALLOWED_ORIGINS` form)
+/// names any origin off loopback — the reading [`check_bind_policy`] wants
+/// from a caller that checks the bind before the server exists.
+pub fn origins_off_loopback(list: &str) -> bool {
+    list.split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .any(|o| !auth::AllowedOrigins::is_loopback(o))
+}
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;

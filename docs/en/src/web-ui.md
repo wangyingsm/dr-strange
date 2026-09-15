@@ -24,6 +24,21 @@ kept in the tab's session storage (gone when the tab closes) and sent as
 form a browser socket can carry. The dashboard's own origin must also be listed
 in `allowed_origins` / `DRSG_ALLOWED_ORIGINS` there, since it is not loopback.
 
+A loopback bind behind a reverse proxy on the same machine (or a forwarded
+port) is a network deployment, not a local one: every client on the internet
+reaches the server from a loopback peer address. The server treats it as
+such wherever it can tell — it never writes the token into a page whose
+request a proxy forwarded (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`)
+or addressed to a name other than this machine (`Host`), and listing the
+proxy's origin in `allowed_origins`, which the dashboard needs to work
+behind one, turns injection off for every page and makes a token mandatory
+at startup (an allowed origin off loopback never counts as the local UI
+either). A proxy that adds no header and keeps a loopback `Host` cannot be
+told from a local browser, so for that shape set `DRSG_PAGE_TOKEN=0`
+(`[server] page_token = false`), which serves the page bare regardless; the
+dashboard then asks for the token as it does on any other address. Set a
+token whenever anything stands in front of the listener.
+
 Every response carries a `Content-Security-Policy` under which scripts and styles
 load only from the server itself; the dashboard is built to satisfy it, and a
 reverse proxy in front should pass it through rather than replace it.

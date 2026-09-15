@@ -79,6 +79,11 @@ pub struct AppState {
     /// guard's "allowed origin" still means "the local human's own UI" (it
     /// does not on a LAN bind, so `local_ui` is never set there).
     pub bind_is_loopback: bool,
+    /// The operator's switch for writing the token into the page at all
+    /// (`DRSG_PAGE_TOKEN`, on unless set to `0`/`false`/`off`/`no`). Off is
+    /// for a loopback bind behind a reverse proxy that this listener cannot
+    /// tell from a local browser — see [`crate::assets::may_inject_token`].
+    pub page_token: bool,
     /// Commit-time change feed (ROADMAP §5): the core observer publishes each
     /// committed `ChangeSet` here, and every `/ws` subscriber that ran
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
@@ -196,12 +201,19 @@ fn resolve_credentials(
     ws_token: Option<String>,
 ) -> Result<Credentials, Box<Response>> {
     // An allowed Origin is only "our own local UI" when the listener is
-    // loopback-bound: on any other bind the same page is served to whoever
-    // can reach the port, so the zero-config fallback must not key off it
-    // (arch/08 §4.2 invariant 2). The 403 for a *disallowed* Origin stands
-    // regardless — that is the CSRF guard, not the fallback.
+    // loopback-bound, the origin itself is loopback, and nothing forwarded
+    // the request: on any other bind the same page is served to whoever can
+    // reach the port; a configured public origin is by definition a page
+    // reached over the network (through a proxy in front of this listener,
+    // whose peer address is loopback for every client); and a forwarded
+    // request's peer is the proxy. So the zero-config fallback must not key
+    // off any of those (arch/08 §4.2 invariant 2). The 403 for a
+    // *disallowed* Origin stands regardless — that is the CSRF guard, not
+    // the fallback.
     let local_ui = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) if state.origins.allows(origin) => state.bind_is_loopback,
+        Some(origin) if state.origins.allows(origin) => {
+            local_ui_for(origin, state.bind_is_loopback, headers)
+        }
         Some(_) => {
             return Err(Box::new(
                 (
@@ -217,6 +229,13 @@ fn resolve_credentials(
         bearer: bearer_of(headers).or(ws_token),
         local_ui,
     })
+}
+
+/// Whether an *allowed* `Origin` is the local human's own dashboard: a
+/// loopback origin, on a loopback listener, on a request nothing forwarded.
+/// Pure so the rule is testable without a server.
+fn local_ui_for(origin: &str, bind_is_loopback: bool, headers: &HeaderMap) -> bool {
+    bind_is_loopback && AllowedOrigins::is_loopback(origin) && !crate::assets::is_forwarded(headers)
 }
 
 /// The bearer a request presents, wherever it presents it: the header, or
@@ -420,14 +439,49 @@ pub fn mcp_allowed_hosts(
 /// the dashboard to whoever can reach the port, and without a token the only
 /// remaining credential is an `Origin` header any client can type. So the
 /// server refuses, naming what to set, rather than starting open.
-pub fn check_bind_policy(addr: std::net::SocketAddr, token_configured: bool) -> anyhow::Result<()> {
-    if addr.ip().is_loopback() || token_configured {
+pub fn check_bind_policy(
+    addr: std::net::SocketAddr,
+    token_configured: bool,
+    network_origins: bool,
+) -> anyhow::Result<()> {
+    if token_configured {
         return Ok(());
     }
-    anyhow::bail!(
-        "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
-        addr.port()
-    )
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
+            addr.port()
+        )
+    }
+    // A public origin is only ever reached through something in front of
+    // this listener; with no token, a request carrying that Origin would be
+    // the zero-config local UI as far as the server could tell, and any
+    // client on the internet can type an Origin header.
+    if network_origins {
+        anyhow::bail!(
+            "refusing to serve without a token: DRSG_ALLOWED_ORIGINS (`[server] allowed_origins`) names an origin off loopback, so this dashboard is served to the network through a proxy in front of {addr}. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or list only loopback origins"
+        )
+    }
+    Ok(())
+}
+
+/// The environment variable that switches the page's token off; see
+/// [`AppState::page_token`].
+const ENV_PAGE_TOKEN: &str = "DRSG_PAGE_TOKEN";
+
+/// Read [`ENV_PAGE_TOKEN`]: unset is on; `0`, `false`, `off` and `no` (any
+/// case) are off; anything else is on.
+fn page_token_from_env() -> bool {
+    page_token_setting(std::env::var(ENV_PAGE_TOKEN).ok().as_deref())
+}
+
+fn page_token_setting(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// How long shutdown waits for in-flight connections before giving up. Both
@@ -1383,7 +1437,18 @@ pub async fn run(
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
     let bind_is_loopback = opts.addr.ip().is_loopback();
     let shared_token = SharedToken::new(token.clone()).bound_to_loopback(bind_is_loopback);
-    check_bind_policy(opts.addr, shared_token.is_configured())?;
+    let origins = AllowedOrigins::from_env();
+    check_bind_policy(
+        opts.addr,
+        shared_token.is_configured(),
+        origins.has_network_origins(),
+    )?;
+    let page_token = page_token_from_env();
+    if shared_token.is_configured() && !page_token {
+        tracing::info!(
+            "the page carries no token ({ENV_PAGE_TOKEN} is off); the dashboard asks for it"
+        );
+    }
     if shared_token.is_configured() {
         tracing::info!(
             "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>, on the WebSocket upgrade too; browsers use ?token=<token>)"
@@ -1481,9 +1546,10 @@ pub async fn run(
             db: db_for_tail,
             db_path,
             authorizer,
-            origins: AllowedOrigins::from_env(),
+            origins,
             bootstrap_token: token,
             bind_is_loopback,
+            page_token,
             changes,
             wal_changes,
             digest: opts.digest,
@@ -1501,9 +1567,10 @@ pub async fn run(
         db: Arc::new(db),
         db_path,
         authorizer,
-        origins: AllowedOrigins::from_env(),
+        origins,
         bootstrap_token: token,
         bind_is_loopback,
+        page_token,
         changes,
         wal_changes,
         digest: opts.digest,
@@ -1911,7 +1978,9 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_bind_policy, mcp_allowed_hosts, spool_snapshot};
+    use super::{
+        check_bind_policy, local_ui_for, mcp_allowed_hosts, page_token_setting, spool_snapshot,
+    };
 
     /// The spool `/snapshot` streams is byte-for-byte the core's dump,
     /// rewound and ready to read; the locks the dump takes are released
@@ -1984,12 +2053,47 @@ mod tests {
         let lan: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
         let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
         let local6: std::net::SocketAddr = "[::1]:7700".parse().unwrap();
-        assert!(check_bind_policy(local, false).is_ok());
-        assert!(check_bind_policy(local6, false).is_ok());
-        assert!(check_bind_policy(lan, true).is_ok());
+        assert!(check_bind_policy(local, false, false).is_ok());
+        assert!(check_bind_policy(local6, false, false).is_ok());
+        assert!(check_bind_policy(lan, true, false).is_ok());
         // The refusal names the knob to set and the way back to loopback.
-        let err = check_bind_policy(lan, false).unwrap_err().to_string();
+        let err = check_bind_policy(lan, false, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("DRSG_TOKEN"), "{err}");
         assert!(err.contains("--addr 127.0.0.1:7700"), "{err}");
+        // A public allowed origin on a tokenless loopback bind is a proxied
+        // network deployment with no credential: refused, naming the knob.
+        let err = check_bind_policy(local, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DRSG_ALLOWED_ORIGINS"), "{err}");
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        assert!(check_bind_policy(local, true, true).is_ok());
+    }
+
+    /// The zero-config local UI is a loopback origin on a loopback bind on a
+    /// request nothing forwarded; a configured public origin or a proxy's
+    /// header on the request is a network client whatever the peer says.
+    #[test]
+    fn only_an_unforwarded_loopback_origin_is_the_local_ui() {
+        let plain = axum::http::HeaderMap::new();
+        assert!(local_ui_for("http://127.0.0.1:7700", true, &plain));
+        assert!(local_ui_for("http://localhost:5173", true, &plain));
+        assert!(!local_ui_for("http://127.0.0.1:7700", false, &plain));
+        assert!(!local_ui_for("https://graph.example.com", true, &plain));
+        let mut forwarded = axum::http::HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert!(!local_ui_for("http://127.0.0.1:7700", true, &forwarded));
+    }
+
+    #[test]
+    fn the_page_token_switch_is_on_unless_told_off() {
+        assert!(page_token_setting(None));
+        assert!(page_token_setting(Some("1")));
+        assert!(page_token_setting(Some("yes")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!page_token_setting(Some(off)), "{off}");
+        }
     }
 }

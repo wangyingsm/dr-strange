@@ -335,8 +335,40 @@ impl AllowedOrigins {
         if self.extra.iter().any(|o| o == origin) {
             return true;
         }
+        Self::is_loopback(origin)
+    }
+
+    /// Is this `Origin` a loopback host — a page this machine served to a
+    /// browser on this machine? Only such an origin can be "the local human's
+    /// own UI"; a configured public origin is allowed through the CSRF guard
+    /// but is by definition reached over the network.
+    pub fn is_loopback(origin: &str) -> bool {
         matches!(host_of(origin), Some(h) if is_loopback_host(h))
     }
+
+    /// Whether any configured origin is off loopback. An operator lists one
+    /// so a dashboard served at a public name (through a reverse proxy in
+    /// front of this listener) can call the API — which is the operator
+    /// saying this deployment faces the network, whatever address the
+    /// listener itself is bound to.
+    pub fn has_network_origins(&self) -> bool {
+        self.extra.iter().any(|o| !Self::is_loopback(o))
+    }
+}
+
+/// Is a `Host` header value (`host[:port]`, IPv6 in brackets) this machine's
+/// loopback? A browser on this machine addressing this listener sends one;
+/// a page reached at any other name was addressed to something in front.
+pub(crate) fn host_header_is_loopback(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => return false,
+        }
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    is_loopback_host(name)
 }
 
 /// Extract the host from an `Origin` (`scheme://host[:port]`), stripping IPv6
@@ -535,5 +567,33 @@ mod tests {
         let later = t0 + FORGET_AFTER + Duration::from_secs(2);
         lim.failed(IpAddr::from([192, 168, 0, 1]), later);
         assert_eq!(lim.tracked(), 1);
+    }
+
+    #[test]
+    fn a_configured_public_origin_is_allowed_but_never_local() {
+        let origins = AllowedOrigins {
+            extra: vec!["https://graph.example.com".into()],
+        };
+        assert!(origins.allows("https://graph.example.com"));
+        assert!(!AllowedOrigins::is_loopback("https://graph.example.com"));
+        assert!(AllowedOrigins::is_loopback("http://localhost:5173"));
+        assert!(AllowedOrigins::is_loopback("http://[::1]:7700"));
+        assert!(origins.has_network_origins());
+        let local_only = AllowedOrigins {
+            extra: vec!["http://127.0.0.1:5173".into()],
+        };
+        assert!(!local_only.has_network_origins());
+        assert!(!AllowedOrigins { extra: vec![] }.has_network_origins());
+    }
+
+    #[test]
+    fn a_host_header_is_loopback_only_for_this_machine() {
+        assert!(host_header_is_loopback("127.0.0.1:7700"));
+        assert!(host_header_is_loopback("localhost"));
+        assert!(host_header_is_loopback("[::1]:7700"));
+        assert!(!host_header_is_loopback("graph.example.com"));
+        assert!(!host_header_is_loopback("192.168.1.20:7700"));
+        assert!(!host_header_is_loopback("[::1"));
+        assert!(!host_header_is_loopback(""));
     }
 }
