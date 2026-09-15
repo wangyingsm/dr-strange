@@ -10,6 +10,18 @@
 //! due course. Because the seq lives in the KV, a reader's `seq` always matches
 //! the storage snapshot it sees — no version chains, no locks, no races.
 //!
+//! The one exception is a *foreign* sequence — snapshot restore and
+//! replication land a seq rather than bumping one, so the same number can
+//! stamp two different states. Those paths [`invalidate_all`], and because
+//! a reader that opened its snapshot *before* such a commit could still
+//! insert pre-restore data afterwards, stamped with the very seq the restore
+//! landed, the cache also keeps a [`generation`]: a reader captures it
+//! before opening its snapshot, `invalidate_all` bumps it first, and an
+//! insert from an older generation is refused. A lost insert is only a
+//! miss; a stale one would be served to every later reader at that seq.
+//!
+//! [`invalidate_all`]: GraphCache::invalidate_all
+//! [`generation`]: GraphCache::generation
 //! Keys are `(plane, id)`. Node/edge ids are globally unique (arch/02 §1), so
 //! one cache serves all planes without collisions — but a lookup is *scoped*
 //! to a plane: `get_node(plane B, id in A)` is `None`, and the cache must say
@@ -25,6 +37,7 @@
 //! query anyway; the executor streams it from storage instead.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moka::sync::Cache;
 
@@ -65,6 +78,9 @@ pub(crate) struct GraphCache {
     cache: Cache<Key, Stamped>,
     /// Entries weighing more than this are not inserted (arch/02 §4).
     entry_cap: u32,
+    /// Bumped by every `invalidate_all`; an insert carrying an older value
+    /// is refused (see the module docs).
+    generation: AtomicU64,
 }
 
 impl GraphCache {
@@ -78,13 +94,23 @@ impl GraphCache {
             // A tiny budget (tests, constrained hosts) shrinks the cap with it,
             // so one entry can never be more than a sixteenth of the cache.
             entry_cap: ENTRY_CAP_BYTES.min((max_bytes / 16).max(1).min(u32::MAX as u64) as u32),
+            generation: AtomicU64::new(0),
         }
     }
 
+    /// The token a reader must capture *before* it opens its read snapshot
+    /// and hand back with every `put_*`; see the module docs.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Insert unless the entry is over the per-entry cap (arch/02 §4), in
-    /// which case it simply isn't cached and the next reader decodes it again.
-    fn insert(&self, key: Key, value: Stamped) {
-        if weight(&value) <= self.entry_cap {
+    /// which case it simply isn't cached and the next reader decodes it
+    /// again, or the reader's `generation` is behind — its snapshot may
+    /// predate a foreign-seq commit that has since flushed the cache, so
+    /// what it read cannot be trusted under the seq it would stamp.
+    fn insert(&self, generation: u64, key: Key, value: Stamped) {
+        if weight(&value) <= self.entry_cap && generation == self.generation() {
             self.cache.insert(key, value);
         }
     }
@@ -94,7 +120,12 @@ impl GraphCache {
     /// snapshot restore and replication set the sequence to a foreign value
     /// rather than bumping it, so exact-seq matching alone cannot tell the old
     /// entries from the new state (arch/02 §3).
+    ///
+    /// The generation moves first: an insert that races this call is either
+    /// refused (it saw the new generation) or wiped (it landed before the
+    /// clear). The other order would let one slip in between.
     pub fn invalidate_all(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache.invalidate_all();
     }
 
@@ -108,8 +139,16 @@ impl GraphCache {
         }
     }
 
-    pub fn put_node(&self, plane: PlaneId, id: u64, seq: u64, node: Arc<NodeRecord>) {
+    pub fn put_node(
+        &self,
+        generation: u64,
+        plane: PlaneId,
+        id: u64,
+        seq: u64,
+        node: Arc<NodeRecord>,
+    ) {
         self.insert(
+            generation,
             Key::Node(plane, id),
             Stamped {
                 seq,
@@ -128,8 +167,16 @@ impl GraphCache {
         }
     }
 
-    pub fn put_edge(&self, plane: PlaneId, id: u64, seq: u64, edge: Arc<EdgeRecord>) {
+    pub fn put_edge(
+        &self,
+        generation: u64,
+        plane: PlaneId,
+        id: u64,
+        seq: u64,
+        edge: Arc<EdgeRecord>,
+    ) {
         self.insert(
+            generation,
             Key::Edge(plane, id),
             Stamped {
                 seq,
@@ -158,8 +205,10 @@ impl GraphCache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // (generation, key parts, stamp, payload)
     pub fn put_adj(
         &self,
+        generation: u64,
         plane: PlaneId,
         id: u64,
         dir: Dir,
@@ -168,6 +217,7 @@ impl GraphCache {
         adj: Arc<[Neighbor]>,
     ) {
         self.insert(
+            generation,
             Key::Adj(plane, id, dir, ty.map(str::to_string)),
             Stamped {
                 seq,
@@ -231,8 +281,9 @@ mod tests {
         let cache = GraphCache::new(1 << 20);
         let a = PlaneId(1);
         let b = PlaneId(2);
-        cache.put_node(a, 1, 5, record(a));
-        cache.put_adj(a, 1, Dir::Out, None, 5, Arc::from(vec![]));
+        let g = cache.generation();
+        cache.put_node(g, a, 1, 5, record(a));
+        cache.put_adj(g, a, 1, Dir::Out, None, 5, Arc::from(vec![]));
 
         assert!(cache.node(a, 1, 5).is_some(), "the plane that read it hits");
         // Ids are global, so the same id looked up from another plane must be
@@ -253,7 +304,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .into();
-        cache.put_adj(plane, 1, Dir::Out, None, 3, hub);
+        let g = cache.generation();
+        cache.put_adj(g, plane, 1, Dir::Out, None, 3, hub);
         assert!(
             cache.adj(plane, 1, Dir::Out, None, 3).is_none(),
             "a hub over the cap is streamed from storage, not cached"
@@ -261,7 +313,7 @@ mod tests {
         assert_eq!(cache.weighted_size(), 0);
 
         let small: Arc<[Neighbor]> = Arc::from(vec![]);
-        cache.put_adj(plane, 2, Dir::Out, None, 3, small);
+        cache.put_adj(g, plane, 2, Dir::Out, None, 3, small);
         assert!(cache.adj(plane, 2, Dir::Out, None, 3).is_some());
     }
 
@@ -269,11 +321,40 @@ mod tests {
     fn invalidate_all_forgets_every_stamp() {
         let cache = GraphCache::new(1 << 20);
         let plane = PlaneId(1);
-        cache.put_node(plane, 1, 5, record(plane));
+        cache.put_node(cache.generation(), plane, 1, 5, record(plane));
         cache.invalidate_all();
         assert!(
             cache.node(plane, 1, 5).is_none(),
             "same seq, but restored data"
         );
+    }
+
+    #[test]
+    fn an_insert_from_before_an_invalidation_is_refused() {
+        // A reader that opened its snapshot before a restore or replicated
+        // batch landed may finish after the cache was cleared. Whatever it
+        // read belongs to the old state, yet it would stamp it with the seq
+        // the foreign commit reused — so its generation, captured before the
+        // snapshot, no longer matches and the insert is dropped.
+        let cache = GraphCache::new(1 << 20);
+        let plane = PlaneId(1);
+        let before = cache.generation();
+        cache.invalidate_all();
+        cache.put_node(before, plane, 1, 5, record(plane));
+        cache.put_adj(before, plane, 1, Dir::Out, None, 5, Arc::from(vec![]));
+        assert!(
+            cache.node(plane, 1, 5).is_none(),
+            "stale-generation node refused"
+        );
+        assert!(
+            cache.adj(plane, 1, Dir::Out, None, 5).is_none(),
+            "stale-generation adjacency refused"
+        );
+
+        // A reader that captured the generation after the clear is current.
+        let after = cache.generation();
+        assert_ne!(before, after);
+        cache.put_node(after, plane, 1, 5, record(plane));
+        assert!(cache.node(plane, 1, 5).is_some());
     }
 }
