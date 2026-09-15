@@ -4,6 +4,388 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+This release closes the findings of a whole-repository audit. Most of it is
+hardening that changes no documented behaviour; the entries under **Changed**
+that begin with **Breaking** or **Behaviour change** are the ones an existing
+deployment, script or query may notice.
+
+### Added
+
+- **`drsg.toml` carries the knobs the hardening introduced.** `[plugins]
+  deadline_secs` and `total_memory_mb` (the per-call wall clock and the
+  process-wide memory budget of the plugin sandbox), `[server]
+  mcp_tool_deadline_secs`, `[server] allowed_hosts`, `[server] page_token`
+  and `[server] retain_commits` are file keys now; each has an environment
+  variable (`DRSG_PLUGINS_DEADLINE_SECS`, `DRSG_PLUGINS_TOTAL_MEMORY_MB`,
+  `DRSG_MCP_TOOL_DEADLINE_SECS`, `DRSG_ALLOWED_HOSTS`, `DRSG_PAGE_TOKEN`,
+  `DRSG_RETAIN_COMMITS`) that wins over the file, the precedence every other
+  `DRSG_*` variable has. `DRSG_CHAT_OMIT` names `temperature` and/or
+  `max_tokens` to leave out of a chat request, for a reasoning model that
+  rejects them. `drsg.example.toml` documents each with its default and what
+  `0` means.
+- **A remembered maintenance failure is visible.** A native commit is
+  acknowledged once its batch is durable, so the flush or compaction it
+  triggers cannot fail it; the engine now keeps the last such error, `drsg
+  check` and `drsg stats` print it after their summary, and `db.stats`
+  carries `maintenance_error` (a string, or `null` on a healthy server).
+- **`db.stats` reports `retain_commits`** (`null` when unbounded), and the
+  dashboard's time-travel slider says how many commits its window holds.
+- **`drsg serve --addr` off loopback answers `/mcp` at the names the operator
+  lists.** The MCP transport's DNS-rebinding guard accepted only the loopback
+  names; with a token configured it now also accepts the bind address and
+  every entry of `[server] allowed_hosts` / `DRSG_ALLOWED_HOSTS`.
+- **The dashboard signs in.** On a page that carries no token, the first
+  unauthorized answer opens a prompt; the typed token is checked once, kept
+  for the tab, sent as a bearer header on RPC and on the socket, and a socket
+  refused before sign-in re-dials afterwards. A throttled answer (429) is
+  shown with the server's own wait rather than as a JSON parse error.
+- **The benchmark scores recall.** `drsg-bench gen` writes an exact top-100
+  oracle beside the vector queries and `run` adds a `vector_recall` row
+  (mean recall@k against it, returning fewer than k rows counting as a
+  miss); `compare.py` scores Kùzu and Neo4j from the same oracle, and the
+  per-run result JSON is no longer gitignored.
+- **The Zig SDK has a CI job** (`sdk-zig`), and `just gate-sdk` and a new
+  `hooks` job (`just gate-hooks`, a unittest module for the usage-report
+  hook) run locally what CI runs.
+- **The Java client can be closed and configured.** `Client` is
+  `AutoCloseable`, `Client.Options` carries the timeout and an optional
+  shared `HttpClient`, `Drsg(Client.Options)` exists, and a listener that
+  throws is logged with the event's `seq` while the subscription continues.
+- **The TypeScript client throws `DrsgTimeoutError`** when its own
+  `timeoutMs` fires (a `DrsgError` carrying the budget), instead of the same
+  "connection failed" a refused socket produces; its declarations no longer
+  depend on an ambient `WebSocket` type, so a Node 18/20 consumer compiles.
+- **The Python client raises `DrsgProtocolError`** (a `DrsgError`, code
+  -32000) for a non-JSON `/rpc` reply or a socket that closes mid-frame,
+  ships a `py.typed` marker, and bounds what its change feed buffers
+  (`max_frame_bytes`, 64 MiB).
+- **The C client can be stopped from outside.** `drsg_watch_cancellable`
+  takes a `drsg_watch_ctl` whose `cancel` may be called from any thread; a
+  cancel that lands before the socket exists is honoured right after
+  connecting.
+- **`DigestReport` counts what was refused.** `rejected` (entities and
+  relations under an unusable key) and `reserved_props` (model-emitted
+  `_`-prefixed, `embedding` or vector properties), with a warning when
+  either is non-zero — a document written to steer a model produces these,
+  a model does not.
+
+### Changed
+
+- **Breaking: strings have escapes, and a backslash is one.** A Cypher
+  string literal reads the openCypher escapes in both quote styles (`\'`,
+  `\"`, `\\`, `\n`, `\t`, `\r`, `\b`, `\f`, `\uXXXX`); an unknown escape is a
+  syntax error. A literal backslash — a Windows path, say — is now written
+  doubled. Before this a quote inside a value ended the literal early
+  (`key(n) = "x\" OR 1 = 1"` parsed as a key comparison plus a tautology).
+- **Breaking: shapes the grammar never ran are refused by name.** OPTIONAL
+  MATCH, a second MATCH, WITH, UNWIND, UNION, a pattern with several paths, a
+  relationship variable (`-[r:CALLS]->`, which was silently dropped), an
+  inline property map in a MATCH node (`(n:Module {path: "a"})`, which points
+  at WHERE), list and map literals in expression position, and `%` / `^`
+  are each a Compile error naming the rewrite, where they used to be
+  accepted with a different meaning or reported as "near `CREATE …`". Every
+  parse error now names its cause at the position of the fault.
+- **Behaviour change: `<>`, `NOT` and `IN` no longer say true about a
+  missing property.** `d.year <> 2020`, `NOT d.year = 2020` and `NOT d.year
+  IN [2020]` used to keep a node with no `year`; they now drop it, as
+  openCypher's null would, and `= null` matches nothing — `IS [NOT] NULL`
+  remains the way to ask about absence. Under `NOT`, a compound predicate
+  whose false branch would have absorbed the null is stricter than
+  openCypher; the query-language chapter says so.
+- **The lexical surface matches the docs.** `ORDER BY count(*)` and other
+  aggregates as sort keys; `{key: $k}` on a CREATE/MERGE node is the
+  external key; Unicode and backtick-quoted identifiers (`` `first name` ``);
+  exponent floats (`1e9`); an integer past i64 is a syntax error; function
+  names are case-insensitive; `shortest_path(weight: "Cost")` keeps its
+  case; `iterations`/`max_levels` past u32 are refused rather than
+  truncated. An expression nested (or an operator chain run) deeper than 64
+  levels is a clear error instead of a stack overflow.
+- **`WHERE hops() = 2` and `WHERE score() > 0.4` are evaluated at the end of
+  the walk**, where those channels are settled — they were pushed to the
+  first slot, where hops() is always 0 and a MATCH row has no score, and
+  silently returned nothing.
+- **A write mutates each matched node once, and MERGE sees its own
+  statement's edges.** `MATCH (a)-[:R]->(n) DETACH DELETE n` deleted a node
+  twice when two `a`s pointed at it; a MERGE that walks the same edge twice
+  in one statement created it twice. Both are once now, and a MERGE after a
+  keyed CREATE in the same statement upserts onto it.
+- **Breaking: `drsg serve` refuses a non-loopback bind without a token.**
+  `--addr 0.0.0.0` (or `[server] addr`, or a public entry in
+  `allowed_origins`) with no `[server] token` / `DRSG_TOKEN` fails at config
+  time, naming the variable and the `--addr` way back. The zero-config
+  Origin fallback is granted on a loopback bind only, to an unforwarded
+  request with a loopback Origin. The container image binds `0.0.0.0`, so
+  `docker-compose.yml` now marks `DRSG_TOKEN` as required.
+- **Behaviour change: the dashboard's token moved from an inline script to
+  a `<meta name="drsg-token">` element, and only a local human gets it.**
+  The page carries the token only when the bind and the peer are both
+  loopback, no `Forwarded` / `X-Forwarded-*` / `X-Real-IP` / `Via` header is
+  present, the `Host` is this machine and no public origin is configured;
+  `DRSG_PAGE_TOKEN=0` (`[server] page_token = false`) switches it off for a
+  same-host proxy that adds no header. Everyone else gets a bare page and
+  the sign-in prompt. `curl /` on a network bind no longer yields a
+  credential.
+- **Every response carries a Content-Security-Policy** of `script-src
+  'self'; style-src 'self'; worker-src blob:; img-src data:`. The
+  placeholder page lost its inline style to comply.
+- **Breaking: a provider named over the wire is a preset or the operator's
+  own.** Every JSON-RPC and MCP field that names a provider (`plane.find`,
+  `plane.hybrid`, `plane.ask` and `embed_provider`, `plane.cypher` /
+  `POST /cypher` `embed`, `plane.vectorize`, `digest.run`; the MCP `cypher`,
+  `hybrid`, `ask`, `digest` tools) accepts one of the llm crate's preset
+  names or exactly the configured `[server] embed_provider`; a base URL is
+  -32602. The MCP tools' `key_env` is accepted only when it repeats that
+  provider's own variable. A base URL is a setting, not a request field:
+  `drsg` at an operator's terminal still takes one.
+- **Behaviour change: a wrong bearer is throttled, and a batch has a size.**
+  Past five wrong bearers a client serves a wait that doubles per failure
+  to five minutes, answered 429 with `Retry-After` on every route; a
+  request with no bearer is never counted or blocked, so `GET /` and
+  `/health` keep answering. Behind a same-host proxy the client is the
+  rightmost `X-Forwarded-For` entry. A JSON-RPC batch above 64 requests is
+  refused whole with -32600.
+- **`plane.ask` and `digest.run` have ceilings.** `max_attempts` defaults to
+  and is capped at `ASK_DEFAULT_ATTEMPTS` (it defaulted to 20 with no
+  ceiling); the row limit is `ASK_DEFAULT_LIMIT` capped at `ASK_MAX_LIMIT`,
+  and `limit: 0` means the ceiling rather than no ceiling. `ask` runs only
+  the plan grammar its prompt teaches — a model-written PageRank, vector
+  search or frontier step is rejected and sent back as a repair — and every
+  plan ends in a `Limit`. `digest.run`'s `concurrency` and `chunk_chars` are
+  clamped.
+- **Behaviour change: an error tells a client only what it may know.**
+  Storage, provider-call and plugin-store errors (which carry paths, upstream
+  bodies or directories) go to the log at warn under a short reference, and
+  the client receives the category and the reference (`storage error (ref
+  00002a)`). Client faults — unknown plane, bad plan, no key configured —
+  keep their text.
+- **Breaking: the MCP `cypher` and `digest` tools confirm what destroys.**
+  A statement containing `DELETE` or `REMOVE` (outside a string literal,
+  backtick name or property name) and `digest` with `apply: true` require
+  `confirm: true`, as `drop_plane` already did; `CREATE`/`MERGE`/`SET` and
+  the write tools do not. JSON-RPC `digest.run` stays ungated on purpose:
+  its caller is a program presenting a write token, not a model guessing.
+- **Behaviour change: MCP `snippet` and `grep` read only inside a tree.**
+  An absolute path, `..`, a symlink out, or a node whose `file` property
+  points elsewhere is refused. On the shared `/mcp` a plane's own
+  `synced_root` is honoured only when it lies inside the attached tree, and
+  with nothing attached nothing is read; the stdio binary and the CLI, which
+  already run as the user, honour it as before.
+- **Every MCP tool call ends.** One deadline covers the wait for a slot and
+  the run (`DRSG_MCP_TOOL_DEADLINE_SECS` / `[server] mcp_tool_deadline_secs`,
+  default five minutes, `0` disables); past it the call answers with a tool
+  error saying whether the server was busy or the body was slow. The relay
+  takes an `Authorization` header from `.mcp.json` only up to the first
+  directory holding a `.git`, and only from a file the current user owns
+  that is not world-writable.
+- **Breaking: the installer requires the checksum, and `drsg update` runs
+  the installer the release shipped.** `install.sh` / `install.ps1` fail when
+  the `.sha256` sidecar is missing, malformed or mismatching, or when there
+  is no `sha256sum`/`shasum` to check with; `--insecure-skip-checksum`
+  (`-InsecureSkipChecksum`, `DRSG_INSECURE_SKIP_CHECKSUM=1`) is the escape
+  hatch for a mirror without sidecars and warns on the way past. `drsg
+  update` fetches `scripts/install.sh` from the tag it resolved and passes
+  `--version` to it, instead of running whatever `master` held that day.
+- **Behaviour change: `[server] retain_commits` governs every command.**
+  Only `serve` applied it; `import`, `cypher`, `digest`, `vectorize` and the
+  stdio `drsg-mcp` binary kept every version forever. They now open with the
+  same window (default 20; `0`, or `DRSG_RETAIN_COMMITS=0` for `drsg-mcp`,
+  is unbounded). The docs no longer say "unset it for unbounded history" —
+  an absent key is the default of 20.
+- **`drsg init` writes the token only where it cannot be avoided.**
+  `.cursor/mcp.json` carries the literal (Cursor has no shell environment)
+  and joins `.mcp.json` in the gitignore block `init` maintains;
+  `.opencode.json` and `.gemini/settings.json` reference `DRSG_TOKEN`
+  through their own `{env:NAME}` / `$NAME` forms, so a committed file stays
+  committable. `drsg.example.toml` no longer ships `token = "change-me"`
+  live. `init` picks another port when its first pick was taken between
+  probe and bind, waits for its own child's `/health` (not any listener),
+  and `stop` signals a pid only when `/proc` says it is a drsg. The
+  Claude-hook plumbing claims a hook only by exact path, quotes a project
+  path holding a space, and reads a redirect only outside quotes — so
+  `rg '>' src` is a search again.
+- **SST format v2.** Every data, index and bloom block ends with a CRC-32
+  the reader checks; a mismatch, a block cut mid-entry or a footer pointing
+  outside the file is `Error::Corrupt` rather than a quiet short read. A v1
+  file (`DRSS`) still opens and is rewritten as v2 (`DRS2`) by its next
+  compaction; only v2 is written, so a database touched by this release is
+  not readable by the previous one once it has flushed.
+- **Behaviour change: a native commit reports `Ok` once it is durable.**
+  A failed flush or compaction after the batch is fsynced and published no
+  longer turns a landed write into an `Err` (which the API layer read as
+  "nothing landed" and skipped index events for); it is logged, kept in the
+  maintenance slot `check`/`stats`/`db.stats` report, and retried by the
+  next commit. Likewise a vector-index event that fails after the KV commit
+  marks the registry diverged (the next open rebuilds it) instead of failing
+  the commit and skipping the remaining events; and a restore whose sidecar
+  write fails is still `Ok`, with the live registries set from what it
+  loaded.
+- **Behaviour change: the JSON dialect refuses an integer past i64 and
+  escapes a map with a `$` key.** `2^63` used to arrive as a large negative
+  `Int`; it is an `InvalidArgument` now, since `PropValue` has no lossless
+  home for it. A nested map whose own key is `$value`, `$vector`, `$bytes`
+  (or any `$`-prefixed name) travels as `{"$map": {...}}` and reads back as
+  the map it was; maps without such keys are unchanged on the wire.
+- **`AS OF` keyword and hybrid search are historical.** They answered from
+  the live BM25 registry, returning nodes created, deleted, re-texted or
+  relabelled after the pinned point; a historical reader now builds its
+  index from the snapshot's own records, so matches and scores are the
+  snapshot's.
+- **Hybrid search scores only the queried label** through its graph
+  channel (an `Author` bridging two `Doc`s is a bridge, not a hit), a
+  frontier is ranked as a set (one node holds one top-k slot and keeps its
+  trail), and non-finite raw scores are dropped before fusion.
+- **The SDKs are 2.7.0 and their change feeds authenticate by header.**
+  Every SDK's version string reads the workspace version (they disagreed
+  between 0.1.0 and 2.0.0-alpha), the READMEs describe what is obtainable
+  today (path/git dependencies, `go get` pinned to a commit, a local `mvnw
+  install`; nothing is on a registry yet), and the six generated clients
+  follow `openrpc.json` 2.7.0 — every method carries `x-access`, every
+  param says whether it is required, `info.version` is the workspace's.
+  The Go, Python, Java, C and TypeScript (under Bun and Node) watch clients
+  send `Authorization: Bearer` on the WebSocket upgrade with a bare `/ws`
+  instead of `?token=`, which lands in proxy logs; a token holding a
+  control character is refused before any I/O. A browser, a Web Worker and
+  Deno keep the query form (`WatchOptions.tokenInQuery` forces either).
+- **Every SDK change feed distrusts its peer.** A frame or reassembled
+  message above the cap (64 MiB in C and Python, 16 MiB in Go) closes the
+  connection instead of being allocated; the Go dial and upgrade honour
+  `ctx` (30 s bound when it has no deadline) and leak no goroutine when the
+  server closes first; the C handshake sends a random nonce, verifies
+  `Sec-WebSocket-Accept`, masks each frame afresh and sends with
+  `MSG_NOSIGNAL`; the Java `Subscription.close()` aborts a peer that ignores
+  the close frame and a `plane.change` without params is dropped rather than
+  handed to the listener as null. A `drsg_client` is one client per thread,
+  and the header, README and guide now say so.
+- **CI names every action by commit and installs from the lock.** Every
+  `uses:` carries a full SHA with the tag as a comment (`dtolnay/rust-toolchain`
+  passes `toolchain: stable` explicitly); every `bun install` in CI, the
+  release workflow, the Dockerfile and `just gate-*` runs
+  `--frozen-lockfile`, so a lock that disagrees with `package.json` fails
+  instead of silently re-resolving.
+- **The plugin sandbox has a clock and a shared budget.** A plugin that
+  spins past `deadline_secs` (default five minutes) is interrupted even with
+  fuel off; memory is bounded process-wide (default twice the per-store
+  ceiling) and tables and instances are counted; a plugin version must be a
+  version; a plugin's `read` refuses any path the ignore policy hides from
+  `list` (`.env`, a gitignored credentials file, `target/`), so the listing
+  is no longer a suggestion.
+- **A model cannot stamp provenance, plant a vector, or key a node on
+  nothing.** Extraction and refinement refuse `_`-prefixed, `embedding` and
+  vector properties, empty property names, and empty, blank or overlong
+  keys; a reply that is not JSON is asked for once more before the run is
+  abandoned, and an object naming neither `entities` nor `relations` earns
+  that nudge rather than counting as an empty extraction.
+- **The HTTP provider keeps a key out of its errors,** obeys `Retry-After`
+  up to sixty seconds (it was clamped to eight), and stops a digest after
+  the first dead chunk instead of paying for every remaining one.
+- **The usage-report hook keeps its watermark under
+  `$XDG_RUNTIME_DIR/drsg`** (0700, falling back to `~/.cache/drsg`), written
+  through an `O_EXCL` temporary, instead of a predictable name in `/tmp`.
+- **The benchmark comparators measure what drsg measures.** Kùzu's point
+  lookup drains its result inside the timer, Neo4j's vector build starts its
+  timer after the load, and BENCHMARKS.md says that drsg is timed in-process
+  from Rust while the others run through Python drivers, where each engine
+  parses its CSV, and which artefacts of the agent benchmark are not
+  published.
+
+### Fixed
+
+- **Deleting the HNSW entry node no longer panics the next query.** The
+  replacement is the tallest live node and `top_layer` drops with it;
+  removing the last node clears the entry.
+- **A bulk-loaded external key must be free in the plane,** not merely in
+  its batch; a key a live node owns is `Conflict`, and a delete drops the
+  `ext_keys` row only when it still points at the deleted node.
+- **The native engine's crash windows are closed.** The SST rename and the
+  WAL truncation are followed by a directory fsync; compaction's unlinks go
+  newest first and are fsynced; a new store's WAL entry is fsynced into its
+  directory; the WAL cursor rewinds the instant the file is cut, so a failed
+  fsync can no longer leave later commits behind a hole replay reads as a
+  torn tail; a WAL record past 4 GiB is refused rather than written as a
+  torn tail.
+- **A replica keeps its master's sequence.** Opening a database commits
+  nothing unless something is missing (each open used to advance the
+  sequence by two, pushing a follower past its master); a restore lands at
+  the snapshot's sequence; a batch at or below the replica's sequence is
+  refused with `Conflict` rather than applied backwards; a restored database
+  recounts its plane counters (followers reported `nodes: 0` over a full
+  database); a follower mirrors each replicated batch into its vector and
+  keyword indexes, which were frozen at whatever it rebuilt on open; the
+  follower's replication queue is bounded (1024 batches) and its pull-time
+  backlog is forwarded by one bounded task, so a busy master can no longer
+  park the bootstrap forever.
+- **The cross-query graph cache is a plane's own.** Entries are keyed by
+  plane (plane B's query could be served plane A's record), entries above
+  4 MiB are not inserted, recording a query no longer flushes the cache,
+  restore and replication drop entries they cannot stamp past, and a reader
+  straddling such a commit cannot repopulate it with stale data.
+- **`drop_plane` drops the plane's index declarations too**, so a later open
+  no longer rebuilds indexes over nothing for a plane id that is never
+  reused.
+- **A restore loads the shipped indexes into the live registries** — an
+  in-memory target kept its empty ones, so keyword search returned nothing —
+  or rebuilds them from the KV when the frames are unusable.
+- **The completer reads characters.** A multi-byte identifier such as
+  `函数` panicked it; an escaped quote ended a literal early; a backticked
+  name was unknown; it offered a hop after `MATCH (n:Module {path: "a"})`,
+  a shape the parser refuses.
+- **`RETURN count(n.x % 2)` reports the unsupported operator** instead of
+  "trailing input", and an `x IN [...]` over a hundred thousand items no
+  longer overflows the stack.
+- **A disabled plugin deadline is never, not one already passed** (with
+  `deadline_secs = 0` every real plugin call panicked in debug and was
+  interrupted at once in release); the wire gate honours the key variable
+  the operator configured for a preset (`embed_provider = "openai"` with
+  `embed_key_env = "MY_OPENAI_KEY"` resolved to `OPENAI_API_KEY`); an
+  environment `DRSG_MCP_TOOL_DEADLINE_SECS` wins over the file's key as
+  documented.
+- **The ingest ledger is written under the plane's write lock**, so a sync
+  stamp set concurrently is no longer overwritten; a commit fold reloads,
+  re-attaches and carries over in one transaction, so a reader never sees a
+  replaced symbol with no embedding and no links into it.
+- **The fetch guard reads the IPv4 address inside a NAT64 spelling**
+  (`64:ff9b::a9fe:a9fe` reached the metadata service) and refuses the
+  local-use block `64:ff9b:1::/48` whole.
+- **The MCP confirm gate reads a backtick name the way the parser does**,
+  so a backslash inside one cannot hide a `DELETE`; `grep` reads the
+  canonical path it checked, not the link.
+- **The store stamp hashes the plugin registry's bytes**, so an install that
+  swaps one pinned hash for another of the same length within a second is
+  seen.
+- **The C e2e harness waits for the server before removing its directory**;
+  the Zig quickstart reports a refused call instead of a null unwrap, and
+  `build.zig` asks `pkg-config` where json-c lives.
+
+### Performance
+
+- **Compaction streams a k-way merge** — one block per run plus one key
+  group resident, instead of every run in a map — and **a flush writes its
+  SST under the store read lock**, so readers proceed through the I/O.
+- **HNSW search borrows a per-thread scratch** instead of zeroing one the
+  size of the arena per query, kept only up to 16 MiB.
+- **A variable-length expansion is pulled one walk at a time**, so
+  `expand_var(1, 12) LIMIT 3` stops at three and a deadline can fire
+  mid-walk.
+- **The change feed caps itself at the source** (a million-node bulk load
+  built a million tuples to keep 256), and the catalog decodes each node
+  once.
+- **A plane is embedded a batch at a time** (512 nodes per provider call and
+  transaction, walking ids rather than cloning every record), and
+  containment keys are folded once.
+- **`/export` and `/snapshot` stream.** An export walks ids and writes one
+  record at a time through a bounded chunked body; a snapshot is spooled to
+  an anonymous temp file under the locks, which are released before the
+  first byte is sent, so a slow follower stalls no commit on the master.
+- **`plane.find` and the degree seed walk the plane a page at a time and
+  stop** at `limit` hits or a cap of nodes visited, reporting `truncated`;
+  `total` is a counter read, not a scan.
+- **A large dashboard layout runs off the main thread** (ForceAtlas2 in a
+  worker above 400 nodes, for a bounded wall-clock budget), and "expand one
+  hop" asks in JSON-RPC batches of 64 with one in flight instead of three
+  hundred concurrent connections.
+
 ## [2.7.0] - 2026-09-06
 
 ### Added
@@ -1227,7 +1609,7 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.7.0...HEAD
 [1.7.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.7.0
 [1.6.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.6.0
 [1.5.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.5.0
