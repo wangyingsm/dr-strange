@@ -125,8 +125,10 @@ security or operations reader can hold the code to.
   example file and Chapter 2 say in so many words.
 - **Hooks.** `init` repoints a Claude Code hook entry only when its command
   is a bare path whose last component is exactly one of drsg's script
-  names; anything else in `settings.local.json` is someone else's and is
-  left alone. The shell guard decides "this is a write, let it through" on
+  names, or is exactly the command `init` writes for this project (the
+  path single-quoted when it holds a space, so the shell runs it — and
+  the unquoted form an earlier `init` wrote); anything else in
+  `settings.local.json` is someone else's and is left alone. The shell guard decides "this is a write, let it through" on
   the command with quoted and backslash-escaped text removed and numbered
   fd redirects dropped, so a pattern containing `>` or `<<` does not bypass
   it. The repository's own `.claude/settings.json` runs `init` with
