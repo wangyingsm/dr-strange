@@ -942,6 +942,39 @@ mod tests {
         assert_eq!(r["truncated"], true);
     }
 
+    /// The export walks ids and reads one record at a time; what it writes
+    /// is unchanged: every node line first, then every edge once, the form
+    /// `drsg import` reads back.
+    #[test]
+    fn export_writes_every_node_line_then_every_edge_once() {
+        let (db, hub, rival) = paged_graph();
+        let ctx = ctx_for(&db);
+        let mut out = Vec::new();
+        crate::methods::export_plane(&ctx, "startup")
+            .unwrap()
+            .write_to(&mut out)
+            .unwrap();
+        let lines: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let total = crate::methods::SCAN_PAGE as usize + 52;
+        assert_eq!(lines.len(), total + 10);
+        assert!(
+            lines[..total]
+                .iter()
+                .all(|l| l.get("external_key").is_some())
+        );
+        let edges = &lines[total..];
+        assert!(edges.iter().all(|l| l["type"] == "SPOKE"));
+        assert_eq!(edges.iter().filter(|l| l["src"] == hub).count(), 5);
+        assert_eq!(edges.iter().filter(|l| l["src"] == rival).count(), 5);
+        let mut ids: Vec<u64> = edges.iter().map(|l| l["id"].as_u64().unwrap()).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "each edge once");
+    }
+
     #[test]
     fn graph_expand_returns_neighbor_and_edge() {
         let (db, alice, bob) = seeded_graph();

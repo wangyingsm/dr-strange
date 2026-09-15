@@ -2692,8 +2692,9 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 ///
 /// Two phases, so the endpoint can answer a bad plane name with a 400 and
 /// stream a good one: resolving the plane returns a [`PlaneExport`], and
-/// [`PlaneExport::write_to`] emits the lines into `out` as it walks — one
-/// node record in memory at a time, never the whole plane as a string.
+/// [`PlaneExport::write_to`] emits the lines into `out` as it walks. What
+/// it holds is the plane's node *ids* (8 bytes each, one scan) and one node
+/// record at a time — never every record, and never the output as a string.
 pub fn export_plane<'a>(ctx: &'a Ctx<'a>, plane_name: &str) -> Result<PlaneExport<'a>, RpcError> {
     Ok(PlaneExport(ctx.plane(plane_name)?))
 }
@@ -2708,13 +2709,24 @@ impl PlaneExport<'_> {
     pub fn write_to(&self, out: &mut dyn std::io::Write) -> Result<(), RpcError> {
         let plane = &self.0;
         let gone = |e: std::io::Error| RpcError::server(format!("export stream closed: {e}"));
-        for node in app(plane.query().scan_all().nodes())? {
-            serde_json::to_writer(&mut *out, &node_json(&node)).map_err(|e| gone(e.into()))?;
-            out.write_all(b"\n").map_err(gone)?;
+        // One id scan for both passes, then a record at a time: `.nodes()`
+        // would clone every record of the plane into one vector before the
+        // first line went out (and again for the edges), which for a large
+        // plane is the plane in memory twice over — the cost streaming the
+        // output was meant to remove. Ids are 8 bytes each; a node deleted
+        // between the scan and its read is simply skipped.
+        let ids = app(plane.query().scan_all().ids())?;
+        for id in &ids {
+            if let Some(node) = app(plane.node(*id))? {
+                serde_json::to_writer(&mut *out, &node_json(&node)).map_err(|e| gone(e.into()))?;
+                out.write_all(b"\n").map_err(gone)?;
+            }
         }
-        // Edges: walk each node's out-adjacency and emit each edge once.
-        for node in app(plane.query().scan_all().nodes())? {
-            for hop in app(plane.neighbors(node.id, Dir::Out, None))? {
+        // Edges after every node line, since `drsg import` resolves an edge's
+        // endpoints against nodes it has already read: walk each node's
+        // out-adjacency and emit each edge once.
+        for id in &ids {
+            for hop in app(plane.neighbors(*id, Dir::Out, None))? {
                 if let Some(edge) = app(plane.edge(hop.edge))? {
                     serde_json::to_writer(&mut *out, &edge_to_json(&edge))
                         .map_err(|e| gone(e.into()))?;
