@@ -327,6 +327,17 @@ impl GraphReader for UncachedReader<'_> {
 /// filtered to one edge type.
 type AdjKey = (NodeId, Dir, Option<String>);
 
+/// The shared L2 as one reader sees it: the cache, the commit seq its
+/// snapshot reads at (what entries are stamped and matched with), and the
+/// cache generation captured before that snapshot was opened (what an insert
+/// must still match to be accepted — see `store`).
+#[derive(Clone, Copy)]
+struct L2<'a> {
+    cache: &'a GraphCache,
+    seq: u64,
+    generation: u64,
+}
+
 pub struct CachedReader<'a> {
     txn: &'a dyn ReadTransaction,
     plane: PlaneId,
@@ -336,7 +347,7 @@ pub struct CachedReader<'a> {
     keywords: Option<&'a KeywordRegistry>,
     /// Optional shared cross-query L2 (arch/02 §3). `None` ⇒ pure per-query
     /// (L1 only) — used by tests and the differential oracle.
-    l2: Option<(&'a GraphCache, u64)>,
+    l2: Option<L2<'a>>,
     /// This reader pins a past snapshot (AS OF) that the keyword registry
     /// (built from the latest commit) does not describe, so `keyword_search`
     /// computes BM25 from the snapshot itself instead of the live postings.
@@ -362,15 +373,29 @@ impl<'a> CachedReader<'a> {
     }
 
     /// The full reader used by the query path: per-query L1 plus the shared,
-    /// cross-query, seq-stamped L2 (`cache` at snapshot `seq`).
+    /// cross-query, seq-stamped L2 (`cache` at snapshot `seq`). `generation`
+    /// is the cache's, captured by the caller *before* it opened `txn` — the
+    /// L2 refuses an insert from an older generation, which is how a reader
+    /// that straddles a restore or replicated batch is kept from stamping
+    /// pre-commit data with the seq that commit reused (`store` docs).
     pub(crate) fn with_cache(
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
         registry: &'a VectorRegistry,
         cache: &'a GraphCache,
         seq: u64,
+        generation: u64,
     ) -> Self {
-        Self::build(txn, plane, Some(registry), Some((cache, seq)))
+        Self::build(
+            txn,
+            plane,
+            Some(registry),
+            Some(L2 {
+                cache,
+                seq,
+                generation,
+            }),
+        )
     }
 
     /// Like [`with_cache`](Self::with_cache) but for a time-travel read
@@ -384,8 +409,18 @@ impl<'a> CachedReader<'a> {
         plane: PlaneId,
         cache: &'a GraphCache,
         seq: u64,
+        generation: u64,
     ) -> Self {
-        let mut reader = Self::build(txn, plane, None, Some((cache, seq)));
+        let mut reader = Self::build(
+            txn,
+            plane,
+            None,
+            Some(L2 {
+                cache,
+                seq,
+                generation,
+            }),
+        );
         reader.historical = true;
         reader
     }
@@ -402,7 +437,7 @@ impl<'a> CachedReader<'a> {
         txn: &'a dyn ReadTransaction,
         plane: PlaneId,
         registry: Option<&'a VectorRegistry>,
-        l2: Option<(&'a GraphCache, u64)>,
+        l2: Option<L2<'a>>,
     ) -> Self {
         Self {
             txn,
@@ -427,15 +462,17 @@ impl GraphReader for CachedReader<'_> {
         if let Some(v) = self.nodes.borrow().get(&id) {
             return Ok(v.clone()); // L1 (per-query), including a cached miss
         }
-        if let Some((cache, seq)) = self.l2
-            && let Some(node) = cache.node(self.plane, id.0, seq)
+        if let Some(l2) = self.l2
+            && let Some(node) = l2.cache.node(self.plane, id.0, l2.seq)
         {
             self.nodes.borrow_mut().insert(id, Some(node.clone()));
             return Ok(Some(node)); // L2 (cross-query, seq-valid)
         }
         let v = graph::get_node(self.txn, self.plane, id)?.map(Arc::new);
-        if let (Some((cache, seq)), Some(node)) = (self.l2, &v) {
-            cache.put_node(self.plane, id.0, seq, node.clone()); // only existing records
+        if let (Some(l2), Some(node)) = (self.l2, &v) {
+            // only existing records
+            l2.cache
+                .put_node(l2.generation, self.plane, id.0, l2.seq, node.clone());
         }
         self.nodes.borrow_mut().insert(id, v.clone());
         Ok(v)
@@ -445,15 +482,16 @@ impl GraphReader for CachedReader<'_> {
         if let Some(v) = self.edges.borrow().get(&id) {
             return Ok(v.clone());
         }
-        if let Some((cache, seq)) = self.l2
-            && let Some(edge) = cache.edge(self.plane, id.0, seq)
+        if let Some(l2) = self.l2
+            && let Some(edge) = l2.cache.edge(self.plane, id.0, l2.seq)
         {
             self.edges.borrow_mut().insert(id, Some(edge.clone()));
             return Ok(Some(edge));
         }
         let v = graph::get_edge(self.txn, self.plane, id)?.map(Arc::new);
-        if let (Some((cache, seq)), Some(edge)) = (self.l2, &v) {
-            cache.put_edge(self.plane, id.0, seq, edge.clone());
+        if let (Some(l2), Some(edge)) = (self.l2, &v) {
+            l2.cache
+                .put_edge(l2.generation, self.plane, id.0, l2.seq, edge.clone());
         }
         self.edges.borrow_mut().insert(id, v.clone());
         Ok(v)
@@ -464,15 +502,16 @@ impl GraphReader for CachedReader<'_> {
         if let Some(v) = self.adjacency.borrow().get(&key) {
             return Ok(v.clone());
         }
-        if let Some((cache, seq)) = self.l2
-            && let Some(a) = cache.adj(self.plane, id.0, dir, ty, seq)
+        if let Some(l2) = self.l2
+            && let Some(a) = l2.cache.adj(self.plane, id.0, dir, ty, l2.seq)
         {
             self.adjacency.borrow_mut().insert(key, a.clone());
             return Ok(a);
         }
         let a: Arc<[Neighbor]> = graph::neighbors(self.txn, self.plane, id, dir, ty)?.into();
-        if let Some((cache, seq)) = self.l2 {
-            cache.put_adj(self.plane, id.0, dir, ty, seq, a.clone());
+        if let Some(l2) = self.l2 {
+            l2.cache
+                .put_adj(l2.generation, self.plane, id.0, dir, ty, l2.seq, a.clone());
         }
         self.adjacency.borrow_mut().insert(key, a.clone());
         Ok(a)
@@ -714,19 +753,57 @@ mod tests {
 
         // Two independent readers at the same seq: the second's node comes
         // from L2, so it's the *same* decoded Arc — proof of a cross-query hit.
-        let r1 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7);
+        let g = cache.generation();
+        let r1 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7, g);
         let n1 = r1.node(seed).unwrap().unwrap();
-        let r2 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7);
+        let r2 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7, g);
         let n2 = r2.node(seed).unwrap().unwrap();
         assert!(Arc::ptr_eq(&n1, &n2), "same seq ⇒ L2 hit ⇒ shared Arc");
         assert!(cache.weighted_size() > 0);
 
         // A reader at a newer seq must NOT get the stale entry: seq mismatch is
         // a miss, so it re-decodes a fresh Arc (snapshot isolation).
-        let r3 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 8);
+        let r3 = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 8, g);
         let n3 = r3.node(seed).unwrap().unwrap();
         assert!(!Arc::ptr_eq(&n1, &n3), "newer seq ⇒ miss ⇒ fresh decode");
         assert_eq!(*n1, *n3, "same underlying record, just re-decoded");
+    }
+
+    #[test]
+    fn a_reader_that_straddles_an_invalidation_does_not_populate_the_l2() {
+        // The interleaving a restore or replicated batch can produce: a reader
+        // captures the generation and opens its snapshot; the foreign-seq
+        // commit lands and clears the cache; the reader then decodes from its
+        // old snapshot. Its puts carry the old generation, so nothing it read
+        // reaches later readers at the seq the commit reused.
+        use crate::index::VectorRegistry;
+        let (eng, seed) = dense_graph(10, 2);
+        let txn = eng.begin_read().unwrap();
+        let cache = GraphCache::new(1 << 20);
+        let reg = VectorRegistry::new();
+
+        let g = cache.generation();
+        let straddler = CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7, g);
+        cache.invalidate_all();
+        straddler.node(seed).unwrap().unwrap();
+        straddler.neighbors(seed, Dir::Out, None).unwrap();
+        assert!(cache.node(PlaneId::STARTUP, seed.0, 7).is_none());
+        assert!(
+            cache
+                .adj(PlaneId::STARTUP, seed.0, Dir::Out, None, 7)
+                .is_none()
+        );
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "nothing stale was stamped with seq 7"
+        );
+
+        // A reader that captured the generation after the clear populates it.
+        let fresh =
+            CachedReader::with_cache(&txn, PlaneId::STARTUP, &reg, &cache, 7, cache.generation());
+        fresh.node(seed).unwrap().unwrap();
+        assert!(cache.node(PlaneId::STARTUP, seed.0, 7).is_some());
     }
 
     #[test]

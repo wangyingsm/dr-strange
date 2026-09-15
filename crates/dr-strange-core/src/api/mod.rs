@@ -1082,15 +1082,20 @@ impl<'db> PlaneHandle<'db> {
         let historical = self.as_of.is_some();
         #[cfg(not(feature = "native-backend"))]
         let historical = false;
+        // Captured before the snapshot opens, on purpose: a restore or
+        // replicated batch that lands while this read is open reuses a seq
+        // the read may already be stamping entries with, and the L2 tells
+        // the two apart only by this token (arch/02 §3).
+        let generation = cache.generation();
         self.with_read(|txn| {
             // The snapshot's own commit seq stamps the cache — for a historical
             // read that is the past seq, so the exact-seq cache never serves
             // "latest" records to a time-travelling query.
             let seq = graph::read_commit_seq(txn)?;
             let reader = if historical {
-                CachedReader::with_cache_historical(txn, self.id, cache, seq)
+                CachedReader::with_cache_historical(txn, self.id, cache, seq, generation)
             } else {
-                CachedReader::with_cache(txn, self.id, &registry, cache, seq)
+                CachedReader::with_cache(txn, self.id, &registry, cache, seq, generation)
             }
             .with_keywords(&keywords);
             f(&reader)

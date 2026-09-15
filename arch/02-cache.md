@@ -106,7 +106,14 @@ see. Design: **version-stamped entries** over the backend's commit sequence.
   is at the same seq as the source's first write — so exact-seq matching
   alone cannot tell old from new. Both paths `invalidate_all()` after they
   commit. A replica's cache is therefore warm between batches, never across
-  one; that is the price of a stamp that lives in replicated KV.
+  one; that is the price of a stamp that lives in replicated KV. Clearing
+  alone leaves one window: a reader that opened its snapshot *before* the
+  foreign commit and misses *after* the clear would insert old data under
+  the reused seq. So the cache also carries a **generation**, bumped by
+  `invalidate_all` before it clears; a reader captures it before opening its
+  snapshot and every insert must still match it. A refused insert is a
+  miss; the alternative was a stale entry served to every later reader at
+  that seq.
 
 ## 4. Eviction and sizing
 
@@ -144,7 +151,9 @@ the trait boundary keeps it removable.
   oracle; the same query after another plane warmed the L2 with the same ids
   must agree (`tests/cache.rs`).
 - Foreign-sequence paths: restore, and a replicated restore, over a cache
-  warmed at the very seq they land (`api/snapshot.rs` tests).
+  warmed at the very seq they land (`api/snapshot.rs` tests); and a reader
+  that straddles the clear, whose inserts the generation refuses
+  (`cache/store.rs`, `cache/mod.rs` tests).
 - Eviction-under-pressure fuzz: tiny budget + random workload, assert
   correctness (falls through) and bounded memory.
 
