@@ -552,25 +552,30 @@ pub const ENV_PLUGIN_DEADLINE_SECS: &str = "DRSG_PLUGINS_DEADLINE_SECS";
 /// in MiB. Read by [`Plugins::load`] on top of the config file.
 pub const ENV_PLUGIN_TOTAL_MEMORY_MB: &str = "DRSG_PLUGINS_TOTAL_MEMORY_MB";
 
-/// Apply the two environment knobs to `limits`.
+/// Apply the two environment knobs to `limits`, reading each variable
+/// through `lookup`.
 ///
-/// The environment rather than [`PluginConfig`] fields: these are the net
-/// under the budgets the config file already names, and an embedder that
-/// wants them exactly sets them on [`Limits`] directly. A value that is not
-/// a number is an error naming the variable, not a silently kept default —
-/// an operator who typed it meant it.
+/// The environment rather than [`PluginConfig`] fields alone: these are the
+/// net under the budgets the config file already names, and an operator at
+/// the shell overrides the file. A value that is not a number is an error
+/// naming the variable, not a silently kept default — an operator who typed
+/// it meant it.
+///
+/// `lookup` rather than `std::env::var` directly so a test can hand in the
+/// values it wants without setting process-wide variables that every other
+/// test in the binary — anything that loads plugins — would read too.
 #[cfg(feature = "plugins")]
-fn apply_env_limits(limits: &mut Limits) -> Result<()> {
-    fn read(name: &str) -> Result<Option<u64>> {
-        match std::env::var(name) {
-            Ok(v) if !v.trim().is_empty() => v
+fn apply_env_limits(limits: &mut Limits, lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let read = |name: &str| -> Result<Option<u64>> {
+        match lookup(name) {
+            Some(v) if !v.trim().is_empty() => v
                 .trim()
                 .parse::<u64>()
                 .map(Some)
                 .map_err(|e| anyhow::anyhow!("{name}={v:?} is not a whole number: {e}")),
             _ => Ok(None),
         }
-    }
+    };
     if let Some(secs) = read(ENV_PLUGIN_DEADLINE_SECS)? {
         limits.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
@@ -639,6 +644,16 @@ impl Plugins {
     /// other `DRSG_*` variable has.
     #[cfg(feature = "plugins")]
     fn limits_for(config: &PluginConfig) -> Result<Limits> {
+        Self::limits_from(config, |name| std::env::var(name).ok())
+    }
+
+    /// [`limits_for`](Self::limits_for) with the environment supplied by
+    /// `lookup` — the seam its tests use, so they never touch the process.
+    #[cfg(feature = "plugins")]
+    fn limits_from(
+        config: &PluginConfig,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Limits> {
         let mut limits = Limits::default();
         match config.fuel {
             Some(0) => limits.fuel = None,
@@ -656,7 +671,7 @@ impl Plugins {
             // store run, so it means "the default".
             limits.total_memory_bytes = (mb > 0).then_some((mb as usize) << 20);
         }
-        apply_env_limits(&mut limits)?;
+        apply_env_limits(&mut limits, lookup)?;
         Ok(limits)
     }
 
