@@ -37,11 +37,14 @@ pub struct VectorizeStats {
 }
 
 /// Nodes embedded per provider call and per write transaction. A plane is
-/// walked once, but its texts are not all held at once: a repository plane
-/// has hundreds of thousands of nodes, and a few KiB of text each is more
-/// than a small machine wants resident before the first vector is written.
-/// Each batch is committed on its own, so a pass that dies halfway leaves
-/// what it embedded, and `_embedded_from` lets the next pass resume.
+/// walked once, by id, and one record is resident at a time beyond the
+/// batch: a repository plane has hundreds of thousands of nodes, and a few
+/// KiB of text each — plus the vector every already-embedded node carries —
+/// is more than a small machine wants resident before the first new vector
+/// is written. What the pass holds for the whole plane is its id list, eight
+/// bytes a node. Each batch is committed on its own, so a pass that dies
+/// halfway leaves what it embedded, and `_embedded_from` lets the next pass
+/// resume.
 pub const EMBED_BATCH: usize = 512;
 
 /// Embed every node in `plane_name` that needs it, then ensure a vector
@@ -57,7 +60,15 @@ pub fn vectorize_plane(
 
     let mut work: Vec<(NodeId, String, String)> = Vec::new(); // id, text, hash
     let mut labels: BTreeSet<String> = BTreeSet::new();
-    for node in plane.query().scan_all().nodes()? {
+    // Ids first, records one at a time: `nodes()` would clone every record
+    // of the plane — existing `embedding` vectors included — before the
+    // first batch was embedded, which is the residency the batching exists
+    // to avoid. A node removed between the scan and its fetch is simply not
+    // there to embed.
+    for id in plane.query().scan_all().ids()? {
+        let Some(node) = plane.node(id)? else {
+            continue;
+        };
         let key = node.external_key.as_deref().unwrap_or("");
         let mut text = crate::embeddable_text(key, &node.labels, &node.properties);
         if text.trim().is_empty() {
