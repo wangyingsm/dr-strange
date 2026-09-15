@@ -52,8 +52,9 @@ allowed_origins = ["https://app.example.com"]
 # when a token is set; merged with DRSG_ALLOWED_HOSTS.
 # allowed_hosts = ["graph.example.com", "db.internal:7700"]
 # Longest one MCP tool call may take over /mcp, queue included, before it is
-# answered with a tool error naming the limit. Default 300 (or
-# DRSG_MCP_TOOL_DEADLINE_SECS). Set 0 to run without limit.
+# answered with a tool error naming the limit. Default 300. Set 0 to run
+# without limit. As with every key here, a DRSG_MCP_TOOL_DEADLINE_SECS already
+# in the environment wins over this line.
 # mcp_tool_deadline_secs = 300
 
 # Uncomment to serve HTTPS directly (rustls). Both files are PEM; `cert` is the
