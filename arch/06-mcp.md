@@ -77,6 +77,10 @@ then narrow, then act:
   `grep` and `snippet` make passes one containment check — the path is
   refused by shape (absolute, `..`, a prefix) and then by where it
   canonicalizes to, which is what catches a symlink planted in a checkout.
+  The file is then opened at the canonical path the check returned, never
+  back through the link; what remains is the window between canonicalize
+  and open in which a path component could be swapped for a link, which
+  needs a writer racing the agent inside the tree and is accepted.
   Which trees exist is `TreeAccess`: the host-attached tree (`serve watch
   --dir`, `[server] source_root`) is always readable; a plane's own
   `synced_root` is data, honoured wherever it points only where the process

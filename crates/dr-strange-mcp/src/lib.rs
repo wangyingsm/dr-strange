@@ -1266,8 +1266,11 @@ fn grep_tree(
             }
             // `DirEntry::metadata` does not follow links, so a linked
             // directory is never entered; a linked file is read only where
-            // it lands inside the tree.
-            if meta.file_type().is_symlink() {
+            // it lands inside the tree — and read at the resolved path
+            // `contained` checked, not back through the link, so the file
+            // opened is the file that was checked rather than wherever the
+            // link points by the time it is re-followed.
+            let source = if meta.file_type().is_symlink() {
                 let Ok(target) = contained(root, &rel) else {
                     continue;
                 };
@@ -1279,8 +1282,11 @@ fn grep_tree(
                 if !readable {
                     continue;
                 }
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
+                target
+            } else {
+                path
+            };
+            let Ok(bytes) = std::fs::read(&source) else {
                 continue;
             };
             if bytes[..bytes.len().min(4096)].contains(&0) {
