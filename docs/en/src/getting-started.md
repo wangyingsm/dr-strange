@@ -271,6 +271,7 @@ dir = "/var/log/drsg"                       # directory for the rolling log file
 OPENAI_API_KEY = "sk-…"
 DEEPSEEK_API_KEY = "…"
 DASHSCOPE_API_KEY = "…"
+DRSG_CHAT_OMIT = "temperature,max_tokens"   # optional: chat fields to leave out, for a model that rejects them
 
 [digest]                                    # server-side AIgest tuning
 concurrency = 8                             # per-chunk extraction calls in flight
@@ -282,6 +283,8 @@ embed_key_env = "OPENAI_API_KEY"            # env var holding its key
 [plugins]                                   # preprocessor sandbox tuning (all optional)
 fuel = 200000000000                         # instruction budget per sandbox call (0 disables)
 memory_mb = 3072                            # guest linear memory per call, MiB (wasm32 allows at most 4096)
+deadline_secs = 300                         # wall-clock ceiling per call, seconds (0 disables)
+total_memory_mb = 6144                      # linear memory all calls may hold together, MiB (0 = twice memory_mb)
 
 [fetch]                                     # URL ingestion (Chapter 3)
 enabled = true                              # false refuses URL fetching outright

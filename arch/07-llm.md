@@ -88,13 +88,15 @@ All three questions this doc opened with are settled.
    part in `ask`.) Two things are enforced on top of that, because a plan is
    the model's and a document can steer a model:
    - an **allowlist** of the grammar the prompt teaches — `ScanAll`,
-     `ScanLabel`, `SeekKeys`; `Expand`, `ExpandVar`, `Filter`, `Distinct`,
-     `Sort`, `Skip`, `Limit`. Vector, keyword, hybrid and algorithm sources
+     `ScanLabel`, `SeekIds`, `SeekKeys`; `Expand`, `ExpandVar`, `Filter`,
+     `Distinct`, `Sort`, `Skip`, `Limit`. Vector, keyword, hybrid and algorithm sources
      and the similarity steps are rejected and sent back as a repair, as is
      any variant the (`#[non_exhaustive]`) core grows later;
    - a **row ceiling**: every `Limit` the model wrote, the caller's cap, and a
      projection's `limit` are clamped to `ASK_MAX_LIMIT` (1 000), and a plan
-     that declares none gets the caller's cap (default `ASK_DEFAULT_LIMIT`,
-     100) appended. No plan runs unbounded; `limit: 0` means the ceiling.
+     whose *last* step is not a `Limit` gets the caller's cap (default
+     `ASK_DEFAULT_LIMIT`, 100) appended — a `Limit` the model wrote before an
+     `Expand` bounds the seeds, not the rows. No plan runs unbounded;
+     `limit: 0` means the ceiling.
    Both constants and `ASK_DEFAULT_ATTEMPTS` (20 model turns) are public so
    the RPC and MCP surfaces validate requests against the same numbers.
