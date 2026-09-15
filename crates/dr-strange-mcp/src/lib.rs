@@ -173,6 +173,57 @@ pub fn tool_deadline_from_env() -> Option<Duration> {
     deadline_from(std::env::var(ENV_TOOL_DEADLINE_SECS).ok().as_deref())
 }
 
+/// Commits of history a database keeps when nothing says otherwise: enough
+/// for the dashboard's time slider and an agent's "what did this look like
+/// before that change" to have somewhere to go, while keeping the store close
+/// to the size of what it currently holds. The one figure `drsg serve`, the
+/// rest of the CLI and the stdio binary all open with — the web crate's
+/// constant of the same name is this one.
+pub const DEFAULT_RETAIN_COMMITS: u64 = 20;
+
+/// Environment override for [`DEFAULT_RETAIN_COMMITS`], read by the stdio
+/// binary — which has no config file — so a store it writes through
+/// (`write_nodes`, `write_edges`, `cypher`, `digest`) is compacted under the
+/// same policy a served one is, rather than keeping every version forever.
+/// `0` keeps everything, as `[server] retain_commits = 0` does.
+pub const ENV_RETAIN_COMMITS: &str = "DRSG_RETAIN_COMMITS";
+
+/// [`ENV_RETAIN_COMMITS`] held something that is not a count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainCommitsError {
+    pub value: String,
+}
+
+impl std::fmt::Display for RetainCommitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{ENV_RETAIN_COMMITS}={:?} is not a number of commits (a whole number; 0 keeps every version)",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for RetainCommitsError {}
+
+/// The retention `value` — the environment's reading of
+/// [`ENV_RETAIN_COMMITS`], if any — asks for, in `Database::set_retention`'s
+/// encoding: `None` is unbounded. Unset is the default; `0` is unbounded; a
+/// value that is not a count is an error rather than a silent default, since
+/// a typo here would quietly change what a compaction throws away.
+pub fn retain_commits_from(value: Option<&str>) -> Result<Option<u64>, RetainCommitsError> {
+    match value {
+        None => Ok(Some(DEFAULT_RETAIN_COMMITS)),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => Ok(None),
+            Ok(commits) => Ok(Some(commits)),
+            Err(_) => Err(RetainCommitsError {
+                value: raw.to_string(),
+            }),
+        },
+    }
+}
+
 /// [`tool_deadline_from_env`] on a value already read.
 fn deadline_from(value: Option<&str>) -> Option<Duration> {
     match value.and_then(|v| v.trim().parse::<u64>().ok()) {
@@ -3829,6 +3880,19 @@ mod tests {
         assert!(!destroys(
             "MATCH (n) WHERE n.x = 'it''s' SET n.deleted = true"
         ));
+    }
+
+    /// The stdio binary's retention reading: unset is the served default,
+    /// `0` is unbounded, a count is itself, and a non-count is refused rather
+    /// than silently becoming the default.
+    #[test]
+    fn the_stdio_retention_is_read_like_the_servers() {
+        assert_eq!(retain_commits_from(None), Ok(Some(DEFAULT_RETAIN_COMMITS)));
+        assert_eq!(retain_commits_from(Some("0")), Ok(None));
+        assert_eq!(retain_commits_from(Some(" 7 ")), Ok(Some(7)));
+        let err = retain_commits_from(Some("many")).unwrap_err();
+        assert_eq!(err.value, "many");
+        assert!(err.to_string().contains(ENV_RETAIN_COMMITS));
     }
 
     /// Applying is confirmed before anything is read or any provider called.
