@@ -72,6 +72,8 @@ dir = "logs"
 # OPENAI_API_KEY = "sk-..."
 # DEEPSEEK_API_KEY = "..."
 # DASHSCOPE_API_KEY = "..."   # Qwen / DashScope
+# Any other name here is exported the same way. One the provider layer reads:
+# DRSG_CHAT_OMIT = "temperature,max_tokens"   # chat request fields to leave out, for a reasoning model that rejects them
 
 # Server-side ingestion tuning. A digest.run request may override the first two.
 [digest]

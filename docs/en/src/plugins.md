@@ -130,19 +130,23 @@ The budgets are tunable in `drsg.toml`
 [plugins]
 fuel = 200000000000    # instructions per sandbox call (0 disables the check)
 memory_mb = 3072       # linear memory per call, MiB (wasm32 itself allows at most 4096)
+deadline_secs = 300    # wall-clock ceiling per call, seconds (0 disables it)
+total_memory_mb = 6144 # linear memory all calls in the process may hold together (0 = twice memory_mb)
 
 [plugins.rust]         # a plugin's own settings pass through untouched
 include_source = true
 ```
 
-Two more are read from the environment. `DRSG_PLUGINS_DEADLINE_SECS` is the
-wall-clock ceiling on one call (default 300; `0` disables it) — not a budget
-for work, which fuel is and deterministically so, but what stops a plugin
-that never returns once fuel has been switched off. `DRSG_PLUGINS_TOTAL_MEMORY_MB`
-is what every call in the process may hold *together* (default twice
-`memory_mb`): `parse` runs one call per core, and a per-call ceiling alone
-would let a wide machine be filled a store at a time. A refusal names the
-ceiling it hit, so the operator knows which knob it was. Turning fuel off
+`deadline_secs` is the wall-clock ceiling on one call (default 300; `0`
+disables it) — not a budget for work, which fuel is and deterministically so,
+but what stops a plugin that never returns once fuel has been switched off.
+`total_memory_mb` is what every call in the process may hold *together*
+(default twice `memory_mb`): `parse` runs one call per core, and a per-call
+ceiling alone would let a wide machine be filled a store at a time. Both can
+be overridden from the shell for one run — `DRSG_PLUGINS_DEADLINE_SECS` and
+`DRSG_PLUGINS_TOTAL_MEMORY_MB`, same units and same reading of `0` — and the
+environment wins over the file, as with every other `DRSG_*` variable. A
+refusal names the ceiling it hit, so the operator knows which knob it was. Turning fuel off
 also switches the sandbox to compiling each plugin from its wasm on every
 load, since the precompiled artifacts carry the fuel instrumentation; the
 first load says so once.

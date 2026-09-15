@@ -107,16 +107,19 @@ interface preprocessor {
 [plugins]
 fuel = 200000000000    # 每次沙箱调用的指令预算（0 为不设限）
 memory_mb = 3072       # 每次调用的线性内存上限，MiB；按照 wasm32 标准，最高支持 4096
+deadline_secs = 300    # 单次调用的墙钟上限，秒（0 为不设限）
+total_memory_mb = 6144 # 进程内所有调用合计可持有的线性内存，MiB（0 为 memory_mb 的两倍）
 
 [plugins.rust]         # 插件自有设置，原样透传
 include_source = true
 ```
 
-另有两项从环境变量读取。`DRSG_PLUGINS_DEADLINE_SECS` 是单次调用的墙钟上限
-（默认 300 秒，`0` 为不设限）——它不是工作量的预算（那是 fuel 的职责，且是确定性的），
-而是关掉 fuel 之后兜住不返回插件的那张网。`DRSG_PLUGINS_TOTAL_MEMORY_MB` 是进程内
-所有调用**合计**可持有的线性内存（默认为 `memory_mb` 的两倍）：`parse` 每核一次调用，
-只有单次上限的话，多核机器会被一个个 store 逐渐填满。被拒绝时错误会点名撞到的是哪一个上限。
+`deadline_secs` 是单次调用的墙钟上限（默认 300 秒，`0` 为不设限）——它不是工作量的预算
+（那是 fuel 的职责，且是确定性的），而是关掉 fuel 之后兜住不返回插件的那张网。
+`total_memory_mb` 是进程内所有调用**合计**可持有的线性内存（默认为 `memory_mb` 的两倍）：
+`parse` 每核一次调用，只有单次上限的话，多核机器会被一个个 store 逐渐填满。两者都可以在
+shell 里临时覆盖——`DRSG_PLUGINS_DEADLINE_SECS` 与 `DRSG_PLUGINS_TOTAL_MEMORY_MB`，单位与
+`0` 的含义相同——环境变量优先于配置文件，与其他 `DRSG_*` 变量一致。被拒绝时错误会点名撞到的是哪一个上限。
 关掉 fuel 也意味着每次加载都要从 wasm 重新编译插件（预编译产物带有 fuel 插桩），首次加载会提示一次。
 
 拉取模型还带来一条边界：预处理在文件所在之处运行。CLI 与 stdio MCP 服务会经过
