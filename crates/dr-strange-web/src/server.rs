@@ -5,6 +5,7 @@
 //! by a long scan.
 
 use std::io::IsTerminal;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -256,15 +257,20 @@ fn presented_bearer(request: &Request) -> Option<String> {
 }
 
 /// Brute-force protection on the bearer check, as a middleware over the
-/// whole router so no handler can forget it. A peer serving a lockout is
-/// answered 429 with `Retry-After` before its request is read further; a
-/// peer whose bearer authorizes nothing — not even a read, so the request
-/// would be refused wherever it went — earns a strike, and a correct bearer
-/// clears its strikes (see [`FailedAuthLimiter`]). A request carrying no
-/// bearer is neither counted nor blocked: it is not a guess, and the
-/// zero-config local UI sends none. With no connect info there is no peer
-/// to key on, and the throttle steps aside rather than lump every client
-/// together.
+/// whole router so no handler can forget it. A client serving a lockout
+/// that presents a bearer is answered 429 with `Retry-After` before its
+/// request is read further; a client whose bearer authorizes nothing — not
+/// even a read, so the request would be refused wherever it went — earns a
+/// strike, and a correct bearer clears its strikes (see
+/// [`FailedAuthLimiter`]). A request carrying no bearer is neither counted
+/// nor blocked, locked out or not: it is not a guess, the zero-config local
+/// UI sends none, and `/health` and the page itself must keep answering —
+/// behind a reverse proxy or NAT many humans share one address, and one of
+/// them guessing wrong must not take the page and the liveness probe away
+/// from the rest (the guesser learns nothing from the probe that
+/// `Retry-After` does not already say). The client is keyed by
+/// [`throttle_key`]; with no connect info there is no address to key on,
+/// and the throttle steps aside rather than lump every client together.
 async fn auth_throttle(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -277,23 +283,49 @@ async fn auth_throttle(
     else {
         return next.run(request).await;
     };
+    let Some(bearer) = presented_bearer(&request) else {
+        return next.run(request).await;
+    };
+    let client = throttle_key(peer, request.headers());
     let now = Instant::now();
-    if let Some(wait) = state.auth_limiter.locked_for(peer, now) {
+    if let Some(wait) = state.auth_limiter.locked_for(client, now) {
         return too_many_attempts(wait);
     }
-    if let Some(bearer) = presented_bearer(&request) {
-        let creds = Credentials {
-            bearer: Some(bearer),
-            local_ui: false,
-        };
-        if state.authorizer.allows(Access::Read, &creds) {
-            state.auth_limiter.succeeded(peer);
-        } else if let Some(wait) = state.auth_limiter.failed(peer, now) {
-            tracing::warn!(%peer, wait_secs = wait.as_secs(), "repeated failed authentication; peer throttled");
-            return too_many_attempts(wait);
-        }
+    let creds = Credentials {
+        bearer: Some(bearer),
+        local_ui: false,
+    };
+    if state.authorizer.allows(Access::Read, &creds) {
+        state.auth_limiter.succeeded(client);
+    } else if let Some(wait) = state.auth_limiter.failed(client, now) {
+        tracing::warn!(%client, wait_secs = wait.as_secs(), "repeated failed authentication; client throttled");
+        return too_many_attempts(wait);
     }
     next.run(request).await
+}
+
+/// The address the failed-auth throttle counts a request against.
+///
+/// The TCP peer, except behind a reverse proxy on this machine: then every
+/// client on the internet is the same loopback peer, and one wrong guesser
+/// would lock the token out for all of them. A proxy names the client it
+/// forwards for in `X-Forwarded-For`; the rightmost entry is the one the
+/// nearest proxy appended, so it is the only one this server can take at
+/// face value — and only from a loopback peer, since nothing but a process
+/// on this machine can connect from one, so the header was set by our
+/// proxy and not typed by the client to pick its own bucket. A LAN or
+/// remote peer's header is ignored for exactly that reason, and a header
+/// that does not parse falls back to the peer.
+fn throttle_key(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|list| list.rsplit(',').next())
+        .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
 }
 
 fn too_many_attempts(wait: Duration) -> Response {
@@ -1980,7 +2012,30 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 mod tests {
     use super::{
         check_bind_policy, local_ui_for, mcp_allowed_hosts, page_token_setting, spool_snapshot,
+        throttle_key,
     };
+
+    /// The throttle counts against the TCP peer, except that a same-host
+    /// proxy's `X-Forwarded-For` names the real client: honoured only from
+    /// a loopback peer, rightmost entry, peer again when it does not parse.
+    #[test]
+    fn the_throttle_keys_on_the_forwarded_client_only_behind_a_local_proxy() {
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let client: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let plain = axum::http::HeaderMap::new();
+        assert_eq!(throttle_key(local, &plain), local);
+        assert_eq!(throttle_key(lan, &plain), lan);
+        let mut forwarded = axum::http::HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "10.0.0.1, 203.0.113.9".parse().unwrap());
+        assert_eq!(throttle_key(local, &forwarded), client);
+        // A LAN peer's header could be typed by the client to pick its own
+        // bucket: ignored.
+        assert_eq!(throttle_key(lan, &forwarded), lan);
+        let mut junk = axum::http::HeaderMap::new();
+        junk.insert("x-forwarded-for", "not-an-address".parse().unwrap());
+        assert_eq!(throttle_key(local, &junk), local);
+    }
 
     /// The spool `/snapshot` streams is byte-for-byte the core's dump,
     /// rewound and ready to read; the locks the dump takes are released

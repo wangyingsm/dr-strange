@@ -43,11 +43,15 @@ Every response carries a `Content-Security-Policy` under which scripts and style
 load only from the server itself; the dashboard is built to satisfy it, and a
 reverse proxy in front should pass it through rather than replace it.
 
-A wrong token may be presented five times; after that the server answers the
-peer `429 Too Many Requests` with a `Retry-After` that doubles per further
-failure, up to five minutes, until a correct token is presented. Requests with
-no token are not counted, so a tokenless local dashboard never trips it. A
-JSON-RPC batch holds at most 64 requests.
+A wrong token may be presented five times; after that the server answers that
+client's requests carrying a token `429 Too Many Requests` with a
+`Retry-After` that doubles per further failure, up to five minutes, until a
+correct token is presented. Requests with no token are neither counted nor
+blocked, so a tokenless local dashboard never trips it and the page and
+`/health` keep answering for everyone else. The client is the connection's
+address; behind a reverse proxy on the same machine it is the address the
+proxy names in `X-Forwarded-For`, so one guesser does not lock out everyone
+the proxy serves. A JSON-RPC batch holds at most 64 requests.
 
 Wherever the interface asks for a provider — semantic search, natural-language
 queries, AIgest — it offers the presets (`openai`, `deepseek`, `qwen`,

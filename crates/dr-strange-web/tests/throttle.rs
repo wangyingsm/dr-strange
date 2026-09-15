@@ -104,14 +104,58 @@ async fn repeated_wrong_tokens_lock_the_peer_out_and_the_right_one_clears_it() {
         assert_eq!(stats_as(&client, &base, "nope").await.status(), 200);
     }
 
-    // A request with no bearer is not a guess: it is not counted, and the
-    // unauthenticated liveness probe still answers while others are locked.
+    // A request with no bearer is not a guess: it is neither counted nor
+    // blocked, so the liveness probe and the page itself still answer while
+    // this client is locked — behind a proxy or NAT many humans share one
+    // address, and one guesser must not take the page away from the rest.
     let resp = stats_as(&client, &base, "nope").await;
     assert_eq!(resp.status(), 429);
     let health = client.get(format!("{base}/health")).send().await.unwrap();
-    // The lockout is per peer and gates everything from that peer, the
-    // probe included: an orchestrator's probe comes from a different
-    // address than a guessing client, and answering the guesser's probe
-    // would tell it exactly when the lockout ends.
-    assert_eq!(health.status(), 429);
+    assert_eq!(health.status(), 200);
+    let page = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    // The lockout still stands for anything presenting a bearer.
+    assert_eq!(stats_as(&client, &base, TOKEN).await.status(), 429);
+}
+
+/// Behind a reverse proxy on this machine every client is the same loopback
+/// peer; the proxy's `X-Forwarded-For` tells them apart, so a guesser locks
+/// out only itself and the next client's guesses and correct token go
+/// through as if the guesser had never been.
+#[tokio::test]
+async fn a_forwarded_client_is_throttled_apart_from_the_others_behind_the_proxy() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+    let as_client = |ip: &'static str, bearer: &'static str| {
+        client
+            .post(format!("{base}/rpc"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("x-forwarded-for", ip)
+            .json(&json!({ "jsonrpc": "2.0", "method": "db.stats", "id": 1 }))
+            .send()
+    };
+    for _ in 0..dr_strange_web::FREE_FAILURES {
+        assert_eq!(
+            as_client("203.0.113.9", "nope").await.unwrap().status(),
+            200
+        );
+    }
+    assert_eq!(
+        as_client("203.0.113.9", "nope").await.unwrap().status(),
+        429
+    );
+    assert_eq!(as_client("203.0.113.9", TOKEN).await.unwrap().status(), 429);
+    // Another client through the same proxy is untouched.
+    assert_eq!(
+        as_client("198.51.100.7", "nope").await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        as_client("198.51.100.7", TOKEN).await.unwrap().status(),
+        200
+    );
+    // And so is a request the proxy did not forward — the peer itself.
+    assert_eq!(stats_as(&client, &base, TOKEN).await.status(), 200);
 }
