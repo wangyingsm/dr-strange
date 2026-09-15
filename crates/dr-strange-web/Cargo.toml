@@ -47,8 +47,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # (tower) plus panic→500 and static security headers (tower-http).
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["catch-panic", "set-header", "limit"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+# `fs`: `/snapshot` streams a spooled file so the core's locks are not held
+# for the client's download; `tokio-util` `io` wraps that file as a body.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "fs"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+# The anonymous spool file `/snapshot` dumps into under the core's locks.
+tempfile = "3.27.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

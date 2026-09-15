@@ -975,10 +975,18 @@ impl std::io::Write for BodyWriter {
 /// `GET /snapshot` — the one-shot bootstrap bundle for `serve --follow`
 /// (arch/01 §9): the whole database, id-faithful, at one commit sequence
 /// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire).
-/// Streamed as it is written, like `/export`: the core writes frame by
-/// frame into any `Write`, so the follower reads the first frame while the
-/// master is still on the last, and neither holds the database in memory a
-/// second time.
+///
+/// The dump goes to an anonymous spool file first and the file is streamed,
+/// not the dump itself. `Database::snapshot` holds the registry read locks
+/// and one read transaction for as long as it writes — that is what makes
+/// the image consistent — so writing it straight into the response body
+/// would hold every commit on the master for as long as the follower took
+/// to download, which over a slow link is the whole transfer; a spool costs
+/// one write of the image to local disk and releases the locks the moment
+/// the last frame is written. The file is unlinked on creation and streamed
+/// by the runtime's own file reader, so a slow follower pins neither a lock
+/// nor a blocking-pool thread, and a spool failure (no space, no temp dir)
+/// is a 500 decided before the status line.
 async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let creds = match resolve_credentials(&state, &headers, None) {
         Ok(c) => c,
@@ -987,32 +995,30 @@ async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     if !state.authorizer.allows(Access::Read, &creds) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let (started, body) = stream_body("snapshot", {
+    let spooled = tokio::task::spawn_blocking({
         let state = state.clone();
-        move |out, ready| {
-            ready.ok();
-            state
-                .db
-                .snapshot(&mut *out)
-                .map(|_| ())
-                .map_err(methods::core_err)
-        }
-    });
-    match started.await {
-        Ok(()) => {
+        move || spool_snapshot(&state.db)
+    })
+    .await;
+    match spooled {
+        Ok(Ok(file)) => {
             tracing::info!("serving a replication snapshot");
+            let reader = tokio_util::io::ReaderStream::with_capacity(
+                tokio::fs::File::from_std(file),
+                STREAM_CHUNK,
+            );
             Response::builder()
                 .header("content-type", "application/octet-stream")
-                .body(body)
+                .body(Body::from_stream(reader))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
                 })
         }
-        Err(Started::Refused(e)) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e.message, "snapshot export refused");
             (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response()
         }
-        Err(Started::Panicked) => {
+        Err(_) => {
             tracing::error!("snapshot export task panicked");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1021,6 +1027,22 @@ async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -
                 .into_response()
         }
     }
+}
+
+/// Dump `db` into an anonymous temporary file and return it rewound to the
+/// start — the spool [`snapshot_http`] streams. Blocking: call it from a
+/// blocking task. The core's locks are held only for the duration of this
+/// function, never for the download.
+fn spool_snapshot(db: &Database) -> Result<std::fs::File, rpc::RpcError> {
+    use std::io::{Seek, Write};
+    let spool = |e: std::io::Error| rpc::RpcError::server(format!("snapshot spool: {e}"));
+    let file = tempfile::tempfile().map_err(spool)?;
+    let mut out = std::io::BufWriter::with_capacity(STREAM_CHUNK, file);
+    db.snapshot(&mut out).map_err(methods::core_err)?;
+    out.flush().map_err(spool)?;
+    let mut file = out.into_inner().map_err(|e| spool(e.into_error()))?;
+    file.rewind().map_err(spool)?;
+    Ok(file)
 }
 
 /// `GET /ws/wal` — the live tail for `serve --follow` (arch/01 §9): every
@@ -1920,7 +1942,37 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_bind_policy, mcp_allowed_hosts};
+    use super::{check_bind_policy, mcp_allowed_hosts, spool_snapshot};
+
+    /// The spool `/snapshot` streams is byte-for-byte the core's dump,
+    /// rewound and ready to read; the locks the dump takes are released
+    /// when the function returns, before any byte reaches a client.
+    #[test]
+    fn the_snapshot_spool_is_the_dump_rewound() {
+        use std::io::Read;
+        let db = dr_strange_core::Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_node_with_key("alice", &["Person"], dr_strange_core::Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let mut direct = Vec::new();
+        db.snapshot(&mut direct).unwrap();
+        let mut spooled = Vec::new();
+        spool_snapshot(&db)
+            .unwrap()
+            .read_to_end(&mut spooled)
+            .unwrap();
+        assert_eq!(spooled, direct);
+        // And a write goes through while the spool is still open: nothing
+        // of the core is held by the file.
+        let file = spool_snapshot(&db).unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_node_with_key("bob", &["Person"], dr_strange_core::Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        drop(file);
+    }
 
     /// The `Host` list `/mcp` answers at: loopback always; the bind address
     /// and the operator's names only once a token gates every request; a

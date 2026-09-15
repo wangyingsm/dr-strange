@@ -177,12 +177,21 @@ server enforces where the line is (shipped 2026-09, `server::run`,
    `ASK_DEFAULT_ATTEMPTS` (20), its `limit` at `ASK_MAX_LIMIT` (1000);
    `digest.run`'s `concurrency` and `chunk_chars` are clamped to
    `DIGEST_MAX_CONCURRENCY` (32) / `DIGEST_MAX_CHUNK_CHARS` (32 000) or the
-   operator's own `[digest]` default, whichever is larger. `/export` and
-   `/snapshot` stream (`server::stream_body`: a blocking producer writing
-   64 KiB chunks into a bounded channel) rather than build the whole body
-   in memory; the status line is chosen after the request is validated, so
-   a bad plane is still a `400`, and a failure mid-stream truncates the
-   chunked body, which is the one honest signal left.
+   operator's own `[digest]` default, whichever is larger. `/export`
+   streams (`server::stream_body`: a blocking producer writing 64 KiB
+   chunks into a bounded channel) rather than build the whole body in
+   memory, and its walk holds the plane's node ids (one scan, 8 bytes each)
+   and one record at a time, never every record; the status line is chosen
+   after the request is validated, so a bad plane is still a `400`, and a
+   failure mid-stream truncates the chunked body, which is the one honest
+   signal left. `/snapshot` is different: `Database::snapshot` holds the
+   registry read locks and a read transaction for as long as it writes, so
+   streaming it straight to the client would hold every commit on the
+   master for the follower's whole download. It is spooled to an anonymous
+   temp file under those locks (`server::spool_snapshot`) and the file is
+   streamed by the runtime's file reader — the locks are held for one local
+   write of the image, and a slow follower pins neither a lock nor a
+   blocking-pool thread.
 9. **An error says only what the client may know.** Core `Io` / `Backend` /
    `Corrupt` errors (the database path, a backend's internals), provider
    *call* errors (the upstream reply body) and plugin-store errors (the
