@@ -10,6 +10,12 @@
 //! Its own test binary because `DRSG_TOKEN` is process-wide (see `bind.rs`):
 //! the follower fetches the snapshot without a browser Origin, so the master
 //! must be able to authenticate it by token.
+//!
+//! Native-only, like `serve --follow` itself (replication mirrors the native
+//! engine's WAL, and `serve` bails without the feature); the redb-only
+//! build compiles this binary to nothing rather than to a missing
+//! `open_read_only`.
+#![cfg(feature = "native-backend")]
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc;

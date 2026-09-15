@@ -68,8 +68,9 @@ impl VectorRegistry {
     }
 
     /// Arm the fault seam: the next `upsert` returns an error (see the
-    /// field).
-    #[cfg(test)]
+    /// field). Gated like its one caller, `api::index_divergence_tests`,
+    /// so the redb-only test build does not see an unused method.
+    #[cfg(all(test, feature = "native-backend"))]
     pub(crate) fn fail_next_upsert(&mut self) {
         self.fail_next_upsert = true;
     }
