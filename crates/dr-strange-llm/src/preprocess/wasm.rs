@@ -198,6 +198,24 @@ impl Limits {
             .max(self.memory_bytes)
     }
 
+    /// The resource limiter a store runs under: the per-store memory ceiling
+    /// and the fixed table, element, instance and memory counts, wrapped in
+    /// the shared budget. One place, so the counts cannot be set on one
+    /// store's builder and forgotten on another's.
+    fn metered(&self) -> Metered {
+        Metered::new(
+            StoreLimitsBuilder::new()
+                .memory_size(self.memory_bytes)
+                .memories(MAX_MEMORIES)
+                .tables(MAX_TABLES)
+                .table_elements(MAX_TABLE_ELEMENTS)
+                .instances(MAX_INSTANCES)
+                .build(),
+            self.memory_bytes,
+            self.budget(),
+        )
+    }
+
     /// The deadline in epoch ticks: at least one, so a deadline shorter than
     /// a tick still fires on the next tick rather than at once.
     ///
@@ -749,17 +767,7 @@ impl WasmPlugin {
                 host,
                 wasi,
                 table: ResourceTable::new(),
-                limits: Metered::new(
-                    StoreLimitsBuilder::new()
-                        .memory_size(self.limits.memory_bytes)
-                        .memories(MAX_MEMORIES)
-                        .tables(MAX_TABLES)
-                        .table_elements(MAX_TABLE_ELEMENTS)
-                        .instances(MAX_INSTANCES)
-                        .build(),
-                    self.limits.memory_bytes,
-                    self.limits.budget(),
-                ),
+                limits: self.limits.metered(),
                 stderr,
             },
         );
@@ -1339,5 +1347,29 @@ error while executing at wasm backtrace:
         drop(first);
         assert!(second.memory_growing(32 << 20, limit, None).unwrap());
         drop(second);
+    }
+
+    /// The counts a store is built with are the ones the limiter reports and
+    /// enforces — not the trait's defaults, which are ten thousand of each.
+    /// Driven through the limiter wasmtime would consult: a table growing to
+    /// the element cap is admitted, one element past it is refused, and the
+    /// instance, table and memory counts are the constants.
+    #[test]
+    fn a_store_is_limited_to_the_configured_tables_instances_and_memories() {
+        let mut metered = Limits::default().metered();
+        assert_eq!(metered.instances(), MAX_INSTANCES);
+        assert_eq!(metered.tables(), MAX_TABLES);
+        assert_eq!(metered.memories(), MAX_MEMORIES);
+        assert!(metered.table_growing(0, MAX_TABLE_ELEMENTS, None).unwrap());
+        assert!(
+            !metered
+                .table_growing(MAX_TABLE_ELEMENTS, MAX_TABLE_ELEMENTS + 1, None)
+                .unwrap(),
+            "one element past the cap must be refused"
+        );
+        assert!(
+            metered.refused.is_none(),
+            "a table refusal is wasmtime's own trap, not a memory refusal"
+        );
     }
 }
