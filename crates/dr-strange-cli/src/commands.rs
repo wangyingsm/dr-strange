@@ -113,6 +113,12 @@ const INIT_TOKEN_LEN: usize = 40;
 #[cfg(feature = "digest")]
 const INIT_HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// One `/health` round trip while waiting for a spawned server: short, so a
+/// stranger on the port that accepts and never answers does not eat the
+/// whole wait, and long enough for a child that is just up to answer.
+#[cfg(feature = "digest")]
+const INIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The name every agent config gives the entry `init` writes. One constant
 /// because `recorded_endpoint` reads back what `write_mcp_json_entry` wrote:
 /// a restart that kept the old address and token depends on the two agreeing.
@@ -742,7 +748,7 @@ fn spawn_serve_watch(
 #[cfg(feature = "digest")]
 #[derive(Debug, PartialEq, Eq)]
 enum Listener {
-    /// Something accepts connections on the address.
+    /// The child itself answers `/health` on the address.
     Up,
     /// The child exited before anything listened — a port it could not
     /// bind, or a start-up failure of its own.
@@ -751,9 +757,16 @@ enum Listener {
     TimedOut,
 }
 
-/// Polls `addr` until something accepts a TCP connection, the child exits
-/// first, or `timeout` elapses. The two failures are told apart because only
-/// the first is worth retrying on another port.
+/// Polls `addr` until the child itself answers `/health` there, the child
+/// exits first, or `timeout` elapses. The two failures are told apart because
+/// only the first is worth retrying on another port.
+///
+/// "The child itself": a connection accepted on the address is not enough,
+/// because a picked port can be taken by something that listens in the
+/// moment before the child binds it. `/health` carries the answering
+/// server's pid, and only the child's pid counts; anything else on the port
+/// is a stranger, and the child — which could not bind — exits shortly after,
+/// which is what sends `init` to another port.
 #[cfg(feature = "digest")]
 fn wait_for_listener(
     addr: std::net::SocketAddr,
@@ -762,7 +775,7 @@ fn wait_for_listener(
 ) -> Listener {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
+        if health_probe(addr, INIT_PROBE_TIMEOUT) == Some(Some(child.id())) {
             return Listener::Up;
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
@@ -4856,6 +4869,52 @@ mod tests {
         );
         let _ = slow.kill();
         let _ = slow.wait();
+    }
+
+    /// A stranger that took the picked port and listens is not the child:
+    /// the wait does not call a connection it accepts "up", it keeps
+    /// waiting for the child's own `/health` — and reports the child's exit
+    /// when the child, unable to bind, gives up.
+    #[cfg(all(feature = "digest", unix))]
+    #[test]
+    fn wait_for_listener_is_not_fooled_by_a_stranger_on_the_port() {
+        let stranger = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = stranger.local_addr().unwrap();
+        // Accept and answer like a drsg would — with somebody else's pid.
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write as _};
+            for conn in stranger.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = format!("{{\"status\":\"ok\",\"pid\":{}}}", u32::MAX - 7);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let short = std::time::Duration::from_millis(400);
+        let mut slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut slow, short),
+            Listener::TimedOut
+        );
+        let _ = slow.kill();
+        let _ = slow.wait();
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut dead, short),
+            Listener::ChildExited
+        );
+        drop(server);
     }
 
     /// A pid read out of an HTTP body is not signalled until the system
