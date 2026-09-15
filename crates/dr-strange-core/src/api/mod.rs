@@ -3653,6 +3653,63 @@ mod index_divergence_tests {
     }
 
     #[test]
+    fn a_failed_index_event_after_commit_is_absorbed_and_the_rest_still_apply() {
+        // The KV commit is durable before the registries are mirrored, so a
+        // failing vector event must not become an `Err` from `commit()` (the
+        // caller would take a landed write for a failed one), must not stop
+        // the remaining events, and must mark the registry diverged so it is
+        // never persisted at this seq.
+        use crate::text::Language;
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index("Doc", "embedding", Metric::Cosine)
+            .unwrap();
+        plane
+            .ensure_keyword_index("Doc", "body", Language::English)
+            .unwrap();
+        fn doc(v: f32, body: &str) -> Properties {
+            let mut p = embed(v);
+            p.insert("body".into(), PropDesc::new(PropValue::Str(body.into())));
+            p
+        }
+
+        db.indexes_mut().fail_next_upsert();
+        let mut w = plane.write().unwrap();
+        let first = w.create_node(&["Doc"], doc(1.0, "graph one")).unwrap();
+        let second = w.create_node(&["Doc"], doc(0.9, "graph two")).unwrap();
+        w.commit()
+            .expect("a failed index event never fails a durable commit");
+
+        assert!(plane.node(first).unwrap().is_some() && plane.node(second).unwrap().is_some());
+        assert!(db.indexes_diverged(), "the failure was recorded");
+        // The first vector event was the one that failed; the second still
+        // applied, as did both keyword events.
+        let vector_hits = plane
+            .query()
+            .vector_top_k(Some("Doc"), "embedding", vec![1.0, 0.0], Metric::Cosine, 10)
+            .ids()
+            .unwrap();
+        assert_eq!(
+            vector_hits,
+            vec![second],
+            "later vector events were not skipped"
+        );
+        let mut keyword_hits: Vec<NodeId> = plane
+            .keyword_search("Doc", "body", "graph", 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        keyword_hits.sort();
+        assert_eq!(
+            keyword_hits,
+            vec![first, second],
+            "keyword events still applied"
+        );
+    }
+
+    #[test]
     fn a_diverged_registry_is_never_persisted_and_the_next_open_rebuilds() {
         // A vector-index event that fails after its commit is durable leaves
         // the in-memory registry behind the KV. That registry must not reach
