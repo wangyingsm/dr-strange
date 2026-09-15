@@ -92,3 +92,32 @@ export function wsUrl(loc, token) {
 export function shouldPrompt(source, code) {
   return code === UNAUTHORIZED && source !== 'page'
 }
+
+/** The HTTP status the server answers a throttled client with. */
+export const TOO_MANY_ATTEMPTS = 429
+
+/**
+ * Whether an HTTP answer can be read as JSON-RPC at all: the server answers
+ * a throttled client (429, `Retry-After`) and a few other refusals in plain
+ * text, and `res.json()` on those throws a parse error that says nothing.
+ */
+export function isJsonAnswer(status, contentType) {
+  return status !== TOO_MANY_ATTEMPTS && String(contentType ?? '').includes('json')
+}
+
+/**
+ * The message to show for an HTTP answer that is not JSON-RPC: the server's
+ * own text, with the wait for a throttled client.
+ */
+export function describeHttpRefusal(status, retryAfter, bodyText) {
+  const text = String(bodyText ?? '').trim()
+  if (status === TOO_MANY_ATTEMPTS) {
+    // The server's text already names the wait; only a bare 429 (a proxy's,
+    // say) needs it read from the header.
+    if (text) return text
+    const secs = Number.parseInt(retryAfter ?? '', 10)
+    const wait = Number.isFinite(secs) && secs > 0 ? `; retry in ${secs}s` : ''
+    return `too many failed authentication attempts${wait}`
+  }
+  return text ? `${text} (HTTP ${status})` : `request failed (HTTP ${status})`
+}

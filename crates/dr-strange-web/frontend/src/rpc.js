@@ -1,6 +1,16 @@
 // Minimal JSON-RPC 2.0 client for the drsg web backend (arch/08 §1).
 
-import { bearerHeaders, forgetToken, rememberToken, resolveToken, shouldPrompt, wsUrl } from './auth.js'
+import {
+  UNAUTHORIZED,
+  bearerHeaders,
+  describeHttpRefusal,
+  forgetToken,
+  isJsonAnswer,
+  rememberToken,
+  resolveToken,
+  shouldPrompt,
+  wsUrl,
+} from './auth.js'
 import { chunk, pairBatch } from './batch.js'
 
 let nextId = 1
@@ -38,7 +48,7 @@ function login() {
   if (pendingLogin) return pendingLogin
   pendingLogin = new Promise((resolve) => {
     // Next tick, so concurrent callers all attach to `pendingLogin` first.
-    setTimeout(() => {
+    setTimeout(async () => {
       forgetToken(storage)
       const typed =
         typeof window !== 'undefined' && typeof window.prompt === 'function'
@@ -47,7 +57,18 @@ function login() {
                 'Paste its DRSG_TOKEN to sign in (kept for this tab only):',
             )
           : null
-      TOKEN = rememberToken(storage, typed)
+      let token = rememberToken(storage, typed)
+      // One probe before anyone retries: the dashboard fires several calls
+      // at load and each of them is waiting here, so a mistyped token
+      // would otherwise be presented once per waiting call — enough to use
+      // up the server's free failures in one go and lock this client out
+      // before the user sees a second prompt. A wrong token costs one
+      // strike this way, and the callers are told without retrying.
+      if (token && !(await tokenWorks(token))) {
+        forgetToken(storage)
+        token = null
+      }
+      TOKEN = token
       source = TOKEN ? 'session' : null
       pendingLogin = null
       if (TOKEN) {
@@ -60,6 +81,33 @@ function login() {
   return pendingLogin
 }
 
+/** Does the server accept `token` for a read? Anything but a refusal counts. */
+async function tokenWorks(token) {
+  try {
+    const res = await fetch('/rpc', {
+      method: 'POST',
+      headers: bearerHeaders(token, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'db.stats', id: nextId++ }),
+    })
+    const msg = await readJsonRpc(res)
+    return msg?.error?.code !== UNAUTHORIZED
+  } catch {
+    // A throttled or unreachable server is not a wrong token; let the
+    // callers retry and report whatever the server says.
+    return true
+  }
+}
+
+/**
+ * Read an `/rpc` answer as JSON-RPC, or throw the server's own words when
+ * it is not one — a throttled client gets `429` and plain text, which
+ * `res.json()` would turn into a parse error with the message lost.
+ */
+export async function readJsonRpc(res) {
+  if (isJsonAnswer(res.status, res.headers?.get?.('content-type'))) return res.json()
+  throw new Error(describeHttpRefusal(res.status, res.headers?.get?.('retry-after'), await res.text()))
+}
+
 /** Call one JSON-RPC method over HTTP POST /rpc. Throws on an RPC error. */
 export async function rpc(method, params = undefined) {
   // At most one retry: a refused answer with no page token means "ask the
@@ -70,7 +118,7 @@ export async function rpc(method, params = undefined) {
       headers: authHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', method, params, id: nextId++ }),
     })
-    const msg = await res.json()
+    const msg = await readJsonRpc(res)
     if (!msg.error) return msg.result
     if (attempt === 0 && shouldPrompt(source, msg.error.code) && (await login())) continue
     throw new Error(`${msg.error.message} (code ${msg.error.code})`)
@@ -105,7 +153,7 @@ async function postBatch(requests) {
       headers: authHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify(requests),
     })
-    const msg = await res.json()
+    const msg = await readJsonRpc(res)
     // A whole-batch refusal (unauthorized, too large) is a single error object.
     const code = !Array.isArray(msg) && msg?.error ? msg.error.code : null
     if (code != null && attempt === 0 && shouldPrompt(source, code) && (await login())) continue

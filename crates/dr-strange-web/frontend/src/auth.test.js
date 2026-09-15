@@ -2,9 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import {
   META_NAME,
   STORAGE_KEY,
+  TOO_MANY_ATTEMPTS,
   UNAUTHORIZED,
   bearerHeaders,
+  describeHttpRefusal,
   forgetToken,
+  isJsonAnswer,
   rememberToken,
   resolveToken,
   shouldPrompt,
@@ -103,5 +106,27 @@ describe('when to ask the user', () => {
 
   test("a token the server itself wrote into the page is never second-guessed", () => {
     expect(shouldPrompt('page', UNAUTHORIZED)).toBe(false)
+  })
+})
+
+describe('an answer that is not JSON-RPC', () => {
+  test('a throttled or non-JSON answer is not parsed as JSON', () => {
+    expect(isJsonAnswer(200, 'application/json')).toBe(true)
+    expect(isJsonAnswer(200, 'application/json; charset=utf-8')).toBe(true)
+    expect(isJsonAnswer(TOO_MANY_ATTEMPTS, 'application/json')).toBe(false)
+    expect(isJsonAnswer(TOO_MANY_ATTEMPTS, 'text/plain; charset=utf-8')).toBe(false)
+    expect(isJsonAnswer(502, 'text/html')).toBe(false)
+    expect(isJsonAnswer(200, null)).toBe(false)
+  })
+
+  test("the server's words and the wait are what the user sees", () => {
+    expect(describeHttpRefusal(429, '4', 'too many failed authentication attempts; retry in 4s')).toBe(
+      'too many failed authentication attempts; retry in 4s',
+    )
+    expect(describeHttpRefusal(429, '4', '')).toBe('too many failed authentication attempts; retry in 4s')
+    expect(describeHttpRefusal(429, null, '')).toBe('too many failed authentication attempts')
+    expect(describeHttpRefusal(429, 'soon', '')).toBe('too many failed authentication attempts')
+    expect(describeHttpRefusal(502, null, 'bad gateway')).toBe('bad gateway (HTTP 502)')
+    expect(describeHttpRefusal(500, null, '  ')).toBe('request failed (HTTP 500)')
   })
 })
