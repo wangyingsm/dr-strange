@@ -86,6 +86,17 @@ def test_connect_sends_bearer_header_and_a_bare_path():
     assert b"Authorization: Bearer s3cret" in lines[1:]
 
 
+def test_connect_refuses_a_control_character_token_before_dialling():
+    """A token holding CR/LF would end the Authorization line and forge another
+    header; it is refused before any socket is opened."""
+    with mock.patch("socket.create_connection") as create:
+        with pytest.raises(DrsgError) as exc:
+            _WebSocket.connect("http://127.0.0.1:1", "x\r\nX-Forged: 1", 5.0)
+    assert exc.value.code == -32000
+    assert "control character" in str(exc.value)
+    create.assert_not_called()
+
+
 @pytest.fixture
 def pair():
     a, b = socket.socketpair()

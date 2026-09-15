@@ -178,6 +178,12 @@ class _WebSocket:
         # prefers (arch/08-web-ui §4.1). `?token=` exists only for browsers,
         # whose WebSocket API cannot set headers; a URL credential would end
         # up in proxy and access logs, so a native client never sends one.
+        if token and any(ord(c) < 0x20 or ord(c) == 0x7F for c in token):
+            # A CR or LF would end the Authorization line early and let the
+            # rest of the token forge another header (or split the request);
+            # refused before any socket is opened, matching the Go/C/Java
+            # clients' handling of the same input.
+            raise DrsgError(-32000, "token contains a control character")
         authz = f"Authorization: Bearer {token}\r\n" if token else ""
 
         raw = socket.create_connection((host, port), timeout=timeout)
