@@ -101,7 +101,8 @@
 //! words, or anything between backticks. Strings take either quote with the
 //! escapes `\'` `\"` `\\` `\n` `\t` `\r` `\b` `\f` `\uXXXX`; numbers are
 //! ints or floats (`1.5`, `1e9`). Expressions nest at most
-//! `parse::MAX_NESTING` levels; deeper is a syntax error, not a stack overflow.
+//! `parse::MAX_NESTING` levels, an operator of an `AND`/`OR`/arithmetic chain
+//! counting one; deeper is a syntax error, not a stack overflow.
 //!
 //! # Not yet (each is a clear error naming the rewrite, never a silent mis-compile)
 //! - cross-variable predicates (`p.year < q.year`);

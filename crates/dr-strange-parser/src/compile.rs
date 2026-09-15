@@ -878,23 +878,15 @@ fn compile_expr(
         // here — it became a `SeekKeys` seek.)
         PExpr::In { lhs, list } => {
             let lhs = compile_expr(lhs, embedder, params, scope)?;
-            let mut out: Option<Expr> = None;
+            let mut eqs = Vec::with_capacity(list.len());
             for item in list {
-                let eq = Expr::Compare {
+                eqs.push(Expr::Compare {
                     op: CmpOp::Eq,
                     lhs: Box::new(lhs.clone()),
                     rhs: sub(item)?,
-                };
-                out = Some(match out {
-                    None => eq,
-                    Some(prev) => Expr::Logic {
-                        op: LogicOp::Or,
-                        lhs: Box::new(prev),
-                        rhs: Box::new(eq),
-                    },
                 });
             }
-            out.unwrap_or(Expr::Literal(PropValue::Bool(false)))
+            balanced(LogicOp::Or, eqs).unwrap_or(Expr::Literal(PropValue::Bool(false)))
         }
         // Not sugar, unlike `PExpr::In`: the haystack is a per-row value, so
         // it stays an operator the executor evaluates.
@@ -1060,17 +1052,41 @@ fn null_guarded(
     params: &crate::Params,
     scope: &Scope,
 ) -> Result<Expr, String> {
-    let mut out: Option<Expr> = None;
+    let mut present = Vec::new();
     for leaf in nullable_leaves(roots) {
         // A param that doesn't resolve fails here as it would anywhere.
-        let present = compile_expr(leaf, embedder, params, scope)?.is_null().not();
-        out = Some(match out {
-            None => present,
-            Some(acc) => acc.and(present),
-        });
+        present.push(compile_expr(leaf, embedder, params, scope)?.is_null().not());
     }
-    Ok(match out {
+    Ok(match balanced(LogicOp::And, present) {
         None => pred,
         Some(guards) => guards.and(pred),
     })
+}
+
+/// `items` joined under `op`, or `None` when there are none.
+///
+/// Balanced, not left-deep: a list is as long as the query body allows
+/// (`x IN [… × 100 000]` is under a megabyte), and core evaluates and drops
+/// an `Expr` recursively on the machine stack, so a chain that long is a
+/// stack overflow — a balanced tree of it is seventeen levels. The parser's
+/// nesting budget bounds every *written* chain; this bounds the ones the
+/// compiler makes. Pairwise rounds keep the first items leftmost, so a short
+/// list reads as it did (`(a OR b) OR c`).
+fn balanced(op: LogicOp, mut items: Vec<Expr>) -> Option<Expr> {
+    while items.len() > 1 {
+        let mut next = Vec::with_capacity(items.len().div_ceil(2));
+        let mut it = items.into_iter();
+        while let Some(lhs) = it.next() {
+            next.push(match it.next() {
+                Some(rhs) => Expr::Logic {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                None => lhs,
+            });
+        }
+        items = next;
+    }
+    items.pop()
 }

@@ -1964,6 +1964,72 @@ fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
 }
 
 #[test]
+fn long_operator_chains_are_a_parse_error_not_a_stack_overflow() {
+    // The chains fold iteratively, so the parser would take a hundred
+    // thousand terms and hand back a tree that deep for the compiler and
+    // the drop glue to overflow on. Run on a 2 MiB stack — the thread the
+    // web and MCP handlers use — so an overflow would show here as it would
+    // in `drsg serve`.
+    let on_small_stack = |f: fn()| {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("no overflow");
+    };
+    on_small_stack(|| {
+        for (term, glue) in [
+            ("1 = 1", " AND "),
+            ("1 = 1", " OR "),
+            ("n.x", " + "),
+            ("n.x", " * "),
+        ] {
+            let chain = |n: usize| vec![term; n].join(glue);
+            for query in [
+                format!("MATCH (n) WHERE {} RETURN n", chain(100_000)),
+                format!("MATCH (n) RETURN {}", chain(100_000)),
+                format!("MATCH (n) RETURN n ORDER BY {}", chain(100_000)),
+            ] {
+                let said = err(&query).to_string();
+                assert!(said.contains("nested deeper than"), "{glue}: {said}");
+            }
+            // A chain well inside the budget still parses, as do chains
+            // nested in each other within it.
+            plan(&format!("MATCH (n) WHERE {} RETURN n", chain(40)));
+        }
+        plan(&format!(
+            "MATCH (n) WHERE ({}) AND ({}) RETURN n",
+            vec!["n.x = 1"; 30].join(" OR "),
+            vec!["n.y = 1"; 30].join(" OR ")
+        ));
+        // A write's WHERE too: the write reading parses and drops it first.
+        let said = err(&format!(
+            "MATCH (n) WHERE {} SET n.y = 1",
+            vec!["1 = 1"; 100_000].join(" AND ")
+        ))
+        .to_string();
+        assert!(said.contains("nested deeper than"), "{said}");
+    });
+    // `IN [...]` is a flat list to the parser; the compiler's expansion of it
+    // must not become the deep chain the grammar refuses.
+    on_small_stack(|| {
+        let items = (0..100_000).map(|i| i.to_string()).collect::<Vec<_>>();
+        let p = plan(&format!(
+            "MATCH (n) WHERE n.x IN [{}] RETURN n",
+            items.join(", ")
+        ));
+        assert_eq!(p.steps.len(), 1);
+        let p = plan(&format!(
+            "MATCH (n) WHERE NOT n.x IN [{}] RETURN n",
+            items.join(", ")
+        ));
+        assert_eq!(p.steps.len(), 1);
+        drop(p);
+    });
+}
+
+#[test]
 fn algorithm_arguments_keep_property_case_and_refuse_oversized_counts() {
     assert_eq!(
         plan(
