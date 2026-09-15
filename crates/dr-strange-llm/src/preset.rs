@@ -131,18 +131,28 @@ impl std::error::Error for WireProviderError {}
 /// the caller hands to `build_provider`: the name and the key variable the
 /// operator (or the preset) chose. A `None` request names `openai`.
 ///
-/// Shared by the JSON-RPC methods of dr-strange-web and the MCP tools of
-/// dr-strange-mcp so the two surfaces cannot drift apart on this.
+/// The configured provider is consulted before the presets: an operator who
+/// wrote `embed_provider = "openai"` with `embed_key_env = "MY_OPENAI_KEY"`
+/// named a preset *and* chose its key variable, and that choice is the one
+/// this returns — the preset's default only fills in a key the operator left
+/// unset. Looking the preset up first handed back `OPENAI_API_KEY` for that
+/// configuration, so every call failed on an unset variable while a request
+/// repeating the operator's own `MY_OPENAI_KEY` was refused as foreign.
+///
+/// The MCP tools of dr-strange-mcp go through here for every request-named
+/// provider; dr-strange-web's `provider_for` applies the same name rule with
+/// [`is_preset`] and takes no key variable from a request at all.
 pub fn wire_provider<'a>(
     requested: Option<&'a str>,
     requested_key_env: Option<&str>,
     configured: Option<ConfiguredProvider<'a>>,
 ) -> Result<(&'a str, Option<&'a str>), WireProviderError> {
     let name = requested.unwrap_or("openai");
-    let default_key_env = match (preset(name), configured) {
-        (Some(p), _) => Some(p.key_env),
-        (None, Some(c)) if c.name == name => c.key_env,
-        _ => {
+    let ours = configured.filter(|c| c.name == name);
+    let default_key_env = match (ours, preset(name)) {
+        (Some(c), p) => c.key_env.or(p.map(|p| p.key_env)),
+        (None, Some(p)) => Some(p.key_env),
+        (None, None) => {
             return Err(WireProviderError::NotAllowed {
                 requested: name.to_string(),
             });
@@ -204,6 +214,41 @@ mod tests {
         assert_eq!(
             wire_provider(Some("deepseek"), Some("DEEPSEEK_API_KEY"), None),
             Ok(("deepseek", Some("DEEPSEEK_API_KEY")))
+        );
+        // A preset the operator configured under a key variable of their
+        // own: the operator's variable wins, and repeating it is not foreign.
+        let own_key = ConfiguredProvider {
+            name: "openai",
+            key_env: Some("MY_OPENAI_KEY"),
+        };
+        assert_eq!(
+            wire_provider(None, None, Some(own_key)),
+            Ok(("openai", Some("MY_OPENAI_KEY")))
+        );
+        assert_eq!(
+            wire_provider(Some("openai"), Some("MY_OPENAI_KEY"), Some(own_key)),
+            Ok(("openai", Some("MY_OPENAI_KEY")))
+        );
+        assert_eq!(
+            wire_provider(Some("openai"), Some("OPENAI_API_KEY"), Some(own_key)),
+            Err(WireProviderError::ForeignKeyEnv {
+                provider: "openai".into(),
+                requested: "OPENAI_API_KEY".into()
+            })
+        );
+        // Another preset is still its own default alongside that config.
+        assert_eq!(
+            wire_provider(Some("deepseek"), None, Some(own_key)),
+            Ok(("deepseek", Some("DEEPSEEK_API_KEY")))
+        );
+        // A configured preset with no key variable keeps the preset's.
+        let no_key = ConfiguredProvider {
+            name: "openai",
+            key_env: None,
+        };
+        assert_eq!(
+            wire_provider(Some("openai"), None, Some(no_key)),
+            Ok(("openai", Some("OPENAI_API_KEY")))
         );
         let configured = ConfiguredProvider {
             name: "http://embed.internal/v1",
