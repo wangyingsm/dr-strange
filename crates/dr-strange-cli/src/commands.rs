@@ -1140,17 +1140,23 @@ fn upsert_claude_hook(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let command = script.display().to_string();
+    let raw = script.display().to_string();
+    let command = hook_command(script);
     let mut found = false;
     for entry in entries.iter_mut() {
         let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
             continue;
         };
         for hook in list.iter_mut() {
+            // Ours: exactly what this `init` writes for this project (quoted
+            // when the path needs it), the unquoted path an earlier `init`
+            // wrote, or a bare path to a script of this name anywhere — a
+            // moved data directory. A project directory holding a space is
+            // why the first two are not covered by the third.
             let ours = hook
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|c| is_our_hook_command(c, &name));
+                .is_some_and(|c| c == command || c == raw || is_our_hook_command(c, &name));
             if ours {
                 hook["command"] = Value::String(command.clone());
                 found = true;
@@ -1166,6 +1172,20 @@ fn upsert_claude_hook(
     }
     let pretty = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
+}
+
+/// The hook command that runs `script`: its path, single-quoted when it
+/// holds whitespace. Claude Code hands the command to a shell, so an
+/// unquoted `/home/me/My Project/.drsg/hooks/drsg-shell-guard` would run
+/// `/home/me/My` — and never guard anything.
+#[cfg(feature = "digest")]
+fn hook_command(script: &Path) -> String {
+    let raw = script.display().to_string();
+    if raw.chars().any(char::is_whitespace) {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    } else {
+        raw
+    }
 }
 
 /// Whether `command` is one of our hook scripts by that exact file name — a
@@ -5207,6 +5227,30 @@ mod tests {
             v["hooks"]["PreToolUse"][2]["hooks"][0]["command"],
             hooks.join("drsg-shell-guard").display().to_string()
         );
+
+        // A data directory with a space in its path: the command is written
+        // quoted so the shell runs the script, and a second `init` still
+        // recognises it as ours — once, not once per run. An unquoted spaced
+        // path an earlier init wrote is repointed rather than duplicated.
+        let spaced = dir.join("my data").join("hooks");
+        let unquoted = spaced.join("drsg-shell-guard").display().to_string();
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": unquoted}]}
+            ]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
+        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
+        let v = read();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            format!("'{}'", spaced.join("drsg-shell-guard").display())
+        );
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
