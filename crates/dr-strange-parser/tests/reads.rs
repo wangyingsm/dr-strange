@@ -74,6 +74,16 @@ fn hops_predicate_counts_the_walk_not_the_source() {
         ),
         vec!["c", "d"]
     );
+    // Mixed with an earlier variable in one conjunct it cannot be split off;
+    // it is still evaluated at the end of the walk, reading `a` from the
+    // row's trail, not pushed down to `a`'s slot where hops() is 0.
+    assert_eq!(
+        keys(
+            &db,
+            r#"MATCH (a:N)-[:R*1..3]->(n) WHERE key(a) = "a" AND (hops() = 2 OR a.x = 1) RETURN n"#
+        ),
+        vec!["c"]
+    );
     // A constant predicate is placed there too, and still means what it says.
     assert_eq!(
         keys(&db, r#"MATCH (a:N)-[:R]->(n) WHERE 1 = 2 RETURN n"#),
