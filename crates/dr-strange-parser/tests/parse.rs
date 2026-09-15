@@ -1743,6 +1743,17 @@ fn modulo_and_power_are_refused_by_name() {
     assert!(m.contains("`^`"), "{m}");
     let m = unsupported("MATCH (n:P) RETURN n ORDER BY n.x % 3");
     assert!(m.contains("`%`"), "{m}");
+    // Inside an aggregate's argument too: the hard failure is the answer, not
+    // `count` read as a variable with `(n.x % 2)` left over as trailing input.
+    let m = unsupported("MATCH (n:P) RETURN count(n.x % 2)");
+    assert!(m.contains("`%`"), "{m}");
+    let deep = format!(
+        "MATCH (n:P) RETURN sum({}n.x{})",
+        "(".repeat(10_000),
+        ")".repeat(10_000)
+    );
+    let said = err(&deep).to_string();
+    assert!(said.contains("nested deeper than"), "{said}");
 }
 
 // ---- lexical surface: aggregates in ORDER BY, escapes, identifiers, depth --

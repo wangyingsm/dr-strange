@@ -852,17 +852,25 @@ fn return_item(i: &str) -> IResult<&str, ReturnItem> {
     }
     // Before a plain expression: `count(…)` is not one of the expression
     // language's functions.
-    if let Ok((rest, (text, (func, arg, distinct)))) = consumed(agg_call)(i) {
-        let (rest, alias) = alias(rest)?;
-        return Ok((
-            rest,
-            ReturnItem::Agg {
-                func,
-                arg,
-                distinct,
-                name: alias.unwrap_or_else(|| as_written(text)),
-            },
-        ));
+    match consumed(agg_call)(i) {
+        Ok((rest, (text, (func, arg, distinct)))) => {
+            let (rest, alias) = alias(rest)?;
+            return Ok((
+                rest,
+                ReturnItem::Agg {
+                    func,
+                    arg,
+                    distinct,
+                    name: alias.unwrap_or_else(|| as_written(text)),
+                },
+            ));
+        }
+        // A hard failure inside the argument (`count(n.x % 2)`, an argument
+        // nested past the bound) is the answer. Swallowed, the expression
+        // reading below would accept `count` as a bare variable and the
+        // caller would report the argument as trailing input.
+        Err(e @ nom::Err::Failure(_)) => return Err(e),
+        Err(_) => {}
     }
     match consumed(expr)(i) {
         Ok((rest, (text, expr))) => {
