@@ -708,6 +708,12 @@ fn dir_within(root: &std::path::Path, dir: &std::path::Path) -> bool {
 /// `.` is a property, not a keyword. The scan errs toward asking: a stray
 /// `remove` outside a literal costs one confirmed retry, while a missed one
 /// would cost data.
+///
+/// The skipping mirrors the parser's lexing exactly, because any gap between
+/// the two is a place to hide a clause: a string literal honours `\` escapes
+/// (`'it\'s'`), while a backtick name has none and ends at the next backtick
+/// unconditionally — treating `\` as an escape there would let `` `n\` ``
+/// swallow the closing backtick and everything after it.
 fn destroys(query: &str) -> bool {
     let mut word = String::new();
     let mut after_dot = false;
@@ -716,7 +722,7 @@ fn destroys(query: &str) -> bool {
     let is_keyword = |w: &str| w.eq_ignore_ascii_case("delete") || w.eq_ignore_ascii_case("remove");
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
-            if c == '\\' {
+            if c == '\\' && q != '`' {
                 chars.next();
             } else if c == q {
                 quote = None;
@@ -3815,6 +3821,11 @@ mod tests {
         assert!(!destroys("MATCH (n) WHERE n.remove = 1 RETURN n"));
         assert!(!destroys("MATCH (n) RETURN n.delete"));
         assert!(!destroys("MATCH (n:`delete`) RETURN n"));
+        // A backslash inside a backtick name is a character of the name, as
+        // the parser reads it — not an escape that hides the clause after it.
+        assert!(destroys("MATCH (n:`a\\`) DETACH DELETE n"));
+        assert!(destroys("MATCH (`n\\`) DETACH DELETE `n\\`"));
+        assert!(destroys(r#"MATCH (n) WHERE n.x = 'a\'b' DELETE n"#));
         assert!(!destroys(
             "MATCH (n) WHERE n.x = 'it''s' SET n.deleted = true"
         ));
