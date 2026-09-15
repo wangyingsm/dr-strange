@@ -906,6 +906,42 @@ mod tests {
         assert_eq!(r["truncated"], true);
     }
 
+    /// The edge pass is bounded by nodes visited, not only by edges examined:
+    /// on a plane of leaves past the cap, a needle matching no edge inside
+    /// the cap stops there and reports `truncated`, rather than looking up
+    /// the neighbours of every node. An edge inside the cap is still found.
+    #[test]
+    fn plane_find_edge_pass_stops_at_the_node_cap() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let first = txn
+            .create_node_with_key("first", &["Leaf"], Properties::new())
+            .unwrap();
+        let mut last = first;
+        for i in 1..=crate::methods::FIND_SCAN_CAP {
+            last = txn
+                .create_node_with_key(&format!("leaf-{i}"), &["Leaf"], Properties::new())
+                .unwrap();
+        }
+        // One SPOKE inside the cap, one from the node just past it.
+        txn.create_edge(first, last, "SPOKE", Properties::new())
+            .unwrap();
+        txn.create_edge(last, first, "SPOKE", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"spoke"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(r["edges"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["edges"][0]["src"], first.0);
+        assert_eq!(r["truncated"], true);
+    }
+
     #[test]
     fn graph_expand_returns_neighbor_and_edge() {
         let (db, alice, bob) = seeded_graph();
