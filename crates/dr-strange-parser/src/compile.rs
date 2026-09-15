@@ -144,9 +144,18 @@ fn push_down_where(
             0 => slots - 1,
             1 => {
                 let v = vars.iter().next().unwrap();
-                *var_slot
+                let slot = *var_slot
                     .get(v.as_str())
-                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?
+                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?;
+                // The same channels mixed with an earlier variable in one
+                // conjunct (`hops() = 2 OR a.x = 1`) cannot be split off, and
+                // at the variable's own slot would read the same unsettled
+                // values. Evaluated at the last slot instead, where the
+                // variable is reached through `Expr::At`.
+                match reads_row_channel(&conj) {
+                    true => slots - 1,
+                    false => slot,
+                }
             }
             _ => {
                 return Err(
@@ -844,6 +853,28 @@ fn split_and(e: PExpr) -> Vec<PExpr> {
             v
         }
         other => vec![other],
+    }
+}
+
+/// Whether an expression reads the row's `score()` or `hops()` channel —
+/// values a path settles only at its last node.
+fn reads_row_channel(e: &PExpr) -> bool {
+    match e {
+        PExpr::Score | PExpr::Hops => true,
+        PExpr::Lit(_)
+        | PExpr::Param(_)
+        | PExpr::Prop { .. }
+        | PExpr::HasLabel { .. }
+        | PExpr::ExternalKey { .. }
+        | PExpr::Similarity { .. }
+        | PExpr::Distance { .. } => false,
+        PExpr::In { lhs, list } => reads_row_channel(lhs) || list.iter().any(reads_row_channel),
+        PExpr::InValue { lhs, haystack } => reads_row_channel(lhs) || reads_row_channel(haystack),
+        PExpr::IsNull(x) | PExpr::Not(x) | PExpr::Neg(x) => reads_row_channel(x),
+        PExpr::StringMatch { lhs, rhs, .. }
+        | PExpr::Compare { lhs, rhs, .. }
+        | PExpr::Logic { lhs, rhs, .. }
+        | PExpr::Arith { lhs, rhs, .. } => reads_row_channel(lhs) || reads_row_channel(rhs),
     }
 }
 
