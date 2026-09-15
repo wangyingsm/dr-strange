@@ -26,7 +26,13 @@ a format migration, a counters row for a plane that predates them — and
 otherwise leaves the commit sequence exactly where the last writer put it.
 A replica (`serve --follow`) depends on this: its sequence is the master's,
 landed by `apply_replicated`, and a bootstrap commit per open would run it
-ahead so that the next replicated batch moved it backwards.
+ahead so that the next replicated batch moved it backwards. `apply_replicated`
+also keeps the replica's live vector and keyword registries in step: the raw
+batch names the node rows it wrote, and each is re-derived from its landed
+record against the plane's declarations (a declaration change rebuilds both
+registries; a plane tombstone drops theirs). A follower's searches therefore
+track the master batch by batch rather than freezing at what it rebuilt on
+open.
 
 `Database` root carries only plane lifecycle (`create_plane`, `drop_plane`,
 `planes()`), cross-plane operations (`copy`, `move_`, stack reads), global

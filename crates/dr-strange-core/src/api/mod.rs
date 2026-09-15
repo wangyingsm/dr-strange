@@ -568,11 +568,85 @@ impl Database {
     /// which this replica may already have stamped entries at), so the cache
     /// is dropped after every applied batch: a replica's cache is warm between
     /// batches, never across one.
+    ///
+    /// The live HNSW and BM25 registries are mirrored too, from the raw ops:
+    /// the batch names the node rows it wrote, and their records after the
+    /// apply say what each declared index should hold for them. Without this
+    /// a follower's searches stayed frozen at whatever it rebuilt on open.
+    /// As on a local commit, a mirror failure after the durable apply is
+    /// logged and recorded as a divergence, never returned: the batch has
+    /// landed, and an `Err` here would make the follower resync for an
+    /// index the next open rebuilds anyway.
     #[cfg(feature = "native-backend")]
     pub fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
+        let touched = ReplicatedIndexWork::from_ops(&batch.ops);
         self.engine.apply_replicated(batch)?;
         self.cache.invalidate_all();
+        if let Err(e) = self.mirror_replicated(touched) {
+            tracing::error!(
+                error = %e,
+                "mirroring a replicated batch into the index registries failed; \
+                 they have diverged from the KV and will be rebuilt on the next open"
+            );
+            self.note_index_divergence();
+        }
         Ok(())
+    }
+
+    /// Bring the live registries in step with a batch already applied to the
+    /// KV. A declaration change (rare) rebuilds both registries outright —
+    /// that is what the master did for the one it declared, and it keeps
+    /// the two databases' registries built the same way. Otherwise every
+    /// node row the batch wrote is re-derived: dropped from every index,
+    /// then re-inserted for each declared index its current record carries
+    /// the label and a fitting value for — the same rule `WriteTxn` applies
+    /// event by event, but computed from the landed state, which is the only
+    /// thing a raw batch tells us.
+    #[cfg(feature = "native-backend")]
+    fn mirror_replicated(&self, work: ReplicatedIndexWork) -> Result<()> {
+        if work.is_empty() {
+            return Ok(());
+        }
+        // Same lock order as `with_reader` (vectors, then keywords).
+        let mut vectors = self.indexes_mut();
+        let mut keywords = self.keywords_mut();
+        if work.declarations_changed {
+            return self.engine.with_read(|txn| {
+                vectors.rebuild_from(txn)?;
+                keywords.rebuild_from(txn)
+            });
+        }
+        for plane in &work.dropped_planes {
+            vectors.drop_plane(*plane);
+            keywords.drop_plane(*plane);
+        }
+        self.engine.with_read(|txn| {
+            for (plane, node) in &work.nodes {
+                vectors.remove_node(*node)?;
+                keywords.remove_node(*node);
+                let Some(record) = graph::get_node(txn, *plane, *node)? else {
+                    continue;
+                };
+                let has = |label: &str| record.labels.iter().any(|l| l == label);
+                for (label, property, _metric) in vectors.declared(*plane) {
+                    if has(&label)
+                        && let Some(PropValue::Vector(v)) =
+                            record.properties.get(&property).map(|p| &p.value)
+                    {
+                        vectors.upsert(*plane, &label, &property, *node, v)?;
+                    }
+                }
+                for (label, property, _language) in keywords.declared(*plane) {
+                    if has(&label)
+                        && let Some(PropValue::Str(text)) =
+                            record.properties.get(&property).map(|p| &p.value)
+                    {
+                        keywords.upsert(*plane, &label, &property, *node, text);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Register a replication observer, invoked synchronously right after
@@ -2276,6 +2350,60 @@ fn apply_kw_event(registry: &mut KeywordRegistry, plane: PlaneId, event: KwEvent
             node,
         } => registry.remove_one(plane, &label, &property, node),
         KwEvent::RemoveNode(node) => registry.remove_node(node),
+    }
+}
+
+/// What a replicated batch may have moved in the index registries, read off
+/// its raw ops before they are applied (`Database::apply_replicated`). Only
+/// key shapes are inspected — node rows by table, declarations and plane
+/// rows by prefix — never values: the landed KV is re-read for those.
+#[cfg(feature = "native-backend")]
+#[derive(Default)]
+struct ReplicatedIndexWork {
+    /// Node rows written or tombstoned, in batch order, deduplicated.
+    nodes: Vec<(PlaneId, NodeId)>,
+    /// A vector or keyword index was declared or dropped.
+    declarations_changed: bool,
+    /// Plane rows tombstoned (a `drop_plane` on the master).
+    dropped_planes: Vec<PlaneId>,
+}
+
+#[cfg(feature = "native-backend")]
+impl ReplicatedIndexWork {
+    fn from_ops(ops: &[crate::storage::engine::ReplicatedOp]) -> Self {
+        use crate::storage::keys;
+        let mut work = Self::default();
+        for op in ops {
+            match op.table {
+                TableId::Nodes => {
+                    // A node row with an unparseable key is not ours to mirror;
+                    // the engine already accepted it, so skipping is the only
+                    // option that keeps the apply infallible here.
+                    if let Ok(key) = keys::parse_node_key(&op.key)
+                        && !work.nodes.contains(&key)
+                    {
+                        work.nodes.push(key);
+                    }
+                }
+                TableId::Meta
+                    if op.key.starts_with(keys::VINDEX_PREFIX)
+                        || op.key.starts_with(keys::KINDEX_PREFIX) =>
+                {
+                    work.declarations_changed = true;
+                }
+                TableId::Planes if op.value.is_none() => {
+                    if let Ok(bytes) = <[u8; 4]>::try_from(op.key.as_slice()) {
+                        work.dropped_planes.push(PlaneId(u32::from_be_bytes(bytes)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        work
+    }
+
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && !self.declarations_changed && self.dropped_planes.is_empty()
     }
 }
 

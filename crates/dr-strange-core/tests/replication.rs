@@ -279,3 +279,99 @@ fn reopening_a_database_commits_nothing() {
         assert_eq!(db.commit_seq().unwrap(), seq, "open is not a write");
     }
 }
+
+#[test]
+fn a_follower_mirrors_replicated_batches_into_its_search_indexes() {
+    // A batch is raw KV, so a follower's HNSW/BM25 registries are not told
+    // about it the way a local commit's events tell the master's. They must
+    // still track it: declarations made after the follower opened, nodes
+    // created, deleted and re-texted afterwards — all searchable on the
+    // follower after the batch lands, not only after its next open.
+    use dr_strange_core::{Language, Metric, NodeId, PropDesc, PropValue};
+
+    fn doc(x: f32, y: f32, body: &str) -> Properties {
+        let mut p = Properties::new();
+        p.insert("emb".into(), PropDesc::new(PropValue::Vector(vec![x, y])));
+        p.insert("body".into(), PropDesc::new(PropValue::Str(body.into())));
+        p
+    }
+    let ids = |hits: Vec<(NodeId, f32)>| hits.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+    let dir_m = Dir::new("index-master");
+    let dir_r = Dir::new("index-replica");
+    let master = Database::open(&dir_m.0).unwrap();
+    let batches = capture_db(&master);
+    let replica = Database::open_read_only(&dir_r.0).unwrap();
+
+    // Declarations replicate: the follower builds the indexes it now knows.
+    let plane = master.plane("startup").unwrap();
+    plane
+        .ensure_vector_index("Doc", "emb", Metric::Cosine)
+        .unwrap();
+    plane
+        .ensure_keyword_index("Doc", "body", Language::English)
+        .unwrap();
+    apply_all(&replica, &batches);
+    let seen = replica.plane("startup").unwrap();
+    assert_eq!(
+        seen.vector_indexes().len(),
+        1,
+        "vector declaration mirrored"
+    );
+    assert_eq!(
+        seen.keyword_indexes().len(),
+        1,
+        "keyword declaration mirrored"
+    );
+
+    // Creates replicate into the indexes.
+    let (a, b) = {
+        let mut w = plane.write().unwrap();
+        let a = w
+            .create_node(&["Doc"], doc(1.0, 0.0, "graph databases"))
+            .unwrap();
+        let b = w
+            .create_node(&["Doc"], doc(0.0, 1.0, "vector search"))
+            .unwrap();
+        w.commit().unwrap();
+        (a, b)
+    };
+    apply_all(&replica, &batches);
+    let near_a = seen
+        .query()
+        .vector_top_k(Some("Doc"), "emb", vec![1.0, 0.0], Metric::Cosine, 5)
+        .ids()
+        .unwrap();
+    assert_eq!(near_a, vec![a, b], "the follower's vector index holds both");
+    assert_eq!(ids(seen.keyword_search("Doc", "body", "graph", 5)), vec![a]);
+
+    // A delete and a re-text replicate too.
+    {
+        let mut w = plane.write().unwrap();
+        w.delete_node(a).unwrap();
+        w.set_prop(
+            b,
+            "body",
+            PropDesc::new(PropValue::Str("graph everywhere".into())),
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+    apply_all(&replica, &batches);
+    let near_a = seen
+        .query()
+        .vector_top_k(Some("Doc"), "emb", vec![1.0, 0.0], Metric::Cosine, 5)
+        .ids()
+        .unwrap();
+    assert_eq!(
+        near_a,
+        vec![b],
+        "the deleted node left the follower's vector index"
+    );
+    assert_eq!(
+        ids(seen.keyword_search("Doc", "body", "graph", 5)),
+        vec![b],
+        "the follower's keyword index scores the new text"
+    );
+    assert!(ids(seen.keyword_search("Doc", "body", "vector", 5)).is_empty());
+}
