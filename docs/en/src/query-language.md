@@ -251,8 +251,10 @@ Identifiers (variables, labels, types, property keys) are Unicode words
 (`n.名字`, `café`), or anything between backticks when the plain form cannot
 spell the name (`` n.`first name` ``, `` (:`order`) ``). Keywords and function
 names are case-insensitive (`COUNT(*)`, `Score()`). Expressions may nest at
-most 64 levels deep (parentheses, `NOT`, unary `-`); deeper is a syntax error
-rather than a crash.
+most 64 levels deep, where parentheses, `NOT`, unary `-` and each operator of
+an `AND`/`OR`/`+ -`/`* /` chain count one level (so a chain of 64 conjuncts
+is the limit); deeper is a syntax error rather than a crash. An `IN [...]`
+list is not a chain and may be as long as the query body allows.
 
 ### What the subset leaves out
 

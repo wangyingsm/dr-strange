@@ -79,6 +79,15 @@ fn ident(i: &str) -> IResult<&str, String> {
 // inside what a 2 MiB thread holds even unoptimised (where a level costs
 // ~16 KiB of `nom` frames and ~120 levels overflow). A guard per recursive
 // descent keeps the count exact even when a branch backtracks.
+//
+// The operator chains (`AND`/`OR`/`+ -`/`* /`) fold iteratively, so the parser
+// itself would take a hundred thousand conjuncts in stride — and hand back a
+// left-deep tree that deep, which every consumer (the conjunct split, the
+// compiler, the drop glue) walks recursively and overflows on. So a chain
+// charges one level per operator to the same budget, held until the chain
+// ends: the tree the parser returns is never deeper than about twice
+// `MAX_NESTING` however it is spelled, and that is what the consumers'
+// recursion is sized for.
 
 /// The deepest expression nesting the parser accepts.
 pub const MAX_NESTING: usize = 64;
@@ -291,7 +300,9 @@ fn expr(i: &str) -> IResult<&str, PExpr> {
 
 fn or_expr(i: &str) -> IResult<&str, PExpr> {
     let (mut i, mut lhs) = and_expr(i)?;
+    let mut chain = Vec::new();
     while let Ok((rest, _)) = kw("or")(i) {
+        chain.push(descend(rest)?.1);
         let (rest, rhs) = and_expr(rest)?;
         lhs = PExpr::Logic {
             op: LogicOp::Or,
@@ -305,7 +316,9 @@ fn or_expr(i: &str) -> IResult<&str, PExpr> {
 
 fn and_expr(i: &str) -> IResult<&str, PExpr> {
     let (mut i, mut lhs) = not_expr(i)?;
+    let mut chain = Vec::new();
     while let Ok((rest, _)) = kw("and")(i) {
+        chain.push(descend(rest)?.1);
         let (rest, rhs) = not_expr(rest)?;
         lhs = PExpr::Logic {
             op: LogicOp::And,
@@ -402,7 +415,9 @@ fn comparison(i: &str) -> IResult<&str, PExpr> {
 
 fn additive(i: &str) -> IResult<&str, PExpr> {
     let (mut i, mut lhs) = multiplicative(i)?;
+    let mut chain = Vec::new();
     while let Ok((rest, op)) = add_op(i) {
+        chain.push(descend(rest)?.1);
         let (rest, rhs) = multiplicative(rest)?;
         let op = if op == '+' {
             ArithOp::Add
@@ -421,7 +436,9 @@ fn additive(i: &str) -> IResult<&str, PExpr> {
 
 fn multiplicative(i: &str) -> IResult<&str, PExpr> {
     let (mut i, mut lhs) = unary(i)?;
+    let mut chain = Vec::new();
     while let Ok((rest, op)) = mul_op(i) {
+        chain.push(descend(rest)?.1);
         let (rest, rhs) = unary(rest)?;
         let op = if op == '*' {
             ArithOp::Mul
