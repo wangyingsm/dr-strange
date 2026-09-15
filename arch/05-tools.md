@@ -142,6 +142,10 @@ security or operations reader can hold the code to.
 - **Respawn.** A port `init` picked itself is retried (up to three picks)
   when the child exits before listening — the pick-then-bind gap is a race
   it can lose; an explicit `--addr` or a recorded address is never swapped.
+  "Listening" means the child itself answers `/health` with its own pid: a
+  stranger that won the port and accepts connections is not taken for the
+  child, so `init` never reports success against a server it did not
+  start.
   Before SIGTERM-ing the pid a `/health` body named, `stop_server` checks on
   Linux that `/proc/<pid>/cmdline` is a drsg binary and refuses otherwise;
   elsewhere the check passes.
