@@ -39,6 +39,28 @@ fn the_well_behaved_fixture_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A disabled deadline (`deadline_secs = 0`) must mean *no* deadline, not one
+/// that has already passed. The engine's epoch has ticked at least once by
+/// the time a real call is made, and a "never" expressed as `u64::MAX` ticks
+/// beyond now overflowed inside wasmtime: a panic in debug builds and an
+/// immediate interrupt in release. The sleep puts the epoch past zero.
+#[test]
+fn a_disabled_deadline_never_fires() {
+    let (dir, host) = scratch("nodeadline");
+    let plugin = fixture(
+        "ok",
+        Limits {
+            deadline: None,
+            ..Limits::default()
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let plugins = Plugins::from_handlers(vec![Box::new(plugin)]);
+    let out = route_tree(&host, None, &plugins).unwrap();
+    assert_eq!(out.nodes.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A path outside the root is refused by the host — checked on the resolved
 /// path, so `..` does not walk through — and the refusal reaches the plugin
 /// as an error it can only report, not argue with.

@@ -159,6 +159,11 @@ const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
 /// it is also the most a deadline can overrun by; a tenth of a second is
 /// nothing beside any deadline worth setting and costs one wake-up per tick.
 const EPOCH_TICK: Duration = Duration::from_millis(100);
+/// The deadline of a store that has none, in ticks beyond the current epoch.
+/// Half the range: far enough that a process ticking ten times a second
+/// reaches it in ~29 billion years, and small enough that adding it to any
+/// epoch the ticker could have counted to cannot overflow.
+const NEVER_TICKS: u64 = u64::MAX / 2;
 
 /// Core instances a component may make per store. A component is a few core
 /// modules and an adapter; a runtime that instantiates hundreds is doing
@@ -195,10 +200,17 @@ impl Limits {
 
     /// The deadline in epoch ticks: at least one, so a deadline shorter than
     /// a tick still fires on the next tick rather than at once.
+    ///
+    /// "No deadline" is [`NEVER_TICKS`], not `u64::MAX`: wasmtime adds the
+    /// delta to the engine's *current* epoch with a plain `+`, and the epoch
+    /// is past zero as soon as the ticker has run once — `u64::MAX` overflowed
+    /// there (a panic in debug builds, a deadline already in the past in
+    /// release) and turned a disabled deadline into one that fired on the
+    /// first call.
     fn deadline_ticks(&self) -> u64 {
         match self.deadline {
             Some(d) => (d.as_millis().div_ceil(EPOCH_TICK.as_millis()).max(1)) as u64,
-            None => u64::MAX,
+            None => NEVER_TICKS,
         }
     }
 }
@@ -758,7 +770,7 @@ impl WasmPlugin {
         }
         // The wall-clock net. Epochs are compiled in unconditionally, and a
         // store's deadline defaults to *now*, so this must be set even when
-        // no deadline is wanted — `u64::MAX` ticks is never.
+        // no deadline is wanted — `NEVER_TICKS` beyond now is never.
         store.set_epoch_deadline(self.limits.deadline_ticks());
 
         let instance = self
