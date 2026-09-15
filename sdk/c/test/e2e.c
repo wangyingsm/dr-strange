@@ -333,7 +333,9 @@ int main(void) {
      * the upgrade as an Authorization: Bearer header, verbatim, with nothing
      * in the URL (the fake answers 400 to a query string or any other
      * spelling, so the watch only ends cleanly when the header was right);
-     * a token that could end the header line is refused before any I/O. */
+     * a token that could end the header line is refused before any I/O
+     * (proved against a closed loopback port: the refusal names the token,
+     * not the connection that was never attempted). */
     if (getenv("DRSG_FAKE_URL")) {
         drsg_error ferr;
         int rc = fake_watch("big", &ferr);
@@ -356,6 +358,16 @@ int main(void) {
         CHECK(rc == -1 && ferr.code == DRSG_TRANSPORT_ERROR_CODE
                   && strstr(ferr.message, "control character") != NULL,
               "token with a control character is refused before the handshake");
+
+        /* Nothing listens on 127.0.0.1:1, so a connect would fail with
+         * "connection failed"; the token error winning means the scan ran
+         * before any lookup or connect. */
+        drsg_client *dead = drsg_client_new("http://127.0.0.1:1", "x\r\nX-Forged: 1");
+        rc = dead ? drsg_watch(dead, "startup", NULL, on_change_never, NULL, &ferr) : -1;
+        CHECK(dead && rc == -1 && ferr.code == DRSG_TRANSPORT_ERROR_CODE
+                  && strstr(ferr.message, "control character") != NULL,
+              "token with a control character is refused before any I/O");
+        drsg_client_free(dead);
     } else {
         CHECK(0, "DRSG_FAKE_URL not set (run via test/run.sh)");
     }

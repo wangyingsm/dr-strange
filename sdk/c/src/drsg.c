@@ -548,6 +548,24 @@ static int ws_connect(const char *base_url, const char *token, struct ws_rd *rd,
     if (strncmp(base_url, "http://", 7) != 0) {
         return set_err(err, -32000, "drsg_watch supports ws:// (http://) endpoints only");
     }
+
+    /* The token is an `Authorization: Bearer` header on the upgrade, the form
+     * the server prefers (arch/08-web-ui §4.1); `?token=` exists only for
+     * browsers, whose WebSocket API cannot set headers, and a URL credential
+     * would end up in proxy and access logs. A header is written verbatim, so
+     * a token carrying a control byte (CR, LF) could end the header line and
+     * forge another; refuse it here, before the host is even resolved, so a
+     * bad credential never costs a lookup or a connection. */
+    if (token && token[0]) {
+        for (const unsigned char *p = (const unsigned char *)token; *p; p++) {
+            if (*p < 0x20 || *p == 0x7f) {
+                return set_err(err, -32000, "token contains a control character");
+            }
+        }
+    } else {
+        token = NULL;
+    }
+
     const char *hostport = base_url + 7;
     size_t hp_len = strcspn(hostport, "/"); /* stop at the path, if any */
     char host[256], port[16] = "80";
@@ -592,23 +610,6 @@ static int ws_connect(const char *base_url, const char *token, struct ws_rd *rd,
     freeaddrinfo(res);
     if (fd < 0) {
         return set_err(err, -32000, "connection failed");
-    }
-
-    /* The token is an `Authorization: Bearer` header on the upgrade, the form
-     * the server prefers (arch/08-web-ui §4.1); `?token=` exists only for
-     * browsers, whose WebSocket API cannot set headers, and a URL credential
-     * would end up in proxy and access logs. A header is written verbatim, so
-     * a token carrying a control byte (CR, LF) could end the header line and
-     * forge another; refuse it here rather than send a malformed request. */
-    if (token && token[0]) {
-        for (const unsigned char *p = (const unsigned char *)token; *p; p++) {
-            if (*p < 0x20 || *p == 0x7f) {
-                close(fd);
-                return set_err(err, -32000, "token contains a control character");
-            }
-        }
-    } else {
-        token = NULL;
     }
 
     /* A fresh 16-byte nonce per handshake (RFC 6455 §4.1); the server must
