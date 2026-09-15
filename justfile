@@ -125,8 +125,13 @@ drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "targe
 # change the other in the same commit.
 #
 # Everything CI runs, locally: run this before pushing.
-gate: gate-rust gate-features gate-frontend gate-docs gate-sdk
+gate: gate-rust gate-features gate-frontend gate-docs gate-hooks gate-sdk
     @echo "gate: every CI job passed locally"
+
+# CI's `hooks` job: the usage-report hook's watermark handling, pinned by the
+# unittest module beside the script. Standard library only.
+gate-hooks:
+    python3 -m unittest discover -s .claude/hooks -v
 
 # The redb pass is the one an all-defaults `cargo test` never covers: the
 # storage backend is a cargo feature, and the other one has its own

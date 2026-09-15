@@ -130,6 +130,18 @@ jobs:
       - name: Build (zh)
         run: mdbook build docs/zh
 
+  # The repository's own Claude Code hooks: the usage report writes a
+  # watermark on the user's behalf, and how it does that (private directory,
+  # exclusive 0600 temporary, never through a planted link) is pinned by a
+  # unittest module beside it. Standard library only; the runner's python3.
+  hooks:
+    name: Hooks — usage-report watermark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Test
+        run: python3 -m unittest discover -s .claude/hooks -v
+
   sdk-typescript:
     name: SDK — TypeScript
     needs: rust
