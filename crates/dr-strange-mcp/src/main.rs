@@ -170,6 +170,10 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .as_deref(),
     )?;
+    // Native-only, as in `drsg serve`: the other engines keep no versions to
+    // bound. The variable is still parsed above so a typo is a start-up
+    // error under every backend.
+    #[cfg(feature = "native-backend")]
     db.set_retention(retain);
     tracing::info!(
         db = %path.display(),
