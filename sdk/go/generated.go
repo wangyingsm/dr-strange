@@ -16,6 +16,7 @@ type DbStats struct {
 	Persistent       bool    `json:"persistent"`
 	Planes           int64   `json:"planes"`
 	PluginBytes      int64   `json:"plugin_bytes"`
+	RetainCommits    *int64  `json:"retain_commits,omitempty"`
 	RssBytes         *int64  `json:"rss_bytes,omitempty"`
 }
 
