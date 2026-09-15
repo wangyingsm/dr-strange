@@ -125,8 +125,13 @@ drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "targe
 # change the other in the same commit.
 #
 # Everything CI runs, locally: run this before pushing.
-gate: gate-rust gate-features gate-frontend gate-docs gate-sdk gate-supply
+gate: gate-rust gate-features gate-frontend gate-docs gate-hooks gate-sdk gate-supply
     @echo "gate: every CI job passed locally"
+
+# CI's `hooks` job: the usage-report hook's watermark handling, pinned by the
+# unittest module beside the script. Standard library only.
+gate-hooks:
+    python3 -m unittest discover -s .claude/hooks -v
 
 # What no compiler answers. `cargo deny` reads the dependency graph against
 # `deny.toml` — licences, RUSTSEC advisories, the registries a crate may come

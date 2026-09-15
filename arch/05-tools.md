@@ -153,7 +153,10 @@ security or operations reader can hold the code to.
 - **The usage-report hook** keeps its per-session watermark under
   `$XDG_RUNTIME_DIR/drsg` (else `~/.cache/drsg`, created 0700), written
   through an `O_EXCL` 0600 temporary and renamed — never in the shared
-  temp directory under a predictable name.
+  temp directory under a predictable name. `.claude/hooks/test_drsg_usage_report.py`
+  pins that (modes, a planted link at the temporary name not followed, no
+  writable private directory degrading to session-only totals); `just
+  gate-hooks` and CI's `hooks` job run it.
 
 ## 5. Open questions
 
