@@ -1497,6 +1497,29 @@ mod tests {
         // The document's version is the crate's: `rpc.discover` says which
         // server a client is talking to.
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
+        // Every key `db.stats` answers is a property of the DbStats schema:
+        // a field added to the result but not the schema is invisible to
+        // every generated SDK.
+        let schema_keys: std::collections::BTreeSet<String> =
+            doc["components"]["schemas"]["DbStats"]["properties"]
+                .as_object()
+                .expect("DbStats properties")
+                .keys()
+                .cloned()
+                .collect();
+        let db = seeded();
+        let resp = call(&db, r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#).unwrap();
+        let answered: std::collections::BTreeSet<String> = resp["result"]
+            .as_object()
+            .expect("db.stats result object")
+            .keys()
+            .cloned()
+            .collect();
+        let missing: Vec<&String> = answered.difference(&schema_keys).collect();
+        assert!(
+            missing.is_empty(),
+            "db.stats answers keys the DbStats schema does not list: {missing:?}"
+        );
     }
 
     #[test]

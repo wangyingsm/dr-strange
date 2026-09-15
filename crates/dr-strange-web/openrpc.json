@@ -2106,6 +2106,13 @@
               "null"
             ],
             "description": "The error from the storage engine's most recent post-commit flush/compaction when that pass failed; null when the last pass succeeded. A commit is acknowledged once durable, so a persistently failing flush shows only here."
+          },
+          "retain_commits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many commits back time travel reaches ([server] retain_commits); null when the history is unbounded."
           }
         },
         "required": [
