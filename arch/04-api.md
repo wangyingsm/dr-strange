@@ -156,6 +156,19 @@ commit before it updates the registries, so an index can briefly name a node
 the snapshot cannot decode; the reader drops such ids rather than surfacing a
 phantom row (02 §3).
 
+Registry locking, by design: a query terminal holds *read* guards on both
+registries for its whole run, so a plan's vector and keyword sources see one
+consistent registry state and the executor never re-locks mid-pipeline. A
+commit takes the *write* guards only after its KV commit is durable and only
+for the index mirroring, so a long-running query delays a concurrent
+writer's `commit()` return — never its durability, never its visibility to
+other readers — by at most that query's runtime; `std::sync::RwLock` on
+Linux does not prefer writers, so a steady stream of overlapping queries can
+extend that wait. Per-query registry snapshots (an `Arc` swapped at commit)
+would remove the wait at the cost of cloning or copy-on-write for every
+index event; not taken until a workload shows the wait, since queries
+already carry a deadline (`with_deadline`) that bounds it.
+
 Row values: `Row` exposes bound variables by name → `NodeRef`/`EdgeRef` with
 `id()`, `labels()`, `prop(key)`, `prop_desc(key)` (value + description),
 `score()`.

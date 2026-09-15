@@ -405,9 +405,11 @@ impl ChangeBuffer {
 pub struct Database {
     engine: Engine,
     /// In-memory vector indexes (arch/01 §5). On open, loaded from the `.hnsw`
-    /// sidecar when fresh, else rebuilt from the KV; read-locked during queries,
-    /// write-locked at commit to apply the coherence events a write transaction
-    /// buffered.
+    /// sidecar when fresh, else rebuilt from the KV; read-locked during queries
+    /// (for the whole terminal, so a plan sees one registry state), write-locked
+    /// at commit — after the KV is durable — to apply the coherence events a
+    /// write transaction buffered. A long query therefore delays a concurrent
+    /// commit's return, not its durability (arch/04 §3).
     indexes: RwLock<VectorRegistry>,
     /// In-memory BM25 keyword indexes (ROADMAP §2). Managed exactly like
     /// `indexes`: sidecar-loaded when fresh else rebuilt, write-locked at commit
