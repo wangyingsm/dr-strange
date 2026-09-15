@@ -84,7 +84,8 @@ public class Drsg extends Client {
             boolean persistent,
             Long fileSize,
             Long rssBytes,
-            long pluginBytes) {
+            long pluginBytes,
+            Long retainCommits) {
     }
 
     public record PluginListItem(
