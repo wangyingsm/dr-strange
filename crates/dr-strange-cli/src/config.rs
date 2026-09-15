@@ -311,6 +311,23 @@ pub fn check_serve_bind(
     dr_strange_web::check_bind_policy(addr, token_configured)
 }
 
+/// The per-call MCP deadline the file asks for, in the web crate's encoding:
+/// `None` leaves the decision to the server (its default, or the environment
+/// variable it reads), `Some(None)` is no deadline, `Some(Some(d))` a bound.
+///
+/// The file is honoured only when `DRSG_MCP_TOOL_DEADLINE_SECS` is not set:
+/// the file's header promises that an environment variable already set
+/// always wins over the file, and this knob is no exception. Passing the file
+/// value through when the variable is set would have the server apply the
+/// file over the environment, the reverse of every other key.
+fn mcp_tool_deadline(file_secs: Option<u64>, env_set: bool) -> Option<Option<std::time::Duration>> {
+    if env_set {
+        return None;
+    }
+    // 0 means "no deadline", as the environment variable reads it.
+    file_secs.map(|secs| (secs > 0).then(|| std::time::Duration::from_secs(secs)))
+}
+
 /// Build the web crate's [`ServeOptions`] from the `[server]` section, with an
 /// explicit CLI `--addr` overriding the file's `addr`.
 pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions {
@@ -336,10 +353,10 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
     if let Some(hosts) = &cfg.server.allowed_hosts {
         opts.allowed_hosts = hosts.clone();
     }
-    if let Some(secs) = cfg.server.mcp_tool_deadline_secs {
-        // 0 means "no deadline", as the environment variable reads it.
-        opts.mcp_tool_deadline = Some((secs > 0).then(|| std::time::Duration::from_secs(secs)));
-    }
+    opts.mcp_tool_deadline = mcp_tool_deadline(
+        cfg.server.mcp_tool_deadline_secs,
+        std::env::var_os(dr_strange_mcp::ENV_TOOL_DEADLINE_SECS).is_some(),
+    );
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {
             cert: tls.cert.clone(),
@@ -523,6 +540,23 @@ mod tests {
 
         let unlimited = serve_options(&parse("[server]\nmcp_tool_deadline_secs = 0\n"), None);
         assert_eq!(unlimited.mcp_tool_deadline, Some(None));
+    }
+
+    /// An environment variable already set wins over the file, as the file's
+    /// header promises: with `DRSG_MCP_TOOL_DEADLINE_SECS` in the environment
+    /// the file's value is not passed on, whatever it says, and the server
+    /// reads the variable itself.
+    #[test]
+    fn the_environment_deadline_wins_over_the_files() {
+        assert_eq!(mcp_tool_deadline(Some(45), true), None);
+        assert_eq!(mcp_tool_deadline(Some(0), true), None);
+        assert_eq!(mcp_tool_deadline(None, true), None);
+        assert_eq!(
+            mcp_tool_deadline(Some(45), false),
+            Some(Some(std::time::Duration::from_secs(45)))
+        );
+        assert_eq!(mcp_tool_deadline(Some(0), false), Some(None));
+        assert_eq!(mcp_tool_deadline(None, false), None);
     }
 
     /// The `[plugins]` sandbox knobs map onto the llm crate's config as the

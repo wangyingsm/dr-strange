@@ -90,7 +90,9 @@ then narrow, then act:
 - **Every tool call ends.** The tool gate queues rather than rejects, but
   under one per-call deadline covering the wait and the run
   (`with_tool_deadline`; default 300 s; `DRSG_MCP_TOOL_DEADLINE_SECS`, `0`
-  disables). Past it the call is a *tool-level* error saying whether the
+  disables; `[server] mcp_tool_deadline_secs` says the same from the file,
+  and as with every file key an environment variable already set wins over
+  it). Past it the call is a *tool-level* error saying whether the
   server was busy or the body was slow. A running body is not cut short —
   blocking work cannot be — but its permit travels with it, so the gate
   keeps counting it until it returns. Core query deadlines (03 §8.6) sit
