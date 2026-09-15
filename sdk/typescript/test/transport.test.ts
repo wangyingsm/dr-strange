@@ -3,6 +3,7 @@
 // non-2xx reply each surface. The e2e suite covers the happy paths.
 import { expect, test } from "bun:test";
 import { Client, DrsgError, DrsgTimeoutError, type FetchLike } from "../src/index";
+import { wsAcceptsHeaders } from "../src/client";
 
 const abortError = (): Error => {
   const e = new Error("The operation was aborted.");
@@ -62,10 +63,11 @@ test("a well-formed reply returns its result", async () => {
 });
 
 // The change feed's credential is a bearer header on the upgrade, never in
-// the URL, outside a browser: a query-string token lands in proxy and access
-// logs, and the server prefers the header (arch/08-web-ui §4.1). Only the
-// browser WebSocket API cannot set headers, so `tokenInQuery` (defaulting to
-// "is there a document?") keeps `?token=` for that one runtime.
+// the URL, wherever the WebSocket can carry one: a query-string token lands in
+// proxy and access logs, and the server prefers the header (arch/08-web-ui
+// §4.1). Only Bun's and Node's constructors take a `headers` init; the
+// standard one (browser window or worker, Deno) does not, so `tokenInQuery`
+// defaults to `!wsAcceptsHeaders()` and keeps `?token=` for those runtimes.
 class RecordingSocket {
   static calls: Array<{ url: string; init?: { headers?: Record<string, string> } }> = [];
   onopen: ((ev: unknown) => void) | null = null;
@@ -99,5 +101,33 @@ test("watch keeps ?token= only when asked for the browser form", () => {
   });
   sub.close();
   expect(RecordingSocket.calls[0].url).toBe("ws://127.0.0.1:1/ws?token=a%26b");
+  expect(RecordingSocket.calls[0].init).toBeUndefined();
+});
+
+// Detection is by capability, not by the absence of `document`: a Web Worker
+// has no document and no header-taking constructor, and Deno's node-compat
+// layer exposes `process.versions.node` without accepting headers.
+test("wsAcceptsHeaders says yes only for Bun and Node", () => {
+  expect(wsAcceptsHeaders({})).toBe(false); // browser worker
+  expect(wsAcceptsHeaders({ document: {} })).toBe(false); // browser window
+  expect(wsAcceptsHeaders({ Deno: {} })).toBe(false);
+  expect(wsAcceptsHeaders({ Deno: {}, process: { versions: { node: "20.0.0" } } })).toBe(false);
+  expect(wsAcceptsHeaders({ Bun: {} })).toBe(true);
+  expect(wsAcceptsHeaders({ process: { versions: { node: "22.0.0" } } })).toBe(true);
+  expect(wsAcceptsHeaders()).toBe(true); // this suite runs under Bun
+});
+
+test("watch falls back to ?token= where the WebSocket takes no headers", () => {
+  RecordingSocket.calls = [];
+  const g = globalThis as { Deno?: unknown };
+  g.Deno = {};
+  try {
+    const c = new Client({ baseUrl: "http://127.0.0.1:1", token: "s3cret" });
+    const sub = c.watch("p", () => {}, { WebSocket: RecordingSocket, reconnect: false });
+    sub.close();
+  } finally {
+    delete g.Deno;
+  }
+  expect(RecordingSocket.calls[0].url).toBe("ws://127.0.0.1:1/ws?token=s3cret");
   expect(RecordingSocket.calls[0].init).toBeUndefined();
 });

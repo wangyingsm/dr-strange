@@ -114,11 +114,23 @@ export type WebSocketConstructor = new (url: string) => WebSocketLike;
  *  send (see `WebSocketConstructor`). */
 type WebSocketConstructorWithInit = new (url: string, init: WebSocketInit) => WebSocketLike;
 
-/** Whether this runtime's WebSocket is the browser's — the one API that cannot
- *  set headers on the upgrade. Anything with a `document` is treated as a
- *  browser; Bun, Node and Deno have none. */
-function isBrowserRuntime(): boolean {
-  return typeof (globalThis as { document?: unknown }).document !== "undefined";
+/** Whether `g`'s global `WebSocket` takes a `{ headers }` init on the upgrade.
+ *  Only Bun's and Node's (undici, >= 22) do; the standard constructor's second
+ *  argument is a protocol list, so a browser window or worker would coerce the
+ *  init to the bogus subprotocol "[object Object]" and throw, and Deno's has
+ *  never accepted headers (denoland/deno#3452). Detection is therefore by
+ *  capability — a Bun or Node marker — not by the absence of `document`,
+ *  which a Web Worker also lacks. Deno is checked first because its Node
+ *  compatibility layer also exposes `process.versions.node`. */
+export function wsAcceptsHeaders(g: object = globalThis): boolean {
+  const env = g as {
+    Deno?: unknown;
+    Bun?: unknown;
+    process?: { versions?: { node?: unknown } };
+  };
+  if (typeof env.Deno !== "undefined") return false;
+  if (typeof env.Bun !== "undefined") return true;
+  return typeof env.process?.versions?.node === "string";
 }
 
 export interface DrsgOptions {
@@ -166,9 +178,12 @@ export interface WatchOptions {
   /** WebSocket implementation, when there is no global one (Node < 21). */
   WebSocket?: WebSocketConstructor;
   /** Send the token as `?token=` on the URL instead of an `Authorization`
-   *  header. Defaults to `true` only in a browser (its WebSocket API cannot
-   *  set headers); set it explicitly for a custom `WebSocket` implementation
-   *  that ignores the `headers` init. */
+   *  header. Defaults to `false` under Bun and Node, whose WebSocket takes a
+   *  `headers` init, and `true` everywhere else (browser windows and workers,
+   *  Deno), where the standard constructor cannot set headers. Set it
+   *  explicitly for a custom `WebSocket` implementation — `false` for one
+   *  that honours the `headers` init (the `ws` package), `true` for one that
+   *  ignores it. */
   tokenInQuery?: boolean;
 }
 
@@ -272,11 +287,12 @@ export class Client {
     }
     // http→ws, https→wss. The server prefers `Authorization: Bearer` on the
     // upgrade (arch/08-web-ui §4.1) and a URL credential lands in proxy and
-    // access logs, so under Bun/Node/Deno the token is a header and the URL
-    // is bare. Only the browser WebSocket API cannot set headers; there the
-    // token rides the query string, which the server accepts for that reason.
+    // access logs, so where the WebSocket takes a headers init (Bun, Node)
+    // the token is a header and the URL is bare. The standard constructor
+    // (browser window or worker, Deno) cannot set headers; there the token
+    // rides the query string, which the server accepts for that reason.
     const base = this.baseUrl.replace(/^http/, "ws") + "/ws";
-    const inBrowser = opts.tokenInQuery ?? isBrowserRuntime();
+    const inBrowser = opts.tokenInQuery ?? !wsAcceptsHeaders();
     const url = this.token && inBrowser ? `${base}?token=${encodeURIComponent(this.token)}` : base;
     const init: WebSocketInit | undefined =
       this.token && !inBrowser ? { headers: { authorization: `Bearer ${this.token}` } } : undefined;
