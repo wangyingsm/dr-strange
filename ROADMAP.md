@@ -1129,10 +1129,9 @@ window of them (twenty by default). The `_git` plane already holds every
 commit from the first: it names the revision, and git's object store supplies
 the bytes, however old.
 
-**Follow-ups.** `drsg serve` handing its `[plugins]` store to `recall`, which
-reads the default store today; a `cat-file --batch` reader, should a plugin that
-pulls many files make one process per read slow; `git grep --max-count` once
-git 2.38 is a safe floor.
+**Follow-ups.** A `cat-file --batch` reader, should a plugin that pulls many
+files make one process per read slow; `git grep --max-count` once git 2.38 is a
+safe floor.
 
 ---
 

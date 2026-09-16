@@ -4,7 +4,7 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.8.0] - 2026-09-16
 
 ### Added
 
@@ -19,6 +19,15 @@ All notable changes to Dr Strange are documented here. The format is based on
 - **Agents are pointed at it.** The server's instructions name `recall` for
   old code, and the shell hook redirects `git show <rev>:<path>`, `git grep`
   and `git log -p` / `-L` to it.
+
+### Fixed
+
+- **The TLS stack takes its patch.** rustls moves to 0.23.45 for
+  RUSTSEC-2026-0285: TLS 1.3 handshake messages were accepted at the wrong
+  encryption level when they followed a key-changing message in the same
+  record. The transcript stays authenticated, so a handshake could not be
+  altered or completed by it; what was missing is the `unexpected_message`
+  alert RFC 8446 §5.1 requires.
 
 ## [2.7.1] - 2026-09-10
 
