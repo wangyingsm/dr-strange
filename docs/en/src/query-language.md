@@ -259,7 +259,7 @@ list is not a chain and may be as long as the query body allows.
 ### What the subset leaves out
 
 Each of these is refused with an error that names the rewrite; none is
-silently mis-read:
+silently misread:
 
 - A second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, `WITH`, and a
   pattern with several paths (`MATCH (a)-->(b), (a)-->(c)`): a query holds
