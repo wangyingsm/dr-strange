@@ -20,7 +20,7 @@
 mod recall;
 pub mod relay;
 
-pub use recall::{Parsers, RecallReq, recall_logic};
+pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
 use std::sync::Arc;
 
@@ -538,6 +538,108 @@ struct DropPlane {
 
 // ---- helpers -------------------------------------------------------------
 
+/// Which trees the file-reading verbs (`grep`, `snippet`) may open.
+///
+/// Two sources name a tree: the one the host attached (`serve watch`'s
+/// `--dir`, `[server] source_root`) and the `synced_root` a plane records on
+/// itself. The first is the operator's choice and always readable. The second
+/// is data — a plane property — so it is honoured as a tree of its own only
+/// where the process already runs as the user whose files these are (stdio,
+/// the CLI). On a shared server a plane root is readable only when it lies
+/// inside the attached tree; otherwise a caller who can set a plane property
+/// could point `snippet` at any directory the server can open.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeAccess<'a> {
+    /// The tree the host attached, if any.
+    pub attached: Option<&'a std::path::Path>,
+    /// Whether a plane's own `synced_root` may be read wherever it points.
+    pub plane_roots: bool,
+}
+
+impl<'a> TreeAccess<'a> {
+    /// Access as a local process has it: the attached tree plus any plane's.
+    pub fn local(attached: Option<&'a std::path::Path>) -> Self {
+        Self {
+            attached,
+            plane_roots: true,
+        }
+    }
+
+    /// The tree `snippet` reads for a plane recording `recorded`, or `None`
+    /// when this process may not read it (with why).
+    fn plane_root(
+        &self,
+        recorded: Option<&std::path::Path>,
+    ) -> Result<Option<std::path::PathBuf>, anyhow::Error> {
+        let Some(recorded) = recorded else {
+            return Ok(self.attached.map(std::path::Path::to_path_buf));
+        };
+        if self.plane_roots {
+            return Ok(Some(recorded.to_path_buf()));
+        }
+        match self.attached {
+            Some(attached) if dir_within(attached, recorded) => Ok(Some(recorded.to_path_buf())),
+            Some(_) => anyhow::bail!(
+                "this plane's `synced_root` ({}) is not inside the tree attached to \
+                 this server, which reads no other files; run `serve watch` on that \
+                 tree or use the stdio server on your own machine",
+                recorded.display()
+            ),
+            None => anyhow::bail!(
+                "this server has no source tree attached and reads no local files — \
+                 the plane's `synced_root` ({}) is readable only from `serve watch` \
+                 on that tree or the stdio server",
+                recorded.display()
+            ),
+        }
+    }
+}
+
+/// Whether `dir` resolves to `root` or somewhere beneath it. Both sides are
+/// canonicalized, so a symlinked `dir` is judged by where it lands; a `dir`
+/// that does not exist is not within anything.
+fn dir_within(root: &std::path::Path, dir: &std::path::Path) -> bool {
+    match (root.canonicalize(), dir.canonicalize()) {
+        (Ok(root), Ok(dir)) => dir.starts_with(&root),
+        _ => false,
+    }
+}
+
+/// The file `file` names under `root`, or an error when it would land outside.
+///
+/// Every file the tools read goes through here: `file` is a tool argument or
+/// a node property — `..`, an absolute path, or a symlink planted in the tree
+/// are all ways of naming a file the tree does not hold. Rejected by shape
+/// first (absolute, `..`, a drive prefix) so the message can say why, then by
+/// where the resolved path lands, which is what catches a symlink.
+fn contained(root: &std::path::Path, file: &str) -> AnyResult<std::path::PathBuf> {
+    use std::path::Component;
+    let rel = std::path::Path::new(file);
+    let escapes = rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir));
+    if rel.is_absolute() || escapes {
+        anyhow::bail!(
+            "refusing to read {file}: paths are relative to the source tree and \
+             may not leave it"
+        );
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("reading {file}: source tree {}: {e}", root.display()))?;
+    let full = root
+        .join(rel)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+    if !full.starts_with(&root) {
+        anyhow::bail!(
+            "refusing to read {file}: it resolves to {} — outside the source tree",
+            full.display()
+        );
+    }
+    Ok(full)
+}
+
 fn parse_metric(s: Option<&str>) -> Metric {
     match s.map(str::to_ascii_lowercase).as_deref() {
         Some("dot") => Metric::Dot,
@@ -965,6 +1067,12 @@ fn grep_tree(
         symbols,
     };
 
+    // The walk starts from the tree's real path so every entry under it can be
+    // judged against it — a symlink that leaves the tree is a file the tree
+    // does not hold, and is passed over as one it cannot read would be.
+    let root = &root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("source tree {}: {e}", root.display()))?;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -992,6 +1100,22 @@ fn grep_tree(
             }
             if !path_admits(filter, &rel) || meta.len() > MAX_FILE {
                 continue;
+            }
+            // `DirEntry::metadata` does not follow links, so a linked
+            // directory is never entered; a linked file is read only where
+            // it lands inside the tree.
+            if meta.file_type().is_symlink() {
+                let Ok(target) = contained(root, &rel) else {
+                    continue;
+                };
+                // The link's own metadata described the link; size and kind
+                // are the target's.
+                let readable = std::fs::metadata(&target)
+                    .map(|m| m.is_file() && m.len() <= MAX_FILE)
+                    .unwrap_or(false);
+                if !readable {
+                    continue;
+                }
             }
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
@@ -1888,21 +2012,21 @@ fn digest_logic(
 /// ranges, which the answer spells out.
 const SNIPPET_CAP: usize = 400;
 
-/// The tree `plane` was parsed from, as it records it (`synced_root`), else `fallback`.
+/// The tree `plane` records having been parsed from (`synced_root`), if any.
 ///
-/// The plane's own record wins: a server holding a second code plane would
-/// otherwise read another repository's file at the same relative path.
-pub(crate) fn source_root(
-    plane: &PlaneHandle<'_>,
-    fallback: Option<&std::path::Path>,
-) -> Option<std::path::PathBuf> {
-    let recorded = plane.properties().ok().and_then(|props| {
-        match props.get("synced_root").map(|d| &d.value) {
-            Some(PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
-            _ => None,
-        }
-    });
-    recorded.or_else(|| fallback.map(std::path::Path::to_path_buf))
+/// Reading it is [`TreeAccess`]'s decision, not this function's: the property
+/// is data — `plane.set_props` writes it — and on a shared server data does
+/// not choose which directories the process opens.
+pub(crate) fn recorded_root(plane: &PlaneHandle<'_>) -> Option<std::path::PathBuf> {
+    match plane
+        .properties()
+        .ok()?
+        .get("synced_root")
+        .map(|d| &d.value)
+    {
+        Some(PropValue::Str(r)) => Some(std::path::PathBuf::from(r)),
+        _ => None,
+    }
 }
 
 /// `lines` numbered from `first`, one per line, as `snippet` prints source.
@@ -1941,7 +2065,7 @@ fn read_range(
     end: usize,
     symbols: Option<&SymbolIndex>,
 ) -> AnyResult<String> {
-    let text = std::fs::read_to_string(root.join(file))
+    let text = std::fs::read_to_string(contained(root, file)?)
         .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
     let total = text.lines().count();
     if start > total {
@@ -1989,9 +2113,19 @@ pub fn snippet_logic(
     fallback_root: Option<&std::path::Path>,
     req: SnippetReq,
 ) -> AnyResult<Value> {
+    snippet_logic_in(db, TreeAccess::local(fallback_root), req)
+}
+
+/// [`snippet_logic`] under an explicit tree policy — what the served `/mcp`
+/// uses, where a plane's own root is not automatically readable.
+pub fn snippet_logic_in(
+    db: &Database,
+    access: TreeAccess<'_>,
+    req: SnippetReq,
+) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
-    let plane_root = source_root(&plane, fallback_root);
-    let root = plane_root.as_deref();
+    let root = access.plane_root(recorded_root(&plane).as_deref())?;
+    let root = root.as_deref();
     let no_tree = || {
         anyhow::anyhow!(
             "no stored source, and no source tree for this plane — the plane \
@@ -2065,7 +2199,9 @@ pub fn snippet_logic(
         Some(dr_strange_core::PropValue::Int(l)) => Some(*l as usize),
         _ => None,
     };
-    let text = std::fs::read_to_string(root.join(&file))
+    // The property is data the parser wrote, not a path the operator chose:
+    // it is contained the same way an argument is.
+    let text = std::fs::read_to_string(contained(root, &file)?)
         .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
     // An explicit `lines` still wins; the extent is only the default, and a
     // node whose parser records none keeps the old fixed guess.
@@ -2322,8 +2458,15 @@ impl DrStrange {
         Parameters(req): Parameters<SnippetReq>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.source_root.clone();
-        self.blocking("snippet", move |db| snippet_logic(db, root.as_deref(), req))
-            .await
+        let plane_roots = self.local_files;
+        self.blocking("snippet", move |db| {
+            let access = TreeAccess {
+                attached: root.as_deref(),
+                plane_roots,
+            };
+            snippet_logic_in(db, access, req)
+        })
+        .await
     }
 
     #[tool(
@@ -2347,8 +2490,13 @@ impl DrStrange {
         Parameters(req): Parameters<RecallReq>,
     ) -> Result<CallToolResult, McpError> {
         let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
+        let plane_roots = self.local_files;
         self.blocking("recall", move |db| {
-            recall_logic(db, root.as_deref(), &*parsers, req)
+            let access = TreeAccess {
+                attached: root.as_deref(),
+                plane_roots,
+            };
+            recall_logic_in(db, access, &*parsers, req)
         })
         .await
     }
@@ -3313,6 +3461,34 @@ mod grep_tests {
         dir
     }
 
+    /// A symlink inside the tree that points outside it is a file the tree
+    /// does not hold: `grep` must not follow it, however plausibly it is
+    /// named — a checkout an agent works in is not a trusted place. One that
+    /// stays inside is read like any other file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_tree_is_not_followed() {
+        let dir = tree("symlink");
+        let outside = dir
+            .parent()
+            .unwrap()
+            .join(format!("drsg-grep-outside-{}.txt", std::process::id()));
+        std::fs::write(&outside, "needle secret outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("src/leak.rs")).unwrap();
+        std::os::unix::fs::symlink(dir.join("docs/c.md"), dir.join("src/inside.md")).unwrap();
+
+        let out = grep_tree(&dir, &req("needle"), None).unwrap();
+        assert!(
+            !out.contains("secret outside"),
+            "followed a symlink out of the tree: {out}"
+        );
+        assert!(!out.contains("leak.rs"), "{out}");
+        assert!(out.contains("src/inside.md:1: needle prose"), "{out}");
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn finds_lines_skips_build_dirs_and_binaries() {
         let dir = tree("basic");
@@ -3692,6 +3868,115 @@ mod snippet_tests {
         .as_str()
         .unwrap()
         .to_string()
+    }
+
+    /// Every way a `snippet` argument or a node property can name a file the
+    /// tree does not hold: `..`, an absolute path, a symlink planted in the
+    /// tree. Each is refused with an error, never read.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_outside_the_tree_is_never_read() {
+        let (a, _b) = two_repos("contain");
+        let outside = a.parent().unwrap().join("secret.txt");
+        std::fs::write(&outside, "top secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, a.join("src/link.rs")).unwrap();
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "p", Some(&a));
+
+        for name in [
+            "../secret.txt:1",
+            &format!("{}:1", outside.display()),
+            "src/link.rs:1",
+            "src/../../secret.txt:1-2",
+        ] {
+            let err = ask(&db, &a, "p", name, None).unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to read") || err.contains("outside"),
+                "{name}: {err}"
+            );
+        }
+        // The range form still reads what is inside.
+        assert!(
+            ask(&db, &a, "p", "src/lib.rs:1", None)
+                .unwrap()
+                .contains("from repo A")
+        );
+
+        // A node whose `file` property points outside: the property is data
+        // the parser wrote — or an agent did with write_nodes — not a path the
+        // operator chose.
+        for (key, file) in [
+            ("abs", outside.display().to_string()),
+            ("dots", "../secret.txt".to_string()),
+            ("link", "src/link.rs".to_string()),
+        ] {
+            write_nodes_logic(
+                &db,
+                from_value(jval!({"plane": "p", "nodes": [
+                    {"external_key": key, "labels": ["Function"],
+                     "properties": {"file": file, "line": 1}}
+                ]}))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+            let err = ask(&db, &a, "p", key, None).unwrap_err().to_string();
+            assert!(!err.contains("top secret"), "{key}: {err}");
+            assert!(
+                err.contains("refusing to read") || err.contains("outside"),
+                "{key}: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    /// On a shared server a plane's `synced_root` is data, not the operator's
+    /// choice: without local files it is read only inside the attached tree.
+    /// With no tree attached at all, nothing is read.
+    #[test]
+    fn a_shared_server_reads_only_inside_the_attached_tree() {
+        let (a, b) = two_repos("shared");
+        let db = Database::in_memory().unwrap();
+        plane_with(&db, "repo-b", Some(&b));
+        let req = || from_value(jval!({"plane": "repo-b", "name": "f"})).unwrap();
+        let text = |v: AnyResult<Value>| v.map(|v| v.as_str().unwrap().to_string());
+
+        // Attached to repo-a, plane root is repo-b: not inside, refused.
+        let shared = TreeAccess {
+            attached: Some(&a),
+            plane_roots: false,
+        };
+        let err = text(snippet_logic_in(&db, shared, req()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not inside the tree attached"), "{err}");
+
+        // Nothing attached, no local files: nothing is read.
+        let none = TreeAccess::default();
+        let err = text(snippet_logic_in(&db, none, req()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no source tree attached"), "{err}");
+
+        // Attached to the parent of both: repo-b is inside, so it is read.
+        let parent = a.parent().unwrap();
+        let wide = TreeAccess {
+            attached: Some(parent),
+            plane_roots: false,
+        };
+        assert!(
+            text(snippet_logic_in(&db, wide, req()))
+                .unwrap()
+                .contains("from repo B")
+        );
+
+        // The local policy (stdio, CLI) reads the plane's own root as before.
+        assert!(
+            text(snippet_logic(&db, Some(&a), req()))
+                .unwrap()
+                .contains("from repo B")
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     /// The bug this guards: `snippet` resolved the *node* in the requested
