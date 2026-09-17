@@ -12,7 +12,9 @@ use dr_strange_llm::git::{Entry, Git, GitTree, GrepAt, ObjKind, RelPath};
 use dr_strange_llm::{Host, LivePlugins, Plugins, Preprocessed, route_paths};
 use serde_json::Value;
 
-use crate::{SNIPPET_CAP, clip, default_plane, numbered, parse_range, regex_tell, source_root};
+use crate::{
+    SNIPPET_CAP, TreeAccess, clip, default_plane, numbered, parse_range, recorded_root, regex_tell,
+};
 
 /// Lines a read returns when the caller names none.
 const DEFAULT_LINES: usize = 40;
@@ -160,9 +162,25 @@ pub fn recall_logic(
     parsers: &dyn Parsers,
     req: RecallReq,
 ) -> AnyResult<Value> {
+    recall_logic_in(db, TreeAccess::local(fallback_root), parsers, req)
+}
+
+/// [`recall_logic`] under an explicit tree policy — what the served `/mcp`
+/// uses, where a plane's own root is not automatically readable.
+///
+/// `recall` reads git objects rather than the working tree, so a name cannot
+/// climb out of the checkout the way a filesystem path can. Which checkout is
+/// opened is the exposure instead, and that is the question `TreeAccess`
+/// answers for `snippet`.
+pub fn recall_logic_in(
+    db: &Database,
+    access: TreeAccess<'_>,
+    parsers: &dyn Parsers,
+    req: RecallReq,
+) -> AnyResult<Value> {
     let mode = req.mode()?;
     let plane = db.plane(&req.plane)?;
-    let Some(root) = source_root(&plane, fallback_root) else {
+    let Some(root) = access.plane_root(recorded_root(&plane).as_deref())? else {
         bail!(
             "no source tree for plane `{}` — recall reads the git checkout the plane was \
              parsed from; digest it from a checkout, or attach the tree (`serve watch` does)",
@@ -1103,6 +1121,52 @@ mod tests {
         let parsers = Plugins::from_handlers(vec![Box::new(LineLang)]);
         let out = recall_logic(db, None, &parsers, from_value(req).unwrap())?;
         Ok(out.as_str().unwrap().to_string())
+    }
+
+    fn recall_in(
+        db: &Database,
+        access: TreeAccess<'_>,
+        req: serde_json::Value,
+    ) -> AnyResult<String> {
+        let parsers = Plugins::from_handlers(vec![Box::new(LineLang)]);
+        let out = recall_logic_in(db, access, &parsers, from_value(req).unwrap())?;
+        Ok(out.as_str().unwrap().to_string())
+    }
+
+    /// A plane's `synced_root` is data — `plane.set_props` writes it — so on a
+    /// shared server it names a checkout to open only when it lies inside the
+    /// tree the operator attached. `recall` cannot be walked out of a checkout
+    /// the way a path can, but it can be pointed at another one.
+    #[test]
+    fn a_shared_server_recalls_only_inside_the_attached_tree() {
+        let f = fixture(true);
+        let req = || json!({"plane": "repo", "name": "src/lib.rs", "at": "v1"});
+
+        let err = recall_in(&f.db, TreeAccess::default(), req())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no source tree attached"), "{err}");
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = TreeAccess {
+            attached: Some(elsewhere.path()),
+            plane_roots: false,
+        };
+        let err = recall_in(&f.db, outside, req()).unwrap_err().to_string();
+        assert!(err.contains("not inside the tree attached"), "{err}");
+
+        let inside = TreeAccess {
+            attached: Some(f.dir.path()),
+            plane_roots: false,
+        };
+        assert!(
+            recall_in(&f.db, inside, req())
+                .unwrap()
+                .contains("fn one() {}")
+        );
+
+        // The local policy (stdio, the CLI) reads the plane's own root as before.
+        assert!(recall(&f.db, req()).unwrap().contains("fn one() {}"));
     }
 
     #[test]
