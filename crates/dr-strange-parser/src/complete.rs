@@ -117,7 +117,9 @@ pub enum Expect {
     /// `AS OF`. `done` are the ones already written, which cannot come again.
     Clause { done: Vec<String> },
     /// Nothing worth guessing at: inside a string literal, where the words
-    /// typed are data rather than syntax.
+    /// typed are data rather than syntax; or after a shape the grammar
+    /// refuses (inline properties in a `MATCH` node), where every suggestion
+    /// would steer further into a query that cannot run.
     Nothing,
 }
 
@@ -185,11 +187,11 @@ pub fn complete(prefix: &str, vocab: &Vocab) -> Completion {
             word: String::new(),
         };
     };
-    let expects = scan(&tokens);
+    let (expects, closing) = scan(&tokens);
     // A relationship's brackets take no spaces — `-[:CALLS ]->` is not a
     // relationship — so a caret that has left one has nothing to add there.
     let loose = word.is_empty() && prefix.ends_with(char::is_whitespace);
-    let mut suggestions = suggest(&expects, &word, vocab, loose);
+    let mut suggestions = suggest(&expects, &word, vocab, loose, closing);
     suggestions.truncate(MAX_SUGGESTIONS);
     Completion {
         best: suggestions.first().map(|s| s.insert.clone()),
@@ -219,50 +221,91 @@ const ARROWY: &str = "-<>=!";
 
 /// Split a prefix into complete tokens and the partial word under the caret.
 ///
-/// `None` when the caret is inside an unterminated string literal. The
-/// language has no escapes, so that scan is exact.
+/// `None` when the caret is inside an unterminated string literal or a
+/// backticked name: what is typed there is data (or a name of the author's
+/// own), and completing it would be noise. A string literal is read the way
+/// [`crate::parse`] reads it — a backslash escapes whatever follows, so an
+/// escaped quote does not end the literal — and a backticked name is one word
+/// whatever it contains.
 ///
 /// The partial word is whatever the prefix ends *part-way through*: a prefix
 /// ending in a space, or in punctuation, has none — the caret sits at a fresh
 /// position rather than inside a name.
+///
+/// The scan walks characters, never bytes: an identifier may be Unicode
+/// (`函数`, `café`), and a string may hold anything, so every slice below is
+/// taken at a character boundary.
 fn tokenize(prefix: &str) -> Option<(Vec<Tok<'_>>, String)> {
-    let bytes = prefix.as_bytes();
     let mut toks = Vec::new();
     let mut partial = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    let mut chars = prefix.char_indices().peekable();
+    // Advance while the character under the cursor satisfies `keep`, and
+    // return the byte offset of the first that does not (or the end).
+    let end_of = |chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+                  keep: &dyn Fn(char) -> bool| {
+        while let Some(&(_, c)) = chars.peek() {
+            if !keep(c) {
+                return;
+            }
+            chars.next();
+        }
+    };
+    let at = |chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>| {
+        chars.peek().map_or(prefix.len(), |&(i, _)| i)
+    };
+    while let Some((start, c)) = chars.next() {
         if c.is_whitespace() {
-            i += 1;
             continue;
         }
-        let start = i;
         if c == '"' || c == '\'' {
-            i += 1;
-            while i < bytes.len() && bytes[i] as char != c {
-                i += 1;
+            // A backslash escapes whatever follows, so an escaped quote is
+            // part of the string; an unterminated string ends the scan.
+            loop {
+                match chars.next() {
+                    None => return None,
+                    Some((_, '\\')) => {
+                        chars.next();
+                    }
+                    Some((_, q)) if q == c => break,
+                    Some(_) => {}
+                }
             }
-            if i == bytes.len() {
-                return None; // unterminated: the caret is inside it
-            }
-            i += 1;
             toks.push(Tok::Str);
+        } else if c == '`' {
+            // A backticked name is one word, backticks and all: the grammar
+            // takes it as a plain identifier, and a suggestion that reads it
+            // (a variable's name) writes it back the same way.
+            end_of(&mut chars, &|c| c != '`');
+            // Unterminated: the caret is inside the name.
+            chars.next()?;
+            toks.push(Tok::Word(&prefix[start..at(&mut chars)]));
         } else if c.is_alphabetic() || c == '_' || c == '$' {
-            i += 1;
-            while i < bytes.len()
-                && matches!(bytes[i] as char, c if c.is_alphanumeric() || c == '_')
-            {
-                i += 1;
-            }
-            let word = &prefix[start..i];
-            if i == bytes.len() {
+            end_of(&mut chars, &|c| c.is_alphanumeric() || c == '_');
+            let end = at(&mut chars);
+            let word = &prefix[start..end];
+            if end == prefix.len() {
                 partial = Some(word.to_string()); // the caret is inside it
             } else {
                 toks.push(Tok::Word(word));
             }
         } else if c.is_ascii_digit() {
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-                i += 1;
+            // `10`, `2.5`, `1e9`: the fraction and the exponent belong to the
+            // number, or `2.5` would read as a number, a `.` and a number.
+            end_of(&mut chars, &|c| c.is_ascii_digit());
+            if let Some(&(dot, '.')) = chars.peek()
+                && prefix[dot + 1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                chars.next();
+                end_of(&mut chars, &|c| c.is_ascii_digit());
+            }
+            if let Some(&(e, 'e' | 'E')) = chars.peek()
+                && prefix[e + 1..]
+                    .trim_start_matches(['+', '-'])
+                    .starts_with(|c: char| c.is_ascii_digit())
+            {
+                chars.next();
+                end_of(&mut chars, &|c| c == '+' || c == '-');
+                end_of(&mut chars, &|c| c.is_ascii_digit());
             }
             toks.push(Tok::Num);
         } else {
@@ -270,13 +313,9 @@ fn tokenize(prefix: &str) -> Option<(Vec<Tok<'_>>, String)> {
             // everything else stands alone.
             if ARROWY.contains(c) || c == '.' {
                 let run = if c == '.' { "." } else { ARROWY };
-                while i < bytes.len() && run.contains(bytes[i] as char) {
-                    i += 1;
-                }
-            } else {
-                i += 1;
+                end_of(&mut chars, &|c| run.contains(c));
             }
-            toks.push(Tok::Punct(&prefix[start..i]));
+            toks.push(Tok::Punct(&prefix[start..at(&mut chars)]));
         }
     }
     Some((toks, partial.unwrap_or_default()))
@@ -299,8 +338,14 @@ enum Pos {
     NodeColon,
     /// After `(n:`: a label.
     NodeLabel,
-    /// After `(n:Label`: `)`.
+    /// After `(n:Label`: `)`, or a `{key: $k, p: 1}` map.
     NodeClose,
+    /// Just inside a node's `{`, and after each `,` in it: a property name —
+    /// `key`, the external key, or one the label's nodes hold.
+    PropKey,
+    /// Anywhere else inside a node's `{…}`: the `:` after a key, or its value,
+    /// which is the author's alone.
+    PropRest,
     /// After `(…)`: a relationship, or the clause that follows.
     Hop,
     /// After `-` or `<-`: `[`.
@@ -331,6 +376,11 @@ enum Pos {
     Sort,
     /// After a complete clause: `ORDER BY`, `SKIP`, `LIMIT`, `AS OF`.
     Clause,
+    /// After a shape the grammar refuses outright — `{` in a `MATCH` node,
+    /// whose predicates live in WHERE. Nothing that follows mends it, so the
+    /// scan stays here: the three readings of the language must agree, and
+    /// the parser's is a hard error.
+    Refused,
 }
 
 /// What a scan learned: where the caret is, and the variables the pattern
@@ -356,6 +406,9 @@ struct Scan {
     term: Option<String>,
     /// The tail clauses already written — a query has one `LIMIT`.
     done: Vec<String>,
+    /// A `CREATE`/`MERGE` has been written: its nodes carry a property map,
+    /// where a read pattern's may not.
+    writing: bool,
 }
 
 impl Scan {
@@ -418,7 +471,10 @@ fn clause_keyword(word: &str) -> Option<&'static str> {
 /// Deliberately forgiving: a token that fits no transition leaves the position
 /// alone rather than derailing the scan, because half a query is full of
 /// tokens the grammar has not seen the rest of yet.
-fn scan(tokens: &[Tok<'_>]) -> Expect {
+///
+/// The flag says the node under the caret is past the point a label may be
+/// added — it has one, or a property map — so all that closes it is `)`.
+fn scan(tokens: &[Tok<'_>]) -> (Expect, bool) {
     let mut s = Scan {
         pos: Pos::Statement,
         vars: Vec::new(),
@@ -430,15 +486,22 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
         star: None,
         term: None,
         done: Vec::new(),
+        writing: false,
     };
     for tok in tokens {
         step(&mut s, tok);
     }
-    match &s.pos {
+    let closing = s.pos == Pos::NodeClose;
+    let expects = match &s.pos {
         Pos::Statement => Expect::Statement,
         Pos::NodeOpen => Expect::Node { var: s.next_var() },
         Pos::NodeVar => Expect::NodeVar { var: s.next_var() },
         Pos::NodeColon | Pos::NodeClose => Expect::NodeEnd,
+        Pos::PropKey => Expect::Property {
+            var: s.var.clone().unwrap_or_default(),
+            label: s.label.clone(),
+        },
+        Pos::PropRest => Expect::Value,
         Pos::NodeLabel => Expect::Label,
         Pos::Hop => Expect::Hop {
             from: s.from.clone(),
@@ -474,7 +537,9 @@ fn scan(tokens: &[Tok<'_>]) -> Expect {
         Pos::Term | Pos::Clause => Expect::Clause {
             done: s.done.clone(),
         },
-    }
+        Pos::Refused => Expect::Nothing,
+    };
+    (expects, closing)
 }
 
 fn step(s: &mut Scan, tok: &Tok<'_>) {
@@ -489,6 +554,12 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
             .find(|(t, _)| t.split(' ').next() == Some(written.as_str()))
         {
             s.done.push((*tail).to_string());
+        }
+        if s.pos == Pos::Refused {
+            return;
+        }
+        if matches!(kw, "CREATE" | "MERGE") {
+            s.writing = true;
         }
         s.pos = match kw {
             "WHERE" | "AND" | "SET" => Pos::Predicate,
@@ -529,6 +600,23 @@ fn step(s: &mut Scan, tok: &Tok<'_>) {
             s.close_node();
             s.pos = Pos::Hop;
         }
+        // A write's node carries its key and properties in a map, `{key: $k,
+        // p: 1}`. Read as its own region, so that the `:` after a key is not
+        // taken for the one that opens a label, and the `}` hands back to the
+        // node it sits in. A read pattern's node has no map — the parser
+        // refuses one with a pointer at WHERE — so there the scan stops.
+        (Pos::NodeVar | Pos::NodeColon | Pos::NodeClose, Tok::Punct("{")) => {
+            s.pos = if s.writing {
+                Pos::PropKey
+            } else {
+                Pos::Refused
+            };
+        }
+        (Pos::Refused, _) => {}
+        (Pos::PropKey, Tok::Word(_)) => s.pos = Pos::PropRest,
+        (Pos::PropRest, Tok::Punct(",")) => s.pos = Pos::PropKey,
+        (Pos::PropKey | Pos::PropRest, Tok::Punct("}")) => s.pos = Pos::NodeClose,
+        (Pos::PropRest, _) => {}
 
         // ---- relationships ----------------------------------------------------
         (Pos::Hop, Tok::Punct(p)) if p.starts_with('-') || p.starts_with('<') => {
@@ -631,7 +719,13 @@ const FOLDS: &[(&str, &str)] = &[
     ("max(", "greatest"),
 ];
 
-fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Suggestion> {
+fn suggest(
+    expects: &Expect,
+    word: &str,
+    vocab: &Vocab,
+    loose: bool,
+    closing: bool,
+) -> Vec<Suggestion> {
     match expects {
         Expect::Nothing | Expect::Value => Vec::new(),
         Expect::Statement => keywords(OPENERS, word),
@@ -640,6 +734,8 @@ fn suggest(expects: &Expect, word: &str, vocab: &Vocab, loose: bool) -> Vec<Sugg
         // once they have started one.
         Expect::NodeVar { var } => at_boundary(word, var, "a name for this node"),
         Expect::Label => labels(word, vocab, ")"),
+        // A node that has its label (or its map) takes no second one.
+        Expect::NodeEnd if closing => at_boundary(word, ")", "close the node"),
         Expect::NodeEnd => node_ends(word, vocab),
         Expect::Hop { from, var, bound } => hops(word, vocab, from.as_deref(), var, *bound),
         Expect::EdgeType {

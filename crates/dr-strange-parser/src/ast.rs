@@ -229,6 +229,13 @@ pub enum SortTarget {
     /// A bare name: a `RETURN` alias, which only a projecting query has. A
     /// bare variable is not an expression in this language.
     Name(String),
+    /// An aggregate — `ORDER BY count(*) DESC` — which names the projected
+    /// column that folds the same way, however that column was spelled.
+    Agg {
+        func: AggFunc,
+        arg: Option<PExpr>,
+        distinct: bool,
+    },
 }
 
 /// A parsed expression. Mirrors core's `Expr` but with variable-qualified
@@ -413,7 +420,9 @@ pub struct CreatePath {
 pub struct CreateNode {
     pub var: Option<String>,
     pub label: Option<String>,
-    pub key: Option<String>,
+    /// The external key: a string literal, or a `$param` the write resolves
+    /// (and requires to be a string) before it runs.
+    pub key: Option<Val>,
     pub props: Vec<(String, Val)>,
 }
 

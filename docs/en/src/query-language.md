@@ -118,9 +118,23 @@ stored `7.0`. A map is tested by **key**, not value. A literal list on the right
 is expanded into equalities at compile time; any other right-hand side is
 evaluated per row.
 
-> A predicate that does not match and a property that is absent are
-> indistinguishable, so `NOT (d.title CONTAINS "x")` is true for a document with
-> no `title` at all. Use `d.title IS NULL` when the difference matters.
+### Missing properties
+
+A predicate over a property the node lacks is not satisfied — and neither is
+its negation. `d.year <> 2020`, `NOT d.year = 2020`, `NOT d.year IN [2020]`
+and `NOT (d.title CONTAINS "x")` all skip a node without the property, as in
+openCypher; `d.year = null` matches nothing. Ask about absence with `IS NULL`
+/ `IS NOT NULL`, and combine when both are wanted:
+
+```text
+MATCH (d:Doc) WHERE d.year <> 2020 OR d.year IS NULL RETURN d
+```
+
+The engine reaches this by guarding `<>` and `NOT` with `IS NOT NULL` on the
+properties they read, rather than with three-valued logic, so one case is
+stricter than openCypher: under `NOT`, a compound predicate whose false branch
+would have absorbed the null — `NOT (d.a = 1 AND d.b = 2)` keeps a node with
+`b = 3` and no `a` in openCypher, and drops it here.
 
 ### Anchoring on a known entity
 
@@ -185,11 +199,13 @@ answers `0` rather than nothing when the match found nothing.
 
 In a projecting query, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` apply to the
 projected rows: `DISTINCT` compares whole tuples (two nodes sharing a file are
-one row), and `ORDER BY` names a column — by its alias, or by the expression it
-returned.
+one row), and `ORDER BY` names a column — by its alias, by the expression it
+returned, or by the aggregate it folds (`ORDER BY count(*) DESC` finds the
+count column however the `RETURN` spelled or aliased it).
 
 ```text
 MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) ORDER BY count(*) DESC
 ```
 
 A node cannot share a `RETURN` with columns, since a node is not a value:
@@ -216,11 +232,54 @@ CREATE (a)-[:KNOWS {since: 1936}]->(b)
 ```
 
 Values may be supplied as `$name` parameters rather than interpolated into the
-query text, which keeps the query stable and avoids escaping:
+query text, which keeps the query stable and avoids escaping. A `key:` may be
+a parameter too — `MERGE (n:Person {key: $k})` upserts on the string `$k`
+resolves to (a non-string is an error, not a property):
 
 ```text
 MATCH (p:Person) WHERE p.age >= $min RETURN p
+MERGE (n:Person {key: $k}) ON CREATE SET n.seen = 1
 ```
+
+### Literals and identifiers
+
+Strings take either quote and the usual escapes — `\'`, `\"`, `\\`, `\n`,
+`\t`, `\r`, `\uXXXX` — so a value that contains a quote is written inside the
+literal, never around it; an unknown escape or an unterminated string is a
+syntax error. Numbers are ints (`42`) or floats (`3.5`, `1e9`, `2.5E-3`).
+Identifiers (variables, labels, types, property keys) are Unicode words
+(`n.名字`, `café`), or anything between backticks when the plain form cannot
+spell the name (`` n.`first name` ``, `` (:`order`) ``). Keywords and function
+names are case-insensitive (`COUNT(*)`, `Score()`). Expressions may nest at
+most 64 levels deep, where parentheses, `NOT`, unary `-` and each operator of
+an `AND`/`OR`/`+ -`/`* /` chain count one level (so a chain of 64 conjuncts
+is the limit); deeper is a syntax error rather than a crash. An `IN [...]`
+list is not a chain and may be as long as the query body allows.
+
+### What the subset leaves out
+
+Each of these is refused with an error that names the rewrite; none is
+silently misread:
+
+- A second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, `WITH`, and a
+  pattern with several paths (`MATCH (a)-->(b), (a)-->(c)`): a query holds
+  one linear path, ending in one `RETURN`. Run one query per pattern or
+  branch and combine the results in the caller.
+- Relationship variables (`-[r:KNOWS]->`): an edge cannot be bound, returned
+  or filtered on. Drop the variable: `-[:KNOWS]->`.
+- Inline property predicates in a `MATCH` node (`(n:Person {name: "x"})`):
+  write them in `WHERE` (`WHERE n.name = "x"`, or `key(n) = "…"`). In
+  `CREATE` and `MERGE` the same map is the node's properties.
+- List and map literals as values (`RETURN [1, 2]`, `n.x = {a: 1}`): a list
+  is only the right side of `IN` (or a vector after `NEAR`), a map only a
+  `CREATE`/`SET` property map.
+- The `%` and `^` operators; arithmetic is `+ - * /`.
+- Cross-variable predicates (`p.year < q.year`), returning the rows of an
+  earlier variable (`RETURN p` after a hop — project `p.name` instead), and
+  unbounded variable-length hops (`*`, `*2..`).
+
+A syntax error is reported near its cause: a typo late in a `CREATE` names
+that spot, not the statement's first word.
 
 ## Similarity search in a query
 

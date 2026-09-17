@@ -108,8 +108,20 @@ MATCH (n) WHERE n.year IN [2020, 2021] RETURN n   -- 字面量列表
 列表按元素判断，所用相等语义与 `=` 相同，因此 `7` 可匹配存储的 `7.0`。映射按**键**
 判断，而非按值。右侧为字面量列表时会在编译期展开为若干等值判断；其余形式则逐行求值。
 
-> 谓词不匹配与属性缺失这两种情形无法区分，因此对于一份根本没有 `title` 的文档，
-> `NOT (d.title CONTAINS "x")` 同样成立。若需要区分，请使用 `d.title IS NULL`。
+### 缺失的属性
+
+针对节点所没有的属性的谓词不成立——它的否定同样不成立。`d.year <> 2020`、
+`NOT d.year = 2020`、`NOT d.year IN [2020]` 与 `NOT (d.title CONTAINS "x")`
+都会跳过没有该属性的节点，与 openCypher 一致；`d.year = null` 不匹配任何节点。
+用 `IS NULL` / `IS NOT NULL` 询问缺失，两者都要时组合使用：
+
+```text
+MATCH (d:Doc) WHERE d.year <> 2020 OR d.year IS NULL RETURN d
+```
+
+引擎通过在 `<>` 与 `NOT` 所读取的属性上加 `IS NOT NULL` 守卫来做到这一点，而非三值逻辑，
+因此有一种情形比 openCypher 更严格：`NOT` 之下、某个为假的分支本可吸收 null 的复合谓词——
+`NOT (d.a = 1 AND d.b = 2)` 在 openCypher 中保留 `b = 3` 且没有 `a` 的节点，这里会丢弃它。
 
 ### 锚定到某个已知实体
 
@@ -167,10 +179,12 @@ LIMIT 10
 
 在投影查询中，`DISTINCT`、`ORDER BY`、`SKIP` 与 `LIMIT` 作用于投影后的行：
 `DISTINCT` 比较的是整个元组（同处一个文件的两个节点在这里是一行），`ORDER BY` 指名
-的是一列——用它的别名，或用它所返回的那个表达式。
+的是一列——用它的别名、用它所返回的那个表达式，或用它所折叠的聚合
+（`ORDER BY count(*) DESC` 能找到计数列，无论 `RETURN` 如何拼写或起了什么别名）。
 
 ```text
 MATCH (f:Fn) RETURN DISTINCT f.file ORDER BY f.file SKIP 10 LIMIT 10
+MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, count(*) ORDER BY count(*) DESC
 ```
 
 节点不能与列同处一个 `RETURN`，因为节点不是值：改为返回它的属性。各个界面渲染投影
@@ -196,11 +210,43 @@ CREATE (a)-[:KNOWS {since: 1936}]->(b)
 ```
 
 值可以通过 `$name` 参数提供，而不必拼接进查询文本，这样既能保持查询稳定，又省去
-了转义：
+了转义。`key:` 也可以是参数——`MERGE (n:Person {key: $k})` 以 `$k` 解析出的字符串
+为键做 upsert（非字符串是错误，而不会变成属性）：
 
 ```text
 MATCH (p:Person) WHERE p.age >= $min RETURN p
+MERGE (n:Person {key: $k}) ON CREATE SET n.seen = 1
 ```
+
+### 字面量与标识符
+
+字符串可用任一种引号，并支持常见转义——`\'`、`\"`、`\\`、`\n`、`\t`、`\r`、
+`\uXXXX`——因此含引号的值写在字面量之内，而不会终止它；未知转义或未闭合的字符串
+是语法错误。数字是整数（`42`）或浮点数（`3.5`、`1e9`、`2.5E-3`）。标识符（变量、
+标签、类型、属性键）是 Unicode 单词（`n.名字`、`café`），或当普通写法拼不出该名字
+时，放在反引号之间的任何内容（`` n.`first name` ``、`` (:`order`) ``）。关键字与
+函数名不区分大小写（`COUNT(*)`、`Score()`）。表达式最多嵌套 64 层：括号、`NOT`、
+一元 `-`，以及 `AND`/`OR`/`+ -`/`* /` 链中的每个运算符各算一层（因此 64 个合取项
+的链是上限）；更深是语法错误，而不是崩溃。`IN [...]` 列表不是链，长度只受查询体
+大小限制。
+
+### 子集不包含的部分
+
+以下各项都会以一条指出改写方式的错误被拒绝，绝不会被悄悄误读：
+
+- 第二个 `MATCH`、`OPTIONAL MATCH`、`UNION`、`UNWIND`、`WITH`，以及含多条路径的模式
+  （`MATCH (a)-->(b), (a)-->(c)`）：一条查询只有一条线性路径、一个 `RETURN`。
+  按模式或分支分别查询，在调用方合并结果。
+- 关系变量（`-[r:KNOWS]->`）：边无法被绑定、返回或过滤。去掉变量：`-[:KNOWS]->`。
+- `MATCH` 节点中的内联属性谓词（`(n:Person {name: "x"})`）：写进 `WHERE`
+  （`WHERE n.name = "x"` 或 `key(n) = "…"`）。在 `CREATE`/`MERGE` 中同样的写法是节点属性。
+- 作为值的列表与映射字面量（`RETURN [1, 2]`、`n.x = {a: 1}`）：列表只能出现在 `IN`
+  右侧（或作为 `NEAR` 的向量），映射只能是 `CREATE`/`SET` 的属性表。
+- `%` 与 `^` 运算符；算术只有 `+ - * /`。
+- 跨变量谓词（`p.year < q.year`）、返回较早变量的行（跳转之后的 `RETURN p`——改为投影
+  `p.name`），以及无上界的变长跳转（`*`、`*2..`）。
+
+语法错误会报告在其成因附近：`CREATE` 末尾的笔误会指向那一处，而不是语句的第一个词。
 
 ## 查询中的相似度检索
 

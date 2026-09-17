@@ -168,6 +168,60 @@ fn plain_delete_refuses_connected_node_detach_cascades() {
 }
 
 #[test]
+fn a_node_the_pattern_reaches_twice_is_mutated_once() {
+    let db = Database::in_memory().unwrap();
+    write(
+        &db,
+        r#"CREATE (a:A {key:"a1"}), (b:A {key:"a2"}), (n:N {key:"n"}),
+                 (a)-[:R]->(n), (b)-[:R]->(n)"#,
+    );
+    // Two paths end on n. The delete must happen once, not fail the second
+    // time round on a node that is already gone.
+    let s = write(&db, "MATCH (a:A)-[:R]->(n:N) DETACH DELETE n");
+    assert_eq!(s.nodes_deleted, 1);
+    assert!(plane(&db).node_by_key("n").unwrap().is_none());
+}
+
+#[test]
+fn merge_sees_the_edges_this_statement_already_created() {
+    let db = Database::in_memory().unwrap();
+    // One path that walks a -> b twice: `(a)-[:R]->(b)` then `(b)<-[:R]-(a)`
+    // is the same directed edge. The second walk must find the first one,
+    // which the committed store cannot show yet.
+    let s = write(
+        &db,
+        r#"MERGE (a:N {key:"a"})-[:R]->(b:N {key:"b"})<-[:R]-(a)"#,
+    );
+    assert_eq!(s.nodes_created, 2);
+    assert_eq!(s.edges_created, 1);
+
+    // Two MERGE clauses in one statement asking for the same edge.
+    let s = write(
+        &db,
+        r#"MATCH (n:N) WHERE key(n) = "a"
+           MERGE (n)-[:R]->(t:N {key:"t"})
+           MERGE (n)-[:R]->(t2:N {key:"t"})"#,
+    );
+    assert_eq!(s.nodes_created, 1);
+    assert_eq!(s.edges_created, 1);
+
+    // And a CREATE followed by a MERGE of the edge it just made.
+    let s = write(
+        &db,
+        r#"MATCH (n:N) WHERE key(n) = "a"
+           CREATE (n)-[:S]->(u:N {key:"u"})
+           MERGE (n)-[:S]->(u2:N {key:"u"})"#,
+    );
+    assert_eq!(s.edges_created, 1);
+
+    let p = plane(&db);
+    let a = p.node_by_key("a").unwrap().unwrap();
+    let out = p.neighbors(a.id, Dir::Out, None).unwrap();
+    // a -> b, a -> t, a -> u: three edges, none doubled.
+    assert_eq!(out.len(), 3);
+}
+
+#[test]
 fn match_create_anchors_new_nodes_to_matched_rows() {
     let db = Database::in_memory().unwrap();
     write(
@@ -431,4 +485,60 @@ fn read_parse_rejects_a_write() {
     let e = parse("CREATE (n:Person)").unwrap_err();
     assert!(matches!(e, ParseError::Compile(_)));
     assert!(e.to_string().contains("write statement"));
+}
+
+#[test]
+fn merge_and_create_take_a_parameterised_key() {
+    let db = Database::in_memory().unwrap();
+    let mut params = Params::new();
+    params.insert("k".into(), PropValue::Str("alice".into()));
+    params.insert("age".into(), PropValue::Int(30));
+    // The param is the external key, not a property named `key`.
+    let s = write_p(&db, "MERGE (a:Person {key: $k, age: $age})", &params);
+    assert_eq!(s.nodes_created, 1);
+    let a = plane(&db).node_by_key("alice").unwrap().unwrap();
+    assert!(!a.properties.contains_key("key"));
+    // Idempotent on the same key; a CREATE with a param key sets it too.
+    assert_eq!(
+        write_p(&db, "MERGE (a:Person {key: $k})", &params).nodes_created,
+        0
+    );
+    let mut p2 = Params::new();
+    p2.insert("k".into(), PropValue::Str("bob".into()));
+    write_p(&db, "CREATE (b:Person {key: $k})", &p2);
+    assert!(plane(&db).node_by_key("bob").unwrap().is_some());
+    // A path MERGE with param keys, after a MATCH.
+    let mut p3 = Params::new();
+    p3.insert("team".into(), PropValue::Str("eng".into()));
+    let s = write_p(
+        &db,
+        "MATCH (p:Person) MERGE (p)-[:MEMBER_OF]->(t:Team {key: $team})",
+        &p3,
+    );
+    assert_eq!((s.nodes_created, s.edges_created), (1, 2));
+}
+
+#[test]
+fn a_parameterised_key_must_resolve_to_a_string() {
+    let mut params = Params::new();
+    params.insert("k".into(), PropValue::Int(7));
+    let e = parse_statement_full("MERGE (a:Person {key: $k})", None, &params).unwrap_err();
+    assert!(matches!(e, ParseError::Compile(_)), "{e}");
+    assert!(e.to_string().contains("must be a string"), "{e}");
+    // Unbound: the statement's error, before anything runs.
+    let e = parse_statement("MERGE (a:Person {key: $k})").unwrap_err();
+    assert!(e.to_string().contains("unbound parameter"), "{e}");
+}
+
+#[test]
+fn string_escapes_reach_the_stored_value() {
+    let db = Database::in_memory().unwrap();
+    write(
+        &db,
+        r#"CREATE (a:Person {key:"o\"k", quote:'it\'s', path:"a\\b", nl:"x\ny"})"#,
+    );
+    let a = plane(&db).node_by_key("o\"k").unwrap().unwrap();
+    assert_eq!(a.properties["quote"].value, PropValue::Str("it's".into()));
+    assert_eq!(a.properties["path"].value, PropValue::Str("a\\b".into()));
+    assert_eq!(a.properties["nl"].value, PropValue::Str("x\ny".into()));
 }

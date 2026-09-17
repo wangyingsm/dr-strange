@@ -8,7 +8,7 @@
 //! the ids, then apply the ops to each. A standalone `CREATE` just builds nodes
 //! and edges.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
 use dr_strange_core::{
     Dir, LogicalPlan, NodeId, PlaneHandle, PropDesc, PropValue, Properties, WriteTxn,
@@ -77,8 +77,9 @@ fn is_label_op(op: &WriteOp) -> bool {
 }
 
 /// Validate a parsed write and compile its `MATCH` (if any) into a read plan.
-pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, String> {
+pub fn compile(mut ast: WriteAst, params: crate::Params) -> Result<WriteStatement, String> {
     let has_label_ops = ast.ops.iter().any(is_label_op);
+    resolve_keys(&mut ast.ops, &params)?;
 
     let binding = match ast.match_clause {
         // Standalone: only CREATE / MERGE are allowed with no MATCH.
@@ -124,8 +125,13 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
                 },
                 beams: Vec::new(),
                 where_clause: m.where_clause,
+                // One row per matched node, not per path: a pattern that
+                // reaches a node twice (`(a)-->(n)`, two `a`s) would otherwise
+                // delete it twice — the second time a missing node — and the
+                // ops can't tell the rows apart anyway, since only the
+                // terminal variable is theirs to mutate.
                 ret: Return {
-                    distinct: false,
+                    distinct: true,
                     items: vec![ReturnItem::Star],
                 },
                 order_by: Vec::new(),
@@ -147,12 +153,57 @@ pub fn compile(ast: WriteAst, params: crate::Params) -> Result<WriteStatement, S
     })
 }
 
-/// A MERGE upserts by external key, so every node needs a string `key:`. ON
-/// CREATE/MATCH SET is only for a single-node MERGE and references its variable.
+/// Resolve every `{key: $param}` to its string now, so a missing or non-string
+/// key is the statement's error rather than one row's, and the run-time path
+/// reads plain literals ([`literal_key`]).
+fn resolve_keys(ops: &mut [WriteOp], params: &crate::Params) -> Result<(), String> {
+    fn resolve_node(cn: &mut CreateNode, params: &crate::Params) -> Result<(), String> {
+        if let Some(Val::Param(name)) = &cn.key {
+            match crate::resolve_param(params, name)? {
+                s @ PropValue::Str(_) => cn.key = Some(Val::Lit(s)),
+                other => {
+                    return Err(format!(
+                        "`key:` must be a string to serve as the external key; `${name}` is {other:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    for op in ops {
+        let paths: Vec<&mut CreatePath> = match op {
+            WriteOp::Create(paths) => paths.iter_mut().collect(),
+            WriteOp::Merge(m) => vec![&mut m.path],
+            _ => continue,
+        };
+        for path in paths {
+            resolve_node(&mut path.first, params)?;
+            for (_, node) in &mut path.rest {
+                resolve_node(node, params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The node's external key, which [`resolve_keys`] has made a literal.
+fn literal_key(cn: &CreateNode) -> Option<&str> {
+    match &cn.key {
+        Some(Val::Lit(PropValue::Str(s))) => Some(s),
+        _ => None,
+    }
+}
+
+/// A MERGE upserts by external key, so every node needs a string `key:` —
+/// unless it re-names a node earlier in the path (`(a)-[:R]->(b)<-[:S]-(a)`),
+/// which is already resolved. ON CREATE/MATCH SET is only for a single-node
+/// MERGE and references its variable.
 fn validate_merge(m: &MergeClause) -> Result<(), String> {
     let nodes = std::iter::once(&m.path.first).chain(m.path.rest.iter().map(|(_, n)| n));
+    let mut bound: AHashSet<&str> = AHashSet::new();
     for n in nodes {
-        if n.key.is_none() {
+        let rebound = n.var.as_deref().is_some_and(|v| !bound.insert(v));
+        if n.key.is_none() && !rebound {
             return Err(
                 "MERGE needs a `key:` on every node to upsert on, e.g. MERGE (n:Label {key:\"…\"})"
                     .to_string(),
@@ -231,7 +282,7 @@ fn props_of(entries: &[(String, Val)], params: &crate::Params) -> Result<Propert
 }
 
 fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummary, String> {
-    let mut summary = WriteSummary::default();
+    let mut staged = Staged::new(&stmt.params);
 
     // Find-then-mutate: run the MATCH read plan to get the target ids.
     let ids: Vec<NodeId> = match &stmt.binding {
@@ -242,62 +293,48 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
         None => Vec::new(),
     };
 
-    // Preload current labels for the targets (label SET/REMOVE is
-    // read-modify-write; core `set_labels` replaces the whole set).
-    let mut labels: AHashMap<u64, Vec<String>> = AHashMap::new();
+    // Preloaded rather than read per op: a label SET/REMOVE rewrites the whole
+    // set, so the ops need the one the store holds now.
     if stmt.has_label_ops {
         for id in &ids {
             if let Some(n) = plane.node(*id).map_err(|e| e.to_string())? {
-                labels.insert(id.0, n.labels);
+                staged.labels.insert(id.0, n.labels);
             }
         }
     }
 
+    let rows = Rows { stmt, ids: &ids };
     let mut txn = plane.write().map_err(|e| e.to_string())?;
-    // Statement-scoped: keyed nodes upserted by MERGE, so a shared target across
-    // matched rows resolves to one node (node_by_key can't see the uncommitted
-    // create). Persists across ops and per-row loops.
-    let mut merged: AHashMap<&str, NodeId> = AHashMap::new();
-
     for op in &stmt.ops {
         match op {
             WriteOp::Create(paths) => {
-                run_create(&mut txn, paths, stmt, &ids, &mut summary)?;
+                run_create(&mut txn, paths, rows, &mut staged)?;
             }
             WriteOp::Merge(m) => {
-                run_merge(
-                    plane,
-                    &mut txn,
-                    m,
-                    stmt,
-                    &ids,
-                    &mut merged,
-                    &mut labels,
-                    &mut summary,
-                )?;
+                run_merge(plane, &mut txn, m, rows, &mut staged)?;
             }
             WriteOp::Set(items) => {
                 for id in &ids {
                     for it in items {
-                        apply_set(&mut txn, *id, it, &mut labels, &mut summary, &stmt.params)?;
+                        apply_set(&mut txn, *id, it, &mut staged)?;
                     }
                 }
             }
             WriteOp::Remove(items) => {
                 for id in &ids {
                     for it in items {
-                        apply_remove(&mut txn, *id, it, &mut labels, &mut summary)?;
+                        apply_remove(&mut txn, *id, it, &mut staged)?;
                     }
                 }
             }
             WriteOp::Delete { detach, .. } => {
-                run_delete(plane, &mut txn, &ids, *detach, &mut labels, &mut summary)?;
+                run_delete(plane, &mut txn, rows, *detach, &mut staged)?;
             }
         }
     }
 
     txn.commit().map_err(|e| e.to_string())?;
-    Ok(summary)
+    Ok(staged.summary)
 }
 
 /// `CREATE`, standalone or after a `MATCH`.
@@ -308,23 +345,22 @@ fn execute(plane: &PlaneHandle<'_>, stmt: &WriteStatement) -> Result<WriteSummar
 fn run_create<'a>(
     txn: &mut WriteTxn<'_>,
     paths: &'a [CreatePath],
-    stmt: &'a WriteStatement,
-    ids: &[NodeId],
-    summary: &mut WriteSummary,
+    rows: Rows<'a>,
+    staged: &mut Staged<'a>,
 ) -> Result<(), String> {
-    match &stmt.binding {
+    match &rows.stmt.binding {
         None => {
             let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
             for path in paths {
-                create_path(txn, path, &mut vars, summary, &stmt.params)?;
+                create_path(txn, path, &mut vars, staged)?;
             }
         }
         Some((bound, _)) => {
-            for id in ids {
+            for id in rows.ids {
                 let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
                 vars.insert(bound.as_str(), *id);
                 for path in paths {
-                    create_path(txn, path, &mut vars, summary, &stmt.params)?;
+                    create_path(txn, path, &mut vars, staged)?;
                 }
             }
         }
@@ -333,48 +369,26 @@ fn run_create<'a>(
 }
 
 /// `MERGE`, standalone or once per matched row — the same anchoring rule as
-/// [`run_create`]. `merged` outlives the rows on purpose: a keyed node two rows
-/// both name must resolve to one node, and `node_by_key` cannot see a create
-/// this transaction has not committed.
-#[allow(clippy::too_many_arguments)]
+/// [`run_create`]. [`Staged::keyed`] outlives the rows on purpose: a keyed node
+/// two rows both name must resolve to one node, and `node_by_key` cannot see a
+/// create this transaction has not committed.
 fn run_merge<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     m: &'a MergeClause,
-    stmt: &'a WriteStatement,
-    ids: &[NodeId],
-    merged: &mut AHashMap<&'a str, NodeId>,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
+    rows: Rows<'a>,
+    staged: &mut Staged<'a>,
 ) -> Result<(), String> {
-    match &stmt.binding {
+    match &rows.stmt.binding {
         None => {
             let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
-            merge_path(
-                plane,
-                txn,
-                m,
-                &mut vars,
-                merged,
-                labels,
-                summary,
-                &stmt.params,
-            )?;
+            merge_path(plane, txn, m, &mut vars, staged)?;
         }
         Some((bound, _)) => {
-            for id in ids {
+            for id in rows.ids {
                 let mut vars: AHashMap<&'a str, NodeId> = AHashMap::new();
                 vars.insert(bound.as_str(), *id);
-                merge_path(
-                    plane,
-                    txn,
-                    m,
-                    &mut vars,
-                    merged,
-                    labels,
-                    summary,
-                    &stmt.params,
-                )?;
+                merge_path(plane, txn, m, &mut vars, staged)?;
             }
         }
     }
@@ -389,12 +403,11 @@ fn run_merge<'a>(
 fn run_delete(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
-    ids: &[NodeId],
+    rows: Rows<'_>,
     detach: bool,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
+    staged: &mut Staged<'_>,
 ) -> Result<(), String> {
-    for id in ids {
+    for id in rows.ids {
         if !detach
             && !plane
                 .neighbors(*id, Dir::Both, None)
@@ -407,8 +420,8 @@ fn run_delete(
             ));
         }
         txn.delete_node(*id).map_err(|e| e.to_string())?;
-        summary.nodes_deleted += 1;
-        labels.remove(&id.0);
+        staged.summary.nodes_deleted += 1;
+        staged.labels.remove(&id.0);
     }
     Ok(())
 }
@@ -417,30 +430,28 @@ fn apply_set(
     txn: &mut WriteTxn<'_>,
     id: NodeId,
     it: &SetItem,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'_>,
 ) -> Result<(), String> {
     match it {
         SetItem::Prop { key, value, .. } => {
-            txn.set_prop(id, key, PropDesc::new(resolve_val(value, params)?))
+            txn.set_prop(id, key, PropDesc::new(resolve_val(value, staged.params)?))
                 .map_err(|e| e.to_string())?;
-            summary.props_set += 1;
+            staged.summary.props_set += 1;
         }
         SetItem::Merge { props, .. } => {
             for (k, v) in props {
-                txn.set_prop(id, k, PropDesc::new(resolve_val(v, params)?))
+                txn.set_prop(id, k, PropDesc::new(resolve_val(v, staged.params)?))
                     .map_err(|e| e.to_string())?;
-                summary.props_set += 1;
+                staged.summary.props_set += 1;
             }
         }
         SetItem::Label { label, .. } => {
-            let set = labels.entry(id.0).or_default();
+            let set = staged.labels.entry(id.0).or_default();
             if !set.iter().any(|l| l == label) {
                 set.push(label.clone());
                 let refs: Vec<&str> = set.iter().map(String::as_str).collect();
                 txn.set_labels(id, &refs).map_err(|e| e.to_string())?;
-                summary.labels_set += 1;
+                staged.summary.labels_set += 1;
             }
         }
     }
@@ -451,22 +462,21 @@ fn apply_remove(
     txn: &mut WriteTxn<'_>,
     id: NodeId,
     it: &RemoveItem,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
+    staged: &mut Staged<'_>,
 ) -> Result<(), String> {
     match it {
         RemoveItem::Prop { key, .. } => {
             txn.remove_prop(id, key).map_err(|e| e.to_string())?;
-            summary.props_set += 1;
+            staged.summary.props_set += 1;
         }
         RemoveItem::Label { label, .. } => {
-            let set = labels.entry(id.0).or_default();
+            let set = staged.labels.entry(id.0).or_default();
             let before = set.len();
             set.retain(|l| l != label);
             if set.len() != before {
                 let refs: Vec<&str> = set.iter().map(String::as_str).collect();
                 txn.set_labels(id, &refs).map_err(|e| e.to_string())?;
-                summary.labels_set += 1;
+                staged.summary.labels_set += 1;
             }
         }
     }
@@ -477,36 +487,23 @@ fn apply_remove(
 
 /// Execute a MERGE (single node or path): upsert each keyed node by external
 /// key, apply ON CREATE/MATCH SET to a single node, and ensure each edge.
-#[allow(clippy::too_many_arguments)]
 fn merge_path<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     m: &'a MergeClause,
     vars: &mut AHashMap<&'a str, NodeId>,
-    merged: &mut AHashMap<&'a str, NodeId>,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'a>,
 ) -> Result<(), String> {
-    let (first_id, created) = upsert_merge_node(
-        plane,
-        txn,
-        &m.path.first,
-        vars,
-        merged,
-        labels,
-        summary,
-        params,
-    )?;
+    let (first_id, created) = upsert_merge_node(plane, txn, &m.path.first, vars, staged)?;
     // ON CREATE / ON MATCH SET apply to a single-node MERGE's node.
     let items = if created { &m.on_create } else { &m.on_match };
     for it in items {
-        apply_set(txn, first_id, it, labels, summary, params)?;
+        apply_set(txn, first_id, it, staged)?;
     }
     let mut prev = first_id;
     for (rel, node) in &m.path.rest {
-        let (cur, _) = upsert_merge_node(plane, txn, node, vars, merged, labels, summary, params)?;
-        ensure_edge(plane, txn, prev, cur, rel, summary, params)?;
+        let (cur, _) = upsert_merge_node(plane, txn, node, vars, staged)?;
+        ensure_edge(plane, txn, (prev, cur), rel, staged)?;
         prev = cur;
     }
     Ok(())
@@ -514,32 +511,25 @@ fn merge_path<'a>(
 
 /// Find a node by external key (and bind it) or create it. Reuse order: an
 /// already-bound variable (a matched anchor / an earlier node in this path),
-/// then a node upserted earlier *in this statement* by the same key (`merged` —
-/// needed because `node_by_key` can't see the uncommitted create, e.g. a shared
-/// MERGE target across matched rows), then the committed store. Returns
-/// `(id, created)`.
-#[allow(clippy::too_many_arguments)]
+/// then a node upserted earlier *in this statement* by the same key
+/// ([`Staged::keyed`] — needed because `node_by_key` can't see the uncommitted
+/// create, e.g. a shared MERGE target across matched rows), then the committed
+/// store. Returns `(id, created)`.
 fn upsert_merge_node<'a>(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
     vars: &mut AHashMap<&'a str, NodeId>,
-    merged: &mut AHashMap<&'a str, NodeId>,
-    labels: &mut AHashMap<u64, Vec<String>>,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'a>,
 ) -> Result<(NodeId, bool), String> {
     if let Some(v) = &cn.var
         && let Some(&id) = vars.get(v.as_str())
     {
         return Ok((id, false));
     }
-    let key = cn
-        .key
-        .as_deref()
-        .ok_or("MERGE node needs a `key:` to upsert on")?;
+    let key = literal_key(cn).ok_or("MERGE node needs a `key:` to upsert on")?;
 
-    if let Some(&id) = merged.get(key) {
+    if let Some(&id) = staged.keyed.get(key) {
         if let Some(v) = &cn.var {
             vars.insert(v.as_str(), id);
         }
@@ -549,53 +539,102 @@ fn upsert_merge_node<'a>(
     let (id, created) = match plane.node_by_key(key).map_err(|e| e.to_string())? {
         Some(found) => {
             let id = found.id;
-            labels.entry(id.0).or_insert(found.labels);
+            staged.labels.entry(id.0).or_insert(found.labels);
             (id, false)
         }
         None => {
             let label_refs: Vec<&str> = cn.label.as_deref().into_iter().collect();
             let id = txn
-                .create_node_with_key(key, &label_refs, props_of(&cn.props, params)?)
+                .create_node_with_key(key, &label_refs, props_of(&cn.props, staged.params)?)
                 .map_err(|e| e.to_string())?;
-            summary.nodes_created += 1;
-            labels
+            staged.summary.nodes_created += 1;
+            staged
+                .labels
                 .entry(id.0)
                 .or_insert_with(|| cn.label.clone().into_iter().collect());
             (id, true)
         }
     };
-    merged.insert(key, id);
+    staged.keyed.insert(key, id);
     if let Some(v) = &cn.var {
         vars.insert(v.as_str(), id);
     }
     Ok((id, created))
 }
 
-/// Ensure a directed edge of `rel.ty` exists between `prev` and `cur` — MERGE is
-/// idempotent, so a matching edge is not duplicated.
+/// A statement in flight: what it has written so far, and the params it
+/// resolves values from.
+///
+/// One transaction spans every op, and the committed store shows none of its
+/// work until commit — so each op reads here what the ones before it made.
+struct Staged<'a> {
+    /// `$name` values, for every op that resolves one.
+    params: &'a crate::Params,
+    /// Keyed nodes this statement upserted or created, so one key names one
+    /// node however many rows or clauses reach it.
+    keyed: AHashMap<&'a str, NodeId>,
+    /// The `(src, dst, type)` triples created, which `ensure_edge` must check
+    /// on top of the committed store.
+    edges: AHashSet<(NodeId, NodeId, String)>,
+    /// Labels per node id: a label SET/REMOVE is read-modify-write, since
+    /// core's `set_labels` replaces the whole set.
+    labels: AHashMap<u64, Vec<String>>,
+    /// The counts returned to the caller.
+    summary: WriteSummary,
+}
+
+impl<'a> Staged<'a> {
+    /// An empty statement, resolving values from `params`.
+    fn new(params: &'a crate::Params) -> Self {
+        Self {
+            params,
+            keyed: AHashMap::new(),
+            edges: AHashSet::new(),
+            labels: AHashMap::new(),
+            summary: WriteSummary::default(),
+        }
+    }
+}
+
+/// The nodes a `MATCH` bound, and the statement that named them.
+///
+/// The two travel together: `ids` is empty exactly when the statement has no
+/// binding, and every op that runs per row needs both — the ids to anchor on
+/// and the binding to say which variable they are.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    stmt: &'a WriteStatement,
+    ids: &'a [NodeId],
+}
+
+/// Ensure a directed edge of `rel.ty` exists between the `(prev, cur)` pair —
+/// MERGE is idempotent, so a matching edge is not duplicated, whether it was
+/// committed earlier or created a clause ago in this same statement.
 fn ensure_edge(
     plane: &PlaneHandle<'_>,
     txn: &mut WriteTxn<'_>,
-    prev: NodeId,
-    cur: NodeId,
+    (prev, cur): (NodeId, NodeId),
     rel: &CreateRel,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'_>,
 ) -> Result<(), String> {
     // `->` is prev→cur; `<-` is cur→prev.
     let (src, dst) = match rel.dir {
         Dir::In => (cur, prev),
         _ => (prev, cur),
     };
+    if staged.edges.contains(&(src, dst, rel.ty.clone())) {
+        return Ok(());
+    }
     let existing = plane
         .neighbors(src, Dir::Out, Some(&rel.ty))
         .map_err(|e| e.to_string())?;
     if existing.iter().any(|n| n.node == dst) {
         return Ok(());
     }
-    txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
+    txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, staged.params)?)
         .map_err(|e| e.to_string())?;
-    summary.edges_created += 1;
+    staged.edges.insert((src, dst, rel.ty.clone()));
+    staged.summary.edges_created += 1;
     Ok(())
 }
 
@@ -605,8 +644,7 @@ fn get_or_create<'a>(
     txn: &mut WriteTxn<'_>,
     cn: &'a CreateNode,
     vars: &mut AHashMap<&'a str, NodeId>,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'a>,
 ) -> Result<NodeId, String> {
     if let Some(v) = &cn.var
         && let Some(&id) = vars.get(v.as_str())
@@ -614,14 +652,20 @@ fn get_or_create<'a>(
         return Ok(id); // same variable → the same node
     }
     let labels: Vec<&str> = cn.label.as_deref().into_iter().collect();
-    let props = props_of(&cn.props, params)?;
-    let id = match &cn.key {
-        Some(k) => txn
-            .create_node_with_key(k, &labels, props)
-            .map_err(|e| e.to_string())?,
+    let props = props_of(&cn.props, staged.params)?;
+    let id = match literal_key(cn) {
+        Some(k) => {
+            let id = txn
+                .create_node_with_key(k, &labels, props)
+                .map_err(|e| e.to_string())?;
+            // A MERGE later in this statement upserts on the same key; the
+            // store won't show it the node until commit, so tell it here.
+            staged.keyed.insert(k, id);
+            id
+        }
         None => txn.create_node(&labels, props).map_err(|e| e.to_string())?,
     };
-    summary.nodes_created += 1;
+    staged.summary.nodes_created += 1;
     if let Some(v) = &cn.var {
         vars.insert(v.as_str(), id);
     }
@@ -632,20 +676,22 @@ fn create_path<'a>(
     txn: &mut WriteTxn<'_>,
     path: &'a CreatePath,
     vars: &mut AHashMap<&'a str, NodeId>,
-    summary: &mut WriteSummary,
-    params: &crate::Params,
+    staged: &mut Staged<'a>,
 ) -> Result<(), String> {
-    let mut prev = get_or_create(txn, &path.first, vars, summary, params)?;
+    let mut prev = get_or_create(txn, &path.first, vars, staged)?;
     for (rel, node) in &path.rest {
-        let cur = get_or_create(txn, node, vars, summary, params)?;
+        let cur = get_or_create(txn, node, vars, staged)?;
         // `->` is prev→cur; `<-` is cur→prev (the parser rejects undirected).
         let (src, dst) = match rel.dir {
             Dir::In => (cur, prev),
             _ => (prev, cur),
         };
-        txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, params)?)
+        txn.create_edge(src, dst, &rel.ty, props_of(&rel.props, staged.params)?)
             .map_err(|e| e.to_string())?;
-        summary.edges_created += 1;
+        // CREATE always adds; it records the edge so a MERGE later in the
+        // same statement sees it.
+        staged.edges.insert((src, dst, rel.ty.clone()));
+        staged.summary.edges_created += 1;
         prev = cur;
     }
     Ok(())

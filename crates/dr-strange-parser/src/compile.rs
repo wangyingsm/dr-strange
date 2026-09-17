@@ -135,12 +135,27 @@ fn push_down_where(
     for conj in split_and(w) {
         let vars = referenced_vars(&conj);
         let slot = match vars.len() {
-            0 => 0, // constant predicate — evaluate at the source
+            // No variable: a constant, or the row channels `score()` /
+            // `hops()`. Those are only settled once the whole path has been
+            // walked — `hops()` counts the hops taken so far, and a BEAM
+            // rewrites `score()` — so the predicate goes on the last slot. At
+            // the source it would read hops() = 0 and a score no MATCH has
+            // yet, and silently drop every row.
+            0 => slots - 1,
             1 => {
                 let v = vars.iter().next().unwrap();
-                *var_slot
+                let slot = *var_slot
                     .get(v.as_str())
-                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?
+                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?;
+                // The same channels mixed with an earlier variable in one
+                // conjunct (`hops() = 2 OR a.x = 1`) cannot be split off, and
+                // at the variable's own slot would read the same unsettled
+                // values. Evaluated at the last slot instead, where the
+                // variable is reached through `Expr::At`.
+                match reads_row_channel(&conj) {
+                    true => slots - 1,
+                    false => slot,
+                }
             }
             _ => {
                 return Err(
@@ -381,12 +396,22 @@ fn compile_sort(
 ) -> Result<Vec<SortKey>, String> {
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        let SortTarget::Expr(e) = &key.target else {
-            return Err(format!(
-                "ORDER BY `{}`: a bare name orders by a RETURN alias, and this query \
-                 returns nodes rather than columns",
-                key.text
-            ));
+        let e = match &key.target {
+            SortTarget::Expr(e) => e,
+            SortTarget::Name(_) => {
+                return Err(format!(
+                    "ORDER BY `{}`: a bare name orders by a RETURN alias, and this query \
+                     returns nodes rather than columns",
+                    key.text
+                ));
+            }
+            SortTarget::Agg { .. } => {
+                return Err(format!(
+                    "ORDER BY `{}`: an aggregate orders a projection, and this query \
+                     returns nodes rather than columns (`RETURN n.name, {}`)",
+                    key.text, key.text
+                ));
+            }
         };
         for v in referenced_vars(e) {
             let slot = *var_slot
@@ -429,10 +454,34 @@ fn order_columns(
         let column = match (by_name, &key.target) {
             (Some(i), _) => i,
             (None, SortTarget::Expr(e)) => {
-                let compiled = compile_expr(e, embedder, params, scope)?;
+                let compiled = ProjExpr::Value(compile_expr(e, embedder, params, scope)?);
                 items
                     .iter()
-                    .position(|c| c.expr == ProjExpr::Value(compiled.clone()))
+                    .position(|c| c.expr == compiled)
+                    .ok_or_else(|| unknown_column(&key.text, items))?
+            }
+            // `ORDER BY count(*)` when the column was aliased (or spelled
+            // `COUNT(*)`): the same fold is the same column.
+            (
+                None,
+                SortTarget::Agg {
+                    func,
+                    arg,
+                    distinct,
+                },
+            ) => {
+                let arg = arg
+                    .as_ref()
+                    .map(|e| compile_expr(e, embedder, params, scope))
+                    .transpose()?;
+                let compiled = ProjExpr::Agg(Agg {
+                    func: *func,
+                    arg,
+                    distinct: *distinct,
+                });
+                items
+                    .iter()
+                    .position(|c| c.expr == compiled)
                     .ok_or_else(|| unknown_column(&key.text, items))?
             }
             (None, SortTarget::Name(_)) => return Err(unknown_column(&key.text, items)),
@@ -614,9 +663,8 @@ fn compile_algo(c: &CallClause, params: &crate::Params) -> Result<Algo, String> 
                 damping: args.float("damping")?.unwrap_or(d.damping),
                 // `iterations` reads better in a query than the API's field name.
                 max_iters: args
-                    .int("iterations")?
-                    .or(args.int("max_iters")?)
-                    .map(|n| n as u32)
+                    .u32("iterations")?
+                    .or(args.u32("max_iters")?)
                     .unwrap_or(d.max_iters),
                 tolerance: args.float("tolerance")?.unwrap_or(d.tolerance),
             }
@@ -625,17 +673,20 @@ fn compile_algo(c: &CallClause, params: &crate::Params) -> Result<Algo, String> 
         "louvain" => {
             let d = LouvainOptions::default();
             Algo::Louvain {
-                max_levels: args
-                    .int("max_levels")?
-                    .map(|n| n as u32)
-                    .unwrap_or(d.max_levels),
+                max_levels: args.u32("max_levels")?.unwrap_or(d.max_levels),
                 min_gain: args.float("min_gain")?.unwrap_or(d.min_gain),
             }
         }
         "shortest_path" => Algo::ShortestPath {
             from: args.node_ref("from")?,
             to: args.node_ref("to")?,
-            dir: match args.string("dir")?.as_deref() {
+            // The direction is a keyword-like choice, so its case is free; the
+            // weight names a property, whose case is the user's.
+            dir: match args
+                .string("dir")?
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
                 None | Some("out") => Dir::Out,
                 Some("in") => Dir::In,
                 Some("both") => Dir::Both,
@@ -701,10 +752,22 @@ impl AlgoArgs {
         }
     }
 
+    /// A whole-number argument that must fit the option it sets: `1e12`
+    /// iterations is refused, not silently truncated to whatever its low
+    /// 32 bits spell.
+    fn u32(&mut self, name: &str) -> Result<Option<u32>, String> {
+        match self.int(name)? {
+            None => Ok(None),
+            Some(n) => u32::try_from(n)
+                .map(Some)
+                .map_err(|_| format!("`{name}` must be at most {}, got {n}", u32::MAX)),
+        }
+    }
+
     fn string(&mut self, name: &str) -> Result<Option<String>, String> {
         match self.take(name) {
             None => Ok(None),
-            Some(PropValue::Str(s)) => Ok(Some(s.to_ascii_lowercase())),
+            Some(PropValue::Str(s)) => Ok(Some(s)),
             Some(other) => Err(format!("`{name}` must be a string, got {other:?}")),
         }
     }
@@ -790,6 +853,28 @@ fn split_and(e: PExpr) -> Vec<PExpr> {
             v
         }
         other => vec![other],
+    }
+}
+
+/// Whether an expression reads the row's `score()` or `hops()` channel —
+/// values a path settles only at its last node.
+fn reads_row_channel(e: &PExpr) -> bool {
+    match e {
+        PExpr::Score | PExpr::Hops => true,
+        PExpr::Lit(_)
+        | PExpr::Param(_)
+        | PExpr::Prop { .. }
+        | PExpr::HasLabel { .. }
+        | PExpr::ExternalKey { .. }
+        | PExpr::Similarity { .. }
+        | PExpr::Distance { .. } => false,
+        PExpr::In { lhs, list } => reads_row_channel(lhs) || list.iter().any(reads_row_channel),
+        PExpr::InValue { lhs, haystack } => reads_row_channel(lhs) || reads_row_channel(haystack),
+        PExpr::IsNull(x) | PExpr::Not(x) | PExpr::Neg(x) => reads_row_channel(x),
+        PExpr::StringMatch { lhs, rhs, .. }
+        | PExpr::Compare { lhs, rhs, .. }
+        | PExpr::Logic { lhs, rhs, .. }
+        | PExpr::Arith { lhs, rhs, .. } => reads_row_channel(lhs) || reads_row_channel(rhs),
     }
 }
 
@@ -889,23 +974,15 @@ fn compile_expr(
         // here — it became a `SeekKeys` seek.)
         PExpr::In { lhs, list } => {
             let lhs = compile_expr(lhs, embedder, params, scope)?;
-            let mut out: Option<Expr> = None;
+            let mut eqs = Vec::with_capacity(list.len());
             for item in list {
-                let eq = Expr::Compare {
+                eqs.push(Expr::Compare {
                     op: CmpOp::Eq,
                     lhs: Box::new(lhs.clone()),
                     rhs: sub(item)?,
-                };
-                out = Some(match out {
-                    None => eq,
-                    Some(prev) => Expr::Logic {
-                        op: LogicOp::Or,
-                        lhs: Box::new(prev),
-                        rhs: Box::new(eq),
-                    },
                 });
             }
-            out.unwrap_or(Expr::Literal(PropValue::Bool(false)))
+            balanced(LogicOp::Or, eqs).unwrap_or(Expr::Literal(PropValue::Bool(false)))
         }
         // Not sugar, unlike `PExpr::In`: the haystack is a per-row value, so
         // it stays an operator the executor evaluates.
@@ -919,7 +996,11 @@ fn compile_expr(
             rhs: sub(rhs)?,
         },
         PExpr::IsNull(x) => Expr::IsNull(sub(x)?),
-        PExpr::Not(x) => Expr::Not(sub(x)?),
+        // `NOT` over a missing property: core's evaluator is two-valued (a
+        // missing value makes the inner predicate false, so its negation
+        // true), openCypher's is not (NOT null = null, which no filter
+        // keeps). Guard with the leaves so both agree.
+        PExpr::Not(x) => null_guarded(Expr::Not(sub(x)?), &[x], embedder, params, scope)?,
         // Fold `-literal` to a literal; otherwise `0 - x` (core has no negate).
         PExpr::Neg(x) => match compile_expr(x, embedder, params, scope)? {
             Expr::Literal(PropValue::Int(n)) => Expr::Literal(PropValue::Int(-n)),
@@ -930,11 +1011,26 @@ fn compile_expr(
                 rhs: Box::new(other),
             },
         },
-        PExpr::Compare { op, lhs, rhs } => Expr::Compare {
-            op: *op,
-            lhs: sub(lhs)?,
-            rhs: sub(rhs)?,
-        },
+        PExpr::Compare { op, lhs, rhs } => {
+            let cmp = Expr::Compare {
+                op: *op,
+                lhs: sub(lhs)?,
+                rhs: sub(rhs)?,
+            };
+            match op {
+                // `<>` against a missing value is true in core and null in
+                // openCypher; `=` differs only when *both* sides can be
+                // missing (Null = Null holds in core). The ordered
+                // comparisons are already false on a missing operand.
+                CmpOp::Ne => null_guarded(cmp, &[lhs, rhs], embedder, params, scope)?,
+                CmpOp::Eq
+                    if !is_non_null_constant(lhs, params) && !is_non_null_constant(rhs, params) =>
+                {
+                    null_guarded(cmp, &[lhs, rhs], embedder, params, scope)?
+                }
+                _ => cmp,
+            }
+        }
         PExpr::Logic { op, lhs, rhs } => Expr::Logic {
             op: *op,
             lhs: sub(lhs)?,
@@ -974,4 +1070,119 @@ fn compile_expr(
             },
         )?,
     })
+}
+
+/// A literal or parameter that is not `null` — an operand that can never be
+/// missing, so needs no guard.
+fn is_non_null_constant(e: &PExpr, params: &crate::Params) -> bool {
+    match e {
+        PExpr::Lit(v) => !matches!(v, PropValue::Null),
+        PExpr::Param(name) => !matches!(
+            crate::resolve_param(params, name),
+            Ok(PropValue::Null) | Err(_)
+        ),
+        _ => false,
+    }
+}
+
+/// The sub-expressions of `roots` that can evaluate to `Null`: property reads,
+/// the external key, the row channels that may be unset, and a literal
+/// `null` itself. Each distinct one once, in first-seen order.
+fn nullable_leaves<'e>(roots: &[&'e PExpr]) -> Vec<&'e PExpr> {
+    fn go<'e>(e: &'e PExpr, out: &mut Vec<&'e PExpr>) {
+        match e {
+            PExpr::Prop { .. }
+            | PExpr::ExternalKey { .. }
+            | PExpr::Score
+            | PExpr::Similarity { .. }
+            | PExpr::Distance { .. }
+            | PExpr::Lit(PropValue::Null)
+            | PExpr::Param(_) => {
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+            // Never null: a non-null literal, a label test, a hop count, and
+            // `IS NULL` itself (which is how null is asked about).
+            PExpr::Lit(_) | PExpr::HasLabel { .. } | PExpr::Hops | PExpr::IsNull(_) => {}
+            PExpr::In { lhs, list } => {
+                go(lhs, out);
+                for e in list {
+                    go(e, out);
+                }
+            }
+            PExpr::InValue { lhs, haystack } => {
+                go(lhs, out);
+                go(haystack, out);
+            }
+            PExpr::StringMatch { lhs, rhs, .. }
+            | PExpr::Compare { lhs, rhs, .. }
+            | PExpr::Logic { lhs, rhs, .. }
+            | PExpr::Arith { lhs, rhs, .. } => {
+                go(lhs, out);
+                go(rhs, out);
+            }
+            PExpr::Not(x) | PExpr::Neg(x) => go(x, out),
+        }
+    }
+    let mut out = Vec::new();
+    for r in roots {
+        go(r, &mut out);
+    }
+    out
+}
+
+/// `pred`, true only where every nullable leaf under `roots` is present:
+/// `l1 IS NOT NULL AND l2 IS NOT NULL AND pred`. This is how the compiler
+/// meets openCypher's null semantics on the predicates where a two-valued
+/// evaluator says *true* for a missing value — `<>` and `NOT` — without
+/// teaching the executor three-valued logic. It is exact for a predicate
+/// over one property (the common case) and stricter than openCypher for a
+/// compound one under `NOT`, where a false branch would have absorbed the
+/// null: `NOT (n.a = 1 AND n.b = 2)` keeps a node with `b = 3` and no `a` in
+/// openCypher, and drops it here. `lib.rs` documents that divergence.
+fn null_guarded(
+    pred: Expr,
+    roots: &[&PExpr],
+    embedder: Option<&dyn Embedder>,
+    params: &crate::Params,
+    scope: &Scope,
+) -> Result<Expr, String> {
+    let mut present = Vec::new();
+    for leaf in nullable_leaves(roots) {
+        // A param that doesn't resolve fails here as it would anywhere.
+        present.push(compile_expr(leaf, embedder, params, scope)?.is_null().not());
+    }
+    Ok(match balanced(LogicOp::And, present) {
+        None => pred,
+        Some(guards) => guards.and(pred),
+    })
+}
+
+/// `items` joined under `op`, or `None` when there are none.
+///
+/// Balanced, not left-deep: a list is as long as the query body allows
+/// (`x IN [… × 100 000]` is under a megabyte), and core evaluates and drops
+/// an `Expr` recursively on the machine stack, so a chain that long is a
+/// stack overflow — a balanced tree of it is seventeen levels. The parser's
+/// nesting budget bounds every *written* chain; this bounds the ones the
+/// compiler makes. Pairwise rounds keep the first items leftmost, so a short
+/// list reads as it did (`(a OR b) OR c`).
+fn balanced(op: LogicOp, mut items: Vec<Expr>) -> Option<Expr> {
+    while items.len() > 1 {
+        let mut next = Vec::with_capacity(items.len().div_ceil(2));
+        let mut it = items.into_iter();
+        while let Some(lhs) = it.next() {
+            next.push(match it.next() {
+                Some(rhs) => Expr::Logic {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                None => lhs,
+            });
+        }
+        items = next;
+    }
+    items.pop()
 }

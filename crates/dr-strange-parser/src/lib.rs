@@ -50,7 +50,8 @@
 //!   each optionally `DISTINCT`, grouped by every column that isn't one.
 //! - `ORDER BY expr [ASC|DESC], …`, `SKIP n`, `LIMIT n` — steps over node rows;
 //!   on the projection tail otherwise, where `ORDER BY` names a returned column
-//!   (by alias, or by the expression it returned).
+//!   (by alias, by the expression it returned, or by the aggregate it folds:
+//!   `ORDER BY count(*)`).
 //! - **`AS OF <seq|"RFC-3339"|TIME <ms>>`** — last clause; reads a past
 //!   snapshot (native backend). Not a plan node: it rides on [`ReadQuery`] for
 //!   the surface to apply with `PlaneHandle::as_of`.
@@ -64,26 +65,65 @@
 //!   external key; edges are directed (`->`/`<-`).
 //! - `MERGE (n:L {key: "…", …}) [ON CREATE SET …] [ON MATCH SET …]` — upsert a
 //!   node by its external key; a path `MERGE (a {key})-[:T]->(b {key})` upserts
-//!   each keyed node and ensures the edge (idempotent, element-wise).
+//!   each keyed node and ensures the edge (idempotent, element-wise — also
+//!   against what earlier clauses of the same statement created).
 //! - `MATCH pattern [WHERE …] SET n.p = v, n:Label, n += {…}` /
 //!   `REMOVE n.p, n:Label` / `[DETACH] DELETE n` — find-then-mutate on the
-//!   pattern's terminal variable (plain `DELETE` refuses a connected node).
+//!   pattern's terminal variable, once per distinct matched node however many
+//!   paths reach it (plain `DELETE` refuses a connected node).
 //! - `MATCH pattern [WHERE …] CREATE (n)-[:T]->(x {…})` /
 //!   `MERGE (n)-[:T]->(x {key})` — once per matched row, with the terminal
 //!   variable pre-bound so `(n)` anchors to the matched node.
 //!
 //! # Parameters
 //! `$name` placeholders in value positions (WHERE/ORDER literals, SET/CREATE/
-//! MERGE props) are resolved from a caller-supplied [`Params`] map via
-//! [`parse_statement_full`] — the SDK-safe way to pass values (no string
-//! interpolation).
+//! MERGE props, and a node's `key:`) are resolved from a caller-supplied
+//! [`Params`] map via [`parse_statement_full`] — the SDK-safe way to pass
+//! values (no string interpolation).
 //!
-//! # Not yet (each is a clear error, never a silent miscompile)
+//! # Null
+//! Core's evaluator is two-valued: a missing property makes a predicate
+//! false, so left alone `n.p <> 1`, `NOT n.p = 1` and `NOT n.p IN [..]` would
+//! be *true* for a node with no `p`. The compiler guards those — `<>`, `NOT`,
+//! and `=` with no constant side — with `IS NOT NULL` on every property (or
+//! channel, or literal `null`) they read, so for a predicate over one
+//! property the rows match openCypher: a missing value satisfies neither the
+//! test nor its negation, `n.p = null` keeps nothing, and `IS [NOT] NULL` is
+//! how absence is asked about. Where this is stricter than openCypher: under
+//! `NOT`, a compound predicate whose false branch would have absorbed a null
+//! (`NOT (n.a = 1 AND n.b = 2)` keeps a node with `b = 3` and no `a` there,
+//! not here); and `x IN [1, null]` is null here even when `x = 1`. Ordered
+//! comparisons, `IN` and the string predicates are already false on a
+//! missing value and stay unguarded.
+//!
+//! # Lexical rules
+//! Keywords and function names are case-insensitive. Identifiers are Unicode
+//! words, or anything between backticks. Strings take either quote with the
+//! escapes `\'` `\"` `\\` `\n` `\t` `\r` `\b` `\f` `\uXXXX`; numbers are
+//! ints or floats (`1.5`, `1e9`). Expressions nest at most
+//! `parse::MAX_NESTING` levels, an operator of an `AND`/`OR`/arithmetic chain
+//! counting one; deeper is a syntax error, not a stack overflow.
+//!
+//! # Not yet (each a clear error naming the rewrite, never a silent miscompile)
 //! - cross-variable predicates (`p.year < q.year`);
 //! - returning the *rows* of a non-terminal variable (`RETURN p` after a hop);
 //!   its values project (`RETURN p.name`);
 //! - `WITH` pipelining: a projection is a tail, so nothing follows it;
-//! - unbounded variable-length (`*`, `*n..`).
+//! - unbounded variable-length (`*`, `*n..`);
+//! - a second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, and a pattern with
+//!   several paths (`(a)-->(b), (a)-->(c)`): a query holds one linear path —
+//!   run one query per pattern or branch;
+//! - relationship variables (`-[r:T]->`): an edge can't be bound, returned or
+//!   filtered on — drop the variable;
+//! - inline property predicates in a `MATCH` node (`(n {name: "x"})`): write
+//!   them in `WHERE`;
+//! - list and map literals as values (`RETURN [1, 2]`, `n.x = {a: 1}`); a
+//!   list is only sugar after `IN` (and a vector after `NEAR`), a map only a
+//!   `CREATE`/`SET` property map;
+//! - the `%` and `^` operators.
+//!
+//! Errors point at the fault: a mistyped clause is reported from the reading
+//! of the statement that got furthest, not from the first token.
 //!
 //! # Completing a prefix
 //! [`complete`] answers the other question an editor asks: not "is this a
@@ -158,9 +198,11 @@ pub trait Embedder {
 pub enum ParseError {
     /// The text didn't match the grammar.
     Syntax(String),
-    /// The text parsed, but the pattern/clauses can't map onto a `LogicalPlan`
-    /// (e.g. a cross-variable predicate, an unbounded `*`, or a text `NEAR`
-    /// with no embedder configured).
+    /// The text is understood, but the pattern/clauses can't map onto a
+    /// `LogicalPlan` (e.g. a cross-variable predicate, an unbounded `*`, a
+    /// text `NEAR` with no embedder configured) — or it uses an openCypher
+    /// clause this cut recognises and refuses (`WITH`, `UNION`, `OPTIONAL
+    /// MATCH`, …). The message names the rewrite that works.
     Compile(String),
 }
 
@@ -232,7 +274,7 @@ fn parse_statement_inner(
     embedder: Option<&dyn Embedder>,
     params: &Params,
 ) -> Result<Statement, ParseError> {
-    let (rest, stmt) = parse::statement(input).map_err(|e| ParseError::Syntax(describe(e)))?;
+    let (rest, stmt) = parse::statement(input).map_err(diagnose)?;
     // Everything must be consumed — trailing tokens mean a mistyped clause.
     let rest = rest.trim_start();
     if !rest.trim_end().is_empty() {
@@ -253,8 +295,27 @@ fn parse_statement_inner(
     })
 }
 
+/// Turn the grammar's failure into the error a caller sees. A recognised but
+/// unsupported shape (`parse::unsupported`) is a `Compile` error carrying its
+/// rewrite hint; anything else is a `Syntax` error located by `describe`.
+fn diagnose(e: nom::Err<nom::error::Error<&str>>) -> ParseError {
+    if let nom::Err::Failure(er) = &e
+        && er.code == nom::error::ErrorKind::Fail
+        && let Some(msg) = parse::take_unsupported()
+    {
+        return ParseError::Compile(msg);
+    }
+    ParseError::Syntax(describe(e))
+}
+
 fn describe(e: nom::Err<nom::error::Error<&str>>) -> String {
     match e {
+        // The one failure that is about the query's shape, not its text.
+        nom::Err::Failure(er) if er.code == nom::error::ErrorKind::TooLarge => format!(
+            "expression nested deeper than {} levels near `{}`",
+            parse::MAX_NESTING,
+            snippet(er.input.trim())
+        ),
         nom::Err::Error(er) | nom::Err::Failure(er) => {
             let at = er.input.trim();
             if at.is_empty() {
