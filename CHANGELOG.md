@@ -4,6 +4,66 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-09-17
+
+### Changed
+
+- **What the subset leaves out is refused, not silently misread.** A
+  relationship variable (`-[r:T]->`) was dropped without a word; an inline
+  property predicate in a `MATCH` node, a second `MATCH`, `OPTIONAL MATCH`,
+  `WITH`, `UNWIND`, `UNION`, a pattern with several paths, list and map
+  literals in expression position, and the `%` and `^` operators now each
+  fail with an error naming the rewrite. A query that appeared to work on
+  2.8 may fail here, which is the point: it was not doing what it read as.
+- **A missing property satisfies neither a predicate nor its negation.**
+  Core's evaluator is two-valued, so `d.year <> 2020`, `NOT d.year = 2020`
+  and `NOT d.year IN [2020]` all kept nodes with no `year` at all, where
+  openCypher's null would have dropped them, and `d.x = null` matched
+  exactly those nodes. The compiler now wraps such a predicate's nullable
+  leaves in `IS NOT NULL` guards without teaching the executor three-valued
+  logic; `IS [NOT] NULL` remains the way to ask about absence. Under `NOT`,
+  a compound predicate whose false branch would have absorbed the null is
+  stricter than openCypher, and the query-language pages say so.
+
+### Fixed
+
+- **A deep expression no longer aborts the process.** The nesting guard
+  covered the grammar's recursion but not its loops, so a hundred thousand
+  `OR`s — or ten thousand parentheses — overflowed the handler stack, and a
+  stack overflow is not a panic any `catch_panic` layer contains: one
+  oversized query on `POST /cypher`, `plane.cypher` or the MCP `cypher` tool
+  took the whole server down. Each operator of a chain is now charged to the
+  same 64-level budget, and `x IN [...]` expands to a balanced tree rather
+  than a left-deep one.
+- **The completer reads characters, not bytes.** Its tokenizer walked bytes
+  and cast each to a `char`, so a multi-byte identifier such as `函数`
+  panicked on a slice that stopped inside a code point. It now walks
+  `char_indices`: identifiers are Unicode words or backticked names, a
+  string skips the character after every backslash, and a number carries its
+  fraction and exponent.
+- **A predicate over `hops()` or `score()` is evaluated at the end of the
+  walk.** Both were pushed down to the source, where `hops()` is 0 and a
+  `MATCH` row has no score yet, so `WHERE hops() = 2` on a `*1..3` walk
+  silently returned nothing although the plan looked right. Such a conjunct
+  now goes on the last slot — including one that mixes a channel with an
+  earlier variable, which no AND-split separates.
+- **A write mutates each matched node once, and `MERGE` sees its own
+  statement's edges.** A pattern reaching the same node twice deleted it
+  twice; `ensure_edge` consulted only the committed store, so a `MERGE` that
+  walked one edge twice created it twice and stopped being idempotent.
+- **The lexical surface matches what the docs promised.** `ORDER BY
+  count(*)` was a syntax error; strings had no escapes, so a value
+  containing a quote ended the literal early; identifiers were ASCII-only
+  with no backtick escape; numbers took no exponent and an int past `i64`
+  fell into a float; function names were case-sensitive where keywords were
+  not; `shortest_path(weight: "Cost")` looked up `cost`; and
+  `iterations`/`max_levels` truncated through an `as u32`.
+- **An error names its cause.** Every mistyped write was reported as "near
+  `CREATE …`", because the statement grammar was a blind `alt` and nom
+  returns the *last* alternative's error. Statements now dispatch on their
+  leading keyword and each clause commits on its own, so a fault is reported
+  where it is.
+
 ## [2.8.1] - 2026-09-17
 
 ### Fixed
