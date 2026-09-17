@@ -4,6 +4,29 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2026-09-17
+
+### Fixed
+
+- **A file the source tree does not hold is never read.** `snippet` joined
+  whatever it was handed onto the tree's root and read the result, so
+  `../etc/passwd:1`, an absolute path, and a node whose `file` property pointed
+  elsewhere all read outside the tree; a symlink planted in a checkout took
+  `grep`'s walk out of it as well. On a served `/mcp` that was an
+  arbitrary-file-read for any authenticated agent. Every read now passes
+  through one helper that refuses a path by shape first and then by where it
+  resolves, which is what catches a symlink.
+- **A plane's `synced_root` no longer chooses what a server opens.** The tree a
+  plane records is data — `plane.set_props` writes it — so it is honoured as a
+  tree of its own only where the process already runs as the user whose files
+  these are: the stdio server and the CLI. On a shared server it is read only
+  when it lies inside the tree the operator attached, and with nothing attached
+  nothing is read.
+- **The SDK end-to-end teardown waits for its server.** The C and Zig suites
+  killed `drsg serve` and removed its directory in the same breath; the server
+  was still writing its index sidecars, and a file landing in a directory just
+  emptied failed the removal with `ENOTEMPTY` after every check had passed.
+
 ## [2.8.0] - 2026-09-16
 
 ### Added

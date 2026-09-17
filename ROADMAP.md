@@ -1131,7 +1131,9 @@ the bytes, however old.
 
 **Follow-ups.** A `cat-file --batch` reader, should a plugin that pulls many
 files make one process per read slow; `git grep --max-count` once git 2.38 is a
-safe floor.
+safe floor; `GitTree::read` serving any tracked blob while `GitTree::list`
+filters dotfiles and ignored directories, so a plugin under `recall` can reach
+a tracked `.env` that a digest would have passed over.
 
 ---
 
