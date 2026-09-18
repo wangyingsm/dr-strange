@@ -3,7 +3,7 @@
 **Status**: shipped — `drsg` (M4) and `digest`, the latter as AIgest's three
 passes (ROADMAP §8), reading URLs (§9) and any office document (§7 here);
 the agent verbs and plugin management landed with ROADMAP §11 ·
-last revised 2026-08-18
+last revised 2026-09-14
 
 **M4 landed** the `drsg` binary (clap): init, plane list/create/drop/show,
 import/export (JSONL in the `json` dialect below), get (id or
@@ -90,7 +90,75 @@ run, chunking that respects paragraph and document boundaries, dedup against a
 plane's existing entities, and a URL reader (§9). A document may be any office
 format, not only text — see 07 §1.
 
-## 4. Open questions
+## 4. Operational contract
+
+What the binary promises beyond its command surface — each a line a
+security or operations reader can hold the code to.
+
+- **Self-update runs the installer the release shipped.** `drsg update`
+  resolves the latest tag through the `releases/latest` redirect, then
+  fetches `scripts/install.sh` *at that tag* — never from `master` — and
+  passes `--version <tag>` so the installer installs the release the check
+  decided on rather than resolving "latest" again. Every interpolated value
+  (`--bin`, `--version`, `--dir`) is single-quoted for `sh -c`. The
+  installers (`scripts/install.sh`, `scripts/install.ps1`) require the
+  archive's `.sha256` sidecar: missing, malformed or mismatching is a hard
+  failure, as is having no tool to hash with. `--insecure-skip-checksum`
+  (`-InsecureSkipChecksum`; `DRSG_INSECURE_SKIP_CHECKSUM=1` in every
+  surface, including `drsg update`) is the one escape hatch and warns.
+  The sidecar shares the archive's origin, so this is integrity against a
+  truncated download, a stale mirror or a swapped asset — not a signature.
+- **Where `init` puts the token.** `.mcp.json` and `.cursor/mcp.json`
+  carry the bearer token literally (a desktop client has no shell
+  environment to read one from) and both are in the `.gitignore` block
+  `init` maintains — the invariant is *every file written with a literal
+  token is in that block*, pinned by test. `.opencode.json`,
+  `.gemini/settings.json` and `.codex/config.toml` pre-exist `init` and are
+  probably committed, so they receive only an environment reference in the
+  client's own syntax (`{env:DRSG_TOKEN}`, `$DRSG_TOKEN`,
+  `bearer_token_env_var`); `init` prints the export line.
+  `drsg.example.toml` ships with `token` commented out. `[server] token`
+  and every `[llm]` key are applied to the process environment at startup
+  (never overwriting a variable already set) and are therefore inherited by
+  every child process — the spawned `serve watch` included — which the
+  example file and Chapter 2 say in so many words.
+- **Hooks.** `init` repoints a Claude Code hook entry only when its command
+  is a bare path whose last component is exactly one of drsg's script
+  names, or is exactly the command `init` writes for this project (the
+  path single-quoted when it holds a space, so the shell runs it — and
+  the unquoted form an earlier `init` wrote); anything else in
+  `settings.local.json` is someone else's and is left alone. The shell guard decides "this is a write, let it through" on
+  the command with quoted and backslash-escaped text removed and numbered
+  fd redirects dropped, so a pattern containing `>` or `<<` does not bypass
+  it. The repository's own `.claude/settings.json` runs `init` with
+  `DRSG_ENSURE_UNCONDITIONAL=1` on purpose — this repository is drsg — and
+  the hook script's header says why a copy elsewhere should not.
+- **Retention is applied wherever the database is opened.** `[server]
+  retain_commits` (default 20; `0` = unbounded) is read by
+  `config::retain_commits` and set on the handle by `commands::open`, which
+  every CLI command goes through — not only `serve`. A CLI-only store
+  therefore reclaims old versions at compaction like a served one. The two
+  `init` opens that only create the file pass no retention: nothing is
+  written through them, and the `serve watch` they spawn sets its own.
+- **Respawn.** A port `init` picked itself is retried (up to three picks)
+  when the child exits before listening — the pick-then-bind gap is a race
+  it can lose; an explicit `--addr` or a recorded address is never swapped.
+  "Listening" means the child itself answers `/health` with its own pid: a
+  stranger that won the port and accepts connections is not taken for the
+  child, so `init` never reports success against a server it did not
+  start.
+  Before SIGTERM-ing the pid a `/health` body named, `stop_server` checks on
+  Linux that `/proc/<pid>/cmdline` is a drsg binary and refuses otherwise;
+  elsewhere the check passes.
+- **The usage-report hook** keeps its per-session watermark under
+  `$XDG_RUNTIME_DIR/drsg` (else `~/.cache/drsg`, created 0700), written
+  through an `O_EXCL` 0600 temporary and renamed — never in the shared
+  temp directory under a predictable name. `.claude/hooks/test_drsg_usage_report.py`
+  pins that (modes, a planted link at the temporary name not followed, no
+  writable private directory degrading to session-only totals); `just
+  gate-hooks` and CI's `hooks` job run it.
+
+## 5. Open questions
 
 1. ~~Should `drsg query` accept a convenience syntax pre-v2, or stay
    plan-JSON-only until the real QL?~~ **Moot — the QL landed.** `drsg cypher`

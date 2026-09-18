@@ -64,6 +64,10 @@ cd sdk/zig
 ./test/run.sh     # starts a real drsg serve, runs `zig build test` against it
 ```
 
+CI runs both (`zig build`, then `test/run.sh` against the `rust` job's `drsg`)
+in the `sdk-zig` job of `.github/workflows/ci.yml`, beside the other SDK jobs;
+`just gate-sdk` runs the same locally.
+
 The e2e suite skips (does not fail) if no `drsg` binary is found; point it at
 one with `$DRSG_BIN`, or build with `cargo build -p dr-strange-cli`. Needs
 `libcurl` and `json-c` development packages.

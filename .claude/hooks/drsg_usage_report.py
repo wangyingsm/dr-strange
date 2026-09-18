@@ -23,7 +23,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 # Both the stdio server (`drsg`) and the watched one (`drsg-watch`) count: they
@@ -105,11 +104,45 @@ def find_transcript(hook: dict) -> Path | None:
     return None
 
 
+def watermark_dir() -> Path:
+    """A directory only this user can write.
+
+    Not the repo: this is per-session bookkeeping with no meaning after the
+    session, and the working tree of a project under review is the last place
+    it should show up. Not the shared temp directory either: a file there with
+    a predictable name (the session id is in the transcript's name) is one
+    another user can pre-create or symlink, and a hook must not follow that.
+    `$XDG_RUNTIME_DIR` is per-user, mode 0700 and cleared at logout — exactly
+    the lifetime of a watermark; `~/.cache/drsg` is the fallback.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime and Path(runtime).is_dir() else Path.home() / ".cache"
+    directory = base / "drsg"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
 def watermark_path(transcript: Path) -> Path:
-    # Temp rather than the repo: this is per-session bookkeeping with no meaning
-    # after the session, and the working tree of a project under review is the
-    # last place it should show up.
-    return Path(tempfile.gettempdir()) / f"drsg-usage-{transcript.stem}.json"
+    return watermark_dir() / f"usage-{transcript.stem}.json"
+
+
+def write_watermark(mark: Path, lines: int) -> None:
+    """Write-then-rename, through a file created exclusively and 0600.
+
+    O_EXCL means a file already at the temporary name — anyone else's, or a
+    symlink pointing somewhere we must not write — fails the write instead of
+    being followed; a leftover of our own from an interrupted run is removed
+    first, since it can only be ours in a 0700 directory.
+    """
+    tmp = mark.with_suffix(".tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"lines": lines}))
+    tmp.replace(mark)
 
 
 def blocks(entry: dict):
@@ -287,13 +320,17 @@ def main() -> int:
         emit("drsg MCP — no session transcript found; usage not reported")
         return 0
 
-    mark = watermark_path(transcript)
+    try:
+        mark = watermark_path(transcript)
+    except Exception:  # no writable private directory: report session totals only
+        mark = None
     since = 0
     tracked = False
     try:
-        state = json.loads(mark.read_text())
-        if isinstance(state.get("lines"), int):
-            since, tracked = state["lines"], True
+        if mark is not None:
+            state = json.loads(mark.read_text())
+            if isinstance(state.get("lines"), int):
+                since, tracked = state["lines"], True
     except Exception:
         pass
 
@@ -311,9 +348,8 @@ def main() -> int:
         tracked = False
 
     try:
-        tmp = mark.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"lines": lines}))
-        tmp.replace(mark)
+        if mark is not None:
+            write_watermark(mark, lines)
     except Exception:
         pass
 

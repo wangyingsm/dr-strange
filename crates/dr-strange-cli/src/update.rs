@@ -40,18 +40,36 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 const REPO: &str = "wangyingsm/dr-strange";
 
-/// Where the installer is read from: the default branch, as the README's
-/// one-liner does. Following `master` rather than a tag is deliberate — a fix
-/// to the installer should reach an upgrade the day it lands, and the archive
-/// it installs is chosen by the release it resolves, not by this file.
-const INSTALLER: &str =
-    "https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh";
+/// Where the installer is read from: the release's own tag, not the default
+/// branch. The archive it installs is chosen by the release this command
+/// resolved, and the script that verifies that archive has to be the one
+/// reviewed and tagged with it — following `master` would let whoever can
+/// write to the branch replace the verifier on every machine that upgrades,
+/// with no release ever being cut. A fix to the installer therefore reaches
+/// upgrades with the next release, which is also when it is needed.
+const INSTALLER_REPO_RAW: &str = "https://raw.githubusercontent.com/wangyingsm/dr-strange";
+
+/// Environment equivalent of `--insecure-skip-checksum`, read by the installer
+/// and by this command alike.
+pub const ENV_SKIP_CHECKSUM: &str = "DRSG_INSECURE_SKIP_CHECKSUM";
+
+/// Whether [`ENV_SKIP_CHECKSUM`] is set to anything but empty or `0` — the
+/// same reading the installer gives it.
+pub fn skip_checksum_from_env() -> bool {
+    std::env::var(ENV_SKIP_CHECKSUM).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The installer at `tag` (`v2.2.1`).
+fn installer_url(tag: &str) -> String {
+    format!("{INSTALLER_REPO_RAW}/{tag}/scripts/install.sh")
+}
 
 /// The Windows equivalent, named only in the message this command prints there
 /// instead of running anything.
 #[cfg(not(unix))]
-const INSTALLER_PS1: &str =
-    "https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1";
+fn installer_ps1_url(tag: &str) -> String {
+    format!("{INSTALLER_REPO_RAW}/{tag}/scripts/install.ps1")
+}
 
 /// What the check found.
 #[derive(Debug, PartialEq, Eq)]
@@ -71,10 +89,16 @@ const MCP_BIN: &str = "drsg-mcp";
 
 /// `bin` is what `--bin` asked for; `None` means nothing was asked, and the
 /// choice is made by what is installed beside this binary (see [`choose_bin`]).
+///
+/// `skip_checksum` forwards `--insecure-skip-checksum` to the installer, which
+/// otherwise refuses an archive whose `.sha256` sidecar is missing or does not
+/// match. It is a hatch for a mirror that publishes no sidecar, and it is
+/// spelled `insecure` because that is what it is.
 pub fn update(
     allow_private: &[dr_strange_web::fetch::Prefix],
     bin: Option<&str>,
     dir: Option<&Path>,
+    skip_checksum: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
     let latest = latest_release(allow_private)?;
@@ -103,7 +127,14 @@ pub fn update(
                 Some(asked) => asked.to_string(),
                 None => choose_bin(&dir, out)?,
             };
-            install(&bin, &dir, out)
+            if skip_checksum {
+                writeln!(
+                    out,
+                    "WARNING: --insecure-skip-checksum — the downloaded archive will be \
+                     installed without verifying its SHA-256"
+                )?;
+            }
+            install(&bin, &dir, &latest, skip_checksum, out)
         }
     }
 }
@@ -201,8 +232,14 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Hand this process over to the installer.
-fn install(bin: &str, dir: &Path, out: &mut dyn Write) -> Result<()> {
-    let command = installer_command(bin, dir)?;
+fn install(
+    bin: &str,
+    dir: &Path,
+    latest: &str,
+    skip_checksum: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let command = installer_command(bin, dir, latest, skip_checksum)?;
     // Printed before the handover, because after it this process is gone: if
     // the installer fails, or the network dies mid-download, the line above
     // the wreckage is the command to retry by hand.
@@ -212,31 +249,52 @@ fn install(bin: &str, dir: &Path, out: &mut dyn Write) -> Result<()> {
     exec(&command)
 }
 
-/// The shell one-liner: the README's install command, with this binary's own
-/// location and name filled in.
-fn installer_command(bin: &str, dir: &Path) -> Result<String> {
+/// The shell one-liner: the README's install command, pinned to the release
+/// being installed, with this binary's own location and name filled in.
+///
+/// `latest` is passed on as `--version` too, so the installer installs the
+/// release this command decided on rather than resolving "latest" a second
+/// time — a release cut between the two lookups would otherwise be installed
+/// by a script from the release before it.
+fn installer_command(bin: &str, dir: &Path, latest: &str, skip_checksum: bool) -> Result<String> {
     let dir = dir.to_str().with_context(|| {
         format!(
             "{} is not valid UTF-8; pass --dir with a plain path",
             dir.display()
         )
     })?;
-    // Single-quoted for the shell, with any embedded quote escaped the POSIX
-    // way. A path is the one part of this command a user controls.
-    let quoted = format!("'{}'", dir.replace('\'', r"'\''"));
+    let tag = format!("v{latest}");
+    let installer = installer_url(&tag);
     let downloader = if which("curl").is_some() {
-        format!("curl -fsSL {INSTALLER}")
+        format!("curl -fsSL {installer}")
     } else if which("wget").is_some() {
-        format!("wget -qO- {INSTALLER}")
+        format!("wget -qO- {installer}")
     } else {
         bail!(
             "neither curl nor wget is available — install manually from \
              https://github.com/{REPO}/releases"
         )
     };
+    // Every interpolated value is quoted, `--bin` included: it is a validated
+    // choice when this command picked it, but a user's `--bin` is whatever
+    // they typed, and it is about to be handed to `sh -c`.
+    let skip = if skip_checksum {
+        " --insecure-skip-checksum"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{downloader} | sh -s -- --bin {bin} --dir {quoted}"
+        "{downloader} | sh -s -- --bin {} --version {} --dir {}{skip}",
+        shell_quote(bin),
+        shell_quote(&tag),
+        shell_quote(dir)
     ))
+}
+
+/// Single-quoted for the shell, with any embedded quote escaped the POSIX
+/// way, so the value stays one argument whatever it contains.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// The directory to install into: the one this binary is running from.
@@ -283,11 +341,20 @@ fn exec(command: &str) -> Result<()> {
 /// to start. Printing the command and standing down leaves the user one
 /// paste away, in a shell where this process is no longer running.
 #[cfg(not(unix))]
-fn exec(_command: &str) -> Result<()> {
+fn exec(command: &str) -> Result<()> {
+    // The tag is the one the command was built for; it is spelled out again
+    // here so the user runs the same pinned script, not master's.
+    let tag = command
+        .split_whitespace()
+        .skip_while(|w| *w != "--version")
+        .nth(1)
+        .map(|t| t.trim_matches('\''))
+        .unwrap_or("master");
+    let ps1 = installer_ps1_url(tag);
     bail!(
         "drsg cannot replace itself while it is running on this platform — \
          Windows locks the running executable. Run the installer from a \
-         terminal instead:\n  irm {INSTALLER_PS1} | iex"
+         terminal instead:\n  & ([scriptblock]::Create((irm {ps1}))) -Version {tag}"
     )
 }
 
@@ -391,19 +458,70 @@ mod tests {
 
     #[test]
     fn the_command_names_this_binarys_own_directory() {
-        let cmd = installer_command("drsg", Path::new("/usr/local/bin")).unwrap();
+        let cmd = installer_command("drsg", Path::new("/usr/local/bin"), "2.2.1", false).unwrap();
         assert!(cmd.contains("scripts/install.sh"), "{cmd}");
         assert!(
-            cmd.ends_with("| sh -s -- --bin drsg --dir '/usr/local/bin'"),
+            cmd.ends_with("| sh -s -- --bin 'drsg' --version 'v2.2.1' --dir '/usr/local/bin'"),
             "{cmd}"
         );
+    }
+
+    /// The script that verifies the archive is fetched from the release it
+    /// verifies, never from a branch anyone with push access can move; and the
+    /// installer is told which release, so it cannot resolve a different one.
+    #[test]
+    fn the_installer_is_pinned_to_the_resolved_release() {
+        let cmd = installer_command("drsg", Path::new("/opt/bin"), "2.10.0", false).unwrap();
+        assert!(
+            cmd.contains(
+                "raw.githubusercontent.com/wangyingsm/dr-strange/v2.10.0/scripts/install.sh"
+            ),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("/master/"), "{cmd}");
+        assert!(cmd.contains("--version 'v2.10.0'"), "{cmd}");
+        // The hatch is off unless asked for, and spelled the installer's way
+        // when it is.
+        assert!(!cmd.contains("insecure"), "{cmd}");
+        let cmd = installer_command("drsg", Path::new("/opt/bin"), "2.10.0", true).unwrap();
+        assert!(
+            cmd.ends_with("--dir '/opt/bin' --insecure-skip-checksum"),
+            "{cmd}"
+        );
+    }
+
+    /// `--bin` is typed by the user and handed to `sh -c`: it is one quoted
+    /// argument, whatever it contains, and the installer is what refuses a
+    /// name it does not know.
+    #[test]
+    fn a_bin_name_is_quoted_like_the_directory() {
+        let cmd = installer_command("all", Path::new("/opt/bin"), "2.2.1", false).unwrap();
+        assert!(cmd.contains("--bin 'all' "), "{cmd}");
+        let cmd = installer_command(
+            "drsg'; rm -rf /; echo '",
+            Path::new("/opt/bin"),
+            "2.2.1",
+            false,
+        )
+        .unwrap();
+        assert!(
+            cmd.contains(r"--bin 'drsg'\''; rm -rf /; echo '\''' "),
+            "{cmd}"
+        );
+        assert_eq!(cmd.matches('\'').count() % 2, 0, "{cmd}");
     }
 
     /// A path is the one part of this command someone else chooses, and it is
     /// about to be handed to `sh -c`.
     #[test]
     fn a_directory_cannot_break_out_of_the_shell_command() {
-        let cmd = installer_command("drsg", Path::new("/tmp/a'; rm -rf /; echo '")).unwrap();
+        let cmd = installer_command(
+            "drsg",
+            Path::new("/tmp/a'; rm -rf /; echo '"),
+            "2.2.1",
+            false,
+        )
+        .unwrap();
         assert!(
             cmd.ends_with(r"--dir '/tmp/a'\''; rm -rf /; echo '\'''"),
             "{cmd}"

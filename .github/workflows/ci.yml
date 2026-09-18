@@ -22,11 +22,12 @@ jobs:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (native backend)
@@ -42,7 +43,7 @@ jobs:
       # suites exercise /rpc and /ws, not the SPA.
       - name: Build drsg
         run: cargo build -p dr-strange-cli
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: drsg
           path: target/debug/drsg
@@ -53,11 +54,12 @@ jobs:
     name: Features — every optional build still compiles
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The `rust` job builds one configuration: all defaults. Every feature
       # this project documents as optional is therefore unbuilt by CI, and a
       # `#[cfg]` that should have been added is invisible until someone tries
@@ -91,13 +93,15 @@ jobs:
     name: Frontend — lint + build + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Install
-        # Not --frozen-lockfile: the committed bun.lock is lockfileVersion 2
-        # (written by a bun canary) which setup-bun's stable bun can't parse;
-        # let it resolve fresh instead of failing to read the lock.
-        run: bun install
+        # --frozen-lockfile: CI builds exactly the dependency set the committed
+        # bun.lock names and fails if package.json has drifted from it, so a
+        # resolver change or an upstream re-publish cannot slip a different
+        # tree into the dashboard. Regenerate the lock with `bun install`
+        # locally when a dependency is meant to change.
+        run: bun install --frozen-lockfile
         working-directory: crates/dr-strange-web/frontend
       # `no-undef` specifically: neither vite nor bun errors on a reference to
       # an identifier that does not exist, so a function lost in a refactor
@@ -117,8 +121,8 @@ jobs:
     name: Docs — mdBook build (en + zh)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: mdbook
       - name: Build (en)
@@ -126,13 +130,25 @@ jobs:
       - name: Build (zh)
         run: mdbook build docs/zh
 
+  # The repository's own Claude Code hooks: the usage report writes a
+  # watermark on the user's behalf, and how it does that (private directory,
+  # exclusive 0600 temporary, never through a planted link) is pinned by a
+  # unittest module beside it. Standard library only; the runner's python3.
+  hooks:
+    name: Hooks — usage-report watermark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Test
+        run: python3 -m unittest discover -s .claude/hooks -v
+
   sdk-typescript:
     name: SDK — TypeScript
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: drsg
           path: bin
@@ -140,8 +156,8 @@ jobs:
         run: |
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install # not --frozen: the committed lock is a bun-canary format
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile # the committed lock is the contract
         working-directory: sdk/typescript
       - name: Test (drift + e2e)
         run: bun test
@@ -152,8 +168,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: drsg
           path: bin
@@ -163,7 +179,7 @@ jobs:
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
       # Pinned exactly: setup-uv stopped publishing a floating major tag after
       # v7, so `@v9` does not resolve even though v9.0.0 is the latest release.
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Test (drift + e2e)
         run: uv run --with pytest pytest -q
         working-directory: sdk/python
@@ -173,8 +189,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: drsg
           path: bin
@@ -182,7 +198,7 @@ jobs:
         run: |
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           cache-dependency-path: sdk/go/go.sum
@@ -195,8 +211,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: drsg
           path: bin
@@ -204,7 +220,7 @@ jobs:
         run: |
           chmod +x bin/drsg
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "17"
@@ -218,8 +234,8 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: drsg
           path: bin
@@ -235,6 +251,35 @@ jobs:
         run: make test
         working-directory: sdk/c
 
+  sdk-zig:
+    name: SDK — Zig
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: drsg
+          path: bin
+      - name: Point at drsg
+        run: |
+          chmod +x bin/drsg
+          echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
+      # The Zig client compiles the C client's sources and links the same
+      # system libraries through pkg-config, so it needs what sdk-c needs.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libjson-c-dev pkg-config
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build
+        working-directory: sdk/zig
+      - name: Test (e2e against a real drsg serve)
+        run: test/run.sh
+        working-directory: sdk/zig
   # What no compiler answers: licences, RUSTSEC advisories and the registries a
   # crate may come from (`deny.toml`), dependencies a refactor stopped using,
   # and the Python SDK's lint — the one member no job above compiles.
@@ -247,19 +292,19 @@ jobs:
     name: Supply chain — deny, machete, ruff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-deny,cargo-machete
       - name: Licences, advisories, sources
         run: cargo deny check
       - name: Unused dependencies
         run: cargo machete
-      # Pinned exactly, as in sdk-python: setup-uv stopped publishing a floating
-      # major tag after v7.
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Lint
         run: uv run --with ruff ruff check .
         working-directory: sdk/python

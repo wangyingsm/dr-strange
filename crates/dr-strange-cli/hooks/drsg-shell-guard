@@ -35,7 +35,16 @@ fi
 # The escape hatch, anywhere in the command line.
 case "$CMD" in *DRSG_RAW=1*) exit 0 ;; esac
 # A redirection or a heredoc is a write, not a read — `cat > file <<EOF`.
-case "$CMD" in *'>'*|*'<<'*) exit 0 ;; esac
+# Judged on the command with its quoted and escaped text removed: `rg '>'`
+# and `grep "a -> b"` are searches whose *pattern* holds an arrow, and a
+# guard that let every such pattern through was a guard with a hole in it.
+# A stderr redirect (`2>/dev/null`) is not a write either.
+bare=$(printf '%s' "$CMD" | sed -E \
+  -e 's/"([^"\\]|\\.)*"//g' \
+  -e "s/'[^']*'//g" \
+  -e 's/\\.//g' \
+  -e 's/[0-9]>//g')
+case "$bare" in *'>'*|*'<<'*) exit 0 ;; esac
 
 # The first word of the first command: past leading env assignments and an
 # `rtk` prefix, up to whitespace or a pipe.

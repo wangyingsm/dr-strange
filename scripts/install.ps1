@@ -3,9 +3,11 @@
   Dr Strange installer for Windows.
 
 .DESCRIPTION
-  Downloads a released archive from GitHub, verifies its SHA-256, and installs
-  the binary. Nothing is compiled; no toolchain is required. Works with both
-  Windows PowerShell 5.1 and PowerShell 7+.
+  Downloads a released archive from GitHub, verifies its SHA-256 against the
+  published .sha256 sidecar, and installs the binary. A missing or mismatching
+  sidecar is a hard failure unless -InsecureSkipChecksum is given. Nothing is
+  compiled; no toolchain is required. Works with both Windows PowerShell 5.1
+  and PowerShell 7+.
 
     irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1 | iex
 
@@ -21,12 +23,17 @@
 
 .PARAMETER Dir
   Installation directory. Defaults to %LOCALAPPDATA%\Programs\drsg\bin.
+
+.PARAMETER InsecureSkipChecksum
+  Install even when the archive's .sha256 sidecar is missing or does not
+  match. Insecure, as the name says; DRSG_INSECURE_SKIP_CHECKSUM=1 is the same.
 #>
 param(
     [ValidateSet('drsg', 'drsg-mcp', 'all')]
     [string]$Bin = $(if ($env:DRSG_INSTALL_BIN) { $env:DRSG_INSTALL_BIN } else { 'drsg' }),
     [string]$Version = $(if ($env:DRSG_VERSION) { $env:DRSG_VERSION } else { 'latest' }),
-    [string]$Dir = $(if ($env:DRSG_INSTALL_DIR) { $env:DRSG_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\drsg\bin" })
+    [string]$Dir = $(if ($env:DRSG_INSTALL_DIR) { $env:DRSG_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\drsg\bin" }),
+    [switch]$InsecureSkipChecksum = $($env:DRSG_INSECURE_SKIP_CHECKSUM -and $env:DRSG_INSECURE_SKIP_CHECKSUM -ne '0')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,18 +75,21 @@ try {
         throw "download failed - $Version may not ship an asset for ${target}: $base/$archive"
     }
 
-    $sumFile = Join-Path $tmp "$archive.sha256"
-    $haveSum = $true
-    try {
-        Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $sumFile -UseBasicParsing
-    } catch {
-        $haveSum = $false
-        Write-Host '  no published checksum; skipping verification'
-    }
-    if ($haveSum) {
+    if ($InsecureSkipChecksum) {
+        Write-Warning 'InsecureSkipChecksum - installing without verifying the archive'
+    } else {
+        $sumFile = Join-Path $tmp "$archive.sha256"
+        try {
+            Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $sumFile -UseBasicParsing
+        } catch {
+            throw "no checksum published for $archive ($base/$archive.sha256) - refusing to install an unverified archive (pass -InsecureSkipChecksum to override)"
+        }
         $expected = ((Get-Content $sumFile -Raw).Trim() -split '\s+')[0]
+        if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "the published checksum for $archive is not a SHA-256: $expected"
+        }
         $actual = (Get-FileHash (Join-Path $tmp $archive) -Algorithm SHA256).Hash
-        if ($actual -ne $expected) { throw "checksum mismatch for $archive" }
+        if ($actual -ne $expected) { throw "checksum mismatch for ${archive}: expected $expected, got $actual" }
         Write-Host '  checksum verified'
     }
 

@@ -18,11 +18,27 @@ use dr_strange_core::{
 use dr_strange_core::{PropDesc, PropValue};
 use serde_json::{Value, json};
 
+use ahash::AHashMap;
+
 use dr_strange_core::json as jsonio;
 
-/// Opens (creating if needed) the database at `path`.
-pub fn open(path: &Path) -> Result<Database> {
-    Database::open(path).with_context(|| format!("opening database at {}", path.display()))
+/// Opens (creating if needed) the database at `path`, with the configured
+/// history retention applied (`None` keeps every version).
+///
+/// Retention is a property of the opened handle, not of the file, so every
+/// command that writes has to set it — `serve` alone doing so meant a
+/// database driven only by `import`, `cypher` and `digest` from the CLI kept
+/// every version ever written and compacted all of them, forever. The value
+/// comes from the same `[server] retain_commits` (and the same default) the
+/// server uses, so one store sees one policy however it is reached.
+pub fn open(path: &Path, retain_commits: Option<u64>) -> Result<Database> {
+    let db =
+        Database::open(path).with_context(|| format!("opening database at {}", path.display()))?;
+    #[cfg(feature = "native-backend")]
+    db.set_retention(retain_commits);
+    #[cfg(not(feature = "native-backend"))]
+    let _ = retain_commits; // the other engines keep no versions to bound
+    Ok(db)
 }
 
 /// Marker file left in a `serve --follow` replica's directory (arch/01 §9)
@@ -84,7 +100,9 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> Result<Pl
 
 #[cfg(not(feature = "digest"))]
 pub fn init(path: &Path, out: &mut dyn Write) -> Result<()> {
-    open(path)?;
+    // Created and closed again: retention belongs to the handle that writes,
+    // and this one writes nothing.
+    open(path, None)?;
     writeln!(out, "initialized dr-strange database at {}", path.display())?;
     Ok(())
 }
@@ -96,6 +114,12 @@ const INIT_TOKEN_LEN: usize = 40;
 
 #[cfg(feature = "digest")]
 const INIT_HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One `/health` round trip while waiting for a spawned server: short, so a
+/// stranger on the port that accepts and never answers does not eat the
+/// whole wait, and long enough for a child that is just up to answer.
+#[cfg(feature = "digest")]
+const INIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The name every agent config gives the entry `init` writes. One constant
 /// because `recorded_endpoint` reads back what `write_mcp_json_entry` wrote:
@@ -110,7 +134,12 @@ const GITIGNORE_PATTERNS: &[&str] = &[
     "*.drsg.hnsw",
     "*.drsg.bm25",
     "logs/",
+    // The two files `init` writes a literal bearer token into. Cursor is a
+    // desktop app: it is launched from a dock with no shell environment to
+    // read a token out of, so its config has to carry the token itself —
+    // and must therefore never be committed.
     ".mcp.json",
+    ".cursor/mcp.json",
 ];
 
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
@@ -153,8 +182,6 @@ pub fn init_bootstrap(
     plugin_config: &dr_strange_llm::PluginConfig,
     out: &mut dyn Write,
 ) -> Result<()> {
-    use rand::distr::{Alphanumeric, SampleString};
-
     let db_path = if db_path.is_absolute() {
         db_path.to_path_buf()
     } else {
@@ -215,50 +242,28 @@ pub fn init_bootstrap(
         return Ok(());
     }
 
-    open(&db_path)?;
+    // Created and closed again: retention belongs to the handle that writes,
+    // and the `serve watch` spawned below sets its own.
+    open(&db_path, None)?;
 
-    // A recorded endpoint that stopped answering is the one worth restoring
-    // verbatim: agents already hold that URL and token. An explicit flag
-    // still wins over it.
-    let (addr, token, mut force) = match recorded {
-        Some((recorded_addr, recorded_token)) => (
-            match addr {
-                Some(explicit) => explicit,
-                // The recorded port was an arbitrary one the OS handed out,
-                // and after a reboot it may belong to something else — which
-                // the health probe already ruled out as being drsg. Moving is
-                // then the only way to come up at all; agents pick the new
-                // address up from the rewritten configs.
-                None if addr_bindable(recorded_addr) => recorded_addr,
-                None => {
-                    let moved = pick_free_port()?;
-                    writeln!(
-                        out,
-                        "note: {recorded_addr} is taken by another process — moving to {moved}"
-                    )?;
-                    moved
-                }
-            },
-            token.unwrap_or(recorded_token),
-            // The plane already exists and records where it left off; `serve
-            // watch` catches it up from there. Re-parsing the whole tree here
-            // would make every restart cost a full digest.
-            false,
-        ),
-        None => (
-            match addr {
-                Some(addr) => addr,
-                None => pick_free_port()?,
-            },
-            token.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)),
-            true,
-        ),
-    };
+    let Endpoint {
+        addr,
+        picked,
+        token,
+        mut force,
+    } = endpoint_for_init(recorded, addr, token, out)?;
     // Whatever the plane's state, `--rebuild` re-reads the tree.
     force |= rebuild;
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
 
-    let pid = spawn_watcher(&dir, &db_path, &plane_name, addr, &token, force)?;
+    let watch = Watch {
+        dir: &dir,
+        db_path: &db_path,
+        plane: &plane_name,
+        token: &token,
+        force,
+    };
+    let (pid, addr) = spawn_watcher(&watch, addr, picked, out)?;
 
     let what = match (rebuild, force) {
         (true, _) => "rebuilt",
@@ -273,70 +278,142 @@ pub fn init_bootstrap(
     write_agent_configs(&dir, &addr, &token, out)
 }
 
+/// Where an `init` will listen, with which token, and how it should come up.
+#[cfg(feature = "digest")]
+struct Endpoint {
+    addr: std::net::SocketAddr,
+    /// Nobody asked for this port — it came from `pick_free_port`, so losing a
+    /// race for it is worth another pick.
+    picked: bool,
+    token: String,
+    /// Re-read the tree rather than catch up from the plane's own mark.
+    force: bool,
+}
+
+/// Resolve the endpoint an `init` comes up on, from what a previous run
+/// recorded and what this one was asked for.
+#[cfg(feature = "digest")]
+fn endpoint_for_init(
+    recorded: Option<(std::net::SocketAddr, String)>,
+    addr: Option<std::net::SocketAddr>,
+    token: Option<String>,
+    out: &mut dyn Write,
+) -> Result<Endpoint> {
+    use rand::distr::{Alphanumeric, SampleString};
+
+    // A recorded endpoint that stopped answering is the one worth restoring
+    // verbatim: agents already hold that URL and token. An explicit flag
+    // still wins over it.
+    // `picked` records that nobody asked for this port — it came out of
+    // `pick_free_port`, and if something else grabs it before the child
+    // binds, another pick is as good as the first. An explicit `--addr` or
+    // a recorded address is a promise to agents and is never swapped.
+    let chosen = match recorded {
+        Some((recorded_addr, recorded_token)) => {
+            let (addr, picked) = match addr {
+                Some(explicit) => (explicit, false),
+                // The recorded port was an arbitrary one the OS handed out,
+                // and after a reboot it may belong to something else — which
+                // the health probe already ruled out as being drsg. Moving is
+                // then the only way to come up at all; agents pick the new
+                // address up from the rewritten configs.
+                None if addr_bindable(recorded_addr) => (recorded_addr, false),
+                None => {
+                    let moved = pick_free_port()?;
+                    writeln!(
+                        out,
+                        "note: {recorded_addr} is taken by another process — moving to {moved}"
+                    )?;
+                    (moved, true)
+                }
+            };
+            Endpoint {
+                addr,
+                picked,
+                token: token.unwrap_or(recorded_token),
+                // The plane already exists and records where it left off;
+                // `serve watch` catches it up from there. Re-parsing the
+                // whole tree here would make every restart cost a full
+                // digest.
+                force: false,
+            }
+        }
+        None => {
+            let (addr, picked) = match addr {
+                Some(addr) => (addr, false),
+                None => (pick_free_port()?, true),
+            };
+            Endpoint {
+                addr,
+                picked,
+                token: token.unwrap_or_else(|| {
+                    Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)
+                }),
+                force: true,
+            }
+        }
+    };
+    Ok(chosen)
+}
+
+/// What a `serve watch` child is started for: the tree it follows, the
+/// database and plane it writes, and how it should come up.
+///
+/// One value because a retry re-spawns the same watcher on another port —
+/// only the address changes between attempts.
+#[cfg(feature = "digest")]
+struct Watch<'a> {
+    dir: &'a Path,
+    db_path: &'a Path,
+    plane: &'a str,
+    token: &'a str,
+    force: bool,
+}
+
 /// Spawn `serve watch` detached, and wait until it is actually listening.
 ///
 /// Detached in its own session so it outlives this process: `init` returns as
 /// soon as the endpoint answers, and the watcher keeps folding commits after
-/// the shell that started it has gone.
+/// the shell that started it has gone. Returns the address it settled on,
+/// which is not the one asked for when a picked port was lost to a race.
 #[cfg(feature = "digest")]
 fn spawn_watcher(
-    dir: &Path,
-    db_path: &Path,
-    plane_name: &str,
+    watch: &Watch<'_>,
     addr: std::net::SocketAddr,
-    token: &str,
-    force: bool,
-) -> Result<u32> {
+    picked: bool,
+    out: &mut dyn Write,
+) -> Result<(u32, std::net::SocketAddr)> {
     let exe = std::env::current_exe().context("resolving the running drsg binary's path")?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.current_dir(dir)
-        .arg("--db")
-        .arg(db_path)
-        .arg("serve")
-        .arg("--addr")
-        .arg(addr.to_string())
-        .arg("watch")
-        .arg("--dir")
-        .arg(dir)
-        .arg("--plane")
-        .arg(plane_name)
-        .env("DRSG_TOKEN", token)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if force {
-        cmd.arg("--force");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid()` is async-signal-safe and touches only the child's
-        // own process state; this runs in the forked child before exec, per
-        // `pre_exec`'s contract.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    // A picked port is free when picked and bound by the child some
+    // milliseconds later; in between, anything may take it. When the child
+    // dies before listening on a port that was only ever our pick, pick
+    // again rather than report a failure the next try would not have.
+    let mut addr = addr;
+    let mut attempt = 1;
+    loop {
+        let mut child = spawn_serve_watch(&exe, watch, addr)?;
+        let pid = child.id();
+        match wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
+            Listener::Up => return Ok((pid, addr)),
+            Listener::ChildExited if picked && attempt < INIT_SPAWN_ATTEMPTS => {
+                let next = pick_free_port()?;
+                writeln!(
+                    out,
+                    "note: `drsg serve watch` exited before listening on {addr} — retrying on {next}"
+                )?;
+                addr = next;
+                attempt += 1;
+            }
+            Listener::ChildExited | Listener::TimedOut => {
+                let log_tail = tail_recent_log(watch.dir)
+                    .unwrap_or_else(|| "(no log file found under logs/)".to_string());
+                let _ = child.kill();
+                bail!(
+                    "`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}"
+                );
+            }
         }
     }
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "spawning `{} serve watch` for {}",
-            exe.display(),
-            dir.display()
-        )
-    })?;
-    let pid = child.id();
-    if !wait_for_listener(addr, &mut child, INIT_HEALTH_CHECK_TIMEOUT) {
-        let log_tail =
-            tail_recent_log(dir).unwrap_or_else(|| "(no log file found under logs/)".to_string());
-        let _ = child.kill();
-        bail!("`drsg serve watch` (pid {pid}) never started listening on {addr}\n{log_tail}");
-    }
-    Ok(pid)
 }
 
 /// Say what will become of this repository's history — one line, and only
@@ -420,17 +497,21 @@ fn write_agent_configs(
             dir.join(".cursor/mcp.json").display()
         )?;
     }
-    if probe_and_write_opencode(dir, addr, token)? {
+    // The terminal clients' files predate `init` and are probably committed:
+    // they get an environment reference, never the token itself.
+    if probe_and_write_opencode(dir, addr)? {
         writeln!(
             out,
-            "  + OpenCode: wrote {}",
+            "  + OpenCode: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
+             before launching `opencode` here)",
             dir.join(".opencode.json").display()
         )?;
     }
-    if probe_and_write_gemini(dir, addr, token)? {
+    if probe_and_write_gemini(dir, addr)? {
         writeln!(
             out,
-            "  + Gemini CLI: wrote {}",
+            "  + Gemini CLI: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
+             before launching `gemini` here)",
             dir.join(".gemini/settings.json").display()
         )?;
     }
@@ -542,6 +623,16 @@ const INIT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// database lock goes at the same moment.
 #[cfg(feature = "digest")]
 fn stop_server(pid: u32, addr: std::net::SocketAddr) -> Result<()> {
+    // The pid came out of an HTTP body. `/health` answered like drsg, but a
+    // stale recorded port could be answering for anyone; before a signal
+    // goes anywhere, the process is checked to be a drsg where the system
+    // lets us look.
+    if !process_is_drsg(pid) {
+        bail!(
+            "pid {pid} (from {addr}'s /health) is not a drsg process — refusing to stop it. \
+             Stop the server holding {addr} by hand and run this again."
+        );
+    }
     terminate(pid)?;
     let deadline = std::time::Instant::now() + INIT_STOP_TIMEOUT;
     while std::time::Instant::now() < deadline {
@@ -554,6 +645,28 @@ fn stop_server(pid: u32, addr: std::net::SocketAddr) -> Result<()> {
         "drsg (pid {pid}) was asked to stop but still holds {addr} after {}s",
         INIT_STOP_TIMEOUT.as_secs()
     )
+}
+
+/// Whether `pid` runs a drsg binary, read from `/proc/<pid>/cmdline`: the
+/// first argument's file name starts with `drsg`. Where there is no `/proc`
+/// to read, or the entry cannot be read, the answer is "yes" — the check
+/// refuses what it can see is wrong, it does not demand proof.
+#[cfg(all(feature = "digest", target_os = "linux"))]
+fn process_is_drsg(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return true;
+    };
+    let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+    let name = Path::new(std::str::from_utf8(argv0).unwrap_or_default())
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default();
+    name.starts_with("drsg")
+}
+
+#[cfg(all(feature = "digest", not(target_os = "linux")))]
+fn process_is_drsg(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(all(feature = "digest", unix))]
@@ -600,24 +713,108 @@ fn pick_free_port() -> Result<std::net::SocketAddr> {
     listener.local_addr().context("reading the picked port")
 }
 
-/// Polls `addr` until something accepts a TCP connection, the child exits
-/// first, or `timeout` elapses.
+/// How many ports `init` will pick before giving up on a child that dies
+/// before listening. Losing one race is plausible; losing three in a row
+/// means the child is dying for a reason a new port will not cure.
+#[cfg(feature = "digest")]
+const INIT_SPAWN_ATTEMPTS: usize = 3;
+
+/// Start `drsg serve watch` for `dir` on `addr`, detached from this process.
+#[cfg(feature = "digest")]
+fn spawn_serve_watch(
+    exe: &Path,
+    watch: &Watch<'_>,
+    addr: std::net::SocketAddr,
+) -> Result<std::process::Child> {
+    let Watch {
+        dir,
+        db_path,
+        plane,
+        token,
+        force,
+    } = *watch;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.current_dir(dir)
+        .arg("--db")
+        .arg(db_path)
+        .arg("serve")
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("watch")
+        .arg("--dir")
+        .arg(dir)
+        .arg("--plane")
+        .arg(plane)
+        .env("DRSG_TOKEN", token)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if force {
+        cmd.arg("--force");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid()` is async-signal-safe and touches only the
+        // child's own process state; this runs in the forked child before
+        // exec, per `pre_exec`'s contract.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn().with_context(|| {
+        format!(
+            "spawning `{} serve watch` for {}",
+            exe.display(),
+            dir.display()
+        )
+    })
+}
+
+/// How a wait for the spawned server ended.
+#[cfg(feature = "digest")]
+#[derive(Debug, PartialEq, Eq)]
+enum Listener {
+    /// The child itself answers `/health` on the address.
+    Up,
+    /// The child exited before anything listened — a port it could not
+    /// bind, or a start-up failure of its own.
+    ChildExited,
+    /// The child is alive but nothing listens yet.
+    TimedOut,
+}
+
+/// Polls `addr` until the child itself answers `/health` there, the child
+/// exits first, or `timeout` elapses. The two failures are told apart because
+/// only the first is worth retrying on another port.
+///
+/// "The child itself": a connection accepted on the address is not enough,
+/// because a picked port can be taken by something that listens in the
+/// moment before the child binds it. `/health` carries the answering
+/// server's pid, and only the child's pid counts; anything else on the port
+/// is a stranger, and the child — which could not bind — exits shortly after,
+/// which is what sends `init` to another port.
 #[cfg(feature = "digest")]
 fn wait_for_listener(
     addr: std::net::SocketAddr,
     child: &mut std::process::Child,
     timeout: std::time::Duration,
-) -> bool {
+) -> Listener {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return true;
+        if health_probe(addr, INIT_PROBE_TIMEOUT) == Some(Some(child.id())) {
+            return Listener::Up;
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return false;
+            return Listener::ChildExited;
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return Listener::TimedOut;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -667,7 +864,7 @@ fn ensure_gitignore_patterns(dir: &Path) -> Result<()> {
         content.push('\n');
     }
     content.push_str(
-        "# drsg — local database, logs, and the MCP config carrying a live bearer token\n",
+        "# drsg — local database, logs, and the MCP configs carrying a live bearer token\n",
     );
     for p in missing {
         content.push_str(p);
@@ -743,8 +940,13 @@ fn probe_and_write_cursor(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
 /// rules/config dir it creates unprompted) — the only honest signal that
 /// this repo's contributors already use it is a pre-existing
 /// `.opencode.json`, so that's the marker, not something created fresh.
+///
+/// That file existed before `init` and is very likely committed, so no
+/// token goes into it: OpenCode substitutes `{env:NAME}` in its config, and
+/// the entry names [`CODEX_TOKEN_ENV_VAR`] the way the Codex entry does.
+/// The caller exports it before launching `opencode` here.
 #[cfg(feature = "digest")]
-fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool> {
     if !dir.join(".opencode.json").is_file() {
         return Ok(false);
     }
@@ -755,7 +957,7 @@ fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str
         json!({
             "type": "remote",
             "url": format!("http://{addr}/mcp"),
-            "headers": { "Authorization": format!("Bearer {token}") },
+            "headers": { "Authorization": format!("Bearer {{env:{CODEX_TOKEN_ENV_VAR}}}") },
             "enabled": true,
         }),
     )?;
@@ -765,8 +967,13 @@ fn probe_and_write_opencode(dir: &Path, addr: &std::net::SocketAddr, token: &str
 /// Gemini CLI shares Claude Code's `mcpServers` key but names the URL field
 /// `httpUrl` instead of `url`, and has no `type` discriminator. Written
 /// only when `.gemini/` already exists.
+///
+/// `.gemini/settings.json` is a project's shared Gemini settings, committed
+/// as often as not, so the token is not written into it: Gemini CLI resolves
+/// `$NAME` in its settings from the environment, and the entry names
+/// [`CODEX_TOKEN_ENV_VAR`] as the Codex and OpenCode entries do.
 #[cfg(feature = "digest")]
-fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) -> Result<bool> {
+fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr) -> Result<bool> {
     if !dir.join(".gemini").is_dir() {
         return Ok(false);
     }
@@ -776,16 +983,18 @@ fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, token: &str) 
         MCP_SERVER_NAME,
         json!({
             "httpUrl": format!("http://{addr}/mcp"),
-            "headers": { "Authorization": format!("Bearer {token}") },
+            "headers": { "Authorization": format!("Bearer ${CODEX_TOKEN_ENV_VAR}") },
         }),
     )?;
     Ok(true)
 }
 
-/// The env var Codex CLI reads its bearer token from at its *own* launch
-/// time — Codex's schema takes `bearer_token_env_var` (a variable name),
-/// never a literal token, so the secret never lands in `.codex/config.toml`
-/// itself. The caller still has to export it before running `codex` here.
+/// The env var the terminal clients read the bearer token from at their own
+/// launch time. Codex's schema takes `bearer_token_env_var` (a variable
+/// name), never a literal; OpenCode and Gemini CLI substitute environment
+/// references in their config files. In all three the secret stays out of a
+/// file that is probably committed, and the caller exports it before running
+/// the client here — `init` prints the line to paste.
 #[cfg(feature = "digest")]
 const CODEX_TOKEN_ENV_VAR: &str = "DRSG_TOKEN";
 
@@ -924,10 +1133,15 @@ fn write_executable(path: &Path, body: &str) -> Result<()> {
 }
 
 /// Upsert one hook command under `hooks.<event>` of a Claude Code settings
-/// file. An entry whose command already ends in this script's name is
-/// repointed (the data directory may have moved); otherwise one is added,
+/// file. An entry whose command is exactly a path to a script of this name
+/// is repointed (the data directory may have moved); otherwise one is added,
 /// with `matcher` when the event takes one. Every other key is untouched,
 /// and a file that is not there yet is created.
+///
+/// "Exactly a path": the whole command, no arguments, and its last path
+/// component equal to the name — not merely ending in it. A team's own
+/// `/x/my-drsg-shell-guard`, or a wrapper that runs our script with
+/// arguments, is somebody else's hook and stays as it is.
 #[cfg(feature = "digest")]
 fn upsert_claude_hook(
     path: &Path,
@@ -958,17 +1172,23 @@ fn upsert_claude_hook(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let command = script.display().to_string();
+    let raw = script.display().to_string();
+    let command = hook_command(script);
     let mut found = false;
     for entry in entries.iter_mut() {
         let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
             continue;
         };
         for hook in list.iter_mut() {
+            // Ours: exactly what this `init` writes for this project (quoted
+            // when the path needs it), the unquoted path an earlier `init`
+            // wrote, or a bare path to a script of this name anywhere — a
+            // moved data directory. A project directory holding a space is
+            // why the first two are not covered by the third.
             let ours = hook
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|c| c.ends_with(&name));
+                .is_some_and(|c| c == command || c == raw || is_our_hook_command(c, &name));
             if ours {
                 hook["command"] = Value::String(command.clone());
                 found = true;
@@ -984,6 +1204,30 @@ fn upsert_claude_hook(
     }
     let pretty = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))
+}
+
+/// The hook command that runs `script`: its path, single-quoted when it
+/// holds whitespace. Claude Code hands the command to a shell, so an
+/// unquoted `/home/me/My Project/.drsg/hooks/drsg-shell-guard` would run
+/// `/home/me/My` — and never guard anything.
+#[cfg(feature = "digest")]
+fn hook_command(script: &Path) -> String {
+    let raw = script.display().to_string();
+    if raw.chars().any(char::is_whitespace) {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    } else {
+        raw
+    }
+}
+
+/// Whether `command` is one of our hook scripts by that exact file name — a
+/// bare path (no arguments, no shell syntax) whose last component is `name`.
+#[cfg(feature = "digest")]
+fn is_our_hook_command(command: &str, name: &str) -> bool {
+    let bare = command.trim();
+    !bare.is_empty()
+        && !bare.chars().any(char::is_whitespace)
+        && Path::new(bare).file_name().and_then(|f| f.to_str()) == Some(name)
 }
 
 /// `drsg history` — a repository's history at a glance.
@@ -3526,7 +3770,7 @@ fn read_jsonl(reader: impl BufRead) -> Result<Batch> {
 /// collides on every line, and a thousand-key error helps nobody.
 fn refuse_conflicts(
     keys: &[Option<String>],
-    conflicted: &ahash::AHashMap<usize, NodeId>,
+    conflicted: &AHashMap<usize, NodeId>,
     plane_name: &str,
 ) -> Result<()> {
     let mut names: Vec<&str> = conflicted
@@ -3570,7 +3814,7 @@ pub fn import(
 
     // Which incoming keys already exist. Done under the open write transaction
     // so no other writer can land between the check and the load.
-    let mut conflicted: ahash::AHashMap<usize, NodeId> = ahash::AHashMap::new();
+    let mut conflicted: AHashMap<usize, NodeId> = AHashMap::new();
     for (i, key) in keys.iter().enumerate() {
         if let Some(key) = key
             && let Some(node) = p.node_by_key(key)?
@@ -3603,8 +3847,8 @@ pub fn import(
     let stats = txn.bulk_load(bnodes, Vec::new())?;
 
     // Maps from this batch's identifiers to the node ids edges must resolve to.
-    let mut old_to_new = ahash::AHashMap::new();
-    let mut key_to_new = ahash::AHashMap::new();
+    let mut old_to_new = AHashMap::new();
+    let mut key_to_new = AHashMap::new();
     for (n, &i) in kept.iter().enumerate() {
         let id = NodeId(stats.node_start + n as u64);
         if let Some(o) = old_ids[i] {
@@ -3696,8 +3940,8 @@ fn parse_ref(obj: &serde_json::Map<String, Value>, prefix: &str) -> Result<Ref> 
 /// plane (a committed key, or a live node id).
 fn resolve(
     r: &Ref,
-    key_to_new: &ahash::AHashMap<String, NodeId>,
-    old_to_new: &ahash::AHashMap<u64, NodeId>,
+    key_to_new: &AHashMap<String, NodeId>,
+    old_to_new: &AHashMap<u64, NodeId>,
     p: &PlaneHandle,
 ) -> Result<NodeId> {
     match r {
@@ -4600,6 +4844,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The retention a CLI command opens with is the one the store lives by:
+    /// a commit below the window is refused, exactly as it would be under
+    /// `serve`. Before, `open` ignored the setting and the CLI-only store
+    /// kept every version ever written.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn open_applies_the_configured_retention() {
+        let dir = std::env::temp_dir().join(format!("drsg-cli-open-retain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir, Some(1)).unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let first = db.commit_seq().unwrap();
+        for i in 0..3 {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key(&format!("n{i}"), &["N"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        assert!(
+            plane.as_of(dr_strange_core::AsOf::Seq(first)).is_err(),
+            "a commit outside the retained window must be refused"
+        );
+        drop(db);
+        // `None` is unbounded: the same store, reopened without a bound,
+        // reaches its first commit again (nothing was compacted away yet).
+        let db = open(&dir, None).unwrap();
+        let plane = db.plane("p").unwrap();
+        assert!(plane.as_of(dr_strange_core::AsOf::Seq(first)).is_ok());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Only the `init`/plugin-store tests need one, and both need the plugin
     /// host.
     #[cfg(feature = "digest")]
@@ -4618,6 +4894,102 @@ mod tests {
         assert_ne!(addr.port(), 0);
         // The picked port is actually free to bind again immediately after.
         std::net::TcpListener::bind(addr).unwrap();
+    }
+
+    /// The two ways a spawn fails are told apart, because only a child that
+    /// died — a port lost to a race — is worth a second port.
+    #[cfg(all(feature = "digest", unix))]
+    #[test]
+    fn wait_for_listener_tells_a_dead_child_from_a_slow_one() {
+        let addr = pick_free_port().unwrap();
+        let short = std::time::Duration::from_millis(300);
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut dead, short),
+            Listener::ChildExited
+        );
+        let mut slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut slow, short),
+            Listener::TimedOut
+        );
+        let _ = slow.kill();
+        let _ = slow.wait();
+    }
+
+    /// A stranger that took the picked port and listens is not the child:
+    /// the wait does not call a connection it accepts "up", it keeps
+    /// waiting for the child's own `/health` — and reports the child's exit
+    /// when the child, unable to bind, gives up.
+    #[cfg(all(feature = "digest", unix))]
+    #[test]
+    fn wait_for_listener_is_not_fooled_by_a_stranger_on_the_port() {
+        let stranger = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = stranger.local_addr().unwrap();
+        // Accept and answer like a drsg would — with somebody else's pid.
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write as _};
+            for conn in stranger.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = format!("{{\"status\":\"ok\",\"pid\":{}}}", u32::MAX - 7);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let short = std::time::Duration::from_millis(400);
+        let mut slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut slow, short),
+            Listener::TimedOut
+        );
+        let _ = slow.kill();
+        let _ = slow.wait();
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_listener(addr, &mut dead, short),
+            Listener::ChildExited
+        );
+        drop(server);
+    }
+
+    /// A pid read out of an HTTP body is not signalled until the system
+    /// confirms it is a drsg: this test binary is one, a `sleep` is not.
+    #[cfg(all(feature = "digest", target_os = "linux"))]
+    #[test]
+    fn only_a_drsg_process_is_stopped() {
+        assert!(process_is_drsg(std::process::id()));
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Between fork and exec the child still wears this binary's cmdline;
+        // give it a moment to become `sleep`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_drsg(other.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!process_is_drsg(other.id()));
+        let _ = other.kill();
+        let _ = other.wait();
+        // A pid nobody has: nothing to see, so nothing to refuse.
+        assert!(process_is_drsg(u32::MAX - 1));
     }
 
     #[cfg(feature = "digest")]
@@ -4793,8 +5165,8 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         assert!(!probe_and_write_cursor(&dir, &addr, "tok").unwrap());
-        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
-        assert!(!probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_opencode(&dir, &addr).unwrap());
+        assert!(!probe_and_write_gemini(&dir, &addr).unwrap());
         assert!(!probe_and_write_codex(&dir, &addr).unwrap());
         assert!(!dir.join(".cursor").exists());
         assert!(!dir.join(".opencode.json").exists());
@@ -4853,20 +5225,64 @@ mod tests {
         );
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
 
-        // Someone else's hooks and settings survive untouched.
+        // Someone else's hooks and settings survive untouched — including a
+        // hook whose command merely *ends in* our script's name, or runs our
+        // script with arguments of its own. Only an exact path is ours.
         std::fs::write(
             &settings,
-            r#"{"permissions": {"allow": ["Bash(git:*)"]}, "hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "/x/lint"}]}]}}"#,
+            r#"{"permissions": {"allow": ["Bash(git:*)"]}, "hooks": {"PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "/x/lint"}]},
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "/x/my-drsg-shell-guard"},
+                    {"type": "command", "command": "/x/wrap drsg-shell-guard"}
+                ]}
+            ]}}"#,
         )
         .unwrap();
         assert!(probe_and_write_claude_hooks(&dir, &hooks, true).unwrap());
         let v = read();
         assert_eq!(v["permissions"]["allow"][0], "Bash(git:*)");
-        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/x/lint"
         );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
+            "/x/my-drsg-shell-guard"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1]["hooks"][1]["command"],
+            "/x/wrap drsg-shell-guard"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][2]["hooks"][0]["command"],
+            hooks.join("drsg-shell-guard").display().to_string()
+        );
+
+        // A data directory with a space in its path: the command is written
+        // quoted so the shell runs the script, and a second `init` still
+        // recognises it as ours — once, not once per run. An unquoted spaced
+        // path an earlier init wrote is repointed rather than duplicated.
+        let spaced = dir.join("my data").join("hooks");
+        let unquoted = spaced.join("drsg-shell-guard").display().to_string();
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": unquoted}]}
+            ]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
+        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
+        let v = read();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            format!("'{}'", spaced.join("drsg-shell-guard").display())
+        );
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4929,6 +5345,15 @@ mod tests {
             "git log -p src/a.rs",
             "git log -L 10,20:src/a.rs",
             "git log --patch -3",
+            // A redirect *inside a pattern* is a search, not a write: the
+            // guard used to wave anything with a `>` through.
+            "rg '>' src",
+            "grep -rn \"a -> b\" src",
+            "rg 'impl<T> Foo' src",
+            "rg \\> src",
+            "grep -rn 'x << 1' src",
+            // stderr to /dev/null is still a read.
+            "rg needle src 2>/dev/null",
         ] {
             let (code, err) = run(blocked);
             assert_eq!(code, 2, "`{blocked}` should be redirected");
@@ -4946,6 +5371,9 @@ mod tests {
             "cargo test -p x",
             "DRSG_RAW=1 rg needle src",
             "cat > out.txt <<'EOF'\nhello\nEOF",
+            "cat a.txt > b.txt",
+            "grep -v junk in.txt >> out.txt",
+            "cat <<EOF > notes.md\nx\nEOF",
             "sed -i 's/a/b/' src/lib.rs",
             "echo hi | grep h",
             "ls -la",
@@ -4984,6 +5412,11 @@ mod tests {
             v["mcpServers"]["drsg-watch"]["url"],
             "http://127.0.0.1:12345/mcp"
         );
+        // Cursor's file carries the token itself (a desktop app has no shell
+        // environment to read one from), so `init`'s .gitignore block covers
+        // it — every file written with a literal token is in that block.
+        assert!(GITIGNORE_PATTERNS.contains(&".cursor/mcp.json"));
+        assert!(GITIGNORE_PATTERNS.contains(&".mcp.json"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4995,17 +5428,23 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         // No pre-existing `.opencode.json`: nothing is created.
-        assert!(!probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(!probe_and_write_opencode(&dir, &addr).unwrap());
         assert!(!dir.join(".opencode.json").exists());
 
         // Once it exists, the entry is upserted under `mcp`, not `mcpServers`.
         std::fs::write(dir.join(".opencode.json"), "{}").unwrap();
-        assert!(probe_and_write_opencode(&dir, &addr, "tok").unwrap());
+        assert!(probe_and_write_opencode(&dir, &addr).unwrap());
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".opencode.json")).unwrap())
                 .unwrap();
         assert_eq!(v["mcp"]["drsg-watch"]["type"], "remote");
         assert_eq!(v["mcp"]["drsg-watch"]["url"], "http://127.0.0.1:12345/mcp");
+        // A file that predates `init` is probably committed: it carries an
+        // environment reference in OpenCode's own syntax, never the token.
+        assert_eq!(
+            v["mcp"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer {env:DRSG_TOKEN}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5017,7 +5456,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".gemini")).unwrap();
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(probe_and_write_gemini(&dir, &addr, "tok").unwrap());
+        assert!(probe_and_write_gemini(&dir, &addr).unwrap());
         let v: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join(".gemini/settings.json")).unwrap(),
         )
@@ -5025,6 +5464,12 @@ mod tests {
         assert_eq!(
             v["mcpServers"]["drsg-watch"]["httpUrl"],
             "http://127.0.0.1:12345/mcp"
+        );
+        // Gemini resolves `$NAME` from the environment; the shared settings
+        // file never holds the token itself.
+        assert_eq!(
+            v["mcpServers"]["drsg-watch"]["headers"]["Authorization"],
+            "Bearer $DRSG_TOKEN"
         );
         assert!(
             v["mcpServers"]["drsg-watch"]["url"].is_null(),

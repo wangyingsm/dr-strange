@@ -4,19 +4,25 @@
 #   curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh | sh -s -- --bin drsg-mcp
 #
-# Downloads a released archive from GitHub, verifies its SHA-256, and installs
-# the binary. Nothing is compiled; no toolchain is required.
+# Downloads a released archive from GitHub, verifies its SHA-256 against the
+# published .sha256 sidecar, and installs the binary. Nothing is compiled; no
+# toolchain is required. A missing or mismatching sidecar is a hard failure:
+# the archive and the sidecar come from the same origin, so the check does not
+# defend against that origin, but it does turn a truncated download, a stale
+# mirror or a swapped asset into an error instead of an installed binary.
 #
 # Options (each has an environment-variable equivalent):
 #   --bin <drsg|drsg-mcp|all>   binary to install         (DRSG_INSTALL_BIN,  default drsg)
 #   --version <vX.Y.Z|latest>   release to install        (DRSG_VERSION,      default latest)
 #   --dir <path>                installation directory    (DRSG_INSTALL_DIR,  default ~/.local/bin)
+#   --insecure-skip-checksum    install without verifying (DRSG_INSECURE_SKIP_CHECKSUM=1)
 set -eu
 
 REPO=wangyingsm/dr-strange
 BIN=${DRSG_INSTALL_BIN:-drsg}
 VERSION=${DRSG_VERSION:-latest}
 INSTALL_DIR=${DRSG_INSTALL_DIR:-}
+SKIP_CHECKSUM=${DRSG_INSECURE_SKIP_CHECKSUM:-}
 
 info() { printf '%s\n' "$*" >&2; }
 err() {
@@ -34,6 +40,8 @@ Dr Strange installer for Linux and macOS.
   --bin <drsg|drsg-mcp|all>   binary to install       (DRSG_INSTALL_BIN, default drsg)
   --version <vX.Y.Z|latest>   release to install      (DRSG_VERSION,     default latest)
   --dir <path>                installation directory  (DRSG_INSTALL_DIR, default ~/.local/bin)
+  --insecure-skip-checksum    install without verifying the archive's SHA-256
+                              (DRSG_INSECURE_SKIP_CHECKSUM=1) — insecure, as it says
 EOF
     exit 0
 }
@@ -43,6 +51,7 @@ while [ $# -gt 0 ]; do
         --bin) BIN=${2:?--bin needs a value} && shift 2 ;;
         --version) VERSION=${2:?--version needs a value} && shift 2 ;;
         --dir) INSTALL_DIR=${2:?--dir needs a value} && shift 2 ;;
+        --insecure-skip-checksum) SKIP_CHECKSUM=1 && shift ;;
         -h | --help) usage ;;
         *) err "unknown option: $1 (try --help)" ;;
     esac
@@ -114,20 +123,30 @@ info "  downloading $archive"
 fetch "$base/$archive" "$tmp/$archive" ||
     err "download failed — $VERSION may not ship an asset for $target: $base/$archive"
 
-if fetch "$base/$archive.sha256" "$tmp/$archive.sha256" 2>/dev/null; then
+# Anything but empty or 0 opts out; the check is otherwise mandatory.
+case ${SKIP_CHECKSUM:-0} in
+    0 | '') verify=1 ;;
+    *) verify= ;;
+esac
+if [ -n "$verify" ]; then
+    fetch "$base/$archive.sha256" "$tmp/$archive.sha256" 2>/dev/null ||
+        err "no checksum published for $archive ($base/$archive.sha256) — refusing to install an unverified archive (pass --insecure-skip-checksum to override)"
     expected=$(cut -d' ' -f1 <"$tmp/$archive.sha256")
+    case $expected in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
+        *) err "the published checksum for $archive is not a SHA-256: $expected" ;;
+    esac
     if have sha256sum; then
         actual=$(sha256sum "$tmp/$archive" | cut -d' ' -f1)
     elif have shasum; then
         actual=$(shasum -a 256 "$tmp/$archive" | cut -d' ' -f1)
     else
-        actual=
-        info '  no sha256sum/shasum available; skipping checksum verification'
+        err 'neither sha256sum nor shasum is available to verify the archive (pass --insecure-skip-checksum to install anyway)'
     fi
-    if [ -n "$actual" ]; then
-        [ "$actual" = "$expected" ] || err "checksum mismatch for $archive"
-        info '  checksum verified'
-    fi
+    [ "$actual" = "$expected" ] || err "checksum mismatch for $archive: expected $expected, got $actual"
+    info '  checksum verified'
+else
+    info '  WARNING: --insecure-skip-checksum — installing without verifying the archive'
 fi
 
 tar -xzf "$tmp/$archive" -C "$tmp" || err "cannot unpack $archive"

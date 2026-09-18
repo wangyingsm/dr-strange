@@ -25,3 +25,7 @@ logs/
 # checked out here so the two can be worked on together. Its history is its
 # own: a plugin ships a fix without waiting for a database release.
 extensions/
+
+# `just gate-hooks` runs the hook's unittest module in place, and CPython
+# caches beside the source it imports.
+__pycache__/
