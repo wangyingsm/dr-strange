@@ -4,6 +4,72 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-09-18
+
+### Fixed
+
+- **The updater runs the installer the release shipped.** `drsg update` pinned
+  the archive but fetched `scripts/install.sh` from `master`, whatever release
+  it had resolved — so anyone able to move the branch replaced the verifier on
+  every machine that upgraded, with no release ever being cut. The command is
+  now built from the tag the check resolved, and every interpolated value is
+  quoted once.
+- **An unverified archive is refused.** Both installers checked the SHA-256
+  only if the sidecar happened to download, and said nothing when it did not:
+  a truncated download or a swapped asset installed as readily as a good one.
+  A missing, malformed or mismatching sidecar — or having no `sha256sum` to
+  check with — is now a hard failure, with `--insecure-skip-checksum`
+  (`DRSG_INSECURE_SKIP_CHECKSUM=1`) as the documented way past for a mirror
+  that publishes none.
+- **A committed agent config never receives the token.** `drsg init` wrote the
+  live bearer token in clear into `.cursor/mcp.json`, `.opencode.json` and
+  `.gemini/settings.json`; the last two pre-exist `init`, which is what made it
+  write to them, so they are as likely as not already committed. OpenCode and
+  Gemini now reference `DRSG_TOKEN` as the Codex entry already did, and Cursor —
+  a desktop app with no shell environment to read — joins `.mcp.json` in the
+  gitignore block `init` maintains. `drsg.example.toml` no longer ships a live
+  `token = "change-me"`.
+- **Every action a workflow runs is named by the commit it is.** The workflows
+  named third-party actions by floating tags, so every run of ci, docs and
+  release fetched whatever those tags pointed at that day and ran it with the
+  repository's checkout — and, for release, its registry and release
+  credentials. Each `uses:` now names a full commit SHA.
+- **The shell guard reads a redirect, not an arrow.** Any command containing
+  `>` or `<<` counted as a write, so `rg '>' src`, `grep "a -> b"` and
+  `rg needle 2>/dev/null` went straight past the guard. The check now runs on
+  the command with its quoted text removed and numbered-fd redirects dropped.
+- **A hook is ours by its exact path.** `init` claimed any hook whose command
+  merely ended in our script's name — a wrapper, or a team's own copy at
+  another path — and repointed it at ours. It now matches only a bare command
+  whose last component is exactly the name, and writes a quoted command where
+  the project path holds whitespace.
+- **The usage report keeps its watermark where only its user can write.** It
+  lived at a predictable name in `/tmp`, so a file or symlink planted there was
+  followed on write and believed on read. It now lives under
+  `$XDG_RUNTIME_DIR/drsg` (falling back to `~/.cache/drsg`, both 0700), written
+  through an `O_EXCL` 0600 temporary and renamed into place.
+- **`init` waits for its own child, and signals only a drsg.** Any accepted
+  connection counted as "up", so a process that won the picked port had `init`
+  reporting success — pid, URL, agent configs — against a stranger; and
+  `stop_server` sent SIGTERM to whatever pid `/health` named. The wait now
+  requires an answer carrying the child's pid, a lost port race is retried on
+  another, and a pid whose `/proc` cmdline is not a drsg binary is refused.
+- **Every command opens the database with the retention the server would.**
+  `[server] retain_commits` was applied only by `serve`, so a store driven from
+  the command line kept every version ever written and carried them through
+  every compaction.
+- **The committed bun lock is the dependency set.** Four `bun install` sites ran
+  unfrozen, dating from a bun canary lockfile a stable bun could not parse, so
+  each build re-resolved and a republished package could change what shipped.
+  Stable bun reads `lockfileVersion 2` now, and every site is frozen.
+
+### Added
+
+- **The Zig client has a CI job**, mirroring `sdk-c`, and `just gate-sdk` runs
+  it — a schema change that broke it previously went red nowhere.
+- **The usage hook's watermark handling is pinned by a unittest module**, run by
+  a `hooks` CI job and `just gate-hooks`.
+
 ## [2.9.0] - 2026-09-17
 
 ### Changed
