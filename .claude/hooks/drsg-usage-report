@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Report this repo's drsg MCP usage at the end of every chat loop (Stop hook).
+#
+# This repository *is* drsg, and its sessions are the deepest users of the code
+# graph they build. Whether that graph is actually earning its place — how often
+# the agent asks it something instead of grepping, and what those answers cost
+# in context — is not visible from inside a session. This makes it visible, once
+# per turn, without anyone having to ask.
+#
+# Reads the Stop hook's JSON on stdin, parses the session transcript, and emits
+# a `systemMessage` for the UI. Never fails a turn: any problem is reported as a
+# short note instead of an error.
+exec python3 -I "$(dirname "$0")/drsg_usage_report.py"
