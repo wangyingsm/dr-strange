@@ -180,8 +180,6 @@ pub fn init_bootstrap(
     plugin_config: &dr_strange_llm::PluginConfig,
     out: &mut dyn Write,
 ) -> Result<()> {
-    use rand::distr::{Alphanumeric, SampleString};
-
     let db_path = if db_path.is_absolute() {
         db_path.to_path_buf()
     } else {
@@ -246,58 +244,12 @@ pub fn init_bootstrap(
     // and the `serve watch` spawned below sets its own.
     open(&db_path, None)?;
 
-    // A recorded endpoint that stopped answering is the one worth restoring
-    // verbatim: agents already hold that URL and token. An explicit flag
-    // still wins over it.
-    // `picked` records that nobody asked for this port — it came out of
-    // `pick_free_port`, and if something else grabs it before the child
-    // binds, another pick is as good as the first. An explicit `--addr` or
-    // a recorded address is a promise to agents and is never swapped.
-    let (addr, picked, token, mut force) = match recorded {
-        Some((recorded_addr, recorded_token)) => {
-            let (addr, picked) = match addr {
-                Some(explicit) => (explicit, false),
-                // The recorded port was an arbitrary one the OS handed out,
-                // and after a reboot it may belong to something else — which
-                // the health probe already ruled out as being drsg. Moving is
-                // then the only way to come up at all; agents pick the new
-                // address up from the rewritten configs.
-                None if addr_bindable(recorded_addr) => (recorded_addr, false),
-                None => {
-                    let moved = pick_free_port()?;
-                    writeln!(
-                        out,
-                        "note: {recorded_addr} is taken by another process — moving to {moved}"
-                    )?;
-                    (moved, true)
-                }
-            };
-            (
-                addr,
-                picked,
-                token.unwrap_or(recorded_token),
-                // The plane already exists and records where it left off;
-                // `serve watch` catches it up from there. Re-parsing the
-                // whole tree here would make every restart cost a full
-                // digest.
-                false,
-            )
-        }
-        None => {
-            let (addr, picked) = match addr {
-                Some(addr) => (addr, false),
-                None => (pick_free_port()?, true),
-            };
-            (
-                addr,
-                picked,
-                token.unwrap_or_else(|| {
-                    Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)
-                }),
-                true,
-            )
-        }
-    };
+    let Endpoint {
+        addr,
+        picked,
+        token,
+        mut force,
+    } = endpoint_for_init(recorded, addr, token, out)?;
     // Whatever the plane's state, `--rebuild` re-reads the tree.
     force |= rebuild;
     let plane_name = plane.unwrap_or_else(|| default_plane(&dir.display().to_string()));
@@ -322,6 +274,84 @@ pub fn init_bootstrap(
     )?;
     say_history(&dir, &plane_name, plugin_config, out)?;
     write_agent_configs(&dir, &addr, &token, out)
+}
+
+/// Where an `init` will listen, with which token, and how it should come up.
+#[cfg(feature = "digest")]
+struct Endpoint {
+    addr: std::net::SocketAddr,
+    /// Nobody asked for this port — it came from `pick_free_port`, so losing a
+    /// race for it is worth another pick.
+    picked: bool,
+    token: String,
+    /// Re-read the tree rather than catch up from the plane's own mark.
+    force: bool,
+}
+
+/// Resolve the endpoint an `init` comes up on, from what a previous run
+/// recorded and what this one was asked for.
+#[cfg(feature = "digest")]
+fn endpoint_for_init(
+    recorded: Option<(std::net::SocketAddr, String)>,
+    addr: Option<std::net::SocketAddr>,
+    token: Option<String>,
+    out: &mut dyn Write,
+) -> Result<Endpoint> {
+    use rand::distr::{Alphanumeric, SampleString};
+
+    // A recorded endpoint that stopped answering is the one worth restoring
+    // verbatim: agents already hold that URL and token. An explicit flag
+    // still wins over it.
+    // `picked` records that nobody asked for this port — it came out of
+    // `pick_free_port`, and if something else grabs it before the child
+    // binds, another pick is as good as the first. An explicit `--addr` or
+    // a recorded address is a promise to agents and is never swapped.
+    let chosen = match recorded {
+        Some((recorded_addr, recorded_token)) => {
+            let (addr, picked) = match addr {
+                Some(explicit) => (explicit, false),
+                // The recorded port was an arbitrary one the OS handed out,
+                // and after a reboot it may belong to something else — which
+                // the health probe already ruled out as being drsg. Moving is
+                // then the only way to come up at all; agents pick the new
+                // address up from the rewritten configs.
+                None if addr_bindable(recorded_addr) => (recorded_addr, false),
+                None => {
+                    let moved = pick_free_port()?;
+                    writeln!(
+                        out,
+                        "note: {recorded_addr} is taken by another process — moving to {moved}"
+                    )?;
+                    (moved, true)
+                }
+            };
+            Endpoint {
+                addr,
+                picked,
+                token: token.unwrap_or(recorded_token),
+                // The plane already exists and records where it left off;
+                // `serve watch` catches it up from there. Re-parsing the
+                // whole tree here would make every restart cost a full
+                // digest.
+                force: false,
+            }
+        }
+        None => {
+            let (addr, picked) = match addr {
+                Some(addr) => (addr, false),
+                None => (pick_free_port()?, true),
+            };
+            Endpoint {
+                addr,
+                picked,
+                token: token.unwrap_or_else(|| {
+                    Alphanumeric.sample_string(&mut rand::rng(), INIT_TOKEN_LEN)
+                }),
+                force: true,
+            }
+        }
+    };
+    Ok(chosen)
 }
 
 /// What a `serve watch` child is started for: the tree it follows, the
