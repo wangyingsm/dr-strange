@@ -18,6 +18,8 @@ use dr_strange_core::{
 use dr_strange_core::{PropDesc, PropValue};
 use serde_json::{Value, json};
 
+use ahash::AHashMap;
+
 use dr_strange_core::json as jsonio;
 
 /// Opens (creating if needed) the database at `path`, with the configured
@@ -3768,7 +3770,7 @@ fn read_jsonl(reader: impl BufRead) -> Result<Batch> {
 /// collides on every line, and a thousand-key error helps nobody.
 fn refuse_conflicts(
     keys: &[Option<String>],
-    conflicted: &ahash::AHashMap<usize, NodeId>,
+    conflicted: &AHashMap<usize, NodeId>,
     plane_name: &str,
 ) -> Result<()> {
     let mut names: Vec<&str> = conflicted
@@ -3812,7 +3814,7 @@ pub fn import(
 
     // Which incoming keys already exist. Done under the open write transaction
     // so no other writer can land between the check and the load.
-    let mut conflicted: ahash::AHashMap<usize, NodeId> = ahash::AHashMap::new();
+    let mut conflicted: AHashMap<usize, NodeId> = AHashMap::new();
     for (i, key) in keys.iter().enumerate() {
         if let Some(key) = key
             && let Some(node) = p.node_by_key(key)?
@@ -3845,8 +3847,8 @@ pub fn import(
     let stats = txn.bulk_load(bnodes, Vec::new())?;
 
     // Maps from this batch's identifiers to the node ids edges must resolve to.
-    let mut old_to_new = ahash::AHashMap::new();
-    let mut key_to_new = ahash::AHashMap::new();
+    let mut old_to_new = AHashMap::new();
+    let mut key_to_new = AHashMap::new();
     for (n, &i) in kept.iter().enumerate() {
         let id = NodeId(stats.node_start + n as u64);
         if let Some(o) = old_ids[i] {
@@ -3938,8 +3940,8 @@ fn parse_ref(obj: &serde_json::Map<String, Value>, prefix: &str) -> Result<Ref> 
 /// plane (a committed key, or a live node id).
 fn resolve(
     r: &Ref,
-    key_to_new: &ahash::AHashMap<String, NodeId>,
-    old_to_new: &ahash::AHashMap<u64, NodeId>,
+    key_to_new: &AHashMap<String, NodeId>,
+    old_to_new: &AHashMap<u64, NodeId>,
     p: &PlaneHandle,
 ) -> Result<NodeId> {
     match r {
