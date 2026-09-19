@@ -4,6 +4,57 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.2] - 2026-09-19
+
+### Fixed
+
+- **A model cannot stamp provenance, plant a vector, or key a node on
+  nothing.** Extraction inserted whatever property name the model emitted, and
+  the provenance stamp afterwards overwrote only `_source`, `_model` and
+  `_run` — so a model-emitted `_generated_by` survived. That property is what
+  marks a node as a parser's, and a parser-owned node is one the next watch
+  fold may delete or rewrite, so a document written to steer the model could
+  hand the graph's ownership to whoever wrote the document. The same path
+  accepted `embedding` and a vector under any other name (a steered
+  similarity search), empty property names, and entity keys that were blank or
+  a paragraph long. A model-emitted name must now be trimmed, non-empty,
+  printable and bounded, and the properties only the pipeline may write are
+  refused at both stages that accept them; the report counts what was dropped,
+  because a model does not produce these — a document written to steer one
+  does.
+- **`ask` runs only the grammar it teaches, and never an unbounded plan.** The
+  safety cap was appended only when the plan declared none, so a model that
+  wrote `{"Limit": 1000000000000}` ran unbounded on a call reachable from the
+  Read tier; and the plan itself was checked against nothing, though the model
+  could already emit the variants the prompt forbids. Plans are now checked
+  against an allowlist of the taught grammar and every limit — the model's,
+  the caller's, a projection's — is clamped to a ceiling. `limit: 0` means
+  that ceiling rather than no ceiling.
+- **The chat provider keeps its key out of its errors.** A transport error was
+  returned as the HTTP client renders it, leading with the URL — which is
+  where a key ends up when an operator was told to supply a base URL
+  (`…/v1?api-key=…`, `https://token@host/`). Errors now describe the fault,
+  and the messages that must name an endpoint name it with the query string
+  and userinfo cut. `Retry-After` is honoured up to sixty seconds instead of
+  being clamped to the backoff schedule, and a dead provider stops a run after
+  one refusal rather than after every chunk has made its own doomed request.
+- **A plugin cannot read what the host would not list.** The sandbox also
+  gains a clock, a shared memory budget across plugin instances, and a version
+  that is part of a build's identity, so a rebuilt plugin is not mistaken for
+  the one it replaced.
+- **A commit fold is one transaction.** The fold committed its delete-and-load,
+  then opened a second transaction to re-attach the incoming edges of replaced
+  nodes and carry their vectors across. Between the two commits a reader saw a
+  replaced symbol with no embedding and no links into it, and a crash left it
+  that way for good.
+- **The ingest ledger is written under the plane's write lock**, and a digest
+  reply that is not JSON is asked for once more before the run is abandoned.
+
+### Changed
+
+- **The embedding pass walks the plane by id** instead of cloning every
+  record, and embeds a batch at a time.
+
 ## [2.9.1] - 2026-09-18
 
 ### Fixed
