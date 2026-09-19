@@ -16,9 +16,14 @@ import {
   focusDistances,
   frontierIds,
   hubsToFold,
+  layoutPlan,
   leavesOf,
   sectorLeaves,
   weightByImportance,
+  WORKER_MAX_MS,
+  WORKER_MIN,
+  WORKER_MIN_MS,
+  WORKER_MS_PER_NODE,
 } from './layout.js'
 
 /** A hub with `n` leaves, plus `extra` nodes wired to each other and the hub. */
@@ -347,5 +352,27 @@ describe('frontierIds', () => {
     g.addNode('10', {})
     const collapsed = new Map([['~bead:x', { hub: 'x', nodes: [{ id: 10 }], edges: [] }]])
     expect(frontierIds(g, collapsed)).toEqual(['10'])
+  })
+})
+
+describe('layoutPlan', () => {
+  test('a small graph is laid out synchronously, exactly', () => {
+    expect(layoutPlan(50)).toEqual({ mode: 'sync', iterations: 150, barnesHut: false })
+    expect(layoutPlan(WORKER_MIN).mode).toBe('sync')
+  })
+
+  test('a large graph goes to the worker for a bounded time', () => {
+    const plan = layoutPlan(WORKER_MIN + 1)
+    expect(plan.mode).toBe('worker')
+    expect(plan.barnesHut).toBe(true)
+    expect(plan.ms).toBeGreaterThanOrEqual(WORKER_MIN_MS)
+    // The budget grows with the graph but never past the ceiling: a plane of
+    // a hundred thousand nodes must not hold the picture for minutes.
+    expect(layoutPlan(100_000).ms).toBe(WORKER_MAX_MS)
+    expect(layoutPlan(1_000).ms).toBe(1_000 * WORKER_MS_PER_NODE)
+  })
+
+  test('without a Worker a large graph still gets a (shorter) synchronous run', () => {
+    expect(layoutPlan(10_000, false)).toEqual({ mode: 'sync', iterations: 60, barnesHut: true })
   })
 })

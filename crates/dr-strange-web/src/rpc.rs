@@ -86,6 +86,14 @@ fn ok_response(id: Value, result: Value) -> Value {
 
 // ---- entry point ----------------------------------------------------------
 
+/// The most requests one JSON-RPC batch may carry. A batch runs its items
+/// in sequence on one blocking task and answers as one body, so it was a
+/// way to multiply one request's cost by the body limit — 64 MiB of
+/// `plane.find` in one call — and to make an unauthorized batch a
+/// brute-force loop with no round trips. A larger batch is refused whole
+/// (-32600), before any item runs. Clients that need more send more bodies.
+pub const MAX_BATCH: usize = 64;
+
 /// Parses and dispatches one JSON-RPC message (single or batch). Returns the
 /// response `Value`, or `None` when nothing is owed to the caller — a batch of
 /// only notifications, or a single notification (a request with no `id`).
@@ -107,6 +115,15 @@ pub fn handle(ctx: &Ctx<'_>, auth: &Auth<'_>, body: &[u8]) -> Option<Value> {
                 return Some(error_response(
                     Value::Null,
                     &RpcError::invalid_request("empty batch"),
+                ));
+            }
+            if items.len() > MAX_BATCH {
+                return Some(error_response(
+                    Value::Null,
+                    &RpcError::invalid_request(format!(
+                        "batch of {} exceeds the limit of {MAX_BATCH} requests",
+                        items.len()
+                    )),
                 ));
             }
             let responses: Vec<Value> = items
@@ -336,15 +353,20 @@ mod tests {
         (db, alice.0, bob.0)
     }
 
-    fn call(db: &Database, body: &str) -> Option<Value> {
-        let ctx = Ctx {
+    fn ctx_for(db: &Database) -> Ctx<'_> {
+        Ctx {
             db,
             db_path: None,
             digest: crate::DigestDefaults::default(),
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
-        };
-        handle(&ctx, &Auth::allow_all(), body.as_bytes())
+            configured_provider: None,
+            retain_commits: Some(crate::DEFAULT_RETAIN_COMMITS),
+        }
+    }
+
+    fn call(db: &Database, body: &str) -> Option<Value> {
+        handle(&ctx_for(db), &Auth::allow_all(), body.as_bytes())
     }
 
     /// Dispatch `body` under an explicit authorizer + credentials (for the auth
@@ -356,6 +378,8 @@ mod tests {
             digest: crate::DigestDefaults::default(),
             deadline: None,
             history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: None,
+            retain_commits: Some(crate::DEFAULT_RETAIN_COMMITS),
         };
         handle(&ctx, auth, body.as_bytes())
     }
@@ -572,9 +596,79 @@ mod tests {
             resp["result"]["note"]
                 .as_str()
                 .unwrap()
-                .contains("semantic unavailable")
+                .contains("semantic search unavailable")
         );
         assert_eq!(resp["result"]["nodes"][0]["external_key"], "alice");
+    }
+
+    /// The SSRF guard at the wire: a provider that is a URL is refused as
+    /// the client's error before any provider is built, on every method
+    /// that takes one.
+    #[test]
+    fn a_raw_url_provider_is_invalid_params_on_every_method() {
+        let db = seeded();
+        let url = "http://169.254.169.254/latest";
+        let cases = [
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.find","params":{{"plane":"startup","q":"ali","semantic":true,"provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.hybrid","params":{{"plane":"startup","q":"ali","vector_prop":"embedding","provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.ask","params":{{"plane":"startup","question":"who?","provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.ask","params":{{"plane":"startup","question":"who?","provider":"deepseek","embed_provider":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.cypher","params":{{"plane":"startup","query":"MATCH (n) RETURN n","embed":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"plane.vectorize","params":{{"plane":"startup","embed":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"digest.run","params":{{"plane":"startup","text":"x","chat":"{url}"}},"id":1}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"digest.run","params":{{"plane":"startup","text":"x","chat":"deepseek","embed":"{url}"}},"id":1}}"#
+            ),
+        ];
+        for body in &cases {
+            let resp = call(&db, body).unwrap();
+            assert_eq!(err_code(&resp), -32602, "{body}\n{resp}");
+            assert!(!resp["error"]["message"].as_str().unwrap().contains(url));
+        }
+    }
+
+    /// The configured provider is the one non-preset name a request may use.
+    #[test]
+    fn the_configured_provider_passes_the_guard() {
+        let db = seeded();
+        let ctx = Ctx {
+            db: &db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+            deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: Some("http://embed.internal/v1"),
+            retain_commits: None,
+        };
+        // A configured URL has no default embedding model, so the build fails
+        // *after* the guard — a -32000 with the model complaint, not -32602.
+        let resp = handle(
+            &ctx,
+            &Auth::allow_all(),
+            br#"{"jsonrpc":"2.0","method":"plane.vectorize","params":{"plane":"startup","embed":"http://embed.internal/v1"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(err_code(&resp), -32000, "{resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("embedding model")
+        );
     }
 
     #[test]
@@ -594,6 +688,61 @@ mod tests {
         assert_eq!(edges[0]["match"], "type");
         assert_eq!(edges[0]["src"], alice);
         assert_eq!(edges[0]["dst"], bob);
+    }
+
+    /// `db.stats` says how deep the history the server keeps goes — the
+    /// slider's depth, in one number a dashboard can show.
+    #[test]
+    fn db_stats_reports_the_retention() {
+        let db = seeded();
+        let resp = call(&db, r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#).unwrap();
+        assert_eq!(
+            resp["result"]["retain_commits"],
+            crate::DEFAULT_RETAIN_COMMITS
+        );
+        let mut ctx = ctx_for(&db);
+        ctx.retain_commits = None;
+        let resp = handle(
+            &ctx,
+            &Auth::allow_all(),
+            br#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"]["retain_commits"].is_null());
+    }
+
+    /// On the native backend the window `plane.history` reports starts at
+    /// the retained floor: with `retain_commits` = 3 and more commits than
+    /// that, `oldest` is three back from `latest`, never the first commit.
+    /// This is what keeps the slider from advertising depth retention has
+    /// reclaimed.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn plane_history_spans_only_the_retained_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.drsg")).unwrap();
+        let plane = db.plane("startup").unwrap();
+        for i in 0..6 {
+            let mut txn = plane.write().unwrap();
+            txn.create_node_with_key(&format!("n{i}"), &["N"], Properties::new())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let unbounded = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.history","params":{},"id":1}"#,
+        )
+        .unwrap();
+        let latest = unbounded["result"]["latest"].as_u64().unwrap();
+        assert!(latest - unbounded["result"]["oldest"].as_u64().unwrap() >= 5);
+        db.set_retention(Some(3));
+        let bounded = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.history","params":{},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(bounded["result"]["latest"], latest);
+        assert_eq!(bounded["result"]["oldest"], latest - 3, "{bounded}");
     }
 
     #[test]
@@ -625,6 +774,205 @@ mod tests {
         assert_eq!(r["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(r["total"], 2);
         assert_eq!(r["truncated"], true);
+    }
+
+    /// A plane wider than one scan page: a hub wired to a leaf on every
+    /// page, plus a rival hub of equal degree created later. Returns the db
+    /// and the ids of (hub, rival) — the two the ranking must place first,
+    /// hub before rival because ties break on id.
+    fn paged_graph() -> (Database, u64, u64) {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let hub = txn
+            .create_node_with_key("hub", &["Hub"], Properties::new())
+            .unwrap();
+        let mut leaves = Vec::new();
+        for i in 0..(crate::methods::SCAN_PAGE as usize + 50) {
+            let leaf = txn
+                .create_node_with_key(&format!("leaf-{i}"), &["Leaf"], Properties::new())
+                .unwrap();
+            leaves.push(leaf);
+            if i % 500 == 0 {
+                txn.create_edge(hub, leaf, "SPOKE", Properties::new())
+                    .unwrap();
+            }
+        }
+        let rival = txn
+            .create_node_with_key("rival", &["Hub"], Properties::new())
+            .unwrap();
+        for leaf in leaves.iter().rev().take(5) {
+            txn.create_edge(rival, *leaf, "SPOKE", Properties::new())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        (db, hub.0, rival.0)
+    }
+
+    /// The bounded, paged degree ranking returns exactly what the previous
+    /// load-everything-and-sort did: descending degree, ties by ascending
+    /// id, `total` from the counters, and the induced edges among the picks.
+    #[test]
+    fn graph_seed_by_degree_ranks_across_pages_like_a_full_sort() {
+        let (db, hub, rival) = paged_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup","order":"degree","limit":4},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        let ids: Vec<u64> = r["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_u64().unwrap())
+            .collect();
+        // Brute force over the whole plane, the way the handler used to.
+        let plane = db.plane("startup").unwrap();
+        let mut expected: Vec<(u64, usize)> = plane
+            .query()
+            .scan_all()
+            .ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| {
+                (
+                    id.0,
+                    plane
+                        .neighbors(id, dr_strange_core::Dir::Both, None)
+                        .unwrap()
+                        .len(),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let expected: Vec<u64> = expected.into_iter().take(4).map(|(id, _)| id).collect();
+        assert_eq!(ids, expected, "{r}");
+        assert_eq!(ids[0], hub);
+        assert_eq!(ids[1], rival);
+        assert_eq!(r["scores"][0]["score"], 5.0);
+        assert_eq!(r["total"], crate::methods::SCAN_PAGE + 52);
+        assert_eq!(r["truncated"], true);
+        // A label filter narrows both the ranking and the counter-backed total.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"graph.seed","params":{"plane":"startup","order":"degree","label":"Hub"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(r["total"], 2);
+        assert_eq!(r["truncated"], false);
+    }
+
+    /// A text match on the last page, for a node and for an edge: the paged
+    /// scan reaches both, and reports the plane's full size as `total`.
+    #[test]
+    fn plane_find_reaches_a_match_past_the_first_page() {
+        let (db, _hub, rival) = paged_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"rival"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["nodes"][0]["id"], rival);
+        assert_eq!(r["total"], crate::methods::SCAN_PAGE + 52);
+        assert_eq!(r["truncated"], false);
+        // Edge search by type: no node is called "spoke", so the node pass
+        // walks the whole plane and the edge pass follows it over every page
+        // — five SPOKE edges from the hub, five from rival on the last page.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"spoke","limit":10},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(r["edges"].as_array().unwrap().len(), 10, "{r}");
+        assert_eq!(r["truncated"], true);
+        // The node pass stops on page one at its first hit; the edge pass
+        // still walks every page (nothing matches, and nothing is missed).
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"leaf-0","limit":1},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(r["nodes"][0]["external_key"], "leaf-0");
+        assert_eq!(r["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(r["truncated"], true);
+    }
+
+    /// The edge pass is bounded by nodes visited, not only by edges examined:
+    /// on a plane of leaves past the cap, a needle matching no edge inside
+    /// the cap stops there and reports `truncated`, rather than looking up
+    /// the neighbours of every node. An edge inside the cap is still found.
+    #[test]
+    fn plane_find_edge_pass_stops_at_the_node_cap() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let first = txn
+            .create_node_with_key("first", &["Leaf"], Properties::new())
+            .unwrap();
+        let mut last = first;
+        for i in 1..=crate::methods::FIND_SCAN_CAP {
+            last = txn
+                .create_node_with_key(&format!("leaf-{i}"), &["Leaf"], Properties::new())
+                .unwrap();
+        }
+        // One SPOKE inside the cap, one from the node just past it.
+        txn.create_edge(first, last, "SPOKE", Properties::new())
+            .unwrap();
+        txn.create_edge(last, first, "SPOKE", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.find","params":{"plane":"startup","q":"spoke"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(r["edges"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["edges"][0]["src"], first.0);
+        assert_eq!(r["truncated"], true);
+    }
+
+    /// The export walks ids and reads one record at a time; what it writes
+    /// is unchanged: every node line first, then every edge once, the form
+    /// `drsg import` reads back.
+    #[test]
+    fn export_writes_every_node_line_then_every_edge_once() {
+        let (db, hub, rival) = paged_graph();
+        let ctx = ctx_for(&db);
+        let mut out = Vec::new();
+        crate::methods::export_plane(&ctx, "startup")
+            .unwrap()
+            .write_to(&mut out)
+            .unwrap();
+        let lines: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let total = crate::methods::SCAN_PAGE as usize + 52;
+        assert_eq!(lines.len(), total + 10);
+        assert!(
+            lines[..total]
+                .iter()
+                .all(|l| l.get("external_key").is_some())
+        );
+        let edges = &lines[total..];
+        assert!(edges.iter().all(|l| l["type"] == "SPOKE"));
+        assert_eq!(edges.iter().filter(|l| l["src"] == hub).count(), 5);
+        assert_eq!(edges.iter().filter(|l| l["src"] == rival).count(), 5);
+        let mut ids: Vec<u64> = edges.iter().map(|l| l["id"].as_u64().unwrap()).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "each edge once");
     }
 
     #[test]
@@ -1198,6 +1546,26 @@ mod tests {
             in_schema, declared,
             "OpenRPC doc and the dispatch surface disagree"
         );
+        // Every method names its tier and every param says whether it is
+        // required: the SDK generators read both, and one that is missing
+        // becomes a silently wrong signature in six languages.
+        for m in doc["methods"].as_array().unwrap() {
+            let name = m["name"].as_str().unwrap();
+            assert!(
+                matches!(m["x-access"].as_str(), Some("read" | "write" | "admin")),
+                "`{name}` has no x-access tier"
+            );
+            for p in m["params"].as_array().unwrap() {
+                assert!(
+                    p["required"].is_boolean(),
+                    "`{name}` param `{}` has no `required`",
+                    p["name"]
+                );
+            }
+        }
+        // The document's version is the crate's: `rpc.discover` says which
+        // server a client is talking to.
+        assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1206,6 +1574,18 @@ mod tests {
         let resp = call(&db, r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#).unwrap();
         assert_eq!(resp["result"]["openrpc"], "1.2.6");
         assert!(resp["result"]["methods"].as_array().unwrap().len() >= 20);
+    }
+
+    #[test]
+    fn a_batch_past_the_limit_is_refused_whole() {
+        let db = seeded();
+        let item = r#"{"jsonrpc":"2.0","method":"db.stats","id":1}"#;
+        let ok = format!("[{}]", vec![item; MAX_BATCH].join(","));
+        assert_eq!(call(&db, &ok).unwrap().as_array().unwrap().len(), MAX_BATCH);
+        let over = format!("[{}]", vec![item; MAX_BATCH + 1].join(","));
+        let resp = call(&db, &over).unwrap();
+        assert_eq!(err_code(&resp), -32600, "{resp}");
+        assert!(resp["id"].is_null());
     }
 
     #[test]

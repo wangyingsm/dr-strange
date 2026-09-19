@@ -20,6 +20,8 @@ mod methods;
 mod rpc;
 mod server;
 
+pub use auth::{FREE_FAILURES, MAX_LOCKOUT, TRACKED_PEERS};
+pub use rpc::MAX_BATCH;
 pub use server::ServeOutcome;
 
 use std::net::SocketAddr;
@@ -119,6 +121,12 @@ pub struct ServeOptions {
     /// of token, and a background task bootstraps from the master's
     /// `/snapshot` then tails its `/ws/wal`.
     pub follow: Option<FollowOptions>,
+    /// Hostnames (or `host:port` authorities) `/mcp` answers at besides
+    /// loopback and the bind address — the `Host` header a proxy or a LAN
+    /// client sends. Honoured only when a bearer token is configured; merged
+    /// with `DRSG_ALLOWED_HOSTS` (comma-separated). See
+    /// [`server::mcp_allowed_hosts`].
+    pub allowed_hosts: Vec<String>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -149,6 +157,14 @@ impl Default for DigestDefaults {
 /// Built-in digest defaults (used when neither the request nor config sets them).
 pub const DEFAULT_DIGEST_CONCURRENCY: usize = 8;
 pub const DEFAULT_DIGEST_CHUNK_CHARS: usize = 4000;
+
+/// The most a *request* may raise `digest.run`'s knobs to, unless the
+/// operator's own `[digest]` default is higher (then that is the ceiling).
+/// Concurrency is chat calls in flight on the server's key; chunk size is
+/// prompt tokens per call. Both were the caller's to name without bound, on
+/// a read credential.
+pub const DIGEST_MAX_CONCURRENCY: usize = 32;
+pub const DIGEST_MAX_CHUNK_CHARS: usize = 32_000;
 
 /// Policy for the URL fetcher (ROADMAP §9), from the `[fetch]` config section.
 ///
@@ -204,6 +220,7 @@ impl Default for ServeOptions {
             recall_parsers: None,
             on_start: None,
             follow: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }

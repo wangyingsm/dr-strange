@@ -65,6 +65,29 @@ async fn wait_ready(client: &reqwest::Client, base: &str) {
     panic!("server never started listening");
 }
 
+/// The page `/` serves: the defensive headers, a Content-Security-Policy the
+/// built bundle satisfies, and no inline script — which is what lets
+/// `script-src 'self'` hold.
+async fn assert_dashboard(client: &reqwest::Client, base: &str) {
+    let index = client.get(base).send().await.unwrap();
+    assert!(index.status().is_success());
+    assert_eq!(index.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(index.headers()["x-frame-options"], "DENY");
+    let csp = index.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.starts_with("default-src 'self'"), "{csp}");
+    assert!(csp.contains("script-src 'self';"), "{csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    let html = index.text().await.unwrap();
+    assert!(html.contains("<div id=\"app\">") || html.contains("dr-strange"));
+    assert!(
+        !html.contains("<script>"),
+        "inline script under script-src 'self': {html}"
+    );
+}
+
 #[tokio::test]
 async fn serves_dashboard_and_rpc() {
     let addr = spawn_server();
@@ -72,14 +95,7 @@ async fn serves_dashboard_and_rpc() {
     let client = reqwest::Client::new();
     wait_ready(&client, &base).await;
 
-    // The embedded SPA is served on `/`.
-    let index = client.get(&base).send().await.unwrap();
-    assert!(index.status().is_success());
-    // Hardening: every response carries the static defensive headers.
-    assert_eq!(index.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(index.headers()["x-frame-options"], "DENY");
-    let html = index.text().await.unwrap();
-    assert!(html.contains("<div id=\"app\">") || html.contains("dr-strange"));
+    assert_dashboard(&client, &base).await;
 
     // /health is an unauthenticated liveness probe — no Origin, no token.
     let health = client.get(format!("{base}/health")).send().await.unwrap();
@@ -835,4 +851,83 @@ async fn history_is_addressable(client: &reqwest::Client, base: &str, rows: &[Va
         .await
         .unwrap();
     assert_eq!(recent.as_array().unwrap().len(), 1);
+}
+
+/// With no token, the only credential left is the same-origin browser check,
+/// and that is meaningless once the port faces a network: anyone who can
+/// reach it can also load the page. So a tokenless `serve` refuses a
+/// non-loopback bind up front, naming what to set.
+#[test]
+fn a_tokenless_server_refuses_to_bind_off_loopback() {
+    let db = Database::in_memory().unwrap();
+    let opts = dr_strange_web::ServeOptions {
+        addr: "0.0.0.0:0".parse().unwrap(),
+        ..Default::default()
+    };
+    let err = dr_strange_web::serve(db, None, opts)
+        .err()
+        .expect("must not start")
+        .to_string();
+    assert!(err.contains("DRSG_TOKEN"), "{err}");
+    assert!(err.contains("--addr"), "{err}");
+}
+
+/// `/export` and `/snapshot` stream: a chunked body that a reader can consume
+/// as it arrives, not a file built in memory first. What the wire carries
+/// must still be exactly what it was — JSONL `drsg import` reads, and a
+/// snapshot `Database::restore` accepts — and a bad plane name is still a
+/// 400, decided before the status line goes out.
+#[tokio::test]
+async fn export_and_snapshot_stream_the_same_bytes_as_before() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let resp = client
+        .post(format!("{base}/export?plane=startup"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/x-ndjson");
+    assert_eq!(
+        resp.headers()["transfer-encoding"],
+        "chunked",
+        "the export is streamed, not sized up front"
+    );
+    let jsonl = resp.text().await.unwrap();
+    let lines: Vec<Value> = jsonl
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{jsonl}");
+    assert_eq!(lines[0]["external_key"], "alice");
+
+    let missing = client
+        .post(format!("{base}/export?plane=nope"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 400);
+    assert!(missing.text().await.unwrap().contains("nope"));
+
+    let snap = client
+        .get(format!("{base}/snapshot"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    assert_eq!(snap.headers()["transfer-encoding"], "chunked");
+    let bytes = snap.bytes().await.unwrap();
+    let restored = Database::in_memory().unwrap();
+    let stats = restored.restore(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(stats.nodes, 1);
+    let plane = restored.plane("startup").unwrap();
+    let nodes = plane.query().scan_all().nodes().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].external_key.as_deref(), Some("alice"));
 }

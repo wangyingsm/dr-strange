@@ -215,3 +215,31 @@ export function weightByImportance(graph, scores, k = IMPORTANCE_SPREAD) {
 export function alphaFor(d) {
   return d == null ? FAR_ALPHA : (FOCUS_ALPHA[d] ?? FAR_ALPHA)
 }
+
+/**
+ * Where a layout runs, and for how long.
+ *
+ * ForceAtlas2 is O(n log n) an iteration with Barnes-Hut and O(n²) without,
+ * and it runs on the main thread when it is called synchronously — a plane
+ * plotted entire (`showAll`) froze the tab for the whole of it. Above
+ * `WORKER_MIN` nodes the layout runs in graphology's web worker for a bounded
+ * wall-clock budget instead: the tab stays responsive, the picture converges
+ * visibly, and the run ends whether or not the worker is quick. Below that a
+ * synchronous run of a fixed iteration count finishes faster than a worker
+ * could be spawned, so the small case is left as it was.
+ *
+ * `workers` says whether a `Worker` exists — a test runtime and some embedded
+ * browsers have none — and a large graph without one takes the shorter
+ * synchronous run rather than nothing.
+ */
+export const WORKER_MIN = 400
+export const WORKER_MS_PER_NODE = 2
+export const WORKER_MIN_MS = 500
+export const WORKER_MAX_MS = 4000
+
+export function layoutPlan(order, workers = true) {
+  if (order <= WORKER_MIN) return { mode: 'sync', iterations: 150, barnesHut: false }
+  if (!workers) return { mode: 'sync', iterations: 60, barnesHut: true }
+  const ms = Math.min(WORKER_MAX_MS, Math.max(WORKER_MIN_MS, order * WORKER_MS_PER_NODE))
+  return { mode: 'worker', ms, barnesHut: true }
+}

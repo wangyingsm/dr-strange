@@ -35,6 +35,16 @@ pub struct Ctx<'a> {
     pub deadline: Option<std::time::Instant>,
     /// How many queries the history keeps.
     pub history_limit: usize,
+    /// The one provider the operator configured by name or URL (`[server]
+    /// embed_provider`), if any. The only non-preset provider a request may
+    /// name — see [`provider_for`].
+    pub configured_provider: Option<&'a str>,
+    /// How many commits back time-travel reaches (`[server] retain_commits`);
+    /// `None` is unbounded. Reported by `db.stats` so a client can say how
+    /// deep the history it offers goes — `plane.history` already spans no
+    /// further than this, since the core's window starts at the retained
+    /// floor.
+    pub retain_commits: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -60,13 +70,64 @@ fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
 
 /// Core errors are the caller's fault far more often than ours (unknown plane,
 /// bad plan), so they ride the server-error code, not `-32603 internal`.
-fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
-    r.map_err(|e| match e {
+pub(crate) fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
+    r.map_err(core_err)
+}
+
+/// The client-facing form of a core error. Client-fault variants (unknown
+/// plane, bad plan, conflict) name the caller's own inputs and go through
+/// verbatim; the storage-side ones carry an `io::Error` with the database's
+/// path or a backend's internals, which the operator wants and the client
+/// has no business seeing — those become an [`opaque`] reference.
+pub(crate) fn core_err(e: dr_strange_core::Error) -> RpcError {
+    use dr_strange_core::Error as E;
+    match e {
         // The one core error a client should retry unchanged rather than treat
         // as its own fault: it never got the writer, so nothing was attempted.
-        dr_strange_core::Error::Timeout(_) => RpcError::timeout(e.to_string()),
+        E::Timeout(_) => RpcError::timeout(e.to_string()),
+        E::Io(_) | E::Backend(_) | E::Corrupt(_) => opaque("storage error", format!("{e:#}")),
         _ => RpcError::server(e.to_string()),
-    })
+    }
+}
+
+/// Resolve the provider a request may use. A provider name is either one of
+/// the llm crate's presets or exactly the one the operator configured; any
+/// other string is a base URL this process would POST to from its own
+/// network, on behalf of whoever holds a read credential — a server-side
+/// request forgery (the audit's third finding). `build_provider` itself takes
+/// a URL because the CLI at an operator's terminal legitimately means one;
+/// the wire surface must never hand it one. Every call site that turns a
+/// request field into a provider goes through here — the same
+/// single-chokepoint reasoning as [`Ctx::plane`] and the `Access` at every
+/// dispatch arm. `None` means the request named nothing and gets `openai`.
+pub(crate) fn provider_for<'a>(
+    ctx: &Ctx<'a>,
+    requested: Option<&'a str>,
+) -> Result<&'a str, RpcError> {
+    let name = requested.unwrap_or("openai");
+    if dr_strange_llm::is_preset(name) || ctx.configured_provider == Some(name) {
+        return Ok(name);
+    }
+    Err(RpcError::invalid_params(format!(
+        "provider must be a preset ({}) or the server's configured provider; \
+         a base URL is not accepted over the wire",
+        dr_strange_llm::PRESET_NAMES.join(", ")
+    )))
+}
+
+/// An error whose text is for the operator, not the client: filesystem
+/// paths, upstream bodies, backend internals. The detail goes to the log
+/// under a reference the client message carries, so a user can quote the
+/// message and the operator can find the line, and nothing about the
+/// server's disk layout or its provider's reply crosses the wire.
+pub(crate) fn opaque(kind: &str, detail: impl std::fmt::Display) -> RpcError {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // A counter rather than a random id: it only has to be unique within one
+    // process's log, and it must not be guessable *into* anything.
+    let reference = format!("{:06x}", NEXT.fetch_add(1, Ordering::Relaxed));
+    tracing::warn!(reference = %reference, error = %detail, "{kind}");
+    RpcError::server(format!("{kind} (ref {reference})"))
 }
 
 /// Optional time-travel address on a read request (ROADMAP §4): pin the read to
@@ -313,6 +374,10 @@ pub fn db_stats(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
         "file_size": file_size,
         "rss_bytes": resident_bytes(),
         "plugin_bytes": dr_strange_llm::plugin_memory_bytes(),
+        // The time-travel depth the operator keeps; null when every version
+        // is retained. What the dashboard's slider can reach is bounded by
+        // it, and this is how the dashboard says so.
+        "retain_commits": ctx.retain_commits,
     }))
 }
 
@@ -438,7 +503,7 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     if let Some((catalog, age)) = dr_strange_llm::cached_catalog(&store) {
         let stale = age > CATALOG_TTL;
         if stale {
-            std::thread::spawn(move || {
+            refresh_catalog_once(|| {
                 let Ok(store) = dr_strange_llm::PluginStore::open_default() else {
                     return;
                 };
@@ -461,6 +526,53 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     let stale = fetched.source.is_stale();
     let source = serde_json::to_value(&fetched.source).unwrap_or(Value::Null);
     catalog_value(&fetched.catalog, stale, source)
+}
+
+/// Set while one background catalog refresh is running (see
+/// [`refresh_catalog_once`]).
+static CATALOG_REFRESHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Run `refresh` in the background unless a refresh is already running;
+/// returns whether this call started one.
+///
+/// Single-flight, because a stale catalog is stale for *every* request until
+/// the refresh lands: a dashboard polling the Extensions panel, or several
+/// tabs opening it at once, would otherwise start one fetch per request, all
+/// racing GitHub for the same bytes and all rewriting the same cache file.
+/// The work goes on the runtime's blocking pool when there is one — it is a
+/// synchronous HTTP fetch, and the pool is where the server puts every other
+/// blocking unit of work, bounded with them — and on a plain thread only when
+/// no runtime is present (an embedding caller running the handler directly).
+/// The flag is cleared by a guard so a panicking fetch cannot wedge refreshes
+/// off for the life of the process.
+fn refresh_catalog_once(refresh: impl FnOnce() + Send + 'static) -> bool {
+    use std::sync::atomic::Ordering;
+    if CATALOG_REFRESHING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            CATALOG_REFRESHING.store(false, Ordering::Release);
+        }
+    }
+    let work = move || {
+        let _clear = Clear;
+        refresh();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(work);
+        }
+        Err(_) => {
+            std::thread::spawn(work);
+        }
+    }
+    true
 }
 
 /// Where a cached answer came from, in the shape `Source` serializes to.
@@ -516,15 +628,15 @@ pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         }
     };
     let embedder = dr_strange_llm::build_provider(
-        req.embed.as_deref().unwrap_or("openai"),
+        provider_for(_ctx, req.embed.as_deref())?,
         req.embed_model.as_deref(),
         None,
         None,
         true,
     )
-    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-    let stats = dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric)
-        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+    .map_err(build_err)?;
+    let stats =
+        dr_strange_llm::vectorize_plane(_ctx.db, &req.plane, &embedder, metric).map_err(llm_err)?;
     serde_json::to_value(stats).map_err(|e| RpcError::server(e.to_string()))
 }
 
@@ -548,7 +660,7 @@ pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }
     const CAP: usize = 256 << 20;
     let bytes = crate::fetch::fetch_bytes(&req.url, CAP, &[])
-        .map_err(|e| RpcError::server(format!("{e:#}")))?;
+        .map_err(|e| opaque("plugin download failed", format!("{e:#}")))?;
     let store = plugin_store()?;
     let (entry, replaced) = store.install(&bytes, &req.url).map_err(plug)?;
     Ok(jval!({ "installed": entry, "replaced": replaced }))
@@ -571,8 +683,9 @@ fn plugin_store() -> Result<dr_strange_llm::PluginStore, RpcError> {
     dr_strange_llm::PluginStore::open_default().map_err(plug)
 }
 
+/// Plugin-store errors name the store directory and the files in it.
 fn plug(e: anyhow::Error) -> RpcError {
-    RpcError::server(format!("{e:#}"))
+    opaque("plugin store error", format!("{e:#}"))
 }
 
 /// `db.catalog` — the soft schema across every plane.
@@ -936,10 +1049,12 @@ fn read_result(q: dr_strange_core::QueryBuilder<'_>) -> Result<Value, RpcError> 
 struct LlmEmbedder(Box<dyn Embedder>);
 impl dr_strange_parser::Embedder for LlmEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        // The parser folds this text into its own error, which reaches the
+        // client verbatim: keep the upstream body out of it.
         let reply = self
             .0
             .embed(&[text.to_string()])
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| opaque("embedding failed", format!("{e:#}")).message)?;
         reply
             .vectors
             .into_iter()
@@ -948,13 +1063,18 @@ impl dr_strange_parser::Embedder for LlmEmbedder {
     }
 }
 
-/// Build an embedder from a provider preset/URL (`None` if it can't be
+/// Build an embedder from a request's provider name (`None` if it can't be
 /// configured — e.g. the provider has no embedding model; a text SEARCH then
-/// errors clearly, while MATCH / literal-vector queries still work).
-fn make_embedder(provider: &str) -> Option<LlmEmbedder> {
-    dr_strange_llm::build_provider(provider, None, None, None, true)
-        .ok()
-        .map(|p| LlmEmbedder(Box::new(p)))
+/// errors clearly, while MATCH / literal-vector queries still work). A name
+/// that is neither a preset nor the configured provider is an error, not a
+/// `None`: silently running the query without it would hide the refusal.
+fn make_embedder(ctx: &Ctx<'_>, provider: Option<&str>) -> Result<Option<LlmEmbedder>, RpcError> {
+    let provider = provider_for(ctx, provider)?;
+    Ok(
+        dr_strange_llm::build_provider(provider, None, None, None, true)
+            .ok()
+            .map(|p| LlmEmbedder(Box::new(p))),
+    )
 }
 
 #[derive(Deserialize)]
@@ -995,7 +1115,7 @@ pub fn plane_cypher(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         ctx,
         &req.plane,
         &req.query,
-        req.embed.as_deref().unwrap_or("openai"),
+        req.embed.as_deref(),
         &params,
         req.lean,
         // An SDK caller asked for a query, not for a screenful of it.
@@ -1074,12 +1194,12 @@ pub fn cypher_subgraph(
     ctx: &Ctx<'_>,
     plane_name: &str,
     query: &str,
-    embed_provider: &str,
+    embed_provider: Option<&str>,
     params: &dr_strange_parser::Params,
     lean: bool,
     page: Page,
 ) -> Result<Value, RpcError> {
-    let embedder = make_embedder(embed_provider);
+    let embedder = make_embedder(ctx, embed_provider)?;
     let stmt = dr_strange_parser::parse_statement_full(
         query,
         embedder
@@ -1201,11 +1321,28 @@ pub fn cypher_subgraph(
 const SEED_LIMIT: u64 = 200;
 /// The default fan-out cap for one click-to-expand (hub-safe expansion).
 const EXPAND_LIMIT: u64 = 100;
-/// Text search stops after examining this many nodes — there is no text index,
-/// so `plane.find` is a linear scan; the cap keeps a huge plane responsive.
-const FIND_SCAN_CAP: usize = 20_000;
+/// Text search stops after examining this many nodes in its node pass, and
+/// again after visiting this many nodes (or examining this many edges) in
+/// its edge pass — there is no text index, so `plane.find` is a linear scan;
+/// the caps keep a huge plane responsive.
+pub(crate) const FIND_SCAN_CAP: usize = 20_000;
 /// Default number of matches `plane.find` returns.
 const FIND_LIMIT: usize = 50;
+/// How many node *records* one page of a linear scan loads. `plane.find` and
+/// a degree-ordered `graph.seed` walk the plane a page at a time and stop
+/// the moment they have what they came for, so a small plane costs one page
+/// of records and a hit early in a huge one costs one page — never every
+/// record of the plane. What each page still costs is the core's id scan:
+/// the executor collects the plane's node ids (8 bytes each) before its
+/// skip/limit steps apply (core `compute/exec.rs` `source_rows`), so a page
+/// is O(plane) in ids and O(page) in records, and a walk to the cap is at
+/// most `cap / SCAN_PAGE` such id scans. A resumable id cursor in the core
+/// would remove that term; until then the caps are what bound a keystroke.
+pub(crate) const SCAN_PAGE: u64 = 2_000;
+/// A degree-ordered seed measures the degree of at most this many nodes. The
+/// measurement is a neighbour lookup per node, so on a plane of millions it
+/// would otherwise be the most expensive thing a header click can trigger.
+const SEED_SCAN_CAP: usize = 20_000;
 
 #[derive(Deserialize)]
 pub struct Seed {
@@ -1232,11 +1369,17 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let limit = req.limit.unwrap_or(SEED_LIMIT);
     let plane = plane_at(ctx, &req.plane, &req.at)?;
 
-    let all_ids = match &req.label {
-        Some(label) => app(plane.query().scan_label(label.clone()).ids())?,
-        None => app(plane.query().scan_all().ids())?,
+    // `total` comes from the transactional counters (arch/03 §5) — a point
+    // read — not from materialising every id of the plane on each seed.
+    let counters = app(plane.counters())?;
+    let total = match &req.label {
+        Some(label) => counters.labels.get(label).copied().unwrap_or(0),
+        None => counters.nodes,
+    } as usize;
+    let scan = || match &req.label {
+        Some(label) => plane.query().scan_label(label.clone()),
+        None => plane.query().scan_all(),
     };
-    let total = all_ids.len();
 
     // Ranked seeding: take the *important* nodes, not the first ones the scan
     // reached. A canvas of two hundred arbitrary nodes is a hairball whatever
@@ -1248,16 +1391,7 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         // a hub that points at forty things ranks below the forty — measured on
         // a test plane, a twelve-leaf hub came out under its own leaves. Degree
         // asks the question actually being asked: what is connected to a lot.
-        Some("degree") => {
-            let mut rows = Vec::with_capacity(all_ids.len());
-            for id in &all_ids {
-                let d = app(plane.neighbors(*id, Dir::Both, None))?.len();
-                rows.push((*id, d as f64));
-            }
-            // Descending by degree, ties by id so a re-seed is reproducible.
-            rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
-            Some(rows)
-        }
+        Some("degree") => Some(top_by_degree(&plane, scan, limit as usize)?),
         Some("pagerank") => {
             let mut builder = plane.algo();
             if let Some(label) = &req.label {
@@ -1276,7 +1410,9 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 Some(top.into_iter().map(|(id, s)| (id.0, s)).collect()),
             )
         }
-        None => (all_ids.into_iter().take(limit as usize).collect(), None),
+        // Scan order: ask for `limit` ids and no more — the executor stops
+        // at the limit instead of this handler discarding the rest.
+        None => (app(scan().limit(limit).ids())?, None),
     };
     let set: std::collections::BTreeSet<u64> = ids.iter().map(|n| n.0).collect();
 
@@ -1319,6 +1455,62 @@ pub fn graph_seed(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     }))
 }
 
+/// The `limit` highest-degree nodes among the first [`SEED_SCAN_CAP`] the
+/// scan reaches, descending by degree and ascending by id within a degree so
+/// a re-seed is reproducible.
+///
+/// The core keeps no per-node degree, so degree is a neighbour lookup per
+/// node; what this bounds is everything around it. Ids arrive a page at a
+/// time (each page an id scan in the core, see [`SCAN_PAGE`]; never every
+/// record), the scan ends at the cap, and the ranking is a bounded min-heap
+/// of `limit` entries rather than a sort of every node — so the cost is
+/// `cap` lookups, at most `cap / SCAN_PAGE` id scans, and `limit` memory,
+/// whatever the plane's size.
+fn top_by_degree<'db>(
+    plane: &PlaneHandle<'db>,
+    scan: impl Fn() -> dr_strange_core::QueryBuilder<'db>,
+    limit: usize,
+) -> Result<Vec<(NodeId, f64)>, RpcError> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // Ordered so the heap's top is the *weakest* candidate: lowest degree,
+    // and among equals the highest id (which the final order puts last).
+    let mut heap: BinaryHeap<Reverse<(usize, Reverse<u64>)>> = BinaryHeap::with_capacity(limit + 1);
+    let mut examined = 0usize;
+    let mut skip = 0u64;
+    'scan: loop {
+        let page = app(scan().skip(skip).limit(SCAN_PAGE).ids())?;
+        let short = (page.len() as u64) < SCAN_PAGE;
+        for id in page {
+            if examined >= SEED_SCAN_CAP {
+                break 'scan;
+            }
+            examined += 1;
+            let d = app(plane.neighbors(id, Dir::Both, None))?.len();
+            let entry = Reverse((d, Reverse(id.0)));
+            if heap.len() < limit {
+                heap.push(entry);
+            } else if let Some(weakest) = heap.peek()
+                && entry < *weakest
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+        if short {
+            break;
+        }
+        skip += SCAN_PAGE;
+    }
+    let mut rows: Vec<(NodeId, f64)> = heap
+        .into_iter()
+        .map(|Reverse((d, Reverse(id)))| (NodeId(id), d as f64))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
+    Ok(rows)
+}
+
 #[derive(Deserialize)]
 pub struct Find {
     plane: String,
@@ -1342,8 +1534,109 @@ pub struct Find {
 /// labels, and string property values; edges match on type and string property
 /// values. Both hit `match` hints (which field matched) so the UI can show
 /// *why* something surfaced. There is no text index (arch/03), so this is a
-/// linear scan capped at [`FIND_SCAN_CAP`] nodes / edges and [`limit`] results
-/// each; `truncated` says whether either cap cut the results short.
+/// linear scan capped at [`FIND_SCAN_CAP`] nodes examined (node pass), nodes
+/// visited and edges examined (edge pass), and [`limit`] results each;
+/// `truncated` says whether any cap cut the results short.
+/// What the node pass found, and where it stopped.
+struct NodeScan {
+    hits: Vec<Value>,
+    /// Nodes looked at, which decides the truncation flag.
+    examined: usize,
+    /// Ids the pass loaded, so the edge walk need not read the same records
+    /// twice; past this prefix it fetches ids alone.
+    walked: Vec<NodeId>,
+    /// A page came back short with every node on it walked, so the plane is
+    /// spent. An early break (limit reached, cap hit) leaves it false, and
+    /// the edge walk knows the remainder of that page is still unvisited.
+    exhausted: bool,
+}
+
+/// Scan nodes for `needle`, a page at a time, stopping at `limit` hits or
+/// [`FIND_SCAN_CAP`] nodes.
+///
+/// This runs on every header keystroke: a match near the front of the plane
+/// costs one page of records, and a miss costs the cap — never every record
+/// of the plane (each page's id scan is the core's cost, see [`SCAN_PAGE`]).
+fn scan_nodes(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    needle: &str,
+    limit: usize,
+) -> Result<NodeScan, RpcError> {
+    let mut scan = NodeScan {
+        hits: Vec::new(),
+        examined: 0,
+        walked: Vec::new(),
+        exhausted: false,
+    };
+    let mut skip = 0u64;
+    'nodes: loop {
+        let page = app(plane.query().scan_all().skip(skip).limit(SCAN_PAGE).nodes())?;
+        let short = (page.len() as u64) < SCAN_PAGE;
+        for n in &page {
+            if scan.examined >= FIND_SCAN_CAP {
+                break 'nodes;
+            }
+            scan.examined += 1;
+            scan.walked.push(n.id);
+            if let Some(hint) = match_node(n, needle) {
+                let mut obj = node_json(n);
+                if let Value::Object(map) = &mut obj {
+                    map.insert("match".into(), Value::String(hint));
+                }
+                scan.hits.push(obj);
+                if scan.hits.len() >= limit {
+                    break 'nodes;
+                }
+            }
+        }
+        if short {
+            scan.exhausted = true;
+            break;
+        }
+        skip += SCAN_PAGE;
+    }
+    Ok(scan)
+}
+
+/// Semantic mode: embed the query and rank nodes by vector similarity.
+///
+/// `Some(answer)` is the answer to return. `None` falls through to the text
+/// scan — no key, a provider error, or a plane with no embeddings — leaving
+/// `note` saying why, which the dashboard shows.
+fn semantic_answer(
+    ctx: &Ctx<'_>,
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    req: &Find,
+    limit: usize,
+    note: &mut Option<String>,
+) -> Result<Option<Value>, RpcError> {
+    let provider = provider_for(ctx, req.provider.as_deref())?;
+    match semantic_find(plane, req, provider, limit) {
+        Ok(hits) if !hits.is_empty() => {
+            let n = hits.len();
+            Ok(Some(jval!({
+                "nodes": hits,
+                "edges": [],
+                "mode": "semantic",
+                "scanned": n,
+                "total": n,
+                "truncated": false,
+            })))
+        }
+        Ok(_) => {
+            *note = Some("no embedded nodes in this plane — showing text matches".into());
+            Ok(None)
+        }
+        // The note is shown in the dashboard, so it gets the same
+        // operator/client split as an error would.
+        Err(e) => {
+            let why = opaque("semantic search unavailable", format!("{e:#}")).message;
+            *note = Some(format!("{why} — showing text matches"));
+            Ok(None)
+        }
+    }
+}
+
 pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Find = params(p)?;
     let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
@@ -1355,84 +1648,87 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let plane = plane_at(ctx, &req.plane, &req.at)?;
 
-    // Semantic mode: embed the query and rank nodes by vector similarity. Any
-    // failure — no key, provider error, or a plane with no embeddings — falls
-    // back to the text scan below, surfacing why via `note`.
     let mut note: Option<String> = None;
-    if req.semantic {
-        match semantic_find(&plane, &req, limit) {
-            Ok(hits) if !hits.is_empty() => {
-                let n = hits.len();
-                return Ok(jval!({
-                    "nodes": hits,
-                    "edges": [],
-                    "mode": "semantic",
-                    "scanned": n,
-                    "total": n,
-                    "truncated": false,
-                }));
-            }
-            Ok(_) => note = Some("no embedded nodes in this plane — showing text matches".into()),
-            Err(e) => note = Some(format!("semantic unavailable ({e}) — showing text matches")),
-        }
+    if req.semantic
+        && let Some(answer) = semantic_answer(ctx, &plane, &req, limit, &mut note)?
+    {
+        return Ok(answer);
     }
 
     let needle = req.q.trim().to_lowercase();
-    let all = app(plane.query().scan_all().nodes())?;
-    let total = all.len();
+    // `total` is the counters' figure (a point read), not the length of a
+    // vector holding every node — the scan below never builds one.
+    let total = app(plane.counters())?.nodes as usize;
 
-    // ---- nodes ----
-    let mut node_hits = Vec::new();
-    let mut examined = 0usize;
-    for n in &all {
-        if examined >= FIND_SCAN_CAP {
-            break;
-        }
-        examined += 1;
-        if let Some(hint) = match_node(n, &needle) {
-            let mut obj = node_json(n);
-            if let Value::Object(map) = &mut obj {
-                map.insert("match".into(), Value::String(hint));
-            }
-            node_hits.push(obj);
-            if node_hits.len() >= limit {
-                break;
-            }
-        }
-    }
+    let NodeScan {
+        hits: node_hits,
+        examined,
+        walked,
+        mut exhausted,
+    } = scan_nodes(&plane, &needle, limit)?;
     let nodes_truncated = examined < total;
 
     // ---- edges ----
     // The core has no edge scan, so walk each node's outgoing hops (as
-    // `graph.seed` does), dedup by edge id, and match the edge record.
+    // `graph.seed` does), dedup by edge id, and match the edge record. The
+    // walk covers the nodes the pass above loaded first, then continues from
+    // where it stopped with ids alone, until `limit` edge hits or the cap.
     let mut edge_hits = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut edges_examined = 0usize;
     let mut edges_truncated = false;
-    'walk: for n in &all {
-        for hop in app(plane.neighbors(n.id, Dir::Out, None))? {
-            if !seen.insert(hop.edge.0) {
-                continue;
-            }
-            if edges_examined >= FIND_SCAN_CAP {
-                edges_truncated = true;
+    let mut sources = walked;
+    let mut next_skip = sources.len() as u64;
+    // Nodes whose out-edges the walk has looked up. A node with no out-edges
+    // examines no edge, so without this second cap a needle matching no edge
+    // on a plane of mostly leaves would look up the neighbours of every node
+    // — the whole plane per keystroke, which is what the cap exists to
+    // prevent.
+    let mut sources_visited = 0usize;
+    'walk: loop {
+        for n in &sources {
+            if sources_visited >= FIND_SCAN_CAP {
+                // Truncated only if the plane holds nodes the walk never
+                // reached; a cap met exactly at the end missed nothing.
+                edges_truncated = sources_visited < total;
                 break 'walk;
             }
-            edges_examined += 1;
-            if let Some(edge) = app(plane.edge(hop.edge))?
-                && let Some(hint) = match_edge(&edge, &needle)
-            {
-                let mut obj = edge_to_json(&edge);
-                if let Value::Object(map) = &mut obj {
-                    map.insert("match".into(), Value::String(hint));
+            sources_visited += 1;
+            for hop in app(plane.neighbors(*n, Dir::Out, None))? {
+                if !seen.insert(hop.edge.0) {
+                    continue;
                 }
-                edge_hits.push(obj);
-                if edge_hits.len() >= limit {
+                if edges_examined >= FIND_SCAN_CAP {
                     edges_truncated = true;
                     break 'walk;
                 }
+                edges_examined += 1;
+                if let Some(edge) = app(plane.edge(hop.edge))?
+                    && let Some(hint) = match_edge(&edge, &needle)
+                {
+                    let mut obj = edge_to_json(&edge);
+                    if let Value::Object(map) = &mut obj {
+                        map.insert("match".into(), Value::String(hint));
+                    }
+                    edge_hits.push(obj);
+                    if edge_hits.len() >= limit {
+                        edges_truncated = true;
+                        break 'walk;
+                    }
+                }
             }
         }
+        if exhausted {
+            break;
+        }
+        sources = app(plane
+            .query()
+            .scan_all()
+            .skip(next_skip)
+            .limit(SCAN_PAGE)
+            .ids())?;
+        exhausted = (sources.len() as u64) < SCAN_PAGE;
+        next_skip += sources.len() as u64;
     }
 
     Ok(jval!({
@@ -1620,13 +1916,13 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         builder = builder.label(label.clone());
     }
     if let Some(prop) = &req.vector_prop {
-        let provider = req.provider.as_deref().unwrap_or("openai");
+        let provider = provider_for(ctx, req.provider.as_deref())?;
         let embedder =
             dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)
-                .map_err(|e| RpcError::server(format!("embedding provider: {e}")))?;
+                .map_err(build_err)?;
         let reply = embedder
             .embed(std::slice::from_ref(&req.q))
-            .map_err(|e| RpcError::server(format!("embedding failed: {e}")))?;
+            .map_err(llm_err)?;
         let query = reply
             .vectors
             .into_iter()
@@ -1680,10 +1976,13 @@ pub struct Ask {
     /// Return the generated plan without executing it.
     #[serde(default)]
     dry_run: bool,
-    /// Total model attempts including repairs (default 3).
+    /// Total model attempts including repairs — default and ceiling
+    /// `ASK_DEFAULT_ATTEMPTS` (20): each attempt is a chat call on the
+    /// server's key, so a request cannot ask for more than the default.
     #[serde(default)]
     max_attempts: Option<u32>,
-    /// Safety row cap appended when the plan declares none (default 100).
+    /// Safety row cap appended when the plan declares none (default
+    /// `ASK_DEFAULT_LIMIT`, 100; at most `ASK_MAX_LIMIT`, 1000).
     #[serde(default)]
     limit: Option<u64>,
     /// Chat provider (preset or base URL); key from the server env.
@@ -1699,6 +1998,20 @@ pub struct Ask {
     embed_model: Option<String>,
 }
 
+/// The attempt and row budgets a `plane.ask` actually gets: the llm crate's
+/// defaults when the request is silent, and never more than its ceilings —
+/// `ASK_DEFAULT_ATTEMPTS` doubles as the attempt ceiling because every
+/// attempt is a chat call on the server's key.
+pub(crate) fn ask_knobs(max_attempts: Option<u32>, limit: Option<u64>) -> (u32, u64) {
+    use dr_strange_llm::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT};
+    (
+        max_attempts
+            .unwrap_or(ASK_DEFAULT_ATTEMPTS)
+            .min(ASK_DEFAULT_ATTEMPTS),
+        limit.unwrap_or(ASK_DEFAULT_LIMIT).min(ASK_MAX_LIMIT),
+    )
+}
+
 /// `plane.ask` — natural-language query (ROADMAP §3): an LLM turns `question`
 /// into a read-only LogicalPlan, which is run (unless `dry_run`). With
 /// `embed_provider` the model can call embedding tools to ground the plan in
@@ -1707,17 +2020,24 @@ pub struct Ask {
 pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Ask = params(p)?;
     let plane = ctx.plane(&req.plane)?;
-    let provider = req.provider.as_deref().unwrap_or("openai");
+    let provider = provider_for(ctx, req.provider.as_deref())?;
     let chat = dr_strange_llm::build_provider(provider, req.model.as_deref(), None, None, false)
-        .map_err(|e| RpcError::server(format!("chat provider: {e}")))?;
-    // Embedding tools are enabled when an embed provider is configured and builds.
-    let embedder = req.embed_provider.as_deref().and_then(|ep| {
-        dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
-    });
+        .map_err(build_err)?;
+    // Embedding tools are enabled when an embed provider is named and builds.
+    // The name is validated even though a build failure is tolerated: a
+    // refused URL is the client's error, not a missing model.
+    let embedder = match req.embed_provider.as_deref() {
+        Some(ep) => {
+            let ep = provider_for(ctx, Some(ep))?;
+            dr_strange_llm::build_provider(ep, req.embed_model.as_deref(), None, None, true).ok()
+        }
+        None => None,
+    };
+    let (max_attempts, limit) = ask_knobs(req.max_attempts, req.limit);
     let opts = dr_strange_llm::AskOptions {
-        max_attempts: req.max_attempts.unwrap_or(20),
+        max_attempts,
         dry_run: req.dry_run,
-        limit: req.limit.unwrap_or(100),
+        limit,
     };
     let res = dr_strange_llm::ask(
         &chat,
@@ -1728,7 +2048,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         &req.question,
         &opts,
     )
-    .map_err(|e| RpcError::server(e.to_string()))?;
+    .map_err(llm_err)?;
     let plans = serde_json::to_value(&res.plans).map_err(|e| RpcError::server(e.to_string()))?;
     // The matched subgraph: nodes + the edges among them (union of all plans),
     // so the answer plots connected, not as disconnected endpoints.
@@ -1838,9 +2158,9 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 fn semantic_find(
     plane: &dr_strange_core::PlaneHandle<'_>,
     req: &Find,
+    provider: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
-    let provider = req.provider.as_deref().unwrap_or("openai");
     let embedder =
         dr_strange_llm::build_provider(provider, req.embed_model.as_deref(), None, None, true)?;
     let reply = embedder.embed(std::slice::from_ref(&req.q))?;
@@ -1988,8 +2308,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A provider *call* failed: the chain carries the upstream reply body,
+/// which may quote the request, the account, or whatever the provider felt
+/// like saying. Operator-facing.
 fn llm_err(e: anyhow::Error) -> RpcError {
-    RpcError::server(e.to_string())
+    opaque("provider request failed", format!("{e:#}"))
+}
+
+/// A provider could not be *built*: no key in the environment, no embedding
+/// model, unknown name. Decided before any network call from strings this
+/// process composed, and the fix is the client's (or the operator's env), so
+/// the message goes through as written.
+fn build_err(e: anyhow::Error) -> RpcError {
+    RpcError::server(format!("provider: {e:#}"))
 }
 
 #[derive(Deserialize)]
@@ -2022,11 +2353,13 @@ pub struct DigestRun {
     #[serde(default)]
     link: Option<bool>,
     /// Per-chunk extraction chat calls to run concurrently. Omit to use the
-    /// server default (`[digest].concurrency`, else 8).
+    /// server default (`[digest].concurrency`, else 8). Capped at
+    /// `DIGEST_MAX_CONCURRENCY` or the server default, whichever is larger.
     #[serde(default)]
     concurrency: Option<usize>,
     /// Target chunk size in characters. Omit to use the server default
-    /// (`[digest].chunk_chars`, else 4000).
+    /// (`[digest].chunk_chars`, else 4000). Capped at `DIGEST_MAX_CHUNK_CHARS`
+    /// or the server default, whichever is larger.
     #[serde(default)]
     chunk_chars: Option<usize>,
     /// How thoroughly to clean up the extraction: `coarse` reconciles the
@@ -2037,19 +2370,43 @@ pub struct DigestRun {
     mode: Option<String>,
 }
 
+/// The concurrency and chunk size a `digest.run` actually gets. A request
+/// may lower either below the server default freely; raising them is bounded
+/// by [`crate::DIGEST_MAX_CONCURRENCY`] / [`crate::DIGEST_MAX_CHUNK_CHARS`]
+/// (or the operator's own default, if they set it higher — their config is
+/// their ceiling). Both spend the server's provider key and memory, which
+/// is why a read credential does not get to name them freely; zero is
+/// rounded up to one because neither means anything at zero.
+pub(crate) fn digest_knobs(
+    defaults: &crate::DigestDefaults,
+    concurrency: Option<usize>,
+    chunk_chars: Option<usize>,
+) -> (usize, usize) {
+    let conc_cap = defaults.concurrency.max(crate::DIGEST_MAX_CONCURRENCY);
+    let chunk_cap = defaults.chunk_chars.max(crate::DIGEST_MAX_CHUNK_CHARS);
+    (
+        concurrency
+            .unwrap_or(defaults.concurrency)
+            .clamp(1, conc_cap),
+        chunk_chars
+            .unwrap_or(defaults.chunk_chars)
+            .clamp(1, chunk_cap),
+    )
+}
+
 /// `digest.run` — extract a proposal from text (LLM, dry-run). Provider API
 /// keys come from the server's environment, never params. Blocking work runs
 /// on the /rpc handler's blocking task.
 pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestRun = params(p)?;
-    let chat_provider = req.chat.as_deref().unwrap_or("openai");
-    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let chat_provider = provider_for(ctx, req.chat.as_deref())?;
+    let embed_provider = provider_for(ctx, req.embed.as_deref().or(Some(chat_provider)))?;
     let embed = !req.no_embed;
     let link = req.link.unwrap_or(true);
 
     let chat =
         dr_strange_llm::build_provider(chat_provider, req.model.as_deref(), None, None, false)
-            .map_err(llm_err)?;
+            .map_err(build_err)?;
     // Opt-in only: unset leaves the request body byte-for-byte what it was, so
     // providers with no such field are unaffected. Embedding calls never carry
     // it — there is nothing to reason about.
@@ -2065,15 +2422,16 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         None,
         embed,
     )
-    .map_err(llm_err)?;
+    .map_err(build_err)?;
 
+    let (concurrency, chunk_chars) = digest_knobs(&ctx.digest, req.concurrency, req.chunk_chars);
     let opts = dr_strange_llm::DigestOptions {
         source: req.source.unwrap_or_else(|| "web-digest".into()),
         model: chat_model,
         run_id: format!("web-{}", now_secs()),
-        chunk_chars: req.chunk_chars.unwrap_or(ctx.digest.chunk_chars),
+        chunk_chars,
         embed,
-        concurrency: req.concurrency.unwrap_or(ctx.digest.concurrency),
+        concurrency,
         mode: match req.mode.as_deref() {
             None => dr_strange_llm::DigestMode::default(),
             Some(m) => dr_strange_llm::DigestMode::parse(m).ok_or_else(|| {
@@ -2370,23 +2728,53 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// exact format `drsg import` reads back. Backs the Dashboard's per-plane
 /// Export download. Not an RPC method (it returns a file, not JSON-RPC data);
 /// the `/export` HTTP endpoint calls it directly.
-pub fn export_plane(ctx: &Ctx<'_>, plane_name: &str) -> Result<String, RpcError> {
-    let plane = ctx.plane(plane_name)?;
-    let mut out = String::new();
-    for node in app(plane.query().scan_all().nodes())? {
-        out.push_str(&node_json(&node).to_string());
-        out.push('\n');
-    }
-    // Edges: walk each node's out-adjacency and emit each edge once.
-    for node in app(plane.query().scan_all().nodes())? {
-        for hop in app(plane.neighbors(node.id, Dir::Out, None))? {
-            if let Some(edge) = app(plane.edge(hop.edge))? {
-                out.push_str(&edge_to_json(&edge).to_string());
-                out.push('\n');
+///
+/// Two phases, so the endpoint can answer a bad plane name with a 400 and
+/// stream a good one: resolving the plane returns a [`PlaneExport`], and
+/// [`PlaneExport::write_to`] emits the lines into `out` as it walks. What
+/// it holds is the plane's node *ids* (8 bytes each, one scan) and one node
+/// record at a time — never every record, and never the output as a string.
+pub fn export_plane<'a>(ctx: &'a Ctx<'a>, plane_name: &str) -> Result<PlaneExport<'a>, RpcError> {
+    Ok(PlaneExport(ctx.plane(plane_name)?))
+}
+
+/// A plane resolved for export — see [`export_plane`].
+pub struct PlaneExport<'a>(PlaneHandle<'a>);
+
+impl PlaneExport<'_> {
+    /// Write the plane as JSONL. An `io::Error` from `out` means the reader
+    /// went away; it is returned as a server error for the log and nothing
+    /// else, since there is no one left to tell.
+    pub fn write_to(&self, out: &mut dyn std::io::Write) -> Result<(), RpcError> {
+        let plane = &self.0;
+        let gone = |e: std::io::Error| RpcError::server(format!("export stream closed: {e}"));
+        // One id scan for both passes, then a record at a time: `.nodes()`
+        // would clone every record of the plane into one vector before the
+        // first line went out (and again for the edges), which for a large
+        // plane is the plane in memory twice over — the cost streaming the
+        // output was meant to remove. Ids are 8 bytes each; a node deleted
+        // between the scan and its read is simply skipped.
+        let ids = app(plane.query().scan_all().ids())?;
+        for id in &ids {
+            if let Some(node) = app(plane.node(*id))? {
+                serde_json::to_writer(&mut *out, &node_json(&node)).map_err(|e| gone(e.into()))?;
+                out.write_all(b"\n").map_err(gone)?;
             }
         }
+        // Edges after every node line, since `drsg import` resolves an edge's
+        // endpoints against nodes it has already read: walk each node's
+        // out-adjacency and emit each edge once.
+        for id in &ids {
+            for hop in app(plane.neighbors(*id, Dir::Out, None))? {
+                if let Some(edge) = app(plane.edge(hop.edge))? {
+                    serde_json::to_writer(&mut *out, &edge_to_json(&edge))
+                        .map_err(|e| gone(e.into()))?;
+                    out.write_all(b"\n").map_err(gone)?;
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -2674,5 +3062,180 @@ mod change_feed_tests {
         let c = &v["params"]["changes"][0];
         assert_eq!(c["op"], "deleted");
         assert!(c.get("record").is_none(), "a delete carries no record");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    //! The request-side guards: which provider a request may name, how far
+    //! it may raise a cost knob, and what an internal error is allowed to say.
+    use super::*;
+
+    fn ctx<'a>(db: &'a Database, configured: Option<&'a str>) -> Ctx<'a> {
+        Ctx {
+            db,
+            db_path: None,
+            digest: crate::DigestDefaults::default(),
+            deadline: None,
+            history_limit: Database::DEFAULT_HISTORY,
+            configured_provider: configured,
+            retain_commits: None,
+        }
+    }
+
+    #[test]
+    fn provider_for_accepts_a_preset_and_defaults_to_openai() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, None);
+        assert_eq!(provider_for(&c, None).unwrap(), "openai");
+        for name in dr_strange_llm::PRESET_NAMES {
+            assert_eq!(provider_for(&c, Some(name)).unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn provider_for_rejects_a_raw_url_as_the_clients_error() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, None);
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://internal.corp:8443/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let err = provider_for(&c, Some(url)).unwrap_err();
+            assert_eq!(err.code, -32602, "{url} must be invalid params");
+            assert!(err.message.contains("preset"), "{}", err.message);
+            // The message names what is allowed, never echoes the URL.
+            assert!(!err.message.contains(url));
+        }
+    }
+
+    #[test]
+    fn provider_for_accepts_exactly_the_configured_provider() {
+        let db = Database::in_memory().unwrap();
+        let c = ctx(&db, Some("http://embed.internal:8080/v1"));
+        assert_eq!(
+            provider_for(&c, Some("http://embed.internal:8080/v1")).unwrap(),
+            "http://embed.internal:8080/v1"
+        );
+        // Same host, different path: not the configured value, not allowed.
+        assert_eq!(
+            provider_for(&c, Some("http://embed.internal:8080/v2"))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        // Presets still work alongside a configured URL.
+        assert_eq!(provider_for(&c, Some("ollama")).unwrap(), "ollama");
+    }
+
+    #[test]
+    fn digest_knobs_are_capped_and_never_zero() {
+        let d = crate::DigestDefaults::default();
+        assert_eq!(digest_knobs(&d, None, None), (d.concurrency, d.chunk_chars));
+        assert_eq!(
+            digest_knobs(&d, Some(10_000), Some(usize::MAX)),
+            (crate::DIGEST_MAX_CONCURRENCY, crate::DIGEST_MAX_CHUNK_CHARS)
+        );
+        assert_eq!(digest_knobs(&d, Some(0), Some(0)), (1, 1));
+        assert_eq!(digest_knobs(&d, Some(2), Some(500)), (2, 500));
+        // An operator default above the built-in ceiling is its own ceiling.
+        let big = crate::DigestDefaults {
+            concurrency: 64,
+            chunk_chars: 100_000,
+        };
+        assert_eq!(
+            digest_knobs(&big, Some(1_000), Some(1_000_000)),
+            (64, 100_000)
+        );
+        assert_eq!(digest_knobs(&big, None, None), (64, 100_000));
+    }
+
+    #[test]
+    fn ask_knobs_follow_the_llm_crate_constants() {
+        use dr_strange_llm::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT};
+        assert_eq!(
+            ask_knobs(None, None),
+            (ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT)
+        );
+        assert_eq!(
+            ask_knobs(Some(u32::MAX), Some(u64::MAX)),
+            (ASK_DEFAULT_ATTEMPTS, ASK_MAX_LIMIT)
+        );
+        assert_eq!(ask_knobs(Some(2), Some(5)), (2, 5));
+    }
+
+    #[test]
+    fn a_storage_error_crosses_the_wire_without_its_path() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/srv/secret/graph.drsg: permission denied",
+        );
+        let err = core_err(dr_strange_core::Error::Io(io));
+        assert_eq!(err.code, -32000);
+        assert!(!err.message.contains("/srv/secret"), "{}", err.message);
+        assert!(
+            err.message.starts_with("storage error (ref "),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_client_fault_keeps_its_message() {
+        let err = core_err(dr_strange_core::Error::NotFound("plane `nope`".into()));
+        assert_eq!(err.message, "not found: plane `nope`");
+        let err = core_err(dr_strange_core::Error::Timeout("writer busy".into()));
+        assert_eq!(err.code, -32002);
+    }
+
+    #[test]
+    fn opaque_references_are_distinct_and_carry_no_detail() {
+        let a = opaque(
+            "provider request failed",
+            "POST /v1/chat → HTTP 402: {\"error\":\"billing\"}",
+        );
+        let b = opaque("provider request failed", "same");
+        assert_ne!(a.message, b.message);
+        assert!(!a.message.contains("billing"));
+        assert!(!a.message.contains("HTTP 402"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// Two stale hits while a refresh is in flight start one refresh, not
+    /// two; once it finishes, the next stale hit starts another.
+    #[test]
+    fn a_catalog_refresh_is_single_flight() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        assert!(refresh_catalog_once(move || {
+            let _ = release_rx.recv();
+            let _ = done_tx.send(());
+        }));
+        // Still running: a second stale hit does not start another.
+        assert!(!refresh_catalog_once(|| unreachable!(
+            "a second refresh must not start"
+        )));
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the refresh runs to completion");
+        // The flag clears when the work returns, so the next stale hit may
+        // refresh again. The guard drops after `done_tx` fires, so poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if refresh_catalog_once(|| {}) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flag never cleared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

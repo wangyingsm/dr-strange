@@ -6,6 +6,7 @@
 import Graph from 'graphology'
 import Sigma from 'sigma'
 import forceAtlas2 from 'graphology-layout-forceatlas2'
+import FA2Supervisor from 'graphology-layout-forceatlas2/worker'
 import { EdgeCurvedArrowProgram, indexParallelEdgesIndex } from '@sigma/edge-curve'
 
 import {
@@ -14,6 +15,7 @@ import {
   focusDistances,
   frontierIds,
   hubsToFold,
+  layoutPlan,
   sectorLeaves,
   weightByImportance,
 } from './layout.js'
@@ -85,6 +87,7 @@ export class Plot {
     this.expandedHubs = new Set() // hubs the reader opened; never re-folded
     this.scores = new Map() // node id -> importance, when the seed was ranked
     this.hiddenLabels = new Set() // categories switched off from the legend
+    this.layoutRun = null // { supervisor, timer } while a worker layout runs
 
     // Labels are canvas-drawn, so CSS variables don't reach them — read the
     // OS theme directly and keep them legible on both backgrounds.
@@ -611,25 +614,54 @@ export class Plot {
   }
 
   _layout() {
+    // A run still going belongs to a graph that no longer exists.
+    this._stopLayout()
     if (this.graph.order === 0) {
       this.sigma.refresh()
       return
     }
     if (this.scores.size) weightByImportance(this.graph, this.scores)
+    const plan = layoutPlan(this.graph.order, typeof Worker !== 'undefined')
     // Low gravity so ForceAtlas2 doesn't pile every disconnected group onto
     // the center (there's no attraction *between* components, only repulsion,
     // so weak gravity lets them drift apart); outbound-attraction spreads hubs.
-    forceAtlas2.assign(this.graph, {
-      iterations: this.graph.order > 400 ? 60 : 150,
-      settings: {
-        gravity: 0.4,
-        scalingRatio: 18,
-        adjustSizes: true,
-        outboundAttractionDistribution: true,
-        barnesHutOptimize: this.graph.order > 400,
-      },
-    })
-    // Then arrange each hub's leaves into label sectors, and only then pack:
+    const settings = {
+      gravity: 0.4,
+      scalingRatio: 18,
+      adjustSizes: true,
+      outboundAttractionDistribution: true,
+      barnesHutOptimize: plan.barnesHut,
+    }
+    if (plan.mode === 'sync') {
+      forceAtlas2.assign(this.graph, { iterations: plan.iterations, settings })
+      this._settle()
+      return
+    }
+    // A large graph is laid out off the main thread, for a bounded time (see
+    // layoutPlan). The supervisor writes positions back each frame and sigma
+    // redraws on the graph events, so the picture converges in view; the
+    // arrangement that follows the forces waits until they have stopped.
+    const supervisor = new FA2Supervisor(this.graph, { settings })
+    supervisor.start()
+    const timer = setTimeout(() => {
+      this._stopLayout()
+      this._settle()
+    }, plan.ms)
+    this.layoutRun = { supervisor, timer }
+  }
+
+  /** End a worker layout, if one is running. Harmless otherwise. */
+  _stopLayout() {
+    if (!this.layoutRun) return
+    const { supervisor, timer } = this.layoutRun
+    this.layoutRun = null
+    clearTimeout(timer)
+    supervisor.kill()
+  }
+
+  /** What follows the forces, once they are still. */
+  _settle() {
+    // Arrange each hub's leaves into label sectors, and only then pack:
     // sectoring moves nodes, and packing measures bounding boxes, so doing it
     // the other way round would let a re-arranged fan spill into its neighbour.
     sectorLeaves(this.graph)
@@ -828,6 +860,7 @@ export class Plot {
   }
 
   destroy() {
+    this._stopLayout()
     window.removeEventListener('mousemove', this._onMove)
     window.removeEventListener('mouseup', this._onUp)
     this.sigma.kill()
