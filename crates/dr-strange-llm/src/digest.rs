@@ -22,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{AHashMap, AHashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use dr_strange_core::json;
 use dr_strange_core::{
     BulkEdge, BulkNode, BulkStats, Metric, PropDesc, PropValue, Properties, WriteTxn,
@@ -215,6 +215,16 @@ pub struct DigestReport {
     /// and were linked to rather than re-created.
     pub linked: usize,
     pub dropped_relations: usize,
+    /// Entities and relations the model emitted under a key that cannot name
+    /// a node — empty, whitespace, control characters, or longer than
+    /// [`MAX_NAME_CHARS`] — and were dropped before anything downstream saw
+    /// them. A model does not emit these; a document written to steer one
+    /// does, so the count is what makes the attempt visible.
+    pub rejected: usize,
+    /// Properties the model tried to set that only the pipeline may write —
+    /// `_`-prefixed provenance, `embedding`, or a vector under any name —
+    /// and that were dropped instead. See [`model_may_set`].
+    pub reserved_props: usize,
     /// Relations that became the same `(src, dst, type)` once edge types were
     /// reconciled, and so collapsed into one.
     pub merged_relations: usize,
@@ -833,6 +843,16 @@ fn finish(
 
     report.entities = nodes.len();
     report.relations = edges.len();
+    if report.rejected > 0 || report.reserved_props > 0 {
+        // Worth a line of its own: a model does not produce these, a document
+        // written to steer one does, and the operator should hear about it
+        // without reading the report's counters.
+        tracing::warn!(
+            rejected = report.rejected,
+            reserved_props = report.reserved_props,
+            "digest dropped model output that tried to name the unnameable or write provenance",
+        );
+    }
     if report.dropped_relations > 0 {
         tracing::warn!(
             dropped = report.dropped_relations,
@@ -916,23 +936,33 @@ fn merge_extractions(extracts: Vec<ChunkExtract>, report: &mut DigestReport) -> 
         report.input_tokens += extraction.input_tokens;
         report.output_tokens += extraction.output_tokens;
         for e in extraction.entities {
+            // The key becomes a node's external key and a relation endpoint,
+            // so it is checked before it can become either: an empty key would
+            // reach `BulkNode` as a node nothing can name, and an unbounded
+            // one is a document steering the model rather than the model.
+            let Some(key) = model_name(&e.key) else {
+                report.rejected += 1;
+                continue;
+            };
             m.origins
-                .entry(e.key.clone())
+                .entry(key.to_string())
                 .or_default()
                 .insert(chunk_index);
             let node = m
                 .entities
-                .entry(e.key.clone())
+                .entry(key.to_string())
                 .or_insert_with(|| DigestNode {
-                    key: e.key.clone(),
+                    key: key.to_string(),
                     label: String::new(),
                     extra_labels: Vec::new(),
                     props: Properties::new(),
                 });
-            if node.label.is_empty() && !e.label.is_empty() {
-                node.label = e.label;
+            if node.label.is_empty()
+                && let Some(label) = model_name(&e.label)
+            {
+                node.label = label.to_string();
             }
-            merge_props(&mut node.props, &e.properties);
+            report.reserved_props += merge_props(&mut node.props, &e.properties);
             if let Some(d) = e.description {
                 node.props
                     .entry("description".into())
@@ -940,19 +970,22 @@ fn merge_extractions(extracts: Vec<ChunkExtract>, report: &mut DigestReport) -> 
             }
         }
         for r in extraction.relations {
-            if r.ty.is_empty() {
+            let (Some(src), Some(dst), Some(ty)) =
+                (model_name(&r.src), model_name(&r.dst), model_name(&r.ty))
+            else {
+                report.rejected += 1;
                 continue;
-            }
-            if seen_rel.insert((r.src.clone(), r.dst.clone(), r.ty.clone())) {
+            };
+            if seen_rel.insert((src.to_string(), dst.to_string(), ty.to_string())) {
                 let mut props = Properties::new();
-                merge_props(&mut props, &r.properties);
+                report.reserved_props += merge_props(&mut props, &r.properties);
                 if let Some(d) = r.description {
                     props.insert("description".into(), desc_prop(d));
                 }
                 m.edges.push(DigestEdge {
-                    src: r.src,
-                    dst: r.dst,
-                    ty: r.ty,
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                    ty: ty.to_string(),
                     props,
                 });
             }
@@ -977,21 +1010,73 @@ fn desc_prop(text: String) -> PropDesc {
     }
 }
 
+/// Longest key, label, edge type or property name a model may mint, in
+/// characters. Canonical names run to a few dozen; the cap exists so a
+/// document cannot make the model write a paragraph where a key goes.
+pub(crate) const MAX_NAME_CHARS: usize = 512;
+
+/// A model-emitted name fit to become a key, label, edge type or property
+/// name: trimmed, non-empty, bounded, and free of control characters — or
+/// `None`, in which case whatever carried it is dropped and counted.
+///
+/// Checked here rather than at the bulk loader because by then the name has
+/// already been a relation endpoint, an identity candidate and a refinement
+/// subject; the pipeline should never see a name it will not write.
+pub(crate) fn model_name(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    let fits = !s.is_empty()
+        && !s.chars().any(char::is_control)
+        && s.chars().take(MAX_NAME_CHARS + 1).count() <= MAX_NAME_CHARS;
+    fits.then_some(s)
+}
+
+/// Whether a model may set property `name` to `value`.
+///
+/// Three things are the pipeline's to write and nobody else's. `_`-prefixed
+/// names are provenance and bookkeeping: `_generated_by` is what marks a node
+/// as a parser's, and a parser-owned node is one the next watch fold may
+/// delete or rewrite — so a document that got the model to emit it would
+/// hand the graph's ownership to whoever wrote the document. `embedding` is
+/// the vector the pipeline computes from the entity's own text; a model-supplied
+/// one would steer every similarity search that touches the node. And a
+/// vector value under any other name is an embedding by another name.
+///
+/// Applied by extraction and refinement alike, so the two stages that accept
+/// model-named properties cannot disagree about what is settable.
+pub(crate) fn model_may_set(name: &str, value: &PropValue) -> bool {
+    model_name(name) == Some(name)
+        && !name.starts_with('_')
+        && name != "embedding"
+        && !matches!(value, PropValue::Vector(_))
+}
+
 /// Merge JSON properties into a property map, skipping ones that don't convert
-/// and never clobbering an existing key (first chunk wins).
-fn merge_props(into: &mut Properties, from: &serde_json::Map<String, Value>) {
+/// and never clobbering an existing key (first chunk wins). Properties the
+/// model may not set ([`model_may_set`]) are skipped and counted; the count is
+/// returned so the report can say the attempt was made.
+fn merge_props(into: &mut Properties, from: &serde_json::Map<String, Value>) -> usize {
+    let mut reserved = 0;
     for (k, v) in from {
         if into.contains_key(k) {
             continue;
         }
-        if let Ok(value) = json::json_to_value(v) {
-            into.insert(k.clone(), prop(value));
+        let Ok(value) = json::json_to_value(v) else {
+            continue;
+        };
+        if !model_may_set(k, &value) {
+            reserved += 1;
+            continue;
         }
+        into.insert(k.clone(), prop(value));
     }
+    reserved
 }
 
 /// Provenance stamped on everything written (arch/07 §2), as self-describing
-/// `PropDesc`. Underscore-prefixed to sit apart from extracted content.
+/// `PropDesc`. Underscore-prefixed to sit apart from extracted content, and
+/// stamped **after** the model's properties were merged — with
+/// [`model_may_set`] refusing every `_` name, nothing the model said can
+/// survive under these keys, whether or not this overwrote it.
 fn add_provenance(props: &mut Properties, opts: &DigestOptions) {
     let stamp = |props: &mut Properties, key: &str, what: &str, value: &str| {
         props.insert(
@@ -1154,7 +1239,15 @@ struct ChunkExtract {
 /// Runs every chunk's extraction chat call, up to `concurrency` at once, and
 /// returns the results in chunk order. A bounded scoped-thread pool over an
 /// atomic cursor; the chat provider is `Sync` and only immutable data is shared,
-/// so no locks are held across a request. The first chunk to error aborts.
+/// so no locks are held across a request.
+///
+/// The first chunk to fail aborts the run — and *stops the others*: a worker
+/// checks the flag before taking another chunk, so a dead key or a provider
+/// that is down costs the calls already in flight and nothing after them,
+/// where a hundred-chunk document used to make its hundred doomed requests
+/// before reporting the first. The error returned is the earliest failed
+/// chunk's, in chunk order, so the report is the same however the workers
+/// interleaved.
 fn extract_all(
     chat: &(dyn Chat + Sync),
     system: &str,
@@ -1166,33 +1259,61 @@ fn extract_all(
     let slots: Vec<Mutex<Option<Result<ChunkExtract>>>> =
         (0..n).map(|_| Mutex::new(None)).collect();
     let cursor = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
     let workers = concurrency.clamp(1, n.max(1));
-    let slots_ref = &slots;
-    let cursor_ref = &cursor;
+    let (slots_ref, cursor_ref, aborted_ref) = (&slots, &cursor, &aborted);
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(move || {
                 loop {
+                    if aborted_ref.load(Ordering::Acquire) {
+                        break;
+                    }
                     let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
                     let out = extract_chunk(chat, system, blocks[i].as_deref(), &chunks[i]);
-                    *slots_ref[i].lock().unwrap() = Some(out);
+                    if out.is_err() {
+                        aborted_ref.store(true, Ordering::Release);
+                    }
+                    *slots_ref[i]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
                 }
             });
         }
     });
-    slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().expect("every chunk was processed"))
-        .collect()
+    let mut out = Vec::with_capacity(n);
+    for slot in slots {
+        match slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(Ok(extract)) => out.push(extract),
+            Some(Err(e)) => return Err(e),
+            // Never started: a failure before it aborted the run, and that
+            // failure is in an earlier slot, so this arm is unreachable in
+            // practice — but a hole is not a result, so it is not one here.
+            None => bail!("extraction was abandoned after an earlier chunk failed"),
+        }
+    }
+    Ok(out)
 }
 
 /// Extracts one chunk. On a truncated reply (the chunk is too dense to fit the
 /// model's output-token cap), splits the chunk and extracts each piece,
 /// recursing until the pieces are small enough — or the chunk can no longer be
 /// divided, in which case the truncation error is surfaced.
+///
+/// A reply that is not the JSON asked for gets **one** more turn, with the
+/// complaint appended: a model that answered in prose, or wrapped the object
+/// in commentary the extractor cannot strip, nearly always answers the nudge
+/// correctly, and the alternative was to abort the whole run — every chunk's
+/// extraction gone over one reply — where the reconcile, identity and refine
+/// passes had always shrugged a garbled reply off. Once only: a model that
+/// fails the nudge is not going to be argued into JSON, and the abort then
+/// says so with both attempts' cost counted.
 fn extract_chunk(
     chat: &(dyn Chat + Sync),
     system: &str,
@@ -1203,35 +1324,56 @@ fn extract_chunk(
         Some(b) => format!("{b}\n---\n{text}"),
         None => text.to_string(),
     };
-    match chat.complete(system, &user) {
-        Ok(reply) => {
-            let extraction = parse_extraction(&reply.text)?;
-            Ok(ChunkExtract {
-                entities: extraction.entities,
-                relations: extraction.relations,
-                input_tokens: reply.input_tokens,
-                output_tokens: reply.output_tokens,
-                chat_requests: 1,
-            })
-        }
-        Err(e) if e.downcast_ref::<OutputTruncated>().is_some() => {
-            let pieces = chunk(text, text.chars().count() / 2);
-            if pieces.len() < 2 {
-                return Err(e); // indivisible — surface the truncation
+    let mut acc = ChunkExtract::default();
+    let mut prompt = user.clone();
+    for nudged in [false, true] {
+        match chat.complete(system, &prompt) {
+            Ok(reply) => {
+                acc.input_tokens += reply.input_tokens;
+                acc.output_tokens += reply.output_tokens;
+                acc.chat_requests += 1;
+                match parse_extraction(&reply.text) {
+                    Ok(extraction) => {
+                        acc.entities = extraction.entities;
+                        acc.relations = extraction.relations;
+                        return Ok(acc);
+                    }
+                    Err(e) if !nudged => {
+                        tracing::warn!(error = %e, "extraction reply was not JSON; asking once more");
+                        prompt = nudge(&user, &e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            let mut acc = ChunkExtract::default();
-            for piece in &pieces {
-                let sub = extract_chunk(chat, system, block, piece)?;
-                acc.entities.extend(sub.entities);
-                acc.relations.extend(sub.relations);
-                acc.input_tokens += sub.input_tokens;
-                acc.output_tokens += sub.output_tokens;
-                acc.chat_requests += sub.chat_requests;
+            Err(e) if e.downcast_ref::<OutputTruncated>().is_some() => {
+                let pieces = chunk(text, text.chars().count() / 2);
+                if pieces.len() < 2 {
+                    return Err(e); // indivisible — surface the truncation
+                }
+                for piece in &pieces {
+                    let sub = extract_chunk(chat, system, block, piece)?;
+                    acc.entities.extend(sub.entities);
+                    acc.relations.extend(sub.relations);
+                    acc.input_tokens += sub.input_tokens;
+                    acc.output_tokens += sub.output_tokens;
+                    acc.chat_requests += sub.chat_requests;
+                }
+                return Ok(acc);
             }
-            Ok(acc)
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
+    unreachable!("the nudged attempt returns either way")
+}
+
+/// The second, and last, ask for a chunk whose first reply was not JSON: the
+/// same text, with what was wrong with the answer and what is wanted instead.
+fn nudge(user: &str, why: &anyhow::Error) -> String {
+    format!(
+        "{user}\n\n---\nYour previous reply could not be used: {why}\n\
+         Reply again with ONLY the JSON object in the shape described — no prose before or \
+         after it, no markdown fences, nothing else."
+    )
 }
 
 /// Opens a paragraph that names where the text after it came from, e.g.
@@ -1367,6 +1509,13 @@ fn existing_block(cands: &[ExistingEntity]) -> Option<String> {
 
 /// Pull the JSON object out of a model reply — tolerate ```json fences and
 /// leading/trailing prose.
+///
+/// An object that names neither `entities` nor `relations` is refused unless
+/// it is empty: `{}` is an unambiguous "nothing here", but `{"key":"a"}` —
+/// which is what the first-brace-to-last-brace cut makes of a reply that was
+/// a list, or an entity on its own — is not an extraction, and accepting it
+/// as an empty one would lose the chunk without a word. Refused, it earns
+/// the nudge instead.
 fn parse_extraction(raw: &str) -> Result<Extraction> {
     let t = raw.trim();
     let t = t
@@ -1378,17 +1527,60 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
         (Some(a), Some(b)) if b >= a => &t[a..=b],
         _ => t,
     };
-    serde_json::from_str(body).with_context(|| {
-        format!(
-            "model reply was not valid extraction JSON: {}…",
-            &body[..body.len().min(160)]
-        )
-    })
+    let complaint = || {
+        let head: String = body.chars().take(160).collect();
+        format!("model reply was not valid extraction JSON: {head}…")
+    };
+    let value: Value = serde_json::from_str(body).with_context(complaint)?;
+    let shaped = match value.as_object() {
+        Some(o) => o.is_empty() || o.contains_key("entities") || o.contains_key("relations"),
+        None => false,
+    };
+    if !shaped {
+        return Err(anyhow::anyhow!(complaint()));
+    }
+    serde_json::from_value(value).with_context(complaint)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chat that fails every call and counts them.
+    struct Dead(AtomicUsize);
+
+    impl Chat for Dead {
+        fn complete(&self, _system: &str, _user: &str) -> Result<crate::provider::ChatReply> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            bail!("provider is down")
+        }
+    }
+
+    /// The first failed chunk stops the workers: a dead provider costs the
+    /// calls in flight, not one per chunk. With one worker that is exactly
+    /// one call for however many chunks were queued — and the error is the
+    /// failed chunk's, not the "abandoned" filler of the ones never started.
+    #[test]
+    fn extract_all_stops_after_the_first_failure() {
+        let chunks: Vec<String> = (0..50).map(|i| format!("chunk {i}")).collect();
+        let blocks = vec![None; chunks.len()];
+        let dead = Dead(AtomicUsize::new(0));
+        let err = match extract_all(&dead, "system", &chunks, &blocks, 1) {
+            Ok(_) => panic!("a dead provider cannot extract"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("provider is down"), "{err:#}");
+        assert_eq!(
+            dead.0.load(Ordering::Relaxed),
+            1,
+            "the remaining chunks must not be sent to a provider that just failed"
+        );
+        // With more workers, at most one call per worker is in flight when
+        // the flag goes up, so the count is bounded by the width, not by n.
+        let dead = Dead(AtomicUsize::new(0));
+        assert!(extract_all(&dead, "system", &chunks, &blocks, 4).is_err());
+        assert!(dead.0.load(Ordering::Relaxed) <= 4);
+    }
 
     #[test]
     fn prompt_is_document_driven_with_no_preset_labels() {
@@ -1529,6 +1721,78 @@ mod tests {
             PropDesc::described("year", PropValue::Int(2020)),
         );
         assert!(embeddable_text("k", &[], &doc).contains("year: 2020"));
+    }
+
+    /// What a model may name, and what it may set — the rule extraction and
+    /// refinement share.
+    #[test]
+    fn model_names_are_trimmed_bounded_and_printable() {
+        assert_eq!(model_name("  alice "), Some("alice"));
+        assert_eq!(model_name(""), None);
+        assert_eq!(model_name("   "), None);
+        assert_eq!(model_name("a\u{0}b"), None, "control characters");
+        assert_eq!(model_name("line\nbreak"), None);
+        let fits = "x".repeat(MAX_NAME_CHARS);
+        assert_eq!(model_name(&fits), Some(fits.as_str()));
+        assert_eq!(model_name(&"x".repeat(MAX_NAME_CHARS + 1)), None);
+        // Multi-byte text is measured in characters, not bytes.
+        let cjk = "数".repeat(MAX_NAME_CHARS);
+        assert_eq!(model_name(&cjk), Some(cjk.as_str()));
+    }
+
+    #[test]
+    fn a_model_may_set_content_but_not_provenance_or_vectors() {
+        let s = PropValue::Str("x".into());
+        assert!(model_may_set("role", &s));
+        assert!(model_may_set("year", &PropValue::Int(2020)));
+        for reserved in ["_generated_by", "_source", "_run", "_model", "_anything"] {
+            assert!(!model_may_set(reserved, &s), "{reserved}");
+        }
+        assert!(!model_may_set("embedding", &s));
+        assert!(!model_may_set("anything", &PropValue::Vector(vec![1.0])));
+        assert!(!model_may_set("", &s));
+        assert!(
+            !model_may_set(" role", &s),
+            "a name with padding is not a name"
+        );
+    }
+
+    /// What the extractor forgives and what it does not: fences and prose
+    /// around the object are stripped; anything that is not the object is an
+    /// error, never an empty extraction that would silently lose a chunk.
+    #[test]
+    fn parse_extraction_forgives_wrapping_and_refuses_everything_else() {
+        let object = r#"{"entities":[{"key":"a","label":"L"}],"relations":[]}"#;
+        for ok in [
+            object.to_string(),
+            format!("```json\n{object}\n```"),
+            format!("```\n{object}\n```"),
+            format!("Here is the graph:\n{object}\nHope this helps!"),
+        ] {
+            let parsed = parse_extraction(&ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+            assert_eq!(parsed.entities.len(), 1, "{ok:?}");
+        }
+        // An empty object is a valid, empty extraction — not an error.
+        assert!(parse_extraction("{}").unwrap().entities.is_empty());
+
+        for bad in [
+            "",
+            "   ",
+            "I'm sorry, I can't extract anything from that.",
+            r#"{"entities":[{"key":"a","#, // cut off mid-object
+            r#"[{"key":"a"}]"#,            // an array, not the object
+            r#"{"key":"a","label":"L"}"#,  // one entity, not an extraction
+            r#"{"entities":"none"}"#,      // wrong type
+            r#"{"entities":[{"label":"no key"}]}"#, // a required field missing
+        ] {
+            let Err(e) = parse_extraction(bad) else {
+                panic!("{bad:?} must not parse");
+            };
+            assert!(
+                e.to_string().contains("not valid extraction JSON"),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     #[test]

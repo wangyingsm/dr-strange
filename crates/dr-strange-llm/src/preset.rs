@@ -62,6 +62,21 @@ pub fn preset(name: &str) -> Option<ProviderPreset> {
 /// The preset names, for CLI help / validation.
 pub const PRESET_NAMES: &[&str] = &["openai", "deepseek", "qwen", "ollama"];
 
+/// Whether `name` is one of the presets — the question a **remote** surface
+/// must ask before handing a provider name to [`build_provider`].
+///
+/// [`build_provider`] also accepts a raw base URL, which is right for the
+/// operator at their own terminal and wrong for a name that arrived over the
+/// wire: an HTTP client that will POST to any URL it is given is a
+/// server-side request forger, and it reaches whatever the server can reach.
+/// A preset resolves only to the fixed endpoint written in this file, so a
+/// request restricted to presets can name a provider without naming a host.
+///
+/// [`build_provider`]: crate::build_provider
+pub fn is_preset(name: &str) -> bool {
+    preset(name).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +93,16 @@ mod tests {
         assert!(preset("nope").is_none());
         // Every advertised name resolves.
         assert!(PRESET_NAMES.iter().all(|n| preset(n).is_some()));
+    }
+
+    /// The gate a remote surface puts in front of `build_provider`: a preset
+    /// is a name, anything else — above all a URL — is not one.
+    #[test]
+    fn is_preset_admits_names_and_nothing_url_shaped() {
+        assert!(PRESET_NAMES.iter().all(|n| is_preset(n)));
+        assert!(!is_preset("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_preset("https://api.openai.com/v1"));
+        assert!(!is_preset("OpenAI"), "names are exact, as `preset` is");
+        assert!(!is_preset(""));
     }
 }

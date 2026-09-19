@@ -97,6 +97,12 @@ fn content_of(props: &Properties) -> BTreeMap<&str, &PropValue> {
 }
 
 /// Reconcile the tree behind `host` into `plane_name`.
+///
+/// `delta` is accepted and not read: the fold reconciles the whole tree
+/// (the module docs say why — a parser's facts for one file depend on
+/// others), and the delta is what the caller logs and records its sync
+/// point against. It stays in the signature so that a future partial
+/// re-route is a change inside this function and not to every caller.
 pub fn sync_paths(
     db: &Database,
     plane_name: &str,
@@ -187,7 +193,7 @@ pub fn sync_paths(
         })
         .collect();
     let mut edges: Vec<BulkEdge> = Vec::new();
-    for edge in edge_creates {
+    for edge in &edge_creates {
         if resolves(&edge.src)? && resolves(&edge.dst)? {
             edges.push(BulkEdge {
                 src_key: &edge.src,
@@ -201,10 +207,27 @@ pub fn sync_paths(
     }
     stats.nodes_loaded = nodes.len();
     stats.edges_written = edges.len();
-    txn.bulk_load(nodes, edges)?;
-    txn.commit()?;
+    let loaded = txn.bulk_load(nodes, edges)?;
 
-    reattach(&plane, &saved, &replaced, &stored, &mut stats)?;
+    let reloaded = Reloaded {
+        new_ids: creates
+            .iter()
+            .enumerate()
+            .map(|(i, fact)| {
+                (
+                    fact.key.as_str(),
+                    dr_strange_core::NodeId(loaded.node_start + i as u64),
+                )
+            })
+            .collect(),
+        asserted: &edge_creates,
+        fresh: &fresh,
+        stored: &stored,
+        replaced: &replaced,
+        saved: &saved,
+    };
+    reattach(&mut txn, &plane, &reloaded, &mut stats)?;
+    txn.commit()?;
     Ok(stats)
 }
 
@@ -418,45 +441,78 @@ fn save_unowned_incoming(
     Ok(saved)
 }
 
-/// Re-attach the saved edges and carry the kept properties over, in a second
-/// transaction: the re-created nodes are only visible to reads once the bulk
-/// load has committed.
+/// What the bulk load just wrote, and what stood there before — all that
+/// [`reattach`] needs to restore a replaced node without a second commit.
+struct Reloaded<'a> {
+    /// Key → the id the load gave it. A bulk load numbers its nodes
+    /// `node_start + i` in the order given, so these are known before the
+    /// commit, which is what lets the re-attach share the transaction.
+    new_ids: BTreeMap<&'a str, dr_strange_core::NodeId>,
+    /// The edges this fold asserts, for telling a saved edge the load already
+    /// carries from one that has to be re-created.
+    asserted: &'a [&'a crate::digest::DigestEdge],
+    /// The tree's facts, one per key: what a replaced node's kept properties
+    /// are checked against.
+    fresh: &'a BTreeMap<&'a str, &'a crate::digest::DigestNode>,
+    /// The plane's parser-owned nodes as they stood before this fold.
+    stored: &'a BTreeMap<String, dr_strange_core::NodeRecord>,
+    /// Keys whose node this fold deleted and re-created.
+    replaced: &'a BTreeSet<&'a str>,
+    /// Unowned incoming edges saved off the replaced nodes.
+    saved: &'a [SavedEdge],
+}
+
+/// Re-attach the saved edges and carry the kept properties over, in the *same*
+/// transaction as the load.
+///
+/// The re-created nodes are addressable before the commit, so a reader never
+/// sees a replaced node without the edges and vectors it had — and a crash
+/// between two commits cannot leave it that way for good.
 fn reattach(
+    txn: &mut dr_strange_core::WriteTxn<'_>,
     plane: &dr_strange_core::PlaneHandle<'_>,
-    saved: &[SavedEdge],
-    replaced: &BTreeSet<&str>,
-    stored: &BTreeMap<String, dr_strange_core::NodeRecord>,
+    r: &Reloaded<'_>,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    let mut txn = plane.write()?;
-    for edge in saved {
-        let Some(dst) = plane.node_by_key(&edge.dst_key)? else {
+    // A saved edge the facts also assert this fold is already in the load: its
+    // source key is a standing node whose id is the one we saved from.
+    let asserted = |edge: &SavedEdge| -> Result<bool> {
+        for fact in r.asserted {
+            if fact.dst != edge.dst_key || fact.ty != edge.ty {
+                continue;
+            }
+            if plane
+                .node_by_key(&fact.src)?
+                .is_some_and(|n| n.id == edge.src)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    for edge in r.saved {
+        let Some(&dst) = r.new_ids.get(edge.dst_key.as_str()) else {
             continue; // the symbol vanished; the dangling assertion goes too
         };
-        if plane
-            .neighbors(edge.src, Dir::Out, Some(&edge.ty))?
-            .iter()
-            .any(|n| n.node == dst.id)
-        {
+        if asserted(edge)? {
             continue;
         }
-        txn.create_edge(edge.src, dst.id, &edge.ty, edge.props.clone())?;
+        txn.create_edge(edge.src, dst, &edge.ty, edge.props.clone())?;
         stats.edges_reattached += 1;
     }
-    for key in replaced {
-        let node = &stored[*key];
-        let Some(new) = plane.node_by_key(key)? else {
+    for key in r.replaced {
+        let node = &r.stored[*key];
+        let (Some(&new), Some(fact)) = (r.new_ids.get(key), r.fresh.get(key)) else {
             continue;
         };
         for (prop_key, prop) in &node.properties {
             let keep = (prop_key.starts_with('_') || matches!(prop.value, PropValue::Vector(_)))
-                && !new.properties.contains_key(prop_key);
+                && !fact.props.contains_key(prop_key);
             if keep {
-                txn.set_prop(new.id, prop_key, prop.clone())?;
+                txn.set_prop(new, prop_key, prop.clone())?;
             }
         }
     }
-    txn.commit()?;
     Ok(())
 }
 

@@ -7,8 +7,8 @@
 //! **provenance on everything** written (source, model, run id); a minimal
 //! provider abstraction ([`Chat`] + [`Embedder`]) with a plain-HTTP
 //! OpenAI-compatible implementation and a deterministic mock for tests.
-//!
-//! Still TODO (arch/07 §1, v1.5): entity-resolution proposals.
+//! Entity resolution, once the open item here, is `reconcile` (model-free
+//! folds) and `identity` (model-adjudicated containment) inside the digest.
 
 mod ask;
 mod digest;
@@ -23,7 +23,7 @@ mod reconcile;
 mod refine;
 mod vectorize;
 
-pub use ask::{AskOptions, AskResult, ask};
+pub use ask::{ASK_DEFAULT_ATTEMPTS, ASK_DEFAULT_LIMIT, ASK_MAX_LIMIT, AskOptions, AskResult, ask};
 pub use digest::{
     ApplyStats, CandidateSource, DigestEdge, DigestMode, DigestNode, DigestOptions, DigestReport,
     DigestResult, ExistingEntity, PlaneCandidates, SOURCE_MARKER, digest, embeddable_text,
@@ -31,7 +31,7 @@ pub use digest::{
 };
 pub use document::to_markdown;
 pub use identity::IdentityReport;
-pub use openai::{OpenAiProvider, build_provider};
+pub use openai::{CHAT_OMIT_ENV, OpenAiProvider, build_provider};
 /// The official plugin catalog — data fetched from the extensions repository,
 /// not a constant of this binary.
 #[cfg(feature = "plugins")]
@@ -47,11 +47,14 @@ pub use preprocess::{
     route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
-pub use preprocess::{InstalledPlugin, Limits, LivePlugins, PluginStore, StoreStamp, WasmPlugin};
+pub use preprocess::{
+    ENV_PLUGIN_DEADLINE_SECS, ENV_PLUGIN_TOTAL_MEMORY_MB, InstalledPlugin, Limits, LivePlugins,
+    PluginStore, StoreStamp, WasmPlugin,
+};
 /// Reading a repository's history beside its code — see [`preprocess::repo`].
 pub use preprocess::{PLANE_SUFFIX as GIT_PLANE_SUFFIX, REPO_PLUGIN, plane_name as git_plane_name};
 pub use preprocess::{WriteStats as GitWriteStats, write_history};
-pub use preset::{PRESET_NAMES, ProviderPreset, preset};
+pub use preset::{PRESET_NAMES, ProviderPreset, is_preset, preset};
 pub use provider::{Chat, ChatReply, EmbedReply, Embedder, MockProvider, OutputTruncated};
 pub use reconcile::ReconcileReport;
 pub use refine::RefineReport;

@@ -108,20 +108,21 @@ fn containment_pairs(keys: &[String], labels: &BTreeMap<String, String>) -> Vec<
         (Some(x), Some(y)) if !x.is_empty() && !y.is_empty() => x.eq_ignore_ascii_case(y),
         _ => true,
     };
+    // Folded once each: the loop below is every key against every other, and
+    // folding is the expensive half of the comparison.
+    let folded: Vec<String> = keys.iter().map(|k| fold_key(k)).collect();
     let mut pairs = BTreeSet::new();
-    for inner in keys {
-        let folded_inner = fold_key(inner);
+    for (inner, folded_inner) in keys.iter().zip(&folded) {
         if folded_inner.is_empty() {
             continue;
         }
         let mut taken = 0;
-        for outer in keys {
+        for (outer, folded_outer) in keys.iter().zip(&folded) {
             if inner == outer || taken >= MAX_PER_KEY || !comparable(inner, outer) {
                 continue;
             }
-            let folded_outer = fold_key(outer);
             // Contained, and genuinely shorter — equal folds are stage 1's job.
-            if folded_outer.len() > folded_inner.len() && folded_outer.contains(&folded_inner) {
+            if folded_outer.len() > folded_inner.len() && folded_outer.contains(folded_inner) {
                 pairs.insert(Pair {
                     inner: inner.clone(),
                     outer: outer.clone(),

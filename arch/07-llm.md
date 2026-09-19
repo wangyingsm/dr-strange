@@ -20,7 +20,7 @@ from the same file. Two readers would mean two vector spaces for one corpus.
 |---|---|
 | Embedding generation | text → vector at ingest/query time; pluggable providers (OpenAI-compatible, which covers gateways and a local `ollama`/`llama.cpp` through a configurable base URL), batched per call. Configured **per server** (`[digest] embed_provider`), not per plane: a per-plane model recorded as plane properties was considered and not built, since nothing yet needs to detect mixed-model vectors and the config an operator actually sets is process-wide |
 | Document reading | bytes → GitHub-Flavored Markdown for Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF (via `anydoc`), with Markdown and plain text passing through. Format is detected from the content, not the filename. Deterministic and model-free — the step before digestion, shared by every surface |
-| Preprocessing | an input's own structure → **facts** (nodes and edges a parser is certain of) plus **prose** (the residue needing a model), routed per file so a polyglot tree fans out and merges (ROADMAP §11). Handlers are **installed wasm plugins** (`drsg plugin install`, SHA-256 pinned; official ones exist for Rust, Go, TypeScript/JavaScript, Python, Java, C, web (HTML/CSS), and TOML). The sandbox grants nothing: an empty preopen table (a guest runtime may *import* `wasi:filesystem` — Go's does before the plugin's first line runs — but there is nothing behind it), `wasi:sockets` refused at load by name, frozen clocks, entropy dealt from a fixed sequence (Go seeds map order from it), fuel- and memory-bounded, and a trapped guest's stderr is captured into the error. Contract and SDKs live in the `dr-strange-extensions` repo. Document reading is the built-in fallback every unclaimed input lands on. An input yielding only facts is digested with **no model call at all**. Local-only: the CLI and the stdio MCP server, never a shared server — see §2 |
+| Preprocessing | an input's own structure → **facts** (nodes and edges a parser is certain of) plus **prose** (the residue needing a model), routed per file so a polyglot tree fans out and merges (ROADMAP §11). Handlers are **installed wasm plugins** (`drsg plugin install`, SHA-256 pinned; official ones exist for Rust, Go, TypeScript/JavaScript, Python, Java, C, web (HTML/CSS), and TOML). The sandbox grants nothing: an empty preopen table (a guest runtime may *import* `wasi:filesystem` — Go's does before the plugin's first line runs — but there is nothing behind it), `wasi:sockets` refused at load by name, frozen clocks, entropy dealt from a fixed sequence (Go seeds map order from it), fuel- and memory-bounded per call (tables and instances too), with a wall-clock deadline under fuel (epoch interruption, one ticker thread per process; `DRSG_PLUGINS_DEADLINE_SECS`) and a memory budget shared by every call in flight (`DRSG_PLUGINS_TOTAL_MEMORY_MB`, default twice the per-call ceiling), and a trapped guest's stderr is captured into the error. A plugin's version, like its name, is held to a filename-safe charset because both become one. The host interface is the grant, and `read` answers for exactly what `list` names: a path outside the root, or one inside it the ignore policy hides (`.env`, an ignored credentials file, a build directory), is refused on its resolved form. Contract and SDKs live in the `dr-strange-extensions` repo. Document reading is the built-in fallback every unclaimed input lands on. An input yielding only facts is digested with **no model call at all**. Local-only: the CLI and the stdio MCP server, never a shared server — see §2 |
 | Document digestion | the engine behind `drsg digest` / MCP `digest`: an LLM parses that Markdown into entities, relations, `PropDesc` descriptions, and embeddings, written through the bulk API. Shipped as AIgest's three passes (ROADMAP §8) |
 | Entity resolution | propose cross-plane / intra-plane duplicate candidates by external key, name similarity, and embedding distance; output is a *proposal set* the caller (human or agent) confirms — feeds plane `merge` (09 §3) |
 | NL → plan translation | natural-language question → serialized logical plan, grounded on the per-plane catalog (labels + property descriptions); shipped as `drsg ask` (ROADMAP §3), read-only by construction — see §3 |
@@ -38,7 +38,14 @@ from the same file. Two readers would mean two vector spaces for one corpus.
   (`rust@3+fdb01bb6` — plugin, version, and the leading bytes of the pinned
   artifact hash) instead of `_model`, so a parsed fact is always distinguishable from a
   model's guess; where both claim one key, **the fact wins** and the model's is
-  dropped and counted.
+  dropped and counted. The line is enforced on the way in as well as stamped on
+  the way out: a model's extraction or refinement may set no `_`-prefixed
+  property, no `embedding`, and no vector under any name — those are dropped
+  and counted (`reserved_props`) before provenance is stamped — and an entity
+  or relation whose key is empty, blank, control-laden or absurdly long is
+  dropped and counted (`rejected`). Otherwise a document written to steer the
+  model could mint a node `_generated_by` a parser, which the next watch fold
+  would then own and delete.
 - **Preprocessing is local-only**: what makes parsing worth its cost is a
   plugin pulling the files *around* the one it was handed — and that pull is
   exactly what a shared server must not offer, since the only filesystem it
@@ -51,7 +58,12 @@ from the same file. Two readers would mean two vector spaces for one corpus.
   rather than a policy document beside it that can drift.
 - Provider abstraction is minimal: `trait Embedder` and `trait Chat` with
   plain HTTP implementations (JSON-RPC where the provider supports it, REST
-  otherwise); no agent-framework dependency.
+  otherwise); no agent-framework dependency. Chat completions send
+  `temperature: 0` and `max_tokens`; a provider that rejects either is
+  served by naming it in `DRSG_CHAT_OMIT` (`temperature,max_tokens`), read
+  where the key is. A `Retry-After` is obeyed up to sixty seconds. No log
+  line or error ever renders a provider URL's query string or userinfo —
+  that is where a key goes when an operator was told "give a base URL".
 - Cost controls: token/request budgets per digest run, surfaced in progress
   output; embedding cache keyed by content hash to avoid re-embedding
   unchanged text.
@@ -68,6 +80,23 @@ All three questions this doc opened with are settled.
    path. `openai.rs` takes a configurable `base_url`, so any
    OpenAI-compatible endpoint works — a gateway, `ollama`, or `llama.cpp`.
 3. **NL → plan safety** — settled: yes, and it is *enforced*, not merely
-   intended. `dr-strange-parser`'s `read_only()` rejects any statement that
-   would mutate before it can become a `ReadQuery`, so the NL interface
-   cannot write even if the model emits a mutation.
+   intended. `ask` never goes through Cypher: the model's answer is
+   deserialized straight into `dr-strange-core`'s `LogicalPlan`, an algebra
+   with **no mutation** in it — every `Source` and every `Step` reads — so
+   there is no write for the model to emit. (`dr-strange-parser`'s
+   `read_only()` is the analogous guard on the *Cypher* surface; it plays no
+   part in `ask`.) Two things are enforced on top of that, because a plan is
+   the model's and a document can steer a model:
+   - an **allowlist** of the grammar the prompt teaches — `ScanAll`,
+     `ScanLabel`, `SeekIds`, `SeekKeys`; `Expand`, `ExpandVar`, `Filter`,
+     `Distinct`, `Sort`, `Skip`, `Limit`. Vector, keyword, hybrid and algorithm sources
+     and the similarity steps are rejected and sent back as a repair, as is
+     any variant the (`#[non_exhaustive]`) core grows later;
+   - a **row ceiling**: every `Limit` the model wrote, the caller's cap, and a
+     projection's `limit` are clamped to `ASK_MAX_LIMIT` (1 000), and a plan
+     whose *last* step is not a `Limit` gets the caller's cap (default
+     `ASK_DEFAULT_LIMIT`, 100) appended — a `Limit` the model wrote before an
+     `Expand` bounds the seeds, not the rows. No plan runs unbounded;
+     `limit: 0` means the ceiling.
+   Both constants and `ASK_DEFAULT_ATTEMPTS` (20 model turns) are public so
+   the RPC and MCP surfaces validate requests against the same numbers.

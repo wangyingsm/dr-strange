@@ -53,12 +53,19 @@
 //!
 //! ## Bounded, and deterministic
 //!
-//! **Fuel**, not epoch interruption: fuel counts instructions, so a runaway
-//! plugin stops at the same point on every machine, where epochs are
-//! wall-clock and would tie the outcome to machine load. Memory is bounded per
-//! store. Both are operator-settable; and no memory setting can lift the
-//! 4 GiB ceiling wasm32 itself imposes — a tree whose facts exceed that is
-//! ingested a subtree at a time, with the plane as the accumulator.
+//! **Fuel** is the budget: it counts instructions, so a runaway plugin stops
+//! at the same point on every machine, where a clock would tie the outcome
+//! to machine load. A **wall-clock deadline** sits behind it as the net —
+//! epoch interruption, ticked by one thread for every engine in the process
+//! — for the operator who turned fuel off and the plugin that then never
+//! returns; it is not deterministic and is not meant to be reached by honest
+//! work. Memory is bounded per store *and* across stores: `parse` runs one
+//! call per core, and a per-store ceiling alone would let a machine's worth
+//! of stores each grow to it at once. Tables and instances are bounded too,
+//! so a guest cannot grow a table where it may not grow a memory. All of it
+//! is operator-settable; and no memory setting can lift the 4 GiB ceiling
+//! wasm32 itself imposes — a tree whose facts exceed that is ingested a
+//! subtree at a time, with the plane as the accumulator.
 //!
 //! Determinism is a matter of what the sandbox will answer: the clocks are
 //! frozen and `wasi:random` deals a fixed byte sequence, so a runtime that
@@ -69,9 +76,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config, Engine, EngineWeak, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use super::{Host, Input, Manifest, PreprocessReport, Preprocessed, Preprocessor};
@@ -104,6 +115,9 @@ fn wt(e: wasmtime::Error) -> anyhow::Error {
 const CHUNK_FILES: usize = 1;
 
 /// How much a plugin may spend, and how much it may hold.
+///
+/// Construct with `..Limits::default()`: fields are added as the sandbox
+/// learns what else needs bounding.
 #[derive(Debug, Clone)]
 pub struct Limits {
     /// Instructions any single call may execute. `None` disables the check,
@@ -112,6 +126,17 @@ pub struct Limits {
     pub fuel: Option<u64>,
     /// Linear memory per store, in bytes.
     pub memory_bytes: usize,
+    /// Wall-clock ceiling on any single call. `None` disables it. Not a
+    /// budget for work — fuel is that, and deterministic — but the net under
+    /// it: with fuel off, a plugin that never returns would otherwise hold
+    /// its thread, and under `serve watch` the fold, forever.
+    pub deadline: Option<Duration>,
+    /// Linear memory all of a process's stores may hold **together**, in
+    /// bytes. `parse` runs one call per core, so a per-store ceiling alone
+    /// bounds nothing on a wide machine: thirty-two cores at 3 GiB apiece is
+    /// the whole box. `None` means twice `memory_bytes` — two calls at their
+    /// ceiling, or a few dozen at the size an honest parse reaches.
+    pub total_memory_bytes: Option<usize>,
 }
 
 /// Sized from slice 1's measurement (~0.3–0.6 G instructions per MiB of Rust,
@@ -125,11 +150,85 @@ const DEFAULT_FUEL: u64 = 200_000_000_000;
 /// whatever this is set to.
 const DEFAULT_MEMORY: usize = 3 << 30;
 
+/// Five minutes per call. The default fuel is spent in a few of those on a
+/// fast core, so honest work under fuel never sees this; it exists for the
+/// operator who set `fuel = 0` and the plugin that then spins.
+const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How often the epoch advances. A deadline is measured in ticks of this, so
+/// it is also the most a deadline can overrun by; a tenth of a second is
+/// nothing beside any deadline worth setting and costs one wake-up per tick.
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+/// The deadline of a store that has none, in ticks beyond the current epoch.
+/// Half the range: far enough that a process ticking ten times a second
+/// reaches it in ~29 billion years, and small enough that adding it to any
+/// epoch the ticker could have counted to cannot overflow.
+const NEVER_TICKS: u64 = u64::MAX / 2;
+
+/// Core instances a component may make per store. A component is a few core
+/// modules and an adapter; a runtime that instantiates hundreds is doing
+/// something a preprocessor has no reason to.
+const MAX_INSTANCES: usize = 64;
+/// Tables a store may hold, and elements per table. A funcref table is the
+/// size of a guest's indirect-call surface — tens of thousands for a Go or
+/// Python runtime — and a million leaves room for a much larger one while
+/// refusing a guest that grows a table where it may not grow a memory.
+const MAX_TABLES: usize = 64;
+const MAX_TABLE_ELEMENTS: usize = 1 << 20;
+/// Linear memories per store. One in practice; a few for multi-memory guests.
+const MAX_MEMORIES: usize = 16;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             fuel: Some(DEFAULT_FUEL),
             memory_bytes: DEFAULT_MEMORY,
+            deadline: Some(DEFAULT_DEADLINE),
+            total_memory_bytes: None,
+        }
+    }
+}
+
+impl Limits {
+    /// The process-wide memory budget: the one set, or twice the per-store
+    /// ceiling — never less than one store's worth, or nothing could run.
+    fn budget(&self) -> usize {
+        self.total_memory_bytes
+            .unwrap_or_else(|| self.memory_bytes.saturating_mul(2))
+            .max(self.memory_bytes)
+    }
+
+    /// The resource limiter a store runs under: the per-store memory ceiling
+    /// and the fixed table, element, instance and memory counts, wrapped in
+    /// the shared budget. One place, so the counts cannot be set on one
+    /// store's builder and forgotten on another's.
+    fn metered(&self) -> Metered {
+        Metered::new(
+            StoreLimitsBuilder::new()
+                .memory_size(self.memory_bytes)
+                .memories(MAX_MEMORIES)
+                .tables(MAX_TABLES)
+                .table_elements(MAX_TABLE_ELEMENTS)
+                .instances(MAX_INSTANCES)
+                .build(),
+            self.memory_bytes,
+            self.budget(),
+        )
+    }
+
+    /// The deadline in epoch ticks: at least one, so a deadline shorter than
+    /// a tick still fires on the next tick rather than at once.
+    ///
+    /// "No deadline" is [`NEVER_TICKS`], not `u64::MAX`: wasmtime adds the
+    /// delta to the engine's *current* epoch with a plain `+`, and the epoch
+    /// is past zero as soon as the ticker has run once — `u64::MAX` overflowed
+    /// there (a panic in debug builds, a deadline already in the past in
+    /// release) and turned a disabled deadline into one that fired on the
+    /// first call.
+    fn deadline_ticks(&self) -> u64 {
+        match self.deadline {
+            Some(d) => (d.as_millis().div_ceil(EPOCH_TICK.as_millis()).max(1)) as u64,
+            None => NEVER_TICKS,
         }
     }
 }
@@ -151,9 +250,64 @@ fn engine(fuel: bool) -> Result<Engine> {
     // Fuel is why a runaway plugin is *interrupted* rather than left to
     // spin, and it is deterministic in a way epoch interruption is not.
     config.consume_fuel(fuel);
-    Engine::new(&config)
+    // Epochs are always compiled in, whether or not a deadline is set: the
+    // instrumentation is part of the engine's configuration, and an artifact
+    // compiled one way does not load into an engine configured the other.
+    // A store with no deadline simply never reaches its epoch.
+    config.epoch_interruption(true);
+    let engine = Engine::new(&config)
         .map_err(wt)
-        .context("starting the wasm engine")
+        .context("starting the wasm engine")?;
+    keep_ticking(&engine)?;
+    Ok(engine)
+}
+
+/// Every engine whose epoch the ticker advances, held weakly so a dropped
+/// plugin's engine is forgotten rather than kept alive by its own clock.
+static TICKED: Mutex<Vec<EngineWeak>> = Mutex::new(Vec::new());
+/// Whether the ticker thread is running. It ends with the last engine and is
+/// started again by the next, so an idle process carries no thread for it.
+static TICKING: AtomicBool = AtomicBool::new(false);
+
+/// Register `engine` with the one thread that advances every engine's epoch
+/// once per [`EPOCH_TICK`], starting it if nothing was ticking.
+///
+/// One thread for all engines rather than one per plugin: a default install
+/// loads nine, and nine threads waking ten times a second to do what one
+/// can is the wrong shape. The check-and-exit in the thread and the
+/// push-and-start here both happen under the list's lock, so an engine
+/// registered as the thread is deciding to stop is never left unticked.
+fn keep_ticking(engine: &Engine) -> Result<()> {
+    let mut list = TICKED.lock().unwrap_or_else(PoisonError::into_inner);
+    list.push(engine.weak());
+    if TICKING.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let spawned = std::thread::Builder::new()
+        .name("drsg-wasm-epoch".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(EPOCH_TICK);
+                let mut list = TICKED.lock().unwrap_or_else(PoisonError::into_inner);
+                list.retain(|weak| match weak.upgrade() {
+                    Some(engine) => {
+                        engine.increment_epoch();
+                        true
+                    }
+                    None => false,
+                });
+                if list.is_empty() {
+                    TICKING.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        TICKING.store(false, Ordering::Release);
+        list.pop();
+        return Err(e).context("starting the wasm deadline ticker");
+    }
+    Ok(())
 }
 
 /// Compile `bytes` on a pool of at most [`COMPILE_THREADS`] threads that
@@ -216,23 +370,59 @@ pub fn held_bytes() -> usize {
     HELD.load(Ordering::Relaxed)
 }
 
-/// A store's limits, with what its guest grew to kept on [`HELD`] for as long
-/// as the store lives.
+/// Guest linear memory held by every live store in the process — the part of
+/// [`HELD`] the budget is about. Images are not in it: they are mapped files
+/// the operator chose to install, not something a guest can grow.
+static GUEST_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Why a store was refused memory, kept so the trap it caused can be
+/// explained as the refusal it was rather than as the guest's allocator
+/// giving up.
+#[derive(Debug, Clone, Copy)]
+enum Refused {
+    /// The per-call ceiling.
+    PerCall { asked: usize, limit: usize },
+    /// The process-wide budget, and what the other stores were holding.
+    Budget {
+        asked: usize,
+        others: usize,
+        budget: usize,
+    },
+}
+
+/// A store's limits, with what its guest grew to kept on [`HELD`] and
+/// [`GUEST_HELD`] for as long as the store lives, and growth refused when the
+/// process-wide budget would be passed.
 ///
-/// Wraps [`StoreLimits`] rather than replacing it: the ceiling is still
-/// wasmtime's own check, and this only watches what it allowed. Every growth
-/// it approves is added — the first one, at instantiation, is the guest's
+/// Wraps [`StoreLimits`] rather than replacing it: the per-call ceiling is
+/// still wasmtime's own check, and this watches what it allowed and adds the
+/// one check it cannot make, since a `StoreLimits` knows one store. Every
+/// growth approved is added — the first one, at instantiation, is the guest's
 /// initial memory — and the whole of it is taken back on drop, which is when
-/// the guest's memory is actually freed.
+/// the guest's memory is actually freed. The budget is reserved before it is
+/// checked, so two stores growing at once cannot both be told there is room
+/// for one.
 struct Metered {
     inner: StoreLimits,
+    /// The per-call ceiling, for the refusal to name.
+    limit: usize,
+    /// The process-wide budget this store shares.
+    budget: usize,
     /// What this store added to [`HELD`], so the drop takes back exactly that.
     held: usize,
+    /// The first refusal, if any — the trap that follows is this.
+    refused: Option<Refused>,
 }
 
 impl Metered {
-    fn new(inner: StoreLimits) -> Self {
-        Self { inner, held: 0 }
+    fn new(inner: StoreLimits, limit: usize, budget: usize) -> Self {
+        Self {
+            inner,
+            limit,
+            budget,
+            held: 0,
+            refused: None,
+        }
     }
 }
 
@@ -243,13 +433,32 @@ impl ResourceLimiter for Metered {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        let allow = self.inner.memory_growing(current, desired, maximum)?;
-        if allow && desired > current {
-            let grew = desired - current;
-            self.held += grew;
-            HELD.fetch_add(grew, Ordering::Relaxed);
+        if !self.inner.memory_growing(current, desired, maximum)? {
+            self.refused.get_or_insert(Refused::PerCall {
+                asked: desired,
+                limit: self.limit,
+            });
+            return Ok(false);
         }
-        Ok(allow)
+        if desired <= current {
+            return Ok(true);
+        }
+        let grew = desired - current;
+        // Reserve, then check: the add is what other stores see, so a race
+        // between two growths cannot admit both into the last gap.
+        let before = GUEST_HELD.fetch_add(grew, Ordering::AcqRel);
+        if before.saturating_add(grew) > self.budget {
+            GUEST_HELD.fetch_sub(grew, Ordering::AcqRel);
+            self.refused.get_or_insert(Refused::Budget {
+                asked: desired,
+                others: before.saturating_sub(self.held),
+                budget: self.budget,
+            });
+            return Ok(false);
+        }
+        self.held += grew;
+        HELD.fetch_add(grew, Ordering::Relaxed);
+        Ok(true)
     }
 
     fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
@@ -285,6 +494,7 @@ impl ResourceLimiter for Metered {
 impl Drop for Metered {
     fn drop(&mut self) {
         HELD.fetch_sub(self.held, Ordering::Relaxed);
+        GUEST_HELD.fetch_sub(self.held, Ordering::AcqRel);
     }
 }
 
@@ -557,11 +767,7 @@ impl WasmPlugin {
                 host,
                 wasi,
                 table: ResourceTable::new(),
-                limits: Metered::new(
-                    StoreLimitsBuilder::new()
-                        .memory_size(self.limits.memory_bytes)
-                        .build(),
-                ),
+                limits: self.limits.metered(),
                 stderr,
             },
         );
@@ -570,6 +776,10 @@ impl WasmPlugin {
             // Cannot fail: the engine was configured to consume fuel above.
             let _ = store.set_fuel(fuel);
         }
+        // The wall-clock net. Epochs are compiled in unconditionally, and a
+        // store's deadline defaults to *now*, so this must be set even when
+        // no deadline is wanted — `NEVER_TICKS` beyond now is never.
+        store.set_epoch_deadline(self.limits.deadline_ticks());
 
         let instance = self
             .instance_pre
@@ -594,10 +804,46 @@ impl WasmPlugin {
     /// which is exactly the line a log line, truncated, drops.
     fn explain_trap(&self, error: wasmtime::Error, store: &Store<State>) -> anyhow::Error {
         let name = &self.manifest.name;
+        // A refusal first: a guest refused memory aborts in its allocator,
+        // and the trap that reaches here says "unreachable" — the refusal is
+        // the cause, and it names the ceiling that was hit.
+        match store.data().limits.refused {
+            Some(Refused::PerCall { asked, limit }) => {
+                return anyhow!(
+                    "plugin `{name}` was refused memory at {} MiB: the per-call limit is {} MiB \
+                     (`[plugins] memory_mb`)",
+                    asked >> 20,
+                    limit >> 20
+                );
+            }
+            Some(Refused::Budget {
+                asked,
+                others,
+                budget,
+            }) => {
+                return anyhow!(
+                    "plugin `{name}` was refused memory at {} MiB: the other calls in flight hold \
+                     {} MiB and the plugins' shared budget is {} MiB",
+                    asked >> 20,
+                    others >> 20,
+                    budget >> 20
+                );
+            }
+            None => {}
+        }
         if self.limits.fuel.is_some() && store.get_fuel().is_ok_and(|left| left == 0) {
             return anyhow!(
                 "plugin `{name}` ran out of fuel — either it does not terminate, \
                  or the input is larger than `[plugins] fuel` allows for"
+            );
+        }
+        if matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt))
+            && let Some(deadline) = self.limits.deadline
+        {
+            return anyhow!(
+                "plugin `{name}` ran past the {}s wall-clock deadline for one call — either it \
+                 does not terminate, or this input needs a longer deadline",
+                deadline.as_secs()
             );
         }
         let rendered = format!("{error:#}");
@@ -1055,5 +1301,75 @@ error while executing at wasm backtrace:
         let one = skipped_note("go", &["a.go".to_string()], "");
         assert!(one.contains("1 file — skipped, so its facts are"), "{one}");
         assert!(!one.contains("more"), "{one}");
+    }
+
+    /// The budget is the one check a `StoreLimits` cannot make, because it
+    /// knows one store: two stores each under their own ceiling are refused
+    /// together once what they hold would pass the budget — and the refusal
+    /// says so, naming what the *others* held, not the ceiling this store
+    /// never reached. Driven through the limiter directly: two guests
+    /// growing at once is not something a fixture can be made to do on cue.
+    #[test]
+    fn the_shared_budget_refuses_what_the_per_call_ceiling_would_allow() {
+        let limit = 64 << 20;
+        let budget = 100 << 20;
+        let fresh = || {
+            Metered::new(
+                StoreLimitsBuilder::new().memory_size(limit).build(),
+                limit,
+                budget,
+            )
+        };
+        let mut first = fresh();
+        let mut second = fresh();
+        assert!(first.memory_growing(0, limit, None).unwrap());
+        assert!(first.refused.is_none());
+        // 36 MiB of budget left; the second store may take that, not more.
+        assert!(second.memory_growing(0, 32 << 20, None).unwrap());
+        assert!(
+            !second.memory_growing(32 << 20, limit, None).unwrap(),
+            "the budget must stop what the ceiling allows"
+        );
+        match second.refused {
+            Some(Refused::Budget {
+                asked,
+                others,
+                budget: named,
+            }) => {
+                assert_eq!(asked, limit);
+                assert_eq!(others, limit, "what the first store holds");
+                assert_eq!(named, budget);
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        // What was refused is not held; dropping the first store gives its
+        // share back and the second may grow after all.
+        drop(first);
+        assert!(second.memory_growing(32 << 20, limit, None).unwrap());
+        drop(second);
+    }
+
+    /// The counts a store is built with are the ones the limiter reports and
+    /// enforces — not the trait's defaults, which are ten thousand of each.
+    /// Driven through the limiter wasmtime would consult: a table growing to
+    /// the element cap is admitted, one element past it is refused, and the
+    /// instance, table and memory counts are the constants.
+    #[test]
+    fn a_store_is_limited_to_the_configured_tables_instances_and_memories() {
+        let mut metered = Limits::default().metered();
+        assert_eq!(metered.instances(), MAX_INSTANCES);
+        assert_eq!(metered.tables(), MAX_TABLES);
+        assert_eq!(metered.memories(), MAX_MEMORIES);
+        assert!(metered.table_growing(0, MAX_TABLE_ELEMENTS, None).unwrap());
+        assert!(
+            !metered
+                .table_growing(MAX_TABLE_ELEMENTS, MAX_TABLE_ELEMENTS + 1, None)
+                .unwrap(),
+            "one element past the cap must be refused"
+        );
+        assert!(
+            metered.refused.is_none(),
+            "a table refusal is wasmtime's own trap, not a memory refusal"
+        );
     }
 }

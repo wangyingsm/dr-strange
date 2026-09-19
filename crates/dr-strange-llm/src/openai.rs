@@ -48,6 +48,64 @@ const MAX_ATTEMPTS: u32 = 4;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
+/// The longest a `Retry-After` header is obeyed for. A provider that names a
+/// wait knows more than the schedule does, so its number outranks
+/// [`MAX_BACKOFF`] — but not without bound: a gateway that says "come back
+/// in an hour" should surface as a failed request the caller can act on,
+/// not as a worker asleep for an hour with nothing logged but a retry line.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// The environment variable naming request fields to leave out of every chat
+/// completion, comma-separated: `temperature`, `max_tokens`, or both.
+///
+/// Both are sent by default and always were. Some reasoning models reject a
+/// request that sets either — `temperature` because they fix it, `max_tokens`
+/// because they want `max_completion_tokens` — and the operator facing that
+/// provider needs a way to omit them that does not involve a code change.
+/// Read once where providers are built from the environment, beside the key.
+pub const CHAT_OMIT_ENV: &str = "DRSG_CHAT_OMIT";
+
+/// A URL fit for a log line or an error: scheme and host only. The query
+/// string and the userinfo are where an operator who was told "give a base
+/// URL" puts a key (`…/v1?api-key=…`, `https://token@host/`), and an error
+/// that quotes the URL would otherwise carry it into the log, the terminal,
+/// and the RPC reply.
+fn redact_url(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
+    match no_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+            format!("{scheme}://{rest}")
+        }
+        None => no_query.to_string(),
+    }
+}
+
+/// A transport error as a log line: the kind, the message, the cause — and
+/// not the URL, which ureq's own rendering leads with.
+fn describe_transport(e: &ureq::Transport) -> String {
+    let mut out = e.kind().to_string();
+    if let Some(m) = e.message() {
+        out.push_str(": ");
+        out.push_str(m);
+    }
+    if let Some(src) = std::error::Error::source(e) {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+    }
+    out
+}
+
+/// How long to wait before try number `attempt` when the provider said
+/// `asked` — its number, capped at [`MAX_RETRY_AFTER`] — or the schedule's
+/// when it said nothing.
+fn retry_wait(asked: Option<Duration>, attempt: u32) -> Duration {
+    match asked {
+        Some(wait) => wait.min(MAX_RETRY_AFTER),
+        None => backoff(attempt),
+    }
+}
+
 /// Whether an HTTP status is worth trying again. `429` and `5xx` say "not now";
 /// every other 4xx is a statement about the request itself — a bad key, a
 /// malformed body, a model that does not exist — and repeating it only spends
@@ -215,6 +273,18 @@ fn looks_like_url(provider: &str) -> bool {
 /// A raw base URL has no preset behind it, so it carries no default key env and
 /// no default model: pass `key_env` when the endpoint needs a key, and `model`
 /// (always, for embeddings — an empty embedding model is rejected below).
+///
+/// # Trust
+///
+/// A raw URL — whether as `provider` or as `url` — is **operator-trusted**:
+/// this function will POST to it, from this process, on the network this
+/// process is on. That is what an operator at their own terminal or config
+/// file means by it, and it is a server-side request forgery when the string
+/// came from anyone else. A remote or unauthenticated request must therefore
+/// never reach this function with a URL: a surface that accepts a provider
+/// name over the wire restricts it with [`is_preset`](crate::is_preset) and
+/// passes no `url`, so the only endpoints reachable are the fixed ones in
+/// [`crate::preset`].
 pub fn build_provider(
     provider: &str,
     model: Option<&str>,
@@ -253,13 +323,30 @@ pub fn build_provider(
         .or_else(|| p.map(|p| if embed { p.embed_model } else { p.chat_model }))
         .unwrap_or("");
     if embed && model.is_empty() {
+        // The name may be a URL, and a URL may carry a key: quote it redacted.
         bail!(
-            "provider '{provider}' has no embedding model — use qwen/openai/ollama, set an embed model, or disable embedding"
+            "provider '{}' has no embedding model — use qwen/openai/ollama, set an embed model, or disable embedding",
+            redact_url(provider)
         );
     }
     let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
     let mut provider = OpenAiProvider::new(base, key, model).with_embed_batch(batch);
     provider.missing_key_env = missing;
+    for field in std::env::var(CHAT_OMIT_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+    {
+        match field {
+            "temperature" => provider = provider.without_temperature(),
+            "max_tokens" => provider = provider.without_max_tokens(),
+            "" => {}
+            other => tracing::warn!(
+                field = other,
+                "{CHAT_OMIT_ENV} names a field this provider never sends; ignored"
+            ),
+        }
+    }
     Ok(provider)
 }
 
@@ -279,6 +366,14 @@ pub struct OpenAiProvider {
     /// "none" disables them. `None` (the default) sends nothing, keeping
     /// behavior unchanged for providers that don't need it.
     reasoning_effort: Option<String>,
+    /// Whether chat completions carry `temperature: 0`. On by default — the
+    /// pipeline wants the model's most likely reading, not a sample — and off
+    /// for a provider that rejects the field (see [`CHAT_OMIT_ENV`]).
+    send_temperature: bool,
+    /// Whether chat completions carry `max_tokens`. On by default; off for a
+    /// provider that rejects the field. Truncation is still detected from
+    /// `finish_reason`, so the recovery path does not depend on sending it.
+    send_max_tokens: bool,
     /// In-flight ceiling, learned from the provider's refusals. Shared by every
     /// thread holding this instance, which is how a digest run's workers come
     /// to agree on a limit none of them was told.
@@ -298,8 +393,29 @@ impl OpenAiProvider {
             embed_batch: 256,
             missing_key_env: None,
             reasoning_effort: None,
+            send_temperature: true,
+            send_max_tokens: true,
             throttle: Throttle::new(),
         }
+    }
+
+    /// Leave `temperature` out of chat completions, for a model that fixes
+    /// its own and rejects a request that sets one.
+    pub fn without_temperature(mut self) -> Self {
+        self.send_temperature = false;
+        self
+    }
+
+    /// Leave `max_tokens` out of chat completions, for a model that rejects
+    /// the field. A truncated reply is still recognised from `finish_reason`.
+    pub fn without_max_tokens(mut self) -> Self {
+        self.send_max_tokens = false;
+        self
+    }
+
+    /// The base URL as it may be shown: no query string, no userinfo.
+    fn shown_url(&self) -> String {
+        redact_url(&self.base_url)
     }
 
     /// Cap embeddings requests at `n` texts each (default 256).
@@ -331,7 +447,7 @@ impl OpenAiProvider {
             bail!(
                 "environment variable {env} is not set — the provider at {} \
                  needs a key; export it (never put it in a config file)",
-                self.base_url
+                self.shown_url()
             );
         }
         let url = format!("{}/{path}", self.base_url);
@@ -380,24 +496,23 @@ impl OpenAiProvider {
                         bail!("{path} → HTTP {code}: {}", detail.trim())
                     }
                     // A provider that says how long to wait knows better than
-                    // the schedule does.
+                    // the schedule does, up to `MAX_RETRY_AFTER`.
                     let asked = resp
                         .header("retry-after")
                         .and_then(|v| v.trim().parse::<u64>().ok())
                         .map(Duration::from_secs);
-                    (
-                        format!("HTTP {code}"),
-                        asked
-                            .unwrap_or_else(|| backoff(attempt + 1))
-                            .min(MAX_BACKOFF),
-                    )
+                    (format!("HTTP {code}"), retry_wait(asked, attempt + 1))
                 }
-                // Transport: no connection, a dropped one, or the timeout above.
-                Err(e) => {
+                // Transport: no connection, a dropped one, or the timeout
+                // above. Described without the URL, which ureq leads with:
+                // the URL is where a key ends up when an operator was told
+                // "give a base URL", and this line reaches the log.
+                Err(ureq::Error::Transport(e)) => {
+                    let why = describe_transport(&e);
                     if attempt == MAX_ATTEMPTS {
-                        return Err(anyhow!("{path}: {e}"));
+                        return Err(anyhow!("{path}: {why}"));
                     }
-                    (e.to_string(), backoff(attempt + 1))
+                    (why, backoff(attempt + 1))
                 }
             };
             drop(permit);
@@ -452,13 +567,19 @@ impl OpenAiProvider {
     fn chat_body(&self, system: &str, user: &str) -> Value {
         let mut body = json!({
             "model": self.model,
-            "temperature": 0,
-            "max_tokens": MAX_OUTPUT_TOKENS,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
             ],
         });
+        // Both on by default, as they always were; each can be left out for
+        // a provider that rejects it (`CHAT_OMIT_ENV`).
+        if self.send_temperature {
+            body["temperature"] = json!(0);
+        }
+        if self.send_max_tokens {
+            body["max_tokens"] = json!(MAX_OUTPUT_TOKENS);
+        }
         // Reasoning models (e.g. DeepSeek-v4-flash) emit long thinking tokens
         // that fill the output cap and truncate the structured JSON dr-strange
         // needs. `with_reasoning_effort("none")` opts into disabling them; when
@@ -548,6 +669,112 @@ mod tests {
             json!(MAX_OUTPUT_TOKENS)
         );
         assert_eq!(p.chat_body("s", "u")["messages"][1]["content"], json!("u"));
+    }
+
+    #[test]
+    fn temperature_and_max_tokens_are_sent_unless_omitted() {
+        let p = OpenAiProvider::new("http://example.invalid/v1", "k", "m");
+        let body = p.chat_body("s", "u");
+        assert_eq!(body["temperature"], json!(0));
+        assert_eq!(body["max_tokens"], json!(MAX_OUTPUT_TOKENS));
+
+        // Each can be left out on its own, and the rest of the body stands.
+        let body = OpenAiProvider::new("http://example.invalid/v1", "k", "m")
+            .without_temperature()
+            .chat_body("s", "u");
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["max_tokens"], json!(MAX_OUTPUT_TOKENS));
+        let body = OpenAiProvider::new("http://example.invalid/v1", "k", "m")
+            .without_max_tokens()
+            .chat_body("s", "u");
+        assert_eq!(body["temperature"], json!(0));
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["messages"][1]["content"], json!("u"));
+    }
+
+    /// A provider's `Retry-After` outranks the schedule — the comment always
+    /// said so, and the code clamped it to the schedule's own eight seconds —
+    /// but not without bound.
+    #[test]
+    fn retry_after_is_obeyed_beyond_the_backoff_cap_but_not_forever() {
+        assert_eq!(
+            retry_wait(Some(Duration::from_secs(30)), 2),
+            Duration::from_secs(30),
+            "a named wait past MAX_BACKOFF is honoured"
+        );
+        assert_eq!(
+            retry_wait(Some(Duration::from_secs(3600)), 2),
+            MAX_RETRY_AFTER,
+            "an hour is not a retry; it is a failure the caller should see"
+        );
+        assert_eq!(
+            retry_wait(None, 2),
+            backoff(2),
+            "silence means the schedule"
+        );
+        assert!(MAX_RETRY_AFTER > MAX_BACKOFF);
+    }
+
+    /// The query string and the userinfo are where a key ends up when an
+    /// operator was told "give a base URL"; nothing that reaches a log or an
+    /// error may carry them.
+    #[test]
+    fn urls_are_shown_without_query_or_userinfo() {
+        assert_eq!(
+            redact_url("https://gw.example/v1?api-key=sk-secret&x=1"),
+            "https://gw.example/v1"
+        );
+        assert_eq!(
+            redact_url("https://sk-secret@gw.example/v1"),
+            "https://gw.example/v1"
+        );
+        assert_eq!(
+            redact_url("https://user:sk-secret@gw.example/v1#frag"),
+            "https://gw.example/v1"
+        );
+        assert_eq!(
+            redact_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(redact_url("ollama"), "ollama");
+
+        // The missing-key message names the endpoint; the endpoint's secret
+        // must not be in it.
+        let p = build_provider(
+            "http://127.0.0.1:9/v1?api-key=sk-secret",
+            Some("m"),
+            None,
+            Some("DRSG_TEST_KEY_THAT_IS_NEVER_SET"),
+            false,
+        )
+        .unwrap();
+        let Err(err) = p.complete("s", "u") else {
+            panic!("a keyless request to a key-wanting provider must fail");
+        };
+        let err = err.to_string();
+        assert!(err.contains("127.0.0.1:9/v1"), "{err}");
+        assert!(!err.contains("sk-secret"), "{err}");
+        // So must the no-embedding-model refusal, which quotes the name.
+        let Err(err) = build_provider("http://h/v1?api-key=sk-secret", None, None, None, true)
+        else {
+            panic!("an embedding provider with no model must be rejected");
+        };
+        assert!(!err.to_string().contains("sk-secret"), "{err}");
+    }
+
+    /// A transport failure is reported as what went wrong, not where: ureq's
+    /// own rendering leads with the URL.
+    #[test]
+    fn a_transport_error_names_the_fault_and_not_the_url() {
+        // Nothing listens on port 9 (discard), so this is a connection refusal.
+        let p = OpenAiProvider::new("http://127.0.0.1:9/v1?api-key=sk-secret", "", "m");
+        let err = p.post("x", json!({})).unwrap_err().to_string();
+        assert!(!err.contains("sk-secret"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
+        assert!(
+            err.contains("x:"),
+            "the path is what identifies the call: {err}"
+        );
     }
 
     #[test]

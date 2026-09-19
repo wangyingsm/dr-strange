@@ -86,12 +86,21 @@ pub struct InstalledPlugin {
     pub compiled_sha256: Option<String>,
 }
 
-/// What [`PluginStore::stamp`] saw: the registry's length and modification
-/// time. Equal stamps mean the store has not changed in between.
+/// What [`PluginStore::stamp`] saw: the registry's length, modification
+/// time, and a hash of its bytes. Equal stamps mean the store has not
+/// changed in between.
+///
+/// The hash is there because length and mtime are not enough on their own:
+/// an install that swaps one pinned hash for another of the same length,
+/// within the filesystem's timestamp granularity (a whole second on some),
+/// would leave both untouched and the watcher serving the old plugin. The
+/// registry is a few hundred bytes of TOML, so hashing it costs less than
+/// the `stat` beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    content: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -129,14 +138,16 @@ impl PluginStore {
     /// when its loaded plugins are behind the store.
     pub fn stamp(&self) -> Result<StoreStamp> {
         let path = self.dir.join("registry.toml");
-        match std::fs::metadata(&path) {
-            Ok(meta) => Ok(StoreStamp {
-                len: meta.len(),
-                modified: meta.modified().ok(),
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(StoreStamp {
+                len: bytes.len() as u64,
+                modified: std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+                content: ahash::RandomState::with_seeds(1, 2, 3, 4).hash_one(&bytes),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreStamp {
                 len: 0,
                 modified: None,
+                content: 0,
             }),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -166,6 +177,9 @@ impl PluginStore {
                 manifest.name
             );
         }
+
+        // The version becomes the other half of the filename.
+        checked_version(&manifest.version)?;
 
         let sha256 = hex_sha256(bytes);
         let file = format!("{}-{}.wasm", manifest.name, manifest.version);
@@ -281,6 +295,19 @@ impl PluginStore {
         limits: &Limits,
     ) -> Result<Vec<WasmPlugin>> {
         let mut registry = self.read()?;
+        if limits.fuel.is_none() && registry.plugins.iter().any(|p| p.compiled.is_some()) {
+            // Once per process, not once per load: `serve watch` loads on
+            // every commit, and the operator who chose this should hear the
+            // price once, not read it in every fold's log.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "fuel is off (`[plugins] fuel = 0`), so the precompiled plugins do not apply: \
+                     every load compiles each plugin from its wasm — seconds and hundreds of MiB \
+                     apiece"
+                );
+            });
+        }
         let mut out = Vec::with_capacity(registry.plugins.len());
         let mut recompiled = false;
         for entry in &mut registry.plugins {
@@ -439,6 +466,9 @@ impl PluginStore {
         version: &str,
         plugin: &WasmPlugin,
     ) -> Result<(String, String)> {
+        // Install checked this; a record hand-edited since is checked again
+        // here, before its version becomes a path.
+        checked_version(version)?;
         let bytes = plugin.serialize()?;
         let file = format!("{name}-{version}.cwasm");
         let path = self.dir.join(&file);
@@ -469,6 +499,36 @@ impl PluginStore {
     }
 }
 
+/// The longest version string a plugin may declare.
+const MAX_VERSION_CHARS: usize = 64;
+
+/// A plugin version fit to be half a filename: non-empty, bounded, drawn
+/// from `[A-Za-z0-9._+-]`, and not led by a dot or a dash.
+///
+/// The name is already held to a safe charset because it becomes a filename;
+/// the version becomes the other half of the same filename and was held to
+/// nothing. A component is the plugin author's to write, and `describe()`
+/// could answer `../../.bashrc` or `1/../../x` — a path separator, or a
+/// leading dot that names a hidden file or the parent directory. A version
+/// is a version, and this is what one looks like.
+pub(super) fn checked_version(version: &str) -> Result<&str> {
+    let ok = !version.is_empty()
+        && version.chars().count() <= MAX_VERSION_CHARS
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        && !version.starts_with(['.', '-']);
+    if !ok {
+        bail!(
+            "plugin version `{}` may only contain letters, digits, `.`, `_`, `+` and `-`, \
+             not start with `.` or `-`, and be at most {MAX_VERSION_CHARS} characters — it \
+             becomes part of a filename",
+            version.chars().take(80).collect::<String>()
+        );
+    }
+    Ok(version)
+}
+
 /// `$XDG_DATA_HOME/drsg/plugins`, or `~/.local/share/drsg/plugins`.
 fn default_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
@@ -493,4 +553,68 @@ pub(super) fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry rewritten to the same length within the same timestamp —
+    /// one pinned hash swapped for another — is still a changed store: the
+    /// stamp reads the bytes, not just the inode's account of them.
+    #[test]
+    fn a_same_length_same_mtime_rewrite_still_moves_the_stamp() {
+        let dir = std::env::temp_dir().join(format!("drsg-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PluginStore::open(dir.clone()).unwrap();
+        let path = dir.join("registry.toml");
+        std::fs::write(&path, "sha256 = \"aaaa\"\n").unwrap();
+        let first = store.stamp().unwrap();
+        let when = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "sha256 = \"bbbb\"\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let second = store.stamp().unwrap();
+        assert_eq!(first.len, second.len);
+        assert_eq!(first.modified, second.modified);
+        assert_ne!(first, second, "the bytes changed, so the stamp must");
+        assert_eq!(second, store.stamp().unwrap(), "and it is stable otherwise");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A version is half a filename, so it is held to what a filename can
+    /// safely be — the same discipline the name already had.
+    #[test]
+    fn a_version_string_is_held_to_a_filename_safe_charset() {
+        for ok in [
+            "1",
+            "2",
+            "1.6.0",
+            "1.6.0-rc.1",
+            "2024.09+build.7",
+            "v3_beta",
+        ] {
+            assert!(checked_version(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "..",
+            ".hidden",
+            "-flag",
+            "1/../../x",
+            "1\\2",
+            "1 2",
+            "1;rm -rf",
+            "版本",
+            "a\u{0}b",
+        ] {
+            assert!(checked_version(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(checked_version(&"9".repeat(MAX_VERSION_CHARS)).is_ok());
+        assert!(checked_version(&"9".repeat(MAX_VERSION_CHARS + 1)).is_err());
+    }
 }

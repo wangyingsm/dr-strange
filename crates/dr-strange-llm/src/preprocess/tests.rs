@@ -323,6 +323,56 @@ fn the_host_refuses_to_read_outside_its_root() {
     );
 }
 
+/// `read` and `list` answer the same question. A plugin used to be able to
+/// read what the listing withheld — `.env` above all — because `read` checked
+/// only the root and `list` alone applied the ignore policy; the listing was
+/// a suggestion. Now a path the policy hides is refused however it is spelt,
+/// and only a host that hides nothing (the history reader's, over `.git`)
+/// answers for a dotfile.
+#[test]
+fn the_host_will_not_read_what_it_would_not_list() {
+    let t = Tree::new("read-policy");
+    t.write(".env", "API_KEY=sk-secret")
+        .write(".gitignore", "credentials.json\n")
+        .write("credentials.json", "{\"token\":\"t\"}")
+        .write("target/debug/out.txt", "derived")
+        .write("src/lib.rs", "pub fn a() {}");
+    let host = t.host();
+
+    // A hostile plugin does not call `list` first; `read` must still know.
+    for hidden in [".env", "credentials.json", "target/debug/out.txt"] {
+        assert!(host.read(hidden).is_err(), "{hidden} must be refused");
+    }
+    let msg = host
+        .read(".env")
+        .expect_err(".env must be refused")
+        .to_string();
+    assert!(msg.contains("ignore policy"), "{msg}");
+    // Spelling does not get around it: the check is on the resolved path.
+    assert!(host.read("./src/../.env").is_err());
+    assert!(host.read("src/./../credentials.json").is_err());
+    // What the listing names is readable, and so spelt oddly.
+    assert_eq!(host.read("src/lib.rs").unwrap(), b"pub fn a() {}");
+    assert!(host.read("./src/../src/lib.rs").is_ok());
+    assert!(!host.list("").unwrap().iter().any(|p| p.contains(".env")));
+
+    // A host that hides nothing reads everything under its root — the
+    // history reader depends on it — and still only regular files.
+    let open = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            gitignore: false,
+            dockerignore: false,
+            hidden: false,
+            builtin_dirs: false,
+            extra: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(open.read(".env").unwrap(), b"API_KEY=sk-secret");
+    assert!(open.read("src").is_err(), "a directory is not a file");
+}
+
 // ---- sync (watch mode) ----------------------------------------------------
 
 use dr_strange_core::Properties;
@@ -623,7 +673,11 @@ fn reserved_and_vector_props_survive_the_reload() {
         changed: vec!["a.aa".to_string()],
         ..Default::default()
     };
+    let before = db.commit_seq().unwrap();
     sync_paths(&db, "code", &tree.host(), &delta, &plugins, "test", "c1").unwrap();
+    // The reload and the carry-over are one commit: a reader never sees the
+    // re-created node without its vector, and a crash cannot strand it so.
+    assert_eq!(db.commit_seq().unwrap(), before + 1, "one transaction");
     let node = db
         .plane("code")
         .unwrap()
@@ -1314,5 +1368,44 @@ mod manifests {
             "{:?}",
             out.nodes.iter().map(|n| &n.key).collect::<Vec<_>>()
         );
+    }
+}
+
+/// The two environment knobs land on the limits, `0` disables what it can,
+/// and a value that is not a number is refused by name rather than kept as
+/// a default the operator did not choose. One test rather than three so the
+/// process-wide variables are set and cleared in one place.
+#[cfg(feature = "plugins")]
+#[test]
+fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
+    // SAFETY: nothing else in this test binary reads these variables, and
+    // they are cleared before the test returns.
+    unsafe {
+        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, " 7 ");
+        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "512");
+    }
+    let mut limits = Limits::default();
+    apply_env_limits(&mut limits).unwrap();
+    assert_eq!(limits.deadline, Some(std::time::Duration::from_secs(7)));
+    assert_eq!(limits.total_memory_bytes, Some(512 << 20));
+
+    unsafe {
+        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "0");
+        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "0");
+    }
+    apply_env_limits(&mut limits).unwrap();
+    assert_eq!(limits.deadline, None, "0 switches the deadline off");
+    assert_eq!(
+        limits.total_memory_bytes, None,
+        "0 means the default budget"
+    );
+
+    unsafe { std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "soon") };
+    let err = apply_env_limits(&mut limits).unwrap_err().to_string();
+    assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
+
+    unsafe {
+        std::env::remove_var(ENV_PLUGIN_DEADLINE_SECS);
+        std::env::remove_var(ENV_PLUGIN_TOTAL_MEMORY_MB);
     }
 }

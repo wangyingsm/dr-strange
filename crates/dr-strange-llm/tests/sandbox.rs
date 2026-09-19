@@ -24,6 +24,28 @@ fn the_well_behaved_fixture_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A disabled deadline (`deadline_secs = 0`) must mean *no* deadline, not one
+/// that has already passed. The engine's epoch has ticked at least once by
+/// the time a real call is made, and a "never" expressed as `u64::MAX` ticks
+/// beyond now overflowed inside wasmtime: a panic in debug builds and an
+/// immediate interrupt in release. The sleep puts the epoch past zero.
+#[test]
+fn a_disabled_deadline_never_fires() {
+    let (dir, host) = scratch("nodeadline");
+    let plugin = fixture(
+        "ok",
+        Limits {
+            deadline: None,
+            ..Limits::default()
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let plugins = Plugins::from_handlers(vec![Box::new(plugin)]);
+    let out = route_tree(&host, None, &plugins).unwrap();
+    assert_eq!(out.nodes.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A path outside the root is refused by the host — checked on the resolved
 /// path, so `..` does not walk through — and the refusal reaches the plugin
 /// as an error it can only report, not argue with.
@@ -89,6 +111,7 @@ fn the_memory_bomb_hits_the_limit() {
         Limits {
             fuel: None, // memory is the wall this test is about
             memory_bytes: 64 << 20,
+            ..Limits::default()
         },
     );
     let err = plugin
@@ -103,6 +126,49 @@ fn the_memory_bomb_hits_the_limit() {
     assert!(
         msg.contains("fixture"),
         "the error must name the plugin: {msg}"
+    );
+    assert!(
+        msg.contains("per-call limit is 64 MiB"),
+        "and name the ceiling it hit, not the allocator that gave up: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With fuel off — an operator's choice for a trusted plugin on a huge tree —
+/// nothing counted instructions, and a plugin that never returned held its
+/// thread forever: under `serve watch`, the fold. The wall-clock deadline is
+/// the net under fuel: not deterministic, never reached by honest work, and
+/// the reason a spinning plugin is an error rather than a hang.
+#[test]
+fn the_infinite_loop_is_interrupted_at_the_deadline_when_fuel_is_off() {
+    let (dir, host) = scratch("deadline");
+    let plugin = fixture(
+        "spin",
+        Limits {
+            fuel: None,
+            deadline: Some(std::time::Duration::from_millis(300)),
+            ..Limits::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    let err = plugin
+        .preprocess(
+            &Input::Files {
+                paths: &["a.fix".to_string()],
+            },
+            &host,
+        )
+        .expect_err("an infinite loop with no fuel must still not return");
+    let took = started.elapsed();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("fixture"),
+        "the error must name the plugin: {msg}"
+    );
+    assert!(msg.contains("deadline"), "and say what stopped it: {msg}");
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the deadline must actually end the call: took {took:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

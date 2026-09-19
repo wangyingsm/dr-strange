@@ -64,7 +64,10 @@ under the digested root, *sorted* — unsorted directory order would vary the
 output between runs, and re-ingesting a tree is meant to yield the same graph.
 `read` returns one file's bytes, refusing any path that resolves outside the
 root (the check is on the resolved path, so `..` and symlinks do not walk
-through it). `label` names the input when its contents cannot.
+through it) — and any path inside it that `%list` would not have named: the
+same `.gitignore`, dotfile and build-directory rules apply to both, so a
+plugin cannot read a `.env` or an ignored credentials file just by asking for
+it. `label` names the input when its contents cannot.
 
 A plugin's `output` is nodes, edges, prose, and a **report** — counts of facts,
 prose characters, and skipped inputs, plus notes in words for whatever could
@@ -109,7 +112,9 @@ Every plugin is a `wasm32-wasip2` component running under a deny-everything
 grant. A guest runtime may *import* `wasi:filesystem` — Go's does, before the
 plugin's first line runs — but the preopen table behind it is empty;
 `wasi:sockets` is refused at load, by name; clocks are frozen; entropy is
-fixed; and each call runs under instruction and memory budgets. A trapped
+fixed; and each call runs under instruction and memory budgets, with a
+wall-clock deadline as the net beneath them and a process-wide memory budget
+across the calls running at once. A trapped
 guest's stderr is captured into the error the operator sees, along with the
 trap code itself. Whatever a plugin produces comes back as a **return value** —
 only the host writes to the database.
@@ -140,10 +145,26 @@ The budgets are tunable in `drsg.toml`
 [plugins]
 fuel = 200000000000    # instructions per sandbox call (0 disables the check)
 memory_mb = 3072       # linear memory per call, MiB (wasm32 itself allows at most 4096)
+deadline_secs = 300    # wall-clock ceiling per call, seconds (0 disables it)
+total_memory_mb = 6144 # linear memory all calls in the process may hold together (0 = twice memory_mb)
 
 [plugins.rust]         # a plugin's own settings pass through untouched
 include_source = true
 ```
+
+`deadline_secs` is the wall-clock ceiling on one call (default 300; `0`
+disables it) — not a budget for work, which fuel is and deterministically so,
+but what stops a plugin that never returns once fuel has been switched off.
+`total_memory_mb` is what every call in the process may hold *together*
+(default twice `memory_mb`): `parse` runs one call per core, and a per-call
+ceiling alone would let a wide machine be filled a store at a time. Both can
+be overridden from the shell for one run — `DRSG_PLUGINS_DEADLINE_SECS` and
+`DRSG_PLUGINS_TOTAL_MEMORY_MB`, same units and same reading of `0` — and the
+environment wins over the file, as with every other `DRSG_*` variable. A
+refusal names the ceiling it hit, so the operator knows which knob it was. Turning fuel off
+also switches the sandbox to compiling each plugin from its wasm on every
+load, since the precompiled artifacts carry the fuel instrumentation; the
+first load says so once.
 
 One boundary follows from the pull model: preprocessing runs where the files
 are. The CLI and the stdio MCP server route through it; bytes sent to a shared

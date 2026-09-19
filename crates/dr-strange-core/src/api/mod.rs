@@ -978,6 +978,21 @@ impl<'db> PlaneHandle<'db> {
             .with_write(|txn| graph::set_plane_properties(txn, self.id, &props))
     }
 
+    /// Edits this plane's property map in place, under the one write lock:
+    /// `f` sees the map as it is at write time and what it leaves is what is
+    /// stored. The way to add or replace *one* property — `properties()`
+    /// followed by `set_properties()` reads under one transaction and writes
+    /// under another, and a writer in between (a sync point stamped while an
+    /// ingest ledger is being recorded) is overwritten with the stale map.
+    pub fn update_properties(&self, f: impl FnOnce(&mut Properties)) -> Result<()> {
+        self.db.engine.with_write(|txn| {
+            let (_, mut props) = graph::read_plane(txn, self.id)?
+                .ok_or_else(|| Error::NotFound(format!("plane {}", self.id.0)))?;
+            f(&mut props);
+            graph::set_plane_properties(txn, self.id, &props)
+        })
+    }
+
     /// Renames this plane (arch/09 §3); the handle's id is unchanged, so it
     /// stays valid. Errors if the name is taken or this is the startup plane.
     pub fn rename(&self, new_name: &str) -> Result<()> {
