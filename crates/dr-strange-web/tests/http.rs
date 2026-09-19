@@ -65,21 +65,14 @@ async fn wait_ready(client: &reqwest::Client, base: &str) {
     panic!("server never started listening");
 }
 
-#[tokio::test]
-async fn serves_dashboard_and_rpc() {
-    let addr = spawn_server();
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
-    wait_ready(&client, &base).await;
-
-    // The embedded SPA is served on `/`.
-    let index = client.get(&base).send().await.unwrap();
+/// The page `/` serves: the defensive headers, a Content-Security-Policy the
+/// built bundle satisfies, and no inline script — which is what lets
+/// `script-src 'self'` hold.
+async fn assert_dashboard(client: &reqwest::Client, base: &str) {
+    let index = client.get(base).send().await.unwrap();
     assert!(index.status().is_success());
-    // Hardening: every response carries the static defensive headers.
     assert_eq!(index.headers()["x-content-type-options"], "nosniff");
     assert_eq!(index.headers()["x-frame-options"], "DENY");
-    // …and a Content-Security-Policy the bundle satisfies: scripts only from
-    // the bundle (no inline), so the page carries no inline script at all.
     let csp = index.headers()["content-security-policy"]
         .to_str()
         .unwrap()
@@ -93,6 +86,16 @@ async fn serves_dashboard_and_rpc() {
         !html.contains("<script>"),
         "inline script under script-src 'self': {html}"
     );
+}
+
+#[tokio::test]
+async fn serves_dashboard_and_rpc() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    assert_dashboard(&client, &base).await;
 
     // /health is an unauthenticated liveness probe — no Origin, no token.
     let health = client.get(format!("{base}/health")).send().await.unwrap();

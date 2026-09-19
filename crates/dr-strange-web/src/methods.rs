@@ -1537,6 +1537,106 @@ pub struct Find {
 /// linear scan capped at [`FIND_SCAN_CAP`] nodes examined (node pass), nodes
 /// visited and edges examined (edge pass), and [`limit`] results each;
 /// `truncated` says whether any cap cut the results short.
+/// What the node pass found, and where it stopped.
+struct NodeScan {
+    hits: Vec<Value>,
+    /// Nodes looked at, which decides the truncation flag.
+    examined: usize,
+    /// Ids the pass loaded, so the edge walk need not read the same records
+    /// twice; past this prefix it fetches ids alone.
+    walked: Vec<NodeId>,
+    /// A page came back short with every node on it walked, so the plane is
+    /// spent. An early break (limit reached, cap hit) leaves it false, and
+    /// the edge walk knows the remainder of that page is still unvisited.
+    exhausted: bool,
+}
+
+/// Scan nodes for `needle`, a page at a time, stopping at `limit` hits or
+/// [`FIND_SCAN_CAP`] nodes.
+///
+/// This runs on every header keystroke: a match near the front of the plane
+/// costs one page of records, and a miss costs the cap — never every record
+/// of the plane (each page's id scan is the core's cost, see [`SCAN_PAGE`]).
+fn scan_nodes(
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    needle: &str,
+    limit: usize,
+) -> Result<NodeScan, RpcError> {
+    let mut scan = NodeScan {
+        hits: Vec::new(),
+        examined: 0,
+        walked: Vec::new(),
+        exhausted: false,
+    };
+    let mut skip = 0u64;
+    'nodes: loop {
+        let page = app(plane.query().scan_all().skip(skip).limit(SCAN_PAGE).nodes())?;
+        let short = (page.len() as u64) < SCAN_PAGE;
+        for n in &page {
+            if scan.examined >= FIND_SCAN_CAP {
+                break 'nodes;
+            }
+            scan.examined += 1;
+            scan.walked.push(n.id);
+            if let Some(hint) = match_node(n, needle) {
+                let mut obj = node_json(n);
+                if let Value::Object(map) = &mut obj {
+                    map.insert("match".into(), Value::String(hint));
+                }
+                scan.hits.push(obj);
+                if scan.hits.len() >= limit {
+                    break 'nodes;
+                }
+            }
+        }
+        if short {
+            scan.exhausted = true;
+            break;
+        }
+        skip += SCAN_PAGE;
+    }
+    Ok(scan)
+}
+
+/// Semantic mode: embed the query and rank nodes by vector similarity.
+///
+/// `Some(answer)` is the answer to return. `None` falls through to the text
+/// scan — no key, a provider error, or a plane with no embeddings — leaving
+/// `note` saying why, which the dashboard shows.
+fn semantic_answer(
+    ctx: &Ctx<'_>,
+    plane: &dr_strange_core::PlaneHandle<'_>,
+    req: &Find,
+    limit: usize,
+    note: &mut Option<String>,
+) -> Result<Option<Value>, RpcError> {
+    let provider = provider_for(ctx, req.provider.as_deref())?;
+    match semantic_find(plane, req, provider, limit) {
+        Ok(hits) if !hits.is_empty() => {
+            let n = hits.len();
+            Ok(Some(jval!({
+                "nodes": hits,
+                "edges": [],
+                "mode": "semantic",
+                "scanned": n,
+                "total": n,
+                "truncated": false,
+            })))
+        }
+        Ok(_) => {
+            *note = Some("no embedded nodes in this plane — showing text matches".into());
+            Ok(None)
+        }
+        // The note is shown in the dashboard, so it gets the same
+        // operator/client split as an error would.
+        Err(e) => {
+            let why = opaque("semantic search unavailable", format!("{e:#}")).message;
+            *note = Some(format!("{why} — showing text matches"));
+            Ok(None)
+        }
+    }
+}
+
 pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Find = params(p)?;
     let limit = req.limit.unwrap_or(FIND_LIMIT).min(FIND_LIMIT);
@@ -1548,32 +1648,11 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let plane = plane_at(ctx, &req.plane, &req.at)?;
 
-    // Semantic mode: embed the query and rank nodes by vector similarity. Any
-    // failure — no key, provider error, or a plane with no embeddings — falls
-    // back to the text scan below, surfacing why via `note`.
     let mut note: Option<String> = None;
-    if req.semantic {
-        let provider = provider_for(ctx, req.provider.as_deref())?;
-        match semantic_find(&plane, &req, provider, limit) {
-            Ok(hits) if !hits.is_empty() => {
-                let n = hits.len();
-                return Ok(jval!({
-                    "nodes": hits,
-                    "edges": [],
-                    "mode": "semantic",
-                    "scanned": n,
-                    "total": n,
-                    "truncated": false,
-                }));
-            }
-            Ok(_) => note = Some("no embedded nodes in this plane — showing text matches".into()),
-            // The note is shown in the dashboard, so it gets the same
-            // operator/client split as an error would.
-            Err(e) => {
-                let why = opaque("semantic search unavailable", format!("{e:#}")).message;
-                note = Some(format!("{why} — showing text matches"));
-            }
-        }
+    if req.semantic
+        && let Some(answer) = semantic_answer(ctx, &plane, &req, limit, &mut note)?
+    {
+        return Ok(answer);
     }
 
     let needle = req.q.trim().to_lowercase();
@@ -1581,48 +1660,12 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     // vector holding every node — the scan below never builds one.
     let total = app(plane.counters())?.nodes as usize;
 
-    // ---- nodes ----
-    // A page at a time, stopping at `limit` hits or [`FIND_SCAN_CAP`] nodes.
-    // This runs on every header keystroke: a match near the front of the
-    // plane costs one page of records, and a miss costs the cap — never
-    // every record of the plane (each page's id scan is the core's cost,
-    // see [`SCAN_PAGE`]).
-    let mut node_hits = Vec::new();
-    let mut examined = 0usize;
-    // Ids the node pass loaded, kept so the edge pass below need not read
-    // the same records twice; past this prefix it fetches ids alone.
-    let mut walked: Vec<NodeId> = Vec::new();
-    let mut skip = 0u64;
-    // True only once a page came back short with every node on it walked;
-    // an early break (limit reached, cap hit) leaves it false so the edge
-    // pass knows the remainder of that page is still unvisited.
-    let mut exhausted = false;
-    'nodes: loop {
-        let page = app(plane.query().scan_all().skip(skip).limit(SCAN_PAGE).nodes())?;
-        let short = (page.len() as u64) < SCAN_PAGE;
-        for n in &page {
-            if examined >= FIND_SCAN_CAP {
-                break 'nodes;
-            }
-            examined += 1;
-            walked.push(n.id);
-            if let Some(hint) = match_node(n, &needle) {
-                let mut obj = node_json(n);
-                if let Value::Object(map) = &mut obj {
-                    map.insert("match".into(), Value::String(hint));
-                }
-                node_hits.push(obj);
-                if node_hits.len() >= limit {
-                    break 'nodes;
-                }
-            }
-        }
-        if short {
-            exhausted = true;
-            break;
-        }
-        skip += SCAN_PAGE;
-    }
+    let NodeScan {
+        hits: node_hits,
+        examined,
+        walked,
+        mut exhausted,
+    } = scan_nodes(&plane, &needle, limit)?;
     let nodes_truncated = examined < total;
 
     // ---- edges ----
