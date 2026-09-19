@@ -182,6 +182,12 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` 跳过向量嵌入——解析无需任何模型。之后运行 `drsg vectorize` 即可让
 平面支持语义检索。
 
+**智能体侧工具。** Claude Code 钩子、共享的长期记忆 daemon，以及把多个仓库的图
+收到同一个 MCP 接口后面的路由器，都维护在本仓库之外的
+[`drsg-harness-kit`](https://github.com/maidol/drsg-harness-kit)（仅 Linux，
+仅面向 Claude Code）。它与 drsg 二进制并排安装、按自己的节奏发布——drsg 本身保持
+客户端中立，且不依赖其中任何一部分。
+
 八个动词回答智能体的问题，每个都在一次往返内完成，输出均为紧凑的每行一条事实的
 文本。八个动词全部是 `drsg serve` 上的 MCP 工具，也全部是 CLI 子命令
 （`grep` 与 `snippet` 读取平面被解析自的那棵源码树；平面若未记录，则由 `--root`

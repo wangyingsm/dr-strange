@@ -205,6 +205,13 @@ $ drsg --db codes.drsg context 'WriteTxn::delete_node' --plane myrepo
 `--no-embed` skips embeddings — parsing needs no model. Run `drsg vectorize`
 later to make the plane semantically searchable.
 
+**Agent-side tooling.** The Claude Code hooks, the shared long-term memory
+daemon, and the router that puts several repositories' graphs behind one MCP
+surface are maintained outside this repository, in
+[`drsg-harness-kit`](https://github.com/maidol/drsg-harness-kit) (Linux, Claude
+Code only). It installs next to a drsg binary and releases on its own cadence —
+drsg itself stays client-neutral and depends on none of it.
+
 **`drsg init`** collapses the digest-and-serve steps into one command, run
 from the repository itself (plugins still need installing first): it digests
 the working directory into a plane named after it, spawns `serve watch`
