@@ -28,7 +28,7 @@ struct json_object *drsg_db_catalog(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). */
+/* Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11). (access: read) */
 struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err) {
     struct json_object *p = NULL;
     struct json_object *result = NULL;
@@ -37,7 +37,7 @@ struct json_object *drsg_plugin_list(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. */
+/* The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept. (access: read) */
 struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err) {
     struct json_object *p = NULL;
     struct json_object *result = NULL;
@@ -46,7 +46,7 @@ struct json_object *drsg_plugin_catalog(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. */
+/* Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC. (access: write) */
 struct json_object *drsg_plugin_install(drsg_client *c, const char *url, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "url", json_object_new_string(url));
@@ -56,7 +56,7 @@ struct json_object *drsg_plugin_install(drsg_client *c, const char *url, drsg_er
     return rc == 0 ? result : NULL;
 }
 
-/* Uninstall a plugin by name. Write-gated. */
+/* Uninstall a plugin by name. Write-gated. (access: write) */
 struct json_object *drsg_plugin_remove(drsg_client *c, const char *name, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "name", json_object_new_string(name));
@@ -75,7 +75,7 @@ struct json_object *drsg_plane_list(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. */
+/* Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment. (access: write) */
 struct json_object *drsg_plane_vectorize(drsg_client *c, const char *plane, const drsg_plane_vectorize_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));

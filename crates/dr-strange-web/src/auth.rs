@@ -15,6 +15,12 @@
 //!     authenticates them.
 //!   * a **bearer token** here gates every non-read method, for every client.
 
+use std::net::IpAddr;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use ahash::AHashMap;
+
 /// How much authority a method needs. Every dispatch arm names one explicitly,
 /// so a new method cannot ship ungated by omission.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,15 +59,37 @@ pub trait Authorizer: Send + Sync {
 /// A single shared secret (the v1 model), read from `DRSG_TOKEN`.
 pub struct SharedToken {
     token: Option<String>,
+    /// Whether the listener this token guards is bound to a loopback address.
+    /// The zero-config fallback (no token, same-origin UI) is only ever
+    /// granted when it is: on any other bind, "our own UI" is a page anyone
+    /// on the network can load, and an allowed `Origin` no longer implies a
+    /// local human (arch/08 §4.2 invariant 2).
+    loopback_bind: bool,
 }
 
 impl SharedToken {
     /// Build from an explicit secret (`None`/empty = no token configured).
     /// Tests use this; production uses [`SharedToken::from_env`].
+    ///
+    /// Assumes a loopback listener — the desktop shape every in-process test
+    /// exercises. [`SharedToken::bound_to_loopback`] narrows it for the real
+    /// server, which knows its bind address.
     pub fn new(token: Option<String>) -> Self {
         Self {
             token: token.filter(|t| !t.is_empty()),
+            loopback_bind: true,
         }
+    }
+
+    /// Record whether the listener is loopback-bound. With `false`, the
+    /// zero-config local-UI fallback is never granted: only a token
+    /// authenticates. `server::run` refuses to start a tokenless non-loopback
+    /// listener at all, so this is the second line behind that check — a
+    /// future code path that builds the state some other way still cannot
+    /// hand a LAN browser unauthenticated write access.
+    pub fn bound_to_loopback(mut self, loopback: bool) -> Self {
+        self.loopback_bind = loopback;
+        self
     }
 
     /// Whether a token is configured — drives the startup banner and the
@@ -92,8 +120,10 @@ impl Authorizer for SharedToken {
         // Zero-config desktop: with NO token set, our own same-origin browser
         // UI is trusted (the Origin guard is its CSRF shield). Any client
         // without the token — even for a read — is denied, so programmatic
-        // (SDK / curl) access requires an explicit DRSG_TOKEN.
-        self.token.is_none() && creds.local_ui
+        // (SDK / curl) access requires an explicit DRSG_TOKEN. Only on a
+        // loopback bind: elsewhere the "own UI" is reachable by anyone who can
+        // reach the port, and an Origin proves nothing about who is behind it.
+        self.loopback_bind && self.token.is_none() && creds.local_ui
     }
 }
 
@@ -146,7 +176,10 @@ impl<'a> Auth<'a> {
     /// reads and writes are both allowed.
     #[cfg(test)]
     pub fn allow_all() -> Auth<'static> {
-        static LOCAL: SharedToken = SharedToken { token: None };
+        static LOCAL: SharedToken = SharedToken {
+            token: None,
+            loopback_bind: true,
+        };
         Auth::new(
             &LOCAL,
             Credentials {
@@ -154,6 +187,121 @@ impl<'a> Auth<'a> {
                 local_ui: true,
             },
         )
+    }
+}
+
+// ---- Failed-auth throttle --------------------------------------------------
+
+/// How many wrong bearers a peer may present before it is made to wait.
+/// Five covers a human retyping a token and a client with one stale
+/// credential and one fresh one; an enumeration of tokens is not five.
+pub const FREE_FAILURES: u32 = 5;
+/// The longest a peer is made to wait between attempts. Long enough that a
+/// guess costs more than a keystroke, short enough that a locked-out
+/// operator who fixed their token is not locked out of their own server.
+pub const MAX_LOCKOUT: Duration = Duration::from_secs(300);
+/// The most peers the throttle remembers at once. Bounds memory against a
+/// client rotating source addresses: past this the idle-longest entry is
+/// forgotten, which weakens the throttle for that flood and nothing else.
+pub const TRACKED_PEERS: usize = 4096;
+/// A peer that has been quiet this long is forgotten — its failures no
+/// longer count, and its entry no longer costs memory.
+const FORGET_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Per-peer brute-force protection on the bearer check, in memory and
+/// bounded. Each wrong bearer past [`FREE_FAILURES`] doubles the wait a
+/// peer serves before its next request is even read, up to
+/// [`MAX_LOCKOUT`]; a correct bearer clears the slate. Consulted by the
+/// server's throttle middleware before any handler runs, so a locked-out
+/// peer costs a map lookup and nothing else. Failures are what the request
+/// *presented*: a bearer that authorizes nothing. A request with no bearer
+/// is not a guess and is not counted.
+///
+/// The clock is a parameter rather than `Instant::now()` inside, so a test
+/// can move time without sleeping.
+pub struct FailedAuthLimiter {
+    peers: Mutex<AHashMap<IpAddr, Strikes>>,
+}
+
+struct Strikes {
+    failures: u32,
+    locked_until: Option<Instant>,
+    last_seen: Instant,
+}
+
+impl Default for FailedAuthLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FailedAuthLimiter {
+    pub fn new() -> Self {
+        Self {
+            peers: Mutex::new(AHashMap::new()),
+        }
+    }
+
+    /// How much longer `peer` must wait, if it is locked out at `now`.
+    pub fn locked_for(&self, peer: IpAddr, now: Instant) -> Option<Duration> {
+        let peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        let until = peers.get(&peer)?.locked_until?;
+        (until > now).then(|| until - now)
+    }
+
+    /// Record a wrong bearer from `peer`. Returns the lockout now imposed,
+    /// if this failure crossed the free allowance.
+    pub fn failed(&self, peer: IpAddr, now: Instant) -> Option<Duration> {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        if !peers.contains_key(&peer) && peers.len() >= TRACKED_PEERS {
+            Self::make_room(&mut peers, now);
+        }
+        let strikes = peers.entry(peer).or_insert(Strikes {
+            failures: 0,
+            locked_until: None,
+            last_seen: now,
+        });
+        strikes.failures = strikes.failures.saturating_add(1);
+        strikes.last_seen = now;
+        let over = strikes.failures.checked_sub(FREE_FAILURES + 1)?;
+        // 1 s, 2 s, 4 s, … — `min(20)` keeps the shift in range long before
+        // the cap does.
+        let wait = Duration::from_secs(1u64 << over.min(20)).min(MAX_LOCKOUT);
+        strikes.locked_until = Some(now + wait);
+        Some(wait)
+    }
+
+    /// A correct bearer from `peer`: forget its failures.
+    pub fn succeeded(&self, peer: IpAddr) {
+        self.peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&peer);
+    }
+
+    /// Drop every entry idle past [`FORGET_AFTER`]; if the map is still full,
+    /// drop the one idle longest. Called only when a new peer must be
+    /// admitted to a full map, so the sweep's cost is paid by the flood that
+    /// caused it.
+    fn make_room(peers: &mut AHashMap<IpAddr, Strikes>, now: Instant) {
+        peers.retain(|_, s| now.duration_since(s.last_seen) < FORGET_AFTER);
+        if peers.len() >= TRACKED_PEERS
+            && let Some(oldest) = peers
+                .iter()
+                .min_by_key(|(_, s)| s.last_seen)
+                .map(|(ip, _)| *ip)
+        {
+            peers.remove(&oldest);
+        }
+    }
+
+    /// How many peers are currently remembered (tests).
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -255,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn the_zero_config_fallback_is_only_for_a_loopback_listener() {
+        // arch/08 §4.2 invariant 2: on a non-loopback bind, an allowed Origin
+        // no longer means "the local human's own UI" — anyone on the network
+        // can load the page — so the tokenless fallback is never granted.
+        let open = SharedToken::new(None).bound_to_loopback(false);
+        assert!(!open.allows(Access::Read, &browser(None)));
+        assert!(!open.allows(Access::Write, &browser(None)));
+        // A token still works there, from the browser and from a native client.
+        let guarded = SharedToken::new(Some("s3cret".into())).bound_to_loopback(false);
+        assert!(guarded.allows(Access::Write, &browser(Some("s3cret"))));
+        assert!(guarded.allows(Access::Write, &native(Some("s3cret"))));
+        assert!(!guarded.allows(Access::Read, &browser(None)));
+    }
+
+    #[test]
     fn configured_token_is_required_even_from_the_browser() {
         // Once a token is set, the local UI must present it too (the server
         // injects it into the page) — the origin bypass only applies when no
@@ -312,5 +475,65 @@ mod tests {
         };
         assert!(o.allows("https://graph.internal"));
         assert!(!o.allows("https://graph.internal.evil.com"));
+    }
+
+    // ---- failed-auth throttle ----
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    #[test]
+    fn free_failures_cost_nothing_then_the_wait_doubles_to_the_cap() {
+        let lim = FailedAuthLimiter::new();
+        let t0 = Instant::now();
+        for _ in 0..FREE_FAILURES {
+            assert_eq!(lim.failed(ip(1), t0), None);
+        }
+        assert_eq!(lim.locked_for(ip(1), t0), None);
+        assert_eq!(lim.failed(ip(1), t0), Some(Duration::from_secs(1)));
+        assert_eq!(lim.locked_for(ip(1), t0), Some(Duration::from_secs(1)));
+        assert_eq!(lim.locked_for(ip(1), t0 + Duration::from_secs(1)), None);
+        assert_eq!(lim.failed(ip(1), t0), Some(Duration::from_secs(2)));
+        assert_eq!(lim.failed(ip(1), t0), Some(Duration::from_secs(4)));
+        let mut last = Duration::ZERO;
+        for _ in 0..40 {
+            last = lim.failed(ip(1), t0).unwrap();
+        }
+        assert_eq!(last, MAX_LOCKOUT);
+        // Another peer is unaffected.
+        assert_eq!(lim.locked_for(ip(2), t0), None);
+    }
+
+    #[test]
+    fn a_correct_bearer_clears_the_slate() {
+        let lim = FailedAuthLimiter::new();
+        let t0 = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            lim.failed(ip(1), t0);
+        }
+        assert!(lim.locked_for(ip(1), t0).is_some());
+        lim.succeeded(ip(1));
+        assert_eq!(lim.locked_for(ip(1), t0), None);
+        assert_eq!(lim.failed(ip(1), t0), None);
+    }
+
+    #[test]
+    fn the_table_is_bounded_and_forgets_the_idle() {
+        let lim = FailedAuthLimiter::new();
+        let t0 = Instant::now();
+        for i in 0..TRACKED_PEERS as u32 {
+            lim.failed(IpAddr::from(i.to_be_bytes()), t0);
+        }
+        assert_eq!(lim.tracked(), TRACKED_PEERS);
+        // A new peer while full and nothing idle: the oldest is evicted, the
+        // table does not grow.
+        lim.failed(ip(200), t0 + Duration::from_secs(1));
+        assert_eq!(lim.tracked(), TRACKED_PEERS);
+        // Once everyone else has been idle past the forget window, one new
+        // peer sweeps them all.
+        let later = t0 + FORGET_AFTER + Duration::from_secs(2);
+        lim.failed(IpAddr::from([192, 168, 0, 1]), later);
+        assert_eq!(lim.tracked(), 1);
     }
 }

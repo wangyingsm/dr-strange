@@ -13,7 +13,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -37,7 +37,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::ServeOptions;
 use crate::assets::static_handler;
 use crate::auth::{
-    Access, AllowedOrigins, Auth, Authorizer, Credentials, ReadOnlyAuthorizer, SharedToken,
+    Access, AllowedOrigins, Auth, Authorizer, Credentials, FailedAuthLimiter, ReadOnlyAuthorizer,
+    SharedToken,
 };
 #[cfg(feature = "native-backend")]
 use crate::follow;
@@ -72,6 +73,12 @@ pub struct AppState {
     /// authenticate (see [`crate::assets`]). `None` when unset. Same value the
     /// `authorizer` checks against, so the injected token always works.
     pub bootstrap_token: Option<String>,
+    /// Whether the listener is bound to a loopback address. Decides two
+    /// things: whether `index.html` may carry the token at all (and then only
+    /// to a loopback peer — see [`crate::assets`]), and whether the Origin
+    /// guard's "allowed origin" still means "the local human's own UI" (it
+    /// does not on a LAN bind, so `local_ui` is never set there).
+    pub bind_is_loopback: bool,
     /// Commit-time change feed (ROADMAP §5): the core observer publishes each
     /// committed `ChangeSet` here, and every `/ws` subscriber that ran
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
@@ -91,6 +98,16 @@ pub struct AppState {
     pub query_timeout: Option<Duration>,
     /// How many queries the history keeps.
     pub history_limit: usize,
+    /// The provider the operator configured (`ServeOptions::embed_provider`'s
+    /// name), the one non-preset name a request may use — see
+    /// [`methods::provider_for`].
+    pub configured_provider: Option<String>,
+    /// The retention the engine was given (`ServeOptions::retain_commits`),
+    /// echoed by `db.stats`.
+    pub retain_commits: Option<u64>,
+    /// Per-peer brute-force throttle on the bearer check — see
+    /// [`auth_throttle`].
+    pub auth_limiter: FailedAuthLimiter,
     /// The completion vocabulary last built, and what it was built from —
     /// see [`AppState::vocab`].
     vocab_cache: Mutex<Option<CachedVocab>>,
@@ -149,6 +166,8 @@ impl AppState {
             // *this* call may run, so it starts when the call does.
             deadline: self.query_timeout.map(|d| Instant::now() + d),
             history_limit: self.history_limit,
+            configured_provider: self.configured_provider.as_deref(),
+            retain_commits: self.retain_commits,
         }
     }
 }
@@ -176,8 +195,13 @@ fn resolve_credentials(
     headers: &HeaderMap,
     ws_token: Option<String>,
 ) -> Result<Credentials, Box<Response>> {
+    // An allowed Origin is only "our own local UI" when the listener is
+    // loopback-bound: on any other bind the same page is served to whoever
+    // can reach the port, so the zero-config fallback must not key off it
+    // (arch/08 §4.2 invariant 2). The 403 for a *disallowed* Origin stands
+    // regardless — that is the CSRF guard, not the fallback.
     let local_ui = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) if state.origins.allows(origin) => true,
+        Some(origin) if state.origins.allows(origin) => state.bind_is_loopback,
         Some(_) => {
             return Err(Box::new(
                 (
@@ -193,6 +217,74 @@ fn resolve_credentials(
         bearer: bearer_of(headers).or(ws_token),
         local_ui,
     })
+}
+
+/// The bearer a request presents, wherever it presents it: the header, or
+/// `?token=` for the WebSocket upgrades that cannot send one. Only for the
+/// throttle's accounting — each handler still resolves its own credentials.
+fn presented_bearer(request: &Request) -> Option<String> {
+    if let Some(b) = bearer_of(request.headers()) {
+        return Some(b);
+    }
+    if !request.uri().path().starts_with("/ws") {
+        return None;
+    }
+    let query = request.uri().query()?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// Brute-force protection on the bearer check, as a middleware over the
+/// whole router so no handler can forget it. A peer serving a lockout is
+/// answered 429 with `Retry-After` before its request is read further; a
+/// peer whose bearer authorizes nothing — not even a read, so the request
+/// would be refused wherever it went — earns a strike, and a correct bearer
+/// clears its strikes (see [`FailedAuthLimiter`]). A request carrying no
+/// bearer is neither counted nor blocked: it is not a guess, and the
+/// zero-config local UI sends none. With no connect info there is no peer
+/// to key on, and the throttle steps aside rather than lump every client
+/// together.
+async fn auth_throttle(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(peer) = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+    else {
+        return next.run(request).await;
+    };
+    let now = Instant::now();
+    if let Some(wait) = state.auth_limiter.locked_for(peer, now) {
+        return too_many_attempts(wait);
+    }
+    if let Some(bearer) = presented_bearer(&request) {
+        let creds = Credentials {
+            bearer: Some(bearer),
+            local_ui: false,
+        };
+        if state.authorizer.allows(Access::Read, &creds) {
+            state.auth_limiter.succeeded(peer);
+        } else if let Some(wait) = state.auth_limiter.failed(peer, now) {
+            tracing::warn!(%peer, wait_secs = wait.as_secs(), "repeated failed authentication; peer throttled");
+            return too_many_attempts(wait);
+        }
+    }
+    next.run(request).await
+}
+
+fn too_many_attempts(wait: Duration) -> Response {
+    let secs = wait.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, secs.to_string())],
+        format!("too many failed authentication attempts; retry in {secs}s"),
+    )
+        .into_response()
 }
 
 /// Gates `/mcp` the same way `cypher_http` gates `/cypher`: **write** level,
@@ -238,6 +330,106 @@ const MCP_SESSION_IDLE: Duration = Duration::from_secs(600);
 /// the same leak for a connection that opens and then goes silent.
 const MCP_SESSION_INIT: Duration = Duration::from_secs(60);
 
+/// The policy every response carries. Written for the built dashboard, which
+/// is fully self-contained (arch/08 §1): scripts come only from the bundle,
+/// so an injected `<script>` never runs — the reason the bootstrap token is a
+/// `<meta>` element rather than inline JS. No `'unsafe-inline'` for styles
+/// either: Vite emits one stylesheet, Svelte 5 applies a dynamic `style="…"`
+/// through `element.style.cssText` (CSSOM, which CSP does not govern), and
+/// sigma styles its canvases the same way — verified against the bundle,
+/// which holds no `style=` attribute, `<style>` element or
+/// `setAttribute("style")`. `img-src data:` covers the inlined SVG logo,
+/// `worker-src blob:` the ForceAtlas2 layout worker graphology builds from a
+/// blob URL. `ws:`/`wss:` are spelled out because older engines did not count
+/// a same-origin socket as `'self'`. Frame ancestors mirror `X-Frame-Options`.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self'; \
+    style-src 'self'; \
+    img-src 'self' data: blob:; \
+    font-src 'self'; \
+    connect-src 'self' ws: wss:; \
+    worker-src 'self' blob:; \
+    object-src 'none'; \
+    base-uri 'self'; \
+    form-action 'self'; \
+    frame-ancestors 'none'";
+
+/// The environment's half of [`ServeOptions::allowed_hosts`]:
+/// `DRSG_ALLOWED_HOSTS`, comma-separated, blanks dropped.
+pub const ENV_ALLOWED_HOSTS: &str = "DRSG_ALLOWED_HOSTS";
+
+fn allowed_hosts_from_env() -> Vec<String> {
+    std::env::var(ENV_ALLOWED_HOSTS)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Host` values `/mcp` answers at — what the MCP transport's
+/// DNS-rebinding guard is handed.
+///
+/// Loopback names are always in: `localhost`, `127.0.0.1`, `::1`. With a
+/// bearer token configured, the bind address joins them when it is a real
+/// address (a wildcard bind names no host), and so does every operator entry
+/// (`[server] allowed_hosts` / `DRSG_ALLOWED_HOSTS`, a hostname or
+/// `host:port`). Without a token the extras are ignored and logged, because
+/// the guard is then doing real work: a tokenless server trusts its own
+/// same-origin UI, and a rebinding page impersonating that UI is precisely
+/// what a loopback-only `Host` list defeats. Once every request has to carry
+/// a secret a rebinding page cannot read, the guard adds nothing the token
+/// does not, and an operator putting `/mcp` behind a hostname must be able
+/// to say so.
+pub fn mcp_allowed_hosts(
+    bind: std::net::SocketAddr,
+    token_configured: bool,
+    extra: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut push = |h: String| {
+        if !h.is_empty() && !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    };
+    let extra: Vec<String> = extra.into_iter().collect();
+    if !token_configured {
+        if !extra.is_empty() {
+            tracing::warn!(
+                hosts = ?extra,
+                "ignoring allowed hosts for /mcp: without DRSG_TOKEN only loopback Host values are answered"
+            );
+        }
+        return hosts;
+    }
+    let ip = bind.ip();
+    if !ip.is_unspecified() && !ip.is_loopback() {
+        push(ip.to_string());
+    }
+    extra.into_iter().for_each(push);
+    hosts
+}
+
+/// Whether a listener may start at all: a non-loopback bind serves the API and
+/// the dashboard to whoever can reach the port, and without a token the only
+/// remaining credential is an `Origin` header any client can type. So the
+/// server refuses, naming what to set, rather than starting open.
+pub fn check_bind_policy(addr: std::net::SocketAddr, token_configured: bool) -> anyhow::Result<()> {
+    if addr.ip().is_loopback() || token_configured {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
+        addr.port()
+    )
+}
+
 /// How long shutdown waits for in-flight connections before giving up. Both
 /// listeners use it, so Ctrl-C behaves the same with and without TLS.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -270,6 +462,7 @@ fn mcp_router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
+    allowed_hosts: Vec<String>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -304,7 +497,10 @@ fn mcp_router(
             Ok(svc)
         },
         Arc::new(sessions),
-        StreamableHttpServerConfig::default(),
+        // The transport's DNS-rebinding guard: the `Host` values it answers
+        // to. Never empty — an empty list is rmcp's "allow any", which is
+        // exactly the guard switched off.
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
     Router::new()
         .route_service("/mcp", service)
@@ -325,6 +521,7 @@ fn router(
     embed: Option<(String, Option<String>, Option<String>)>,
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
+    allowed_hosts: Vec<String>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -346,7 +543,12 @@ fn router(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
         ))
-        .layer(DefaultBodyLimit::max(MAX_BODY));
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_throttle));
     Router::new()
         .merge(mcp_router(
             state.clone(),
@@ -354,6 +556,7 @@ fn router(
             embed,
             source_root,
             parsers,
+            allowed_hosts,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -624,41 +827,166 @@ async fn export_http(
     }
 
     let plane = q.plane;
-    let built = tokio::task::spawn_blocking({
+    // Resolve the plane before the status line goes out, then stream the
+    // lines as they are produced: a plane's export used to be built as one
+    // `String` in memory, which for a large plane was the plane twice over.
+    let (started, body) = stream_body("export", {
         let state = state.clone();
         let plane = plane.clone();
-        move || methods::export_plane(&state.ctx(), &plane)
-    })
-    .await;
-
-    match built {
-        Ok(Ok(jsonl)) => {
-            tracing::info!(plane = %plane, bytes = jsonl.len(), "exported plane as JSONL");
+        move |out, ready| {
+            let ctx = state.ctx();
+            let export = methods::export_plane(&ctx, &plane)?;
+            ready.ok();
+            export.write_to(out)
+        }
+    });
+    match started.await {
+        Ok(()) => {
+            tracing::info!(plane = %plane, "exporting plane as JSONL");
             Response::builder()
                 .header("content-type", "application/x-ndjson")
                 .header(
                     "content-disposition",
                     format!("attachment; filename=\"{}.jsonl\"", safe_filename(&plane)),
                 )
-                .body(Body::from(jsonl))
-                .unwrap()
+                .body(body)
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export failed").into_response()
+                })
         }
-        Ok(Err(e)) => {
-            tracing::warn!(plane = %plane, error = %e.message, "export failed");
+        Err(Started::Refused(e)) => {
+            tracing::warn!(plane = %plane, error = %e.message, "export refused");
             (StatusCode::BAD_REQUEST, e.message).into_response()
         }
-        Err(_) => {
+        Err(Started::Panicked) => {
             tracing::error!(plane = %plane, "export task panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, "export task failed").into_response()
         }
     }
 }
 
+/// Why a streamed response never started: the producer refused the request
+/// (a client error, with the message a handler may forward), or its task
+/// died before deciding.
+enum Started {
+    Refused(rpc::RpcError),
+    Panicked,
+}
+
+/// Bytes per chunk handed to the HTTP body by [`stream_body`]. Large enough
+/// that a chunk is a syscall's worth, small enough that a slow reader holds
+/// little: with the channel's depth, at most a megabyte is in flight.
+const STREAM_CHUNK: usize = 64 << 10;
+
+/// Run a blocking producer on its own task and stream what it writes as a
+/// chunked HTTP body, without ever holding the whole of it. The producer
+/// validates the request first and then calls [`Ready::ok`] — that resolves
+/// the returned future, so the handler can still answer a 400 for an error
+/// returned before it — and writes into a [`BodyWriter`] whose bounded
+/// channel applies backpressure to a slow reader. A failure after `ok` is
+/// logged under the same operator/client split as an RPC error and ends
+/// the body early, which a chunked transfer reports to the client as a
+/// truncated response — the one honest signal left once the status line
+/// has gone out.
+fn stream_body<F>(
+    what: &'static str,
+    produce: F,
+) -> (impl std::future::Future<Output = Result<(), Started>>, Body)
+where
+    F: FnOnce(&mut BodyWriter, &mut Ready) -> Result<(), rpc::RpcError> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<Result<(), rpc::RpcError>>();
+    tokio::task::spawn_blocking(move || {
+        let mut out = BodyWriter {
+            tx,
+            buf: Vec::with_capacity(STREAM_CHUNK),
+        };
+        let mut ready = Ready(Some(started_tx));
+        let res = produce(&mut out, &mut ready).and_then(|()| {
+            std::io::Write::flush(&mut out)
+                .map_err(|e| rpc::RpcError::server(format!("{what} stream closed: {e}")))
+        });
+        match (ready.0.take(), res) {
+            // Never signalled: the producer decided against the request
+            // (or produced nothing and returned) before the status line.
+            (Some(started), Err(e)) => {
+                let _ = started.send(Err(e));
+            }
+            (Some(started), Ok(())) => {
+                let _ = started.send(Ok(()));
+            }
+            (None, Err(e)) => {
+                let e = methods::opaque(&format!("{what} failed mid-stream"), e.message);
+                let _ = out.tx.blocking_send(Err(std::io::Error::other(e.message)));
+            }
+            (None, Ok(())) => {}
+        }
+    });
+    let started = async move {
+        match started_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Started::Refused(e)),
+            Err(_) => Err(Started::Panicked),
+        }
+    };
+    (started, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+/// The producer's "the request is valid, start the response" signal — see
+/// [`stream_body`]. Calling it twice is harmless.
+struct Ready(Option<tokio::sync::oneshot::Sender<Result<(), rpc::RpcError>>>);
+
+impl Ready {
+    fn ok(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+}
+
+/// The `Write` end of [`stream_body`]: buffers to [`STREAM_CHUNK`] and hands
+/// each chunk to the body's channel, blocking when the reader is behind.
+struct BodyWriter {
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for BodyWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= STREAM_CHUNK {
+            self.flush()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_CHUNK));
+        self.tx
+            .blocking_send(Ok(Bytes::from(chunk)))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
 /// `GET /snapshot` — the one-shot bootstrap bundle for `serve --follow`
 /// (arch/01 §9): the whole database, id-faithful, at one commit sequence
-/// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire). Same
-/// full-buffer-then-respond shape as `export_http`: this project's scale
-/// doesn't yet need chunked transfer.
+/// (`Database::snapshot`, ROADMAP §6 — unchanged, just given a wire).
+///
+/// The dump goes to an anonymous spool file first and the file is streamed,
+/// not the dump itself. `Database::snapshot` holds the registry read locks
+/// and one read transaction for as long as it writes — that is what makes
+/// the image consistent — so writing it straight into the response body
+/// would hold every commit on the master for as long as the follower took
+/// to download, which over a slow link is the whole transfer; a spool costs
+/// one write of the image to local disk and releases the locks the moment
+/// the last frame is written. The file is unlinked on creation and streamed
+/// by the runtime's own file reader, so a slow follower pins neither a lock
+/// nor a blocking-pool thread, and a spool failure (no space, no temp dir)
+/// is a 500 decided before the status line.
 async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let creds = match resolve_credentials(&state, &headers, None) {
         Ok(c) => c,
@@ -667,26 +995,28 @@ async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     if !state.authorizer.allows(Access::Read, &creds) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let built = tokio::task::spawn_blocking({
+    let spooled = tokio::task::spawn_blocking({
         let state = state.clone();
-        move || -> Result<Vec<u8>, dr_strange_core::Error> {
-            let mut buf = Vec::new();
-            state.db.snapshot(&mut buf)?;
-            Ok(buf)
-        }
+        move || spool_snapshot(&state.db)
     })
     .await;
-    match built {
-        Ok(Ok(bytes)) => {
-            tracing::info!(bytes = bytes.len(), "served a replication snapshot");
+    match spooled {
+        Ok(Ok(file)) => {
+            tracing::info!("serving a replication snapshot");
+            let reader = tokio_util::io::ReaderStream::with_capacity(
+                tokio::fs::File::from_std(file),
+                STREAM_CHUNK,
+            );
             Response::builder()
                 .header("content-type", "application/octet-stream")
-                .body(Body::from(bytes))
-                .unwrap()
+                .body(Body::from_stream(reader))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
+                })
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "snapshot export failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            tracing::warn!(error = %e.message, "snapshot export refused");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response()
         }
         Err(_) => {
             tracing::error!("snapshot export task panicked");
@@ -697,6 +1027,22 @@ async fn snapshot_http(State(state): State<Arc<AppState>>, headers: HeaderMap) -
                 .into_response()
         }
     }
+}
+
+/// Dump `db` into an anonymous temporary file and return it rewound to the
+/// start — the spool [`snapshot_http`] streams. Blocking: call it from a
+/// blocking task. The core's locks are held only for the duration of this
+/// function, never for the download.
+fn spool_snapshot(db: &Database) -> Result<std::fs::File, rpc::RpcError> {
+    use std::io::{Seek, Write};
+    let spool = |e: std::io::Error| rpc::RpcError::server(format!("snapshot spool: {e}"));
+    let file = tempfile::tempfile().map_err(spool)?;
+    let mut out = std::io::BufWriter::with_capacity(STREAM_CHUNK, file);
+    db.snapshot(&mut out).map_err(methods::core_err)?;
+    out.flush().map_err(spool)?;
+    let mut file = out.into_inner().map_err(|e| spool(e.into_error()))?;
+    file.rewind().map_err(spool)?;
+    Ok(file)
 }
 
 /// `GET /ws/wal` — the live tail for `serve --follow` (arch/01 §9): every
@@ -817,7 +1163,7 @@ async fn cypher_http(
         Err(_) => return (StatusCode::BAD_REQUEST, "query body must be UTF-8").into_response(),
     };
     let plane = q.plane.clone();
-    let embed = q.embed.clone().unwrap_or_else(|| "openai".to_string());
+    let embed = q.embed.clone();
 
     let built = tokio::task::spawn_blocking({
         let state = state.clone();
@@ -828,7 +1174,7 @@ async fn cypher_http(
                 &state.ctx(),
                 &plane,
                 &query,
-                &embed,
+                embed.as_deref(),
                 &Default::default(),
                 q.lean.unwrap_or(true),
                 methods::Page {
@@ -1030,12 +1376,14 @@ pub enum ServeOutcome {
 /// never disagree. `serve --follow` (arch/01 §9) then refuses every write RPC
 /// regardless of token — a third, orthogonal layer alongside the Origin guard
 /// and the bearer token itself.
-fn build_authorizer(opts: &ServeOptions) -> (Arc<dyn Authorizer>, Option<String>) {
+fn build_authorizer(opts: &ServeOptions) -> anyhow::Result<Authorization> {
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
-    let shared_token = SharedToken::new(token.clone());
+    let bind_is_loopback = opts.addr.ip().is_loopback();
+    let shared_token = SharedToken::new(token.clone()).bound_to_loopback(bind_is_loopback);
+    check_bind_policy(opts.addr, shared_token.is_configured())?;
     if shared_token.is_configured() {
         tracing::info!(
-            "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>; WebSocket via ?token=<token>)"
+            "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>, on the WebSocket upgrade too; browsers use ?token=<token>)"
         );
     } else {
         tracing::warn!(
@@ -1048,7 +1396,22 @@ fn build_authorizer(opts: &ServeOptions) -> (Arc<dyn Authorizer>, Option<String>
     } else {
         Arc::new(shared_token)
     };
-    (authorizer, token)
+    Ok(Authorization {
+        authorizer,
+        token,
+        bind_is_loopback,
+    })
+}
+
+/// What the bind and the environment settle before a request is served: who
+/// may do what, the copy of the token the SPA is handed, and whether this
+/// listener is local enough to hand it out at all.
+struct Authorization {
+    authorizer: Arc<dyn Authorizer>,
+    token: Option<String>,
+    /// Loopback binds alone may splice the token into the page or honour the
+    /// zero-config local-UI fallback.
+    bind_is_loopback: bool,
 }
 
 /// History retention (see `ServeOptions::retain_commits`): bound how far back
@@ -1082,7 +1445,11 @@ pub async fn run(
     opts: ServeOptions,
 ) -> anyhow::Result<ServeOutcome> {
     startup_banner();
-    let (authorizer, token) = build_authorizer(&opts);
+    let Authorization {
+        authorizer,
+        token,
+        bind_is_loopback,
+    } = build_authorizer(&opts)?;
     // Change feed (ROADMAP §5): publish every committed ChangeSet to a
     // broadcast channel that `/ws` subscribers drain. Registered before the db
     // is shared, and best-effort — `send` failing (no live subscriber) is fine.
@@ -1147,12 +1514,16 @@ pub async fn run(
             authorizer,
             origins: AllowedOrigins::from_env(),
             bootstrap_token: token,
+            bind_is_loopback,
             changes,
             wal_changes,
             digest: opts.digest,
             fetch: opts.fetch.clone(),
             query_timeout: opts.query_timeout,
             history_limit: opts.history_limit,
+            configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+            retain_commits: opts.retain_commits,
+            auth_limiter: FailedAuthLimiter::new(),
             vocab_cache: Mutex::new(None),
         });
         return run_app(state, opts, &resync_needed, &follow_lost).await;
@@ -1163,12 +1534,16 @@ pub async fn run(
         authorizer,
         origins: AllowedOrigins::from_env(),
         bootstrap_token: token,
+        bind_is_loopback,
         changes,
         wal_changes,
         digest: opts.digest,
         fetch: opts.fetch.clone(),
         query_timeout: opts.query_timeout,
         history_limit: opts.history_limit,
+        configured_provider: opts.embed_provider.as_ref().map(|(p, _, _)| p.clone()),
+        retain_commits: opts.retain_commits,
+        auth_limiter: FailedAuthLimiter::new(),
         vocab_cache: Mutex::new(None),
     });
     run_app(state, opts, &resync_needed, &follow_lost).await
@@ -1195,12 +1570,21 @@ async fn run_app(
     // database's Drop from ever running, so the sidecars must be saved
     // explicitly at shutdown or every restart rebuilds the indexes.
     let db_at_shutdown = state.db.clone();
+    let allowed_hosts = mcp_allowed_hosts(
+        opts.addr,
+        state.bootstrap_token.is_some(),
+        opts.allowed_hosts
+            .iter()
+            .cloned()
+            .chain(allowed_hosts_from_env()),
+    );
     let app = router(
         state,
         opts.max_concurrent,
         opts.embed_provider.clone(),
         opts.source_root.clone(),
         opts.recall_parsers.clone(),
+        allowed_hosts,
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
@@ -1228,7 +1612,13 @@ async fn run_app(
             // lifetime, so no replacement can start until this one dies.
             let (fired_tx, fired_rx) = tokio::sync::oneshot::channel();
             let serve = std::future::IntoFuture::into_future(
-                axum::serve(listener, app).with_graceful_shutdown(async move {
+                // With connect info, so the SPA handler can see the peer
+                // address it is about to hand the bootstrap token to.
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     let _ = fired_tx.send(());
                 }),
@@ -1302,7 +1692,7 @@ async fn serve_tls(
     });
     let serve = axum_server::from_tcp_rustls(listener, config)?
         .handle(handle)
-        .serve(app.into_make_service());
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
     tokio::select! {
         res = serve => res?,
         // `--follow` losing its replication stream: same immediate-not-
@@ -1368,8 +1758,12 @@ async fn rpc_http(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
 
 // ---- WebSocket ------------------------------------------------------------
 
-/// The WebSocket carries its bearer token in the query string (`/ws?token=…`)
-/// because the browser WebSocket API can't set request headers.
+/// The WebSocket's query-string credential (`/ws?token=…`), for the browser
+/// WebSocket API, which can't set request headers. Any other client should
+/// send `Authorization: Bearer` on the upgrade instead — a header is neither
+/// written to access logs nor kept in a browser's history — and the header
+/// wins when both are present. Nothing here logs a request target, so the
+/// query value never reaches a log line; keep it that way.
 #[derive(serde::Deserialize)]
 struct WsQuery {
     #[serde(default)]
@@ -1544,4 +1938,89 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
         .ok()
         .flatten()?;
     Some(json!({ "jsonrpc": "2.0", "method": "db.stats", "params": stats }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_bind_policy, mcp_allowed_hosts, spool_snapshot};
+
+    /// The spool `/snapshot` streams is byte-for-byte the core's dump,
+    /// rewound and ready to read; the locks the dump takes are released
+    /// when the function returns, before any byte reaches a client.
+    #[test]
+    fn the_snapshot_spool_is_the_dump_rewound() {
+        use std::io::Read;
+        let db = dr_strange_core::Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_node_with_key("alice", &["Person"], dr_strange_core::Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let mut direct = Vec::new();
+        db.snapshot(&mut direct).unwrap();
+        let mut spooled = Vec::new();
+        spool_snapshot(&db)
+            .unwrap()
+            .read_to_end(&mut spooled)
+            .unwrap();
+        assert_eq!(spooled, direct);
+        // And a write goes through while the spool is still open: nothing
+        // of the core is held by the file.
+        let file = spool_snapshot(&db).unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_node_with_key("bob", &["Person"], dr_strange_core::Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        drop(file);
+    }
+
+    /// The `Host` list `/mcp` answers at: loopback always; the bind address
+    /// and the operator's names only once a token gates every request; a
+    /// wildcard bind names nothing; duplicates and blanks are dropped.
+    #[test]
+    fn mcp_hosts_grow_past_loopback_only_under_a_token() {
+        let lan: std::net::SocketAddr = "192.168.1.20:7700".parse().unwrap();
+        let any: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        let loopback = vec!["localhost", "127.0.0.1", "::1"];
+        // No token: the extras are ignored, whatever the bind.
+        assert_eq!(
+            mcp_allowed_hosts(lan, false, vec!["memory.example.com".into()]),
+            loopback
+        );
+        // A token: the bind address and the extras are answered.
+        assert_eq!(
+            mcp_allowed_hosts(
+                lan,
+                true,
+                vec!["memory.example.com".into(), "".into(), "127.0.0.1".into()]
+            ),
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "192.168.1.20",
+                "memory.example.com"
+            ]
+        );
+        // A wildcard or loopback bind adds no host of its own.
+        assert_eq!(mcp_allowed_hosts(any, true, vec![]), loopback);
+        assert_eq!(mcp_allowed_hosts(local, true, vec![]), loopback);
+        // Never empty: rmcp reads an empty list as "any host".
+        assert!(!mcp_allowed_hosts(any, false, vec![]).is_empty());
+    }
+
+    #[test]
+    fn a_tokenless_listener_may_only_be_loopback() {
+        let lan: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        let local6: std::net::SocketAddr = "[::1]:7700".parse().unwrap();
+        assert!(check_bind_policy(local, false).is_ok());
+        assert!(check_bind_policy(local6, false).is_ok());
+        assert!(check_bind_policy(lan, true).is_ok());
+        // The refusal names the knob to set and the way back to loopback.
+        let err = check_bind_policy(lan, false).unwrap_err().to_string();
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        assert!(err.contains("--addr 127.0.0.1:7700"), "{err}");
+    }
 }

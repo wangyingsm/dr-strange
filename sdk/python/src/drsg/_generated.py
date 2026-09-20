@@ -35,21 +35,29 @@ class Drsg(_Client):
         return self._call("db.catalog")
 
     def plugin_list(self) -> Any:
-        """Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11)."""
+        """Installed preprocessor plugins — the same records `drsg plugin list --json` prints, so an agent reads one shape from either surface (ROADMAP §11).
+
+        Access: read."""
         return self._call("plugin.list")
 
     def plugin_catalog(self) -> Any:
-        """The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept."""
+        """The official plugin catalog, read from the extensions repository's catalog.json rather than compiled into this build — a plugin release needs no drsg release. Entries this build cannot run are returned tagged with why, not filtered out. Join against plugin.list to mark each installed/upgradable/absent. Cached for an hour; stale:true means the fetch failed and this is the last copy the store kept.
+
+        Access: read."""
         return self._call("plugin.catalog")
 
     def plugin_install(self, url) -> Any:
-        """Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC."""
+        """Download, validate, hash-pin and store a plugin from an http(s) URL. Write-gated; the URL passes the same resolved-address network policy as every other fetch. Server-local paths are deliberately not accepted over RPC.
+
+        Access: write."""
         _p: dict = {}
         _p["url"] = url
         return self._call("plugin.install", _p)
 
     def plugin_remove(self, name) -> Any:
-        """Uninstall a plugin by name. Write-gated."""
+        """Uninstall a plugin by name. Write-gated.
+
+        Access: write."""
         _p: dict = {}
         _p["name"] = name
         return self._call("plugin.remove", _p)
@@ -61,7 +69,9 @@ class Drsg(_Client):
         return self._call("plane.list")
 
     def plane_vectorize(self, plane, embed=None, embed_model=None, metric=None) -> Any:
-        """Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment."""
+        """Embed every node in a plane (incremental by meaning — unchanged texts are skipped) and ensure a vector index on `embedding` per label. Same engine as `drsg vectorize`; the provider key comes from the server's environment.
+
+        Access: write."""
         _p: dict = {}
         _p["plane"] = plane
         if embed is not None:
