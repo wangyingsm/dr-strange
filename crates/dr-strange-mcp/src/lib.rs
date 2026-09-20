@@ -3629,6 +3629,37 @@ mod tests {
     /// preset or the host's configured provider, never a base URL, and never
     /// the environment variable the key is read from. Checked on `cypher`,
     /// `hybrid` and `ask`, the tools that take a provider from params.
+    /// `digest` resolves its providers through the same gate, before the run
+    /// — so a base URL or a foreign key variable is refused there too.
+    #[test]
+    fn digest_params_cannot_name_a_url_or_a_foreign_key_env() {
+        let db = fixture();
+        let url = "http://169.254.169.254/latest/meta-data";
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "chat": url})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn tool_params_cannot_name_a_url_or_a_foreign_key_env() {
         let db = fixture();
@@ -3690,32 +3721,6 @@ mod tests {
         let err = ask_logic(
             &db,
             from_value(jval!({"question": "q", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
-            "{err}"
-        );
-
-        // `digest` goes through the same gate: its providers are resolved
-        // before the run, so a URL is refused there too.
-        let err = digest_logic(
-            &db,
-            from_value(jval!({"text": "some prose", "chat": url})).unwrap(),
-            DigestTuning::default(),
-            false,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not allowed over the wire"), "{err}");
-        let err = digest_logic(
-            &db,
-            from_value(jval!({"text": "some prose", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
-            DigestTuning::default(),
-            false,
             None,
         )
         .unwrap_err()
