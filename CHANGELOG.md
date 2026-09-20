@@ -4,6 +4,58 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-09-21
+
+### Changed
+
+- **A server without a token refuses to listen anywhere but loopback.** It
+  starts with an error naming `DRSG_TOKEN` and the `--addr` way back, rather
+  than coming up open with an `Origin` header — which any client can type — as
+  its only credential. A `drsg serve --addr 0.0.0.0:7700` that worked before
+  now needs a token; the container image already sets one.
+- **The page carries the token only to a local human.** `GET /` is
+  unauthenticated by necessity — it is how a browser fetches the page that
+  will authenticate — and it spliced the token into the HTML for every caller.
+  The token is now written only when the bind *and* the peer are both
+  loopback, and as a `<meta>` element rather than an inline script, so every
+  response can carry `script-src 'self'`. A dashboard reached over the network
+  asks for the token once and keeps it for the tab.
+- **`/mcp` answers at the names the operator lists.** Besides loopback and the
+  bind address, the endpoint answers only at hostnames given through
+  `[server] allowed_hosts` / `DRSG_ALLOWED_HOSTS`, and only once a token gates
+  it — the transport's DNS-rebinding guard, which an empty list switches off.
+- **A JSON-RPC batch holds at most 64 requests**, refused whole before any
+  item runs, rather than as many as fit in a 64 MiB body.
+
+### Fixed
+
+- **A wrong token is counted.** `/rpc` answered every wrong bearer at wire
+  speed, so the only thing between a client and the token was the token. Past
+  five failures a peer serves a wait that doubles to five minutes, applied as
+  middleware over the whole router so no route can forget it; a request with
+  no bearer is not a guess, so the zero-config local UI is untouched.
+- **A NAT64 spelling of a protected address is that address.** The fetch guard
+  read the v4 address inside v4-mapped, v4-compatible, 6to4 and Teredo forms
+  but not inside the well-known prefix `64:ff9b::/96`, so on a host with a
+  NAT64 gateway `64:ff9b::a9fe:a9fe` reached the cloud metadata service and
+  `64:ff9b::7f00:1` reached loopback while reading as ordinary public v6. The
+  local-use block `64:ff9b:1::/48` is refused whole.
+- **A follower's replication queue has a size**, and its pull-time backlog is
+  forwarded by one bounded task rather than a task per batch.
+- **`plane.find` stops.** The node scan walks a page at a time to a cap, and
+  the edge pass now caps the nodes it visits as well as the edges it examines
+  — a needle matching no edge on a plane of mostly leaves looked up the
+  neighbours of every node, once per keystroke.
+- **A snapshot is spooled before it is streamed** and an export walks ids, so
+  neither holds the whole database in memory while a client reads slowly.
+
+### Added
+
+- **Every method in the contract names its access tier**, and every parameter
+  says whether it is required. The six generated SDK clients carry the tiers.
+- **The dashboard is told how deep the history it offers goes**, so it does
+  not offer time-travel past what the server retains.
+
 ## [2.9.2] - 2026-09-19
 
 ### Fixed
