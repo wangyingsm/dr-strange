@@ -4,6 +4,48 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-09-21
+
+### Changed
+
+- **What destroys is confirmed over MCP.** `drop_plane` already required
+  `confirm: true`; now a `cypher` statement carrying `DELETE` or `REMOVE`, and
+  `digest` with `apply: true`, do too, and refuse without it in the same
+  words. `CREATE`, `MERGE`, `SET` and the bulk writers stay ungated — asking
+  twice for the everyday additive work would only teach clients to pass
+  `confirm` reflexively. A client that deletes over MCP must now pass the flag.
+- **A tool call ends.** Each call carries one deadline covering the wait for a
+  slot and the run — five minutes by default, `DRSG_MCP_TOOL_DEADLINE_SECS`
+  to change it (`0` removes it). Past it the call answers with a tool error
+  saying whether the server was busy or the body was slow, rather than never
+  returning.
+
+### Fixed
+
+- **The stdio relay takes a credential only from the repository's own file.**
+  `drsg-mcp` walked every ancestor of the working directory for a `.mcp.json`
+  and forwarded the `Authorization` header it found, so a host launched in a
+  checkout under a shared or hostile parent directory handed its session —
+  token included — to whatever server that file named. The walk now ends at
+  the first directory holding a `.git`, and on Unix a file is read only when
+  the effective user owns it and no one else may write it.
+- **A tool parameter cannot name a URL or a key variable.** `cypher`,
+  `hybrid`, `ask` and `digest` handed a request-supplied provider straight to
+  the provider builder, which accepts a raw base URL — so an authenticated
+  caller could make the server POST, with a key from its own environment, to
+  any host it could reach, and choose which variable the key was read from.
+  A provider named over MCP must now be a preset or the one the operator
+  configured, as it already had to be over JSON-RPC.
+- **The confirm gate reads a backtick name the way the parser does.** It
+  honoured a backslash inside backticks where the grammar does not, so
+  `` MATCH (n:`a\`) DETACH DELETE n `` parsed and ran unconfirmed.
+- **The stdio binary keeps the retention the server does.** `drsg-mcp`
+  opened its database with none, so a store driven only through a stdio host
+  kept every version it ever wrote. It now opens with the served default, or
+  `DRSG_RETAIN_COMMITS` (`0` keeps everything); a value that is not a number
+  is a start-up error rather than a silent default.
+- **The redb-only build compiles again.**
+
 ## [2.10.0] - 2026-09-21
 
 ### Changed
