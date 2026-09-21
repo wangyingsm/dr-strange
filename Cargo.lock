@@ -1251,6 +1251,7 @@ dependencies = [
  "dr-strange-llm",
  "dr-strange-log",
  "dr-strange-parser",
+ "libc",
  "mimalloc",
  "regex",
  "reqwest 0.13.4",
@@ -1259,6 +1260,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]

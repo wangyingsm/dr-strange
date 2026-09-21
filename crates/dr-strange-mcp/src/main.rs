@@ -46,7 +46,9 @@ Options:
   -V, --version  Print the version.
 
 With no database named, the nearest .mcp.json is read (walking up, as git
-finds its own directory). If it declares a drsg server and that server
+finds its own directory, and no further than the repository root; a file
+another user owns or anyone can write is passed over). If it declares a
+drsg server and that server
 answers, this process relays the session to it — so a repository prepared by
 `drsg init` is reached through the `drsg serve … watch` already holding its
 database, whose plane is synced to the repository's commits.
@@ -159,7 +161,25 @@ async fn main() -> anyhow::Result<()> {
 
     require_existing(&path)?;
     let db = Arc::new(Database::open(&path)?);
-    tracing::info!(db = %path.display(), "drsg-mcp: database opened; serving MCP over stdio");
+    // Retention is applied wherever the database is opened for writing, and
+    // this process writes (`write_nodes`, `write_edges`, `cypher`, `digest`).
+    // With no config file to read, the environment is the only knob; the
+    // default is the one `drsg serve` and the CLI open with.
+    let retain = dr_strange_mcp::retain_commits_try_from(
+        std::env::var(dr_strange_mcp::ENV_RETAIN_COMMITS)
+            .ok()
+            .as_deref(),
+    )?;
+    // Native-only, as in `drsg serve`: the other engines keep no versions to
+    // bound. The variable is still parsed above so a typo is a start-up
+    // error under every backend.
+    #[cfg(feature = "native-backend")]
+    db.set_retention(retain);
+    tracing::info!(
+        db = %path.display(),
+        retain_commits = ?retain,
+        "drsg-mcp: database opened; serving MCP over stdio",
+    );
 
     // Local files are allowed here and nowhere else: this process runs on the
     // agent's own machine, as that agent's user, so `digest { path }` reads

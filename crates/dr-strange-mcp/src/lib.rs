@@ -17,12 +17,15 @@
 //! runs the second one, `drsg-mcp` forwards to it rather than opening the
 //! same database, which one process at a time may do.
 
+mod error;
 mod recall;
 pub mod relay;
 
+pub use error::McpError;
 pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
@@ -34,7 +37,7 @@ use dr_strange_core::{
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
@@ -61,6 +64,9 @@ pub struct DrStrange {
     source_root: Option<std::path::PathBuf>,
     /// The preprocessors `recall` locates a symbol with — see [`DrStrange::with_parsers`].
     parsers: Arc<dyn Parsers>,
+    /// Longest one tool call may take, queue included — see
+    /// [`DrStrange::with_tool_deadline`]. `None` waits and runs without limit.
+    deadline: Option<Duration>,
 }
 
 /// How the host reaches an embedding provider. Only the *names* live here; the
@@ -74,6 +80,37 @@ pub struct EmbedProvider {
     pub model: Option<String>,
     /// Environment variable holding the key.
     pub key_env: Option<String>,
+}
+
+impl EmbedProvider {
+    /// The shape [`dr_strange_llm::wire_provider`] compares a request against.
+    fn configured(&self) -> dr_strange_llm::ConfiguredProvider<'_> {
+        dr_strange_llm::ConfiguredProvider {
+            name: &self.provider,
+            key_env: self.key_env.as_deref(),
+        }
+    }
+}
+
+/// Resolve a provider a **tool call** named. The rule is the web crate's
+/// (`provider_for` there, [`dr_strange_llm::wire_provider`] for both): a
+/// preset or exactly the provider the host configured, and the key's
+/// environment variable is the provider's own, never the caller's pick.
+/// `build_provider` accepts a base URL because the operator at their terminal
+/// legitimately means one; a name that arrived over MCP must not reach it
+/// unchecked, or the server POSTs — with a key from its own environment —
+/// wherever the caller points it. Every tool that turns a request field into
+/// a provider goes through here.
+fn wire_provider<'a>(
+    requested: Option<&'a str>,
+    requested_key_env: Option<&str>,
+    allow: Option<&'a EmbedProvider>,
+) -> AnyResult<(&'a str, Option<&'a str>)> {
+    Ok(dr_strange_llm::wire_provider(
+        requested,
+        requested_key_env,
+        allow.map(EmbedProvider::configured),
+    )?)
 }
 
 /// Digest knobs the host resolved, applied to the `digest` tool.
@@ -120,6 +157,82 @@ pub fn default_parsers() -> Arc<dyn Parsers> {
         .clone()
 }
 
+/// Longest one tool call may take — waiting for a slot and running — when the
+/// host sets nothing. Generous, because a `digest` over a directory fans out
+/// to a provider and legitimately runs for minutes; the point is that a call
+/// ends, not that it ends quickly.
+pub const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Environment override for [`DEFAULT_TOOL_DEADLINE`], in whole seconds; `0`
+/// disables the deadline. Read when a [`DrStrange`] is built, so the stdio
+/// binary — which has no config file — can be tuned the same way a served one
+/// is through its host.
+pub const ENV_TOOL_DEADLINE_SECS: &str = "DRSG_MCP_TOOL_DEADLINE_SECS";
+
+/// The deadline the environment asks for, else the default — which a value
+/// that is not a count also falls back to, with a warning: a typo should not
+/// silently remove the bound, and building a [`DrStrange`] cannot fail. The
+/// error is there for a caller that would rather refuse to start, and for the
+/// day this decides differently.
+pub fn tool_deadline_from_env() -> Option<Duration> {
+    match deadline_try_from(std::env::var(ENV_TOOL_DEADLINE_SECS).ok().as_deref()) {
+        Ok(deadline) => deadline,
+        Err(e) => {
+            tracing::warn!("{e}; falling back to the default");
+            Some(DEFAULT_TOOL_DEADLINE)
+        }
+    }
+}
+
+/// Commits of history a database keeps when nothing says otherwise: enough
+/// for the dashboard's time slider and an agent's "what did this look like
+/// before that change" to have somewhere to go, while keeping the store close
+/// to the size of what it currently holds. The one figure `drsg serve`, the
+/// rest of the CLI and the stdio binary all open with — the web crate's
+/// constant of the same name is this one.
+pub const DEFAULT_RETAIN_COMMITS: u64 = 20;
+
+/// Environment override for [`DEFAULT_RETAIN_COMMITS`], read by the stdio
+/// binary — which has no config file — so a store it writes through
+/// (`write_nodes`, `write_edges`, `cypher`, `digest`) is compacted under the
+/// same policy a served one is, rather than keeping every version forever.
+/// `0` keeps everything, as `[server] retain_commits = 0` does.
+pub const ENV_RETAIN_COMMITS: &str = "DRSG_RETAIN_COMMITS";
+
+/// The retention `value` — the environment's reading of
+/// [`ENV_RETAIN_COMMITS`], if any — asks for, in `Database::set_retention`'s
+/// encoding: `None` is unbounded. Unset is the default; `0` is unbounded; a
+/// value that is not a count is an error rather than a silent default, since
+/// a typo here would quietly change what a compaction throws away.
+pub fn retain_commits_try_from(value: Option<&str>) -> Result<Option<u64>, McpError> {
+    match value {
+        None => Ok(Some(DEFAULT_RETAIN_COMMITS)),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => Ok(None),
+            Ok(commits) => Ok(Some(commits)),
+            Err(_) => Err(McpError::RetainCommits {
+                value: raw.to_string(),
+            }),
+        },
+    }
+}
+
+/// [`tool_deadline_from_env`] on a value already read: unset is the default,
+/// `0` removes the deadline, and anything else is an error rather than a
+/// silent reading — the caller decides what to do with a misconfigured host.
+fn deadline_try_from(value: Option<&str>) -> Result<Option<Duration>, McpError> {
+    let Some(raw) = value else {
+        return Ok(Some(DEFAULT_TOOL_DEADLINE));
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+        Err(_) => Err(McpError::ToolDeadline {
+            value: raw.to_string(),
+        }),
+    }
+}
+
 impl DrStrange {
     pub fn new(db: Arc<Database>) -> Self {
         Self::with_digest(db, DigestTuning::default())
@@ -135,7 +248,22 @@ impl DrStrange {
             local_files: false,
             source_root: None,
             parsers: default_parsers(),
+            deadline: tool_deadline_from_env(),
         }
+    }
+
+    /// Bound one tool call, queue included; `None` removes the bound.
+    ///
+    /// Without it a call behind a full gate waits for as long as the calls
+    /// ahead of it run, and a body that never returns holds its slot for
+    /// good — the agent sees neither, only a call that does not come back.
+    /// Past the deadline the call answers with a tool error naming it, so
+    /// the agent can retry or do something else. A body already running is
+    /// not cut short — blocking work cannot be — but it keeps its slot until
+    /// it finishes, so the gate still counts it.
+    pub fn with_tool_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Let `digest` read a document path the caller names.
@@ -293,12 +421,14 @@ struct Hybrid {
     w_graph: Option<f32>,
     #[serde(default)]
     k: Option<usize>,
-    /// Embedding provider for the vector channel (key from the server env).
+    /// Embedding provider for the vector channel: a preset or the provider
+    /// the server was configured with (a base URL is refused); key from the
+    /// server env.
     #[serde(default)]
     provider: Option<String>,
-    /// Name of the environment variable the server reads the provider key
-    /// from. A preset defaults to its own; a base URL has none, so name it
-    /// here when the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     #[serde(default)]
@@ -320,12 +450,14 @@ struct Ask {
     /// Safety row cap appended when the plan declares none (default 100).
     #[serde(default)]
     limit: Option<u64>,
-    /// Chat provider (preset or base URL); key from the server env.
+    /// Chat provider: a preset (`openai`/`deepseek`/`qwen`/`ollama`) or the
+    /// provider the server was configured with; a base URL is refused. Key
+    /// from the server env.
     #[serde(default)]
     provider: Option<String>,
-    /// Name of the environment variable the server reads the chat key from. A
-    /// preset defaults to its own; a base URL has none, so name it here when
-    /// the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     #[serde(default)]
@@ -367,16 +499,23 @@ struct Digest {
     /// nodes/edges for inspection (arch/07 §2: proposals, not mutations).
     #[serde(default)]
     apply: bool,
-    /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or a base
-    /// URL. API keys are read from the server's environment, never params.
+    /// Must be `true` alongside `apply` — applying a digest rewrites the
+    /// plane against the document, which on a mirrored plane overwrites
+    /// parser-owned nodes, so it is confirmed the way `drop_plane` is
+    /// (arch/06 §3). A dry-run needs no confirmation.
+    #[serde(default)]
+    confirm: bool,
+    /// Chat provider: preset (`openai`/`deepseek`/`qwen`/`ollama`) or the
+    /// provider the server was configured with; a base URL is refused. API
+    /// keys are read from the server's environment, never params.
     #[serde(default)]
     chat: Option<String>,
-    /// Embedding provider preset or base URL (defaults to the chat provider).
+    /// Embedding provider, same rule (defaults to the chat provider).
     #[serde(default)]
     embed: Option<String>,
-    /// Name of the environment variable the server reads the chat key from. A
-    /// preset defaults to its own; a base URL has none, so name it here when
-    /// the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     key_env: Option<String>,
     /// The same, for the embedding provider.
@@ -446,13 +585,14 @@ struct Cypher {
     /// A query in the openCypher-subset language, e.g.
     /// `MATCH (n:Person) WHERE n.age >= 30 RETURN n ORDER BY n.age DESC LIMIT 5`.
     query: String,
-    /// Embedding provider for a text `SEARCH … NEAR "…"` (preset or base URL);
-    /// the server environment supplies the key. Defaults to `openai`.
+    /// Embedding provider for a text `SEARCH … NEAR "…"`: a preset or the
+    /// provider the server was configured with (a base URL is refused); the
+    /// server environment supplies the key. Defaults to `openai`.
     #[serde(default)]
     embed: Option<String>,
-    /// Name of the environment variable the server reads the embedding key
-    /// from. A preset defaults to its own; a base URL has none, so name it
-    /// here when the endpoint needs a key. The key never travels in params.
+    /// Accepted only when it repeats the provider's own key variable; the
+    /// server never reads a variable a caller names. The key never travels in
+    /// params.
     #[serde(default)]
     embed_key_env: Option<String>,
     /// Embedding model. A preset supplies its own; a base URL has none, so it
@@ -463,6 +603,11 @@ struct Cypher {
     #[serde(default)]
     #[schemars(with = "crate::JsonObject")]
     params: serde_json::Map<String, Value>,
+    /// Must be `true` for a statement that destroys — `DELETE` or `REMOVE` —
+    /// as `drop_plane` requires (arch/06 §3). Additive writes (`CREATE`,
+    /// `MERGE`, `SET`) need no confirmation.
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// Free-form JSON object. Rendered as a full Schema object (`{"type":
@@ -605,6 +750,54 @@ fn dir_within(root: &std::path::Path, dir: &std::path::Path) -> bool {
     }
 }
 
+/// Whether a cypher statement carries a `DELETE` or `REMOVE` clause — the
+/// two that destroy, and so want the confirmation `drop_plane` wants.
+///
+/// A keyword scan over the text rather than the compiled statement, whose
+/// ops are private to the parser. String literals and backtick names are
+/// skipped so a value that says "delete" is not a clause, and a word after
+/// `.` is a property, not a keyword. The scan errs toward asking: a stray
+/// `remove` outside a literal costs one confirmed retry, while a missed one
+/// would cost data.
+///
+/// The skipping mirrors the parser's lexing exactly, because any gap between
+/// the two is a place to hide a clause: a string literal honours `\` escapes
+/// (`'it\'s'`), while a backtick name has none and ends at the next backtick
+/// unconditionally — treating `\` as an escape there would let `` `n\` ``
+/// swallow the closing backtick and everything after it.
+fn destroys(query: &str) -> bool {
+    let mut word = String::new();
+    let mut after_dot = false;
+    let mut quote: Option<char> = None;
+    let mut chars = query.chars().peekable();
+    let is_keyword = |w: &str| w.eq_ignore_ascii_case("delete") || w.eq_ignore_ascii_case("remove");
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' && q != '`' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            if !after_dot && is_keyword(&word) {
+                return true;
+            }
+            word.clear();
+        }
+        after_dot = c == '.';
+        if matches!(c, '"' | '\'' | '`') {
+            quote = Some(c);
+        }
+    }
+    !after_dot && is_keyword(&word)
+}
+
 /// The file `file` names under `root`, or an error when it would land outside.
 ///
 /// Every file the tools read goes through here: `file` is a tool argument or
@@ -668,6 +861,16 @@ impl DrStrange {
     /// Runs sync database work off the async runtime. A core error becomes a
     /// *tool-level* error (the caller sees the message); only a task-join
     /// failure is a protocol error (arch/06: rmcp's two failure modes).
+    /// [`Self::blocking`] at the transport boundary: rmcp's `#[tool_router]`
+    /// accepts only its own error type from a tool body, so this is the one
+    /// place the crate's [`McpError`] becomes a wire error.
+    async fn run<F>(&self, tool: &'static str, f: F) -> Result<CallToolResult, rmcp::ErrorData>
+    where
+        F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
+    {
+        self.blocking(tool, f).await.map_err(Into::into)
+    }
+
     async fn blocking<F>(&self, tool: &'static str, f: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
@@ -675,16 +878,56 @@ impl DrStrange {
         // Held for the tool's whole body: this is the only thing bounding tool
         // work, since the transport releases its own permit once the call is
         // merely queued (see `with_tool_gate`). Queues rather than rejects — a
-        // busy server should make an agent wait, not fail it.
-        let _permit = self
-            .tools
-            .acquire()
-            .await
-            .map_err(|_| McpError::internal_error("tool gate closed", None))?;
+        // busy server should make an agent wait, not fail it — but not for
+        // ever: past the deadline the wait is a tool error the agent can act
+        // on, where an open-ended queue looks like a server that hung.
+        let started = std::time::Instant::now();
+        let closed =
+            |_| McpError::Protocol(rmcp::ErrorData::internal_error("tool gate closed", None));
+        let acquire = self.tools.clone().acquire_owned();
+        let permit = match self.deadline {
+            Some(limit) => match tokio::time::timeout(limit, acquire).await {
+                Ok(permit) => permit.map_err(closed)?,
+                Err(_) => {
+                    tracing::warn!(tool, ?limit, "mcp tool waited past its deadline");
+                    return Ok(tool_error(format!(
+                        "{tool}: the server is busy — no tool slot freed within \
+                         {}s; retry in a moment, or narrow the calls in flight",
+                        limit.as_secs()
+                    )));
+                }
+            },
+            None => acquire.await.map_err(closed)?,
+        };
         let db = self.db.clone();
-        let joined = tokio::task::spawn_blocking(move || f(&db))
-            .await
-            .map_err(|e| McpError::internal_error(format!("task join failed: {e}"), None))?;
+        // The permit travels with the body, not with this future: a body that
+        // outlives its deadline keeps its slot until it returns, so the gate
+        // still counts the work that is actually running.
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&db)
+        });
+        let joined = match self.deadline {
+            Some(limit) => {
+                let left = limit.saturating_sub(started.elapsed());
+                match tokio::time::timeout(left, task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        tracing::warn!(tool, ?limit, "mcp tool ran past its deadline");
+                        return Ok(tool_error(format!(
+                            "{tool}: did not finish within {}s; it keeps running \
+                             to completion but this call is abandoned — narrow \
+                             the request (a smaller `limit`, `depth` or \
+                             document), or raise {ENV_TOOL_DEADLINE_SECS}",
+                            limit.as_secs()
+                        )));
+                    }
+                }
+            }
+            None => task.await,
+        };
+        let joined = joined
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("task join failed: {e}"), None))?;
         Ok(match joined {
             Ok(value) => {
                 tracing::debug!(tool, "mcp tool ok");
@@ -1143,31 +1386,50 @@ fn grep_tree(
 /// Provider keys come from the server's environment, never from tool
 /// parameters — `key_env` names the variable, it does not carry the key.
 #[allow(clippy::too_many_arguments)]
+/// What one digest run needs beyond its input: where it came from, the id it
+/// stamps, the mode it reads in, and the two providers it may call.
+///
+/// The providers arrive already checked by [`wire_provider`] — a name the
+/// request supplied is a preset or the operator's own, never a base URL, and
+/// the key variable is the one that provider reads.
+struct DigestRun<'a> {
+    source: String,
+    run_id: String,
+    mode: dr_strange_llm::DigestMode,
+    chat: (&'a str, Option<&'a str>),
+    embed: (&'a str, Option<&'a str>),
+}
+
 fn run_digest(
     facts: dr_strange_llm::Preprocessed,
     req: &Digest,
     tuning: &DigestTuning,
     p: &dr_strange_core::PlaneHandle<'_>,
-    source: String,
-    run_id: String,
-    mode: dr_strange_llm::DigestMode,
+    run: DigestRun<'_>,
 ) -> AnyResult<dr_strange_llm::DigestResult> {
-    let chat_provider = req.chat.as_deref().unwrap_or("openai");
-    let embed_provider = req.embed.as_deref().unwrap_or(chat_provider);
+    let DigestRun {
+        source,
+        run_id,
+        mode,
+        chat: (chat_provider, chat_key_env),
+        embed: (embed_provider, embed_key_env),
+    } = run;
     let embed = !req.no_embed;
 
+    // Provider keys come from the server's environment (never tool params) —
+    // `key_env` names the variable, it does not carry the key.
     let chat = dr_strange_llm::build_provider(
         chat_provider,
         req.model.as_deref(),
         None,
-        req.key_env.as_deref(),
+        chat_key_env,
         false,
     )?;
     let embedder = dr_strange_llm::build_provider(
         embed_provider,
         req.embed_model.as_deref(),
         None,
-        req.embed_key_env.as_deref(),
+        embed_key_env,
         embed,
     )?;
     let opts = dr_strange_llm::DigestOptions {
@@ -1541,19 +1803,20 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
     }
 }
 
-fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
+fn hybrid_logic(db: &Database, req: Hybrid, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
     let mut b = plane.hybrid();
     if let Some(label) = &req.label {
         b = b.label(label.clone());
     }
     if let Some(prop) = &req.vector_prop {
-        let provider = req.provider.as_deref().unwrap_or("openai");
+        let (provider, key_env) =
+            wire_provider(req.provider.as_deref(), req.key_env.as_deref(), allow)?;
         let embedder: Box<dyn dr_strange_llm::Embedder> = Box::new(dr_strange_llm::build_provider(
             provider,
             req.embed_model.as_deref(),
             None,
-            req.key_env.as_deref(),
+            key_env,
             true,
         )?);
         let reply = embedder.embed(std::slice::from_ref(&req.query))?;
@@ -1597,26 +1860,29 @@ fn hybrid_logic(db: &Database, req: Hybrid) -> AnyResult<Value> {
     Ok(jval!({ "results": results, "count": results.len() }))
 }
 
-fn ask_logic(db: &Database, req: Ask) -> AnyResult<Value> {
+fn ask_logic(db: &Database, req: Ask, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
-    let provider = req.provider.as_deref().unwrap_or("openai");
-    let chat = dr_strange_llm::build_provider(
-        provider,
-        req.model.as_deref(),
-        None,
-        req.key_env.as_deref(),
-        false,
-    )?;
-    let embedder = req.embed_provider.as_deref().and_then(|ep| {
-        dr_strange_llm::build_provider(
-            ep,
-            req.embed_model.as_deref(),
-            None,
-            req.embed_key_env.as_deref(),
-            true,
-        )
-        .ok()
-    });
+    let (provider, key_env) =
+        wire_provider(req.provider.as_deref(), req.key_env.as_deref(), allow)?;
+    let chat =
+        dr_strange_llm::build_provider(provider, req.model.as_deref(), None, key_env, false)?;
+    // The grounding embedder is optional, so a provider that cannot be
+    // *built* degrades to schema-only; a provider that is not *allowed* is
+    // refused like the chat one — silence would hide the policy.
+    let embedder = match req.embed_provider.as_deref() {
+        None => None,
+        Some(ep) => {
+            let (ep, embed_key_env) = wire_provider(Some(ep), req.embed_key_env.as_deref(), allow)?;
+            dr_strange_llm::build_provider(
+                ep,
+                req.embed_model.as_deref(),
+                None,
+                embed_key_env,
+                true,
+            )
+            .ok()
+        }
+    };
     let opts = dr_strange_llm::AskOptions {
         max_attempts: req.max_attempts.unwrap_or(20),
         dry_run: req.dry_run,
@@ -1692,8 +1958,9 @@ fn pin(p: PlaneHandle<'_>, at: Option<dr_strange_parser::AsOfSpec>) -> AnyResult
     Ok(p)
 }
 
-fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
-    let provider = req.embed.as_deref().unwrap_or("openai");
+fn cypher_logic(db: &Database, req: Cypher, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
+    let (provider, embed_key_env) =
+        wire_provider(req.embed.as_deref(), req.embed_key_env.as_deref(), allow)?;
     // Built eagerly because the parser needs it up front, but tolerantly: most
     // queries never embed anything, and a plain MATCH must not require a
     // provider. The reason is kept rather than dropped — without it a query
@@ -1704,7 +1971,7 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
         provider,
         req.embed_model.as_deref(),
         None,
-        req.embed_key_env.as_deref(),
+        embed_key_env,
         true,
     );
     let why_no_embedder = built.as_ref().err().map(|e| e.to_string());
@@ -1753,6 +2020,18 @@ fn cypher_logic(db: &Database, req: Cypher) -> AnyResult<Value> {
             }
         }
         dr_strange_parser::Statement::Write(w) => {
+            // The same bar `drop_plane` sets: what destroys is confirmed, what
+            // adds is not. Checked before the mirror test so the answer to a
+            // destructive statement is one refusal, not two in turn.
+            if !req.confirm && destroys(&req.query) {
+                anyhow::bail!(
+                    "refusing to run a DELETE/REMOVE on plane `{}` without \
+                     `confirm: true` — it destroys nodes, edges, labels or \
+                     properties; pass confirm=true to run it (CREATE/MERGE/SET \
+                     need no confirmation)",
+                    req.plane
+                );
+            }
             if let Some(commit) = mirrored_commit(&plane)? {
                 anyhow::bail!(
                     "plane `{}` mirrors a source tree (synced at commit {}); \
@@ -1910,8 +2189,22 @@ fn digest_logic(
     req: Digest,
     tuning: DigestTuning,
     local_files: bool,
+    allow: Option<&EmbedProvider>,
 ) -> AnyResult<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Applying rewrites the plane, so it is confirmed as `drop_plane` is —
+    // and refused here, before the document is read or a provider called,
+    // so a missing confirmation costs nothing but the retry.
+    if req.apply && !req.confirm {
+        anyhow::bail!(
+            "refusing to apply a digest to plane `{}` without `confirm: true` — \
+             apply writes the extraction into the plane (and on a mirrored \
+             plane reconciles it against the tree); dry-run first if unsure, \
+             then call again with apply=true and confirm=true",
+            req.plane
+        );
+    }
 
     let (mut facts, ran_plugins) = resolve_input(&req, local_files)?;
 
@@ -1942,7 +2235,24 @@ fn digest_logic(
     // model call at all** — no provider constructed, no key read from the
     // environment, no request made.
     let result = if facts.needs_model() {
-        run_digest(facts, &req, &tuning, &p, source, run_id, mode)?
+        {
+            // A provider a request names is a preset or the operator's own; a base
+            // URL would make the server POST wherever a caller says, with a key
+            // from its own environment.
+            let chat = wire_provider(req.chat.as_deref(), req.key_env.as_deref(), allow)?;
+            let embed = match req.embed.as_deref() {
+                Some(e) => wire_provider(Some(e), req.embed_key_env.as_deref(), allow)?,
+                None => chat,
+            };
+            let run = DigestRun {
+                source,
+                run_id,
+                mode,
+                chat,
+                embed,
+            };
+            run_digest(facts, &req, &tuning, &p, run)?
+        }
     } else {
         dr_strange_llm::fold(facts, dr_strange_llm::DigestResult::default())
     };
@@ -2244,9 +2554,9 @@ impl DrStrange {
         server watches) `grep` searches it. Match `synced_root` against the \
         caller's cwd to find the right plane instead of relying on any \
         tool's default.")]
-    async fn list_planes(&self) -> Result<CallToolResult, McpError> {
+    async fn list_planes(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
-        self.blocking("list_planes", move |db| {
+        self.run("list_planes", move |db| {
             list_planes_logic(db, root.as_deref())
         })
         .await
@@ -2257,8 +2567,8 @@ impl DrStrange {
     async fn describe_plane(
         &self,
         Parameters(req): Parameters<PlaneOnly>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("describe_plane", move |db| describe_plane_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("describe_plane", move |db| describe_plane_logic(db, req))
             .await
     }
 
@@ -2275,8 +2585,8 @@ impl DrStrange {
     async fn context(
         &self,
         Parameters(req): Parameters<SymbolReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("context", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("context", move |db| {
             compact_logic(db, req, dr_strange_core::compact::context)
         })
         .await
@@ -2290,9 +2600,9 @@ impl DrStrange {
     async fn search(
         &self,
         Parameters(req): Parameters<SearchReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let embed = self.embed.clone();
-        self.blocking("search", move |db| {
+        self.run("search", move |db| {
             let Some(cfg) = &embed else {
                 // The section is `[digest]`, and saying `[server]` was worse
                 // than saying nothing: `[server]` denies unknown fields, so an
@@ -2334,9 +2644,12 @@ impl DrStrange {
         marks them, as `rg -C`). For log messages, config values, comments — \
         anything the graph does not model — and for finding where to point \
         `context` when the name is only half known.")]
-    async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
+    async fn grep(
+        &self,
+        Parameters(req): Parameters<GrepReq>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
-        self.blocking("grep", move |db| {
+        self.run("grep", move |db| {
             let Some(root) = root else {
                 anyhow::bail!(
                     "no source tree attached to this server — `serve watch` \
@@ -2355,8 +2668,8 @@ impl DrStrange {
     async fn trace(
         &self,
         Parameters(req): Parameters<TraceReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("trace", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("trace", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::trace(
                 &plane, &req.from, &req.to,
@@ -2373,8 +2686,8 @@ impl DrStrange {
     async fn impact(
         &self,
         Parameters(req): Parameters<ImpactReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("impact", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("impact", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::impact(
                 &plane,
@@ -2399,8 +2712,8 @@ impl DrStrange {
     async fn fathom(
         &self,
         Parameters(req): Parameters<FathomReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("fathom", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("fathom", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::fathom(
                 &plane,
@@ -2423,8 +2736,8 @@ impl DrStrange {
     async fn history(
         &self,
         Parameters(req): Parameters<HistoryReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("history", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("history", move |db| {
             // Naming the code plane finds the history beside it; naming the
             // history plane is taken at its word.
             let history = dr_strange_core::compact::history_plane_name(&req.plane);
@@ -2456,10 +2769,10 @@ impl DrStrange {
     async fn snippet(
         &self,
         Parameters(req): Parameters<SnippetReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
         let plane_roots = self.local_files;
-        self.blocking("snippet", move |db| {
+        self.run("snippet", move |db| {
             let access = TreeAccess {
                 attached: root.as_deref(),
                 plane_roots,
@@ -2488,10 +2801,10 @@ impl DrStrange {
     async fn recall(
         &self,
         Parameters(req): Parameters<RecallReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
         let plane_roots = self.local_files;
-        self.blocking("recall", move |db| {
+        self.run("recall", move |db| {
             let access = TreeAccess {
                 attached: root.as_deref(),
                 plane_roots,
@@ -2507,8 +2820,8 @@ impl DrStrange {
     async fn describe(
         &self,
         Parameters(req): Parameters<SymbolReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("describe", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("describe", move |db| {
             compact_logic(db, req, dr_strange_core::compact::describe)
         })
         .await
@@ -2518,8 +2831,8 @@ impl DrStrange {
     async fn get_node(
         &self,
         Parameters(req): Parameters<GetNode>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("get_node", move |db| get_node_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("get_node", move |db| get_node_logic(db, req))
             .await
     }
 
@@ -2528,15 +2841,18 @@ impl DrStrange {
     async fn traverse(
         &self,
         Parameters(req): Parameters<Traverse>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("traverse", move |db| traverse_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("traverse", move |db| traverse_logic(db, req))
             .await
     }
 
     #[tool(description = "Run a serialized logical query plan and return the \
         matching node records (with scores where present).")]
-    async fn query(&self, Parameters(req): Parameters<Query>) -> Result<CallToolResult, McpError> {
-        self.blocking("query", move |db| query_logic(db, req)).await
+    async fn query(
+        &self,
+        Parameters(req): Parameters<Query>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("query", move |db| query_logic(db, req)).await
     }
 
     #[tool(description = "Run a graph algorithm over a plane (or one `label` \
@@ -2548,8 +2864,11 @@ impl DrStrange {
         `weight` property; returns {found, path:{nodes, edges, cost}}), or \
         `louvain` (community detection; [{id, community}] + community count). \
         `limit` caps the ranked/labelled rows (default 100).")]
-    async fn algo(&self, Parameters(req): Parameters<Algo>) -> Result<CallToolResult, McpError> {
-        self.blocking("algo", move |db| algo_logic(db, req)).await
+    async fn algo(
+        &self,
+        Parameters(req): Parameters<Algo>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("algo", move |db| algo_logic(db, req)).await
     }
 
     #[tool(
@@ -2565,8 +2884,9 @@ impl DrStrange {
     async fn hybrid(
         &self,
         Parameters(req): Parameters<Hybrid>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("hybrid", move |db| hybrid_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let allow = self.embed.clone();
+        self.run("hybrid", move |db| hybrid_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2578,8 +2898,13 @@ impl DrStrange {
         the generated plan WITHOUT executing it. Read-only — it can never mutate \
         the graph. Chat provider key comes from the server env, never params."
     )]
-    async fn ask(&self, Parameters(req): Parameters<Ask>) -> Result<CallToolResult, McpError> {
-        self.blocking("ask", move |db| ask_logic(db, req)).await
+    async fn ask(
+        &self,
+        Parameters(req): Parameters<Ask>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let allow = self.embed.clone();
+        self.run("ask", move |db| ask_logic(db, req, allow.as_ref()))
+            .await
     }
 
     #[tool(description = "Run an openCypher-subset statement — the way to ask \
@@ -2596,15 +2921,17 @@ impl DrStrange {
         clause it broke on — no need to guess twice. Writes \
         (CREATE/MERGE/SET/REMOVE/DELETE) mutate a plane of your own and are \
         refused on a plane that mirrors a source tree, where the next fold \
-        would undo them; annotate those with write_nodes/write_edges. \
-        Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
+        would undo them; annotate those with write_nodes/write_edges. A \
+        DELETE or REMOVE destroys and requires `confirm: true`, as drop_plane \
+        does; CREATE/MERGE/SET do not. Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
         RETURN f`; `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) \
         AS calls ORDER BY calls DESC LIMIT 10`.")]
     async fn cypher(
         &self,
         Parameters(req): Parameters<Cypher>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("cypher", move |db| cypher_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let allow = self.embed.clone();
+        self.run("cypher", move |db| cypher_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2613,9 +2940,9 @@ impl DrStrange {
     async fn write_nodes(
         &self,
         Parameters(req): Parameters<WriteNodes>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let embed = self.embed.clone();
-        self.blocking("write_nodes", move |db| {
+        self.run("write_nodes", move |db| {
             // Built inside the blocking body: constructing it reads the
             // environment, and `embed` itself is a blocking HTTP call (the LLM
             // layer is sync, on ureq), so it belongs on this thread and not on
@@ -2646,8 +2973,8 @@ impl DrStrange {
     async fn write_edges(
         &self,
         Parameters(req): Parameters<WriteEdges>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("write_edges", move |db| write_edges_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("write_edges", move |db| write_edges_logic(db, req))
             .await
     }
 
@@ -2655,8 +2982,8 @@ impl DrStrange {
     async fn create_plane(
         &self,
         Parameters(req): Parameters<CreatePlane>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("create_plane", move |db| create_plane_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("create_plane", move |db| create_plane_logic(db, req))
             .await
     }
 
@@ -2665,14 +2992,14 @@ impl DrStrange {
     async fn drop_plane(
         &self,
         Parameters(req): Parameters<DropPlane>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         if !req.confirm {
             return Ok(tool_error(format!(
                 "refusing to drop plane '{}': pass confirm=true (this deletes all its data)",
                 req.name
             )));
         }
-        self.blocking("drop_plane", move |db| drop_plane_logic(db, req))
+        self.run("drop_plane", move |db| drop_plane_logic(db, req))
             .await
     }
 
@@ -2682,18 +3009,20 @@ impl DrStrange {
         plane nodes via vector retrieval (set link=false to propose everything as new), embed \
         them, and — \
         only when apply=true — write them with provenance. Dry-run (the default) returns the \
-        proposed nodes/edges for review; call again with apply=true to commit. Provider API keys \
+        proposed nodes/edges for review; call again with apply=true and confirm=true to \
+        commit (apply rewrites the plane, so it is confirmed as drop_plane is). Provider API keys \
         come from the server's environment (e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / \
         DASHSCOPE_API_KEY), never from params."
     )]
     async fn digest(
         &self,
         Parameters(req): Parameters<Digest>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tuning = self.digest;
         let local_files = self.local_files;
-        self.blocking("digest", move |db| {
-            digest_logic(db, req, tuning, local_files)
+        let allow = self.embed.clone();
+        self.run("digest", move |db| {
+            digest_logic(db, req, tuning, local_files, allow.as_ref())
         })
         .await
     }
@@ -2753,7 +3082,6 @@ impl ServerHandler for DrStrange {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use super::*;
     use serde_json::from_value;
@@ -2884,7 +3212,7 @@ mod tests {
     fn digest_refuses_a_path_unless_the_host_allows_local_files() {
         let db = Database::in_memory().unwrap();
         let req: Digest = from_value(jval!({"path": "/etc/passwd"})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), false)
+        let err = digest_logic(&db, req, DigestTuning::default(), false, None)
             .expect_err("a networked server must refuse a caller-named path");
         let msg = err.to_string();
         assert!(msg.contains("does not read local files"), "got: {msg}");
@@ -2900,7 +3228,7 @@ mod tests {
     fn digest_with_neither_text_nor_path_is_refused() {
         let db = Database::in_memory().unwrap();
         let req: Digest = from_value(jval!({"text": "   "})).unwrap();
-        let err = digest_logic(&db, req, DigestTuning::default(), true)
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
             .expect_err("an empty document must not reach a provider");
         assert!(err.to_string().contains("nothing to digest"), "{err}");
     }
@@ -2930,6 +3258,74 @@ mod tests {
             .await
             .expect("the tool should run once a permit frees")
             .expect("list_planes");
+    }
+
+    /// The queue is bounded: a call that cannot get a slot within its deadline
+    /// comes back as a tool error, not as a call that never returns. The
+    /// error is tool-level — the session is fine, this one call was not.
+    #[tokio::test]
+    async fn a_call_behind_a_full_gate_fails_at_its_deadline() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let svc = DrStrange::new(db)
+            .with_tool_gate(gate.clone())
+            .with_tool_deadline(Some(Duration::from_millis(100)));
+
+        let _held = gate.clone().acquire_owned().await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), svc.list_planes())
+            .await
+            .expect("the deadline must end the wait")
+            .expect("a deadline is a tool error, not a protocol error");
+        assert_eq!(answered.is_error, Some(true), "{answered:?}");
+        let text = format!("{:?}", answered.content);
+        assert!(text.contains("busy"), "{text}");
+    }
+
+    /// A body that runs past the deadline is abandoned by the call — and keeps
+    /// its slot until it actually finishes, so the gate still bounds it.
+    #[tokio::test]
+    async fn a_body_past_its_deadline_is_a_tool_error_and_keeps_its_slot() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let gate = Arc::new(Semaphore::new(1));
+        let svc = DrStrange::new(db)
+            .with_tool_gate(gate.clone())
+            .with_tool_deadline(Some(Duration::from_millis(50)));
+
+        let answered = svc
+            .blocking("slow", |_| {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(jval!(null))
+            })
+            .await
+            .expect("a deadline is a tool error, not a protocol error");
+        assert_eq!(answered.is_error, Some(true), "{answered:?}");
+        assert!(format!("{:?}", answered.content).contains("did not finish"));
+        // Abandoned, not released: the body is still running with the slot.
+        assert_eq!(gate.available_permits(), 0, "the slot was released early");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(gate.available_permits(), 1, "the slot outlived the body");
+    }
+
+    /// Unset is the default and an explicit `0` removes the bound; anything
+    /// else is an error naming the variable, which the environment reader
+    /// answers with the default and a warning.
+    #[test]
+    fn the_deadline_is_read_in_seconds_with_zero_disabling_it() {
+        assert_eq!(deadline_try_from(None), Ok(Some(DEFAULT_TOOL_DEADLINE)));
+        assert_eq!(
+            deadline_try_from(Some(" 30 ")),
+            Ok(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(deadline_try_from(Some("0")), Ok(None));
+        assert_eq!(
+            deadline_try_from(Some("nonsense")),
+            Err(McpError::ToolDeadline {
+                value: "nonsense".to_string()
+            })
+        );
+        let err = deadline_try_from(Some("nonsense")).unwrap_err().to_string();
+        assert!(err.contains(ENV_TOOL_DEADLINE_SECS), "{err}");
+        assert!(err.contains("not a number of seconds"), "{err}");
     }
 
     /// The gate is only useful if every session shares one — MCP puts no limit
@@ -3245,6 +3641,7 @@ mod tests {
         let out = hybrid_logic(
             &db,
             from_value(jval!({"query": "graph", "label": "Doc", "keyword_prop": "body"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(out["count"], jval!(2));
@@ -3256,9 +3653,152 @@ mod tests {
         assert!(
             hybrid_logic(
                 &db,
-                from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap()
+                from_value(jval!({"query": "x", "keyword_prop": "body"})).unwrap(),
+                None
             )
             .is_err()
+        );
+    }
+
+    /// SSRF parity with the web crate (audit N2a): a tool call may name a
+    /// preset or the host's configured provider, never a base URL, and never
+    /// the environment variable the key is read from. Checked on `cypher`,
+    /// `hybrid` and `ask`, the tools that take a provider from params.
+    /// `digest` resolves its providers through the same gate, before the run
+    /// — so a base URL or a foreign key variable is refused there too.
+    #[test]
+    fn digest_params_cannot_name_a_url_or_a_foreign_key_env() {
+        let db = fixture();
+        let url = "http://169.254.169.254/latest/meta-data";
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "chat": url})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = digest_logic(
+            &db,
+            from_value(jval!({"text": "some prose", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
+            DigestTuning::default(),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn tool_params_cannot_name_a_url_or_a_foreign_key_env() {
+        let db = fixture();
+        let url = "http://169.254.169.254/latest/meta-data";
+        // A raw URL is refused before any request is made — and refused even
+        // for a plain MATCH, which never embeds: the policy is on the name.
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN n", "embed": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = hybrid_logic(
+            &db,
+            from_value(jval!({"query": "x", "vector_prop": "v", "provider": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+        let err = ask_logic(
+            &db,
+            from_value(jval!({"question": "q", "provider": url})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not allowed over the wire"), "{err}");
+
+        // A preset passes the gate (the query then runs; nothing embeds).
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({"query": "MATCH (n:Doc) RETURN n", "embed": "deepseek"})).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+
+        // A foreign key_env is refused on a preset: the server would
+        // otherwise send whatever that variable holds as a bearer token.
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "openai",
+                "embed_key_env": "AWS_SECRET_ACCESS_KEY",
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+        let err = ask_logic(
+            &db,
+            from_value(jval!({"question": "q", "key_env": "AWS_SECRET_ACCESS_KEY"})).unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'AWS_SECRET_ACCESS_KEY' is not accepted"),
+            "{err}"
+        );
+
+        // The host's configured provider is the one URL that passes, with its
+        // own key variable and no other.
+        let configured = EmbedProvider {
+            provider: "http://embed.internal/v1".into(),
+            model: Some("m".into()),
+            key_env: Some("EMBED_KEY".into()),
+        };
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "http://embed.internal/v1",
+                "embed_model": "m",
+            }))
+            .unwrap(),
+            Some(&configured),
+        )
+        .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        let err = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": "MATCH (n:Doc) RETURN n",
+                "embed": "http://embed.internal/v1",
+                "embed_key_env": "OPENAI_API_KEY",
+            }))
+            .unwrap(),
+            Some(&configured),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("key_env 'OPENAI_API_KEY' is not accepted"),
+            "{err}"
         );
     }
 
@@ -3269,6 +3809,7 @@ mod tests {
         let all = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (n:Doc) RETURN n"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2);
@@ -3276,12 +3817,20 @@ mod tests {
         let hop = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (a:Doc)-[:CITES]->(b:Doc) RETURN b"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(hop.as_array().unwrap().len(), 1);
         assert_eq!(hop[0]["external_key"], jval!("d1"));
         // a malformed query surfaces the parser error, not a panic
-        assert!(cypher_logic(&db, from_value(jval!({"query": "MATCH (n)"})).unwrap()).is_err());
+        assert!(
+            cypher_logic(
+                &db,
+                from_value(jval!({"query": "MATCH (n)"})).unwrap(),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3290,6 +3839,7 @@ mod tests {
         let out = cypher_logic(
             &db,
             from_value(jval!({"query": r#"CREATE (a:Person {key:"x", age:40})"#})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(out["nodes_created"], jval!(1));
@@ -3300,6 +3850,116 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(n.labels.iter().any(|l| l == "Person"));
+    }
+
+    /// What destroys is confirmed, as `drop_plane` is; what adds is not.
+    #[test]
+    fn cypher_destructive_statements_need_confirm() {
+        let db = Database::in_memory().unwrap();
+        cypher_logic(
+            &db,
+            from_value(
+                jval!({"query": r#"CREATE (a:Person {key:"x", age:40, note:"delete me"})"#}),
+            )
+            .unwrap(),
+            None,
+        )
+        .expect("an additive write with a literal saying delete is not gated");
+        cypher_logic(
+            &db,
+            from_value(jval!({"query": r#"MATCH (a:Person) WHERE key(a) = "x" SET a.age = 41"#}))
+                .unwrap(),
+            None,
+        )
+        .expect("SET is additive");
+
+        for q in [
+            r#"MATCH (a:Person) WHERE key(a) = "x" REMOVE a.age"#,
+            r#"MATCH (a:Person) WHERE key(a) = "x" DETACH DELETE a"#,
+            r#"match (a:Person) where key(a) = "x" delete a"#,
+        ] {
+            let err = cypher_logic(&db, from_value(jval!({"query": q})).unwrap(), None)
+                .expect_err("a destructive statement without confirm must be refused")
+                .to_string();
+            assert!(err.contains("confirm: true"), "{q}: {err}");
+        }
+        let plane = db.plane("startup").unwrap();
+        assert!(
+            plane.node_by_key("x").unwrap().is_some(),
+            "refused means untouched"
+        );
+
+        let out = cypher_logic(
+            &db,
+            from_value(jval!({
+                "query": r#"MATCH (a:Person) WHERE key(a) = "x" DETACH DELETE a"#,
+                "confirm": true
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out["nodes_deleted"], jval!(1));
+        assert!(plane.node_by_key("x").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_keyword_is_told_from_a_literal_and_a_property() {
+        assert!(destroys("MATCH (n) DELETE n"));
+        assert!(destroys("MATCH (n) remove n:Label"));
+        assert!(destroys("MATCH (n) WHERE n.x = 'a' REMOVE n.x"));
+        assert!(!destroys(r#"CREATE (n {note: "please delete"})"#));
+        assert!(!destroys("MATCH (n) WHERE n.remove = 1 RETURN n"));
+        assert!(!destroys("MATCH (n) RETURN n.delete"));
+        assert!(!destroys("MATCH (n:`delete`) RETURN n"));
+        // A backslash inside a backtick name is a character of the name, as
+        // the parser reads it — not an escape that hides the clause after it.
+        assert!(destroys("MATCH (n:`a\\`) DETACH DELETE n"));
+        assert!(destroys("MATCH (`n\\`) DETACH DELETE `n\\`"));
+        assert!(destroys(r#"MATCH (n) WHERE n.x = 'a\'b' DELETE n"#));
+        assert!(!destroys(
+            "MATCH (n) WHERE n.x = 'it''s' SET n.deleted = true"
+        ));
+    }
+
+    /// The stdio binary's retention reading: unset is the served default,
+    /// `0` is unbounded, a count is itself, and a non-count is refused rather
+    /// than silently becoming the default.
+    #[test]
+    fn the_stdio_retention_is_read_like_the_servers() {
+        assert_eq!(
+            retain_commits_try_from(None),
+            Ok(Some(DEFAULT_RETAIN_COMMITS))
+        );
+        assert_eq!(retain_commits_try_from(Some("0")), Ok(None));
+        assert_eq!(retain_commits_try_from(Some(" 7 ")), Ok(Some(7)));
+        let err = retain_commits_try_from(Some("many")).unwrap_err();
+        assert_eq!(
+            err,
+            McpError::RetainCommits {
+                value: "many".to_string()
+            }
+        );
+        assert!(err.to_string().contains(ENV_RETAIN_COMMITS));
+    }
+
+    /// Applying is confirmed before anything is read or any provider called.
+    #[test]
+    fn digest_apply_needs_confirm() {
+        let db = Database::in_memory().unwrap();
+        let req: Digest =
+            from_value(jval!({"text": "Ada wrote the first program.", "apply": true})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
+            .expect_err("apply without confirm must be refused")
+            .to_string();
+        assert!(err.contains("confirm: true"), "{err}");
+        // A dry-run over the same text is not gated: it stops later, at the
+        // provider, which is the point — nothing destructive was asked.
+        let req: Digest = from_value(jval!({"text": "Ada wrote the first program."})).unwrap();
+        let err = digest_logic(&db, req, DigestTuning::default(), true, None)
+            .expect_err("no provider in tests")
+            .to_string();
+        assert!(!err.contains("confirm"), "{err}");
     }
 
     /// Stamp the fixture's plane as a digest would: it now mirrors a commit.
@@ -3321,6 +3981,7 @@ mod tests {
         let err = cypher_logic(
             &db,
             from_value(jval!({"query": "SEARCH (d:Doc) NEAR 'x' RETURN"})).unwrap(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3343,6 +4004,7 @@ mod tests {
         let err = cypher_logic(
             &db,
             from_value(jval!({"query": r#"CREATE (a:Person {key:"x"})"#})).unwrap(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3372,11 +4034,11 @@ mod tests {
         let db = fixture();
         let query =
             || from_value(jval!({"query": "MATCH (n:Doc) RETURN n ORDER BY n.year"})).unwrap();
-        let records = cypher_logic(&db, query()).unwrap();
+        let records = cypher_logic(&db, query(), None).unwrap();
         assert_eq!(records[0]["external_key"], jval!("d0"));
 
         mirrored(&db);
-        let text = cypher_logic(&db, query()).unwrap();
+        let text = cypher_logic(&db, query(), None).unwrap();
         let text = text.as_str().expect("compact text on a mirrored plane");
         assert!(
             text.starts_with("2 nodes\nsynced: commit 0123456789ab\n"),
@@ -3389,6 +4051,7 @@ mod tests {
         let table = cypher_logic(
             &db,
             from_value(jval!({"query": "MATCH (n:Doc) RETURN count(*) AS docs"})).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(table["rows"], jval!([[2]]));

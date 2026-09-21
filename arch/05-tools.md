@@ -139,7 +139,11 @@ security or operations reader can hold the code to.
   every CLI command goes through — not only `serve`. A CLI-only store
   therefore reclaims old versions at compaction like a served one. The two
   `init` opens that only create the file pass no retention: nothing is
-  written through them, and the `serve watch` they spawn sets its own.
+  written through them, and the `serve watch` they spawn sets its own. The
+  stdio `drsg-mcp` binary, which has no config file, opens with the same
+  default (`dr_strange_mcp::DEFAULT_RETAIN_COMMITS`, the figure the web
+  crate re-exports) or with `DRSG_RETAIN_COMMITS` when set — a store driven
+  only through a stdio host is bounded like every other (06 §3).
 - **Respawn.** A port `init` picked itself is retried (up to three picks)
   when the child exits before listening — the pick-then-bind gap is a race
   it can lose; an explicit `--addr` or a recorded address is never swapped.

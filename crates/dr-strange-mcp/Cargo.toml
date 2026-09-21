@@ -28,6 +28,7 @@ dr-strange-core = { workspace = true, features = ["json"] }
 # agents, so the `digest` tool (arch/07) is always compiled in.
 dr-strange-llm = { path = "../dr-strange-llm" }
 dr-strange-log.workspace = true
+thiserror.workspace = true
 dr-strange-parser.workspace = true
 # `client` + the streamable-http client transport are for `relay`: when a
 # repository already runs `drsg serve … watch`, this binary forwards the
@@ -43,7 +44,8 @@ rmcp = { workspace = true, features = [
 # The liveness probe's HTTP client. Pinned to the version rmcp itself uses, so
 # the relay and the probe share one client crate rather than linking two.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+# `time` for the per-call tool deadline.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -52,6 +54,11 @@ schemars = "1"
 # could not, and the reason agents kept reaching past it.
 regex = "1"
 tracing.workspace = true
+
+# `relay` forwards the `Authorization` a `.mcp.json` carries, so it reads
+# only a file the current user owns: the uid comes from here.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # `relay`'s discovery tests write `.mcp.json` files into throwaway trees.
