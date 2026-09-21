@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     // this process writes (`write_nodes`, `write_edges`, `cypher`, `digest`).
     // With no config file to read, the environment is the only knob; the
     // default is the one `drsg serve` and the CLI open with.
-    let retain = dr_strange_mcp::retain_commits_from(
+    let retain = dr_strange_mcp::retain_commits_try_from(
         std::env::var(dr_strange_mcp::ENV_RETAIN_COMMITS)
             .ok()
             .as_deref(),

@@ -17,9 +17,11 @@
 //! runs the second one, `drsg-mcp` forwards to it rather than opening the
 //! same database, which one process at a time may do.
 
+mod error;
 mod recall;
 pub mod relay;
 
+pub use error::McpError;
 pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use dr_strange_core::{
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json as jval};
@@ -167,10 +169,19 @@ pub const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(300);
 /// is through its host.
 pub const ENV_TOOL_DEADLINE_SECS: &str = "DRSG_MCP_TOOL_DEADLINE_SECS";
 
-/// The deadline the environment asks for, else the default. An unparsable
-/// value is the default too: a typo should not silently remove the bound.
+/// The deadline the environment asks for, else the default — which a value
+/// that is not a count also falls back to, with a warning: a typo should not
+/// silently remove the bound, and building a [`DrStrange`] cannot fail. The
+/// error is there for a caller that would rather refuse to start, and for the
+/// day this decides differently.
 pub fn tool_deadline_from_env() -> Option<Duration> {
-    deadline_from(std::env::var(ENV_TOOL_DEADLINE_SECS).ok().as_deref())
+    match deadline_try_from(std::env::var(ENV_TOOL_DEADLINE_SECS).ok().as_deref()) {
+        Ok(deadline) => deadline,
+        Err(e) => {
+            tracing::warn!("{e}; falling back to the default");
+            Some(DEFAULT_TOOL_DEADLINE)
+        }
+    }
 }
 
 /// Commits of history a database keeps when nothing says otherwise: enough
@@ -188,48 +199,37 @@ pub const DEFAULT_RETAIN_COMMITS: u64 = 20;
 /// `0` keeps everything, as `[server] retain_commits = 0` does.
 pub const ENV_RETAIN_COMMITS: &str = "DRSG_RETAIN_COMMITS";
 
-/// [`ENV_RETAIN_COMMITS`] held something that is not a count.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetainCommitsError {
-    pub value: String,
-}
-
-impl std::fmt::Display for RetainCommitsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{ENV_RETAIN_COMMITS}={:?} is not a number of commits (a whole number; 0 keeps every version)",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for RetainCommitsError {}
-
 /// The retention `value` — the environment's reading of
 /// [`ENV_RETAIN_COMMITS`], if any — asks for, in `Database::set_retention`'s
 /// encoding: `None` is unbounded. Unset is the default; `0` is unbounded; a
 /// value that is not a count is an error rather than a silent default, since
 /// a typo here would quietly change what a compaction throws away.
-pub fn retain_commits_from(value: Option<&str>) -> Result<Option<u64>, RetainCommitsError> {
+pub fn retain_commits_try_from(value: Option<&str>) -> Result<Option<u64>, McpError> {
     match value {
         None => Ok(Some(DEFAULT_RETAIN_COMMITS)),
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(0) => Ok(None),
             Ok(commits) => Ok(Some(commits)),
-            Err(_) => Err(RetainCommitsError {
+            Err(_) => Err(McpError::RetainCommits {
                 value: raw.to_string(),
             }),
         },
     }
 }
 
-/// [`tool_deadline_from_env`] on a value already read.
-fn deadline_from(value: Option<&str>) -> Option<Duration> {
-    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => None,
-        Some(secs) => Some(Duration::from_secs(secs)),
-        None => Some(DEFAULT_TOOL_DEADLINE),
+/// [`tool_deadline_from_env`] on a value already read: unset is the default,
+/// `0` removes the deadline, and anything else is an error rather than a
+/// silent reading — the caller decides what to do with a misconfigured host.
+fn deadline_try_from(value: Option<&str>) -> Result<Option<Duration>, McpError> {
+    let Some(raw) = value else {
+        return Ok(Some(DEFAULT_TOOL_DEADLINE));
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+        Err(_) => Err(McpError::ToolDeadline {
+            value: raw.to_string(),
+        }),
     }
 }
 
@@ -861,6 +861,16 @@ impl DrStrange {
     /// Runs sync database work off the async runtime. A core error becomes a
     /// *tool-level* error (the caller sees the message); only a task-join
     /// failure is a protocol error (arch/06: rmcp's two failure modes).
+    /// [`Self::blocking`] at the transport boundary: rmcp's `#[tool_router]`
+    /// accepts only its own error type from a tool body, so this is the one
+    /// place the crate's [`McpError`] becomes a wire error.
+    async fn run<F>(&self, tool: &'static str, f: F) -> Result<CallToolResult, rmcp::ErrorData>
+    where
+        F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
+    {
+        self.blocking(tool, f).await.map_err(Into::into)
+    }
+
     async fn blocking<F>(&self, tool: &'static str, f: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&Database) -> AnyResult<Value> + Send + 'static,
@@ -872,7 +882,8 @@ impl DrStrange {
         // ever: past the deadline the wait is a tool error the agent can act
         // on, where an open-ended queue looks like a server that hung.
         let started = std::time::Instant::now();
-        let closed = |_| McpError::internal_error("tool gate closed", None);
+        let closed =
+            |_| McpError::Protocol(rmcp::ErrorData::internal_error("tool gate closed", None));
         let acquire = self.tools.clone().acquire_owned();
         let permit = match self.deadline {
             Some(limit) => match tokio::time::timeout(limit, acquire).await {
@@ -915,8 +926,8 @@ impl DrStrange {
             }
             None => task.await,
         };
-        let joined =
-            joined.map_err(|e| McpError::internal_error(format!("task join failed: {e}"), None))?;
+        let joined = joined
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("task join failed: {e}"), None))?;
         Ok(match joined {
             Ok(value) => {
                 tracing::debug!(tool, "mcp tool ok");
@@ -2543,9 +2554,9 @@ impl DrStrange {
         server watches) `grep` searches it. Match `synced_root` against the \
         caller's cwd to find the right plane instead of relying on any \
         tool's default.")]
-    async fn list_planes(&self) -> Result<CallToolResult, McpError> {
+    async fn list_planes(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
-        self.blocking("list_planes", move |db| {
+        self.run("list_planes", move |db| {
             list_planes_logic(db, root.as_deref())
         })
         .await
@@ -2556,8 +2567,8 @@ impl DrStrange {
     async fn describe_plane(
         &self,
         Parameters(req): Parameters<PlaneOnly>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("describe_plane", move |db| describe_plane_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("describe_plane", move |db| describe_plane_logic(db, req))
             .await
     }
 
@@ -2574,8 +2585,8 @@ impl DrStrange {
     async fn context(
         &self,
         Parameters(req): Parameters<SymbolReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("context", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("context", move |db| {
             compact_logic(db, req, dr_strange_core::compact::context)
         })
         .await
@@ -2589,9 +2600,9 @@ impl DrStrange {
     async fn search(
         &self,
         Parameters(req): Parameters<SearchReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let embed = self.embed.clone();
-        self.blocking("search", move |db| {
+        self.run("search", move |db| {
             let Some(cfg) = &embed else {
                 // The section is `[digest]`, and saying `[server]` was worse
                 // than saying nothing: `[server]` denies unknown fields, so an
@@ -2633,9 +2644,12 @@ impl DrStrange {
         marks them, as `rg -C`). For log messages, config values, comments — \
         anything the graph does not model — and for finding where to point \
         `context` when the name is only half known.")]
-    async fn grep(&self, Parameters(req): Parameters<GrepReq>) -> Result<CallToolResult, McpError> {
+    async fn grep(
+        &self,
+        Parameters(req): Parameters<GrepReq>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
-        self.blocking("grep", move |db| {
+        self.run("grep", move |db| {
             let Some(root) = root else {
                 anyhow::bail!(
                     "no source tree attached to this server — `serve watch` \
@@ -2654,8 +2668,8 @@ impl DrStrange {
     async fn trace(
         &self,
         Parameters(req): Parameters<TraceReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("trace", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("trace", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::trace(
                 &plane, &req.from, &req.to,
@@ -2672,8 +2686,8 @@ impl DrStrange {
     async fn impact(
         &self,
         Parameters(req): Parameters<ImpactReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("impact", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("impact", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::impact(
                 &plane,
@@ -2698,8 +2712,8 @@ impl DrStrange {
     async fn fathom(
         &self,
         Parameters(req): Parameters<FathomReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("fathom", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("fathom", move |db| {
             let plane = db.plane(&req.plane)?;
             Ok(Value::String(dr_strange_core::compact::fathom(
                 &plane,
@@ -2722,8 +2736,8 @@ impl DrStrange {
     async fn history(
         &self,
         Parameters(req): Parameters<HistoryReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("history", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("history", move |db| {
             // Naming the code plane finds the history beside it; naming the
             // history plane is taken at its word.
             let history = dr_strange_core::compact::history_plane_name(&req.plane);
@@ -2755,10 +2769,10 @@ impl DrStrange {
     async fn snippet(
         &self,
         Parameters(req): Parameters<SnippetReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let root = self.source_root.clone();
         let plane_roots = self.local_files;
-        self.blocking("snippet", move |db| {
+        self.run("snippet", move |db| {
             let access = TreeAccess {
                 attached: root.as_deref(),
                 plane_roots,
@@ -2787,10 +2801,10 @@ impl DrStrange {
     async fn recall(
         &self,
         Parameters(req): Parameters<RecallReq>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
         let plane_roots = self.local_files;
-        self.blocking("recall", move |db| {
+        self.run("recall", move |db| {
             let access = TreeAccess {
                 attached: root.as_deref(),
                 plane_roots,
@@ -2806,8 +2820,8 @@ impl DrStrange {
     async fn describe(
         &self,
         Parameters(req): Parameters<SymbolReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("describe", move |db| {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("describe", move |db| {
             compact_logic(db, req, dr_strange_core::compact::describe)
         })
         .await
@@ -2817,8 +2831,8 @@ impl DrStrange {
     async fn get_node(
         &self,
         Parameters(req): Parameters<GetNode>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("get_node", move |db| get_node_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("get_node", move |db| get_node_logic(db, req))
             .await
     }
 
@@ -2827,15 +2841,18 @@ impl DrStrange {
     async fn traverse(
         &self,
         Parameters(req): Parameters<Traverse>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("traverse", move |db| traverse_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("traverse", move |db| traverse_logic(db, req))
             .await
     }
 
     #[tool(description = "Run a serialized logical query plan and return the \
         matching node records (with scores where present).")]
-    async fn query(&self, Parameters(req): Parameters<Query>) -> Result<CallToolResult, McpError> {
-        self.blocking("query", move |db| query_logic(db, req)).await
+    async fn query(
+        &self,
+        Parameters(req): Parameters<Query>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("query", move |db| query_logic(db, req)).await
     }
 
     #[tool(description = "Run a graph algorithm over a plane (or one `label` \
@@ -2847,8 +2864,11 @@ impl DrStrange {
         `weight` property; returns {found, path:{nodes, edges, cost}}), or \
         `louvain` (community detection; [{id, community}] + community count). \
         `limit` caps the ranked/labelled rows (default 100).")]
-    async fn algo(&self, Parameters(req): Parameters<Algo>) -> Result<CallToolResult, McpError> {
-        self.blocking("algo", move |db| algo_logic(db, req)).await
+    async fn algo(
+        &self,
+        Parameters(req): Parameters<Algo>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("algo", move |db| algo_logic(db, req)).await
     }
 
     #[tool(
@@ -2864,9 +2884,9 @@ impl DrStrange {
     async fn hybrid(
         &self,
         Parameters(req): Parameters<Hybrid>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let allow = self.embed.clone();
-        self.blocking("hybrid", move |db| hybrid_logic(db, req, allow.as_ref()))
+        self.run("hybrid", move |db| hybrid_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2878,9 +2898,12 @@ impl DrStrange {
         the generated plan WITHOUT executing it. Read-only — it can never mutate \
         the graph. Chat provider key comes from the server env, never params."
     )]
-    async fn ask(&self, Parameters(req): Parameters<Ask>) -> Result<CallToolResult, McpError> {
+    async fn ask(
+        &self,
+        Parameters(req): Parameters<Ask>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let allow = self.embed.clone();
-        self.blocking("ask", move |db| ask_logic(db, req, allow.as_ref()))
+        self.run("ask", move |db| ask_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2906,9 +2929,9 @@ impl DrStrange {
     async fn cypher(
         &self,
         Parameters(req): Parameters<Cypher>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let allow = self.embed.clone();
-        self.blocking("cypher", move |db| cypher_logic(db, req, allow.as_ref()))
+        self.run("cypher", move |db| cypher_logic(db, req, allow.as_ref()))
             .await
     }
 
@@ -2917,9 +2940,9 @@ impl DrStrange {
     async fn write_nodes(
         &self,
         Parameters(req): Parameters<WriteNodes>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let embed = self.embed.clone();
-        self.blocking("write_nodes", move |db| {
+        self.run("write_nodes", move |db| {
             // Built inside the blocking body: constructing it reads the
             // environment, and `embed` itself is a blocking HTTP call (the LLM
             // layer is sync, on ureq), so it belongs on this thread and not on
@@ -2950,8 +2973,8 @@ impl DrStrange {
     async fn write_edges(
         &self,
         Parameters(req): Parameters<WriteEdges>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("write_edges", move |db| write_edges_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("write_edges", move |db| write_edges_logic(db, req))
             .await
     }
 
@@ -2959,8 +2982,8 @@ impl DrStrange {
     async fn create_plane(
         &self,
         Parameters(req): Parameters<CreatePlane>,
-    ) -> Result<CallToolResult, McpError> {
-        self.blocking("create_plane", move |db| create_plane_logic(db, req))
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("create_plane", move |db| create_plane_logic(db, req))
             .await
     }
 
@@ -2969,14 +2992,14 @@ impl DrStrange {
     async fn drop_plane(
         &self,
         Parameters(req): Parameters<DropPlane>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         if !req.confirm {
             return Ok(tool_error(format!(
                 "refusing to drop plane '{}': pass confirm=true (this deletes all its data)",
                 req.name
             )));
         }
-        self.blocking("drop_plane", move |db| drop_plane_logic(db, req))
+        self.run("drop_plane", move |db| drop_plane_logic(db, req))
             .await
     }
 
@@ -2994,11 +3017,11 @@ impl DrStrange {
     async fn digest(
         &self,
         Parameters(req): Parameters<Digest>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tuning = self.digest;
         let local_files = self.local_files;
         let allow = self.embed.clone();
-        self.blocking("digest", move |db| {
+        self.run("digest", move |db| {
             digest_logic(db, req, tuning, local_files, allow.as_ref())
         })
         .await
@@ -3283,14 +3306,26 @@ mod tests {
         assert_eq!(gate.available_permits(), 1, "the slot outlived the body");
     }
 
-    /// Unset and unparsable both mean the default — a typo must not silently
-    /// remove the bound — and only an explicit `0` removes it.
+    /// Unset is the default and an explicit `0` removes the bound; anything
+    /// else is an error naming the variable, which the environment reader
+    /// answers with the default and a warning.
     #[test]
     fn the_deadline_is_read_in_seconds_with_zero_disabling_it() {
-        assert_eq!(deadline_from(None), Some(DEFAULT_TOOL_DEADLINE));
-        assert_eq!(deadline_from(Some("nonsense")), Some(DEFAULT_TOOL_DEADLINE));
-        assert_eq!(deadline_from(Some(" 30 ")), Some(Duration::from_secs(30)));
-        assert_eq!(deadline_from(Some("0")), None);
+        assert_eq!(deadline_try_from(None), Ok(Some(DEFAULT_TOOL_DEADLINE)));
+        assert_eq!(
+            deadline_try_from(Some(" 30 ")),
+            Ok(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(deadline_try_from(Some("0")), Ok(None));
+        assert_eq!(
+            deadline_try_from(Some("nonsense")),
+            Err(McpError::ToolDeadline {
+                value: "nonsense".to_string()
+            })
+        );
+        let err = deadline_try_from(Some("nonsense")).unwrap_err().to_string();
+        assert!(err.contains(ENV_TOOL_DEADLINE_SECS), "{err}");
+        assert!(err.contains("not a number of seconds"), "{err}");
     }
 
     /// The gate is only useful if every session shares one — MCP puts no limit
@@ -3892,11 +3927,19 @@ mod tests {
     /// than silently becoming the default.
     #[test]
     fn the_stdio_retention_is_read_like_the_servers() {
-        assert_eq!(retain_commits_from(None), Ok(Some(DEFAULT_RETAIN_COMMITS)));
-        assert_eq!(retain_commits_from(Some("0")), Ok(None));
-        assert_eq!(retain_commits_from(Some(" 7 ")), Ok(Some(7)));
-        let err = retain_commits_from(Some("many")).unwrap_err();
-        assert_eq!(err.value, "many");
+        assert_eq!(
+            retain_commits_try_from(None),
+            Ok(Some(DEFAULT_RETAIN_COMMITS))
+        );
+        assert_eq!(retain_commits_try_from(Some("0")), Ok(None));
+        assert_eq!(retain_commits_try_from(Some(" 7 ")), Ok(Some(7)));
+        let err = retain_commits_try_from(Some("many")).unwrap_err();
+        assert_eq!(
+            err,
+            McpError::RetainCommits {
+                value: "many".to_string()
+            }
+        );
         assert!(err.to_string().contains(ENV_RETAIN_COMMITS));
     }
 
