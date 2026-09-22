@@ -4,6 +4,79 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-09-23
+
+Three core groups from the audit branch, and the storage migration they made
+necessary. A store written by this release is not readable by an older binary:
+new SSTs carry the `DRS2` magic. Old files still open here.
+
+### Added
+
+- **`drsg upgrade` rewrites storage runs that predate block checksums.** A v1
+  run is rewritten as v2 by the next compaction, but compaction only fires
+  above four runs, so a database that settles below that kept unchecked blocks
+  for good — and whether a store ever gained checksums depended on how often it
+  happened to be written to. `drsg check` now counts such runs and names the
+  command; the rewrite re-encodes each run's entries as they stand, so unlike a
+  compaction nothing is reclaimed and no version becomes unreachable. It takes
+  the writer slot and is safe to interrupt.
+- **A failed flush or compaction is visible.** `Database::last_maintenance_error`
+  surfaces through `drsg check`, `drsg stats` and `db.stats`. A disk that keeps
+  taking the WAL but refuses new files used to look healthy from every operator
+  surface while the WAL and memtable grew without bound.
+
+### Changed
+
+- **A native commit returns `Ok` once its batch is durable.** It used to return
+  whatever the flush it triggered said, so a failed flush became an `Err` after
+  the write was fsynced and visible — and the layer above reads `Err` as
+  "nothing landed", skipping its index and keyword events. Maintenance failures
+  are now reported through the slot above rather than through the commit.
+- **An SST block carries a CRC-32.** The footer magic names the format: `DRSS`
+  (v1, no checksums, read-only) and `DRS2` (v2, written now).
+
+### Fixed
+
+- **Deleting the HNSW entry node no longer panics the next search.** The
+  replacement was an arbitrary live node while `top_layer` was left alone, and
+  most nodes carry only layer 0 — so the next query indexed past the
+  replacement's layers. Any delete that removed the entry vector was enough.
+- **A corrupted SST block is an error, not an answer.** Every scan loop ended
+  quietly at a bad entry: a point read said "absent", a range stopped short,
+  and a compaction dropped the rest of the block for good.
+- **Durable commits could vanish.** An fsync error between the WAL truncate and
+  the seek left the cursor at the old end, so later batches landed behind a
+  zero-filled hole that replay reads as a torn tail — and the next open cut the
+  file at zero.
+- **A crash during compaction could resurrect a deleted key.** The unlinks of
+  replaced runs were not fsynced into the directory, so an old run holding a
+  put could come back without the newer run holding its tombstone.
+- **A JSON integer past `i64` is refused** instead of wrapping to a negative
+  number. Every JSON write path went through that cast. A nested map with a
+  `$`-prefixed key now round-trips.
+- **`LIMIT` can stop a variable-length walk.** The expansion materialized every
+  walk from a start row before the next step saw the first, so a deep bound ran
+  to exhaustion before `LIMIT` — or the query deadline — could stop it.
+- **A bulk-loaded external key must be free in the plane.** The loader checked
+  uniqueness only within its batch, so a key already owned by a live node left
+  two claimants.
+- **The hybrid graph channel scores only the queried label**, and a NaN or
+  infinite score no longer poisons a channel's normalization.
+- **A frontier is ranked as a set**, so `k` counts distinct nodes and each keeps
+  the walk that reached it.
+
+### Performance
+
+- Compaction streams a k-way merge instead of loading every run; its peak was
+  the sum of the runs, which on an embedding-heavy store is the store itself.
+- A flush writes its SST under the store read lock, so readers are no longer
+  stalled through the write, fsync and rename.
+- The change feed caps itself at the source: a million-node load buffers 256
+  change tuples, not a million.
+- HNSW search borrows a per-thread scratch instead of zeroing one per query,
+  and the scratch is capped so a worker that once searched a large index does
+  not pin it for good.
+
 ## [2.11.1] - 2026-09-22
 
 ### Added
