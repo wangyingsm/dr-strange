@@ -47,6 +47,15 @@ allowed_origins = ["https://app.example.com"]
 # that some earlier `digest` parsed. Unset, those tools answer that they have no
 # tree rather than guessing at one.
 # source_root = "/srv/myrepo"
+# Hostnames (or host:port) the MCP endpoint answers at besides loopback and the
+# bind address — the `Host` a reverse proxy or a LAN client sends. Honoured only
+# when a token is set; merged with DRSG_ALLOWED_HOSTS.
+# allowed_hosts = ["graph.example.com", "db.internal:7700"]
+# Longest one MCP tool call may take over /mcp, queue included, before it is
+# answered with a tool error naming the limit. Default 300. Set 0 to run
+# without limit. As with every key here, a DRSG_MCP_TOOL_DEADLINE_SECS already
+# in the environment wins over this line.
+# mcp_tool_deadline_secs = 300
 
 # Uncomment to serve HTTPS directly (rustls). Both files are PEM; `cert` is the
 # certificate chain, `key` its private key. Omit the whole section for plain
@@ -113,6 +122,9 @@ dir = "logs"
 [plugins]
 # fuel = 200000000000    # instructions per call; 0 disables the check
 # memory_mb = 3072       # linear memory per call (wasm32 caps at 4096 anyway)
+# deadline_secs = 60     # wall-clock per call; 0 disables (DRSG_PLUGINS_DEADLINE_SECS overrides)
+# total_memory_mb = 2048 # linear memory all calls in the process may hold together;
+#                        # 0 keeps the default (DRSG_PLUGINS_TOTAL_MEMORY_MB overrides)
 
 # Each plugin's own settings, passed through uninterpreted — what a plugin can
 # be configured to do is the plugin's business, not the database's.

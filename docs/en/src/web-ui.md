@@ -8,11 +8,61 @@ rendering is local.
 
 ## Access and authentication
 
-Open the address reported by `drsg serve` (default `http://127.0.0.1:7700`). When
-a token is configured, the server injects it into the served page, so the
-same-origin UI authenticates automatically; when no token is configured, the
-same-origin origin check authorizes the local UI. Cross-origin requests are
-refused regardless.
+Open the address reported by `drsg serve` (default `http://127.0.0.1:7700`). On a
+loopback address, the UI needs no setup: with no token configured, the
+same-origin check authorizes it; with `DRSG_TOKEN` set, the server writes the
+token into the page it serves to a loopback browser (as a `<meta>` element the
+app reads — never as a script), and the UI presents it as a bearer credential.
+Cross-origin requests are refused regardless.
+
+Served on any other address (`--addr 0.0.0.0:7700`, the container image), the
+server requires a token to start at all and never writes it into the page,
+because that page goes to anyone who can reach the port. The first request the
+server answers *unauthorized* opens a prompt; paste `DRSG_TOKEN` there. It is
+kept in the tab's session storage (gone when the tab closes) and sent as
+`Authorization: Bearer` on every call and as `?token=` on the WebSocket, the only
+form a browser socket can carry. The dashboard's own origin must also be listed
+in `allowed_origins` / `DRSG_ALLOWED_ORIGINS` there, since it is not loopback.
+
+A loopback bind behind a reverse proxy on the same machine (or a forwarded
+port) is a network deployment, not a local one: every client on the internet
+reaches the server from a loopback peer address. The server treats it as
+such wherever it can tell — it never writes the token into a page whose
+request a proxy forwarded (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`)
+or addressed to a name other than this machine (`Host`), and listing the
+proxy's origin in `allowed_origins`, which the dashboard needs to work
+behind one, turns injection off for every page and makes a token mandatory
+at startup (an allowed origin off loopback never counts as the local UI
+either). A proxy that adds no header and keeps a loopback `Host` cannot be
+told from a local browser, so for that shape set `DRSG_PAGE_TOKEN=0`
+(`[server] page_token = false`), which serves the page bare regardless; the
+dashboard then asks for the token as it does on any other address. Set a
+token whenever anything stands in front of the listener.
+
+Every response carries a `Content-Security-Policy` under which scripts and styles
+load only from the server itself; the dashboard is built to satisfy it, and a
+reverse proxy in front should pass it through rather than replace it.
+
+A wrong token may be presented five times; after that the server answers that
+client's requests carrying a token `429 Too Many Requests` with a
+`Retry-After` that doubles per further failure, up to five minutes, until a
+correct token is presented. Requests with no token are neither counted nor
+blocked, so a tokenless local dashboard never trips it and the page and
+`/health` keep answering for everyone else. The client is the connection's
+address; behind a reverse proxy on the same machine it is the address the
+proxy names in `X-Forwarded-For`, so one guesser does not lock out everyone
+the proxy serves. A JSON-RPC batch holds at most 64 requests.
+
+Wherever the interface asks for a provider — semantic search, natural-language
+queries, AIgest — it offers the presets (`openai`, `deepseek`, `qwen`,
+`ollama`), and the API accepts exactly those, or the one provider the server was
+configured with (`[server] embed_provider`). A base URL is refused over the
+wire, because the server would be calling it from its own network on behalf of
+whoever holds a credential; an operator who wants a local or self-hosted
+endpoint configures it on the server. Errors that would describe the server's
+own disk or its provider's reply come back as a category and a reference
+(`storage error (ref 00002a)`); the detail is in the server's log under that
+reference.
 
 The interface has three views, selected from the header: **Dashboard**,
 **Explore**, and **AIgest**.
@@ -134,8 +184,9 @@ returns the view to live when dismissed. The header search reflects the same
 cursor. On a non-native backend the tab is absent.
 
 The slider spans the *retained* window, not every commit ever made:
-`plane.history` starts at the floor `[server] retain_commits` keeps (20 by
-default; unset it for unbounded history), the readout says how many commits
+`plane.history` starts at the floor `[server] retain_commits` keeps (20 when
+the key is omitted; set `retain_commits = 0` for unbounded history), the
+readout says how many commits
 that is, and `db.stats` reports the setting as `retain_commits`. Raise it
 before you need the depth — versions past the floor are reclaimed at
 compaction and cannot be reached afterwards.

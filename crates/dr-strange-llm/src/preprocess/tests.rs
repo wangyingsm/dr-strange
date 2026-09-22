@@ -1371,41 +1371,87 @@ mod manifests {
     }
 }
 
-/// The two environment knobs land on the limits, `0` disables what it can,
-/// and a value that is not a number is refused by name rather than kept as
-/// a default the operator did not choose. One test rather than three so the
-/// process-wide variables are set and cleared in one place.
+/// The `[plugins]` file knobs reach the limits the way the environment's do:
+/// a deadline in seconds (`0` off) and a shared budget in MiB (`0` default),
+/// with an empty environment so the file alone decides.
 #[cfg(feature = "plugins")]
 #[test]
-fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
-    // SAFETY: nothing else in this test binary reads these variables, and
-    // they are cleared before the test returns.
-    unsafe {
-        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, " 7 ");
-        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "512");
-    }
-    let mut limits = Limits::default();
-    apply_env_limits(&mut limits).unwrap();
+fn the_config_knobs_set_the_deadline_and_the_shared_budget() {
+    let none = |_: &str| None;
+    let limits = Plugins::limits_from(&PluginConfig::default(), none).unwrap();
+    let defaults = Limits::default();
+    assert_eq!(limits.deadline, defaults.deadline);
+    assert_eq!(limits.total_memory_bytes, defaults.total_memory_bytes);
+
+    let limits = Plugins::limits_from(
+        &PluginConfig {
+            deadline_secs: Some(7),
+            total_memory_mb: Some(512),
+            ..Default::default()
+        },
+        none,
+    )
+    .unwrap();
     assert_eq!(limits.deadline, Some(std::time::Duration::from_secs(7)));
     assert_eq!(limits.total_memory_bytes, Some(512 << 20));
 
-    unsafe {
-        std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "0");
-        std::env::set_var(ENV_PLUGIN_TOTAL_MEMORY_MB, "0");
-    }
-    apply_env_limits(&mut limits).unwrap();
+    let limits = Plugins::limits_from(
+        &PluginConfig {
+            deadline_secs: Some(0),
+            total_memory_mb: Some(0),
+            ..Default::default()
+        },
+        none,
+    )
+    .unwrap();
+    assert_eq!(limits.deadline, None, "0 switches the deadline off");
+    assert_eq!(
+        limits.total_memory_bytes, None,
+        "0 means the default budget"
+    );
+}
+
+/// The two environment knobs land on the limits over the file's values,
+/// `0` disables what it can, and a value that is not a number is refused by
+/// name rather than kept as a default the operator did not choose. The
+/// variables are handed in through the lookup seam, not set on the process:
+/// every test that loads plugins reads them, and a set-and-clear here raced
+/// the config test above.
+#[cfg(feature = "plugins")]
+#[test]
+fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
+    let env = |deadline: &'static str, total: &'static str| {
+        move |name: &str| match name {
+            ENV_PLUGIN_DEADLINE_SECS => Some(deadline.to_string()),
+            ENV_PLUGIN_TOTAL_MEMORY_MB => Some(total.to_string()),
+            _ => None,
+        }
+    };
+    let file = PluginConfig {
+        deadline_secs: Some(30),
+        total_memory_mb: Some(64),
+        ..Default::default()
+    };
+    let limits = Plugins::limits_from(&file, env(" 7 ", "512")).unwrap();
+    assert_eq!(limits.deadline, Some(std::time::Duration::from_secs(7)));
+    assert_eq!(limits.total_memory_bytes, Some(512 << 20));
+
+    let limits = Plugins::limits_from(&file, env("0", "0")).unwrap();
     assert_eq!(limits.deadline, None, "0 switches the deadline off");
     assert_eq!(
         limits.total_memory_bytes, None,
         "0 means the default budget"
     );
 
-    unsafe { std::env::set_var(ENV_PLUGIN_DEADLINE_SECS, "soon") };
-    let err = apply_env_limits(&mut limits).unwrap_err().to_string();
-    assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
+    let limits = Plugins::limits_from(&file, env("", "")).unwrap();
+    assert_eq!(
+        limits.deadline,
+        Some(std::time::Duration::from_secs(30)),
+        "an empty variable leaves the file's value"
+    );
 
-    unsafe {
-        std::env::remove_var(ENV_PLUGIN_DEADLINE_SECS);
-        std::env::remove_var(ENV_PLUGIN_TOTAL_MEMORY_MB);
-    }
+    let err = Plugins::limits_from(&file, env("soon", "1"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
 }

@@ -5,6 +5,7 @@
 //! by a long scan.
 
 use std::io::IsTerminal;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +80,11 @@ pub struct AppState {
     /// guard's "allowed origin" still means "the local human's own UI" (it
     /// does not on a LAN bind, so `local_ui` is never set there).
     pub bind_is_loopback: bool,
+    /// The operator's switch for writing the token into the page at all
+    /// (`DRSG_PAGE_TOKEN`, on unless set to `0`/`false`/`off`/`no`). Off is
+    /// for a loopback bind behind a reverse proxy that this listener cannot
+    /// tell from a local browser — see [`crate::assets::may_inject_token`].
+    pub page_token: bool,
     /// Commit-time change feed (ROADMAP §5): the core observer publishes each
     /// committed `ChangeSet` here, and every `/ws` subscriber that ran
     /// `plane.watch` drains its own receiver. Best-effort — a lagging consumer
@@ -196,12 +202,19 @@ fn resolve_credentials(
     ws_token: Option<String>,
 ) -> Result<Credentials, Box<Response>> {
     // An allowed Origin is only "our own local UI" when the listener is
-    // loopback-bound: on any other bind the same page is served to whoever
-    // can reach the port, so the zero-config fallback must not key off it
-    // (arch/08 §4.2 invariant 2). The 403 for a *disallowed* Origin stands
-    // regardless — that is the CSRF guard, not the fallback.
+    // loopback-bound, the origin itself is loopback, and nothing forwarded
+    // the request: on any other bind the same page is served to whoever can
+    // reach the port; a configured public origin is by definition a page
+    // reached over the network (through a proxy in front of this listener,
+    // whose peer address is loopback for every client); and a forwarded
+    // request's peer is the proxy. So the zero-config fallback must not key
+    // off any of those (arch/08 §4.2 invariant 2). The 403 for a
+    // *disallowed* Origin stands regardless — that is the CSRF guard, not
+    // the fallback.
     let local_ui = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) if state.origins.allows(origin) => state.bind_is_loopback,
+        Some(origin) if state.origins.allows(origin) => {
+            local_ui_for(origin, state.bind_is_loopback, headers)
+        }
         Some(_) => {
             return Err(Box::new(
                 (
@@ -217,6 +230,13 @@ fn resolve_credentials(
         bearer: bearer_of(headers).or(ws_token),
         local_ui,
     })
+}
+
+/// Whether an *allowed* `Origin` is the local human's own dashboard: a
+/// loopback origin, on a loopback listener, on a request nothing forwarded.
+/// Pure so the rule is testable without a server.
+fn local_ui_for(origin: &str, bind_is_loopback: bool, headers: &HeaderMap) -> bool {
+    bind_is_loopback && AllowedOrigins::is_loopback(origin) && !crate::assets::is_forwarded(headers)
 }
 
 /// The bearer a request presents, wherever it presents it: the header, or
@@ -237,15 +257,20 @@ fn presented_bearer(request: &Request) -> Option<String> {
 }
 
 /// Brute-force protection on the bearer check, as a middleware over the
-/// whole router so no handler can forget it. A peer serving a lockout is
-/// answered 429 with `Retry-After` before its request is read further; a
-/// peer whose bearer authorizes nothing — not even a read, so the request
-/// would be refused wherever it went — earns a strike, and a correct bearer
-/// clears its strikes (see [`FailedAuthLimiter`]). A request carrying no
-/// bearer is neither counted nor blocked: it is not a guess, and the
-/// zero-config local UI sends none. With no connect info there is no peer
-/// to key on, and the throttle steps aside rather than lump every client
-/// together.
+/// whole router so no handler can forget it. A client serving a lockout
+/// that presents a bearer is answered 429 with `Retry-After` before its
+/// request is read further; a client whose bearer authorizes nothing — not
+/// even a read, so the request would be refused wherever it went — earns a
+/// strike, and a correct bearer clears its strikes (see
+/// [`FailedAuthLimiter`]). A request carrying no bearer is neither counted
+/// nor blocked, locked out or not: it is not a guess, the zero-config local
+/// UI sends none, and `/health` and the page itself must keep answering —
+/// behind a reverse proxy or NAT many humans share one address, and one of
+/// them guessing wrong must not take the page and the liveness probe away
+/// from the rest (the guesser learns nothing from the probe that
+/// `Retry-After` does not already say). The client is keyed by
+/// [`throttle_key`]; with no connect info there is no address to key on,
+/// and the throttle steps aside rather than lump every client together.
 async fn auth_throttle(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -258,23 +283,49 @@ async fn auth_throttle(
     else {
         return next.run(request).await;
     };
+    let Some(bearer) = presented_bearer(&request) else {
+        return next.run(request).await;
+    };
+    let client = throttle_key(peer, request.headers());
     let now = Instant::now();
-    if let Some(wait) = state.auth_limiter.locked_for(peer, now) {
+    if let Some(wait) = state.auth_limiter.locked_for(client, now) {
         return too_many_attempts(wait);
     }
-    if let Some(bearer) = presented_bearer(&request) {
-        let creds = Credentials {
-            bearer: Some(bearer),
-            local_ui: false,
-        };
-        if state.authorizer.allows(Access::Read, &creds) {
-            state.auth_limiter.succeeded(peer);
-        } else if let Some(wait) = state.auth_limiter.failed(peer, now) {
-            tracing::warn!(%peer, wait_secs = wait.as_secs(), "repeated failed authentication; peer throttled");
-            return too_many_attempts(wait);
-        }
+    let creds = Credentials {
+        bearer: Some(bearer),
+        local_ui: false,
+    };
+    if state.authorizer.allows(Access::Read, &creds) {
+        state.auth_limiter.succeeded(client);
+    } else if let Some(wait) = state.auth_limiter.failed(client, now) {
+        tracing::warn!(%client, wait_secs = wait.as_secs(), "repeated failed authentication; client throttled");
+        return too_many_attempts(wait);
     }
     next.run(request).await
+}
+
+/// The address the failed-auth throttle counts a request against.
+///
+/// The TCP peer, except behind a reverse proxy on this machine: then every
+/// client on the internet is the same loopback peer, and one wrong guesser
+/// would lock the token out for all of them. A proxy names the client it
+/// forwards for in `X-Forwarded-For`; the rightmost entry is the one the
+/// nearest proxy appended, so it is the only one this server can take at
+/// face value — and only from a loopback peer, since nothing but a process
+/// on this machine can connect from one, so the header was set by our
+/// proxy and not typed by the client to pick its own bucket. A LAN or
+/// remote peer's header is ignored for exactly that reason, and a header
+/// that does not parse falls back to the peer.
+fn throttle_key(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|list| list.rsplit(',').next())
+        .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
 }
 
 fn too_many_attempts(wait: Duration) -> Response {
@@ -420,14 +471,49 @@ pub fn mcp_allowed_hosts(
 /// the dashboard to whoever can reach the port, and without a token the only
 /// remaining credential is an `Origin` header any client can type. So the
 /// server refuses, naming what to set, rather than starting open.
-pub fn check_bind_policy(addr: std::net::SocketAddr, token_configured: bool) -> anyhow::Result<()> {
-    if addr.ip().is_loopback() || token_configured {
+pub fn check_bind_policy(
+    addr: std::net::SocketAddr,
+    token_configured: bool,
+    network_origins: bool,
+) -> anyhow::Result<()> {
+    if token_configured {
         return Ok(());
     }
-    anyhow::bail!(
-        "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
-        addr.port()
-    )
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to listen on {addr} without a token: a non-loopback bind exposes the API and the dashboard to the network. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or bind to loopback with --addr 127.0.0.1:{}",
+            addr.port()
+        )
+    }
+    // A public origin is only ever reached through something in front of
+    // this listener; with no token, a request carrying that Origin would be
+    // the zero-config local UI as far as the server could tell, and any
+    // client on the internet can type an Origin header.
+    if network_origins {
+        anyhow::bail!(
+            "refusing to serve without a token: DRSG_ALLOWED_ORIGINS (`[server] allowed_origins`) names an origin off loopback, so this dashboard is served to the network through a proxy in front of {addr}. Set DRSG_TOKEN (or `[server] token` in drsg.toml), or list only loopback origins"
+        )
+    }
+    Ok(())
+}
+
+/// The environment variable that switches the page's token off; see
+/// [`AppState::page_token`].
+const ENV_PAGE_TOKEN: &str = "DRSG_PAGE_TOKEN";
+
+/// Read [`ENV_PAGE_TOKEN`]: unset is on; `0`, `false`, `off` and `no` (any
+/// case) are off; anything else is on.
+fn page_token_from_env() -> bool {
+    page_token_setting(std::env::var(ENV_PAGE_TOKEN).ok().as_deref())
+}
+
+fn page_token_setting(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// How long shutdown waits for in-flight connections before giving up. Both
@@ -463,6 +549,7 @@ fn mcp_router(
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router<Arc<AppState>> {
     let db = state.db.clone();
     let digest = dr_strange_mcp::DigestTuning {
@@ -486,6 +573,11 @@ fn mcp_router(
             }
             if let Some(parsers) = &parsers {
                 svc = svc.with_parsers(parsers.clone());
+            }
+            // The file's deadline over the environment's, when the file
+            // says; `DrStrange::new` already read the variable otherwise.
+            if let Some(deadline) = tool_deadline {
+                svc = svc.with_tool_deadline(deadline);
             }
             if let Some((provider, model, key_env)) = &embed {
                 svc = svc.with_embed_provider(dr_strange_mcp::EmbedProvider {
@@ -522,6 +614,7 @@ fn router(
     source_root: Option<std::path::PathBuf>,
     parsers: Option<Arc<dyn dr_strange_mcp::Parsers>>,
     allowed_hosts: Vec<String>,
+    tool_deadline: Option<Option<Duration>>,
 ) -> Router {
     // Outermost → innermost: catch panics so a bug becomes a 500 (not a dropped
     // connection), then cap total requests in flight, then stamp defensive
@@ -557,6 +650,7 @@ fn router(
             source_root,
             parsers,
             allowed_hosts,
+            tool_deadline,
         ))
         .route("/rpc", post(rpc_http))
         .route("/ws", get(ws_upgrade))
@@ -1380,7 +1474,18 @@ fn build_authorizer(opts: &ServeOptions) -> anyhow::Result<Authorization> {
     let token = std::env::var("DRSG_TOKEN").ok().filter(|t| !t.is_empty());
     let bind_is_loopback = opts.addr.ip().is_loopback();
     let shared_token = SharedToken::new(token.clone()).bound_to_loopback(bind_is_loopback);
-    check_bind_policy(opts.addr, shared_token.is_configured())?;
+    let origins = AllowedOrigins::from_env();
+    check_bind_policy(
+        opts.addr,
+        shared_token.is_configured(),
+        origins.has_network_origins(),
+    )?;
+    let page_token = page_token_from_env();
+    if shared_token.is_configured() && !page_token {
+        tracing::info!(
+            "the page carries no token ({ENV_PAGE_TOKEN} is off); the dashboard asks for it"
+        );
+    }
     if shared_token.is_configured() {
         tracing::info!(
             "auth ENABLED — every request requires DRSG_TOKEN (Authorization: Bearer <token>, on the WebSocket upgrade too; browsers use ?token=<token>)"
@@ -1400,6 +1505,8 @@ fn build_authorizer(opts: &ServeOptions) -> anyhow::Result<Authorization> {
         authorizer,
         token,
         bind_is_loopback,
+        origins,
+        page_token,
     })
 }
 
@@ -1412,6 +1519,11 @@ struct Authorization {
     /// Loopback binds alone may splice the token into the page or honour the
     /// zero-config local-UI fallback.
     bind_is_loopback: bool,
+    /// The origins the CSRF guard admits, read once so the bind policy and
+    /// the request path cannot disagree about what counts as off-loopback.
+    origins: AllowedOrigins,
+    /// Whether the page served to a local browser may carry the token.
+    page_token: bool,
 }
 
 /// History retention (see `ServeOptions::retain_commits`): bound how far back
@@ -1449,6 +1561,8 @@ pub async fn run(
         authorizer,
         token,
         bind_is_loopback,
+        origins,
+        page_token,
     } = build_authorizer(&opts)?;
     // Change feed (ROADMAP §5): publish every committed ChangeSet to a
     // broadcast channel that `/ws` subscribers drain. Registered before the db
@@ -1512,9 +1626,10 @@ pub async fn run(
             db: db_for_tail,
             db_path,
             authorizer,
-            origins: AllowedOrigins::from_env(),
+            origins,
             bootstrap_token: token,
             bind_is_loopback,
+            page_token,
             changes,
             wal_changes,
             digest: opts.digest,
@@ -1532,9 +1647,10 @@ pub async fn run(
         db: Arc::new(db),
         db_path,
         authorizer,
-        origins: AllowedOrigins::from_env(),
+        origins,
         bootstrap_token: token,
         bind_is_loopback,
+        page_token,
         changes,
         wal_changes,
         digest: opts.digest,
@@ -1585,6 +1701,7 @@ async fn run_app(
         opts.source_root.clone(),
         opts.recall_parsers.clone(),
         allowed_hosts,
+        opts.mcp_tool_deadline,
     );
     // Bind a std listener up front so we can report the actual port (handy when
     // the caller asked for :0) before either serving path takes over. Both paths
@@ -1942,7 +2059,32 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_bind_policy, mcp_allowed_hosts, spool_snapshot};
+    use super::{
+        check_bind_policy, local_ui_for, mcp_allowed_hosts, page_token_setting, spool_snapshot,
+        throttle_key,
+    };
+
+    /// The throttle counts against the TCP peer, except that a same-host
+    /// proxy's `X-Forwarded-For` names the real client: honoured only from
+    /// a loopback peer, rightmost entry, peer again when it does not parse.
+    #[test]
+    fn the_throttle_keys_on_the_forwarded_client_only_behind_a_local_proxy() {
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let client: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let plain = axum::http::HeaderMap::new();
+        assert_eq!(throttle_key(local, &plain), local);
+        assert_eq!(throttle_key(lan, &plain), lan);
+        let mut forwarded = axum::http::HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "10.0.0.1, 203.0.113.9".parse().unwrap());
+        assert_eq!(throttle_key(local, &forwarded), client);
+        // A LAN peer's header could be typed by the client to pick its own
+        // bucket: ignored.
+        assert_eq!(throttle_key(lan, &forwarded), lan);
+        let mut junk = axum::http::HeaderMap::new();
+        junk.insert("x-forwarded-for", "not-an-address".parse().unwrap());
+        assert_eq!(throttle_key(local, &junk), local);
+    }
 
     /// The spool `/snapshot` streams is byte-for-byte the core's dump,
     /// rewound and ready to read; the locks the dump takes are released
@@ -2015,12 +2157,47 @@ mod tests {
         let lan: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
         let local: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
         let local6: std::net::SocketAddr = "[::1]:7700".parse().unwrap();
-        assert!(check_bind_policy(local, false).is_ok());
-        assert!(check_bind_policy(local6, false).is_ok());
-        assert!(check_bind_policy(lan, true).is_ok());
+        assert!(check_bind_policy(local, false, false).is_ok());
+        assert!(check_bind_policy(local6, false, false).is_ok());
+        assert!(check_bind_policy(lan, true, false).is_ok());
         // The refusal names the knob to set and the way back to loopback.
-        let err = check_bind_policy(lan, false).unwrap_err().to_string();
+        let err = check_bind_policy(lan, false, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("DRSG_TOKEN"), "{err}");
         assert!(err.contains("--addr 127.0.0.1:7700"), "{err}");
+        // A public allowed origin on a tokenless loopback bind is a proxied
+        // network deployment with no credential: refused, naming the knob.
+        let err = check_bind_policy(local, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DRSG_ALLOWED_ORIGINS"), "{err}");
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        assert!(check_bind_policy(local, true, true).is_ok());
+    }
+
+    /// The zero-config local UI is a loopback origin on a loopback bind on a
+    /// request nothing forwarded; a configured public origin or a proxy's
+    /// header on the request is a network client whatever the peer says.
+    #[test]
+    fn only_an_unforwarded_loopback_origin_is_the_local_ui() {
+        let plain = axum::http::HeaderMap::new();
+        assert!(local_ui_for("http://127.0.0.1:7700", true, &plain));
+        assert!(local_ui_for("http://localhost:5173", true, &plain));
+        assert!(!local_ui_for("http://127.0.0.1:7700", false, &plain));
+        assert!(!local_ui_for("https://graph.example.com", true, &plain));
+        let mut forwarded = axum::http::HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert!(!local_ui_for("http://127.0.0.1:7700", true, &forwarded));
+    }
+
+    #[test]
+    fn the_page_token_switch_is_on_unless_told_off() {
+        assert!(page_token_setting(None));
+        assert!(page_token_setting(Some("1")));
+        assert!(page_token_setting(Some("yes")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!page_token_setting(Some(off)), "{off}");
+        }
     }
 }

@@ -259,6 +259,8 @@ query_timeout_secs = 60                     # how long one request's queries may
 retain_commits = 20                         # commits of history time-travel can reach; older versions are reclaimed (0 keeps all). Applies to every drsg command, not only serve
 source_root = "/srv/myrepo"                 # source tree behind the grep/snippet agent tools (serve watch sets it from --dir)
 allowed_origins = ["https://app.example.com"]  # additional browser origins
+# page_token = false                        # never write the token into the page (→ DRSG_PAGE_TOKEN); for a loopback bind behind a reverse proxy, see the Web UI chapter
+# /mcp behind a hostname: DRSG_ALLOWED_HOSTS=memory.example.com (env; honoured only with a token — see the MCP chapter)
 
 [server.tls]                                # present ⇒ serve HTTPS
 cert = "/etc/drsg/cert.pem"                 # PEM certificate chain
@@ -373,11 +375,25 @@ deployments. The runtime image binds to `0.0.0.0:7700` and stores the database o
 the `/data` volume (the native backend database is a directory, which the volume
 persists). Provider keys are supplied as environment variables.
 
+`DRSG_TOKEN` is **required** in a container: the image binds `0.0.0.0`, and
+`drsg serve` refuses a non-loopback bind without a token rather than serve the
+API and the dashboard to whoever reaches the port (the container exits with the
+message naming the variable). Every client presents that token — the SDKs and
+curl as a bearer, the dashboard through its prompt. Opening the dashboard at
+`http://localhost:7700` on the Docker host works as is; a browser reaching the
+container by any other name — `http://graph.example:7700` — must have that origin
+listed in `DRSG_ALLOWED_ORIGINS` (comma-separated, or `[server] allowed_origins`),
+because off loopback the served page carries no token and an unlisted origin is
+refused as cross-site.
+
 For a persistent deployment, `docker-compose.yml` pulls the same image and defines
-a named volume:
+a named volume. It marks `DRSG_TOKEN` as required, so an unset token stops
+`docker compose up` with a message instead of starting a container that exits;
+`DRSG_ALLOWED_ORIGINS` is passed through when set:
 
 ```console
 $ DRSG_TOKEN=please-change-me docker compose up
+$ DRSG_TOKEN=please-change-me DRSG_ALLOWED_ORIGINS=http://graph.example:7700 docker compose up
 ```
 
 To build the image locally instead, the repository ships a multi-stage

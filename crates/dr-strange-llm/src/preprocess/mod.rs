@@ -535,6 +535,14 @@ pub struct PluginConfig {
     /// Linear-memory bound per sandbox call, in bytes; `None` keeps the
     /// default. No value can lift the 4 GiB ceiling wasm32 itself imposes.
     pub memory_bytes: Option<usize>,
+    /// Wall-clock deadline per sandbox call, in whole seconds; `None` keeps
+    /// the default and `Some(0)` switches it off. The config file's spelling
+    /// of [`ENV_PLUGIN_DEADLINE_SECS`], which still overrides it.
+    pub deadline_secs: Option<u64>,
+    /// Linear memory every sandbox call in the process may hold together, in
+    /// MiB; `None` or `Some(0)` keeps the default. The config file's spelling
+    /// of [`ENV_PLUGIN_TOTAL_MEMORY_MB`], which still overrides it.
+    pub total_memory_mb: Option<u64>,
 }
 
 /// The wall-clock deadline per sandbox call, in whole seconds; `0` disables
@@ -544,25 +552,30 @@ pub const ENV_PLUGIN_DEADLINE_SECS: &str = "DRSG_PLUGINS_DEADLINE_SECS";
 /// in MiB. Read by [`Plugins::load`] on top of the config file.
 pub const ENV_PLUGIN_TOTAL_MEMORY_MB: &str = "DRSG_PLUGINS_TOTAL_MEMORY_MB";
 
-/// Apply the two environment knobs to `limits`.
+/// Apply the two environment knobs to `limits`, reading each variable
+/// through `lookup`.
 ///
-/// The environment rather than [`PluginConfig`] fields: these are the net
-/// under the budgets the config file already names, and an embedder that
-/// wants them exactly sets them on [`Limits`] directly. A value that is not
-/// a number is an error naming the variable, not a silently kept default —
-/// an operator who typed it meant it.
+/// The environment rather than [`PluginConfig`] fields alone: these are the
+/// net under the budgets the config file already names, and an operator at
+/// the shell overrides the file. A value that is not a number is an error
+/// naming the variable, not a silently kept default — an operator who typed
+/// it meant it.
+///
+/// `lookup` rather than `std::env::var` directly so a test can hand in the
+/// values it wants without setting process-wide variables that every other
+/// test in the binary — anything that loads plugins — would read too.
 #[cfg(feature = "plugins")]
-fn apply_env_limits(limits: &mut Limits) -> Result<()> {
-    fn read(name: &str) -> Result<Option<u64>> {
-        match std::env::var(name) {
-            Ok(v) if !v.trim().is_empty() => v
+fn apply_env_limits(limits: &mut Limits, lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let read = |name: &str| -> Result<Option<u64>> {
+        match lookup(name) {
+            Some(v) if !v.trim().is_empty() => v
                 .trim()
                 .parse::<u64>()
                 .map(Some)
                 .map_err(|e| anyhow::anyhow!("{name}={v:?} is not a whole number: {e}")),
             _ => Ok(None),
         }
-    }
+    };
     if let Some(secs) = read(ENV_PLUGIN_DEADLINE_SECS)? {
         limits.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
@@ -618,6 +631,29 @@ impl Plugins {
     pub fn load(config: &PluginConfig) -> Result<Self> {
         let mut plugins = Self::with_options(&config.options);
         let store = Self::store(config)?;
+        let limits = Self::limits_for(config)?;
+        for plugin in store.load_all(&config.options, &limits)? {
+            plugins.handlers.push(Box::new(plugin));
+        }
+        Ok(plugins)
+    }
+
+    /// The sandbox limits `config` asks for: the file's budgets over the
+    /// defaults, then the environment knobs over the file — an operator at
+    /// the shell overrides what `drsg.toml` says, the same precedence every
+    /// other `DRSG_*` variable has.
+    #[cfg(feature = "plugins")]
+    fn limits_for(config: &PluginConfig) -> Result<Limits> {
+        Self::limits_from(config, |name| std::env::var(name).ok())
+    }
+
+    /// [`limits_for`](Self::limits_for) with the environment supplied by
+    /// `lookup` — the seam its tests use, so they never touch the process.
+    #[cfg(feature = "plugins")]
+    fn limits_from(
+        config: &PluginConfig,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Limits> {
         let mut limits = Limits::default();
         match config.fuel {
             Some(0) => limits.fuel = None,
@@ -627,11 +663,16 @@ impl Plugins {
         if let Some(bytes) = config.memory_bytes {
             limits.memory_bytes = bytes;
         }
-        apply_env_limits(&mut limits)?;
-        for plugin in store.load_all(&config.options, &limits)? {
-            plugins.handlers.push(Box::new(plugin));
+        if let Some(secs) = config.deadline_secs {
+            limits.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
         }
-        Ok(plugins)
+        if let Some(mb) = config.total_memory_mb {
+            // Same reading as the environment's: a zero budget would let no
+            // store run, so it means "the default".
+            limits.total_memory_bytes = (mb > 0).then_some((mb as usize) << 20);
+        }
+        apply_env_limits(&mut limits, lookup)?;
+        Ok(limits)
     }
 
     /// The store `config` names, or the per-user default.

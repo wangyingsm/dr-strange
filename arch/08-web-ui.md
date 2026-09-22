@@ -127,17 +127,31 @@ server enforces where the line is (shipped 2026-09, `server::run`,
    any address that is not loopback unless `DRSG_TOKEN` is configured, and
    the error names the variable and the `--addr` way back. Without a token
    the only credential left is an `Origin` header any client can type.
-2. **The fallback is gated on a loopback bind.** `SharedToken` knows whether
-   its listener is loopback-bound, and `resolve_credentials` never sets
-   `local_ui` otherwise; an allowed `Origin` on a LAN bind still passes the
-   CSRF guard but authorizes nothing by itself. Invariant 2 of §4.2, closed.
+2. **The fallback is gated on a loopback bind, a loopback origin and an
+   unforwarded request.** `SharedToken` knows whether its listener is
+   loopback-bound, and `resolve_credentials` sets `local_ui` only for an
+   `Origin` that is itself loopback, on such a listener, on a request
+   carrying no proxy header; an allowed `Origin` on a LAN bind, or a
+   configured public origin on any bind, still passes the CSRF guard but
+   authorizes nothing by itself. A public origin in `DRSG_ALLOWED_ORIGINS`
+   is the operator saying a proxy serves the dashboard to the network, so
+   `check_bind_policy` also refuses a tokenless server with one configured,
+   whatever the bind address. Invariant 2 of §4.2, closed.
 3. **The page carries the token only to a local human.** `GET /` is
    unauthenticated (it must be — it is how the browser gets the page that
    will authenticate), so whatever is in the page is public to whoever can
-   fetch it. The token is spliced into `index.html` only when the bind *and*
-   the peer address are both loopback; on any other deployment the page is
-   served bare, and the SPA asks for the token the first time the server
-   answers unauthorized, keeping it in the tab's `sessionStorage`.
+   fetch it. The token is spliced into `index.html` only when every sign
+   says a browser on this machine asked for it (`assets::may_inject_token`):
+   the bind *and* the peer address are both loopback, the request carries
+   none of `Forwarded` / `X-Forwarded-*` / `X-Real-IP` / `Via`, its `Host`
+   is this machine, no public origin is configured, and the operator has
+   not set `DRSG_PAGE_TOKEN=0`. A same-host reverse proxy or a forwarded
+   port shows a loopback peer for every client on the internet, which is
+   why a loopback peer alone is not enough and why the switch exists for a
+   proxy that adds nothing the listener can see. On any other deployment
+   the page is served bare, and the SPA asks for the token the first time
+   the server answers unauthorized, keeping it in the tab's
+   `sessionStorage`.
 4. **The token is data, not code.** It rides a `<meta name="drsg-token">`
    element, never an inline `<script>`, and every response carries a
    `Content-Security-Policy` of `script-src 'self'` (and `style-src 'self'` —
@@ -150,17 +164,23 @@ server enforces where the line is (shipped 2026-09, `server::run`,
    `?token=` only because the browser WebSocket API cannot set headers. The
    header wins when both are present. Nothing in the server logs a request
    target, so a query-string token never reaches a log line.
-6. **A wrong token is guessed five times, then waited for.** A per-peer
+6. **A wrong token is guessed five times, then waited for.** A per-client
    throttle (`auth::FailedAuthLimiter`, applied as a middleware over the
    whole router so no route can forget it) counts bearers that authorize
-   nothing; past `FREE_FAILURES` (5) the peer serves a wait that doubles per
-   failure up to `MAX_LOCKOUT` (5 min), answered `429` with `Retry-After`
-   before the request is read further. A correct bearer clears it. A request
-   with no bearer is not a guess and is neither counted nor blocked, so the
-   zero-config local UI is untouched. The table is in memory and bounded
-   (`TRACKED_PEERS`, 4096; idle entries are forgotten after 15 min) — a
-   client rotating addresses weakens the throttle for itself, not the
-   server. A JSON-RPC batch is at most `rpc::MAX_BATCH` (64) requests,
+   nothing; past `FREE_FAILURES` (5) the client serves a wait that doubles
+   per failure up to `MAX_LOCKOUT` (5 min), answered `429` with
+   `Retry-After` before the request is read further. A correct bearer
+   clears it. A request with no bearer is not a guess and is neither
+   counted nor blocked, locked out or not — so the zero-config local UI is
+   untouched and `/health` and the page keep answering, which matters
+   where many humans share one address. The client is the TCP peer, except
+   that a same-host reverse proxy's `X-Forwarded-For` (rightmost entry,
+   honoured only from a loopback peer, since only our proxy can be one)
+   names the real client, so one guesser behind the proxy locks out itself
+   and not everyone behind it (`server::throttle_key`). The table is in
+   memory and bounded (`TRACKED_PEERS`, 4096; idle entries are forgotten
+   after 15 min) — a client rotating addresses weakens the throttle for
+   itself, not the server. A JSON-RPC batch is at most `rpc::MAX_BATCH` (64) requests,
    refused whole with `-32600` above that.
 7. **A provider named over the wire is a preset or the operator's.** Every
    method that takes a `provider` / `embed_provider` / `chat` / `embed`

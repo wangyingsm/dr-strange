@@ -2099,6 +2099,13 @@
           "plugin_bytes": {
             "type": "integer",
             "description": "Bytes the loaded preprocessor plugins hold right now: every compiled plugin image plus the linear memory of every instance mid-call. Zero when no plugin is loaded."
+          },
+          "retain_commits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many commits back time travel reaches ([server] retain_commits); null when the history is unbounded."
           }
         },
         "required": [

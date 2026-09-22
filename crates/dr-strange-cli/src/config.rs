@@ -124,6 +124,13 @@ pub struct PluginsCfg {
     /// Linear memory per sandbox call, in MiB. No value lifts the 4 GiB
     /// ceiling wasm32 itself imposes.
     pub memory_mb: Option<u64>,
+    /// Wall-clock deadline per sandbox call, in seconds; `0` switches it off
+    /// (→ `DRSG_PLUGINS_DEADLINE_SECS`, which overrides it).
+    pub deadline_secs: Option<u64>,
+    /// Linear memory every sandbox call in the process may hold together, in
+    /// MiB; `0` keeps the default (→ `DRSG_PLUGINS_TOTAL_MEMORY_MB`, which
+    /// overrides it).
+    pub total_memory_mb: Option<u64>,
     /// An explicit plugin-store directory; defaults to the per-user store.
     pub store_dir: Option<PathBuf>,
     /// `[plugins.<name>]` sub-tables, passed to each plugin uninterpreted.
@@ -160,6 +167,8 @@ pub fn plugin_config(cfg: &Config) -> Result<dr_strange_llm::PluginConfig> {
         store_dir: cfg.plugins.store_dir.clone(),
         fuel: cfg.plugins.fuel,
         memory_bytes: cfg.plugins.memory_mb.map(|mb| (mb as usize) << 20),
+        deadline_secs: cfg.plugins.deadline_secs,
+        total_memory_mb: cfg.plugins.total_memory_mb,
     })
 }
 
@@ -191,6 +200,18 @@ pub struct ServerCfg {
     pub retain_commits: Option<u64>,
     /// Extra allowed browser origins (→ `DRSG_ALLOWED_ORIGINS`).
     pub allowed_origins: Option<Vec<String>>,
+    /// Whether the page served to a local browser may carry the token
+    /// (→ `DRSG_PAGE_TOKEN`; omitted means yes). `false` for a loopback bind
+    /// behind a reverse proxy the server cannot tell from a local browser.
+    pub page_token: Option<bool>,
+    /// Hostnames (or `host:port`) `/mcp` answers at besides loopback and the
+    /// bind address — what a proxy or LAN client sends as `Host`. Honoured
+    /// only with a token; merged with `DRSG_ALLOWED_HOSTS`.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Longest one MCP tool call may take over `/mcp`, queue included, in
+    /// seconds; `0` runs without limit; omitted means the default (or
+    /// `DRSG_MCP_TOOL_DEADLINE_SECS`).
+    pub mcp_tool_deadline_secs: Option<u64>,
     /// TLS certificate/key; when present, `serve` speaks HTTPS.
     pub tls: Option<TlsCfg>,
 }
@@ -255,6 +276,9 @@ pub fn apply_env(cfg: &Config) {
     if let Some(origins) = &cfg.server.allowed_origins {
         set("DRSG_ALLOWED_ORIGINS", &origins.join(","));
     }
+    if let Some(page_token) = cfg.server.page_token {
+        set("DRSG_PAGE_TOKEN", if page_token { "1" } else { "0" });
+    }
     if let Some(dir) = &cfg.logging.dir {
         set("DRSG_LOG_DIR", &dir.to_string_lossy());
     }
@@ -273,6 +297,50 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
         Some(commits) => (commits > 0).then_some(commits),
         None => Some(dr_strange_web::DEFAULT_RETAIN_COMMITS),
     }
+}
+
+/// The web crate's bind rule, applied to the resolved `[server] addr` /
+/// `--addr` before the database is opened: a non-loopback bind without a
+/// token is refused with the same message `serve` itself would give. Here so
+/// a `drsg.toml` that says `addr = "0.0.0.0:7700"` and no token fails at
+/// config time, before a replica wipes its directory or a watch starts
+/// folding a tree, rather than a few seconds later inside the web crate.
+/// `token_configured` is the caller's reading of `[server] token` and
+/// `DRSG_TOKEN` (after [`apply_env`] the two agree).
+pub fn check_serve_bind(
+    cfg: &Config,
+    cli_addr: Option<SocketAddr>,
+    token_configured: bool,
+) -> Result<()> {
+    let addr = cli_addr
+        .or(cfg.server.addr)
+        .unwrap_or_else(|| ServeOptions::default().addr);
+    // The origins the server will see: after `apply_env` the file's list is
+    // in the environment unless the variable was already set, so the
+    // variable is the one reading that matches the server's own.
+    let network_origins = std::env::var("DRSG_ALLOWED_ORIGINS")
+        .ok()
+        .into_iter()
+        .chain(cfg.server.allowed_origins.iter().map(|o| o.join(",")))
+        .any(|list| dr_strange_web::origins_off_loopback(&list));
+    dr_strange_web::check_bind_policy(addr, token_configured, network_origins)
+}
+
+/// The per-call MCP deadline the file asks for, in the web crate's encoding:
+/// `None` leaves the decision to the server (its default, or the environment
+/// variable it reads), `Some(None)` is no deadline, `Some(Some(d))` a bound.
+///
+/// The file is honoured only when `DRSG_MCP_TOOL_DEADLINE_SECS` is not set:
+/// the file's header promises that an environment variable already set
+/// always wins over the file, and this knob is no exception. Passing the file
+/// value through when the variable is set would have the server apply the
+/// file over the environment, the reverse of every other key.
+fn mcp_tool_deadline(file_secs: Option<u64>, env_set: bool) -> Option<Option<std::time::Duration>> {
+    if env_set {
+        return None;
+    }
+    // 0 means "no deadline", as the environment variable reads it.
+    file_secs.map(|secs| (secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
 /// Build the web crate's [`ServeOptions`] from the `[server]` section, with an
@@ -297,6 +365,13 @@ pub fn serve_options(cfg: &Config, cli_addr: Option<SocketAddr>) -> ServeOptions
         opts.query_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     }
     opts.retain_commits = retain_commits(cfg);
+    if let Some(hosts) = &cfg.server.allowed_hosts {
+        opts.allowed_hosts = hosts.clone();
+    }
+    opts.mcp_tool_deadline = mcp_tool_deadline(
+        cfg.server.mcp_tool_deadline_secs,
+        std::env::var_os(dr_strange_mcp::ENV_TOOL_DEADLINE_SECS).is_some(),
+    );
     if let Some(tls) = &cfg.server.tls {
         opts.tls = Some(TlsOptions {
             cert: tls.cert.clone(),
@@ -352,6 +427,7 @@ mod tests {
             max_concurrent = 32
             retain_commits = 5
             allowed_origins = ["https://a.example", "https://b.example"]
+            page_token = false
 
             [logging]
             dir = "/var/log/drsg"
@@ -374,6 +450,7 @@ mod tests {
         assert_eq!(cfg.server.max_concurrent, Some(32));
         assert_eq!(cfg.server.retain_commits, Some(5));
         assert_eq!(cfg.server.allowed_origins.as_ref().unwrap().len(), 2);
+        assert_eq!(cfg.server.page_token, Some(false));
         assert_eq!(cfg.logging.dir.as_deref(), Some(Path::new("/var/log/drsg")));
         assert_eq!(
             cfg.llm.get("OPENAI_API_KEY").map(String::as_str),
@@ -435,6 +512,96 @@ mod tests {
     #[test]
     fn no_tls_section_means_plain_http() {
         assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
+    }
+
+    /// A non-loopback `[server] addr` (or `--addr`) without a token is refused
+    /// at config time with the web crate's own message; a token, or a
+    /// loopback bind, passes.
+    #[test]
+    fn a_non_loopback_addr_without_a_token_is_refused_at_config_time() {
+        let lan = parse("[server]\naddr = \"0.0.0.0:7700\"\n");
+        let err = check_serve_bind(&lan, None, false).unwrap_err().to_string();
+        assert!(err.contains("refusing to listen on 0.0.0.0:7700"), "{err}");
+        assert!(err.contains("DRSG_TOKEN"), "{err}");
+        check_serve_bind(&lan, None, true).expect("a token makes the bind acceptable");
+        check_serve_bind(&parse(""), None, false).expect("the default bind is loopback");
+        check_serve_bind(&parse(""), Some("127.0.0.1:7701".parse().unwrap()), false)
+            .expect("an explicit loopback --addr passes");
+        let err = check_serve_bind(&parse(""), Some("[::]:7700".parse().unwrap()), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to listen"), "{err}");
+        // A loopback bind whose `allowed_origins` names a public origin is
+        // a dashboard served through a proxy: refused without a token too,
+        // while loopback-only origins pass.
+        let proxied = parse("[server]\nallowed_origins = [\"https://graph.example.com\"]\n");
+        let err = check_serve_bind(&proxied, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_origins"), "{err}");
+        check_serve_bind(&proxied, None, true).expect("a token makes the proxied shape acceptable");
+        let local = parse("[server]\nallowed_origins = [\"http://localhost:5173\"]\n");
+        check_serve_bind(&local, None, false).expect("a loopback origin is not a proxy");
+    }
+
+    /// The `[server]` knobs that reach `/mcp`: `allowed_hosts` lands on the
+    /// options verbatim, and `mcp_tool_deadline_secs` distinguishes "not
+    /// said" (the server's default) from `0` (no deadline) from a number.
+    #[test]
+    fn allowed_hosts_and_the_mcp_tool_deadline_reach_the_serve_options() {
+        let absent = serve_options(&parse(""), None);
+        assert!(absent.allowed_hosts.is_empty());
+        assert_eq!(absent.mcp_tool_deadline, None);
+
+        let set = serve_options(
+            &parse(
+                "[server]\nallowed_hosts = [\"db.internal:7700\", \"graph.example\"]\n\
+                 mcp_tool_deadline_secs = 45\n",
+            ),
+            None,
+        );
+        assert_eq!(set.allowed_hosts, vec!["db.internal:7700", "graph.example"]);
+        assert_eq!(
+            set.mcp_tool_deadline,
+            Some(Some(std::time::Duration::from_secs(45)))
+        );
+
+        let unlimited = serve_options(&parse("[server]\nmcp_tool_deadline_secs = 0\n"), None);
+        assert_eq!(unlimited.mcp_tool_deadline, Some(None));
+    }
+
+    /// An environment variable already set wins over the file, as the file's
+    /// header promises: with `DRSG_MCP_TOOL_DEADLINE_SECS` in the environment
+    /// the file's value is not passed on, whatever it says, and the server
+    /// reads the variable itself.
+    #[test]
+    fn the_environment_deadline_wins_over_the_files() {
+        assert_eq!(mcp_tool_deadline(Some(45), true), None);
+        assert_eq!(mcp_tool_deadline(Some(0), true), None);
+        assert_eq!(mcp_tool_deadline(None, true), None);
+        assert_eq!(
+            mcp_tool_deadline(Some(45), false),
+            Some(Some(std::time::Duration::from_secs(45)))
+        );
+        assert_eq!(mcp_tool_deadline(Some(0), false), Some(None));
+        assert_eq!(mcp_tool_deadline(None, false), None);
+    }
+
+    /// The `[plugins]` sandbox knobs map onto the llm crate's config as the
+    /// numbers the file says; the llm crate applies the `0` readings.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn plugin_deadline_and_total_memory_reach_the_plugin_config() {
+        let cfg = plugin_config(&parse(
+            "[plugins]\ndeadline_secs = 7\ntotal_memory_mb = 512\nmemory_mb = 64\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.deadline_secs, Some(7));
+        assert_eq!(cfg.total_memory_mb, Some(512));
+        assert_eq!(cfg.memory_bytes, Some(64 << 20));
+        let absent = plugin_config(&parse("")).unwrap();
+        assert_eq!(absent.deadline_secs, None);
+        assert_eq!(absent.total_memory_mb, None);
     }
 
     #[test]

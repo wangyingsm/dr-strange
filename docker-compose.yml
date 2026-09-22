@@ -3,8 +3,12 @@
 #   docker compose up
 #
 # Pulls the published multi-arch image from GHCR. Then open
-# http://localhost:7700. Set DRSG_TOKEN (see below) to allow programmatic
-# access from the SDKs or curl. To build locally instead, run
+# http://localhost:7700. DRSG_TOKEN is required: the container binds
+# 0.0.0.0:7700, and `drsg serve` refuses a non-loopback bind without a token
+# rather than expose the API and dashboard to whoever reaches the port, so
+# compose fails up front (`DRSG_TOKEN=$(openssl rand -hex 20) docker compose up`)
+# instead of starting a container that exits. The same token is what the SDKs,
+# curl and the dashboard present. To build locally instead, run
 # `docker compose up --build` after adding `build: .` back to the service.
 
 services:
@@ -16,9 +20,15 @@ services:
     volumes:
       - drsg-data:/data
     environment:
-      # Shared bearer token. Unset ⇒ only the same-origin browser UI may call
-      # the API; set it to permit SDK / curl access.
-      DRSG_TOKEN: ${DRSG_TOKEN:-}
+      # Shared bearer token, required for a 0.0.0.0 bind (see the header). The
+      # `:?` makes compose stop with this message when it is unset or empty.
+      DRSG_TOKEN: ${DRSG_TOKEN:?set DRSG_TOKEN — drsg serve refuses to bind 0.0.0.0:7700 without a token (e.g. DRSG_TOKEN=$(openssl rand -hex 20) docker compose up)}
+      # Browser origins allowed to use the dashboard besides loopback. Opening
+      # http://localhost:7700 on the Docker host needs nothing here; a browser
+      # reaching the container by any other name (http://graph.example:7700)
+      # must have that origin listed, and the dashboard then prompts for
+      # DRSG_TOKEN — the served page carries no token off loopback.
+      DRSG_ALLOWED_ORIGINS: ${DRSG_ALLOWED_ORIGINS:-}
       # Optional LLM provider keys — needed for AIgest, semantic search, and
       # natural-language queries. Supply only the providers you use.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

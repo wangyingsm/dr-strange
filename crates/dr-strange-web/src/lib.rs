@@ -22,7 +22,17 @@ mod server;
 
 pub use auth::{FREE_FAILURES, MAX_LOCKOUT, TRACKED_PEERS};
 pub use rpc::MAX_BATCH;
-pub use server::ServeOutcome;
+pub use server::{ServeOutcome, check_bind_policy};
+
+/// Whether a comma-separated origin list (the `DRSG_ALLOWED_ORIGINS` form)
+/// names any origin off loopback — the reading [`check_bind_policy`] wants
+/// from a caller that checks the bind before the server exists.
+pub fn origins_off_loopback(list: &str) -> bool {
+    list.split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .any(|o| !auth::AllowedOrigins::is_loopback(o))
+}
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -127,6 +137,11 @@ pub struct ServeOptions {
     /// with `DRSG_ALLOWED_HOSTS` (comma-separated). See
     /// [`server::mcp_allowed_hosts`].
     pub allowed_hosts: Vec<String>,
+    /// Longest one MCP tool call over `/mcp` may take, queue included
+    /// (`[server] mcp_tool_deadline_secs`). `None` leaves it to
+    /// `DRSG_MCP_TOOL_DEADLINE_SECS` or the mcp crate's default;
+    /// `Some(None)` runs without limit; `Some(Some(d))` is the deadline.
+    pub mcp_tool_deadline: Option<Option<Duration>>,
 }
 
 /// A PEM certificate chain + private key for native TLS.
@@ -221,6 +236,7 @@ impl Default for ServeOptions {
             on_start: None,
             follow: None,
             allowed_hosts: Vec::new(),
+            mcp_tool_deadline: None,
         }
     }
 }
