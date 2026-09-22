@@ -109,6 +109,22 @@ struct Scratch {
     w: BinaryHeap<(Dist, usize)>,
 }
 
+thread_local! {
+    /// The read path's [`Scratch`]: `search` takes `&self`, so it cannot use
+    /// the index-owned buffers the build path reuses. One per thread keeps
+    /// the visited set's allocation (and its zeroing) off every query.
+    static SEARCH_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// The largest `visited` buffer a thread keeps between searches. The scratch
+/// lives as long as the thread and only ever grows, so without a cap a big
+/// index would pin `4 * N` bytes on every thread that ever searched it — a
+/// pool of long-lived workers multiplies that. Up to this size (4M nodes) the
+/// buffer is kept and a query costs no allocation; above it the thread's
+/// scratch is dropped after the search, which is the per-query allocation the
+/// scratch replaced — no worse than before, and bounded per thread.
+const RETAINED_SCRATCH_BYTES: usize = 16 << 20;
+
 impl Scratch {
     /// Ready the buffers for a search over `n` nodes: grow `visited`, bump the
     /// generation (clearing on the rare `u32` wrap), and empty the heaps.
@@ -123,6 +139,12 @@ impl Scratch {
         }
         self.cand.clear();
         self.w.clear();
+    }
+
+    /// Whether this scratch is small enough to keep for the thread's next
+    /// search (see [`RETAINED_SCRATCH_BYTES`]).
+    fn retainable(&self) -> bool {
+        self.visited.capacity() * std::mem::size_of::<u32>() <= RETAINED_SCRATCH_BYTES
     }
 }
 
@@ -376,7 +398,13 @@ impl HnswIndex {
             vec: query,
             norm: dot(query, query).sqrt(),
         };
-        let mut scratch = Scratch::default();
+        // `search` is `&self`, so it cannot use the index-owned `scratch`;
+        // borrow the thread's instead of zeroing a fresh N-slot visited set
+        // per query. Taken out of the cell (not borrowed across the search)
+        // so a re-entrant call from a filter could never hit a `RefCell`
+        // panic; the generation stamp makes the buffer safe to share between
+        // indexes of different sizes.
+        let mut scratch = SEARCH_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
 
         let mut ep = entry;
         let mut lc = self.top_layer;
@@ -389,6 +417,9 @@ impl HnswIndex {
         }
 
         let w = Self::search_layer(&self.nodes, self.metric, q, &[ep], ef, 0, &mut scratch);
+        if scratch.retainable() {
+            SEARCH_SCRATCH.with(|c| *c.borrow_mut() = scratch);
+        }
 
         let hits = top_k(
             w.into_iter()
@@ -803,11 +834,22 @@ impl VectorIndex for HnswIndex {
     fn remove(&mut self, id: u64) -> Result<()> {
         if let Some(idx) = self.id_to_idx.remove(&id) {
             self.nodes[idx].deleted = true;
-            // If we tombstoned the entry point, pick any live node as the new
-            // one (search still works; the graph stays connected enough for
-            // recall, and rebuild-from-KV is the real fix — arch/01 §5).
+            // If we tombstoned the entry point, hand the role to the tallest
+            // live node and lower `top_layer` to match. Search and insert
+            // start at `nodes[entry].layers[top_layer]` without a bounds
+            // check (the invariant `is_wellformed` states), so an arbitrary
+            // replacement — ~94% of nodes have only layer 0 — would panic on
+            // the next query. The scan is linear in the live set, paid only
+            // when the entry itself goes; rebuild-from-KV remains the way to
+            // reclaim tombstones (arch/01 §5).
             if self.entry == Some(idx) {
-                self.entry = self.id_to_idx.values().next().copied();
+                let tallest = self
+                    .id_to_idx
+                    .values()
+                    .copied()
+                    .max_by_key(|&i| (self.nodes[i].layers.len(), std::cmp::Reverse(i)));
+                self.entry = tallest;
+                self.top_layer = tallest.map_or(0, |i| self.nodes[i].layers.len() - 1);
             }
         }
         Ok(())
@@ -843,6 +885,33 @@ mod tests {
     use super::*;
     use crate::storage::vector::BruteForceIndex;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_search_scratch_beyond_the_cap_is_not_kept_for_the_thread() {
+        // A thread that once served a huge index must not pin that index's
+        // visited buffer forever: after a search the scratch is put back only
+        // if it is under the cap. Plant an over-cap scratch on this thread,
+        // search a tiny index, and check the thread now holds nothing.
+        let over = RETAINED_SCRATCH_BYTES / std::mem::size_of::<u32>() + 1;
+        SEARCH_SCRATCH.with(|c| {
+            *c.borrow_mut() = Scratch {
+                visited: Vec::with_capacity(over),
+                ..Scratch::default()
+            }
+        });
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        idx.insert(1, &[1.0, 0.0]).unwrap();
+        idx.insert(2, &[0.0, 1.0]).unwrap();
+        assert_eq!(idx.search(&[1.0, 0.1], 1, None).unwrap()[0].id, 1);
+        let kept = SEARCH_SCRATCH.with(|c| c.borrow().visited.capacity());
+        assert_eq!(kept, 0, "an over-cap scratch is dropped, not retained");
+
+        // Whereas a normal-sized one is kept, so the next query allocates
+        // nothing.
+        assert_eq!(idx.search(&[0.1, 1.0], 1, None).unwrap()[0].id, 2);
+        let kept = SEARCH_SCRATCH.with(|c| c.borrow().visited.capacity());
+        assert!(kept >= 2 && kept * 4 <= RETAINED_SCRATCH_BYTES, "{kept}");
+    }
 
     /// Deterministic vector generator (seeded xorshift → f32 in [-1,1]).
     struct Gen(u64);
@@ -1018,6 +1087,112 @@ mod tests {
         for _ in 0..20 {
             let hits = idx.search(&q.vec(dim), 10, None).unwrap();
             assert!(hits.iter().all(|h| !removed.contains(&h.id)));
+        }
+    }
+
+    /// Removing the entry node must leave `entry`/`top_layer` agreeing with
+    /// a live node: search and insert start at `layers[top_layer]` of the
+    /// entry unchecked, so an arbitrary successor (most nodes are layer-0
+    /// only) used to panic on the next query.
+    #[test]
+    fn removing_the_entry_node_keeps_the_graph_wellformed() {
+        let dim = 8;
+        let mut g = Gen(31);
+        let mut idx = HnswIndex::new(Metric::L2);
+        for id in 0..300u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        assert!(idx.top_layer > 0, "fixture needs a multi-layer graph");
+
+        // Delete whichever node is the entry, repeatedly, so the successor
+        // chain walks down through every layer height.
+        let mut removed = HashSet::new();
+        while let Some(e) = idx.entry {
+            let id = idx.nodes[e].id;
+            idx.remove(id).unwrap();
+            removed.insert(id);
+            assert!(idx.is_wellformed(), "after removing entry {id}");
+            if let Some(ne) = idx.entry {
+                assert!(!idx.nodes[ne].deleted);
+                assert_eq!(idx.nodes[ne].layers.len(), idx.top_layer + 1);
+                // The tallest survivor is chosen, so the top never rises.
+                assert!(
+                    idx.id_to_idx
+                        .values()
+                        .all(|&i| idx.nodes[i].layers.len() <= idx.top_layer + 1)
+                );
+            }
+            let hits = idx.search(&g.vec(dim), 10, None).unwrap();
+            assert!(hits.iter().all(|h| !removed.contains(&h.id)));
+            idx.insert(1_000 + id, &g.vec(dim)).unwrap();
+            assert!(idx.is_wellformed(), "after re-inserting past entry {id}");
+            if removed.len() > 40 {
+                break;
+            }
+        }
+        assert!(!removed.is_empty());
+    }
+
+    /// Deleting every node empties the index cleanly; the next insert
+    /// becomes the new entry and search works again.
+    #[test]
+    fn removing_every_node_then_inserting_recovers() {
+        let dim = 8;
+        let mut g = Gen(32);
+        let mut idx = HnswIndex::new(Metric::Cosine);
+        for id in 0..120u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+        }
+        for id in 0..120u64 {
+            idx.remove(id).unwrap();
+            assert!(idx.is_wellformed());
+            idx.search(&g.vec(dim), 5, None).unwrap();
+        }
+        assert!(idx.is_empty());
+        assert_eq!(idx.entry, None);
+        assert_eq!(idx.top_layer, 0);
+        assert!(idx.search(&g.vec(dim), 5, None).unwrap().is_empty());
+
+        for id in 200..260u64 {
+            idx.insert(id, &g.vec(dim)).unwrap();
+            assert!(idx.is_wellformed());
+        }
+        let hits = idx.search(&g.vec(dim), 5, None).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|h| (200..260).contains(&h.id)));
+    }
+
+    /// The thread-local search scratch is shared by every index a thread
+    /// queries; the generation stamp must keep a small index's search from
+    /// seeing a larger index's marks (and vice versa) — results equal a
+    /// fresh-scratch run.
+    #[test]
+    fn shared_search_scratch_does_not_leak_between_indexes() {
+        let dim = 8;
+        let mut g = Gen(33);
+        let mut big = HnswIndex::new(Metric::L2);
+        for id in 0..400u64 {
+            big.insert(id, &g.vec(dim)).unwrap();
+        }
+        let mut small = HnswIndex::new(Metric::L2);
+        for id in 0..20u64 {
+            small.insert(id, &g.vec(dim)).unwrap();
+        }
+        let q = g.vec(dim);
+        let fresh = std::thread::spawn({
+            let small = small.clone();
+            let q = q.clone();
+            move || small.search(&q, 10, None).unwrap()
+        })
+        .join()
+        .unwrap();
+        for _ in 0..3 {
+            big.search(&q, 10, None).unwrap();
+            let got = small.search(&q, 10, None).unwrap();
+            assert_eq!(
+                got.iter().map(|h| h.id).collect::<Vec<_>>(),
+                fresh.iter().map(|h| h.id).collect::<Vec<_>>()
+            );
         }
     }
 
