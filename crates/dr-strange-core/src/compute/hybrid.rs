@@ -65,7 +65,10 @@ pub struct HybridHit {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HybridSpec {
     /// Scope every channel to this label. Required by the keyword channel (its
-    /// index is keyed on the label); optional for the others.
+    /// index is keyed on the label); optional for the others. The graph
+    /// channel walks through any node but only *scores* nodes carrying the
+    /// label, so a `Doc` query boosted through an `Author` still surfaces
+    /// only `Doc`s.
     pub label: Option<String>,
     pub vector: Option<VectorChannel>,
     pub keyword: Option<KeywordChannel>,
@@ -141,6 +144,7 @@ pub fn run<R: GraphReader + ?Sized>(reader: &R, spec: &HybridSpec) -> Result<Vec
         Some(g) => Some(Channel {
             hits: graph_proximity(
                 reader,
+                label,
                 &top_seeds(&vector, &keyword, g.seeds),
                 g.hops,
                 g.decay,
@@ -193,6 +197,12 @@ impl Channel {
 
 /// Fuse the (optional) channels into a single ranking, highest fused score
 /// first (ties by ascending node id), truncated to `k`.
+///
+/// A non-finite raw score (a NaN distance from a corrupt vector, an infinite
+/// BM25 weight) cannot be normalized and would poison the whole channel's
+/// min/max, so it is dropped from that channel before fusion: the node then
+/// simply has no contribution from it, the same as being absent. Fused scores
+/// are therefore always finite and the sort is a total order.
 pub(crate) fn fuse(
     vector: Option<Channel>,
     keyword: Option<Channel>,
@@ -200,6 +210,13 @@ pub(crate) fn fuse(
     weights: HybridWeights,
     k: usize,
 ) -> Vec<HybridHit> {
+    let finite = |ch: Option<Channel>| {
+        ch.map(|mut c| {
+            c.hits.retain(|&(_, s)| s.is_finite());
+            c
+        })
+    };
+    let (vector, keyword, graph) = (finite(vector), finite(keyword), finite(graph));
     let vn = vector.as_ref().map(Channel::normalized);
     let kn = keyword.as_ref().map(Channel::normalized);
     let gn = graph.as_ref().map(Channel::normalized);
@@ -237,12 +254,7 @@ pub(crate) fn fuse(
         })
         .collect();
 
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.node.0.cmp(&b.node.0))
-    });
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.0.cmp(&b.node.0)));
     hits.truncate(k);
     hits
 }
@@ -266,8 +278,13 @@ pub(crate) fn top_seeds(
 /// Multi-source BFS proximity: from `seeds` (distance 0), expand up to `hops`
 /// over undirected neighbours, scoring each reached node `decay^distance`.
 /// A seed scores 1.0; its 1-hop neighbours `decay`; and so on.
+///
+/// The walk itself is unscoped — an intermediate of another label is a
+/// legitimate bridge — but with a `label` only reached nodes carrying it are
+/// scored, matching what the vector and keyword channels return for it.
 pub(crate) fn graph_proximity<R: GraphReader + ?Sized>(
     reader: &R,
+    label: Option<&str>,
     seeds: &[NodeId],
     hops: u32,
     decay: f32,
@@ -292,10 +309,19 @@ pub(crate) fn graph_proximity<R: GraphReader + ?Sized>(
         }
         frontier = next;
     }
-    Ok(dist
-        .into_iter()
-        .map(|(node, d)| (node, decay.powi(d as i32)))
-        .collect())
+    let mut out = Vec::with_capacity(dist.len());
+    for (node, d) in dist {
+        if let Some(label) = label {
+            let carries = reader
+                .node(node)?
+                .is_some_and(|n| n.labels.iter().any(|l| l == label));
+            if !carries {
+                continue;
+            }
+        }
+        out.push((node, decay.powi(d as i32)));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -346,6 +372,29 @@ mod tests {
         assert_eq!(fused[0].node, NodeId(1));
         assert_eq!(fused[0].vector, None);
         assert!(fused[0].score > fused[1].score);
+    }
+
+    #[test]
+    fn non_finite_scores_are_dropped_before_fusion() {
+        // A NaN distance would make the whole vector channel's min/max NaN and
+        // every normalized score with it; an infinite BM25 score would flatten
+        // the keyword channel to 0. Both are dropped, so node 3 ranks on its
+        // finite keyword score alone and every fused score stays finite.
+        let vector = ch(&[(1, 0.0), (2, f32::NAN), (3, 1.0)], false);
+        let keyword = ch(&[(2, f32::INFINITY), (3, 4.0), (1, 2.0)], true);
+        let fused = fuse(
+            Some(vector),
+            Some(keyword),
+            None,
+            HybridWeights::default(),
+            10,
+        );
+        assert!(fused.iter().all(|h| h.score.is_finite()));
+        let n2 = fused.iter().find(|h| h.node == NodeId(2));
+        assert!(n2.is_none(), "node 2 had no finite score in any channel");
+        let n3 = fused.iter().find(|h| h.node == NodeId(3)).unwrap();
+        assert_eq!(n3.keyword, Some(4.0));
+        assert!((n3.score - 1.0).abs() < 1e-6, "best finite keyword → 1.0");
     }
 
     #[test]

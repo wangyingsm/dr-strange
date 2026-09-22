@@ -360,7 +360,7 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
             // index is declared, exact brute force otherwise. The reader
             // decides (arch/01 §5); either way the result is `(id, distance)`.
             let hits =
-                reader.vector_search(label.as_deref(), property, query, *metric, *k as usize)?;
+                reader.vector_search(label.as_deref(), property, query, *metric, clamp(*k))?;
             return Ok(hits
                 .into_iter()
                 .map(|hit| {
@@ -379,7 +379,7 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
         } => {
             // BM25 over the declared keyword index; the relevance score seeds
             // the row's score channel, as a vector seed's similarity does.
-            let hits = reader.keyword_search(label, property, query, *k as usize)?;
+            let hits = reader.keyword_search(label, property, query, clamp(*k))?;
             return Ok(hits
                 .into_iter()
                 .map(|(id, score)| Row::scored(id, score))
@@ -543,17 +543,19 @@ fn apply_step<'r>(
             max,
         } => {
             let (dir, ty, min, max) = (*dir, edge_type.clone(), *min, *max);
-            Box::new(iter.flat_map(move |rr| match rr {
-                Err(e) => vec![Err(e)].into_iter(),
-                Ok(row) => expand_var(reader, row, dir, &ty, min, max).into_iter(),
+            Box::new(iter.flat_map(move |rr| -> RowIter<'r> {
+                match rr {
+                    Err(e) => Box::new(std::iter::once(Err(e))),
+                    Ok(row) => Box::new(ExpandVar::new(reader, row, dir, ty.clone(), min, max)),
+                }
             }))
         }
         Step::Filter(expr) => {
             let pred = expr.clone();
             Box::new(iter.filter_map(move |rr| filter_one(reader, rr, &pred, &need)))
         }
-        Step::Skip(n) => Box::new(iter.skip(*n as usize)),
-        Step::Limit(n) => Box::new(iter.take(*n as usize)),
+        Step::Skip(n) => Box::new(iter.skip(clamp(*n))),
+        Step::Limit(n) => Box::new(iter.take(clamp(*n))),
         Step::Distinct => {
             let mut seen: AHashSet<NodeId> = AHashSet::new();
             Box::new(iter.filter_map(move |rr| match rr {
@@ -570,13 +572,22 @@ fn apply_step<'r>(
             metric,
             k,
         } => {
-            let frontier = drain(iter)?;
-            let ids: Vec<NodeId> = frontier.iter().map(|r| r.head).collect();
-            let ranked = vector_top_k_rows(reader, &ids, property, query, *metric, *k as usize)?;
+            // The frontier is ranked as a *set* of nodes: a node several
+            // walks reach is one candidate holding one of the k slots, and
+            // the row it keeps is the first walk that reached it (so the
+            // trail is real, not a synthesized trail-less row). Ranking the
+            // raw row list instead would let one node fill several slots.
+            let mut by_head: ahash::AHashMap<NodeId, Row> = ahash::AHashMap::new();
+            let mut ids: Vec<NodeId> = Vec::new();
+            for row in drain(iter)? {
+                if let std::collections::hash_map::Entry::Vacant(e) = by_head.entry(row.head) {
+                    ids.push(row.head);
+                    e.insert(row);
+                }
+            }
+            let ranked = vector_top_k_rows(reader, &ids, property, query, *metric, clamp(*k))?;
             // vector_top_k_rows makes fresh scored rows (no trail); re-attach
             // each winner's original trail so path info survives the rerank.
-            let mut by_head: ahash::AHashMap<NodeId, Row> =
-                frontier.into_iter().map(|r| (r.head, r)).collect();
             let out: Vec<Result<Row>> = ranked
                 .into_iter()
                 .map(|scored| {
@@ -611,6 +622,12 @@ fn apply_step<'r>(
             Box::new(out.into_iter().map(Ok))
         }
     })
+}
+
+/// A plan's `u64` count as a `usize`, saturating: on a 32-bit target a count
+/// above `usize::MAX` means "all of them", never a wrapped small number.
+fn clamp(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// Drains a row stream, propagating the first error (used by barrier steps).
@@ -696,34 +713,76 @@ fn expand_one(
 /// a node/edge may be revisited; the only bound is depth ∈ `min..=max`. Emits
 /// one row per distinct walk. Callers wanting uniqueness add `Distinct`.
 ///
-/// DFS with an explicit stack; a `neighbors` error ends that branch as an
-/// `Err` row rather than aborting the whole expansion.
-fn expand_var(
-    reader: &dyn GraphReader,
-    start: Row,
+/// DFS with an explicit stack, pulled one row at a time: the number of walks
+/// grows exponentially with `max`, so a start row's expansion is never
+/// materialized — a `Limit` downstream stops it after its n rows and the
+/// deadline sees rows as they are produced. Preorder, children in reverse
+/// neighbour order (the last neighbour pushed is the first popped), exactly
+/// the order the eager version produced. A `neighbors` error ends that branch
+/// as an `Err` row, emitted right after the row it was expanding, rather than
+/// aborting the whole expansion.
+struct ExpandVar<'r> {
+    reader: &'r dyn GraphReader,
     dir: Dir,
-    ty: &Option<String>,
+    ty: Option<String>,
     min: u32,
     max: u32,
-) -> Vec<Result<Row>> {
-    let mut out = Vec::new();
-    let mut stack = vec![(start, 0u32)];
-    while let Some((row, depth)) = stack.pop() {
-        if depth >= min && depth <= max {
-            out.push(Ok(row.clone()));
+    stack: Vec<(Row, u32)>,
+    /// An expansion error owed to the caller after the row it belongs to.
+    pending: Option<Error>,
+}
+
+impl<'r> ExpandVar<'r> {
+    fn new(
+        reader: &'r dyn GraphReader,
+        start: Row,
+        dir: Dir,
+        ty: Option<String>,
+        min: u32,
+        max: u32,
+    ) -> Self {
+        ExpandVar {
+            reader,
+            dir,
+            ty,
+            min,
+            max,
+            stack: vec![(start, 0)],
+            pending: None,
         }
-        if depth < max {
-            match reader.neighbors(row.head, dir, ty.as_deref()) {
-                Err(e) => out.push(Err(e)),
-                Ok(ns) => {
-                    for n in ns.iter() {
-                        stack.push((row.step(n.edge, n.node), depth + 1));
+    }
+}
+
+impl Iterator for ExpandVar<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.pending.take() {
+            return Some(Err(e));
+        }
+        loop {
+            let (row, depth) = self.stack.pop()?;
+            if depth < self.max {
+                match self
+                    .reader
+                    .neighbors(row.head, self.dir, self.ty.as_deref())
+                {
+                    Err(e) => self.pending = Some(e),
+                    Ok(ns) => {
+                        for n in ns.iter() {
+                            self.stack.push((row.step(n.edge, n.node), depth + 1));
+                        }
                     }
                 }
             }
+            if depth >= self.min && depth <= self.max {
+                return Some(Ok(row));
+            }
+            if let Some(e) = self.pending.take() {
+                return Some(Err(e));
+            }
         }
     }
-    out
 }
 
 fn filter_one(
@@ -802,10 +861,10 @@ pub fn execute_table(
         rows.sort_by(|a, b| cmp_columns(a, b, &proj.order_by));
     }
     if let Some(skip) = proj.skip {
-        rows.drain(..(skip as usize).min(rows.len()));
+        rows.drain(..clamp(skip).min(rows.len()));
     }
     if let Some(limit) = proj.limit {
-        rows.truncate(limit as usize);
+        rows.truncate(clamp(limit));
     }
     Ok(Table {
         columns: proj.items.iter().map(|i| i.name.clone()).collect(),
@@ -1739,6 +1798,112 @@ mod tests {
         assert!(matches!(sorted[4], PropValue::Float(f) if f.is_nan()));
         assert!(matches!(sorted[5], PropValue::Float(f) if f.is_nan()));
         assert!(matches!(sorted[6], PropValue::Str(_)));
+    }
+
+    #[test]
+    fn frontier_top_k_ranks_distinct_nodes_and_keeps_each_trail() {
+        // a -> t via two edges, a -> u via one; t is closest to the query.
+        // The frontier after Expand holds t twice (two walks) and u once.
+        // Top-2 must be {t, u} — t must not take both slots — and every
+        // emitted row must still carry the walk that reached it.
+        let eng = MemoryEngine::new();
+        let (a, t, u);
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            let emb = |x: f32| props(&[("emb", PropValue::Vector(vec![x, 0.0]))]);
+            a = graph::create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new()).unwrap();
+            t = graph::create_node(&mut txn, PlaneId::STARTUP, &[], &emb(0.0)).unwrap();
+            u = graph::create_node(&mut txn, PlaneId::STARTUP, &[], &emb(5.0)).unwrap();
+            graph::create_edge(&mut txn, PlaneId::STARTUP, a, t, "N", &Properties::new()).unwrap();
+            graph::create_edge(&mut txn, PlaneId::STARTUP, a, t, "N", &Properties::new()).unwrap();
+            graph::create_edge(&mut txn, PlaneId::STARTUP, a, u, "N", &Properties::new()).unwrap();
+            txn.commit().unwrap();
+        }
+        let mut plan = LogicalPlan::new(Source::SeekIds(vec![a]));
+        plan.push(Step::Expand {
+            dir: Dir::Out,
+            edge_type: None,
+        });
+        plan.push(Step::FrontierTopK {
+            property: "emb".into(),
+            query: vec![0.0, 0.0],
+            metric: Metric::L2,
+            k: 2,
+        });
+        let txn = eng.begin_read().unwrap();
+        let reader = UncachedReader::new(&txn, PlaneId::STARTUP);
+        let rows: Vec<Row> = execute(&plan, &reader)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let heads: Vec<NodeId> = rows.iter().map(|r| r.head).collect();
+        assert_eq!(heads, vec![t, u], "one slot per distinct node, best first");
+        for row in &rows {
+            assert_eq!(row.hops(), 1, "the winner keeps the walk that reached it");
+            assert_eq!(row.origin, a);
+            assert_eq!(row.path().last().map(|(_, n)| *n), Some(row.head));
+        }
+    }
+
+    #[test]
+    fn expand_var_is_lazy_so_limit_stops_an_exponential_walk() {
+        // A 6-clique has 5^11 ≈ 48M walks of length 12 from one node. Eager
+        // expansion would materialize them all before Limit saw a row; lazy
+        // expansion yields the first three and stops.
+        let eng = MemoryEngine::new();
+        let mut ids = Vec::new();
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            for _ in 0..6 {
+                ids.push(
+                    graph::create_node(&mut txn, PlaneId::STARTUP, &[], &Properties::new())
+                        .unwrap(),
+                );
+            }
+            for &a in &ids {
+                for &b in &ids {
+                    if a != b {
+                        graph::create_edge(
+                            &mut txn,
+                            PlaneId::STARTUP,
+                            a,
+                            b,
+                            "N",
+                            &Properties::new(),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+        }
+        let mut plan = LogicalPlan::new(Source::SeekIds(vec![ids[0]]));
+        plan.push(Step::ExpandVar {
+            dir: Dir::Out,
+            edge_type: None,
+            min: 1,
+            max: 12,
+        });
+        plan.push(Step::Limit(3));
+        let txn = eng.begin_read().unwrap();
+        let reader = UncachedReader::new(&txn, PlaneId::STARTUP);
+        let started = Instant::now();
+        let rows: Vec<Row> = execute(&plan, &reader)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the walk was materialized before Limit saw a row"
+        );
+        // Preorder DFS, last neighbour first: the walk goes deeper each row.
+        assert_eq!(
+            rows.iter().map(|r| r.hops()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]

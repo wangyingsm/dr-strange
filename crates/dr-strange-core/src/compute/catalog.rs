@@ -9,12 +9,14 @@
 
 use std::collections::BTreeMap;
 
+use ahash::AHashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
-use crate::types::{PlaneId, PropValue};
+use crate::types::{NodeId, PlaneId, PropValue};
 
 /// The kind of a [`PropValue`], for observed-type frequencies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -224,11 +226,29 @@ pub fn count(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<PlaneCounters>
 pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnapshot> {
     let mut cat = CatalogSnapshot::default();
 
+    // Each node's labels, remembered from the node pass as interned ids so
+    // the edge pass can resolve both endpoints without decoding the two
+    // records again (three decodes per node on a dense graph, otherwise).
+    let mut label_ids: AHashMap<String, u32> = AHashMap::new();
+    let mut label_names: Vec<String> = Vec::new();
+    let mut labels_of: AHashMap<NodeId, Vec<u32>> = AHashMap::new();
+
     for id in graph::scan_all(txn, plane)? {
         let Some(node) = graph::get_node(txn, plane, id)? else {
             continue;
         };
         cat.node_count += 1;
+        let interned: Vec<u32> = node
+            .labels
+            .iter()
+            .map(|l| {
+                *label_ids.entry(l.clone()).or_insert_with(|| {
+                    label_names.push(l.clone());
+                    (label_names.len() - 1) as u32
+                })
+            })
+            .collect();
+        labels_of.insert(id, interned);
         for label in &node.labels {
             let ls = cat.labels.entry(label.clone()).or_default();
             ls.count += 1;
@@ -248,18 +268,15 @@ pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnaps
             continue;
         };
         cat.edge_count += 1;
-        // Record every (src_label, dst_label) combination this edge links.
-        let src_labels = graph::get_node(txn, plane, edge.src)?
-            .map(|n| n.labels)
-            .unwrap_or_default();
-        let dst_labels = graph::get_node(txn, plane, edge.dst)?
-            .map(|n| n.labels)
-            .unwrap_or_default();
+        // Record every (src_label, dst_label) combination this edge links. An
+        // endpoint the node pass did not see (a dangling edge) has no labels.
+        let src_labels = labels_of.get(&edge.src).map(Vec::as_slice).unwrap_or(&[]);
+        let dst_labels = labels_of.get(&edge.dst).map(Vec::as_slice).unwrap_or(&[]);
         let ets = cat.edge_types.entry(edge.ty.clone()).or_default();
         ets.count += 1;
-        for sl in &src_labels {
-            for dl in &dst_labels {
-                ets.add_connection(sl, dl, 1);
+        for &sl in src_labels {
+            for &dl in dst_labels {
+                ets.add_connection(&label_names[sl as usize], &label_names[dl as usize], 1);
             }
         }
     }
