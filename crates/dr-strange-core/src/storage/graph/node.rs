@@ -289,7 +289,14 @@ pub fn delete_node(txn: &mut dyn WriteTransaction, plane: PlaneId, id: NodeId) -
     for lid in label_ids {
         txn.delete(TableId::LabelIdx, &keys::label_idx_key(plane, lid, id))?;
     }
-    if let Some(key) = &external_key {
+    // Only drop the lookup row if it still points at this node. The inline
+    // key is the node's own claim; the `ext_keys` row is the plane's current
+    // owner. They agree under the uniqueness check, but the delete stays
+    // conservative so a stale inline key (an older file, a bypassed check)
+    // can never strip a live node's lookup entry.
+    if let Some(key) = &external_key
+        && node_id_by_external_key(txn, plane, key)? == Some(id)
+    {
         txn.delete(TableId::ExtKeys, &keys::ext_key_key(plane, key))?;
     }
     txn.delete(TableId::NodePlane, &keys::node_plane_key(id))?;

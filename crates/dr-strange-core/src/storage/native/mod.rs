@@ -27,7 +27,7 @@
 mod sst;
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
@@ -290,6 +290,25 @@ pub struct NativeEngine {
     /// contract as `api::ChangeObserver` ("cheap and non-blocking — the web
     /// layer just forwards into a broadcast channel").
     wal_observer: Mutex<Option<WalObserver>>,
+    /// The error from the most recent post-commit maintenance pass
+    /// (flush/compaction) that failed, cleared once a later pass succeeds.
+    /// Maintenance runs after the batch is durable and published, so its
+    /// failure cannot be reported through `commit` without lying about a
+    /// write that did land; it is logged and kept here, readable through
+    /// `last_maintenance_error` and `Database::last_maintenance_error`.
+    last_maintenance_error: Mutex<Option<String>>,
+    /// Test seam: parks a flush after its SST is written but before the swap,
+    /// so a test can prove readers get through that window.
+    #[cfg(test)]
+    flush_pause: test_hooks::Pause,
+    /// Test seam: makes the next flush's SST write fail, standing in for a
+    /// disk that still takes the log but refuses a new file.
+    #[cfg(test)]
+    sst_write_fault: test_hooks::Fault,
+    /// Test seam: makes the next WAL truncation's fsync fail, after the
+    /// truncate itself took effect.
+    #[cfg(test)]
+    wal_sync_fault: test_hooks::Fault,
 }
 
 impl NativeEngine {
@@ -351,12 +370,21 @@ impl NativeEngine {
 
         // Then the WAL tail (records not yet folded into an SST).
         let wal_path = dir.join("wal");
+        let fresh = !wal_path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&wal_path)?;
+        // A brand-new store's directory entries (LOCK, wal) are made durable
+        // now: each commit fsyncs the WAL file itself, but on a filesystem that
+        // does not journal the parent on a file fsync the entry could still be
+        // lost in a crash before the first flush, which is the first time the
+        // directory is otherwise fsynced — every commit until then with it.
+        if fresh {
+            sync_dir(&dir)?;
+        }
         let valid_len = replay(&mut file, &mut store)?;
         file.set_len(valid_len)?;
         file.seek(SeekFrom::Start(valid_len))?;
@@ -377,33 +405,96 @@ impl NativeEngine {
             retain_commits: AtomicU64::new(0),
             read_only,
             wal_observer: Mutex::new(None),
+            last_maintenance_error: Mutex::new(None),
+            #[cfg(test)]
+            flush_pause: test_hooks::Pause::default(),
+            #[cfg(test)]
+            sst_write_fault: test_hooks::Fault::default(),
+            #[cfg(test)]
+            wal_sync_fault: test_hooks::Fault::default(),
         })
     }
 
+    /// The error from the latest failed flush/compaction, if the most recent
+    /// maintenance pass failed. A commit whose batch is durable returns `Ok`
+    /// even when the maintenance it triggered fails (the write is safe; the
+    /// memtable/WAL just stay larger than intended until the next commit
+    /// retries), so this is where that failure is surfaced.
+    pub fn last_maintenance_error(&self) -> Option<String> {
+        self.last_maintenance_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Test seam for the `api` layer: fail the next SST write, so a test
+    /// above this module can produce a remembered maintenance failure
+    /// without reaching into the engine's private hooks.
+    #[cfg(test)]
+    pub(crate) fn arm_sst_write_fault(&self) {
+        self.sst_write_fault.arm();
+    }
+
     /// Flush the memtable to a new SST and rotate the WAL, if the memtable is
-    /// over threshold. Called from `commit` while holding the store write lock
-    /// (so single-writer). The SST is made durable before the WAL is truncated.
-    fn maybe_flush(&self, store: &mut Store) -> Result<()> {
-        if store.mem_bytes < self.flush_threshold || store.mem.is_empty() {
-            return Ok(());
-        }
-        let n = store.next_sst;
-        store.next_sst += 1;
-        let path = self.dir.join(format!("sst-{n:06}"));
-        sst::write(&path, &store.mem, store.committed_seq)?;
+    /// over threshold. Called from `commit` after the batch is published and
+    /// the store write lock released, still under the write gate.
+    ///
+    /// The SST is written under the store *read* lock, so readers keep going
+    /// through the write+fsync. That is sound because the memtable only ever
+    /// changes inside `durable_commit`, and the gate makes this the only
+    /// `durable_commit` in flight: between publish and the swap below the
+    /// memtable is effectively immutable, and the SST is an exact copy of it
+    /// stamped with the same sequences. The swap itself — run in, memtable
+    /// out — is the only step that takes the write lock, and it is a few
+    /// pointer moves; a reader before or after it sees the same versions. The
+    /// SST is made durable before the WAL is truncated.
+    fn maybe_flush(&self) -> Result<()> {
+        let (path, n) = {
+            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+            if store.mem_bytes < self.flush_threshold || store.mem.is_empty() {
+                return Ok(());
+            }
+            let n = store.next_sst;
+            let path = self.dir.join(format!("sst-{n:06}"));
+            #[cfg(test)]
+            self.sst_write_fault.trip()?;
+            sst::write(&path, &store.mem, store.committed_seq)?;
+            #[cfg(test)]
+            self.flush_pause.wait();
+            (path, n)
+        };
         let s = self.open_sst(&path)?;
-        store.ssts.push(s);
-        store.mem.clear();
-        store.mem_bytes = 0;
+        {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            // A failed attempt (write error above, or open_sst) leaves the
+            // number unclaimed and the memtable in place; the retry the next
+            // commit makes overwrites the same name via rename.
+            store.next_sst = n + 1;
+            store.ssts.push(s);
+            store.mem.clear();
+            store.mem_bytes = 0;
+        }
 
         // The flushed records are now durable in the SST → drop them from the
-        // WAL. (Not fsynced: if the truncation is lost, the next open just
-        // replays records already captured by the SST, which is idempotent.)
+        // WAL. Losing the truncation itself would be harmless (the next open
+        // would replay records already captured by the SST, which is
+        // idempotent), but the truncate is a metadata change and the SST
+        // rename before it another, so the directory is fsynced to make the
+        // new file list durable in the same order the code produced it.
         let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
         wal.flush()?;
         let f = wal.get_mut();
         f.set_len(0)?;
+        // The cursor moves the instant the file is cut, before anything that
+        // can fail: a commit is Ok even when its maintenance fails, so were the
+        // fsync below to fail with the cursor still at the old end, every later
+        // batch would be appended behind a zero-filled hole that replay reads
+        // as an empty torn tail — durable commits, lost on the next open.
         f.seek(SeekFrom::Start(0))?;
+        f.sync_all()?;
+        #[cfg(test)]
+        self.wal_sync_fault.trip()?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -506,21 +597,24 @@ impl NativeEngine {
         };
         let min_snap = self.min_snapshot(committed_seq);
 
-        // Merge every run into one map (a later run's version wins), then drop
-        // what no reader needs.
-        let mut merged: BTreeMap<MemKey, Op> = BTreeMap::new();
-        for run in &runs {
-            run.load_into(&mut merged)?;
-        }
-        let kept = gc_versions(merged, min_snap);
-        let max_seq = kept
-            .keys()
-            .map(|(_, _, Reverse(s))| *s)
+        // Stream the runs through a k-way merge (a later run's version wins)
+        // and the version GC straight into the new file: memory is one block
+        // per run plus one key's version group, not the sum of the runs. The
+        // merged run is stamped with the newest sequence any input held, which
+        // stays right when GC drops the newest entry of an all-dead key.
+        let max_seq = runs
+            .iter()
+            .map(|r| r.max_seq)
             .max()
             .unwrap_or(committed_seq);
-
+        let count_hint = runs.iter().map(|r| r.count).sum::<u64>();
+        let count_hint = usize::try_from(count_hint).unwrap_or(usize::MAX);
         let path = self.dir.join(format!("sst-{next:06}"));
-        sst::write(&path, &kept, max_seq)?;
+        {
+            let merged = MergeIter::new(runs.iter().map(|r| r.entries()));
+            let kept = gc_versions(merged, min_snap);
+            sst::write_sorted(&path, kept, count_hint, max_seq)?;
+        }
         let merged_sst = self.open_sst(&path)?;
 
         // Swap the merged runs out for the single new run. Single writer ⇒ the
@@ -537,46 +631,211 @@ impl NativeEngine {
         };
 
         // Delete the merged runs' files. Their `Arc`s drop here (readers never
-        // retain a run across a call), closing the handles first.
-        let paths: Vec<PathBuf> = old.iter().map(|s| s.path.clone()).collect();
+        // retain a run across a call), closing the handles first. Newest run
+        // first, then the directory is fsynced: the merged run may have GC'd a
+        // key whose put sits in an old run and whose tombstone in a newer one,
+        // so were the older unlink to reach disk without the newer, a crash
+        // would bring the put back with nothing shadowing it. A journal that
+        // persists unlinks in order can then never leave that shape, and the
+        // fsync makes the whole removal durable rather than a crash's choice.
+        let paths: Vec<PathBuf> = old.iter().rev().map(|s| s.path.clone()).collect();
         drop(old);
         for p in paths {
-            let _ = std::fs::remove_file(p);
+            std::fs::remove_file(&p).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })?;
         }
+        sync_dir(&self.dir)?;
         Ok(())
     }
 }
 
-/// Reclaim dead versions from a merged run. Processing each key newest-first,
-/// keep versions down to and including the first at or below `min_snapshot`
-/// (the "floor" a reader at that snapshot would see); drop everything older. A
-/// key whose only survivor is a tombstone at/below the floor is dropped
-/// entirely — this is the bottom run, so nothing older can resurface.
-///
-/// Surviving values are **moved** out of `merged` into the result, never
-/// cloned, and `merged` is consumed as it is walked. Values are where a store's
-/// bytes are (a node carrying an embedding is a few KiB per version), so this
-/// is what keeps a compaction's peak near one copy of the run rather than
-/// two — measured on a 175 MiB store, the clone doubled it to ~400 MiB.
-fn gc_versions(merged: BTreeMap<MemKey, Op>, min_snapshot: u64) -> BTreeMap<MemKey, Op> {
-    let mut out = BTreeMap::new();
-    let mut group: Vec<(u64, Op)> = Vec::new();
-    let mut cur: Option<(u8, Vec<u8>)> = None;
+/// Make a directory's entry list durable: on unix a rename or truncate is
+/// only guaranteed to survive a crash once the *directory* is fsynced too,
+/// otherwise a just-renamed SST can vanish while the WAL that held its records
+/// has already been cut. Windows has no directory fsync (NTFS journals
+/// metadata), so this is a no-op there.
+pub(super) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
 
-    for ((table, key, Reverse(seq)), op) in merged {
-        let same = matches!(&cur, Some((t, k)) if *t == table && *k == key);
-        if !same {
-            if let Some((t, k)) = cur.take() {
-                emit_group(t, k, &mut group, min_snapshot, &mut out);
-            }
-            cur = Some((table, key));
+/// The k-way merge of several runs' entry sweeps into one `(table, key, seq
+/// DESC)` stream — compaction's input. Each sweep keeps one block resident and
+/// the heap holds one entry per run, so the merge's memory is proportional to
+/// the number of runs, not to their size. Runs are given oldest first; should
+/// two runs ever carry the same `(table, key, seq)`, the later run's entry is
+/// the one emitted (what the memtable-based merge used to produce by
+/// overwriting) and the earlier one is dropped.
+struct MergeIter<I: Iterator<Item = Result<(MemKey, Op)>>> {
+    runs: Vec<I>,
+    heap: BinaryHeap<Reverse<MergeHead>>,
+    last: Option<MemKey>,
+    /// A sweep's error is delivered once and ends the merge.
+    done: bool,
+}
+
+/// A run's current front entry. Ordered by key, then by *later run first*, so
+/// equal keys pop in the order that lets the newest run win.
+struct MergeHead {
+    key: MemKey,
+    run: usize,
+    op: Op,
+}
+
+impl PartialEq for MergeHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for MergeHead {}
+impl PartialOrd for MergeHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MergeHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| other.run.cmp(&self.run))
+    }
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> MergeIter<I> {
+    /// `runs` oldest first. Priming reads one block per run; a read error
+    /// there is reported by the first `next`.
+    fn new(runs: impl IntoIterator<Item = I>) -> Self {
+        Self {
+            runs: runs.into_iter().collect(),
+            heap: BinaryHeap::new(),
+            last: None,
+            done: false,
         }
-        group.push((seq, op)); // newest-first: merged iterates seq DESC per key
     }
-    if let Some((t, k)) = cur {
-        emit_group(t, k, &mut group, min_snapshot, &mut out);
+
+    /// Pull `run`'s next entry onto the heap (nothing if the run is drained).
+    fn advance(&mut self, run: usize) -> Result<()> {
+        if let Some(next) = self.runs[run].next() {
+            let (key, op) = next?;
+            self.heap.push(Reverse(MergeHead { key, run, op }));
+        }
+        Ok(())
     }
-    out
+
+    fn fail(&mut self, e: Error) -> Option<Result<(MemKey, Op)>> {
+        self.done = true;
+        self.heap.clear();
+        Some(Err(e))
+    }
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> Iterator for MergeIter<I> {
+    type Item = Result<(MemKey, Op)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.last.is_none() && self.heap.is_empty() {
+            // First call: prime every run.
+            for run in 0..self.runs.len() {
+                if let Err(e) = self.advance(run) {
+                    return self.fail(e);
+                }
+            }
+        }
+        loop {
+            let Reverse(MergeHead { key, run, op }) = self.heap.pop()?;
+            if let Err(e) = self.advance(run) {
+                return self.fail(e);
+            }
+            if self.last.as_ref() == Some(&key) {
+                continue; // an older run's copy of an entry already emitted
+            }
+            self.last = Some(key.clone());
+            return Some(Ok((key, op)));
+        }
+    }
+}
+
+/// Reclaim dead versions from a merged stream, itself streaming: `merged` is
+/// in `(table, key, seq DESC)` order, so a key's versions arrive together
+/// newest-first. Keep versions down to and including the first at or below
+/// `min_snapshot` (the "floor" a reader at that snapshot would see); drop
+/// everything older. A key whose only survivor is a tombstone at/below the
+/// floor is dropped entirely — this is the bottom run, so nothing older can
+/// resurface. Memory is one key's version group; an input error is passed
+/// through and ends the stream.
+fn gc_versions<I: Iterator<Item = Result<(MemKey, Op)>>>(
+    merged: I,
+    min_snapshot: u64,
+) -> GcIter<I> {
+    GcIter {
+        merged,
+        min_snapshot,
+        cur: None,
+        group: Vec::new(),
+        out: VecDeque::new(),
+        done: false,
+    }
+}
+
+/// See [`gc_versions`].
+struct GcIter<I> {
+    merged: I,
+    min_snapshot: u64,
+    /// The key whose versions `group` is collecting.
+    cur: Option<(u8, Vec<u8>)>,
+    group: Vec<(u64, Op)>,
+    /// Survivors of the last closed group, drained before more input is read.
+    out: VecDeque<(MemKey, Op)>,
+    done: bool,
+}
+
+impl<I: Iterator<Item = Result<(MemKey, Op)>>> Iterator for GcIter<I> {
+    type Item = Result<(MemKey, Op)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.out.pop_front() {
+                return Some(Ok(item));
+            }
+            if self.done {
+                return None;
+            }
+            match self.merged.next() {
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+                Some(Ok(((table, key, Reverse(seq)), op))) => {
+                    let same = matches!(&self.cur, Some((t, k)) if *t == table && *k == key);
+                    if !same {
+                        if let Some((t, k)) = self.cur.take() {
+                            emit_group(t, k, &mut self.group, self.min_snapshot, &mut self.out);
+                        }
+                        self.cur = Some((table, key));
+                    }
+                    self.group.push((seq, op)); // newest-first per key
+                }
+                None => {
+                    self.done = true;
+                    if let Some((t, k)) = self.cur.take() {
+                        emit_group(t, k, &mut self.group, self.min_snapshot, &mut self.out);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Emit the surviving versions of one key (its `group`, newest-first), then
@@ -588,7 +847,7 @@ fn emit_group(
     key: Vec<u8>,
     group: &mut Vec<(u64, Op)>,
     min_snapshot: u64,
-    out: &mut BTreeMap<MemKey, Op>,
+    out: &mut VecDeque<(MemKey, Op)>,
 ) {
     let mut keep = 0;
     for (seq, _) in group.iter() {
@@ -616,75 +875,18 @@ fn emit_group(
                 .expect("still held until the last survivor")
                 .clone()
         };
-        out.insert((table, k, Reverse(seq)), op);
+        out.push_back(((table, k, Reverse(seq)), op));
     }
 }
 
 #[cfg(test)]
-mod gc_tests {
-    use super::*;
+mod test_hooks;
 
-    fn put(v: &str) -> Op {
-        Op::Put(v.as_bytes().to_vec())
-    }
+#[cfg(test)]
+mod gc_tests;
 
-    fn merged(entries: &[(u8, &str, u64, Op)]) -> BTreeMap<MemKey, Op> {
-        entries
-            .iter()
-            .map(|(t, k, seq, op)| ((*t, k.as_bytes().to_vec(), Reverse(*seq)), op.clone()))
-            .collect()
-    }
-
-    fn seqs(out: &BTreeMap<MemKey, Op>, key: &str) -> Vec<u64> {
-        out.keys()
-            .filter(|(_, k, _)| k == key.as_bytes())
-            .map(|(_, _, Reverse(s))| *s)
-            .collect()
-    }
-
-    #[test]
-    fn keeps_versions_down_to_the_floor_and_drops_the_rest() {
-        let m = merged(&[
-            (0, "k", 9, put("v9")),
-            (0, "k", 6, put("v6")),
-            (0, "k", 4, put("v4")),
-            (0, "k", 2, put("v2")),
-        ]);
-        let out = gc_versions(m, 5);
-        // Above the floor: 9, 6. The first at/below it (4) is what a reader
-        // pinned at 5 sees, so it stays; 2 is unreachable.
-        assert_eq!(seqs(&out, "k"), vec![9, 6, 4]);
-        assert_eq!(out[&(0, b"k".to_vec(), Reverse(4))], put("v4"));
-    }
-
-    #[test]
-    fn a_lone_tombstone_below_the_floor_vanishes_but_a_shadowing_one_stays() {
-        let m = merged(&[
-            (0, "gone", 3, Op::Del),
-            (0, "gone", 1, put("x")),
-            (0, "live", 8, Op::Del),
-            (0, "live", 7, put("y")),
-        ]);
-        let out = gc_versions(m, 5);
-        assert!(seqs(&out, "gone").is_empty(), "nothing older can resurface");
-        // A tombstone above the floor still shadows the version a pinned
-        // reader at 5 would otherwise see.
-        assert_eq!(seqs(&out, "live"), vec![8, 7]);
-    }
-
-    #[test]
-    fn keys_are_grouped_per_table_and_every_survivor_keeps_its_value() {
-        let m = merged(&[
-            (0, "a", 2, put("n")),
-            (1, "a", 2, put("e")),
-            (1, "a", 1, put("old")),
-        ]);
-        let out = gc_versions(m, 10);
-        assert_eq!(out.len(), 2, "the same key in two tables is two keys");
-        assert_eq!(out[&(0, b"a".to_vec(), Reverse(2))], put("n"));
-        assert_eq!(out[&(1, b"a".to_vec(), Reverse(2))], put("e"));
-    }
-}
+#[cfg(test)]
+mod engine_tests;
 
 impl StorageEngine for NativeEngine {
     type ReadTxn<'a> = NativeReadTxn<'a>;
@@ -932,7 +1134,7 @@ impl WriteTransaction for NativeWriteTxn<'_> {
             return Ok(());
         }
         let seq = self.snapshot + 1;
-        self.engine.durable_commit(seq, self.buf)
+        self.engine.durable_commit(seq, self.buf).map(|_| ())
     }
 }
 
@@ -943,7 +1145,16 @@ impl NativeEngine {
     /// a freshly allocated sequence) and [`Self::apply_replicated`] (`seq`
     /// taken verbatim from the source it's replicating, so a replica's
     /// commit sequence matches its master's exactly).
-    fn durable_commit(&self, seq: u64, ops: BTreeMap<(u8, Vec<u8>), Op>) -> Result<()> {
+    ///
+    /// Returns `Ok(seq)` as soon as the batch is durable *and* published: from
+    /// that point the write has happened, and a caller that treated an `Err`
+    /// as "nothing landed" (the API layer applies index/keyword events only
+    /// after `Ok`) would drift from the KV. So the maintenance that follows
+    /// (flush, compaction) never fails the commit; its error is logged and
+    /// parked in [`Self::last_maintenance_error`], and the next commit simply
+    /// retries — a failed flush leaves the memtable over threshold, a failed
+    /// compaction leaves the runs in place.
+    fn durable_commit(&self, seq: u64, ops: BTreeMap<(u8, Vec<u8>), Op>) -> Result<u64> {
         let batch = WalBatchRef {
             seq,
             ops: ops
@@ -970,10 +1181,19 @@ impl NativeEngine {
         // Notify a replication subscriber, if any, before publishing — same
         // "durable before visible" ordering as the WAL fsync itself. Skipped
         // entirely (no clone of `ops`) when nobody's registered, so a master
-        // with no followers pays nothing for this.
+        // with no followers pays nothing for this. The observer is called with
+        // its slot's mutex *released*: an observer that blocks (a full channel,
+        // a slow subscriber) must not wedge `set_wal_observer`, and one that
+        // re-registers from inside the callback must not deadlock. Batches
+        // still reach it strictly in commit order because every caller of
+        // `durable_commit` holds the write gate for the whole call.
         {
-            let observer = self.wal_observer.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(obs) = observer.as_ref() {
+            let observer = self
+                .wal_observer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(obs) = observer {
                 let replicated = ReplicatedBatch {
                     seq,
                     ops: ops
@@ -993,7 +1213,7 @@ impl NativeEngine {
             }
         }
 
-        // Publish to the memtable, advance the sequence, then flush if large.
+        // Publish to the memtable and advance the sequence.
         {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
             for ((t, k), op) in ops {
@@ -1001,10 +1221,34 @@ impl NativeEngine {
                 store.mem.insert((t, k, Reverse(seq)), op);
             }
             store.committed_seq = seq;
-            self.maybe_flush(&mut store)?;
         }
-        // Compact outside the store lock (heavy merge I/O shouldn't block reads).
-        self.maybe_compact()
+        // Flush and compact outside the store write lock (their I/O shouldn't
+        // block reads); both are safe there because the gate is still held.
+        let maintained = self.maybe_flush().and_then(|()| self.maybe_compact());
+        self.record_maintenance(seq, maintained);
+        Ok(seq)
+    }
+
+    /// Log and remember a post-publish maintenance failure (or clear the slot
+    /// on success) — see [`Self::durable_commit`] for why it never fails the
+    /// commit that triggered it.
+    fn record_maintenance(&self, seq: u64, outcome: Result<()>) {
+        let mut slot = self
+            .last_maintenance_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(()) => *slot = None,
+            Err(e) => {
+                tracing::error!(
+                    seq,
+                    error = %e,
+                    "post-commit flush/compaction failed; the commit is durable, \
+                     maintenance is retried on the next commit"
+                );
+                *slot = Some(e.to_string());
+            }
+        }
     }
 
     /// The guts of `begin_write`, minus the `read_only` check — used by
@@ -1044,6 +1288,26 @@ impl NativeEngine {
         let _gate = self
             .write_gate
             .acquire((ms != 0).then(|| Duration::from_millis(ms)))?;
+        // Under the gate, so the comparison is against a sequence no other
+        // writer can move. Sequences must only advance: a batch landing at or
+        // below `committed_seq` would be stamped older than versions already
+        // visible (its ops would lose to them in the memtable, and a reader
+        // pinned at the current sequence would see it appear mid-snapshot).
+        // Refusing is safer than skipping — the follower treats an error as
+        // "resync from a fresh snapshot", which re-captures the batch, while a
+        // silent skip could drop it for good.
+        let committed = self
+            .store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed_seq;
+        if batch.seq <= committed {
+            return Err(Error::Conflict(format!(
+                "cannot apply replicated batch {}: this replica has already committed \
+                 sequence {committed}; sequences must only advance (a full resync is needed)",
+                batch.seq
+            )));
+        }
         let ops: BTreeMap<(u8, Vec<u8>), Op> = batch
             .ops
             .into_iter()
@@ -1054,7 +1318,7 @@ impl NativeEngine {
                 )
             })
             .collect();
-        self.durable_commit(batch.seq, ops)
+        self.durable_commit(batch.seq, ops).map(|_| ())
     }
 
     /// Register (or clear, with `None`) the replication observer invoked
@@ -1105,9 +1369,28 @@ struct WalOpRef<'a> {
     value: Option<&'a [u8]>,
 }
 
+/// Largest WAL record body the `u32` length prefix can describe.
+const MAX_WAL_RECORD_LEN: usize = u32::MAX as usize;
+
+/// The length-prefix value for a record body of `len` bytes, or a typed error
+/// when it does not fit: `len as u32` would silently wrap for a >4 GiB batch
+/// and write a record whose prefix disagrees with its body, which replay would
+/// then treat as a torn tail — losing the commit *after* reporting it durable.
+fn wal_record_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "transaction too large for one WAL record: {len} bytes serialized, \
+             the limit is {MAX_WAL_RECORD_LEN} bytes; split the write into smaller batches"
+        ))
+    })
+}
+
 fn append_batch(w: &mut impl Write, batch: &WalBatchRef<'_>) -> Result<()> {
     let body = postcard::to_stdvec(batch).map_err(backend)?;
-    w.write_all(&(body.len() as u32).to_le_bytes())?;
+    // Checked before the first byte is written, so an oversize batch leaves
+    // the WAL exactly as it was.
+    let len = wal_record_len(body.len())?;
+    w.write_all(&len.to_le_bytes())?;
     w.write_all(&crc32(&body).to_le_bytes())?;
     w.write_all(&body)?;
     Ok(())

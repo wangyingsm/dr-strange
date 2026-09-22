@@ -2533,6 +2533,23 @@ pub fn stats(db: &Database, out: &mut dyn Write) -> Result<()> {
         counters.nodes,
         counters.edges
     )?;
+    report_maintenance(db, out)?;
+    Ok(())
+}
+
+/// The one storage fault a successful commit cannot report: a memtable flush
+/// or compaction that failed after the batch was durable. The engine keeps
+/// the latest such error until a later pass succeeds; `stats` and `check`
+/// print it so an operator sees a disk that takes the log but refuses new
+/// files before the WAL fills it.
+fn report_maintenance(db: &Database, out: &mut dyn Write) -> Result<()> {
+    if let Some(err) = db.last_maintenance_error() {
+        writeln!(
+            out,
+            "warning: the last flush/compaction failed and will be retried on the next \
+             commit: {err}"
+        )?;
+    }
     Ok(())
 }
 
@@ -2544,6 +2561,7 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
         nodes += db.plane(&name)?.catalog()?.node_count;
     }
     writeln!(out, "ok: {nodes} nodes readable across all planes")?;
+    report_maintenance(db, out)?;
     Ok(())
 }
 

@@ -71,7 +71,7 @@ fn write_invalidates_cache_memory() {
 }
 
 #[test]
-fn write_invalidates_cache_redb() {
+fn write_invalidates_cache_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     check_snapshot_isolation(&Database::open(dir.path().join("g.drsg")).unwrap());
 }

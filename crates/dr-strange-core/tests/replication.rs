@@ -141,3 +141,43 @@ fn read_only_rejects_begin_write_but_not_apply_replicated() {
         .expect("apply_replicated bypasses read_only — it's the replica's own write path");
     assert_eq!(engine.committed_seq(), 1);
 }
+
+#[test]
+fn apply_replicated_refuses_a_sequence_that_does_not_advance() {
+    // A replica's own sequence can run ahead of a batch's (its bootstrap and
+    // restore commits allocate sequences locally). Landing such a batch would
+    // stamp its versions older than what is already visible — they would lose
+    // to the current versions in the memtable and a reader pinned at the
+    // current sequence would see them appear mid-snapshot — so it is refused
+    // with a typed error the follower turns into a resync, never silently
+    // applied or dropped.
+    let dir = Dir::new("regress");
+    let e = NativeEngine::open(&dir.0).unwrap();
+    for i in 1..=3u8 {
+        let mut w = e.begin_write().unwrap();
+        w.put(TableId::Nodes, &[i], &[i]).unwrap();
+        w.commit().unwrap();
+    }
+    let before = dump(&e);
+    let batch = |seq: u64| ReplicatedBatch {
+        seq,
+        ops: vec![dr_strange_core::ReplicatedOp {
+            table: TableId::Nodes,
+            key: vec![1],
+            value: Some(vec![0xff]),
+        }],
+    };
+
+    for stale in [1u64, 3] {
+        let err = e.apply_replicated(batch(stale)).unwrap_err();
+        assert!(matches!(err, dr_strange_core::Error::Conflict(_)), "{err}");
+        assert_eq!(e.committed_seq(), 3, "the sequence never moves backwards");
+        assert_eq!(dump(&e), before, "a refused batch changes nothing");
+    }
+
+    // The next sequence — or any later one — is still accepted.
+    e.apply_replicated(batch(4)).unwrap();
+    assert_eq!(e.committed_seq(), 4);
+    let txn = e.begin_read().unwrap();
+    assert_eq!(txn.get(TableId::Nodes, &[1]).unwrap(), Some(vec![0xff]));
+}

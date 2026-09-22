@@ -60,7 +60,13 @@ and property-based testing against a model.
   external keys are also the identity thread for cross-plane entity
   resolution. The key is also carried inline in the node's own record, so
   deleting a node can find (and remove) its `ext_keys` entry without a
-  reverse index.
+  reverse index. **Ownership rule:** within a plane a key belongs to at most
+  one live node. Every creation path — `create_node_with_key` and the bulk
+  loader alike — refuses a key the plane's `ext_keys` table already maps
+  (`Error::Conflict`; the bulk loader also rejects a key repeated within its
+  own batch, and writes nothing on failure). Deletion removes the `ext_keys`
+  row only if it still points at the node being deleted, so a stale inline
+  key can never strip another live node's lookup entry.
 - Label names and edge-type names are interned to `u32`s in a dictionary
   table shared across planes; all keys store interned IDs, not strings.
   Dictionaries are small and cached in memory.
@@ -194,7 +200,11 @@ Notes:
   the KV.
 - Search is `&self` and uses a per-thread scratch (generation-stamped visited
   set plus heaps) rather than allocating per query; the build path uses the
-  index-owned scratch.
+  index-owned scratch. The scratch costs 4 bytes per node on every thread
+  that searches, for the thread's lifetime, so it is kept between searches
+  only while under `RETAINED_SCRATCH_BYTES` (16 MiB, 4M nodes); a thread
+  that served a larger index drops it after the search and that query
+  allocates as before the scratch existed.
 
 ## 6. Transactions
 
@@ -206,6 +216,99 @@ Inherited from redb in v1:
 - Write batching at the graph layer (e.g. bulk ingest API) amortizes commit
   cost; the single-writer ceiling is an accepted v1 constraint (revisit if
   ingest throughput demands a RocksDB backend or group-commit machinery).
+
+### 6.1 Native engine commit contract
+
+The native LSM (`storage/native`) commits a transaction as one
+length+CRC-prefixed WAL batch, `fsync`s it, notifies the replication observer,
+then publishes it to the memtable under the store write lock. The rules that
+follow from that ordering:
+
+- **`commit` returns `Ok` exactly when the batch is durable and visible.** The
+  flush and compaction a commit may trigger run *after* publication, so their
+  failure is not the commit's failure: it is logged (`tracing::error!`) and
+  kept in `NativeEngine::last_maintenance_error`, and the next commit retries
+  naturally (a failed flush leaves the memtable over threshold, a failed
+  compaction leaves the runs in place). That accessor is the only surface
+  today — `Database::check`/stats do not yet read it, so a persistently
+  failing compaction (e.g. one rotted block in any run, which fails every
+  merge with `Corrupt`) shows up only in the log while the run count grows;
+  wiring it into `check` is API-layer work still to do. Callers — the API
+  layer applies index/keyword events only after `Ok` — may rely on `Err`
+  meaning "nothing landed".
+- **A failed flush never moves the WAL cursor off the truncated file.** The
+  truncation is `set_len(0)`, seek to 0, then fsync, in that order: since the
+  engine keeps committing after a failed fsync, a cursor left at the old end
+  would put every later batch behind a zero-filled hole that replay reads as
+  an empty torn tail. A cfg(test) fault seam (`sst_write_fault`,
+  `wal_sync_fault`) fails these steps deterministically in tests.
+- **Directory metadata is fsynced.** An SST's temp+fsync+rename is followed
+  by an fsync of the directory, and so is the WAL truncation that depends on
+  it; otherwise the SST's name could be lost in a crash after the WAL that
+  held its records was already cut. Compaction unlinks the runs it merged
+  newest first and then fsyncs the directory, so a crash cannot bring back
+  an old run's put without the newer run's tombstone that the merged run
+  GC'd away. A brand-new store fsyncs the directory once after creating its
+  `wal`, so the commits before the first flush are not durable in a file
+  whose name is not. No-op on non-unix.
+- **A WAL record body is at most `u32::MAX` bytes.** A larger serialized
+  batch is refused with `Error::InvalidArgument` before a byte is written;
+  the alternative (a wrapped length prefix) would be a record replay treats
+  as a torn tail — a commit reported durable, then lost.
+- **Replicated sequences only advance.** `apply_replicated` lands a batch at
+  its master's own `seq`; a `seq` at or below the replica's `committed_seq`
+  is refused with `Error::Conflict` (the follower treats any error as
+  "resync from a fresh snapshot", which re-captures the batch). Landing it
+  would stamp versions older than ones already visible.
+- **The WAL observer runs outside its registration mutex** (a blocking
+  subscriber cannot wedge `set_wal_observer`); ordering is still strict
+  commit order because every commit path holds the write gate for the whole
+  of `durable_commit`.
+- **Torn tail.** Replay stops at the first short or checksum-failing record
+  and truncates the WAL there; every earlier commit is intact.
+- **Flush I/O runs outside the store write lock.** A commit publishes under
+  the write lock and releases it; the flush then writes and fsyncs the SST
+  under the store *read* lock, so readers are served throughout. That is
+  sound because the memtable changes only inside `durable_commit` and the
+  write gate makes this the only one in flight: between publish and the
+  swap the memtable is immutable and the SST is an exact copy with the same
+  sequences. Only the swap (run in, memtable out) takes the write lock; a
+  reader before or after it sees the same versions. A failed flush leaves
+  the memtable and the SST number in place for the next commit's retry.
+- **Compaction streams.** Once more than `COMPACTION_TRIGGER` runs exist the
+  writer merges them all into one: each run is swept block by block
+  (`Sst::entries`, bypassing the block cache so a sweep does not evict what
+  readers are using), a `BinaryHeap` k-way merge yields one `(table, key,
+  seq DESC)` stream — a later run wins a tie — and the version GC runs over
+  that stream one key group at a time straight into the new file. Memory is
+  O(runs × block) plus one key's versions, not the sum of the runs. The
+  merged run is stamped with the newest `max_seq` of its inputs. Range
+  reads still materialise the requested range per run (a `BTreeMap` per
+  call); that is unchanged.
+
+### 6.2 SST file format
+
+An SST (`storage/native/sst.rs`) is data blocks, an index block, a Bloom
+block and a fixed 56-byte footer whose magic names the format version:
+
+- **v1 (`DRSS`)** — blocks carry no checksum. Read-only: readers still open
+  v1 files (a v1 run is rewritten as v2 by the next compaction), and the
+  writer never emits it.
+- **v2 (`DRS2`, current)** — every block (data, index, bloom) ends with a
+  CRC-32 of its bytes; the index/footer lengths include the 4-byte trailer.
+
+Rules readers honour for either version:
+
+- **Corruption is `Error::Corrupt`, never "absent".** A block whose CRC does
+  not match, whose bytes do not decode to whole entries (v1 has only this
+  check), or that lies outside the file per the footer/index, fails the read
+  (`get`/`range`/`entries`) or the open (index/bloom). Iteration must not
+  stop quietly at a broken entry: that reported bit-rot as a missing key,
+  and a compaction over such a run would have dropped the tail of the block
+  for good. Only verified payloads enter the block cache.
+- **Reads are positional.** Blocks are read with `pread` (`seek_read` on
+  Windows) against a shared `File`, never through a seeking cursor under a
+  mutex, so concurrent readers of one run do not serialize.
 
 ## 7. Testing strategy
 
@@ -230,6 +333,17 @@ Inherited from redb in v1:
 - The in-memory `StorageEngine` keeps the upper-layer suite fast. Its
   committed snapshot is `Arc`-shared (M5), so a read is an O(1) pointer clone
   and a write is copy-on-write — no longer a full deep copy per read.
+- **Native engine invariants are tested where they live** (`native/mod.rs`,
+  `native/sst.rs`, `conformance_tests.rs`): a torn WAL tail, an oversized
+  WAL record, a commit whose flush fails and a commit after a WAL
+  truncation whose fsync failed (both via the injected-fault seam), a
+  reader served while a flush is parked mid-I/O, the HNSW scratch cap, the
+  streaming merge
+  against the map union, a sweep over a rotted block ending in `Corrupt`,
+  v1 files still opening, retention reclaiming versions on compaction, and
+  a reader pinned through compaction. The HNSW entry-point rule is checked
+  by `is_wellformed` after removals (`hnsw.rs`), and the external-key
+  ownership rule by the graph-layer and `tests/bulk.rs` tests.
 
 ## 9. Replication (`serve --follow`)
 
@@ -274,7 +388,15 @@ key.
   replica never gets promoted, so this needs no runtime setter.
   `begin_write` refuses immediately when set; `apply_replicated` (the
   replica's own write path, landing a batch at its master's exact `seq`)
-  bypasses it entirely, since it isn't the gate this flag exists for.
+  bypasses it entirely, since it isn't the gate this flag exists for. It
+  does enforce §6.1's ordering rule: a batch at or below the replica's
+  `committed_seq` is `Error::Conflict`, and the follower resyncs. Known
+  gap: a fresh replica's own bootstrap (two `Database::init` commits) and
+  `restore` (one more) consume engine sequences 1–3, so against a master
+  whose snapshot `seq` is ≤ 2 (no data writes yet) the master's first live
+  batch is refused and the follower resyncs once more before converging.
+  The fix is API-side — the bootstrap/restore path should land the replica
+  at the snapshot's sequence rather than allocating its own.
 - `Database::init`'s one-time-per-open plane/counters bootstrap, and
   `restore`, both need to succeed on a read-only-opened engine — they're the
   engine's own setup, not a caller's write. Both go through a
