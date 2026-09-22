@@ -2562,6 +2562,47 @@ pub fn check(db: &Database, out: &mut dyn Write) -> Result<()> {
     }
     writeln!(out, "ok: {nodes} nodes readable across all planes")?;
     report_maintenance(db, out)?;
+    report_legacy_runs(db, out)?;
+    Ok(())
+}
+
+/// Runs still written in the format that has no block checksums.
+///
+/// A compaction rewrites what it merges, so a busy store upgrades itself and
+/// this never fires; a store that settles below the compaction threshold keeps
+/// unchecked blocks indefinitely, which is exactly the case an operator cannot
+/// otherwise see. Named with the command that fixes it, since the count alone
+/// would only be alarming.
+fn report_legacy_runs(db: &Database, out: &mut dyn Write) -> Result<()> {
+    let runs = db.legacy_runs();
+    if runs > 0 {
+        let s = if runs == 1 { "" } else { "s" };
+        writeln!(
+            out,
+            "warning: {runs} storage run{s} predate block checksums, so corruption in them \
+             reads as data rather than an error: run `drsg upgrade` to rewrite them"
+        )?;
+    }
+    Ok(())
+}
+
+/// `drsg upgrade` — rewrite every run still in the old on-disk format.
+///
+/// Explicit rather than automatic on open: it rewrites files, and a startup
+/// that silently rewrites a store is a surprise an operator cannot schedule.
+pub fn upgrade(db: &Database, out: &mut dyn Write) -> Result<()> {
+    let before = db.legacy_runs();
+    if before == 0 {
+        writeln!(out, "ok: every storage run already carries block checksums")?;
+        return Ok(());
+    }
+    let done = db.upgrade_storage()?;
+    let s = if done == 1 { "" } else { "s" };
+    writeln!(
+        out,
+        "upgraded {done} storage run{s} to the checksummed format"
+    )?;
+    report_legacy_runs(db, out)?;
     Ok(())
 }
 

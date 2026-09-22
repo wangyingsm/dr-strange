@@ -323,3 +323,68 @@ fn the_wal_observer_runs_outside_its_slots_mutex() {
     );
     assert_eq!(get(&e, b"a"), Some(b"1".to_vec()));
 }
+
+/// A store carrying a run from before block checksums existed: the upgrade
+/// rewrites it, keeps every entry, and leaves the blocks checked — which is
+/// the whole point, so the test corrupts one afterwards and expects an error
+/// where the v1 run would have served the bytes.
+#[test]
+fn an_old_run_is_rewritten_with_checksums_and_keeps_its_entries() {
+    let dir = Dir::new("upgrade");
+    std::fs::create_dir_all(&dir.0).unwrap();
+
+    // Stage a v1 run beside an empty store, as an older drsg would have left.
+    let mut entries: std::collections::BTreeMap<MemKey, Op> = Default::default();
+    for i in 0..200u32 {
+        let key = format!("key-{i:06}").into_bytes();
+        entries.insert(
+            (TableId::Nodes as u8, key, std::cmp::Reverse(1)),
+            Op::Put(vec![(i % 251) as u8; 120]),
+        );
+    }
+    let legacy = dir.0.join("sst-000001");
+    sst::tests::write_v1(&legacy, &entries, 0);
+
+    let e = NativeEngine::open(&dir.0).unwrap();
+    assert_eq!(e.legacy_runs(), 1, "the staged run is v1");
+    let before: Vec<_> = {
+        let store = e.store.read().unwrap();
+        store.ssts[0].entries().collect::<Result<Vec<_>>>().unwrap()
+    };
+
+    assert_eq!(e.upgrade_runs().unwrap(), 1);
+    assert_eq!(e.legacy_runs(), 0, "nothing is left in the old format");
+
+    // Same entries, same order — a rewrite, not a merge.
+    let after: Vec<_> = {
+        let store = e.store.read().unwrap();
+        store.ssts[0].entries().collect::<Result<Vec<_>>>().unwrap()
+    };
+    assert_eq!(before, after);
+    assert_eq!(after.len(), 200);
+
+    // A second pass has nothing to do.
+    assert_eq!(e.upgrade_runs().unwrap(), 0);
+
+    // The rewritten run is checked: corrupt a data block and the read fails
+    // instead of handing back whatever the bytes decoded to.
+    let path = {
+        let store = e.store.read().unwrap();
+        store.ssts[0].path.clone()
+    };
+    drop(e);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes.len() / 4;
+    for b in bytes[at..at + 64].iter_mut() {
+        *b = b'A';
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let e = NativeEngine::open(&dir.0).unwrap();
+    let store = e.store.read().unwrap();
+    let swept: Result<Vec<_>> = store.ssts[0].entries().collect();
+    match swept {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("crc"), "{msg}"),
+        other => panic!("corruption went unreported: {:?}", other.map(|v| v.len())),
+    }
+}

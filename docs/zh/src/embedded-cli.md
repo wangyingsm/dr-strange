@@ -175,6 +175,16 @@ $ drsg --db graph.drsg stats
 $ drsg --db graph.drsg check
 ```
 
+`check` 还会指出仍为旧格式、其数据块没有校验和的存储段。压缩会重写它所合并的段，
+因此写入频繁的库会自行升级；而稳定在压缩阈值以下的库则会一直保留未校验的块——这些
+块中的损坏会被当作数据读出，而不是报错。`upgrade` 逐条重写这些段，不回收任何版本，
+库中内容保持原样：
+
+```console
+$ drsg --db graph.drsg upgrade
+upgraded 2 storage runs to the checksummed format
+```
+
 ## 提供服务
 
 `serve` 是嵌入式模型的例外：它打开数据库，随后将其通过网络暴露给仪表盘、各 SDK 与

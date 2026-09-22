@@ -586,6 +586,78 @@ impl NativeEngine {
     /// If enough runs have accumulated, merge them all into one, dropping
     /// versions no reader can reach. Called from `commit` (single writer) after
     /// the store lock is released, so the heavy merge I/O doesn't block readers.
+    /// How many runs still carry the v1 format, whose blocks have no checksum.
+    ///
+    /// A compaction rewrites what it merges, so a busy store upgrades itself —
+    /// but `maybe_compact` only fires above `COMPACTION_TRIGGER` runs, and a
+    /// store that settles below it never would. This is what makes the gap
+    /// visible, and [`Self::upgrade_runs`] is what closes it.
+    pub(crate) fn legacy_runs(&self) -> usize {
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        store.ssts.iter().filter(|s| s.is_legacy()).count()
+    }
+
+    /// Rewrite every v1 run as v2, so its blocks gain the checksum that turns
+    /// a bit-rotted read into an error instead of a wrong answer.
+    ///
+    /// One run at a time, and a rewrite rather than a merge: the entries are
+    /// re-encoded exactly as they stand, so nothing is GC'd and no version
+    /// becomes unreachable — a store upgraded this way holds what it held. The
+    /// writer slot is taken for the whole pass, because a flush or compaction
+    /// running in between would be swapping the same `ssts` vector.
+    ///
+    /// Returns how many runs were rewritten. Safe to call on a store that has
+    /// none, and safe to interrupt: each run is swapped in and its predecessor
+    /// unlinked before the next is read, so a crash leaves a prefix upgraded
+    /// and the rest to do next time.
+    pub(crate) fn upgrade_runs(&self) -> Result<usize> {
+        let _slot = self.write_gate.acquire(None)?;
+        let mut done = 0usize;
+        loop {
+            // Re-read each time: the run just swapped in changed the vector.
+            let legacy = {
+                let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+                store.ssts.iter().find(|s| s.is_legacy()).map(Arc::clone)
+            };
+            let Some(old) = legacy else { break };
+            let next = {
+                let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+                store.next_sst
+            };
+            let path = self.dir.join(format!("sst-{next:06}"));
+            let count_hint = usize::try_from(old.count).unwrap_or(usize::MAX);
+            sst::write_sorted(&path, old.entries(), count_hint, old.max_seq)?;
+            let fresh = self.open_sst(&path)?;
+
+            // Swap this run for its rewrite, leaving every other run alone.
+            let replaced = {
+                let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+                store.next_sst = next + 1;
+                match store.ssts.iter().position(|s| Arc::ptr_eq(s, &old)) {
+                    Some(i) => Some(std::mem::replace(&mut store.ssts[i], fresh)),
+                    // A compaction cannot have run — we hold the slot — but if
+                    // the run is gone, the new file is not this store's.
+                    None => None,
+                }
+            };
+            let Some(replaced) = replaced else {
+                std::fs::remove_file(&path)?;
+                sync_dir(&self.dir)?;
+                break;
+            };
+            let old_path = replaced.path.clone();
+            drop(replaced);
+            drop(old);
+            std::fs::remove_file(&old_path).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })?;
+            sync_dir(&self.dir)?;
+            done += 1;
+        }
+        Ok(done)
+    }
+
     fn maybe_compact(&self) -> Result<()> {
         // Snapshot the runs to merge under a brief read lock.
         let (runs, committed_seq, next) = {

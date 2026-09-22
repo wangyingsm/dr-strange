@@ -646,6 +646,41 @@ impl Database {
         }
     }
 
+    /// How many on-disk runs still carry the storage format that has no block
+    /// checksums — `0` on a fully upgraded store, and on every other backend.
+    ///
+    /// A compaction rewrites what it merges, so a store written to often
+    /// upgrades itself; one that settles below the compaction threshold never
+    /// does. Reported by `drsg check` so the gap is visible rather than a
+    /// matter of how busy the store happened to be.
+    pub fn legacy_runs(&self) -> usize {
+        match &self.engine {
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => e.legacy_runs(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Rewrite every run still in the old format, so its blocks gain the
+    /// checksum that makes a bit-rotted read an error instead of a wrong
+    /// answer. Returns how many runs were rewritten.
+    ///
+    /// The entries are re-encoded as they stand: nothing is garbage-collected
+    /// and no version becomes unreachable, so an upgraded store holds exactly
+    /// what it held. It takes the writer slot for the pass, and is safe to
+    /// interrupt — each run is replaced before the next is read, so a crash
+    /// leaves a prefix upgraded and the rest for next time. A no-op on the
+    /// other backends.
+    pub fn upgrade_storage(&self) -> Result<usize> {
+        match &self.engine {
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => e.upgrade_runs(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(0),
+        }
+    }
+
     /// Records a query that ran, so it can be run again — the dashboard's
     /// history list and the CLI's `history`.
     ///

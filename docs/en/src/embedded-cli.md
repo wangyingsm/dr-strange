@@ -192,6 +192,18 @@ $ drsg --db graph.drsg stats
 $ drsg --db graph.drsg check
 ```
 
+`check` also names storage runs written before block checksums existed. A
+compaction rewrites what it merges, so a store written to often upgrades
+itself, but one that settles below the compaction threshold keeps unchecked
+blocks for good — and corruption in them reads as data rather than an error.
+`upgrade` rewrites those runs, entry for entry, so nothing is reclaimed and
+the store holds what it held:
+
+```console
+$ drsg --db graph.drsg upgrade
+upgraded 2 storage runs to the checksummed format
+```
+
 ## Serving
 
 `serve` is the exception to the embedded model: it opens the database and then

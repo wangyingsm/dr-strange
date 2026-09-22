@@ -337,6 +337,9 @@ enum Command {
     Stats,
     /// Integrity check: scan every plane, report readability.
     Check,
+    /// Rewrite storage runs left in an older on-disk format, so every block
+    /// carries the checksum that turns corruption into an error.
+    Upgrade,
     /// Write a consistent whole-database snapshot bundle (arch §6).
     Snapshot {
         /// Output file for the snapshot bundle.
@@ -1329,6 +1332,10 @@ fn run_maintenance(
         Command::Check => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             commands::check(&db, out)
+        }
+        Command::Upgrade => {
+            let db = commands::open(db_path, config::retain_commits(cfg))?;
+            commands::upgrade(&db, out)
         }
         Command::Snapshot { out: path } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;

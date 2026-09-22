@@ -293,7 +293,13 @@ block and a fixed 56-byte footer whose magic names the format version:
 
 - **v1 (`DRSS`)** — blocks carry no checksum. Read-only: readers still open
   v1 files (a v1 run is rewritten as v2 by the next compaction), and the
-  writer never emits it.
+  writer never emits it. A compaction only fires above `COMPACTION_TRIGGER`
+  runs, so a store that settles below it keeps v1 blocks indefinitely: `drsg
+  check` counts them and `drsg upgrade` rewrites them, one run at a time,
+  re-encoding the entries as they stand rather than merging, so no version is
+  reclaimed and the store holds what it held. The pass takes the writer slot
+  and is safe to interrupt — each run is swapped in and its predecessor
+  unlinked before the next is read.
 - **v2 (`DRS2`, current)** — every block (data, index, bloom) ends with a
   CRC-32 of its bytes; the index/footer lengths include the 4-byte trailer.
 

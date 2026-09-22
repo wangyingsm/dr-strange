@@ -597,6 +597,12 @@ impl Sst {
         })
     }
 
+    /// Whether this run is still the v1 format, whose blocks carry no
+    /// checksum. The migration rewrites exactly these.
+    pub(super) fn is_legacy(&self) -> bool {
+        matches!(self.version, Version::V1)
+    }
+
     /// Every entry of this run in file (= memtable) order, one block resident
     /// at a time — a compaction's input. Blocks are read past the shared cache:
     /// a full sweep of every run would otherwise evict the blocks live readers
@@ -813,7 +819,7 @@ pub(super) fn list(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::collections::BTreeMap;
@@ -870,8 +876,13 @@ mod tests {
 
     /// The layout a pre-v2 writer produced: identical entries and footer, but
     /// no CRC trailers and the `DRSS` magic. Kept here (not in the writer) so
-    /// the production path can never emit it by accident.
-    fn write_v1(path: &Path, entries: &BTreeMap<MemKey, Op>, truncate_last_block_by: usize) {
+    /// the production path can never emit it by accident. `pub(in super::super)`
+    /// so the engine's own tests can stage a store that needs upgrading.
+    pub(in super::super) fn write_v1(
+        path: &Path,
+        entries: &BTreeMap<MemKey, Op>,
+        truncate_last_block_by: usize,
+    ) {
         let mut out = Vec::new();
         let mut index: Vec<(KeyPos, u64, u32)> = Vec::new();
         let mut cur: Option<(KeyPos, Vec<u8>)> = None;
