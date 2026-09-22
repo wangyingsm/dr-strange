@@ -76,7 +76,7 @@ $ export PATH="$HOME/.local/bin:$PATH"
 
 ```console
 $ drsg update
-drsg 2.11.0 is the latest release — nothing to do
+drsg 2.11.1 is the latest release — nothing to do
 ```
 
 确有新版本时，它会先打印即将执行的命令，然后**变成**它：进程被首次安装所用的同一
@@ -85,10 +85,10 @@ drsg 2.11.0 is the latest release — nothing to do
 
 ```console
 $ drsg update
-drsg 2.10.0 -> 2.11.0
-$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.11.0/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.11.0' --dir '/home/me/.local/bin'
-Dr Strange v2.11.0 (x86_64-unknown-linux-gnu)
-  downloading dr-strange-v2.11.0-x86_64-unknown-linux-gnu.tar.gz
+drsg 2.11.0 -> 2.11.1
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.11.1/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.11.1' --dir '/home/me/.local/bin'
+Dr Strange v2.11.1 (x86_64-unknown-linux-gnu)
+  downloading dr-strange-v2.11.1-x86_64-unknown-linux-gnu.tar.gz
   checksum verified
   installed /home/me/.local/bin/drsg
 ```

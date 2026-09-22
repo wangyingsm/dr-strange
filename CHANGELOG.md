@@ -4,6 +4,42 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.1] - 2026-09-22
+
+### Added
+
+- **`drsg.toml` carries the last knobs that were environment-only.**
+  `[plugins] deadline_secs` and `total_memory_mb` bound the plugin sandbox;
+  `[server] allowed_hosts` lists the extra `Host` values `/mcp` answers at;
+  `[server] mcp_tool_deadline_secs` bounds one MCP tool call. An environment
+  variable already set still wins over the file, as for every other key.
+- **`DRSG_PAGE_TOKEN=0` (`[server] page_token = false`) keeps the token out of
+  the page** for a loopback bind behind a reverse proxy, where every client
+  arrives looking like a local one.
+
+### Fixed
+
+- **A loopback bind behind a reverse proxy hands out neither the page token
+  nor the local-UI fallback.** A proxy in front of the listener makes every
+  client's peer address loopback, so 2.10.0's loopback rules would have given
+  the token to the network. A forwarded request is no longer treated as local,
+  and a server with no token refuses to start when `DRSG_ALLOWED_ORIGINS` names
+  an origin off loopback — such an origin is only ever reached through a proxy.
+- **The bind policy is checked when the config is read.** A `[server] addr` off
+  loopback with no token now fails before the database is opened, rather than
+  after a follower has wiped its directory or a watch has started folding a
+  tree. The compose file marks `DRSG_TOKEN` as required, so `docker compose up`
+  stops with the reason instead of starting a container that exits unseen.
+- **The auth throttle counts only guesses**, and tells a client behind a proxy
+  when it has been locked out.
+- **An environment deadline wins over the file.** `mcp_tool_deadline_secs` in
+  `drsg.toml` overrode `DRSG_MCP_TOOL_DEADLINE_SECS` even when the variable was
+  set.
+- **The docs say `retain_commits = 0` is unbounded.** The Web UI chapter told
+  readers to unset the key for unbounded history, but an absent key is the
+  default of 20. The OpenRPC schema now lists the `retain_commits` field
+  `db.stats` answers.
+
 ## [2.11.0] - 2026-09-21
 
 ### Changed
