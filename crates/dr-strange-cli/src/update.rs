@@ -160,8 +160,11 @@ fn choose_bin(dir: &Path, out: &mut dyn Write) -> Result<String> {
 /// The newest release's version, without the leading `v`.
 pub fn latest_release(allow_private: &[dr_strange_web::fetch::Prefix]) -> Result<String> {
     let url = format!("https://github.com/{REPO}/releases/latest");
-    let location = dr_strange_web::fetch::redirect_target(&url, allow_private)
-        .context("asking GitHub for the latest release")?;
+    let location = dr_strange_web::fetch::redirect_target(
+        &url,
+        dr_strange_web::fetch::Route::guarded(allow_private),
+    )
+    .context("asking GitHub for the latest release")?;
     tag_version(&location).with_context(|| {
         format!("could not read a release version out of GitHub's answer: {location}")
     })

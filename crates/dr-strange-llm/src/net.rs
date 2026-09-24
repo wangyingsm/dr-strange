@@ -178,6 +178,13 @@ pub struct Network {
 impl Network {
     /// No proxy for anything — the policy for a caller-named URL, where the
     /// address guard is the protection and a proxy would make it unenforceable.
+    pub const DIRECT: &'static Self = &Self {
+        https: None,
+        http: None,
+        no_proxy: NoProxy(Vec::new()),
+    };
+
+    /// An owned [`Network::DIRECT`], for a field that holds one.
     pub fn direct() -> Self {
         Self::default()
     }
@@ -197,10 +204,7 @@ impl Network {
     /// Separate from [`Network::resolve`] so it can be tested without setting
     /// process-wide variables: the test runner shares one environment across
     /// threads, and CI runs the suite in a single process.
-    fn resolve_from(
-        cfg: &NetworkConfig,
-        lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<Self> {
+    fn resolve_from(cfg: &NetworkConfig, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         // Uppercase first, then lowercase, which is the order ureq reads them.
         let get = |upper: &str| lookup(upper).or_else(|| lookup(&upper.to_ascii_lowercase()));
         let named = |upper: &str| -> Result<Option<Option<ProxyUrl>>> {
@@ -397,7 +401,9 @@ mod tests {
             no_proxy: NoProxy::default(),
         };
         assert_eq!(
-            net.proxy_for(to("https", "a.example", 443)).unwrap().shown(),
+            net.proxy_for(to("https", "a.example", 443))
+                .unwrap()
+                .shown(),
             "http://secure:1"
         );
         assert_eq!(
@@ -432,7 +438,9 @@ mod tests {
             &[("https_proxy", "http://from-env:2")],
         );
         assert_eq!(
-            net.proxy_for(to("https", "a.example", 443)).unwrap().shown(),
+            net.proxy_for(to("https", "a.example", 443))
+                .unwrap()
+                .shown(),
             "http://from-env:2"
         );
         // Nothing named the http scheme, so the file still supplies it.
@@ -446,7 +454,9 @@ mod tests {
     fn the_config_file_is_used_when_nothing_is_set() {
         let net = resolved(&cfg(Some("http://from-config:1"), Some("localhost")), &[]);
         assert_eq!(
-            net.proxy_for(to("https", "a.example", 443)).unwrap().shown(),
+            net.proxy_for(to("https", "a.example", 443))
+                .unwrap()
+                .shown(),
             "http://from-config:1"
         );
         assert!(net.proxy_for(to("http", "localhost", 11434)).is_none());
@@ -488,7 +498,9 @@ mod tests {
             ],
         );
         assert_eq!(
-            net.proxy_for(to("https", "a.example", 443)).unwrap().shown(),
+            net.proxy_for(to("https", "a.example", 443))
+                .unwrap()
+                .shown(),
             "http://upper:1"
         );
     }
@@ -503,7 +515,10 @@ mod tests {
             net.proxy_for(to("http", "localhost", 11434)).is_some(),
             "the configured list is replaced, not merged"
         );
-        assert!(net.proxy_for(to("https", "internal.example", 443)).is_none());
+        assert!(
+            net.proxy_for(to("https", "internal.example", 443))
+                .is_none()
+        );
     }
 
     #[test]

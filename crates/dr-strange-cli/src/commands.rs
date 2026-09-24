@@ -2754,7 +2754,11 @@ fn official_catalog(
     allow_private: &[dr_strange_web::fetch::Prefix],
 ) -> Result<dr_strange_llm::Fetched> {
     dr_strange_llm::load_catalog(store, |url| {
-        dr_strange_web::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, allow_private)
+        dr_strange_web::fetch::fetch_bytes(
+            url,
+            dr_strange_llm::CATALOG_DOWNLOAD_CAP,
+            dr_strange_web::fetch::Route::guarded(allow_private),
+        )
     })
 }
 
@@ -3116,7 +3120,11 @@ fn install_one(
     let is_url = location.starts_with("http://") || location.starts_with("https://");
     let bytes = if is_url {
         writeln!(out, "downloading {location}")?;
-        dr_strange_web::fetch::fetch_bytes(location, PLUGIN_DOWNLOAD_CAP, allow_private)?
+        dr_strange_web::fetch::fetch_bytes(
+            location,
+            PLUGIN_DOWNLOAD_CAP,
+            dr_strange_web::fetch::Route::guarded(allow_private),
+        )?
     } else {
         std::fs::read(location).with_context(|| format!("reading {location}"))?
     };

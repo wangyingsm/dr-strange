@@ -512,7 +512,11 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
                     return;
                 };
                 dr_strange_llm::refresh_cache(&store, |url| {
-                    crate::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, &[])
+                    crate::fetch::fetch_bytes(
+                        url,
+                        dr_strange_llm::CATALOG_DOWNLOAD_CAP,
+                        crate::fetch::Route::guarded(&[]),
+                    )
                 });
             });
         }
@@ -524,7 +528,11 @@ pub fn plugin_catalog(_ctx: &Ctx<'_>) -> Result<Value, RpcError> {
     // redirect into its own network is exactly what the guard is for, and the
     // catalog lives on the public internet.
     let fetched = dr_strange_llm::load_catalog_within(&store, CATALOG_TTL, |url| {
-        crate::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, &[])
+        crate::fetch::fetch_bytes(
+            url,
+            dr_strange_llm::CATALOG_DOWNLOAD_CAP,
+            crate::fetch::Route::guarded(&[]),
+        )
     })
     .map_err(plug)?;
     let stale = fetched.source.is_stale();
@@ -663,7 +671,7 @@ pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         ));
     }
     const CAP: usize = 256 << 20;
-    let bytes = crate::fetch::fetch_bytes(&req.url, CAP, &[])
+    let bytes = crate::fetch::fetch_bytes(&req.url, CAP, crate::fetch::Route::guarded(&[]))
         .map_err(|e| opaque("plugin download failed", format!("{e:#}")))?;
     let store = plugin_store()?;
     let (entry, replaced) = store.install(&bytes, &req.url).map_err(plug)?;
