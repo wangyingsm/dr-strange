@@ -16,7 +16,10 @@ logs/
 
 # Local MCP server registrations — carries a bearer token for a `serve watch`
 # instance bound to an ephemeral, machine-local port. Never share or commit.
+# Cursor is a desktop app, launched with no shell environment to read a token
+# out of, so its config carries the token itself; `drsg init` writes both.
 .mcp.json
+.cursor/mcp.json
 
 # Local agent working notes (coverage baseline, conventions) — per machine.
 /CLAUDE.md
