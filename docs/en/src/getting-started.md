@@ -103,6 +103,13 @@ Dr Strange v2.12.0 (x86_64-unknown-linux-gnu)
   installed /home/me/.local/bin/drsg
 ```
 
+Both halves cross the network, and both honour a proxy: the version check is a
+drsg request (see [Working behind an HTTP
+proxy](#working-behind-an-http-proxy)), and the installer it hands over to is
+`curl`, which reads the same variables. On a network that needs a proxy the
+version check is what fails first, so an `update` that cannot reach GitHub
+never reaches the installer at all.
+
 The installer it runs is the one **tagged with the release being installed**,
 not the copy on `master`, and the release is passed along as `--version`: the
 script that verifies the archive is the script reviewed and shipped with it,
@@ -294,6 +301,10 @@ max_pages = 10                              # ceiling on pages kept per crawl
 max_depth = 3                               # ceiling on link-following depth a request may ask for
 concurrency = 4                             # requests in flight
 allow_private = []                          # see below — normally left empty
+
+[network]                                   # where this binary's own requests go
+proxy = "http://127.0.0.1:7897"             # or socks5://…; overridden by ALL_PROXY / HTTPS_PROXY / HTTP_PROXY
+no_proxy = ".internal, 192.168.1.10"        # NO_PROXY-style bypass list; overridden by NO_PROXY
 ```
 
 **`[fetch]` changes the server's network posture**, and is worth reading before
@@ -309,6 +320,44 @@ redirect hop.
 intranet wiki — and is the one deliberate exception to that. It is not a switch
 that turns the guard off, and a server reachable by untrusted clients should
 leave it empty. To refuse URL fetching entirely, set `enabled = false`.
+
+### Working behind an HTTP proxy
+
+`[network]` governs the requests drsg makes **on your behalf**: `drsg plugin
+install`, `drsg update`, `drsg digest <url>`, the LLM provider, and a replica's
+snapshot fetch. Set it in the file, or export any of `ALL_PROXY`, `HTTPS_PROXY`
+or `HTTP_PROXY` (each also read lowercase). `socks5://` works as well as
+`http://`.
+
+Three rules are worth knowing, because each one is a decision rather than an
+accident:
+
+**A URL a caller names is never proxied.** `/digest/fetch` and `plugin.install`
+over JSON-RPC take a URL from whoever is calling, and the address guard
+described above is what stops that URL naming the server's own loopback or a
+cloud metadata endpoint. A proxy resolves the name and connects on the server's
+behalf, so the guard would have no address left to judge — it cannot be enforced
+through a proxy, and drsg does not pretend otherwise. Those requests stay direct
+and guarded. `drsg serve` says so once at startup when a proxy is configured.
+
+**Loopback is never proxied**, whatever is configured. A local model server —
+the `ollama` preset is `http://localhost:11434/v1` — is not what anyone setting
+`https_proxy` for the outside world meant to redirect. Any other address obeys
+the configuration; only `localhost` and the loopback ranges are automatic.
+
+**The environment wins.** A variable that is set overrides the file, so a single
+command can go through a different proxy without editing anything:
+
+```bash
+https_proxy=http://127.0.0.1:1080 drsg plugin install ts   # this run only
+https_proxy= drsg plugin install ts                        # set but empty: go direct
+```
+
+`no_proxy` takes a `NO_PROXY`-style list, comma- or space-separated: an exact
+host, a `.suffix` or `*.suffix` wildcard, an IP literal, an entry with a port
+(`example.com:8080`), or `*` for everything. CIDR blocks are not supported.
+`NO_PROXY` in the environment **replaces** the file's list rather than adding to
+it.
 
 Precedence is fixed: an environment variable already set in the process always
 takes precedence over the corresponding file value, and the `--addr` flag
