@@ -1373,6 +1373,18 @@ fn run_services(
             // environment, so the variable is the one reading.
             let token_configured = std::env::var("DRSG_TOKEN").is_ok_and(|t| !t.is_empty());
             config::check_serve_bind(cfg, addr, token_configured)?;
+            // Said once at startup rather than leaving an operator to wonder
+            // why one fetch is proxied and another is not. A proxy carries the
+            // requests this binary makes on their behalf; a URL a caller hands
+            // the API is address-guarded instead, and through a proxy that
+            // guard would have no address to judge (issue #37).
+            if !config::network(cfg)?.is_direct() {
+                tracing::info!(
+                    "a proxy is configured: plugin, update and provider requests use it, \
+                     while URL fetches asked for through the API go direct under the \
+                     address guard"
+                );
+            }
             if let Some(upstream) = follow {
                 let follow_opts = dr_strange_web::FollowOptions {
                     upstream,
@@ -1587,11 +1599,13 @@ fn run_plugins_and_ingest(
                     .or_default()
                     .push(("include_source".to_string(), "true".to_string()));
             }
+            let net = config::network(cfg)?;
             let args = commands::DigestArgs {
                 source: &source,
                 topic: topic.as_deref(),
                 pages,
                 depth,
+                net: &net,
                 plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,
                 chunk_chars,
