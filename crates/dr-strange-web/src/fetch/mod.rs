@@ -801,12 +801,12 @@ fn terse(e: &ureq::Error) -> String {
 /// A transport failure through a proxy is ambiguous — the proxy may be down,
 /// or it may be the one that could not reach the destination — and an error
 /// that does not even mention the proxy sends the reader to debug the wrong
-/// one (issue #37). The password never appears; [`ProxyUrl::shown`] redacts it.
+/// one (issue #37). The password never appears; `ProxyUrl`'s `Display` redacts it.
 fn terse_via(e: &ureq::Error, url: &Url, route: Route<'_>) -> String {
     let terse = terse(e);
     match route.net.proxy_for(guard::destination(url)) {
         Some(p) if matches!(e, ureq::Error::Transport(_)) => {
-            format!("{terse} (via the proxy {})", p.shown())
+            format!("{terse} (via the proxy {p})")
         }
         _ => terse,
     }

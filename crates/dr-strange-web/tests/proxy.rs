@@ -39,7 +39,7 @@ fn stub_proxy() -> (String, mpsc::Receiver<String>) {
 /// `ALL_PROXY` set, and `Network::resolve` would rightly let it win — sending
 /// these requests somewhere other than the stub.
 fn proxied_to(proxy: String) -> Network {
-    Network::through(ProxyUrl::parse(&proxy).unwrap(), NoProxy::default())
+    Network::through(proxy.parse::<ProxyUrl>().unwrap(), NoProxy::default())
 }
 
 fn first_line(rx: &mpsc::Receiver<String>) -> String {
@@ -121,7 +121,7 @@ fn the_update_version_check_goes_through_the_proxy() {
 fn a_bypassed_host_does_not_reach_the_proxy() {
     let (proxy, rx) = stub_proxy();
     let net = Network::through(
-        ProxyUrl::parse(&proxy).unwrap(),
+        proxy.parse::<ProxyUrl>().unwrap(),
         NoProxy::parse("127.0.0.1, localhost"),
     );
     let route = Route {
@@ -148,7 +148,9 @@ fn a_bypassed_host_does_not_reach_the_proxy() {
 fn a_failure_through_a_proxy_says_so_without_leaking_the_password() {
     // Port 9 (discard) refuses, so this is a proxy that cannot be reached.
     let net = Network::through(
-        ProxyUrl::parse("http://alice:hunter2@127.0.0.1:9").unwrap(),
+        "http://alice:hunter2@127.0.0.1:9"
+            .parse::<ProxyUrl>()
+            .unwrap(),
         NoProxy::default(),
     );
     let route = Route {

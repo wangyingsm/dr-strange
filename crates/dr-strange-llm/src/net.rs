@@ -11,6 +11,9 @@
 //! against a known destination, so the proxy is a per-request decision rather
 //! than a property of a shared agent.
 
+use std::fmt;
+use std::str::FromStr;
+
 use anyhow::{Context, Result, bail};
 
 /// Where a request is going, which is all the proxy decision is made from.
@@ -44,10 +47,12 @@ impl<'a> Destination<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyUrl(String);
 
-impl ProxyUrl {
-    /// Parse and validate against ureq's own grammar, so a bad value is
-    /// refused where it was written rather than at the first request.
-    pub fn parse(s: &str) -> Result<Self> {
+impl FromStr for ProxyUrl {
+    type Err = anyhow::Error;
+
+    /// Validated against ureq's own grammar, so a bad value is refused where
+    /// it was written rather than at the first request.
+    fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.is_empty() {
             bail!("a proxy URL cannot be empty");
@@ -56,31 +61,39 @@ impl ProxyUrl {
             anyhow::anyhow!(
                 "`{}` is not a proxy URL — expected <protocol>://[user:password@]host[:port], \
                  where protocol is http, socks4, socks4a, socks5 or socks",
-                Self(s.to_string()).shown()
+                Self(s.to_string())
             )
         })?;
         Ok(Self(s.to_string()))
     }
+}
 
-    /// The URL with any password replaced, for logs and errors.
-    pub fn shown(&self) -> String {
+/// The URL with any password replaced, so it can be printed anywhere.
+impl fmt::Display for ProxyUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (prefix, rest) = match self.0.split_once("://") {
-            Some((p, r)) => (format!("{p}://"), r),
-            None => (String::new(), self.0.as_str()),
+            Some((p, r)) => (p, r),
+            None => ("", self.0.as_str()),
         };
+        if !prefix.is_empty() {
+            write!(f, "{prefix}://")?;
+        }
         match rest.rsplit_once('@') {
             Some((creds, host)) => {
                 let user = creds.split_once(':').map_or(creds, |(u, _)| u);
-                format!("{prefix}{user}:***@{host}")
+                write!(f, "{user}:***@{host}")
             }
-            None => format!("{prefix}{rest}"),
+            None => write!(f, "{rest}"),
         }
     }
+}
 
-    /// The ureq value, rebuilt per agent because `ureq::Proxy` is not `Eq`.
-    fn to_ureq(&self) -> Result<ureq::Proxy> {
+impl ProxyUrl {
+    /// The ureq value, built per agent because `ureq::Proxy` is neither `Clone`
+    /// nor `Eq` and so cannot be kept in the policy.
+    fn into_ureq(self) -> Result<ureq::Proxy> {
         ureq::Proxy::new(&self.0)
-            .map_err(|e| anyhow::anyhow!("proxy {}: {e}", self.shown()))
+            .map_err(|e| anyhow::anyhow!("proxy {self}: {e}"))
             .context("building the proxy for this request")
     }
 }
@@ -244,15 +257,19 @@ impl Network {
             if v.trim().is_empty() {
                 return Ok(Some(None));
             }
-            let p =
-                ProxyUrl::parse(&v).with_context(|| format!("the {upper} environment variable"))?;
+            let p = v
+                .parse::<ProxyUrl>()
+                .with_context(|| format!("the {upper} environment variable"))?;
             Ok(Some(Some(p)))
         };
 
         let from_cfg = cfg
             .proxy
             .as_deref()
-            .map(|s| ProxyUrl::parse(s).context("the `proxy` key in the [network] config section"))
+            .map(|s| {
+                s.parse::<ProxyUrl>()
+                    .context("the `proxy` key in the [network] config section")
+            })
             .transpose()?;
 
         let all = named("ALL_PROXY")?;
@@ -299,7 +316,7 @@ impl Network {
     /// Attach the proxy for `to`, if there is one, to an agent builder.
     pub fn apply(&self, b: ureq::AgentBuilder, to: Destination<'_>) -> Result<ureq::AgentBuilder> {
         match self.proxy_for(to) {
-            Some(p) => Ok(b.proxy(p.to_ureq()?)),
+            Some(p) => Ok(b.proxy(p.clone().into_ureq()?)),
             None => Ok(b),
         }
     }
@@ -361,23 +378,32 @@ mod tests {
 
     #[test]
     fn a_proxy_url_is_validated_where_it_is_written() {
-        assert!(ProxyUrl::parse("http://127.0.0.1:7897").is_ok());
-        assert!(ProxyUrl::parse("socks5://127.0.0.1:7897").is_ok());
+        assert!("http://127.0.0.1:7897".parse::<ProxyUrl>().is_ok());
+        assert!("socks5://127.0.0.1:7897".parse::<ProxyUrl>().is_ok());
         // No scheme means http, as ureq reads it.
-        assert!(ProxyUrl::parse("127.0.0.1:7897").is_ok());
-        let err = ProxyUrl::parse("ftp://nope").unwrap_err().to_string();
+        assert!("127.0.0.1:7897".parse::<ProxyUrl>().is_ok());
+        let err = "ftp://nope".parse::<ProxyUrl>().unwrap_err().to_string();
         assert!(err.contains("is not a proxy URL"), "{err}");
-        assert!(ProxyUrl::parse("   ").is_err(), "empty is refused");
+        assert!("   ".parse::<ProxyUrl>().is_err(), "empty is refused");
     }
 
     #[test]
     fn a_password_never_reaches_a_message() {
-        let p = ProxyUrl::parse("http://alice:hunter2@proxy.example:8080").unwrap();
-        assert_eq!(p.shown(), "http://alice:***@proxy.example:8080");
-        assert!(!p.shown().contains("hunter2"));
+        let p = "http://alice:hunter2@proxy.example:8080"
+            .parse::<ProxyUrl>()
+            .unwrap();
+        // Interpolation is the path every message takes, so assert that one.
+        assert_eq!(format!("{p}"), "http://alice:***@proxy.example:8080");
+        assert!(!format!("{p}").contains("hunter2"));
+        // Debug is derived and keeps the raw string; it must not be printed at
+        // a user, which is why every message uses Display.
+        assert!(format!("{p:?}").contains("hunter2"));
         // Nothing to redact, nothing changed.
-        let plain = ProxyUrl::parse("http://proxy.example:8080").unwrap();
-        assert_eq!(plain.shown(), "http://proxy.example:8080");
+        let plain = "http://proxy.example:8080".parse::<ProxyUrl>().unwrap();
+        assert_eq!(plain.to_string(), "http://proxy.example:8080");
+        // No scheme, and a password still redacted.
+        let bare = "bob:s3cret@proxy.example:8080".parse::<ProxyUrl>().unwrap();
+        assert_eq!(bare.to_string(), "bob:***@proxy.example:8080");
     }
 
     #[test]
@@ -441,18 +467,20 @@ mod tests {
     #[test]
     fn the_scheme_picks_the_variable() {
         let net = Network {
-            https: ProxyUrl::parse("http://secure:1").ok(),
-            http: ProxyUrl::parse("http://plain:2").ok(),
+            https: "http://secure:1".parse::<ProxyUrl>().ok(),
+            http: "http://plain:2".parse::<ProxyUrl>().ok(),
             no_proxy: NoProxy::default(),
         };
         assert_eq!(
             net.proxy_for(to("https", "a.example", 443))
                 .unwrap()
-                .shown(),
+                .to_string(),
             "http://secure:1"
         );
         assert_eq!(
-            net.proxy_for(to("http", "a.example", 80)).unwrap().shown(),
+            net.proxy_for(to("http", "a.example", 80))
+                .unwrap()
+                .to_string(),
             "http://plain:2"
         );
     }
@@ -460,8 +488,8 @@ mod tests {
     #[test]
     fn a_bypassed_host_has_no_proxy_whatever_the_scheme() {
         let net = Network {
-            https: ProxyUrl::parse("http://secure:1").ok(),
-            http: ProxyUrl::parse("http://plain:2").ok(),
+            https: "http://secure:1".parse::<ProxyUrl>().ok(),
+            http: "http://plain:2".parse::<ProxyUrl>().ok(),
             no_proxy: NoProxy::parse("localhost"),
         };
         assert!(net.proxy_for(to("http", "localhost", 11434)).is_none());
@@ -474,7 +502,7 @@ mod tests {
     #[test]
     fn loopback_is_never_proxied() {
         let net = Network::through(
-            ProxyUrl::parse("http://127.0.0.1:7897").unwrap(),
+            "http://127.0.0.1:7897".parse::<ProxyUrl>().unwrap(),
             NoProxy::default(),
         );
         for host in ["localhost", "127.0.0.1", "127.0.0.53", "::1", "LocalHost"] {
@@ -509,12 +537,14 @@ mod tests {
         assert_eq!(
             net.proxy_for(to("https", "a.example", 443))
                 .unwrap()
-                .shown(),
+                .to_string(),
             "http://from-env:2"
         );
         // Nothing named the http scheme, so the file still supplies it.
         assert_eq!(
-            net.proxy_for(to("http", "a.example", 80)).unwrap().shown(),
+            net.proxy_for(to("http", "a.example", 80))
+                .unwrap()
+                .to_string(),
             "http://from-config:1"
         );
     }
@@ -525,7 +555,7 @@ mod tests {
         assert_eq!(
             net.proxy_for(to("https", "a.example", 443))
                 .unwrap()
-                .shown(),
+                .to_string(),
             "http://from-config:1"
         );
         assert!(net.proxy_for(to("http", "localhost", 11434)).is_none());
@@ -553,7 +583,7 @@ mod tests {
             ],
         );
         for d in [to("https", "a.example", 443), to("http", "a.example", 80)] {
-            assert_eq!(net.proxy_for(d).unwrap().shown(), "http://everything:1");
+            assert_eq!(net.proxy_for(d).unwrap().to_string(), "http://everything:1");
         }
     }
 
@@ -569,7 +599,7 @@ mod tests {
         assert_eq!(
             net.proxy_for(to("https", "a.example", 443))
                 .unwrap()
-                .shown(),
+                .to_string(),
             "http://upper:1"
         );
     }
