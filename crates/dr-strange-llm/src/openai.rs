@@ -330,7 +330,14 @@ pub fn build_provider(
         );
     }
     let batch = p.map(|p| p.embed_batch).unwrap_or(64).max(1);
-    let mut provider = OpenAiProvider::new(base, key, model).with_embed_batch(batch);
+    // Read here rather than threaded in: every caller would have to carry it,
+    // and the CLI has already folded `[network]` into the environment without
+    // overwriting what the operator exported (issue #37). A local endpoint —
+    // the `ollama` preset — is loopback and is never proxied regardless.
+    let net = crate::net::Network::resolve(&crate::net::NetworkConfig::default())?;
+    let mut provider = OpenAiProvider::new(base, key, model)
+        .with_embed_batch(batch)
+        .through(net);
     provider.missing_key_env = missing;
     for field in std::env::var(CHAT_OMIT_ENV)
         .unwrap_or_default()
@@ -378,6 +385,10 @@ pub struct OpenAiProvider {
     /// thread holding this instance, which is how a digest run's workers come
     /// to agree on a limit none of them was told.
     throttle: Throttle,
+    /// Where this provider's requests go. A hosted endpoint is reached through
+    /// the operator's proxy; a local one (the `ollama` preset) is loopback and
+    /// never proxied (issue #37).
+    net: crate::net::Network,
 }
 
 impl OpenAiProvider {
@@ -396,7 +407,30 @@ impl OpenAiProvider {
             send_temperature: true,
             send_max_tokens: true,
             throttle: Throttle::new(),
+            net: crate::net::Network::direct(),
         }
+    }
+
+    /// Send this provider's requests through `net`.
+    pub fn through(mut self, net: crate::net::Network) -> Self {
+        self.net = net;
+        self
+    }
+
+    /// The agent for one request, carrying the proxy this endpoint warrants.
+    ///
+    /// A base URL that will not parse is the operator's own typo, and it is
+    /// reported here rather than being silently sent unproxied.
+    fn agent(&self, url: &str) -> Result<ureq::Agent> {
+        let parsed = url::Url::parse(url)
+            .with_context(|| format!("the provider URL {} is not a URL", self.shown_url()))?;
+        Ok(self
+            .net
+            .apply(
+                ureq::AgentBuilder::new(),
+                crate::net::Destination::of(&parsed),
+            )?
+            .build())
     }
 
     /// Leave `temperature` out of chat completions, for a model that fixes
@@ -451,12 +485,17 @@ impl OpenAiProvider {
             );
         }
         let url = format!("{}/{path}", self.base_url);
+        // One agent for every attempt: it carries the proxy (if the operator
+        // configured one and this endpoint is not local), and building it can
+        // fail on a malformed proxy — which should be said once, not per retry.
+        let agent = self.agent(&url)?;
         for attempt in 1..=MAX_ATTEMPTS {
             // Bounded: ureq applies no timeout of its own, so a provider that
             // accepts the connection and then stops responding would wedge the
             // caller forever — an `ask` loop or a digest run with no way out
             // but Ctrl-C. A generous cap still ends the wait.
-            let mut req = ureq::post(&url)
+            let mut req = agent
+                .post(&url)
                 .timeout(timeout)
                 .set("Content-Type", "application/json");
             if !self.api_key.is_empty() {

@@ -30,6 +30,8 @@ anyhow = "1"
 # `proxy-from-env` stays off, because it has no `NO_PROXY` and would send a
 # local provider's traffic through the proxy too (see `net`).
 ureq = { version = "2", features = ["json", "socks-proxy"] }
+# Parsing a provider or upstream URL into the host the proxy decision needs.
+url = "2"
 # Server-side document → Markdown for the digest page (arch/07, arch/08).
 # Replaces a hand-rolled pdf-extract + unzip-the-docx pair: one crate covers
 # doc/docx/odt/rtf/epub/pdf/pptx/xlsx/csv, detects the format from the bytes

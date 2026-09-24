@@ -240,15 +240,7 @@ pub fn precheck(url: &Url, allow: &[Prefix], net: &Network) -> Result<()> {
 /// `Url` keeps around an IPv6 literal, so it is spelled the way a `NO_PROXY`
 /// entry spells it.
 pub fn destination(url: &Url) -> Destination<'_> {
-    let host = url.host_str().unwrap_or_default();
-    Destination {
-        scheme: url.scheme(),
-        host: host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host),
-        port: url.port_or_known_default().unwrap_or(443),
-    }
+    Destination::of(url)
 }
 
 /// Whether a proxy carries this request, in which case the address policy

@@ -310,6 +310,17 @@ pub fn apply_env(cfg: &Config) {
     for (key, val) in &cfg.llm {
         set(key, val);
     }
+    // The per-scheme variables, never `ALL_PROXY`: `set` skips a variable the
+    // operator already exported, but `ALL_PROXY` outranks `HTTPS_PROXY` when
+    // the policy is resolved, so writing the file's value there would let it
+    // beat an environment that was supposed to win.
+    if let Some(proxy) = &cfg.network.proxy {
+        set("HTTPS_PROXY", proxy);
+        set("HTTP_PROXY", proxy);
+    }
+    if let Some(no_proxy) = &cfg.network.no_proxy {
+        set("NO_PROXY", no_proxy);
+    }
 }
 
 /// The history retention every command opens the database with: `[server]

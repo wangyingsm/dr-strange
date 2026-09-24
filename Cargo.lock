@@ -1229,6 +1229,7 @@ dependencies = [
  "toml",
  "tracing",
  "ureq",
+ "url",
  "wasmtime",
  "wasmtime-wasi",
 ]

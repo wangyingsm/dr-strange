@@ -24,6 +24,22 @@ pub struct Destination<'a> {
     pub port: u16,
 }
 
+impl<'a> Destination<'a> {
+    /// What `url` names. The host loses the brackets `Url` keeps around an
+    /// IPv6 literal, so it is spelled the way a `NO_PROXY` entry spells it.
+    pub fn of(url: &'a url::Url) -> Self {
+        let host = url.host_str().unwrap_or_default();
+        Self {
+            scheme: url.scheme(),
+            host: host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host),
+            port: url.port_or_known_default().unwrap_or(443),
+        }
+    }
+}
+
 /// A proxy URL as configured, kept verbatim so messages can quote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyUrl(String);
@@ -264,8 +280,14 @@ impl Network {
     }
 
     /// The proxy that would carry a request to `to`, or `None` for direct.
+    ///
+    /// Loopback never goes through a proxy. A proxy exists to reach somewhere
+    /// else, and the local addresses this binary talks to are a local model
+    /// server (the `ollama` preset is `http://localhost:11434/v1`) or a replica
+    /// upstream — which an operator who set `https_proxy` for their browser
+    /// never meant to redirect. Go's `ProxyFromEnvironment` does the same.
     pub fn proxy_for(&self, to: Destination<'_>) -> Option<&ProxyUrl> {
-        if self.no_proxy.bypasses(to) {
+        if is_loopback(to.host) || self.no_proxy.bypasses(to) {
             return None;
         }
         match to.scheme {
@@ -293,6 +315,15 @@ impl Network {
 /// in [`Network::resolve_from`], where it is tested.
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+/// `localhost`, or an address literal in a loopback range.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -438,6 +469,30 @@ mod tests {
         assert!(!net.is_direct(), "a proxy is still configured");
     }
 
+    /// A local model server is the common case, and an operator who set
+    /// `https_proxy` for the outside world never meant to redirect it.
+    #[test]
+    fn loopback_is_never_proxied() {
+        let net = Network::through(
+            ProxyUrl::parse("http://127.0.0.1:7897").unwrap(),
+            NoProxy::default(),
+        );
+        for host in ["localhost", "127.0.0.1", "127.0.0.53", "::1", "LocalHost"] {
+            assert!(
+                net.proxy_for(to("http", host, 11434)).is_none(),
+                "{host} must go direct"
+            );
+        }
+        // A name that merely contains one is not one.
+        assert!(
+            net.proxy_for(to("https", "localhost.evil.com", 443))
+                .is_some()
+        );
+        assert!(net.proxy_for(to("https", "notlocalhost", 443)).is_some());
+        // Nor is a non-loopback private address: only loopback is automatic.
+        assert!(net.proxy_for(to("http", "192.168.1.10", 80)).is_some());
+    }
+
     #[test]
     fn direct_is_direct() {
         let net = Network::direct();
@@ -521,17 +576,20 @@ mod tests {
 
     #[test]
     fn no_proxy_from_the_environment_replaces_the_configured_list() {
+        // Neither host is loopback: that bypasses unconditionally and would
+        // hide whether the two lists were replaced or merged.
         let net = resolved(
-            &cfg(Some("http://p:1"), Some("localhost")),
-            &[("NO_PROXY", "internal.example")],
+            &cfg(Some("http://p:1"), Some("from-file.example")),
+            &[("NO_PROXY", "from-env.example")],
         );
         assert!(
-            net.proxy_for(to("http", "localhost", 11434)).is_some(),
-            "the configured list is replaced, not merged"
-        );
-        assert!(
-            net.proxy_for(to("https", "internal.example", 443))
+            net.proxy_for(to("https", "from-env.example", 443))
                 .is_none()
+        );
+        assert!(
+            net.proxy_for(to("https", "from-file.example", 443))
+                .is_some(),
+            "the configured list is replaced, not merged"
         );
     }
 
