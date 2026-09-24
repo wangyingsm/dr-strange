@@ -878,6 +878,12 @@ fn fetch_options(
         max_depth: q.depth.unwrap_or(DEFAULT_FETCH_DEPTH).min(cfg.max_depth),
         concurrency: cfg.concurrency,
         allow_private,
+        // Deliberately direct, and spelled out so it stays that way. This URL
+        // came from a caller, so the address guard is what protects the
+        // server's network position — and a proxy resolves and connects on our
+        // behalf, leaving the guard nothing to judge (issue #37). An
+        // operator's own `drsg digest <url>` is proxied; this is not.
+        net: crate::fetch::Network::direct(),
         ..Default::default()
     })
 }
@@ -2060,9 +2066,31 @@ async fn stats_notification(state: &Arc<AppState>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_bind_policy, local_ui_for, mcp_allowed_hosts, page_token_setting, spool_snapshot,
-        throttle_key,
+        FetchQuery, check_bind_policy, fetch_options, local_ui_for, mcp_allowed_hosts,
+        page_token_setting, spool_snapshot, throttle_key,
     };
+
+    /// A URL a caller hands the server is fetched direct, whatever proxy the
+    /// operator configured for their own commands: through a proxy the address
+    /// guard has no address to judge, and this is the endpoint the guard
+    /// exists for (issue #37).
+    #[test]
+    fn a_caller_named_fetch_is_never_proxied() {
+        let cfg = crate::FetchDefaults {
+            allow_private: Vec::new(),
+            ..Default::default()
+        };
+        let q = FetchQuery {
+            url: "https://example.com/doc".into(),
+            topic: None,
+            pages: None,
+            depth: None,
+        };
+        assert!(
+            fetch_options(&cfg, &q).unwrap().net.is_direct(),
+            "the server's fetch must stay address-guarded"
+        );
+    }
 
     /// The throttle counts against the TCP peer, except that a same-host
     /// proxy's `X-Forwarded-For` names the real client: honoured only from

@@ -15,6 +15,7 @@ mod digest;
 pub mod document;
 pub mod git;
 mod identity;
+pub mod net;
 mod openai;
 pub mod preprocess;
 mod preset;

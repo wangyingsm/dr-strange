@@ -198,8 +198,18 @@ async fn forward_tail(
 async fn fetch_snapshot(opts: &FollowOptions) -> anyhow::Result<Vec<u8>> {
     let url = snapshot_url(opts);
     let token = opts.token.clone();
+    let net = opts.net.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let mut req = ureq::get(&url).timeout(SNAPSHOT_FETCH_TIMEOUT);
+        // Through an agent, not `ureq::get`: a bare call reads no proxy at
+        // all, so a replica behind one could never bootstrap (issue #37).
+        let parsed = url::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
+        let agent = net
+            .apply(
+                ureq::AgentBuilder::new(),
+                crate::fetch::guard::destination(&parsed),
+            )?
+            .build();
+        let mut req = agent.get(&url).timeout(SNAPSHOT_FETCH_TIMEOUT);
         if let Some(t) = &token {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }

@@ -95,13 +95,13 @@ const MCP_BIN: &str = "drsg-mcp";
 /// match. It is a hatch for a mirror that publishes no sidecar, and it is
 /// spelled `insecure` because that is what it is.
 pub fn update(
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     bin: Option<&str>,
     dir: Option<&Path>,
     skip_checksum: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let latest = latest_release(allow_private)?;
+    let latest = latest_release(route)?;
     match standing(CURRENT, &latest) {
         Standing::Current => {
             writeln!(out, "drsg {CURRENT} is the latest release — nothing to do")?;
@@ -158,9 +158,9 @@ fn choose_bin(dir: &Path, out: &mut dyn Write) -> Result<String> {
 }
 
 /// The newest release's version, without the leading `v`.
-pub fn latest_release(allow_private: &[dr_strange_web::fetch::Prefix]) -> Result<String> {
+pub fn latest_release(route: dr_strange_web::fetch::Route<'_>) -> Result<String> {
     let url = format!("https://github.com/{REPO}/releases/latest");
-    let location = dr_strange_web::fetch::redirect_target(&url, allow_private)
+    let location = dr_strange_web::fetch::redirect_target(&url, route)
         .context("asking GitHub for the latest release")?;
     tag_version(&location).with_context(|| {
         format!("could not read a release version out of GitHub's answer: {location}")

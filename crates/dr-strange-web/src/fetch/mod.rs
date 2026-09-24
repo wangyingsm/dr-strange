@@ -28,9 +28,49 @@ use dr_strange_core::{Analyzer, Language};
 use dr_strange_llm::SOURCE_MARKER;
 use url::Url;
 
+// Re-exported so a caller need not depend on the llm crate for them: the
+// CLI's own dependency on it is optional (`digest`), but every build of it
+// has a proxy policy to resolve.
+pub use dr_strange_llm::net::{Destination, Network, NetworkConfig, NoProxy, ProxyUrl};
 pub use guard::Prefix;
 use relevance::Target;
 use robots::Robots;
+
+/// How one request is protected.
+#[derive(Clone, Copy)]
+pub struct Route<'a> {
+    /// Where requests go. [`Network::direct`] means the address guard applies.
+    pub net: &'a Network,
+    /// Blocks an operator re-permitted, for when the guard applies.
+    pub allow: &'a [Prefix],
+}
+
+impl<'a> Route<'a> {
+    /// The guard, and no proxy — the policy for a URL a caller named.
+    pub fn guarded(allow: &'a [Prefix]) -> Self {
+        Self {
+            net: Network::DIRECT,
+            allow,
+        }
+    }
+}
+
+/// Attach the request's protection: the proxy the operator configured for this
+/// destination, or the address guard when they configured none.
+///
+/// Never both, and that is the point. ureq connects to the proxy and hands it
+/// the destination as a name, so [`guard::PublicOnly`] would be asked to
+/// approve the proxy's own address — usually loopback, which it refuses — and
+/// would never see the address it exists to judge. The caller picks which of
+/// the two it is getting rather than believing it has both.
+fn protect(b: ureq::AgentBuilder, url: &Url, route: Route<'_>) -> Result<ureq::AgentBuilder> {
+    if guard::proxied(url, route.net) {
+        return route.net.apply(b, guard::destination(url));
+    }
+    Ok(b.resolver(guard::PublicOnly {
+        allow: route.allow.to_vec(),
+    }))
+}
 
 /// Identifies the crawler to the sites it reads. A server that will not say who
 /// it is has no business asking for anyone's bandwidth.
@@ -70,6 +110,20 @@ pub struct FetchOptions {
     pub language: Language,
     /// Address blocks an operator has deliberately re-permitted.
     pub allow_private: Vec<Prefix>,
+    /// Where requests go. Direct by default: a crawl started from a URL a
+    /// caller named is guarded by address, which a proxy would make
+    /// unenforceable (see [`protect`]).
+    pub net: Network,
+}
+
+impl FetchOptions {
+    /// The protection these options ask for.
+    pub fn route(&self) -> Route<'_> {
+        Route {
+            net: &self.net,
+            allow: &self.allow_private,
+        }
+    }
 }
 
 impl Default for FetchOptions {
@@ -88,6 +142,7 @@ impl Default for FetchOptions {
             host_delay: Duration::from_millis(500),
             language: Language::English,
             allow_private: Vec::new(),
+            net: Network::direct(),
         }
     }
 }
@@ -154,23 +209,23 @@ pub struct Progress {
 /// For **artifacts** rather than pages — a plugin's `.wasm`, say — so there is
 /// no HTML, no links, no relevance scoring, and no robots dance: one request
 /// the operator asked for by exact URL.
-pub fn fetch_bytes(url: &str, max_bytes: usize, allow: &[Prefix]) -> Result<Vec<u8>> {
+pub fn fetch_bytes(url: &str, max_bytes: usize, route: Route<'_>) -> Result<Vec<u8>> {
     let url = parse_url(url)?;
-    guard::precheck(&url, allow)?;
+    guard::precheck(&url, route.allow, route.net)?;
 
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(USER_AGENT)
-        .resolver(guard::PublicOnly {
-            allow: allow.to_vec(),
-        })
-        .redirects(5)
-        .timeout(std::time::Duration::from_secs(60))
-        .build();
+    let agent = protect(
+        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        &url,
+        route,
+    )?
+    .redirects(5)
+    .timeout(std::time::Duration::from_secs(60))
+    .build();
 
     let response = agent
         .request_url("GET", &url)
         .call()
-        .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse(&e)))?;
+        .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse_via(&e, &url, route)))?;
 
     let mut bytes = Vec::new();
     // One byte past the cap distinguishes "exactly at the limit" from "over
@@ -199,18 +254,18 @@ pub fn fetch_bytes(url: &str, max_bytes: usize, allow: &[Prefix]) -> Result<Vec<
 /// The initial request goes through the same guard as every other fetch. The
 /// redirect is *not* followed and nothing at it is read: the caller gets a
 /// string to parse, which is the only reason to ask.
-pub fn redirect_target(url: &str, allow: &[Prefix]) -> Result<String> {
+pub fn redirect_target(url: &str, route: Route<'_>) -> Result<String> {
     let url = parse_url(url)?;
-    guard::precheck(&url, allow)?;
+    guard::precheck(&url, route.allow, route.net)?;
 
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(USER_AGENT)
-        .resolver(guard::PublicOnly {
-            allow: allow.to_vec(),
-        })
-        .redirects(0)
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
+    let agent = protect(
+        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        &url,
+        route,
+    )?
+    .redirects(0)
+    .timeout(std::time::Duration::from_secs(30))
+    .build();
 
     // With no redirects allowed, ureq may hand a 3xx back either way depending
     // on the status; both are the answer here, and only a transport failure is
@@ -218,7 +273,10 @@ pub fn redirect_target(url: &str, allow: &[Prefix]) -> Result<String> {
     let response = match agent.request_url("GET", &url).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => bail!("asking {url} where it redirects: {}", terse(&e)),
+        Err(e) => bail!(
+            "asking {url} where it redirects: {}",
+            terse_via(&e, &url, route)
+        ),
     };
 
     response
@@ -235,16 +293,16 @@ pub fn fetch_with_progress(
     let root_url = parse_url(root)?;
     guard::check_url(&root_url)?;
 
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(USER_AGENT)
-        // Every hop resolves through the guard, so a redirect cannot walk the
-        // request inward after the first address was approved.
-        .resolver(guard::PublicOnly {
-            allow: opts.allow_private.clone(),
-        })
-        .redirects(5)
-        .timeout(opts.request_timeout)
-        .build();
+    // Every hop resolves through the guard, so a redirect cannot walk the
+    // request inward after the first address was approved.
+    let agent = protect(
+        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        &root_url,
+        opts.route(),
+    )?
+    .redirects(5)
+    .timeout(opts.request_timeout)
+    .build();
 
     let analyzer = Analyzer::new(opts.language);
     let ctx = Crawl {
@@ -607,7 +665,7 @@ impl Crawl<'_> {
 
     fn load(&self, url: &Url) -> Result<Loaded> {
         // Says *why* an address is refused; PublicOnly is what enforces it.
-        guard::precheck(url, &self.opts.allow_private)?;
+        guard::precheck(url, &self.opts.allow_private, &self.opts.net)?;
         let host = url.host_str().unwrap_or_default().to_string();
         let delay = self.check_robots(url, &host)?;
         self.wait_turn(&host, delay);
@@ -735,6 +793,22 @@ fn terse(e: &ureq::Error) -> String {
             .message()
             .map(str::to_string)
             .unwrap_or_else(|| "the request failed".into()),
+    }
+}
+
+/// `terse`, plus which hop the caller should go and look at.
+///
+/// A transport failure through a proxy is ambiguous — the proxy may be down,
+/// or it may be the one that could not reach the destination — and an error
+/// that does not even mention the proxy sends the reader to debug the wrong
+/// one (issue #37). The password never appears; `ProxyUrl`'s `Display` redacts it.
+fn terse_via(e: &ureq::Error, url: &Url, route: Route<'_>) -> String {
+    let terse = terse(e);
+    match route.net.proxy_for(guard::destination(url)) {
+        Some(p) if matches!(e, ureq::Error::Transport(_)) => {
+            format!("{terse} (via the proxy {p})")
+        }
+        _ => terse,
     }
 }
 

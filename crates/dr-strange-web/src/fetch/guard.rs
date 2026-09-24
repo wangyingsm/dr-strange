@@ -18,6 +18,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{Result, bail};
+use dr_strange_llm::net::{Destination, Network};
 use url::Url;
 
 /// A CIDR prefix an operator has deliberately re-permitted, e.g. to let the
@@ -213,8 +214,16 @@ fn filter(addrs: Vec<SocketAddr>, allow: &[Prefix]) -> Result<Vec<SocketAddr>, S
 /// wondering why their intranet wiki will not load would be told the name did
 /// not resolve when in truth it resolved fine and was refused. Belt and
 /// braces, where the braces are the ones that can talk.
-pub fn precheck(url: &Url, allow: &[Prefix]) -> Result<()> {
+///
+/// A proxied request skips the lookup: the proxy resolves the name, so
+/// resolving it here judges an address this process will never connect to —
+/// and a name with no usable local answer is exactly what a proxy is often
+/// there to reach (issue #37).
+pub fn precheck(url: &Url, allow: &[Prefix], net: &Network) -> Result<()> {
     check_url(url)?;
+    if proxied(url, net) {
+        return Ok(());
+    }
     let host = url.host_str().unwrap_or_default();
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<SocketAddr> = (host, port)
@@ -225,6 +234,25 @@ pub fn precheck(url: &Url, allow: &[Prefix]) -> Result<()> {
         Ok(_) => Ok(()),
         Err(why) => bail!("refusing to connect to {host}: {why}"),
     }
+}
+
+/// What `url` names, for the proxy decision. The host loses the brackets
+/// `Url` keeps around an IPv6 literal, so it is spelled the way a `NO_PROXY`
+/// entry spells it.
+pub fn destination(url: &Url) -> Destination<'_> {
+    Destination::of(url)
+}
+
+/// Whether a proxy carries this request, in which case the address policy
+/// cannot apply to it.
+///
+/// ureq resolves and connects to the *proxy*, and hands the destination over
+/// as a name for the proxy to resolve — [`PublicOnly`] is asked for the
+/// proxy's address and never sees the destination's. So a proxied request is
+/// not a guarded one, and the caller picks which of the two it is getting
+/// rather than believing it has both.
+pub fn proxied(url: &Url, net: &Network) -> bool {
+    net.proxy_for(destination(url)).is_some()
 }
 
 /// A [`ureq::Resolver`] that resolves normally and then drops every address
@@ -246,9 +274,14 @@ impl ureq::Resolver for PublicOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dr_strange_llm::net::NetworkConfig;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
     }
 
     #[test]
@@ -397,8 +430,6 @@ mod tests {
     #[test]
     fn precheck_refuses_before_a_packet_moves() {
         // Literal addresses, so this resolves locally and needs no network.
-        let url = |s: &str| Url::parse(s).unwrap();
-
         let err = guard_err(&url("http://127.0.0.1:8080/x"), &[]);
         assert!(err.contains("refusing to connect"), "{err}");
         assert!(err.contains("loopback"), "{err}");
@@ -407,15 +438,92 @@ mod tests {
         assert!(meta.contains("link-local"), "the metadata endpoint: {meta}");
 
         // A public address passes, and a granted private one passes too.
-        assert!(precheck(&url("http://1.1.1.1/"), &[]).is_ok());
+        assert!(precheck(&url("http://1.1.1.1/"), &[], Network::DIRECT).is_ok());
         let allow = vec![Prefix::parse("10.0.0.0/8").unwrap()];
-        assert!(precheck(&url("http://10.0.0.5/wiki"), &allow).is_ok());
+        assert!(precheck(&url("http://10.0.0.5/wiki"), &allow, Network::DIRECT).is_ok());
         // The scheme check runs first, so a `file:` URL never reaches resolution.
-        assert!(precheck(&url("file:///etc/passwd"), &[]).is_err());
+        assert!(precheck(&url("file:///etc/passwd"), &[], Network::DIRECT).is_err());
     }
 
     fn guard_err(u: &Url, allow: &[Prefix]) -> String {
-        precheck(u, allow).expect_err("must be refused").to_string()
+        precheck(u, allow, Network::DIRECT)
+            .expect_err("must be refused")
+            .to_string()
+    }
+
+    /// A policy that proxies everything, as `https_proxy=http://127.0.0.1:7897`
+    /// gives.
+    fn through_a_proxy() -> Network {
+        Network::resolve(&NetworkConfig {
+            proxy: Some("http://127.0.0.1:7897".into()),
+            no_proxy: None,
+        })
+        .unwrap()
+    }
+
+    /// The bug behind issue #37: the reporter's resolver answers `::` for a
+    /// name their proxy reaches perfectly well, and the precheck refused the
+    /// fetch before a packet moved. A proxied request must not be resolved
+    /// here at all — the proxy is the thing that resolves it.
+    #[test]
+    fn a_proxied_request_is_not_resolved_locally() {
+        let u = url("https://raw.githubusercontent.com/o/r/main/catalog.json");
+        // Direct, an unresolvable name is refused by this very lookup.
+        let bad = url("https://name.invalid/x");
+        assert!(precheck(&bad, &[], Network::DIRECT).is_err());
+        // Proxied, the same name is left to the proxy.
+        assert!(precheck(&bad, &[], &through_a_proxy()).is_ok());
+        assert!(precheck(&u, &[], &through_a_proxy()).is_ok());
+    }
+
+    /// A proxy is normally on loopback, which the address policy refuses. The
+    /// two are alternatives, so `proxied` says which one is in force.
+    #[test]
+    fn a_loopback_proxy_does_not_refuse_itself() {
+        let net = through_a_proxy();
+        let u = url("https://example.com/x");
+        assert!(proxied(&u, &net));
+        assert!(!proxied(&u, Network::DIRECT));
+        // And the destination that would otherwise be refused is not checked.
+        let inward = url("http://169.254.169.254/latest/meta-data/");
+        assert!(precheck(&inward, &[], Network::DIRECT).is_err());
+        assert!(
+            precheck(&inward, &[], &net).is_ok(),
+            "a proxied request is not an address-guarded one"
+        );
+    }
+
+    /// A bypassed host keeps the guard, because nothing proxies it.
+    #[test]
+    fn a_bypassed_host_is_still_guarded() {
+        let net = Network::resolve(&NetworkConfig {
+            proxy: Some("http://127.0.0.1:7897".into()),
+            no_proxy: Some("169.254.169.254".into()),
+        })
+        .unwrap();
+        let inward = url("http://169.254.169.254/latest/meta-data/");
+        assert!(!proxied(&inward, &net));
+        assert!(precheck(&inward, &[], &net).is_err(), "guard still applies");
+    }
+
+    /// `Url` brackets an IPv6 literal; a `NO_PROXY` entry does not.
+    #[test]
+    fn an_ipv6_destination_loses_its_brackets() {
+        let local = url("http://[::1]:11434/v1");
+        let d = destination(&local);
+        assert_eq!(d.host, "::1");
+        assert_eq!(d.port, 11434);
+        assert_eq!(d.scheme, "http");
+
+        let net = Network::resolve(&NetworkConfig {
+            proxy: Some("http://127.0.0.1:7897".into()),
+            no_proxy: Some("::1".into()),
+        })
+        .unwrap();
+        assert!(
+            !proxied(&url("http://[::1]:11434/v1"), &net),
+            "the bypass entry has to match what the URL carries"
+        );
     }
 
     #[test]

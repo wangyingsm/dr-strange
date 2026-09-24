@@ -222,6 +222,40 @@ Every successful fetch is cached beside the installed plugins, so an offline
 cache and no network it fails naming the URL, because a plugin can still be
 installed without a catalog at all — a path or a URL needs no list.
 
+### Behind a proxy, or with no network at all
+
+`drsg plugin install` honours `ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (also
+read lowercase), or `[network] proxy` in `drsg.toml`; see [Getting
+Started](./getting-started.md#working-behind-an-http-proxy). `socks5://` works
+as well as `http://`.
+
+When the machine that runs drsg has no route out at all, install from a file.
+The catalog is only a lookup table, and nothing about the artifact's integrity
+depends on having fetched it — the SHA-256 is checked either way:
+
+```console
+# On a machine that can reach GitHub — the catalog names both the artifact
+# and its hash, so read them from it rather than guessing a release path.
+# A name may have several entries, one per host generation; pick the one
+# your drsg can run (`drsg plugin list --available` prints that reasoning).
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange-extension/master/catalog.json \
+    | jq -r '.plugins[] | select(.name=="ts") | "\(.version)\t\(.url)\t\(.sha256)"'
+2.0.0	https://github.com/…/ts.wasm	9f86d081…
+
+$ curl -fLo ts.wasm 'https://github.com/…/ts.wasm'
+$ echo '9f86d081…  ts.wasm' | sha256sum -c -
+ts.wasm: OK
+
+# Carry ts.wasm across, then on the offline machine:
+$ drsg plugin install ./ts.wasm
+```
+
+Installing from a path pins that file's SHA-256 in the store exactly as a
+catalog install would, so every later load re-checks it. Verify the checksum
+yourself before installing: an install from a path cannot compare against a
+catalog entry it never fetched, so that step is the one the catalog would
+otherwise have done for you.
+
 Install pins the artifact's SHA-256 in the store; every later load re-checks
 it, so a file that changes on disk is refused rather than silently run.
 Installing a name again is the upgrade path.

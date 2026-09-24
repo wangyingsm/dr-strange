@@ -117,6 +117,23 @@ dir = "logs"
 # untrusted clients should leave it empty.
 # allow_private = []
 
+# Where this binary's OWN requests go: `plugin install`, `update`, the LLM
+# provider, and a replica's snapshot fetch. A daemon started by systemd has no
+# shell to read `https_proxy` from, which is why the file can say it — but the
+# environment still wins wherever it is set, so one command can be run through
+# a different proxy, or through none with an empty value.
+#
+# A URL a CALLER hands the server is NOT proxied. Through a proxy the address
+# guard above has nothing to judge: the proxy resolves the name and connects,
+# so `/digest/fetch` and `plugin.install` over RPC stay direct and guarded.
+#
+# Loopback is never proxied, whatever is set here — a local model server
+# (the `ollama` preset is http://localhost:11434/v1) is not what an operator
+# meant to redirect.
+[network]
+# proxy = "http://127.0.0.1:7897"   # or socks5://…; overridden by ALL_PROXY / HTTPS_PROXY / HTTP_PROXY
+# no_proxy = ".internal, 192.168.1.10"  # NO_PROXY-style bypass list; overridden by NO_PROXY
+
 # Preprocessor plugins (ROADMAP §11): sandboxed wasm components installed with
 # `drsg plugin install <file.wasm | url>`. Budgets apply per sandbox call.
 [plugins]

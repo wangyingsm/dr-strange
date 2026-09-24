@@ -180,6 +180,37 @@ $ drsg plugin list --available     # 目录本身，并标注本地安装状态
 会列出清单并说明它有多旧。既无缓存又无网络时，它会报错并给出该 URL——因为不带目录
 也一样能装插件：一个路径或一个 URL 不需要任何清单。
 
+### 在代理之后，或完全没有网络
+
+`drsg plugin install` 遵循 `ALL_PROXY`、`HTTPS_PROXY` 与 `HTTP_PROXY`（同时按小写
+形式读取），也遵循 `drsg.toml` 中的 `[network] proxy`；参见
+[快速开始](./getting-started.md#在-http-代理之后工作)。`socks5://` 与 `http://`
+同样受支持。
+
+当运行 drsg 的机器完全没有出网路径时，改从文件安装。目录只是一张查找表，制品的完整
+性并不依赖于是否抓取过它——两种方式都会校验 SHA-256：
+
+```console
+# 在一台能访问 GitHub 的机器上——目录同时给出制品地址与其哈希，
+# 因此应当从目录里读取，而不是去猜测发布路径。
+# 同一名字可能有多个条目，各对应一代宿主；挑选你的 drsg 能运行的那个
+# （`drsg plugin list --available` 会打印这一判断过程）。
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange-extension/master/catalog.json \
+    | jq -r '.plugins[] | select(.name=="ts") | "\(.version)\t\(.url)\t\(.sha256)"'
+2.0.0	https://github.com/…/ts.wasm	9f86d081…
+
+$ curl -fLo ts.wasm 'https://github.com/…/ts.wasm'
+$ echo '9f86d081…  ts.wasm' | sha256sum -c -
+ts.wasm: OK
+
+# 把 ts.wasm 带过去，然后在离线机器上：
+$ drsg plugin install ./ts.wasm
+```
+
+从路径安装同样会把该文件的 SHA-256 固定在插件库中，与从目录安装别无二致，之后每次
+加载都会重新校验。请在安装之前自行核对校验和：从路径安装无法与一份从未抓取过的目录
+条目作比对，因此这一步正是目录本来会替你完成的那一步。
+
 安装时会在插件库中固定制品的 SHA-256，之后每次加载都重新校验，磁盘上被改动的文件
 会被拒绝而不是被悄悄运行。对同名插件再次安装即是升级路径。
 
