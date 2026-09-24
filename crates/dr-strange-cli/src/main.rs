@@ -1389,6 +1389,7 @@ fn run_services(
                 let follow_opts = dr_strange_web::FollowOptions {
                     upstream,
                     token: follow_token.or_else(|| std::env::var("DRSG_FOLLOW_TOKEN").ok()),
+                    net: config::network(cfg)?,
                 };
                 // Every (re)connect is a full resync from scratch (arch/01
                 // §9): each loop iteration wipes `db_path` and reopens a fresh,

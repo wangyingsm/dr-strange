@@ -54,6 +54,10 @@ pub struct FollowOptions {
     /// Bearer token presented to the master. Distinct from this replica's own
     /// `DRSG_TOKEN`, which still gates *its* downstream clients.
     pub token: Option<String>,
+    /// Where the snapshot fetch goes. The operator named the upstream, so it
+    /// is proxied like their other commands — and a master on the same network
+    /// belongs in `no_proxy` (issue #37).
+    pub net: fetch::Network,
 }
 
 /// Default listen address when neither the CLI nor a config file specifies one.
