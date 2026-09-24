@@ -116,6 +116,34 @@ impl Engine {
         }
     }
 
+    /// Like [`with_write`](Self::with_write) but WITHOUT bumping the commit
+    /// sequence or stamping the commit time: for writes that change nothing a
+    /// graph read can see. The commit sequence is the cache's version stamp
+    /// (arch/02 §3), and bumping it is a whole-cache flush — so a write that
+    /// only touches bookkeeping (the query history) must not, or every query
+    /// run evicts the working set the next query wants. Honours `read_only`
+    /// like `with_write` does: the bookkeeping is still a caller's write.
+    fn with_write_unstamped<T>(
+        &self,
+        f: impl FnOnce(&mut dyn WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        macro_rules! run {
+            ($e:expr) => {{
+                let mut txn = $e.begin_write()?;
+                let out = f(&mut txn)?;
+                txn.commit()?;
+                Ok(out)
+            }};
+        }
+        match self {
+            Engine::Memory(e) => run!(e),
+            #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
+            Engine::Redb(e) => run!(e),
+            #[cfg(feature = "native-backend")]
+            Engine::Native(e) => run!(e),
+        }
+    }
+
     /// Like [`with_write`](Self::with_write), but bypasses `read_only`
     /// (native-only, via `begin_write_unchecked`). Used only by
     /// [`Database::init`]'s one-time-per-open plane/counters bootstrap,
@@ -498,9 +526,17 @@ impl Database {
     /// batch's own commit sequence rather than allocating a new one — so a
     /// replica's KV content converges byte-for-byte with its source
     /// (`serve --follow`, arch/01 §9). Native-only.
+    ///
+    /// The batch may change graph data without moving the commit sequence the
+    /// cache stamps with (a replicated restore lands the source's sequence,
+    /// which this replica may already have stamped entries at), so the cache
+    /// is dropped after every applied batch: a replica's cache is warm between
+    /// batches, never across one.
     #[cfg(feature = "native-backend")]
     pub fn apply_replicated(&self, batch: ReplicatedBatch) -> Result<()> {
-        self.engine.apply_replicated(batch)
+        self.engine.apply_replicated(batch)?;
+        self.cache.invalidate_all();
+        Ok(())
     }
 
     /// Register a replication observer, invoked synchronously right after
@@ -691,10 +727,17 @@ impl Database {
     ///
     /// A **write**, and callers should treat it as best-effort: a query that
     /// ran is a query that ran, whether or not the note about it landed.
+    ///
+    /// Not a *graph* write, though: it leaves [`commit_seq`](Self::commit_seq)
+    /// alone. That sequence is the graph cache's version stamp (arch/02 §3),
+    /// and advancing it for a history row would flush the whole cache after
+    /// every query — the cache would never be warm for the second of two
+    /// queries in a row. Nothing a graph read returns changes here, so the
+    /// stamp stays and so does the cache.
     pub fn record_query(&self, plane: &str, query: &str, keep: usize) -> Result<u64> {
         let at = now_millis();
         self.engine
-            .with_write(|txn| graph::record_query(txn, plane, query, at, keep))
+            .with_write_unstamped(|txn| graph::record_query(txn, plane, query, at, keep))
     }
 
     /// The queries recorded, newest first, at most `limit` of them.
@@ -973,6 +1016,14 @@ impl<'db> PlaneHandle<'db> {
     /// Native backend only (hence gated to it); errors if the point is older
     /// than the retained history. A point beyond the latest commit clamps to
     /// the latest (i.e. "now").
+    ///
+    /// Index-backed terminals are answered from the snapshot, not the live
+    /// indexes: vector searches brute-force the pinned records (exact,
+    /// unindexed) and keyword searches compute BM25 from the pinned records
+    /// the same way (one label scan and analysis per query). A historical
+    /// keyword or hybrid result is therefore the snapshot's own answer —
+    /// the nodes that matched *then*, on the text they held then, scored
+    /// against that corpus — not a filter over today's index.
     #[cfg(feature = "native-backend")]
     pub fn as_of(mut self, at: AsOf) -> Result<Self> {
         self.as_of = Some(self.db.resolve_as_of(at)?);
@@ -1025,19 +1076,26 @@ impl<'db> PlaneHandle<'db> {
         // A time-travelling read drops the live vector index (built from the
         // latest commit, so it can't answer a past snapshot); its vector
         // searches then brute-force the pinned snapshot — correct, unindexed.
+        // BM25 has no unindexed path, so its keyword searches filter the live
+        // postings through the snapshot instead (see `CachedReader`).
         #[cfg(feature = "native-backend")]
         let historical = self.as_of.is_some();
         #[cfg(not(feature = "native-backend"))]
         let historical = false;
+        // Captured before the snapshot opens, on purpose: a restore or
+        // replicated batch that lands while this read is open reuses a seq
+        // the read may already be stamping entries with, and the L2 tells
+        // the two apart only by this token (arch/02 §3).
+        let generation = cache.generation();
         self.with_read(|txn| {
             // The snapshot's own commit seq stamps the cache — for a historical
             // read that is the past seq, so the exact-seq cache never serves
             // "latest" records to a time-travelling query.
             let seq = graph::read_commit_seq(txn)?;
             let reader = if historical {
-                CachedReader::with_cache_no_index(txn, self.id, cache, seq)
+                CachedReader::with_cache_historical(txn, self.id, cache, seq, generation)
             } else {
-                CachedReader::with_cache(txn, self.id, &registry, cache, seq)
+                CachedReader::with_cache(txn, self.id, &registry, cache, seq, generation)
             }
             .with_keywords(&keywords);
             f(&reader)
@@ -1253,9 +1311,10 @@ impl<'db> PlaneHandle<'db> {
         query: &str,
         k: usize,
     ) -> Vec<(NodeId, f32)> {
-        self.db
-            .keywords()
-            .search(self.id, label, property, query, k)
+        // Through the query reader rather than the registry directly, so the
+        // hits are this handle's snapshot's: filtered through it on a live
+        // read, computed from it under AS OF (arch/04 §3).
+        self.with_reader(|reader| reader.keyword_search(label, property, query, k))
             .unwrap_or_default()
     }
 
@@ -2233,7 +2292,9 @@ impl<'db> QueryBuilder<'db> {
 
     /// BM25 keyword search (ROADMAP §2): the `k` nodes whose `property` best
     /// matches `query`, seeded with their relevance score. Needs a keyword
-    /// index declared on `(label, property)`; empty without one.
+    /// index declared on `(label, property)`; empty without one. Under
+    /// [`PlaneHandle::as_of`] the answer is computed from the pinned
+    /// snapshot rather than the live index (see there).
     pub fn keyword_top_k(mut self, label: &str, property: &str, query: &str, k: u64) -> Self {
         self.plan.source = Source::KeywordTopK {
             label: label.to_string(),
@@ -2933,6 +2994,118 @@ mod time_travel_tests {
     }
 
     #[test]
+    fn as_of_keyword_and_hybrid_search_answer_from_the_snapshot() {
+        // The BM25 registry is only ever the latest commit's, so a
+        // time-travelling keyword (and hybrid-keyword) search must compute
+        // its answer from the pinned snapshot, as vector search brute-forces
+        // it: nodes the snapshot held as matching Docs are found — even ones
+        // deleted, relabelled or re-texted since — and nodes that only match
+        // on their later text (or were created later) are not.
+        use crate::text::Language;
+
+        fn body(text: &str) -> Properties {
+            let mut p = Properties::new();
+            p.insert("body".into(), PropDesc::new(PropValue::Str(text.into())));
+            p
+        }
+        fn text(t: &str) -> PropDesc {
+            PropDesc::new(PropValue::Str(t.into()))
+        }
+
+        let (_dir, db) = open();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        plane
+            .ensure_keyword_index("Doc", "body", Language::English)
+            .unwrap();
+
+        let (a, gone, relabelled, retexted, later_match) = {
+            let mut w = plane.write().unwrap();
+            let a = w
+                .create_node(&["Doc"], body("graph databases store nodes"))
+                .unwrap();
+            let gone = w
+                .create_node(&["Doc"], body("graph databases store edges"))
+                .unwrap();
+            let relabelled = w
+                .create_node(&["Doc"], body("graph databases store planes"))
+                .unwrap();
+            let retexted = w
+                .create_node(&["Doc"], body("graph databases store trees"))
+                .unwrap();
+            let later_match = w.create_node(&["Doc"], body("apples")).unwrap();
+            w.commit().unwrap();
+            (a, gone, relabelled, retexted, later_match)
+        };
+        let s1 = db.commit_seq().unwrap();
+
+        // After the point: a better-matching node appears, one is deleted,
+        // one loses the indexed label, one's text stops matching and one's
+        // starts.
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], body("graph graph graph databases"))
+                .unwrap();
+            w.delete_node(gone).unwrap();
+            w.set_labels(relabelled, &["Note"]).unwrap();
+            w.set_prop(retexted, "body", text("apples")).unwrap();
+            w.set_prop(later_match, "body", text("graph databases store fruit"))
+                .unwrap();
+            w.commit().unwrap();
+        }
+
+        let live = plane
+            .query()
+            .keyword_top_k("Doc", "body", "graph databases", 10)
+            .ids()
+            .unwrap();
+        assert_eq!(
+            live.len(),
+            3,
+            "live: the survivor, the newcomer and the node whose text now matches"
+        );
+        assert!(live.contains(&later_match) && !live.contains(&retexted));
+
+        // As of s1 the four equal-length matching bodies tie, so the answer is
+        // in id order — and it is the snapshot's answer, not a filter over the
+        // live one: `gone`, `relabelled` and `retexted` are back, `later_match`
+        // (then "apples") is not.
+        let expected = vec![a, gone, relabelled, retexted];
+        let past = plane.as_of(AsOf::Seq(s1)).unwrap();
+        let hits = past.keyword_search("Doc", "body", "graph databases", 10);
+        let ids: Vec<NodeId> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids, expected,
+            "the plane-level search answers from the snapshot"
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].1 == w[1].1),
+            "scores come from the snapshot's corpus, where the four bodies tie: {hits:?}"
+        );
+
+        let ids = past
+            .query()
+            .keyword_top_k("Doc", "body", "graph databases", 10)
+            .ids()
+            .unwrap();
+        assert_eq!(ids, expected, "the query source answers from the snapshot");
+
+        let hybrid: Vec<NodeId> = past
+            .hybrid()
+            .label("Doc")
+            .keyword("body", "graph databases")
+            .k(10)
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.node)
+            .collect();
+        assert_eq!(
+            hybrid, expected,
+            "the hybrid keyword channel answers from the snapshot"
+        );
+    }
+
+    #[test]
     fn as_of_survives_compaction() {
         // With unbounded retention, an old snapshot stays readable even after
         // enough commits to trigger compaction (the versions aren't reclaimed).
@@ -3364,5 +3537,74 @@ mod maintenance_tests {
             w.commit().unwrap();
         }
         assert_eq!(db.last_maintenance_error(), None);
+    }
+}
+
+/// The commit sequence is the graph cache's version stamp (arch/02 §3), so
+/// which writes move it decides which writes flush the cache.
+#[cfg(test)]
+mod cache_stamp_tests {
+    use super::*;
+
+    /// Decoded through the query path's reader, so a shared `Arc` between two
+    /// calls is proof the second came from the cross-query L2.
+    fn read_arc(plane: &PlaneHandle<'_>, id: NodeId) -> Arc<NodeRecord> {
+        plane
+            .with_reader(|r| Ok(r.node(id)?.expect("node exists")))
+            .unwrap()
+    }
+
+    #[test]
+    fn recording_a_query_keeps_the_cache_warm() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("p", Properties::new()).unwrap();
+        let id = {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+            w.commit().unwrap();
+            id
+        };
+        let seq = db.commit_seq().unwrap();
+        let first = read_arc(&plane, id);
+
+        // History is bookkeeping, not graph data: the stamp must not move, so
+        // the next query's read is the same decoded record — an L2 hit.
+        let recorded = db.record_query("p", "MATCH (n) RETURN n", 10).unwrap();
+        assert_eq!(
+            db.commit_seq().unwrap(),
+            seq,
+            "history does not bump the seq"
+        );
+        assert!(Arc::ptr_eq(&first, &read_arc(&plane, id)), "cache survived");
+        assert_eq!(
+            db.recorded_query(recorded).unwrap().map(|r| r.query),
+            Some("MATCH (n) RETURN n".to_string()),
+            "the history row still landed"
+        );
+
+        // A graph write still flushes (the exact-match invariant is intact).
+        {
+            let mut w = plane.write().unwrap();
+            w.set_prop(id, "k", PropDesc::new(PropValue::Int(1)))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        assert!(db.commit_seq().unwrap() > seq);
+        let fresh = read_arc(&plane, id);
+        assert!(!Arc::ptr_eq(&first, &fresh));
+        assert!(fresh.properties.contains_key("k"));
+    }
+
+    /// A read-only replica still refuses history writes: unstamped is not
+    /// unchecked.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn recording_a_query_respects_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_read_only(dir.path().join("db")).unwrap();
+        assert!(matches!(
+            db.record_query("startup", "q", 10),
+            Err(Error::ReadOnly(_))
+        ));
     }
 }

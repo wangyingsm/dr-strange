@@ -429,9 +429,12 @@ and the SDKs, as `PlaneHandle::as_of(…)` in the embedded API, and as the
 "at or before" semantics: a value between two commits resolves to the latest
 commit not after it.
 
-A time-travelling read cannot use the vector index, which is built from the
-latest commit; its similarity searches scan the pinned snapshot instead —
-correct, but unindexed. Time-travel requires the native backend.
+A time-travelling read cannot use the vector or keyword indexes, which are
+built from the latest commit; its similarity searches scan the pinned snapshot
+and its keyword and hybrid searches compute BM25 over it instead — correct (the
+matches and scores are the snapshot's own, so a node deleted or edited after
+the point is still found as it was), but unindexed. Time-travel requires the
+native backend.
 
 The queryable window is reported by `plane.history` as an oldest/latest pair of
 commit sequences. History is retained without bound by default; a retention

@@ -2,7 +2,8 @@
 
 **Status**: shipped — the seam, the per-query `CachedReader`, and the
 persistent cross-query `GraphCache` with commit-sequence stamping · last
-revised 2026-08-11
+revised 2026-09-14 (plane-scoped keys, per-entry cap, restore/replication
+invalidation, history writes leave the stamp alone)
 
 **M2 landed the seam, not the cache.** The `GraphReader` trait (§2) and the
 pass-through `UncachedReader` are built; the executor reads only through them.
@@ -39,9 +40,13 @@ Traversal is the motivating workload: a 2-hop expansion touches the same hub
 nodes' adjacency segments and records over and over; decoding a `PropDesc`
 map per visit is pure waste.
 
-Planes need no special handling here: node/edge IDs are globally unique
-across planes, so ID-keyed entries can't collide, and a record's plane is
-part of its cached payload. `drop_plane` invalidates through the same
+Planes are part of the key: every entry is keyed `(plane, id)` (adjacency:
+`(plane, node_id, dir, edge_type?)`). Node/edge IDs are globally unique
+across planes, so entries never *collide* — but a read is scoped to a plane,
+and `get_node(plane B, id owned by A)` is `None`. Keying by plane makes the
+cache say the same: a hit under plane A can never shadow plane B's miss,
+which is what a hit-time `record.plane` check could not guarantee once
+negative caching (§7.4) arrives. `drop_plane` invalidates through the same
 commit-sequence mechanism as any other write (§3).
 
 ## 2. Interface
@@ -86,6 +91,29 @@ see. Design: **version-stamped entries** over the backend's commit sequence.
   the cache retaining anything.
 - Crash safety: the cache is memory-only and rebuilt cold on open. It holds
   no durable state, so it can never corrupt the database.
+- **Which writes move the stamp.** The stamp is the graph commit sequence,
+  bumped by every write a graph read can observe: records, adjacency,
+  planes, index and schema declarations. Bookkeeping that no graph read
+  returns — the query history (`Database::record_query`) — commits
+  *unstamped*: it neither bumps the sequence nor writes the commit time, so
+  recording that a query ran does not flush the cache the next query wants.
+  (It still respects `read_only`; unstamped is not unchecked.)
+- **Foreign sequences.** Two paths land a sequence instead of bumping one:
+  snapshot `restore` (the source's seq, so shipped sidecars stay valid) and
+  `apply_replicated` (the master's seq, so a replica converges
+  byte-for-byte). Either can put new data under a sequence this database
+  already stamped entries with — an empty target that made one declaration
+  is at the same seq as the source's first write — so exact-seq matching
+  alone cannot tell old from new. Both paths `invalidate_all()` after they
+  commit. A replica's cache is therefore warm between batches, never across
+  one; that is the price of a stamp that lives in replicated KV. Clearing
+  alone leaves one window: a reader that opened its snapshot *before* the
+  foreign commit and misses *after* the clear would insert old data under
+  the reused seq. So the cache also carries a **generation**, bumped by
+  `invalidate_all` before it clears; a reader captures it before opening its
+  snapshot and every insert must still match it. A refused insert is a
+  miss; the alternative was a stale entry served to every later reader at
+  that seq.
 
 ## 4. Eviction and sizing
 
@@ -97,9 +125,14 @@ see. Design: **version-stamped entries** over the backend's commit sequence.
   modest, e.g. 64 MiB — embedded-library ethos; hosts can raise it). Adjacency
   segments and node records share the budget; entries are weighted by
   approximate heap size.
-- Oversized entries (a hub node with a 10M-edge adjacency segment) bypass the
-  cache above a per-entry cap rather than evicting everything else; the
-  executor streams them from storage.
+- Oversized entries (a hub node with a 10M-edge adjacency segment, a record
+  carrying a multi-megabyte blob) bypass the cache above a **per-entry cap**
+  rather than evicting everything else; the executor streams them from
+  storage. Shipped: the cap is 4 MiB or 1/16 of the budget, whichever is
+  smaller, applied to the same weigher estimate the budget uses. `put_*` of
+  a heavier entry is a no-op, so the next reader decodes it again — decode-
+  once-per-query is the cheaper failure mode for something that would have
+  been most of the cache.
 
 ## 5. Observability
 
@@ -114,6 +147,13 @@ the trait boundary keeps it removable.
   and `UncachedReader`; results must be identical.
 - Snapshot-isolation tests: interleave writer commits with readers pinned to
   old snapshots; assert no future-version leaks (the `[from, until)` check).
+- Plane isolation, differentially: a plane's answer on a cold cache is the
+  oracle; the same query after another plane warmed the L2 with the same ids
+  must agree (`tests/cache.rs`).
+- Foreign-sequence paths: restore, and a replicated restore, over a cache
+  warmed at the very seq they land (`api/snapshot.rs` tests); and a reader
+  that straddles the clear, whose inserts the generation refuses
+  (`cache/store.rs`, `cache/mod.rs` tests).
 - Eviction-under-pressure fuzz: tiny budget + random workload, assert
   correctness (falls through) and bounded memory.
 
