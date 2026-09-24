@@ -4101,6 +4101,9 @@ mod tests {
 
     /// The address guard and no proxy — what these tests exercise, and what an
     /// operator who has configured nothing gets.
+    ///
+    /// Only the plugin tests take a route, and those are `digest`-gated.
+    #[cfg(feature = "digest")]
     fn guarded() -> dr_strange_web::fetch::Route<'static> {
         dr_strange_web::fetch::Route::guarded(&[])
     }

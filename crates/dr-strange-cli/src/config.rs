@@ -341,8 +341,8 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
 /// One reading shared by every command that reaches the network, so `plugin
 /// install`, `update` and the LLM provider cannot disagree about where the
 /// traffic goes.
-pub fn network(cfg: &Config) -> Result<dr_strange_llm::net::Network> {
-    dr_strange_llm::net::Network::resolve(&network_config(cfg))
+pub fn network(cfg: &Config) -> Result<dr_strange_web::fetch::Network> {
+    dr_strange_web::fetch::Network::resolve(&network_config(cfg))
 }
 
 /// Just the file's half of it, with no environment read.
@@ -350,8 +350,8 @@ pub fn network(cfg: &Config) -> Result<dr_strange_llm::net::Network> {
 /// Separate so it can be tested: `network` resolves against the real
 /// environment, and a machine that has `https_proxy` set — the very machine
 /// this issue was reported from — would see it win over any fixture.
-fn network_config(cfg: &Config) -> dr_strange_llm::net::NetworkConfig {
-    dr_strange_llm::net::NetworkConfig {
+fn network_config(cfg: &Config) -> dr_strange_web::fetch::NetworkConfig {
+    dr_strange_web::fetch::NetworkConfig {
         proxy: cfg.network.proxy.clone(),
         no_proxy: cfg.network.no_proxy.clone(),
     }
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn a_bad_proxy_in_the_file_is_refused() {
         let nc = network_config(&parse("[network]\nproxy = \"ftp://nope\"\n"));
-        let err = dr_strange_llm::net::Network::resolve(&nc).unwrap_err();
+        let err = dr_strange_web::fetch::Network::resolve(&nc).unwrap_err();
         let err = format!("{err:#}");
         assert!(err.contains("[network]"), "{err}");
     }
