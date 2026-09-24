@@ -41,6 +41,9 @@ pub struct Config {
     /// URL-fetch policy for the web AIgest (ROADMAP §9).
     #[serde(default)]
     pub fetch: FetchCfg,
+    /// Proxy policy for the requests this binary makes (issue #37).
+    #[serde(default)]
+    pub network: NetworkCfg,
     /// Preprocessor plugins (ROADMAP §11): sandbox budgets, and each plugin's
     /// own settings.
     ///
@@ -73,6 +76,28 @@ pub struct DigestCfg {
     /// the process environment at call time — never from config, never from a
     /// request.
     pub embed_key_env: Option<String>,
+}
+
+/// The `[network]` section — where this binary's own requests go.
+///
+/// A daemon started from systemd has no shell environment to read `https_proxy`
+/// out of, which is why the file can say it at all. The environment still wins
+/// when it is set, so one command can be run through a different proxy — or,
+/// with an empty value, through none — without editing the file.
+///
+/// It governs the requests the operator asks for: `plugin install`, `update`,
+/// and the LLM provider. A URL a *caller* named is fetched under the address
+/// guard instead, which a proxy would make unenforceable.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkCfg {
+    /// e.g. `http://127.0.0.1:7897` or `socks5://127.0.0.1:7897`. Overridden
+    /// by `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY`.
+    pub proxy: Option<String>,
+    /// Hosts that bypass the proxy, `NO_PROXY`-style: `localhost, ::1,
+    /// .internal`. Overridden by `NO_PROXY`. A local LLM endpoint belongs
+    /// here.
+    pub no_proxy: Option<String>,
 }
 
 /// The `[fetch]` section — URL ingestion policy.
@@ -299,6 +324,28 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
     }
 }
 
+/// The outbound proxy policy: `[network]` from the file, with the environment
+/// winning wherever it is set.
+///
+/// One reading shared by every command that reaches the network, so `plugin
+/// install`, `update` and the LLM provider cannot disagree about where the
+/// traffic goes.
+pub fn network(cfg: &Config) -> Result<dr_strange_llm::net::Network> {
+    dr_strange_llm::net::Network::resolve(&network_config(cfg))
+}
+
+/// Just the file's half of it, with no environment read.
+///
+/// Separate so it can be tested: `network` resolves against the real
+/// environment, and a machine that has `https_proxy` set — the very machine
+/// this issue was reported from — would see it win over any fixture.
+fn network_config(cfg: &Config) -> dr_strange_llm::net::NetworkConfig {
+    dr_strange_llm::net::NetworkConfig {
+        proxy: cfg.network.proxy.clone(),
+        no_proxy: cfg.network.no_proxy.clone(),
+    }
+}
+
 /// The web crate's bind rule, applied to the resolved `[server] addr` /
 /// `--addr` before the database is opened: a non-loopback bind without a
 /// token is refused with the same message `serve` itself would give. Here so
@@ -512,6 +559,41 @@ mod tests {
     #[test]
     fn no_tls_section_means_plain_http() {
         assert!(serve_options(&parse("[server]\n"), None).tls.is_none());
+    }
+
+    /// The environment is what `network` layers on top; here only the file's
+    /// half is asserted, so the test says the same thing on a machine that has
+    /// `https_proxy` set as on one that does not.
+    #[test]
+    fn the_network_section_is_read_into_the_policy() {
+        let cfg =
+            parse("[network]\nproxy = \"http://127.0.0.1:7897\"\nno_proxy = \"localhost, ::1\"\n");
+        let nc = network_config(&cfg);
+        assert_eq!(nc.proxy.as_deref(), Some("http://127.0.0.1:7897"));
+        assert_eq!(nc.no_proxy.as_deref(), Some("localhost, ::1"));
+    }
+
+    #[test]
+    fn no_network_section_says_nothing() {
+        let nc = network_config(&parse("[server]\n"));
+        assert_eq!(nc.proxy, None);
+        assert_eq!(nc.no_proxy, None);
+    }
+
+    #[test]
+    fn a_bad_proxy_in_the_file_is_refused() {
+        let nc = network_config(&parse("[network]\nproxy = \"ftp://nope\"\n"));
+        let err = dr_strange_llm::net::Network::resolve(&nc).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("[network]"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_network_key_is_refused() {
+        assert!(
+            toml::from_str::<Config>("[network]\nproxxy = \"x\"\n").is_err(),
+            "deny_unknown_fields catches a typo in the section"
+        );
     }
 
     /// A non-loopback `[server] addr` (or `--addr`) without a token is refused

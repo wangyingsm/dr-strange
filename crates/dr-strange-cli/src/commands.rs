@@ -2751,14 +2751,10 @@ const PLUGIN_DOWNLOAD_CAP: usize = 256 << 20;
 #[cfg(feature = "digest")]
 fn official_catalog(
     store: &dr_strange_llm::PluginStore,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
 ) -> Result<dr_strange_llm::Fetched> {
     dr_strange_llm::load_catalog(store, |url| {
-        dr_strange_web::fetch::fetch_bytes(
-            url,
-            dr_strange_llm::CATALOG_DOWNLOAD_CAP,
-            dr_strange_web::fetch::Route::guarded(allow_private),
-        )
+        dr_strange_web::fetch::fetch_bytes(url, dr_strange_llm::CATALOG_DOWNLOAD_CAP, route)
     })
 }
 
@@ -2873,7 +2869,7 @@ impl PluginSource {
 #[cfg(feature = "digest")]
 fn choose_plugins(
     store: &dr_strange_llm::PluginStore,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     out: &mut dyn Write,
 ) -> Result<Vec<PluginSource>> {
     use std::io::IsTerminal;
@@ -2884,7 +2880,7 @@ fn choose_plugins(
         );
     }
     let installed = installed_hashes(store)?;
-    let fetched = official_catalog(store, allow_private)?;
+    let fetched = official_catalog(store, route)?;
     let picks = fetched.catalog.current();
 
     writeln!(out, "official plugins:")?;
@@ -2948,14 +2944,14 @@ fn choose_plugins(
 #[cfg(feature = "digest")]
 fn resolve_source(
     store: &dr_strange_llm::PluginStore,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     arg: &str,
     out: &mut dyn Write,
 ) -> Result<PluginSource> {
     if arg.starts_with("http://") || arg.starts_with("https://") || Path::new(arg).exists() {
         return Ok(PluginSource::Given(arg.to_string()));
     }
-    let fetched = official_catalog(store, allow_private)?;
+    let fetched = official_catalog(store, route)?;
     if let Some(note) = fetched.source.note() {
         writeln!(out, "{note}")?;
     }
@@ -3025,17 +3021,17 @@ fn plugin_store(cfg: &dr_strange_llm::PluginConfig) -> Result<dr_strange_llm::Pl
 #[cfg(feature = "digest")]
 pub fn plugin_install(
     cfg: &dr_strange_llm::PluginConfig,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     source: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
     let store = plugin_store(cfg)?;
     let sources = match source {
-        Some(s) => vec![resolve_source(&store, allow_private, s, out)?],
-        None => choose_plugins(&store, allow_private, out)?,
+        Some(s) => vec![resolve_source(&store, route, s, out)?],
+        None => choose_plugins(&store, route, out)?,
     };
     for source in &sources {
-        install_one(cfg, allow_private, source, out)?;
+        install_one(cfg, route, source, out)?;
     }
     Ok(())
 }
@@ -3112,7 +3108,7 @@ fn resolve_extension_conflicts(
 #[cfg(feature = "digest")]
 fn install_one(
     cfg: &dr_strange_llm::PluginConfig,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     source: &PluginSource,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -3120,11 +3116,7 @@ fn install_one(
     let is_url = location.starts_with("http://") || location.starts_with("https://");
     let bytes = if is_url {
         writeln!(out, "downloading {location}")?;
-        dr_strange_web::fetch::fetch_bytes(
-            location,
-            PLUGIN_DOWNLOAD_CAP,
-            dr_strange_web::fetch::Route::guarded(allow_private),
-        )?
+        dr_strange_web::fetch::fetch_bytes(location, PLUGIN_DOWNLOAD_CAP, route)?
     } else {
         std::fs::read(location).with_context(|| format!("reading {location}"))?
     };
@@ -3203,12 +3195,12 @@ fn install_one(
 #[cfg(feature = "digest")]
 fn plugin_list_available(
     cfg: &dr_strange_llm::PluginConfig,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
     let store = plugin_store(cfg)?;
-    let fetched = official_catalog(&store, allow_private)?;
+    let fetched = official_catalog(&store, route)?;
     let picks = fetched.catalog.current();
     if json {
         // Shaped like `plugin.catalog` over RPC, staleness included: a script
@@ -3235,13 +3227,13 @@ fn plugin_list_available(
 #[cfg(feature = "digest")]
 pub fn plugin_list(
     cfg: &dr_strange_llm::PluginConfig,
-    allow_private: &[dr_strange_web::fetch::Prefix],
+    route: dr_strange_web::fetch::Route<'_>,
     available: bool,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
     if available {
-        return plugin_list_available(cfg, allow_private, json, out);
+        return plugin_list_available(cfg, route, json, out);
     }
     let store = plugin_store(cfg)?;
     let plugins = store.list()?;
@@ -4102,6 +4094,12 @@ pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()>
 mod tests {
     use super::*;
 
+    /// The address guard and no proxy — what these tests exercise, and what an
+    /// operator who has configured nothing gets.
+    fn guarded() -> dr_strange_web::fetch::Route<'static> {
+        dr_strange_web::fetch::Route::guarded(&[])
+    }
+
     /// Runs a handler and returns its captured stdout as a String.
     fn cap(f: impl FnOnce(&mut dyn Write) -> Result<()>) -> String {
         let mut buf = Vec::new();
@@ -4504,11 +4502,11 @@ mod tests {
         let (dir, cfg) = scratch_store("empty");
         // JSON stays machine-readable even when there is nothing to say —
         // an agent parsing it must never meet prose.
-        let json = cap(|o| plugin_list(&cfg, &[], false, true, o));
+        let json = cap(|o| plugin_list(&cfg, guarded(), false, true, o));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, serde_json::json!([]));
         // The human shape says what to do next instead.
-        let table = cap(|o| plugin_list(&cfg, &[], false, false, o));
+        let table = cap(|o| plugin_list(&cfg, guarded(), false, false, o));
         assert!(table.contains("no plugins installed"), "{table}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4520,11 +4518,11 @@ mod tests {
         let wasm = dir.join("fixture.wasm");
         std::fs::write(&wasm, FIXTURE_WASM).unwrap();
 
-        let out = cap(|o| plugin_install(&cfg, &[], Some(wasm.to_str().unwrap()), o));
+        let out = cap(|o| plugin_install(&cfg, guarded(), Some(wasm.to_str().unwrap()), o));
         assert!(out.contains("installed fixture@0"), "{out}");
         assert!(out.contains("handles: .fix"), "{out}");
 
-        let table = cap(|o| plugin_list(&cfg, &[], false, false, o));
+        let table = cap(|o| plugin_list(&cfg, guarded(), false, false, o));
         assert!(
             table.contains("NAME") && table.contains("EXTENSIONS"),
             "{table}"
@@ -4536,7 +4534,7 @@ mod tests {
 
         // `--json` is the agent surface: the same records `plugin.list`
         // serves over RPC, parseable without scraping the table.
-        let json = cap(|o| plugin_list(&cfg, &[], false, true, o));
+        let json = cap(|o| plugin_list(&cfg, guarded(), false, true, o));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed[0]["name"], "fixture");
         assert_eq!(parsed[0]["extensions"][0], "fix");

@@ -1498,8 +1498,12 @@ fn run_model_backed(
                 .iter()
                 .map(|s| dr_strange_web::fetch::Prefix::parse(s))
                 .collect::<Result<_>>()?;
+            let net = config::network(cfg)?;
             update::update(
-                &allow,
+                dr_strange_web::fetch::Route {
+                    net: &net,
+                    allow: &allow,
+                },
                 bin.as_deref(),
                 dir.as_deref(),
                 insecure_skip_checksum || update::skip_checksum_from_env(),
@@ -1532,12 +1536,17 @@ fn run_plugins_and_ingest(
                 .iter()
                 .map(|s| dr_strange_web::fetch::Prefix::parse(s))
                 .collect::<Result<_>>()?;
+            let net = config::network(cfg)?;
+            let route = dr_strange_web::fetch::Route {
+                net: &net,
+                allow: &allow,
+            };
             match cmd {
                 PluginCmd::Install { source } => {
-                    commands::plugin_install(&plugin_config, &allow, source.as_deref(), out)
+                    commands::plugin_install(&plugin_config, route, source.as_deref(), out)
                 }
                 PluginCmd::List { available, json } => {
-                    commands::plugin_list(&plugin_config, &allow, available, json, out)
+                    commands::plugin_list(&plugin_config, route, available, json, out)
                 }
                 PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
             }

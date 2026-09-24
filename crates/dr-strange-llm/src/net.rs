@@ -189,6 +189,20 @@ impl Network {
         Self::default()
     }
 
+    /// A policy the caller has already decided, with no environment read.
+    ///
+    /// `resolve` lets the environment win, which is right for a command an
+    /// operator runs and wrong for a caller that means exactly this proxy —
+    /// a test with a stub, above all, since the machine running it may well
+    /// have `ALL_PROXY` set.
+    pub fn through(proxy: ProxyUrl, no_proxy: NoProxy) -> Self {
+        Self {
+            https: Some(proxy.clone()),
+            http: Some(proxy),
+            no_proxy,
+        }
+    }
+
     /// Resolve the policy, with the environment winning over `cfg`.
     ///
     /// `ALL_PROXY` covers both schemes; `HTTPS_PROXY` and `HTTP_PROXY` cover
