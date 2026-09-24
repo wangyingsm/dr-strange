@@ -1455,3 +1455,122 @@ fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
         .to_string();
     assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
 }
+
+/// The report reconstructs the reported repository (issue #36): a
+/// `.dockerignore` excluding `src/` leaves almost nothing, and the report says
+/// which file and which pattern did it.
+#[test]
+fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
+    let t = Tree::new("report-blame");
+    t.write("README.md", "# hi")
+        .write("src/a.rs", "fn a() {}")
+        .write("src/b.rs", "fn b() {}")
+        .write("src/deep/c.rs", "fn c() {}")
+        .write(".dockerignore", "src/\n");
+
+    // With `.dockerignore` honoured, the source is gone.
+    let on = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let r = on.report().unwrap();
+    // `.dockerignore` is itself a dotfile, so it is below the hidden floor and
+    // is not its own denominator: README plus the three sources.
+    assert_eq!(r.total, 4, "floor is README and the 3 sources");
+    assert_eq!(
+        r.admitted.len(),
+        1,
+        "only README survives: {:?}",
+        r.admitted
+    );
+    assert_eq!(r.declared().count(), 3, "the three sources were withheld");
+
+    // Every one of them is blamed on the file and the pattern as written.
+    for s in r.declared() {
+        match &s.reason {
+            SkipReason::Rule { file, pattern } => {
+                assert_eq!(file, std::path::Path::new(".dockerignore"));
+                assert_eq!(pattern, "src/");
+            }
+            other => panic!("expected a rule, got {other}"),
+        }
+    }
+    assert_eq!(
+        r.culprits(),
+        vec![(std::path::PathBuf::from(".dockerignore"), 3)],
+        "the warning has one file to name"
+    );
+    assert!(
+        (r.declared_share() - 0.75).abs() < 1e-9,
+        "{}",
+        r.declared_share()
+    );
+
+    // With it off — the new default — nothing is withheld at all.
+    let off = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: false,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let r = off.report().unwrap();
+    assert_eq!(r.total, 4);
+    assert_eq!(r.admitted.len(), 4, "{:?}", r.admitted);
+    assert_eq!(r.declared().count(), 0);
+    assert_eq!(r.declared_share(), 0.0);
+}
+
+/// Two ignore files, and each withheld file is blamed on the right one.
+#[test]
+fn the_nearest_ignore_file_is_the_one_blamed() {
+    let t = Tree::new("report-two");
+    t.write("keep.rs", "fn k() {}")
+        .write("gen/out.rs", "fn g() {}")
+        .write("web/tmp.rs", "fn t() {}")
+        .write(".gitignore", "gen/\n")
+        .write("web/.gitignore", "tmp.rs\n");
+
+    let r = t.host().report().unwrap();
+    let mut blamed: Vec<(String, String)> = r
+        .declared()
+        .map(|s| match &s.reason {
+            SkipReason::Rule { file, pattern } => (file.display().to_string(), pattern.clone()),
+            other => panic!("expected a rule, got {other}"),
+        })
+        .collect();
+    blamed.sort();
+    blamed.dedup();
+    assert_eq!(
+        blamed,
+        vec![
+            (".gitignore".to_string(), "gen/".to_string()),
+            ("web/.gitignore".to_string(), "tmp.rs".to_string()),
+        ]
+    );
+    // Both files are named, each with its own count.
+    assert_eq!(r.culprits().len(), 2);
+}
+
+/// drsg's own floor is not the project's doing, so it is below the denominator
+/// and never warned about — otherwise every repository with a `node_modules/`
+/// would look catastrophically over-excluded.
+#[test]
+fn the_builtin_floor_is_not_counted_against_the_project() {
+    let t = Tree::new("report-floor");
+    t.write("src/a.rs", "fn a() {}")
+        .write("node_modules/dep/index.js", "x")
+        .write("target/debug/thing", "x")
+        .write(".hidden/secret.rs", "fn s() {}");
+
+    let r = t.host().report().unwrap();
+    assert_eq!(r.total, 1, "only src/a.rs is above the floor");
+    assert_eq!(r.admitted.len(), 1);
+    assert_eq!(r.declared().count(), 0, "nothing the project asked for");
+    assert_eq!(r.declared_share(), 0.0, "and so no warning");
+}

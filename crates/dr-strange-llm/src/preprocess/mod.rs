@@ -60,7 +60,10 @@ use anyhow::{Context, Result, bail};
 use dr_strange_core::{PropDesc, PropValue};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+
+pub mod report;
 use rayon::prelude::*;
+pub use report::{SkipReason, Skipped, WalkReport};
 
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
@@ -418,6 +421,60 @@ impl LocalFiles {
             }
         }
         Ok(out)
+    }
+
+    /// The walk, plus an account of what the project's own ignore files
+    /// withheld and which rule did it (issue #36).
+    ///
+    /// Two walks and a matcher per ignore file, so it is asked for rather than
+    /// always paid: `-v` and the over-exclusion warning want it, an ordinary
+    /// digest does not.
+    pub fn report(&self) -> Result<WalkReport> {
+        let admitted = self.walk()?;
+
+        // drsg's own floor — hidden files and IGNORED_DIRS — with the
+        // project's declarations switched off. This is the denominator: a
+        // `node_modules/` of 80,000 files in it would drown every percentage.
+        let floor = LocalFiles::with_policy(
+            &self.root,
+            IgnorePolicy {
+                gitignore: false,
+                dockerignore: false,
+                hidden: self.policy.hidden,
+                builtin_dirs: self.policy.builtin_dirs,
+                extra: Vec::new(),
+            },
+        )?
+        .walk()?;
+
+        let kept: AHashSet<&PathBuf> = admitted.iter().collect();
+        let withheld: Vec<&PathBuf> = floor.iter().filter(|p| !kept.contains(*p)).collect();
+
+        let skipped = if withheld.is_empty() {
+            Vec::new()
+        } else {
+            let names =
+                report::candidate_ignore_files(self.policy.gitignore, self.policy.dockerignore);
+            let blame = report::Attribution::build(&self.root, &names);
+            withheld
+                .into_iter()
+                .map(|p| Skipped {
+                    path: p.clone(),
+                    reason: blame.blame(p, false).unwrap_or(SkipReason::Rule {
+                        // An `extra` pattern from configuration is not in any
+                        // file, and is the only other thing that withholds.
+                        file: PathBuf::from("(configured ignore pattern)"),
+                        pattern: String::new(),
+                    }),
+                })
+                .collect()
+        };
+
+        Ok(WalkReport {
+            total: floor.len(),
+            admitted,
+            skipped,
+        })
     }
 
     /// Remember what the walk admitted, for `read` to check against.
