@@ -76,6 +76,11 @@ pub struct DigestCfg {
     /// the process environment at call time — never from config, never from a
     /// request.
     pub embed_key_env: Option<String>,
+    /// Which of a project's ignore files decide what is source: any of
+    /// `"gitignore"` and `"dockerignore"`. Omitted, only `gitignore`; `[]`
+    /// honours neither and reads the tree as it sits (issue #36).
+    #[cfg_attr(not(feature = "digest"), allow(dead_code))]
+    pub ignore_files: Option<Vec<String>>,
 }
 
 /// The `[network]` section — where this binary's own requests go.
@@ -332,6 +337,30 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
         // 0 means "keep everything", the engine's own encoding of unbounded.
         Some(commits) => (commits > 0).then_some(commits),
         None => Some(dr_strange_web::DEFAULT_RETAIN_COMMITS),
+    }
+}
+
+/// Which ignore files decide what is source: `--ignore-files` if given, else
+/// `[digest] ignore_files`, else the default (`gitignore` alone).
+///
+/// One reading shared by `digest`, `init` and the watch folds, so a tree is
+/// read the same way however it is reached.
+#[cfg(feature = "digest")]
+pub fn ignore_policy(cfg: &Config, flag: Option<&str>) -> Result<dr_strange_llm::IgnorePolicy> {
+    // An empty flag value is how a shell says "none", and splitting "" would
+    // otherwise yield one empty name and be refused.
+    if let Some(list) = flag {
+        let names: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        return dr_strange_llm::IgnorePolicy::from_names(&names).context("the --ignore-files flag");
+    }
+    match &cfg.digest.ignore_files {
+        Some(names) => dr_strange_llm::IgnorePolicy::from_names(names)
+            .context("the `ignore_files` key in the [digest] config section"),
+        None => Ok(dr_strange_llm::IgnorePolicy::default()),
     }
 }
 
@@ -721,5 +750,40 @@ mod tests {
             retain_commits(&parse("[server]\nretain_commits = 0\n")),
             None
         );
+    }
+
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_ignore_files_flag_beats_the_file_which_beats_the_default() {
+        let file = parse("[digest]\nignore_files = [\"gitignore\", \"dockerignore\"]\n");
+
+        // The default: gitignore alone, `.dockerignore` not read.
+        let d = ignore_policy(&parse("[digest]\n"), None).unwrap();
+        assert_eq!(d.names(), vec!["gitignore"]);
+
+        // The file, when there is no flag.
+        let f = ignore_policy(&file, None).unwrap();
+        assert_eq!(f.names(), vec!["gitignore", "dockerignore"]);
+
+        // The flag, over the file.
+        let g = ignore_policy(&file, Some("gitignore")).unwrap();
+        assert_eq!(g.names(), vec!["gitignore"]);
+
+        // An empty flag is "none", not "unset" — the difference a shell needs.
+        let n = ignore_policy(&file, Some("")).unwrap();
+        assert!(n.names().is_empty());
+
+        // Whitespace around a name is forgiven; a typo is not.
+        assert_eq!(
+            ignore_policy(&file, Some(" dockerignore , gitignore "))
+                .unwrap()
+                .names(),
+            vec!["gitignore", "dockerignore"]
+        );
+        let err = format!("{:#}", ignore_policy(&file, Some("nope")).unwrap_err());
+        assert!(err.contains("--ignore-files"), "{err}");
+        let bad = parse("[digest]\nignore_files = [\"nope\"]\n");
+        let err = format!("{:#}", ignore_policy(&bad, None).unwrap_err());
+        assert!(err.contains("[digest]"), "{err}");
     }
 }

@@ -1619,3 +1619,37 @@ fn the_default_policy_reads_gitignore_and_not_dockerignore() {
         "opted in, it withholds again"
     );
 }
+
+/// The names an operator writes in `--ignore-files` or `[digest]
+/// ignore_files`, and what each one turns on.
+#[test]
+fn ignore_file_names_map_to_the_policy_and_a_typo_is_refused() {
+    let only_git = IgnorePolicy::from_names(&["gitignore"]).unwrap();
+    assert!(only_git.gitignore && !only_git.dockerignore);
+    assert_eq!(only_git.names(), vec!["gitignore"]);
+
+    let both = IgnorePolicy::from_names(&["gitignore", "dockerignore"]).unwrap();
+    assert!(both.gitignore && both.dockerignore);
+    assert_eq!(both.names(), vec!["gitignore", "dockerignore"]);
+
+    // An empty list is a real answer: honour none of them.
+    let none = IgnorePolicy::from_names::<&str>(&[]).unwrap();
+    assert!(!none.gitignore && !none.dockerignore);
+    assert!(none.names().is_empty());
+    // drsg's own floor is untouched by it — this is not `--no-ignore`.
+    assert!(none.hidden && none.builtin_dirs);
+
+    // A typo that silently read different files is the failure this setting
+    // exists to end, so it is an error rather than a skipped entry.
+    let err = IgnorePolicy::from_names(&["gitignore", "dockerignor"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("`dockerignor` is not an ignore-file name"),
+        "{err}"
+    );
+    assert!(
+        err.contains("dockerignore"),
+        "it names the valid ones: {err}"
+    );
+}

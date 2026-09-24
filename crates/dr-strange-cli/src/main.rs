@@ -56,6 +56,13 @@ enum Command {
         /// Repository to digest and watch.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+        /// Which of a project's ignore files decide what is source:
+        /// `gitignore`, `dockerignore`, or both, comma-separated. Empty
+        /// honours neither. **Omitted**: `[digest] ignore_files`, then
+        /// `gitignore` alone — `.dockerignore` answers a different question
+        /// and is not read unless asked for.
+        #[arg(long)]
+        ignore_files: Option<String>,
         /// Target plane. **Omitted**: the directory's own name, `startup`
         /// as the fallback.
         #[arg(long)]
@@ -553,6 +560,13 @@ enum Command {
         /// different questions and have different lifetimes.
         #[arg(long)]
         git_plane: Option<String>,
+        /// Which of a project's ignore files decide what is source:
+        /// `gitignore`, `dockerignore`, or both, comma-separated. Empty
+        /// honours neither. **Omitted**: `[digest] ignore_files`, then
+        /// `gitignore` alone — `.dockerignore` answers a different question
+        /// and is not read unless asked for.
+        #[arg(long)]
+        ignore_files: Option<String>,
     },
 }
 
@@ -567,6 +581,13 @@ enum ServeMode {
         /// Repository to watch.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+        /// Which of a project's ignore files decide what is source:
+        /// `gitignore`, `dockerignore`, or both, comma-separated. Empty
+        /// honours neither. **Omitted**: `[digest] ignore_files`, then
+        /// `gitignore` alone — `.dockerignore` answers a different question
+        /// and is not read unless asked for.
+        #[arg(long)]
+        ignore_files: Option<String>,
         /// Target plane. **Omitted**: the directory's own name, `startup`
         /// as the fallback.
         #[arg(long)]
@@ -901,6 +922,7 @@ fn run_bootstrap(
             addr,
             token,
             rebuild,
+            ignore_files,
         } => {
             // Both fall back to `drsg.toml`'s `[server]`, the same way
             // `serve` reads them — pinning an address and token there is what
@@ -912,12 +934,15 @@ fn run_bootstrap(
             // and a promise it cannot keep would be worse than silence.
             let plugin_config = config::plugin_config(cfg)?;
             commands::init_bootstrap(
-                db_path,
-                dir,
-                plane,
-                addr,
-                token,
-                rebuild,
+                commands::InitArgs {
+                    db_path,
+                    dir,
+                    plane,
+                    addr,
+                    token,
+                    rebuild,
+                    ignore_files,
+                },
                 &plugin_config,
                 out,
             )
@@ -1423,6 +1448,7 @@ fn run_services(
                     plane,
                     force,
                     no_git,
+                    ignore_files,
                 }) = mode
                 {
                     let plane = plane
@@ -1435,8 +1461,12 @@ fn run_services(
                     // MCP `grep` tool answers literal-text questions beside the
                     // graph's structural ones.
                     opts.source_root = Some(dir.clone());
+                    let tree = commands::WatchTree {
+                        dir: dir.clone(),
+                        policy: config::ignore_policy(cfg, ignore_files.as_deref())?,
+                    };
                     opts.on_start = Some(Box::new(move |db| {
-                        commands::watch(db, dir, plane, plugin_config, embed, force, !no_git)
+                        commands::watch(db, tree, plane, plugin_config, embed, force, !no_git)
                     }));
                 }
                 #[cfg(not(feature = "digest"))]
@@ -1589,6 +1619,7 @@ fn run_plugins_and_ingest(
             plugin_source,
             no_git,
             git_plane,
+            ignore_files,
         } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             // The `[plugins]` section, with the legacy flag folded in on top.
@@ -1601,11 +1632,13 @@ fn run_plugins_and_ingest(
                     .push(("include_source".to_string(), "true".to_string()));
             }
             let net = config::network(cfg)?;
+            let ignore = config::ignore_policy(cfg, ignore_files.as_deref())?;
             let args = commands::DigestArgs {
                 source: &source,
                 topic: topic.as_deref(),
                 pages,
                 depth,
+                ignore: &ignore,
                 net: &net,
                 plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,

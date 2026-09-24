@@ -332,6 +332,44 @@ impl Default for IgnorePolicy {
 }
 
 impl IgnorePolicy {
+    /// The ignore files an operator named, as `["gitignore", "dockerignore"]`.
+    ///
+    /// An empty list honours none of them — a repository is then read as it
+    /// sits, minus drsg's own floor. An unknown name is refused rather than
+    /// skipped: a typo that silently changed which files were read is the
+    /// whole failure this setting exists to end.
+    pub fn from_names<S: AsRef<str>>(names: &[S]) -> Result<Self> {
+        let mut policy = Self {
+            gitignore: false,
+            dockerignore: false,
+            ..Self::default()
+        };
+        for name in names {
+            match name.as_ref().trim() {
+                "gitignore" => policy.gitignore = true,
+                "dockerignore" => policy.dockerignore = true,
+                other => bail!(
+                    "`{other}` is not an ignore-file name — expected `gitignore` \
+                     (which covers .gitignore, .ignore, .git/info/exclude and the \
+                     global gitignore) or `dockerignore`"
+                ),
+            }
+        }
+        Ok(policy)
+    }
+
+    /// The names this policy honours, for reporting it back.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.gitignore {
+            out.push("gitignore");
+        }
+        if self.dockerignore {
+            out.push("dockerignore");
+        }
+        out
+    }
+
     /// Whether this policy withholds anything at all. One that does not —
     /// the history reader's, rooted at a `.git` directory — makes every
     /// regular file under the root readable, and the walk that would say so
