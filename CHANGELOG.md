@@ -4,6 +4,67 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-09-25
+
+Outbound requests honour an HTTP or SOCKS proxy, and the graph cache no longer
+answers across a boundary it cannot see.
+
+### Added
+
+- **A proxy carries the requests drsg makes on your behalf** (#37): `plugin
+  install`, `update`, `digest <url>`, the LLM provider and a replica's snapshot
+  fetch read `ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (each also lowercase),
+  or a new `[network]` section — `proxy` and a `NO_PROXY`-style `no_proxy` — for
+  a daemon with no shell environment to read them from. An environment variable
+  that is set wins over the file, so one command can be run through a different
+  proxy, or through none with an empty value. `socks5://` works as well as
+  `http://`. `NO_PROXY` is implemented here: ureq has none of its own.
+
+### Changed
+
+- **A proxied request is not an address-guarded one.** The two are alternatives,
+  not layers: ureq connects to the proxy and hands the destination over as a
+  name, so the guard's resolver is asked for the proxy's address — usually
+  loopback, which it refuses — and never sees the address it exists to judge. A
+  URL the operator named is therefore proxied; a URL a *caller* named
+  (`/digest/fetch`, `plugin.install` over RPC, which is only `Access::Write`
+  gated) stays direct and guarded. `serve` says which is in force at startup
+  when a proxy is configured.
+- **Loopback is never proxied**, whatever is configured — a local model server
+  (the `ollama` preset is `http://localhost:11434/v1`) is not what an operator
+  who set `https_proxy` for the outside world meant to redirect.
+- A transport failure through a proxy names the proxy, with the password
+  redacted, instead of reporting only "the request failed".
+
+### Fixed
+
+- **The graph cache could answer for the wrong plane.** It keyed decoded records
+  and adjacency by bare id; ids are global but a read is plane-scoped, so
+  `planeB.query().seek_ids([id_in_A])` found a node the uncached path does not.
+  The plane is now part of every key rather than checked on hit.
+- **Recording a query flushed the whole cache.** `record_query` went through
+  `with_write`, which bumps the commit sequence every L2 entry is stamped with,
+  so every query run through the web or MCP layers — which record it — emptied
+  the cache before the next query could use it.
+- **Restore and replication invalidate the cache they cannot stamp past.** Both
+  land a foreign commit sequence rather than bumping one, so new data can arrive
+  under a sequence this database has already stamped entries with; restore
+  served an empty adjacency for a node it had just loaded edges for. A
+  generation, bumped before the clear, also closes the window where a reader
+  that opened before the commit could repopulate it afterwards.
+- **`AS OF` keyword search is historical.** A time-travelling handle answered
+  keyword and hybrid-keyword searches from the live BM25 registry, which only
+  describes the latest commit, so it returned nodes created, deleted or
+  relabelled after the pinned point and scored them on their latest text.
+  `KeywordRegistry::search_snapshot` builds a throwaway index from the pinned
+  transaction, the shape the vector path already had.
+- **`drsg plugin install` refused a name its own resolver could not answer.**
+  The address precheck resolved locally before any packet moved, so on a network
+  where the name resolves to `::` — which is why a proxy is there — the fetch was
+  refused before it could be tried. A proxied request is not resolved locally.
+- The proxy policy resolves in a build without the `digest` feature, where the
+  LLM crate is not linked.
+
 ## [2.12.0] - 2026-09-23
 
 Three core groups from the audit branch, and the storage migration they made
