@@ -141,6 +141,39 @@ fn a_bypassed_host_does_not_reach_the_proxy() {
     );
 }
 
+/// A transport failure through a proxy names the proxy. Without that, "the
+/// request failed" sends the reader to debug the destination when the proxy is
+/// what is broken — the complaint issue #37 makes about the old messages.
+#[test]
+fn a_failure_through_a_proxy_says_so_without_leaking_the_password() {
+    // Port 9 (discard) refuses, so this is a proxy that cannot be reached.
+    let net = Network::through(
+        ProxyUrl::parse("http://alice:hunter2@127.0.0.1:9").unwrap(),
+        NoProxy::default(),
+    );
+    let route = Route {
+        net: &net,
+        allow: &[],
+    };
+
+    let err = fetch_bytes("https://example.invalid/x", 1 << 20, route).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("via the proxy"), "{err}");
+    assert!(err.contains("alice:***@127.0.0.1:9"), "{err}");
+    assert!(
+        !err.contains("hunter2"),
+        "the password must not appear: {err}"
+    );
+}
+
+/// A direct failure says nothing about a proxy, because there is not one.
+#[test]
+fn a_direct_failure_does_not_mention_a_proxy() {
+    let err = fetch_bytes("https://example.invalid/x", 1 << 20, Route::guarded(&[])).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(!err.contains("proxy"), "{err}");
+}
+
 /// With no proxy configured nothing changes: the address guard is in force and
 /// refuses what it always refused.
 #[test]

@@ -222,7 +222,7 @@ pub fn fetch_bytes(url: &str, max_bytes: usize, route: Route<'_>) -> Result<Vec<
     let response = agent
         .request_url("GET", &url)
         .call()
-        .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse(&e)))?;
+        .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse_via(&e, &url, route)))?;
 
     let mut bytes = Vec::new();
     // One byte past the cap distinguishes "exactly at the limit" from "over
@@ -270,7 +270,10 @@ pub fn redirect_target(url: &str, route: Route<'_>) -> Result<String> {
     let response = match agent.request_url("GET", &url).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => bail!("asking {url} where it redirects: {}", terse(&e)),
+        Err(e) => bail!(
+            "asking {url} where it redirects: {}",
+            terse_via(&e, &url, route)
+        ),
     };
 
     response
@@ -787,6 +790,22 @@ fn terse(e: &ureq::Error) -> String {
             .message()
             .map(str::to_string)
             .unwrap_or_else(|| "the request failed".into()),
+    }
+}
+
+/// `terse`, plus which hop the caller should go and look at.
+///
+/// A transport failure through a proxy is ambiguous — the proxy may be down,
+/// or it may be the one that could not reach the destination — and an error
+/// that does not even mention the proxy sends the reader to debug the wrong
+/// one (issue #37). The password never appears; [`ProxyUrl::shown`] redacts it.
+fn terse_via(e: &ureq::Error, url: &Url, route: Route<'_>) -> String {
+    let terse = terse(e);
+    match route.net.proxy_for(guard::destination(url)) {
+        Some(p) if matches!(e, ureq::Error::Transport(_)) => {
+            format!("{terse} (via the proxy {})", p.shown())
+        }
+        _ => terse,
     }
 }
 
