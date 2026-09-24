@@ -1574,3 +1574,48 @@ fn the_builtin_floor_is_not_counted_against_the_project() {
     assert_eq!(r.declared().count(), 0, "nothing the project asked for");
     assert_eq!(r.declared_share(), 0.0, "and so no warning");
 }
+
+/// The default policy reads `.gitignore` and not `.dockerignore` (issue #36).
+///
+/// Pinned on `IgnorePolicy::default()` itself rather than an explicit policy,
+/// because the default is what every digest uses and what changed — and nothing
+/// asserted the old behaviour, which is part of why it shipped unnoticed.
+#[test]
+fn the_default_policy_reads_gitignore_and_not_dockerignore() {
+    assert!(IgnorePolicy::default().gitignore);
+    assert!(!IgnorePolicy::default().dockerignore);
+
+    let t = Tree::new("default-policy");
+    t.write("src/kept.rs", "fn k() {}")
+        .write("gen/dropped.rs", "fn d() {}")
+        .write(".gitignore", "gen/\n")
+        .write(".dockerignore", "src/\n");
+
+    let listed = t.host().list("").unwrap();
+    assert!(
+        listed.iter().any(|f| f == "src/kept.rs"),
+        "`.dockerignore` must not withhold the source: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|f| f == "gen/dropped.rs"),
+        "`.gitignore` is still obeyed: {listed:?}"
+    );
+
+    // And the opt-in still works for anyone who wants it.
+    let opted_in = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !opted_in
+            .list("")
+            .unwrap()
+            .iter()
+            .any(|f| f == "src/kept.rs"),
+        "opted in, it withholds again"
+    );
+}

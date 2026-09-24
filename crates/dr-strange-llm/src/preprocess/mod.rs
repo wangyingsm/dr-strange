@@ -296,11 +296,20 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
 /// they are honoured by default. They are *not* obeyed unconditionally:
 /// generated code a build ignores is sometimes exactly what a reader wants in
 /// the graph, so every rule here can be turned off.
+///
+/// `.dockerignore` is the exception, and is off by default (issue #36). It
+/// answers a different question — what belongs in the build context sent to the
+/// Docker daemon — and the answers routinely differ: a front end built in CI
+/// and shipped as `dist/` is *right* to keep `src/` out of its image, and
+/// nothing about that says the source is derived. Worse, the `ignore` crate
+/// gives a custom ignore file precedence over every other, so a
+/// `.dockerignore` outranked the `.gitignore` beside it and no `.ignore` or
+/// `!src` could win it back.
 #[derive(Debug, Clone)]
 pub struct IgnorePolicy {
     /// Honour `.gitignore`, `.git/info/exclude` and the global gitignore.
     pub gitignore: bool,
-    /// Honour `.dockerignore`.
+    /// Honour `.dockerignore`. Off by default — see the type's own note.
     pub dockerignore: bool,
     /// Skip dotfiles and dot-directories.
     pub hidden: bool,
@@ -314,7 +323,7 @@ impl Default for IgnorePolicy {
     fn default() -> Self {
         Self {
             gitignore: true,
-            dockerignore: true,
+            dockerignore: false,
             hidden: true,
             builtin_dirs: true,
             extra: Vec::new(),
