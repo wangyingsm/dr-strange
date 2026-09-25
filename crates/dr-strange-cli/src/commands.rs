@@ -2034,6 +2034,11 @@ fn rebuild_from_tree(
     run_id: &str,
 ) -> Result<dr_strange_llm::SyncStats> {
     let host = tree.host()?;
+    // Through tracing rather than the `-v` report: this runs in the server,
+    // whose stdout `init` sends to /dev/null, and whose levels already decide
+    // what an operator sees. The walk is the whole tree here, so the account is
+    // worth its second pass (issue #36).
+    trace_walk(&host, tree.dir);
     dr_strange_llm::resync(db, plane_name, &host, plugins, source, run_id)
 }
 
@@ -5799,6 +5804,39 @@ impl Verbosity {
     #[cfg(feature = "digest")]
     fn every_file(self) -> bool {
         self.0 >= 3
+    }
+}
+
+/// What the walk read, for the server's log.
+///
+/// The daemon's counterpart to `report_files`: same numbers, same warning, but
+/// as events rather than lines on a stdout nobody is reading. A walk that fails
+/// here is not worth failing the rebuild for — the rebuild itself walks, and
+/// will report the real error.
+#[cfg(feature = "digest")]
+fn trace_walk(host: &dr_strange_llm::LocalFiles, dir: &Path) {
+    let report = match host.report() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = format!("{e:#}"), "could not account for the walk");
+            return;
+        }
+    };
+    let (read, total) = (report.admitted.len(), report.total);
+    tracing::info!(dir = %dir.display(), read, total, "walked the tree");
+    if report.skipped_share() >= OVER_EXCLUDED && !report.skipped.is_empty() {
+        let named = report
+            .culprits()
+            .iter()
+            .map(|(f, n)| format!("{} ({n})", f.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            withheld = report.skipped.len(),
+            total,
+            by = %named,
+            "most of the tree was withheld by ignore rules — `--ignore-files` chooses which apply"
+        );
     }
 }
 
