@@ -17,45 +17,31 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use super::IGNORED_DIRS;
 
-/// Why one file the tree holds is not in the graph.
+/// The rule that withheld a file: both halves named, because "something
+/// ignored it" is not an answer an operator can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkipReason {
-    /// A pattern in one of the project's own ignore files. Both are named,
-    /// because "something ignored it" is not an answer an operator can act on.
-    Rule {
-        /// The ignore file, relative to the walk root.
-        file: PathBuf,
-        /// The pattern in it, as written.
-        pattern: String,
-    },
-    /// Admitted by the policy, but no installed plugin claims the extension.
-    /// Not a problem — a README is not missing from the graph, it is not code.
-    NoPlugin,
+pub struct IgnoreRule {
+    /// The ignore file, relative to the walk root.
+    pub file: PathBuf,
+    /// The pattern in it, as written.
+    pub pattern: String,
 }
 
-impl SkipReason {
-    /// Whether this is the project's own doing, and so the kind of exclusion
-    /// worth warning about. A plugin gap is nobody's mistake.
-    pub fn is_declared(&self) -> bool {
-        matches!(self, Self::Rule { .. })
-    }
-}
-
-impl std::fmt::Display for SkipReason {
+impl std::fmt::Display for IgnoreRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rule { file, pattern } => write!(f, "`{pattern}` in {}", file.display()),
-            Self::NoPlugin => write!(f, "no plugin claims it"),
+        if self.pattern.is_empty() {
+            return write!(f, "{}", self.file.display());
         }
+        write!(f, "`{}` in {}", self.pattern, self.file.display())
     }
 }
 
-/// One withheld file and why.
+/// One withheld file and the rule that withheld it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     /// Root-relative.
     pub path: PathBuf,
-    pub reason: SkipReason,
+    pub rule: IgnoreRule,
 }
 
 /// What one walk of a tree came to.
@@ -70,33 +56,26 @@ pub struct WalkReport {
     pub total: usize,
     /// What the project's ignore files left, root-relative.
     pub admitted: Vec<PathBuf>,
-    /// What was withheld, and by what.
+    /// What the project's own rules withheld, and by what.
     pub skipped: Vec<Skipped>,
 }
 
 impl WalkReport {
-    /// Files withheld by the project's own ignore rules.
-    pub fn declared(&self) -> impl Iterator<Item = &Skipped> {
-        self.skipped.iter().filter(|s| s.reason.is_declared())
-    }
-
     /// The share of `total` the project's own rules withheld, 0.0 to 1.0.
     /// Zero when the tree is empty, so a caller need not special-case it.
-    pub fn declared_share(&self) -> f64 {
+    pub fn skipped_share(&self) -> f64 {
         if self.total == 0 {
             return 0.0;
         }
-        self.declared().count() as f64 / self.total as f64
+        self.skipped.len() as f64 / self.total as f64
     }
 
     /// The ignore files responsible, each with how many files it withheld,
     /// most first. What a warning names.
     pub fn culprits(&self) -> Vec<(PathBuf, usize)> {
         let mut by_file: BTreeMap<PathBuf, usize> = BTreeMap::new();
-        for s in self.declared() {
-            if let SkipReason::Rule { file, .. } = &s.reason {
-                *by_file.entry(file.clone()).or_default() += 1;
-            }
+        for s in &self.skipped {
+            *by_file.entry(s.rule.file.clone()).or_default() += 1;
         }
         let mut out: Vec<(PathBuf, usize)> = by_file.into_iter().collect();
         // Most withheld first; the path breaks ties so the order is stable.
@@ -188,7 +167,7 @@ impl Attribution {
     ///
     /// `is_dir` matters: a gitignore pattern ending in `/` matches only a
     /// directory, and the ancestor test is how `src/` withholds `src/a/b.ts`.
-    pub(crate) fn blame(&self, rel: &Path, is_dir: bool) -> Option<SkipReason> {
+    pub(crate) fn blame(&self, rel: &Path, is_dir: bool) -> Option<IgnoreRule> {
         for (dir, file, gi) in &self.matchers {
             // A file only answers for paths beneath it.
             if !rel.starts_with(dir) {
@@ -196,7 +175,7 @@ impl Attribution {
             }
             let m = gi.matched_path_or_any_parents(rel, is_dir);
             if let ignore::Match::Ignore(glob) = m {
-                return Some(SkipReason::Rule {
+                return Some(IgnoreRule {
                     file: file.clone(),
                     pattern: glob.original().to_string(),
                 });

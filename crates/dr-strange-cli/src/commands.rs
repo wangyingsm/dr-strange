@@ -149,6 +149,8 @@ const GITIGNORE_PATTERNS: &[&str] = &[
 #[cfg(feature = "digest")]
 pub struct InitArgs<'a> {
     pub db_path: &'a Path,
+    /// How much to say about which files the walk read.
+    pub verbose: Verbosity,
     pub dir: PathBuf,
     pub plane: Option<String>,
     pub addr: Option<std::net::SocketAddr>,
@@ -195,6 +197,7 @@ pub fn init_bootstrap(
 ) -> Result<()> {
     let InitArgs {
         db_path,
+        verbose,
         dir,
         plane,
         addr,
@@ -208,6 +211,21 @@ pub fn init_bootstrap(
         dir.join(db_path)
     };
     ensure_gitignore_patterns(&dir)?;
+
+    // The walk `serve watch` is about to do, accounted for here: the child's
+    // stdout goes to /dev/null, so this is the only place an operator can be
+    // told that most of their tree was withheld (issue #36).
+    let policy = dr_strange_llm::IgnorePolicy::from_names(
+        &ignore_files
+            .as_deref()
+            .unwrap_or("gitignore")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>(),
+    )?;
+    let walked = dr_strange_llm::LocalFiles::with_policy(&dir, policy)?.report()?;
+    report_files(&walked, None, None, verbose, out)?;
 
     // What a previous run left behind, and whether it is still answering.
     let recorded = recorded_endpoint(&dir);
@@ -2690,6 +2708,8 @@ pub struct DigestArgs<'a> {
     /// Path only: which of the project's ignore files decide what is source
     /// (issue #36).
     pub ignore: &'a dr_strange_llm::IgnorePolicy,
+    /// How much to say about which files were read.
+    pub verbose: Verbosity,
     /// URL only: where the crawl's requests go. The operator named this URL on
     /// their own command line, so it goes through their proxy — unlike a URL a
     /// caller hands the server, which is address-guarded instead.
@@ -3396,6 +3416,15 @@ fn read_source(
         if path.is_dir() {
             let host = dr_strange_llm::LocalFiles::with_policy(path, args.ignore.clone())
                 .with_context(|| format!("reading {}", path.display()))?;
+            // Before the work, not after: the account is most useful to
+            // someone about to wonder why so little was read.
+            report_files(
+                &host.report()?,
+                Some(plugins),
+                args.handler,
+                args.verbose,
+                out,
+            )?;
             let facts = dr_strange_llm::route_tree(&host, args.handler, plugins)?;
             return Ok((facts, name));
         }
@@ -4165,6 +4194,97 @@ pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report over a tree where one rule withheld most of it.
+    #[cfg(feature = "digest")]
+    fn withheld_report() -> dr_strange_llm::WalkReport {
+        let rule = dr_strange_llm::IgnoreRule {
+            file: std::path::PathBuf::from(".dockerignore"),
+            pattern: "src/".to_string(),
+        };
+        dr_strange_llm::WalkReport {
+            total: 4,
+            admitted: vec![std::path::PathBuf::from("README.md")],
+            skipped: (1..=3)
+                .map(|i| dr_strange_llm::Skipped {
+                    path: std::path::PathBuf::from(format!("src/f{i}.rs")),
+                    rule: rule.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(feature = "digest")]
+    fn rendered(v: u8) -> String {
+        cap(|o| report_files(&withheld_report(), None, None, Verbosity::new(v), o))
+    }
+
+    /// Each level says strictly more than the one below (issue #36).
+    #[cfg(feature = "digest")]
+    #[test]
+    fn verbosity_adds_counts_then_withheld_files_then_every_file() {
+        // Default: no accounting at all — only the warning, which this tree
+        // earns because three of its four files were withheld.
+        let quiet = rendered(0);
+        assert!(!quiet.contains("read 1 of 4"), "{quiet}");
+        assert!(quiet.contains("warning:"), "{quiet}");
+
+        // -v: the count and the percentage.
+        let one = rendered(1);
+        assert!(one.contains("read 1 of 4 files (25.0%)"), "{one}");
+        assert!(!one.contains("withheld src/"), "not yet: {one}");
+
+        // -vv: which files, and the rule that withheld each.
+        let two = rendered(2);
+        assert!(two.contains("read 1 of 4 files"), "{two}");
+        assert!(
+            two.contains("withheld src/f1.rs  `src/` in .dockerignore"),
+            "{two}"
+        );
+        assert!(!two.contains("read     README.md"), "not yet: {two}");
+
+        // -vvv: every file, admitted ones included.
+        let three = rendered(3);
+        assert!(three.contains("read     README.md"), "{three}");
+        assert!(three.contains("withheld src/f1.rs"), "{three}");
+    }
+
+    /// The warning is not gated on a flag: nine nodes where six thousand were
+    /// expected is exactly when nobody thought to pass one. It names the file
+    /// to go and edit, and the escape hatch.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_over_exclusion_warning_names_the_file_and_the_way_out() {
+        let w = rendered(0);
+        assert!(w.contains("3 of 4 files were withheld"), "{w}");
+        assert!(w.contains(".dockerignore (3)"), "{w}");
+        assert!(w.contains("--ignore-files"), "{w}");
+    }
+
+    /// A tree nothing withheld says nothing unasked, and a healthy one that
+    /// withholds a little is not nagged about it.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn a_tree_that_is_mostly_read_is_not_warned_about() {
+        let healthy = dr_strange_llm::WalkReport {
+            total: 10,
+            admitted: (1..=9)
+                .map(|i| std::path::PathBuf::from(format!("src/f{i}.rs")))
+                .collect(),
+            skipped: vec![dr_strange_llm::Skipped {
+                path: std::path::PathBuf::from("gen/g.rs"),
+                rule: dr_strange_llm::IgnoreRule {
+                    file: std::path::PathBuf::from(".gitignore"),
+                    pattern: "gen/".to_string(),
+                },
+            }],
+        };
+        let quiet = cap(|o| report_files(&healthy, None, None, Verbosity::new(0), o));
+        assert!(quiet.is_empty(), "silent by default: {quiet:?}");
+        let counted = cap(|o| report_files(&healthy, None, None, Verbosity::new(1), o));
+        assert!(counted.contains("read 9 of 10 files (90.0%)"), "{counted}");
+        assert!(!counted.contains("warning:"), "{counted}");
+    }
 
     /// The address guard and no proxy — what these tests exercise, and what an
     /// operator who has configured nothing gets.
@@ -5646,4 +5766,113 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// How much a command says about the files it read (issue #36).
+///
+/// A newtype rather than a bare `u8` so the levels are named once here instead
+/// of as `>= 2` at every call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Verbosity(u8);
+
+impl Verbosity {
+    /// From clap's repeat count.
+    pub fn new(count: u8) -> Self {
+        Self(count)
+    }
+
+    // The three levels are read only by `report_files`, which only a build
+    // that can digest has.
+    /// `-v`: how many files were read, of how many.
+    #[cfg(feature = "digest")]
+    fn counts(self) -> bool {
+        self.0 >= 1
+    }
+
+    /// `-vv`: which files an ignore rule withheld, and which rule.
+    #[cfg(feature = "digest")]
+    fn withheld(self) -> bool {
+        self.0 >= 2
+    }
+
+    /// `-vvv`: every file, and what read it.
+    #[cfg(feature = "digest")]
+    fn every_file(self) -> bool {
+        self.0 >= 3
+    }
+}
+
+/// The share of a tree that has to be withheld before it is said unasked.
+///
+/// Half. A repository that declares away most of itself is either doing
+/// something deliberate — a vendored monorepo subtree — or has the bug this
+/// threshold exists to catch, and both are worth one line.
+#[cfg(feature = "digest")]
+const OVER_EXCLUDED: f64 = 0.5;
+
+/// Say what the walk read, at the level asked for, and warn when a tree is
+/// mostly withheld whether or not anything was asked.
+///
+/// The warning is not gated on verbosity: nine nodes where six thousand were
+/// expected is exactly the case where nobody thought to pass a flag.
+#[cfg(feature = "digest")]
+fn report_files(
+    report: &dr_strange_llm::WalkReport,
+    plugins: Option<&dr_strange_llm::Plugins>,
+    handler: Option<&str>,
+    v: Verbosity,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let read = report.admitted.len();
+    let total = report.total;
+    let pct = |n: usize| {
+        if total == 0 {
+            100.0
+        } else {
+            n as f64 * 100.0 / total as f64
+        }
+    };
+
+    if v.counts() {
+        writeln!(out, "read {read} of {total} files ({:.1}%)", pct(read))?;
+    }
+
+    if v.every_file() {
+        for path in &report.admitted {
+            let name = path.display().to_string();
+            match plugins {
+                Some(p) => {
+                    let by = dr_strange_llm::owner_of(p, &name, handler)
+                        .unwrap_or_else(|| "document reader".to_string());
+                    writeln!(out, "  read     {name}  [{by}]")?;
+                }
+                // `init` has loaded no plugins yet, and loading them to name a
+                // handler would cost more than the name is worth.
+                None => writeln!(out, "  read     {name}")?,
+            }
+        }
+    }
+    if v.withheld() {
+        for s in &report.skipped {
+            writeln!(out, "  withheld {}  {}", s.path.display(), s.rule)?;
+        }
+    }
+
+    // Named files, not just a count: the one thing the operator needs is which
+    // file to go and edit.
+    if report.skipped_share() >= OVER_EXCLUDED && !report.skipped.is_empty() {
+        let culprits = report.culprits();
+        let named = culprits
+            .iter()
+            .map(|(f, n)| format!("{} ({n})", f.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            out,
+            "warning: {} of {total} files were withheld by ignore rules — {named}. \
+             If that is not what you meant, `--ignore-files` chooses which of them apply.",
+            report.skipped.len()
+        )?;
+    }
+    Ok(())
 }

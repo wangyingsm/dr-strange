@@ -1487,17 +1487,12 @@ fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
         "only README survives: {:?}",
         r.admitted
     );
-    assert_eq!(r.declared().count(), 3, "the three sources were withheld");
+    assert_eq!(r.skipped.len(), 3, "the three sources were withheld");
 
     // Every one of them is blamed on the file and the pattern as written.
-    for s in r.declared() {
-        match &s.reason {
-            SkipReason::Rule { file, pattern } => {
-                assert_eq!(file, std::path::Path::new(".dockerignore"));
-                assert_eq!(pattern, "src/");
-            }
-            other => panic!("expected a rule, got {other}"),
-        }
+    for s in &r.skipped {
+        assert_eq!(s.rule.file, std::path::Path::new(".dockerignore"));
+        assert_eq!(s.rule.pattern, "src/");
     }
     assert_eq!(
         r.culprits(),
@@ -1505,9 +1500,9 @@ fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
         "the warning has one file to name"
     );
     assert!(
-        (r.declared_share() - 0.75).abs() < 1e-9,
+        (r.skipped_share() - 0.75).abs() < 1e-9,
         "{}",
-        r.declared_share()
+        r.skipped_share()
     );
 
     // With it off — the new default — nothing is withheld at all.
@@ -1522,8 +1517,8 @@ fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
     let r = off.report().unwrap();
     assert_eq!(r.total, 4);
     assert_eq!(r.admitted.len(), 4, "{:?}", r.admitted);
-    assert_eq!(r.declared().count(), 0);
-    assert_eq!(r.declared_share(), 0.0);
+    assert_eq!(r.skipped.len(), 0);
+    assert_eq!(r.skipped_share(), 0.0);
 }
 
 /// Two ignore files, and each withheld file is blamed on the right one.
@@ -1538,11 +1533,9 @@ fn the_nearest_ignore_file_is_the_one_blamed() {
 
     let r = t.host().report().unwrap();
     let mut blamed: Vec<(String, String)> = r
-        .declared()
-        .map(|s| match &s.reason {
-            SkipReason::Rule { file, pattern } => (file.display().to_string(), pattern.clone()),
-            other => panic!("expected a rule, got {other}"),
-        })
+        .skipped
+        .iter()
+        .map(|s| (s.rule.file.display().to_string(), s.rule.pattern.clone()))
         .collect();
     blamed.sort();
     blamed.dedup();
@@ -1571,8 +1564,8 @@ fn the_builtin_floor_is_not_counted_against_the_project() {
     let r = t.host().report().unwrap();
     assert_eq!(r.total, 1, "only src/a.rs is above the floor");
     assert_eq!(r.admitted.len(), 1);
-    assert_eq!(r.declared().count(), 0, "nothing the project asked for");
-    assert_eq!(r.declared_share(), 0.0, "and so no warning");
+    assert_eq!(r.skipped.len(), 0, "nothing the project asked for");
+    assert_eq!(r.skipped_share(), 0.0, "and so no warning");
 }
 
 /// The default policy reads `.gitignore` and not `.dockerignore` (issue #36).

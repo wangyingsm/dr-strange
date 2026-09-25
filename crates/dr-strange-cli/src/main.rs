@@ -37,6 +37,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Say more about which files were read. `-v` counts them, `-vv` adds the
+    /// ones an ignore rule withheld and the rule, `-vvv` names every file and
+    /// what read it. Silent by default; a tree that is mostly withheld warns
+    /// at any level (issue #36).
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -904,7 +911,8 @@ fn as_text(v: &serde_json::Value) -> String {
 /// construction: the last group has no `other` arm to fall through.
 fn run(cli: Cli, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
     let db = cli.db.clone();
-    run_bootstrap(cli.command, &db, cfg, out)
+    let verbose = commands::Verbosity::new(cli.verbose);
+    run_bootstrap(cli.command, &db, cfg, verbose, out)
 }
 
 /// Bootstrapping a repository, plane lifecycle, and data in and out.
@@ -912,6 +920,7 @@ fn run_bootstrap(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -936,6 +945,7 @@ fn run_bootstrap(
             commands::init_bootstrap(
                 commands::InitArgs {
                     db_path,
+                    verbose,
                     dir,
                     plane,
                     addr,
@@ -975,7 +985,7 @@ fn run_bootstrap(
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             commands::get(&db, &plane, &node, out)
         }
-        other => run_query(other, db_path, cfg, out),
+        other => run_query(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -984,6 +994,7 @@ fn run_query(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1030,7 +1041,7 @@ fn run_query(
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             commands::queries(&db, id, limit, out)
         }
-        other => run_agent_verbs(other, db_path, cfg, out),
+        other => run_agent_verbs(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1040,6 +1051,7 @@ fn run_agent_verbs(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1093,7 +1105,7 @@ fn run_agent_verbs(
         // `snippet`, `grep` and `traverse` are the MCP surface's, called here
         // rather than reimplemented: two copies of a reader's verb would
         // answer differently the first time one of them was fixed.
-        other => run_tree_verbs(other, db_path, cfg, out),
+        other => run_tree_verbs(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1105,6 +1117,7 @@ fn run_tree_verbs(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1209,7 +1222,7 @@ fn run_tree_verbs(
             commands::history(&db, &plane, limit, out)
         }
         Command::Recall(args) => run_recall(args, db_path, cfg, out),
-        other => run_analytics(other, db_path, cfg, out),
+        other => run_analytics(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1218,6 +1231,7 @@ fn run_analytics(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1268,7 +1282,7 @@ fn run_analytics(
                 }
             }
         }
-        other => run_retrieval(other, db_path, cfg, out),
+        other => run_retrieval(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1277,6 +1291,7 @@ fn run_retrieval(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1338,7 +1353,7 @@ fn run_retrieval(
                 None => commands::keyword_index_ensure_all(&db, &plane, &first, language, out),
             }
         }
-        other => run_maintenance(other, db_path, cfg, out),
+        other => run_maintenance(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1347,6 +1362,7 @@ fn run_maintenance(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1370,7 +1386,7 @@ fn run_maintenance(
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             commands::restore(&db, &input, out)
         }
-        other => run_services(other, db_path, cfg, out),
+        other => run_services(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1380,6 +1396,7 @@ fn run_services(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1477,7 +1494,7 @@ fn run_services(
                 dr_strange_web::serve(db, Some(db_path.to_path_buf()), opts).map(|_| ())
             }
         }
-        other => run_model_backed(other, db_path, cfg, out),
+        other => run_model_backed(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1486,6 +1503,7 @@ fn run_model_backed(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1553,7 +1571,7 @@ fn run_model_backed(
                 out,
             )
         }
-        other => run_plugins_and_ingest(other, db_path, cfg, out),
+        other => run_plugins_and_ingest(other, db_path, cfg, verbose, out),
     }
 }
 
@@ -1565,6 +1583,7 @@ fn run_plugins_and_ingest(
     cmd: Command,
     db_path: &Path,
     cfg: &config::Config,
+    verbose: commands::Verbosity,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
@@ -1639,6 +1658,7 @@ fn run_plugins_and_ingest(
                 pages,
                 depth,
                 ignore: &ignore,
+                verbose,
                 net: &net,
                 plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,

@@ -63,7 +63,7 @@ use ignore::overrides::OverrideBuilder;
 
 pub mod report;
 use rayon::prelude::*;
-pub use report::{SkipReason, Skipped, WalkReport};
+pub use report::{IgnoreRule, Skipped, WalkReport};
 
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
@@ -507,9 +507,9 @@ impl LocalFiles {
                 .into_iter()
                 .map(|p| Skipped {
                     path: p.clone(),
-                    reason: blame.blame(p, false).unwrap_or(SkipReason::Rule {
-                        // An `extra` pattern from configuration is not in any
-                        // file, and is the only other thing that withholds.
+                    rule: blame.blame(p, false).unwrap_or(IgnoreRule {
+                        // An `extra` pattern from configuration is in no file,
+                        // and is the only other thing that withholds.
                         file: PathBuf::from("(configured ignore pattern)"),
                         pattern: String::new(),
                     }),
@@ -998,6 +998,21 @@ pub fn route_tree(
 /// files one commit touched, not the tree. Handlers may still pull *other*
 /// files through the host — that is where cross-file resolution comes from —
 /// but facts are only expected for the paths given.
+/// Which handler claims `path`, by the same rule [`route_paths`] buckets with.
+///
+/// Shared so a report of what was read cannot disagree with what read it:
+/// duplicating the manifest-then-extension precedence here is how the two
+/// would drift. `None` is the built-in document reader's pile.
+pub fn owner_of(plugins: &Plugins, path: &str, handler: Option<&str>) -> Option<String> {
+    let registry = &plugins.handlers;
+    let idx = match handler {
+        None => manifest_handler(registry, path)
+            .or_else(|| index_for(registry, &extension_of(path), handler)),
+        Some(_) => index_for(registry, &extension_of(path), handler),
+    };
+    idx.map(|i| registry[i].manifest().name.clone())
+}
+
 pub fn route_paths(
     host: &dyn Host,
     paths: Vec<String>,
