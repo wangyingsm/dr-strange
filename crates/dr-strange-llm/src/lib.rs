@@ -42,10 +42,10 @@ pub use preprocess::{
     refresh_cache,
 };
 pub use preprocess::{
-    CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, LEDGER_PROP, LocalFiles, Manifest,
-    PluginConfig, Plugins, Preprocessed, Preprocessor, SyncStats, fold, git_dir,
-    plugin_memory_bytes, record_ledger, resync, route_document, route_paths, route_repository,
-    route_tree, stamp_run, sync_paths,
+    CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, IgnoreRule, LEDGER_PROP, LocalFiles,
+    Manifest, PluginConfig, Plugins, Preprocessed, Preprocessor, Skipped, SyncStats, WalkReport,
+    fold, git_dir, owner_of, plugin_memory_bytes, record_ledger, resync, route_document,
+    route_paths, route_repository, route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
 pub use preprocess::{

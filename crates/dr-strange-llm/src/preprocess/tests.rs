@@ -1455,3 +1455,194 @@ fn the_environment_knobs_set_the_deadline_and_the_shared_budget() {
         .to_string();
     assert!(err.contains(ENV_PLUGIN_DEADLINE_SECS), "{err}");
 }
+
+/// The report reconstructs the reported repository (issue #36): a
+/// `.dockerignore` excluding `src/` leaves almost nothing, and the report says
+/// which file and which pattern did it.
+#[test]
+fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
+    let t = Tree::new("report-blame");
+    t.write("README.md", "# hi")
+        .write("src/a.rs", "fn a() {}")
+        .write("src/b.rs", "fn b() {}")
+        .write("src/deep/c.rs", "fn c() {}")
+        .write(".dockerignore", "src/\n");
+
+    // With `.dockerignore` honoured, the source is gone.
+    let on = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let r = on.report().unwrap();
+    // `.dockerignore` is itself a dotfile, so it is below the hidden floor and
+    // is not its own denominator: README plus the three sources.
+    assert_eq!(r.total, 4, "floor is README and the 3 sources");
+    assert_eq!(
+        r.admitted.len(),
+        1,
+        "only README survives: {:?}",
+        r.admitted
+    );
+    assert_eq!(r.skipped.len(), 3, "the three sources were withheld");
+
+    // Every one of them is blamed on the file and the pattern as written.
+    for s in &r.skipped {
+        assert_eq!(s.rule.file, std::path::Path::new(".dockerignore"));
+        assert_eq!(s.rule.pattern, "src/");
+    }
+    assert_eq!(
+        r.culprits(),
+        vec![(std::path::PathBuf::from(".dockerignore"), 3)],
+        "the warning has one file to name"
+    );
+    assert!(
+        (r.skipped_share() - 0.75).abs() < 1e-9,
+        "{}",
+        r.skipped_share()
+    );
+
+    // With it off — the new default — nothing is withheld at all.
+    let off = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: false,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let r = off.report().unwrap();
+    assert_eq!(r.total, 4);
+    assert_eq!(r.admitted.len(), 4, "{:?}", r.admitted);
+    assert_eq!(r.skipped.len(), 0);
+    assert_eq!(r.skipped_share(), 0.0);
+}
+
+/// Two ignore files, and each withheld file is blamed on the right one.
+#[test]
+fn the_nearest_ignore_file_is_the_one_blamed() {
+    let t = Tree::new("report-two");
+    t.write("keep.rs", "fn k() {}")
+        .write("gen/out.rs", "fn g() {}")
+        .write("web/tmp.rs", "fn t() {}")
+        .write(".gitignore", "gen/\n")
+        .write("web/.gitignore", "tmp.rs\n");
+
+    let r = t.host().report().unwrap();
+    let mut blamed: Vec<(String, String)> = r
+        .skipped
+        .iter()
+        .map(|s| (s.rule.file.display().to_string(), s.rule.pattern.clone()))
+        .collect();
+    blamed.sort();
+    blamed.dedup();
+    assert_eq!(
+        blamed,
+        vec![
+            (".gitignore".to_string(), "gen/".to_string()),
+            ("web/.gitignore".to_string(), "tmp.rs".to_string()),
+        ]
+    );
+    // Both files are named, each with its own count.
+    assert_eq!(r.culprits().len(), 2);
+}
+
+/// drsg's own floor is not the project's doing, so it is below the denominator
+/// and never warned about — otherwise every repository with a `node_modules/`
+/// would look catastrophically over-excluded.
+#[test]
+fn the_builtin_floor_is_not_counted_against_the_project() {
+    let t = Tree::new("report-floor");
+    t.write("src/a.rs", "fn a() {}")
+        .write("node_modules/dep/index.js", "x")
+        .write("target/debug/thing", "x")
+        .write(".hidden/secret.rs", "fn s() {}");
+
+    let r = t.host().report().unwrap();
+    assert_eq!(r.total, 1, "only src/a.rs is above the floor");
+    assert_eq!(r.admitted.len(), 1);
+    assert_eq!(r.skipped.len(), 0, "nothing the project asked for");
+    assert_eq!(r.skipped_share(), 0.0, "and so no warning");
+}
+
+/// The default policy reads `.gitignore` and not `.dockerignore` (issue #36).
+///
+/// Pinned on `IgnorePolicy::default()` itself rather than an explicit policy,
+/// because the default is what every digest uses and what changed — and nothing
+/// asserted the old behaviour, which is part of why it shipped unnoticed.
+#[test]
+fn the_default_policy_reads_gitignore_and_not_dockerignore() {
+    assert!(IgnorePolicy::default().gitignore);
+    assert!(!IgnorePolicy::default().dockerignore);
+
+    let t = Tree::new("default-policy");
+    t.write("src/kept.rs", "fn k() {}")
+        .write("gen/dropped.rs", "fn d() {}")
+        .write(".gitignore", "gen/\n")
+        .write(".dockerignore", "src/\n");
+
+    let listed = t.host().list("").unwrap();
+    assert!(
+        listed.iter().any(|f| f == "src/kept.rs"),
+        "`.dockerignore` must not withhold the source: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|f| f == "gen/dropped.rs"),
+        "`.gitignore` is still obeyed: {listed:?}"
+    );
+
+    // And the opt-in still works for anyone who wants it.
+    let opted_in = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            dockerignore: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !opted_in
+            .list("")
+            .unwrap()
+            .iter()
+            .any(|f| f == "src/kept.rs"),
+        "opted in, it withholds again"
+    );
+}
+
+/// The names an operator writes in `--ignore-files` or `[digest]
+/// ignore_files`, and what each one turns on.
+#[test]
+fn ignore_file_names_map_to_the_policy_and_a_typo_is_refused() {
+    let only_git = IgnorePolicy::from_names(&["gitignore"]).unwrap();
+    assert!(only_git.gitignore && !only_git.dockerignore);
+    assert_eq!(only_git.names(), vec!["gitignore"]);
+
+    let both = IgnorePolicy::from_names(&["gitignore", "dockerignore"]).unwrap();
+    assert!(both.gitignore && both.dockerignore);
+    assert_eq!(both.names(), vec!["gitignore", "dockerignore"]);
+
+    // An empty list is a real answer: honour none of them.
+    let none = IgnorePolicy::from_names::<&str>(&[]).unwrap();
+    assert!(!none.gitignore && !none.dockerignore);
+    assert!(none.names().is_empty());
+    // drsg's own floor is untouched by it — this is not `--no-ignore`.
+    assert!(none.hidden && none.builtin_dirs);
+
+    // A typo that silently read different files is the failure this setting
+    // exists to end, so it is an error rather than a skipped entry.
+    let err = IgnorePolicy::from_names(&["gitignore", "dockerignor"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("`dockerignor` is not an ignore-file name"),
+        "{err}"
+    );
+    assert!(
+        err.contains("dockerignore"),
+        "it names the valid ones: {err}"
+    );
+}

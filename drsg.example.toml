@@ -98,6 +98,13 @@ dir = "logs"
 # embed_provider = "openai"
 # embed_model = "text-embedding-3-small"
 # embed_key_env = "OPENAI_API_KEY"
+# Which of a project's ignore files decide what is source. Omitted: gitignore
+# alone. `.dockerignore` is NOT read by default — it says what belongs in a
+# Docker build context, which is a different question, and a front end built in
+# CI is right to keep `src/` out of its image without that meaning the source is
+# derived. `[]` honours neither; drsg's own floor (dotfiles, target/,
+# node_modules/ and their kin) stands either way. `--ignore-files` overrides.
+# ignore_files = ["gitignore"]
 
 # URL ingestion for the web AIgest (ROADMAP §9). Fetching is on by default; what
 # is NOT a default is reaching the private network. A client names an address

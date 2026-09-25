@@ -60,7 +60,10 @@ use anyhow::{Context, Result, bail};
 use dr_strange_core::{PropDesc, PropValue};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+
+pub mod report;
 use rayon::prelude::*;
+pub use report::{IgnoreRule, Skipped, WalkReport};
 
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
@@ -293,11 +296,20 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
 /// they are honoured by default. They are *not* obeyed unconditionally:
 /// generated code a build ignores is sometimes exactly what a reader wants in
 /// the graph, so every rule here can be turned off.
+///
+/// `.dockerignore` is the exception, and is off by default (issue #36). It
+/// answers a different question — what belongs in the build context sent to the
+/// Docker daemon — and the answers routinely differ: a front end built in CI
+/// and shipped as `dist/` is *right* to keep `src/` out of its image, and
+/// nothing about that says the source is derived. Worse, the `ignore` crate
+/// gives a custom ignore file precedence over every other, so a
+/// `.dockerignore` outranked the `.gitignore` beside it and no `.ignore` or
+/// `!src` could win it back.
 #[derive(Debug, Clone)]
 pub struct IgnorePolicy {
     /// Honour `.gitignore`, `.git/info/exclude` and the global gitignore.
     pub gitignore: bool,
-    /// Honour `.dockerignore`.
+    /// Honour `.dockerignore`. Off by default — see the type's own note.
     pub dockerignore: bool,
     /// Skip dotfiles and dot-directories.
     pub hidden: bool,
@@ -311,7 +323,7 @@ impl Default for IgnorePolicy {
     fn default() -> Self {
         Self {
             gitignore: true,
-            dockerignore: true,
+            dockerignore: false,
             hidden: true,
             builtin_dirs: true,
             extra: Vec::new(),
@@ -320,6 +332,44 @@ impl Default for IgnorePolicy {
 }
 
 impl IgnorePolicy {
+    /// The ignore files an operator named, as `["gitignore", "dockerignore"]`.
+    ///
+    /// An empty list honours none of them — a repository is then read as it
+    /// sits, minus drsg's own floor. An unknown name is refused rather than
+    /// skipped: a typo that silently changed which files were read is the
+    /// whole failure this setting exists to end.
+    pub fn from_names<S: AsRef<str>>(names: &[S]) -> Result<Self> {
+        let mut policy = Self {
+            gitignore: false,
+            dockerignore: false,
+            ..Self::default()
+        };
+        for name in names {
+            match name.as_ref().trim() {
+                "gitignore" => policy.gitignore = true,
+                "dockerignore" => policy.dockerignore = true,
+                other => bail!(
+                    "`{other}` is not an ignore-file name — expected `gitignore` \
+                     (which covers .gitignore, .ignore, .git/info/exclude and the \
+                     global gitignore) or `dockerignore`"
+                ),
+            }
+        }
+        Ok(policy)
+    }
+
+    /// The names this policy honours, for reporting it back.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.gitignore {
+            out.push("gitignore");
+        }
+        if self.dockerignore {
+            out.push("dockerignore");
+        }
+        out
+    }
+
     /// Whether this policy withholds anything at all. One that does not —
     /// the history reader's, rooted at a `.git` directory — makes every
     /// regular file under the root readable, and the walk that would say so
@@ -418,6 +468,60 @@ impl LocalFiles {
             }
         }
         Ok(out)
+    }
+
+    /// The walk, plus an account of what the project's own ignore files
+    /// withheld and which rule did it (issue #36).
+    ///
+    /// Two walks and a matcher per ignore file, so it is asked for rather than
+    /// always paid: `-v` and the over-exclusion warning want it, an ordinary
+    /// digest does not.
+    pub fn report(&self) -> Result<WalkReport> {
+        let admitted = self.walk()?;
+
+        // drsg's own floor — hidden files and IGNORED_DIRS — with the
+        // project's declarations switched off. This is the denominator: a
+        // `node_modules/` of 80,000 files in it would drown every percentage.
+        let floor = LocalFiles::with_policy(
+            &self.root,
+            IgnorePolicy {
+                gitignore: false,
+                dockerignore: false,
+                hidden: self.policy.hidden,
+                builtin_dirs: self.policy.builtin_dirs,
+                extra: Vec::new(),
+            },
+        )?
+        .walk()?;
+
+        let kept: AHashSet<&PathBuf> = admitted.iter().collect();
+        let withheld: Vec<&PathBuf> = floor.iter().filter(|p| !kept.contains(*p)).collect();
+
+        let skipped = if withheld.is_empty() {
+            Vec::new()
+        } else {
+            let names =
+                report::candidate_ignore_files(self.policy.gitignore, self.policy.dockerignore);
+            let blame = report::Attribution::build(&self.root, &names);
+            withheld
+                .into_iter()
+                .map(|p| Skipped {
+                    path: p.clone(),
+                    rule: blame.blame(p, false).unwrap_or(IgnoreRule {
+                        // An `extra` pattern from configuration is in no file,
+                        // and is the only other thing that withholds.
+                        file: PathBuf::from("(configured ignore pattern)"),
+                        pattern: String::new(),
+                    }),
+                })
+                .collect()
+        };
+
+        Ok(WalkReport {
+            total: floor.len(),
+            admitted,
+            skipped,
+        })
     }
 
     /// Remember what the walk admitted, for `read` to check against.
@@ -894,6 +998,21 @@ pub fn route_tree(
 /// files one commit touched, not the tree. Handlers may still pull *other*
 /// files through the host — that is where cross-file resolution comes from —
 /// but facts are only expected for the paths given.
+/// Which handler claims `path`, by the same rule [`route_paths`] buckets with.
+///
+/// Shared so a report of what was read cannot disagree with what read it:
+/// duplicating the manifest-then-extension precedence here is how the two
+/// would drift. `None` is the built-in document reader's pile.
+pub fn owner_of(plugins: &Plugins, path: &str, handler: Option<&str>) -> Option<String> {
+    let registry = &plugins.handlers;
+    let idx = match handler {
+        None => manifest_handler(registry, path)
+            .or_else(|| index_for(registry, &extension_of(path), handler)),
+        Some(_) => index_for(registry, &extension_of(path), handler),
+    };
+    idx.map(|i| registry[i].manifest().name.clone())
+}
+
 pub fn route_paths(
     host: &dyn Host,
     paths: Vec<String>,

@@ -142,6 +142,25 @@ const GITIGNORE_PATTERNS: &[&str] = &[
     ".cursor/mcp.json",
 ];
 
+/// What `init` was asked to bootstrap.
+///
+/// A struct rather than eight positional arguments, which is what the count
+/// had already reached before `ignore_files` needed a place.
+#[cfg(feature = "digest")]
+pub struct InitArgs<'a> {
+    pub db_path: &'a Path,
+    /// How much to say about which files the walk read.
+    pub verbose: Verbosity,
+    pub dir: PathBuf,
+    pub plane: Option<String>,
+    pub addr: Option<std::net::SocketAddr>,
+    pub token: Option<String>,
+    pub rebuild: bool,
+    /// Forwarded verbatim to the spawned `serve watch`, so the watcher reads
+    /// the tree the way this command was told to (issue #36).
+    pub ignore_files: Option<String>,
+}
+
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
 /// artifacts this leaves behind, spawns `drsg serve watch` detached in the
 /// background, waits for it to come up, and writes the connection details to
@@ -171,23 +190,42 @@ const GITIGNORE_PATTERNS: &[&str] = &[
 /// to want this: a parser that has been upgraded changes what the tree means,
 /// and nothing short of re-reading it says so.
 #[cfg(feature = "digest")]
-#[allow(clippy::too_many_arguments)]
 pub fn init_bootstrap(
-    db_path: &Path,
-    dir: PathBuf,
-    plane: Option<String>,
-    addr: Option<std::net::SocketAddr>,
-    token: Option<String>,
-    rebuild: bool,
+    args: InitArgs<'_>,
     plugin_config: &dr_strange_llm::PluginConfig,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let InitArgs {
+        db_path,
+        verbose,
+        dir,
+        plane,
+        addr,
+        token,
+        rebuild,
+        ignore_files,
+    } = args;
     let db_path = if db_path.is_absolute() {
         db_path.to_path_buf()
     } else {
         dir.join(db_path)
     };
     ensure_gitignore_patterns(&dir)?;
+
+    // The walk `serve watch` is about to do, accounted for here: the child's
+    // stdout goes to /dev/null, so this is the only place an operator can be
+    // told that most of their tree was withheld (issue #36).
+    let policy = dr_strange_llm::IgnorePolicy::from_names(
+        &ignore_files
+            .as_deref()
+            .unwrap_or("gitignore")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>(),
+    )?;
+    let walked = dr_strange_llm::LocalFiles::with_policy(&dir, policy)?.report()?;
+    report_files(&walked, None, None, verbose, out)?;
 
     // What a previous run left behind, and whether it is still answering.
     let recorded = recorded_endpoint(&dir);
@@ -262,6 +300,7 @@ pub fn init_bootstrap(
         plane: &plane_name,
         token: &token,
         force,
+        ignore_files: ignore_files.as_deref(),
     };
     let (pid, addr) = spawn_watcher(&watch, addr, picked, out)?;
 
@@ -368,6 +407,37 @@ struct Watch<'a> {
     plane: &'a str,
     token: &'a str,
     force: bool,
+    /// Passed on to the child so it reads the tree the way `init` was told to;
+    /// `None` leaves the child to read the config itself (issue #36).
+    ignore_files: Option<&'a str>,
+}
+
+/// A directory to read, and the rules deciding what in it counts as source.
+///
+/// One value rather than a second parameter beside every `dir`: the policy is
+/// meaningless apart from the tree it applies to, and `fold_one_move` already
+/// carries as many arguments as it should (issue #36).
+#[cfg(feature = "digest")]
+#[derive(Clone, Copy)]
+struct TreeRead<'a> {
+    dir: &'a Path,
+    policy: &'a dr_strange_llm::IgnorePolicy,
+}
+
+#[cfg(feature = "digest")]
+impl TreeRead<'_> {
+    /// A host over the tree under these rules.
+    fn host(&self) -> Result<dr_strange_llm::LocalFiles> {
+        dr_strange_llm::LocalFiles::with_policy(self.dir, self.policy.clone())
+    }
+}
+
+/// The owned form, for the public `watch` entry, so that entry point gains no
+/// extra argument.
+#[cfg(feature = "digest")]
+pub struct WatchTree {
+    pub dir: std::path::PathBuf,
+    pub policy: dr_strange_llm::IgnorePolicy,
 }
 
 /// Spawn `serve watch` detached, and wait until it is actually listening.
@@ -732,6 +802,7 @@ fn spawn_serve_watch(
         plane,
         token,
         force,
+        ignore_files,
     } = *watch;
     let mut cmd = std::process::Command::new(exe);
     cmd.current_dir(dir)
@@ -751,6 +822,11 @@ fn spawn_serve_watch(
         .stderr(std::process::Stdio::null());
     if force {
         cmd.arg("--force");
+    }
+    // Forwarded even when empty: "" is how an operator says "no ignore files",
+    // and dropping the flag would silently restore the default instead.
+    if let Some(list) = ignore_files {
+        cmd.arg("--ignore-files").arg(list);
     }
     #[cfg(unix)]
     {
@@ -1551,14 +1627,18 @@ fn recorded_sync_point(db: &Database, plane_name: &str) -> (Option<String>, Opti
 #[allow(clippy::too_many_arguments)]
 pub fn watch(
     db: std::sync::Arc<Database>,
-    dir: std::path::PathBuf,
+    tree: WatchTree,
     plane_name: String,
     plugin_config: dr_strange_llm::PluginConfig,
     embed: Option<(String, Option<String>, Option<String>)>,
     force: bool,
     git: bool,
 ) {
-    if let Err(e) = watch_loop(&db, &dir, &plane_name, &plugin_config, embed, force, git) {
+    let tree = TreeRead {
+        dir: &tree.dir,
+        policy: &tree.policy,
+    };
+    if let Err(e) = watch_loop(&db, tree, &plane_name, &plugin_config, embed, force, git) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
     }
 }
@@ -1658,7 +1738,7 @@ fn catch_up_from(
 #[cfg(feature = "digest")]
 fn fold_one_move(
     db: &Database,
-    dir: &Path,
+    tree: TreeRead<'_>,
     plane_name: &str,
     live: &mut dr_strange_llm::LivePlugins,
     source: &str,
@@ -1666,7 +1746,7 @@ fn fold_one_move(
     head: &str,
     now: &str,
 ) -> Result<bool> {
-    let delta = git_changes(dir, head, now)?;
+    let delta = git_changes(tree.dir, head, now)?;
     let touches_code = !(delta.changed.is_empty() && delta.deleted.is_empty());
     if !touches_code && !git {
         return Ok(false);
@@ -1677,12 +1757,12 @@ fn fold_one_move(
     // repository even when it touched no file the code plane holds — an empty
     // commit, or one that moved only something ignored, still moved a branch.
     if git {
-        fold_history(db, dir, plane_name, plugins, "commit");
+        fold_history(db, tree.dir, plane_name, plugins, "commit");
     }
     if !touches_code {
         return Ok(false);
     }
-    let host = dr_strange_llm::LocalFiles::new(dir)?;
+    let host = tree.host()?;
     let stats = dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, source, now)?;
     tracing::info!(
         commit = %&now[..12.min(now.len())],
@@ -1707,7 +1787,7 @@ fn fold_one_move(
 #[cfg(feature = "digest")]
 fn watch_loop(
     db: &Database,
-    dir: &Path,
+    tree: TreeRead<'_>,
     plane_name: &str,
     plugin_config: &dr_strange_llm::PluginConfig,
     embed: Option<(String, Option<String>, Option<String>)>,
@@ -1739,15 +1819,17 @@ fn watch_loop(
             ),
         }
     };
-    let root = dir
+    let root = tree
+        .dir
         .canonicalize()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| dir.display().to_string());
-    let source = dir
+        .unwrap_or_else(|_| tree.dir.display().to_string());
+    let source = tree
+        .dir
         .canonicalize()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| dir.display().to_string());
+        .unwrap_or_else(|| tree.dir.display().to_string());
 
     // The plugins, loaded once and kept: every fold below asks `live` for
     // them, and it reloads only when the store changed — so a `drsg plugin
@@ -1760,10 +1842,10 @@ fn watch_loop(
     // anchor on: `git rev-parse HEAD` fails both in a repository whose first
     // commit is still unborn and in a directory that is not a repository at
     // all. Neither is a reason to leave the tree unparsed.
-    let (mut head, bootstrapped) = match git_head(dir) {
+    let (mut head, bootstrapped) = match git_head(tree.dir) {
         Ok(head) => (head, false),
         Err(e) => {
-            match bootstrap_unborn(db, dir, plane_name, &mut live, &source, &e, &revectorize)? {
+            match bootstrap_unborn(db, tree, plane_name, &mut live, &source, &e, &revectorize)? {
                 Some(first) => (first, true),
                 // Not a repository: the plane is built and current as of the
                 // scan, but no commit will ever arrive to fold into it.
@@ -1784,8 +1866,8 @@ fn watch_loop(
             plane = plane_name,
             "--force: rebuilding the plane from the tree"
         );
-        let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, &source, &head)?;
-        record_sync_point(db, plane_name, dir)?;
+        let stats = rebuild_from_tree(db, tree, plane_name, live.current()?, &source, &head)?;
+        record_sync_point(db, plane_name, tree.dir)?;
         tracing::info!(
             commit = %&head[..12.min(head.len())],
             nodes_loaded = stats.nodes_loaded,
@@ -1795,13 +1877,13 @@ fn watch_loop(
         );
         revectorize("--force rebuild");
     } else {
-        head = catch_up_from(db, dir, plane_name, &root, head)?;
+        head = catch_up_from(db, tree.dir, plane_name, &root, head)?;
     }
     // History, once, before serving: a plane bootstrapped by `drsg init` has
     // never seen a digest, so this is where it first gains one.
     if git {
         match live.current() {
-            Ok(plugins) => fold_history(db, dir, plane_name, plugins, "startup"),
+            Ok(plugins) => fold_history(db, tree.dir, plane_name, plugins, "startup"),
             Err(e) => tracing::warn!(
                 error = format!("{e:#}"),
                 "loading plugins for the history plane failed"
@@ -1810,7 +1892,7 @@ fn watch_loop(
     }
 
     tracing::info!(
-        dir = %dir.display(),
+        tree.dir = %tree.dir.display(),
         plane = plane_name,
         head = %head,
         history = git,
@@ -1822,7 +1904,7 @@ fn watch_loop(
     );
     poll_commits(
         db,
-        dir,
+        tree,
         plane_name,
         &mut live,
         &source,
@@ -1841,7 +1923,7 @@ fn watch_loop(
 #[cfg(feature = "digest")]
 fn poll_commits(
     db: &Database,
-    dir: &Path,
+    tree: TreeRead<'_>,
     plane_name: &str,
     live: &mut dr_strange_llm::LivePlugins,
     source: &str,
@@ -1851,7 +1933,7 @@ fn poll_commits(
 ) -> Result<()> {
     loop {
         std::thread::sleep(WATCH_POLL);
-        let now = match git_head(dir) {
+        let now = match git_head(tree.dir) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = format!("{e:#}"), "reading HEAD failed; will retry");
@@ -1861,11 +1943,11 @@ fn poll_commits(
         if now == head {
             continue;
         }
-        match fold_one_move(db, dir, plane_name, live, source, git, &head, &now) {
+        match fold_one_move(db, tree, plane_name, live, source, git, &head, &now) {
             Ok(changed) => {
                 // The plane now reflects `now`; say so durably, so the next
                 // start knows where to catch up from.
-                if let Err(e) = record_sync_point(db, plane_name, dir) {
+                if let Err(e) = record_sync_point(db, plane_name, tree.dir) {
                     tracing::warn!(error = format!("{e:#}"), "recording the sync point failed");
                 }
                 if changed {
@@ -1945,13 +2027,18 @@ fn fold_history(
 #[cfg(feature = "digest")]
 fn rebuild_from_tree(
     db: &Database,
-    dir: &Path,
+    tree: TreeRead<'_>,
     plane_name: &str,
     plugins: &dr_strange_llm::Plugins,
     source: &str,
     run_id: &str,
 ) -> Result<dr_strange_llm::SyncStats> {
-    let host = dr_strange_llm::LocalFiles::new(dir)?;
+    let host = tree.host()?;
+    // Through tracing rather than the `-v` report: this runs in the server,
+    // whose stdout `init` sends to /dev/null, and whose levels already decide
+    // what an operator sees. The walk is the whole tree here, so the account is
+    // worth its second pass (issue #36).
+    trace_walk(&host, tree.dir);
     dr_strange_llm::resync(db, plane_name, &host, plugins, source, run_id)
 }
 
@@ -1968,21 +2055,21 @@ fn rebuild_from_tree(
 #[cfg(feature = "digest")]
 fn bootstrap_unborn(
     db: &Database,
-    dir: &Path,
+    tree: TreeRead<'_>,
     plane_name: &str,
     live: &mut dr_strange_llm::LivePlugins,
     source: &str,
     why: &anyhow::Error,
     revectorize: &dyn Fn(&str),
 ) -> Result<Option<String>> {
-    let is_repo = is_git_repo(dir);
+    let is_repo = is_git_repo(tree.dir);
     tracing::info!(
-        dir = %dir.display(),
+        tree.dir = %tree.dir.display(),
         plane = plane_name,
         reason = format!("{why:#}"),
         "no commit to anchor on — building the plane from the working tree"
     );
-    let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, source, UNBORN_RUN_ID)?;
+    let stats = rebuild_from_tree(db, tree, plane_name, live.current()?, source, UNBORN_RUN_ID)?;
     tracing::info!(
         nodes_loaded = stats.nodes_loaded,
         edges_written = stats.edges_written,
@@ -1993,7 +2080,7 @@ fn bootstrap_unborn(
 
     if !is_repo {
         tracing::warn!(
-            dir = %dir.display(),
+            tree.dir = %tree.dir.display(),
             "not a git repository — the plane reflects this scan and nothing will fold into it; `git init` here and restart `drsg serve watch` to follow commits"
         );
         return Ok(None);
@@ -2002,14 +2089,14 @@ fn bootstrap_unborn(
     tracing::info!("waiting for this repository's first commit");
     let first = loop {
         std::thread::sleep(WATCH_POLL);
-        if let Ok(head) = git_head(dir) {
+        if let Ok(head) = git_head(tree.dir) {
             break head;
         }
     };
     // Rebuild rather than fold: there is no earlier commit to diff the first
     // one against, and the tree may have changed since the scan above.
-    let stats = rebuild_from_tree(db, dir, plane_name, live.current()?, source, &first)?;
-    record_sync_point(db, plane_name, dir)?;
+    let stats = rebuild_from_tree(db, tree, plane_name, live.current()?, source, &first)?;
+    record_sync_point(db, plane_name, tree.dir)?;
     tracing::info!(
         commit = %&first[..12.min(first.len())],
         nodes_loaded = stats.nodes_loaded,
@@ -2623,6 +2710,11 @@ pub struct DigestArgs<'a> {
     pub pages: usize,
     /// URL only: link-following depth.
     pub depth: usize,
+    /// Path only: which of the project's ignore files decide what is source
+    /// (issue #36).
+    pub ignore: &'a dr_strange_llm::IgnorePolicy,
+    /// How much to say about which files were read.
+    pub verbose: Verbosity,
     /// URL only: where the crawl's requests go. The operator named this URL on
     /// their own command line, so it goes through their proxy — unlike a URL a
     /// caller hands the server, which is address-guarded instead.
@@ -3327,8 +3419,17 @@ fn read_source(
         // the files it wants through the host, so "digest this project" needs
         // no file list from the caller.
         if path.is_dir() {
-            let host = dr_strange_llm::LocalFiles::new(path)
+            let host = dr_strange_llm::LocalFiles::with_policy(path, args.ignore.clone())
                 .with_context(|| format!("reading {}", path.display()))?;
+            // Before the work, not after: the account is most useful to
+            // someone about to wonder why so little was read.
+            report_files(
+                &host.report()?,
+                Some(plugins),
+                args.handler,
+                args.verbose,
+                out,
+            )?;
             let facts = dr_strange_llm::route_tree(&host, args.handler, plugins)?;
             return Ok((facts, name));
         }
@@ -4098,6 +4199,97 @@ pub fn restore(db: &Database, in_path: &Path, out: &mut dyn Write) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report over a tree where one rule withheld most of it.
+    #[cfg(feature = "digest")]
+    fn withheld_report() -> dr_strange_llm::WalkReport {
+        let rule = dr_strange_llm::IgnoreRule {
+            file: std::path::PathBuf::from(".dockerignore"),
+            pattern: "src/".to_string(),
+        };
+        dr_strange_llm::WalkReport {
+            total: 4,
+            admitted: vec![std::path::PathBuf::from("README.md")],
+            skipped: (1..=3)
+                .map(|i| dr_strange_llm::Skipped {
+                    path: std::path::PathBuf::from(format!("src/f{i}.rs")),
+                    rule: rule.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(feature = "digest")]
+    fn rendered(v: u8) -> String {
+        cap(|o| report_files(&withheld_report(), None, None, Verbosity::new(v), o))
+    }
+
+    /// Each level says strictly more than the one below (issue #36).
+    #[cfg(feature = "digest")]
+    #[test]
+    fn verbosity_adds_counts_then_withheld_files_then_every_file() {
+        // Default: no accounting at all — only the warning, which this tree
+        // earns because three of its four files were withheld.
+        let quiet = rendered(0);
+        assert!(!quiet.contains("read 1 of 4"), "{quiet}");
+        assert!(quiet.contains("warning:"), "{quiet}");
+
+        // -v: the count and the percentage.
+        let one = rendered(1);
+        assert!(one.contains("read 1 of 4 files (25.0%)"), "{one}");
+        assert!(!one.contains("withheld src/"), "not yet: {one}");
+
+        // -vv: which files, and the rule that withheld each.
+        let two = rendered(2);
+        assert!(two.contains("read 1 of 4 files"), "{two}");
+        assert!(
+            two.contains("withheld src/f1.rs  `src/` in .dockerignore"),
+            "{two}"
+        );
+        assert!(!two.contains("read     README.md"), "not yet: {two}");
+
+        // -vvv: every file, admitted ones included.
+        let three = rendered(3);
+        assert!(three.contains("read     README.md"), "{three}");
+        assert!(three.contains("withheld src/f1.rs"), "{three}");
+    }
+
+    /// The warning is not gated on a flag: nine nodes where six thousand were
+    /// expected is exactly when nobody thought to pass one. It names the file
+    /// to go and edit, and the escape hatch.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_over_exclusion_warning_names_the_file_and_the_way_out() {
+        let w = rendered(0);
+        assert!(w.contains("3 of 4 files were withheld"), "{w}");
+        assert!(w.contains(".dockerignore (3)"), "{w}");
+        assert!(w.contains("--ignore-files"), "{w}");
+    }
+
+    /// A tree nothing withheld says nothing unasked, and a healthy one that
+    /// withholds a little is not nagged about it.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn a_tree_that_is_mostly_read_is_not_warned_about() {
+        let healthy = dr_strange_llm::WalkReport {
+            total: 10,
+            admitted: (1..=9)
+                .map(|i| std::path::PathBuf::from(format!("src/f{i}.rs")))
+                .collect(),
+            skipped: vec![dr_strange_llm::Skipped {
+                path: std::path::PathBuf::from("gen/g.rs"),
+                rule: dr_strange_llm::IgnoreRule {
+                    file: std::path::PathBuf::from(".gitignore"),
+                    pattern: "gen/".to_string(),
+                },
+            }],
+        };
+        let quiet = cap(|o| report_files(&healthy, None, None, Verbosity::new(0), o));
+        assert!(quiet.is_empty(), "silent by default: {quiet:?}");
+        let counted = cap(|o| report_files(&healthy, None, None, Verbosity::new(1), o));
+        assert!(counted.contains("read 9 of 10 files (90.0%)"), "{counted}");
+        assert!(!counted.contains("warning:"), "{counted}");
+    }
 
     /// The address guard and no proxy — what these tests exercise, and what an
     /// operator who has configured nothing gets.
@@ -5579,4 +5771,146 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// How much a command says about the files it read (issue #36).
+///
+/// A newtype rather than a bare `u8` so the levels are named once here instead
+/// of as `>= 2` at every call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Verbosity(u8);
+
+impl Verbosity {
+    /// From clap's repeat count.
+    pub fn new(count: u8) -> Self {
+        Self(count)
+    }
+
+    // The three levels are read only by `report_files`, which only a build
+    // that can digest has.
+    /// `-v`: how many files were read, of how many.
+    #[cfg(feature = "digest")]
+    fn counts(self) -> bool {
+        self.0 >= 1
+    }
+
+    /// `-vv`: which files an ignore rule withheld, and which rule.
+    #[cfg(feature = "digest")]
+    fn withheld(self) -> bool {
+        self.0 >= 2
+    }
+
+    /// `-vvv`: every file, and what read it.
+    #[cfg(feature = "digest")]
+    fn every_file(self) -> bool {
+        self.0 >= 3
+    }
+}
+
+/// What the walk read, for the server's log.
+///
+/// The daemon's counterpart to `report_files`: same numbers, same warning, but
+/// as events rather than lines on a stdout nobody is reading. A walk that fails
+/// here is not worth failing the rebuild for — the rebuild itself walks, and
+/// will report the real error.
+#[cfg(feature = "digest")]
+fn trace_walk(host: &dr_strange_llm::LocalFiles, dir: &Path) {
+    let report = match host.report() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = format!("{e:#}"), "could not account for the walk");
+            return;
+        }
+    };
+    let (read, total) = (report.admitted.len(), report.total);
+    tracing::info!(dir = %dir.display(), read, total, "walked the tree");
+    if report.skipped_share() >= OVER_EXCLUDED && !report.skipped.is_empty() {
+        let named = report
+            .culprits()
+            .iter()
+            .map(|(f, n)| format!("{} ({n})", f.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            withheld = report.skipped.len(),
+            total,
+            by = %named,
+            "most of the tree was withheld by ignore rules — `--ignore-files` chooses which apply"
+        );
+    }
+}
+
+/// The share of a tree that has to be withheld before it is said unasked.
+///
+/// Half. A repository that declares away most of itself is either doing
+/// something deliberate — a vendored monorepo subtree — or has the bug this
+/// threshold exists to catch, and both are worth one line.
+#[cfg(feature = "digest")]
+const OVER_EXCLUDED: f64 = 0.5;
+
+/// Say what the walk read, at the level asked for, and warn when a tree is
+/// mostly withheld whether or not anything was asked.
+///
+/// The warning is not gated on verbosity: nine nodes where six thousand were
+/// expected is exactly the case where nobody thought to pass a flag.
+#[cfg(feature = "digest")]
+fn report_files(
+    report: &dr_strange_llm::WalkReport,
+    plugins: Option<&dr_strange_llm::Plugins>,
+    handler: Option<&str>,
+    v: Verbosity,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let read = report.admitted.len();
+    let total = report.total;
+    let pct = |n: usize| {
+        if total == 0 {
+            100.0
+        } else {
+            n as f64 * 100.0 / total as f64
+        }
+    };
+
+    if v.counts() {
+        writeln!(out, "read {read} of {total} files ({:.1}%)", pct(read))?;
+    }
+
+    if v.every_file() {
+        for path in &report.admitted {
+            let name = path.display().to_string();
+            match plugins {
+                Some(p) => {
+                    let by = dr_strange_llm::owner_of(p, &name, handler)
+                        .unwrap_or_else(|| "document reader".to_string());
+                    writeln!(out, "  read     {name}  [{by}]")?;
+                }
+                // `init` has loaded no plugins yet, and loading them to name a
+                // handler would cost more than the name is worth.
+                None => writeln!(out, "  read     {name}")?,
+            }
+        }
+    }
+    if v.withheld() {
+        for s in &report.skipped {
+            writeln!(out, "  withheld {}  {}", s.path.display(), s.rule)?;
+        }
+    }
+
+    // Named files, not just a count: the one thing the operator needs is which
+    // file to go and edit.
+    if report.skipped_share() >= OVER_EXCLUDED && !report.skipped.is_empty() {
+        let culprits = report.culprits();
+        let named = culprits
+            .iter()
+            .map(|(f, n)| format!("{} ({n})", f.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            out,
+            "warning: {} of {total} files were withheld by ignore rules — {named}. \
+             If that is not what you meant, `--ignore-files` chooses which of them apply.",
+            report.skipped.len()
+        )?;
+    }
+    Ok(())
 }
