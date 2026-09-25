@@ -4,6 +4,42 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.0] - 2026-09-26
+
+A repository whose `.dockerignore` excluded `src/` digested to nine nodes instead
+of six thousand, and said nothing. Both halves of that are fixed.
+
+### Added
+
+- **`--ignore-files` and `[digest] ignore_files`** choose which of a project's
+  ignore files decide what is source — `gitignore`, `dockerignore`, both, or
+  neither. Accepted by `digest`, `init` and `serve watch`; the flag beats the
+  file. An unknown name is refused rather than skipped, because a typo that
+  silently changed which files were read is the failure this setting exists to
+  end. `IgnorePolicy` had these knobs already and nothing could reach them.
+- **An ingest says what it read.** `-v` gives the count and the share of the
+  tree, `-vv` adds each withheld file and the rule that withheld it, `-vvv`
+  names every file and the handler that read it. The denominator is what drsg's
+  own floor left, not every file on disk: a `node_modules/` of 80,000 files
+  would make the percentage meaningless.
+- **A mostly-withheld tree warns without being asked**, naming the ignore file
+  responsible and the flag that overrides it — the case where nobody thought to
+  pass a flag is exactly the case that needed one. `serve watch` reports the
+  same through its log, since its output is a log rather than a terminal.
+
+### Changed
+
+- **`.dockerignore` is no longer read by default.** It answers a different
+  question — what belongs in the build context sent to the Docker daemon — and
+  the answers routinely differ: a front end built in CI and shipped as `dist/`
+  is right to keep `src/` out of its image, and that says nothing about whether
+  the source is derived. It was also the *least* overridable file in the
+  repository: the `ignore` crate gives a custom ignore file precedence over
+  every other, so a `.dockerignore` outranked the `.gitignore` beside it and no
+  `.ignore` or `!src` could win it back. A tree that digested almost nothing
+  under 2.13.0 will digest all of it here; `--ignore-files
+  gitignore,dockerignore` restores the old reading.
+
 ## [2.13.0] - 2026-09-25
 
 Outbound requests honour an HTTP or SOCKS proxy, and the graph cache no longer
