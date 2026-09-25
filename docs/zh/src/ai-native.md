@@ -244,9 +244,48 @@ note: 553 call(s) named nothing defined here — calls into other crates and
 函数自身的源码存到它的节点上以供取回，默认关闭，因为那几乎等于把整个代码库复制进
 图里。
 
-遍历会遵守 `.gitignore` 与 `.dockerignore`（一个项目对「什么是衍生物、什么是源码」
-的自我声明，胜过本工具所能猜测的任何清单），并且总是跳过 `target/`、`node_modules/`
-之类的目录。对未改动的树运行两次，得到的图逐字节相同。
+遍历会遵守 `.gitignore`——一个项目对「什么是衍生物、什么是源码」的自我声明，胜过
+本工具所能猜测的任何清单——并且总是跳过 `target/`、`node_modules/` 之类的目录。对
+未改动的树运行两次，得到的图逐字节相同。
+
+`.dockerignore` **默认不读**。它回答的是另一个问题——什么该进入送往 Docker 守护
+进程的构建上下文——而两者的答案常常相反：一个在 CI 中构建、只发布 `dist/` 的前端
+项目，把 `src/` 排除在镜像之外是正确的，这并不意味着源码是衍生物。用
+`--ignore-files` 选择：
+
+```console
+$ drsg digest .                                    # 仅 .gitignore（默认）
+$ drsg digest . --ignore-files gitignore,dockerignore
+$ drsg digest . --ignore-files ''                  # 两者都不读，按树的原样读取
+```
+
+`drsg.toml` 中的 `[digest] ignore_files` 为每次运行设定它，`drsg init` 与
+`drsg serve watch` 也接受同一个标志。无论怎么选，drsg 自己的底线不变：点文件与
+上述构建目录一律跳过。
+
+### 知道读了些什么
+
+一棵把自己大部分声明掉的树，摄取出来几乎是空的，而单看数字没人会去读。因此当一次
+摄取排除掉了它所看到的一半以上文件时，会不经询问就说出来，并指名是哪个文件造成的：
+
+```console
+$ drsg digest .
+warning: 5 of 7 files were withheld by ignore rules — .dockerignore (5). If that
+is not what you meant, `--ignore-files` chooses which of them apply.
+```
+
+无论是否有异常，`-v` 都会给出这份账目，每多一个 `v` 就多说一些：
+
+| | |
+|---|---|
+| *（无）* | 静默，仅保留上面那条警告 |
+| `-v` | `read 812 of 840 files (96.7%)` |
+| `-vv` | 追加每个被排除的文件，以及排除它的那条规则 |
+| `-vvv` | 追加每个被读取的文件，以及读取它的处理器 |
+
+分母是 drsg 自己的底线过滤之后剩下的文件数，而非磁盘上的全部文件：把一个 8 万个
+文件的 `node_modules/` 计入，百分比就失去了意义。`drsg serve watch` 通过它的日志
+报告同样的内容，因为它的输出是日志而不是终端。
 
 这一能力被刻意限定为**仅限本地**：只能用在你自己机器上的 `drsg` 与 stdio MCP
 服务器，绝不包括共享的 `drsg serve`。解析之所以值得花这个代价，是因为处理器

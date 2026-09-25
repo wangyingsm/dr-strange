@@ -281,10 +281,53 @@ uninterpreted — `[plugins.rust] include_source = true` stores each function's
 source on its node for retrieval, off by default because it is roughly a copy
 of the codebase in the graph.
 
-The walk honours `.gitignore` and `.dockerignore` (a project's own statement of
-what is derived rather than source, and better than a list this tool could
-guess at) and always skips `target/`, `node_modules/` and their kin. Running it
-twice on an unchanged tree yields the same graph, byte for byte.
+The walk honours `.gitignore` — a project's own statement of what is derived
+rather than source, and better than a list this tool could guess at — and always
+skips `target/`, `node_modules/` and their kin. Running it twice on an unchanged
+tree yields the same graph, byte for byte.
+
+`.dockerignore` is **not** read by default. It answers a different question —
+what belongs in the build context sent to the Docker daemon — and the answers
+routinely differ: a front end built in CI and shipped as `dist/` is right to keep
+`src/` out of its image, and that says nothing about whether the source is
+derived. `--ignore-files` chooses:
+
+```console
+$ drsg digest .                                    # .gitignore only (the default)
+$ drsg digest . --ignore-files gitignore,dockerignore
+$ drsg digest . --ignore-files ''                  # neither; read the tree as it sits
+```
+
+`[digest] ignore_files` in `drsg.toml` sets it for every run, and the same flag
+is accepted by `drsg init` and `drsg serve watch`. Whatever is chosen, drsg's own
+floor stands: dotfiles and the build directories above are skipped regardless.
+
+### Knowing what was read
+
+A tree that declares most of itself away digests to almost nothing, and the
+count alone is not something anyone reads. So an ingest that withholds more than
+half of what it saw says so unprompted, naming the file responsible:
+
+```console
+$ drsg digest .
+warning: 5 of 7 files were withheld by ignore rules — .dockerignore (5). If that
+is not what you meant, `--ignore-files` chooses which of them apply.
+```
+
+`-v` asks for the accounting whether or not anything looks wrong, and each
+further `v` says more:
+
+| | |
+|---|---|
+| *(none)* | silent, except the warning above |
+| `-v` | `read 812 of 840 files (96.7%)` |
+| `-vv` | and each withheld file with the rule that withheld it |
+| `-vvv` | and every file read, with the handler that read it |
+
+The denominator is what drsg's own floor left, not every file on disk: counting a
+`node_modules/` of 80,000 would make the percentage meaningless. `drsg serve
+watch` reports the same thing through its log, since its output is a log rather
+than a terminal.
 
 This is deliberately **local-only** — `drsg` on your own machine and the stdio
 MCP server, never a shared `drsg serve`. What makes parsing worth its cost is a

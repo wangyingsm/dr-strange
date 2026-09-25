@@ -288,6 +288,7 @@ chunk_chars = 4000                          # target chunk size
 embed_provider = "openai"                   # embedding provider for search / write_nodes / watch re-vectorization
 embed_model = "text-embedding-3-small"      # its model (each provider has a default)
 embed_key_env = "OPENAI_API_KEY"            # env var holding its key
+ignore_files = ["gitignore"]                # whose ignore files decide what is source; [] honours neither
 
 [plugins]                                   # preprocessor sandbox tuning (all optional)
 fuel = 200000000000                         # instruction budget per sandbox call (0 disables)
