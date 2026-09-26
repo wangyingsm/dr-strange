@@ -105,6 +105,15 @@ dir = "logs"
 # derived. `[]` honours neither; drsg's own floor (dotfiles, target/,
 # node_modules/ and their kin) stands either way. `--ignore-files` overrides.
 # ignore_files = ["gitignore"]
+# Read only what git tracks. The walk reads the WORKING TREE, so by default an
+# untracked file lands in a plane that names a commit it has never been in; the
+# plane records that drift either way and every answer says so. A tracked file
+# with uncommitted edits is still read as it stands.
+# tracked_only = false
+# Read only files a handler claims, leaving Markdown, PDFs, spreadsheets and
+# unclaimed extensions out of a code graph. Prose is also what needs a model, so
+# this makes a pure-code digest free of chat calls.
+# code_only = false
 
 # URL ingestion for the web AIgest (ROADMAP §9). Fetching is on by default; what
 # is NOT a default is reaching the private network. A client names an address

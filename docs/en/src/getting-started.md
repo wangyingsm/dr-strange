@@ -289,6 +289,8 @@ embed_provider = "openai"                   # embedding provider for search / wr
 embed_model = "text-embedding-3-small"      # its model (each provider has a default)
 embed_key_env = "OPENAI_API_KEY"            # env var holding its key
 ignore_files = ["gitignore"]                # whose ignore files decide what is source; [] honours neither
+tracked_only = false                        # true reads only what git tracks
+code_only = false                           # true reads only what a handler claims (no Markdown/PDF)
 
 [plugins]                                   # preprocessor sandbox tuning (all optional)
 fuel = 200000000000                         # instruction budget per sandbox call (0 disables)
