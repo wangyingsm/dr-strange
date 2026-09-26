@@ -1588,9 +1588,56 @@ const UNBORN_RUN_ID: &str = "working-tree";
 pub const SYNC_COMMIT_PROP: &str = "synced_commit";
 #[cfg(feature = "digest")]
 pub const SYNC_ROOT_PROP: &str = "synced_root";
+/// How far the working tree had drifted from that commit (issue #38).
+#[cfg(feature = "digest")]
+pub const SYNC_MODIFIED_PROP: &str = "synced_modified";
+#[cfg(feature = "digest")]
+pub const SYNC_UNTRACKED_PROP: &str = "synced_untracked";
 
-/// Stamp the plane with the commit and parse basis it now reflects. A quiet
-/// no-op outside a git repository — there is no commit to speak of.
+/// How far the working tree had drifted from the commit when it was parsed.
+///
+/// Counted as git counts it, which is the right basis for the question this
+/// answers: a modified file was read in its modified form, so the graph holds
+/// something that commit does not.
+#[cfg(feature = "digest")]
+struct Drift {
+    modified: i64,
+    untracked: i64,
+}
+
+/// `git status`'s view of the tree, or `None` outside a repository.
+#[cfg(feature = "digest")]
+fn working_tree_drift(dir: &Path) -> Option<Drift> {
+    // `-z` because paths are data; `--porcelain=v1` because the format is
+    // documented stable and this parses it.
+    let out = git(dir, &["status", "--porcelain=v1", "-z"]).ok()?;
+    let mut drift = Drift {
+        modified: 0,
+        untracked: 0,
+    };
+    for entry in out.split(|b| *b == 0) {
+        // `XY <path>`: two status letters, a space, then the path.
+        if entry.len() < 3 {
+            continue;
+        }
+        match &entry[..2] {
+            b"??" => drift.untracked += 1,
+            // Anything else git reported is a tracked path that differs from
+            // HEAD, staged or not.
+            _ => drift.modified += 1,
+        }
+    }
+    Some(drift)
+}
+
+/// Stamp the plane with the commit it was parsed at, the parse basis, and how
+/// far the working tree had drifted from that commit. A quiet no-op outside a
+/// git repository — there is no commit to speak of.
+///
+/// The drift is the point (issue #38). The facts come from the *working tree*,
+/// so a plane can name a commit and hold a symbol from a file that commit never
+/// contained; recording the drift is what lets every reader say so instead of
+/// implying the two agree.
 #[cfg(feature = "digest")]
 fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> {
     let Ok(head) = git_head(dir) else {
@@ -1604,8 +1651,31 @@ fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> 
     let mut props = plane.properties()?;
     props.insert(
         SYNC_COMMIT_PROP.into(),
-        PropDesc::described("commit the plane reflects", PropValue::Str(head)),
+        // Not "the commit the plane reflects": the parse read the working tree,
+        // which that commit may not match. The drift below is how far.
+        PropDesc::described(
+            "commit HEAD was at when these facts were parsed",
+            PropValue::Str(head),
+        ),
     );
+    // Always written, both of them, so a plane that does not carry them is one
+    // an older drsg wrote — unknown drift rather than a clean tree.
+    if let Some(drift) = working_tree_drift(dir) {
+        props.insert(
+            SYNC_MODIFIED_PROP.into(),
+            PropDesc::described(
+                "tracked files differing from that commit when parsed",
+                PropValue::Int(drift.modified),
+            ),
+        );
+        props.insert(
+            SYNC_UNTRACKED_PROP.into(),
+            PropDesc::described(
+                "untracked files present when parsed",
+                PropValue::Int(drift.untracked),
+            ),
+        );
+    }
     props.insert(
         SYNC_ROOT_PROP.into(),
         PropDesc::described("directory the facts were parsed from", PropValue::Str(root)),
