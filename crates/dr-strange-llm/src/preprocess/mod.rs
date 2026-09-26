@@ -287,7 +287,26 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
     ".mypy_cache",
     ".pytest_cache",
     "vendor",
+    // drsg's own rolling log (`DRSG_LOG_DIR`, default `./logs`). Without this a
+    // `digest .` reads the log it is writing as it writes it — and reads it as
+    // prose, so a pure-code tree demands a chat provider it should not need
+    // (issue #38). `drsg init` puts `logs/` in `.gitignore` for the same
+    // reason; the floor should not depend on having run `init`.
+    "logs",
 ];
+
+/// drsg's own store, beside the tree it describes.
+///
+/// A database opened at `./graph.drsg` sits in the directory being walked, and
+/// its sidecars beside it. Reading them back in is never what anyone meant, and
+/// like `logs/` above it should not take an `init` to avoid (issue #38).
+fn is_own_artifact(name: &str) -> bool {
+    name.ends_with(".drsg")
+        || name.ends_with(".drsg.jsonl")
+        || name.ends_with(".drsg.hnsw")
+        || name.ends_with(".drsg.bm25")
+        || name.ends_with(".drsg.wal")
+}
 
 /// Which files the host will answer for.
 ///
@@ -452,8 +471,11 @@ impl LocalFiles {
         }
         if p.builtin_dirs {
             builder.filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                // A native store is a *directory* (`graph.drsg/wal`), so it is
+                // pruned here rather than filtered per file below.
                 !(e.file_type().is_some_and(|t| t.is_dir())
-                    && IGNORED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                    && (IGNORED_DIRS.contains(&name.as_ref()) || is_own_artifact(&name)))
             });
         }
 
@@ -461,6 +483,10 @@ impl LocalFiles {
         for entry in builder.build() {
             let entry = entry?;
             if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            // The sidecars sit beside the store, not inside it.
+            if p.builtin_dirs && is_own_artifact(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             if let Ok(rel) = entry.path().strip_prefix(&self.root) {

@@ -1646,3 +1646,33 @@ fn ignore_file_names_map_to_the_policy_and_a_typo_is_refused() {
         "it names the valid ones: {err}"
     );
 }
+
+/// drsg's own store and log are below the floor, so a bare `digest .` in the
+/// directory it writes to does not read its own output back (issue #38).
+///
+/// Before this, `logs/drsg.log.<date>` was read as *prose*, which meant a
+/// pure-code tree demanded a chat provider it had no use for.
+#[test]
+fn drsg_does_not_ingest_its_own_store_or_log() {
+    let t = Tree::new("own-artifacts");
+    t.write("src/a.rs", "fn a() {}")
+        .write("logs/drsg.log.2026-09-26", "INFO opened database")
+        .write("graph.drsg/wal", "binary-ish")
+        .write("graph.drsg/LOCK", "")
+        .write("graph.drsg.hnsw", "sidecar")
+        .write("graph.drsg.bm25", "sidecar")
+        .write("other.drsg", "a store someone named differently");
+
+    let listed = t.host().list("").unwrap();
+    assert_eq!(
+        listed,
+        vec!["src/a.rs".to_string()],
+        "only the source is readable: {listed:?}"
+    );
+
+    // And the floor is what excluded them, so they are not counted against the
+    // project the way an ignore rule would be.
+    let r = t.host().report().unwrap();
+    assert_eq!(r.total, 1);
+    assert_eq!(r.skipped.len(), 0);
+}
