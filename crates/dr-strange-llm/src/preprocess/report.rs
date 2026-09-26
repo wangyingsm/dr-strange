@@ -36,12 +36,34 @@ impl std::fmt::Display for IgnoreRule {
     }
 }
 
-/// One withheld file and the rule that withheld it.
+/// Why a file the tree holds is not in the graph.
+///
+/// Two reasons, and not the same kind of thing: an ignore rule is the project
+/// declaring the file derived, which may be a mistake worth warning about;
+/// untracked is the operator having asked for `--tracked-only`, which never is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A pattern in one of the project's own ignore files.
+    Rule(IgnoreRule),
+    /// Git does not track it, and `tracked_only` is set (issue #38).
+    Untracked,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rule(r) => write!(f, "{r}"),
+            Self::Untracked => write!(f, "untracked"),
+        }
+    }
+}
+
+/// One withheld file and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     /// Root-relative.
     pub path: PathBuf,
-    pub rule: IgnoreRule,
+    pub reason: SkipReason,
 }
 
 /// What one walk of a tree came to.
@@ -61,21 +83,35 @@ pub struct WalkReport {
 }
 
 impl WalkReport {
-    /// The share of `total` the project's own rules withheld, 0.0 to 1.0.
+    /// Files an ignore *rule* withheld — not the ones `tracked_only` left out,
+    /// which the operator asked for.
+    pub fn by_rule(&self) -> impl Iterator<Item = &Skipped> {
+        self.skipped
+            .iter()
+            .filter(|s| matches!(s.reason, SkipReason::Rule(_)))
+    }
+
+    /// The share of `total` the project's own ignore rules withheld, 0.0 to 1.0.
     /// Zero when the tree is empty, so a caller need not special-case it.
+    ///
+    /// `tracked_only`'s exclusions are deliberately outside this: warning that
+    /// most of a tree was withheld, when what withheld it is the flag just
+    /// passed, would be noise.
     pub fn skipped_share(&self) -> f64 {
         if self.total == 0 {
             return 0.0;
         }
-        self.skipped.len() as f64 / self.total as f64
+        self.by_rule().count() as f64 / self.total as f64
     }
 
     /// The ignore files responsible, each with how many files it withheld,
     /// most first. What a warning names.
     pub fn culprits(&self) -> Vec<(PathBuf, usize)> {
         let mut by_file: BTreeMap<PathBuf, usize> = BTreeMap::new();
-        for s in &self.skipped {
-            *by_file.entry(s.rule.file.clone()).or_default() += 1;
+        for s in self.by_rule() {
+            if let SkipReason::Rule(r) = &s.reason {
+                *by_file.entry(r.file.clone()).or_default() += 1;
+            }
         }
         let mut out: Vec<(PathBuf, usize)> = by_file.into_iter().collect();
         // Most withheld first; the path breaks ties so the order is stable.

@@ -126,6 +126,7 @@ pub fn route_repository(dir: &Path, plugins: &Plugins) -> Result<Option<Preproce
             hidden: false,
             builtin_dirs: false,
             extra: Vec::new(),
+            tracked_only: false,
         },
     )
     .with_context(|| format!("opening {}", git.display()))?;
