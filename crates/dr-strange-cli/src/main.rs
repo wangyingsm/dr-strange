@@ -70,6 +70,16 @@ enum Command {
         /// and is not read unless asked for.
         #[arg(long)]
         ignore_files: Option<String>,
+        /// Read only what git tracks, leaving untracked files out of the
+        /// graph. A tracked file with uncommitted edits is still read as it
+        /// stands; the plane's sync point says when the two differ.
+        #[arg(long)]
+        tracked_only: bool,
+        /// Read only files an installed handler claims, leaving Markdown, PDF,
+        /// spreadsheets and unclaimed extensions out. A graph of a codebase,
+        /// not of the documents beside it.
+        #[arg(long)]
+        code_only: bool,
         /// Target plane. **Omitted**: the directory's own name, `startup`
         /// as the fallback.
         #[arg(long)]
@@ -574,6 +584,16 @@ enum Command {
         /// and is not read unless asked for.
         #[arg(long)]
         ignore_files: Option<String>,
+        /// Read only what git tracks, leaving untracked files out of the
+        /// graph. A tracked file with uncommitted edits is still read as it
+        /// stands; the plane's sync point says when the two differ.
+        #[arg(long)]
+        tracked_only: bool,
+        /// Read only files an installed handler claims, leaving Markdown, PDF,
+        /// spreadsheets and unclaimed extensions out. A graph of a codebase,
+        /// not of the documents beside it.
+        #[arg(long)]
+        code_only: bool,
     },
 }
 
@@ -595,6 +615,16 @@ enum ServeMode {
         /// and is not read unless asked for.
         #[arg(long)]
         ignore_files: Option<String>,
+        /// Read only what git tracks, leaving untracked files out of the
+        /// graph. A tracked file with uncommitted edits is still read as it
+        /// stands; the plane's sync point says when the two differ.
+        #[arg(long)]
+        tracked_only: bool,
+        /// Read only files an installed handler claims, leaving Markdown, PDF,
+        /// spreadsheets and unclaimed extensions out. A graph of a codebase,
+        /// not of the documents beside it.
+        #[arg(long)]
+        code_only: bool,
         /// Target plane. **Omitted**: the directory's own name, `startup`
         /// as the fallback.
         #[arg(long)]
@@ -932,6 +962,8 @@ fn run_bootstrap(
             token,
             rebuild,
             ignore_files,
+            tracked_only,
+            code_only,
         } => {
             // Both fall back to `drsg.toml`'s `[server]`, the same way
             // `serve` reads them — pinning an address and token there is what
@@ -946,6 +978,8 @@ fn run_bootstrap(
                 commands::InitArgs {
                     db_path,
                     verbose,
+                    tracked_only,
+                    code_only: config::code_only(cfg, code_only),
                     dir,
                     plane,
                     addr,
@@ -1466,6 +1500,8 @@ fn run_services(
                     force,
                     no_git,
                     ignore_files,
+                    tracked_only,
+                    code_only,
                 }) = mode
                 {
                     let plane = plane
@@ -1480,7 +1516,8 @@ fn run_services(
                     opts.source_root = Some(dir.clone());
                     let tree = commands::WatchTree {
                         dir: dir.clone(),
-                        policy: config::ignore_policy(cfg, ignore_files.as_deref())?,
+                        code_only: config::code_only(cfg, code_only),
+                        policy: config::ignore_policy(cfg, ignore_files.as_deref(), tracked_only)?,
                     };
                     opts.on_start = Some(Box::new(move |db| {
                         commands::watch(db, tree, plane, plugin_config, embed, force, !no_git)
@@ -1639,6 +1676,8 @@ fn run_plugins_and_ingest(
             no_git,
             git_plane,
             ignore_files,
+            tracked_only,
+            code_only,
         } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             // The `[plugins]` section, with the legacy flag folded in on top.
@@ -1651,7 +1690,7 @@ fn run_plugins_and_ingest(
                     .push(("include_source".to_string(), "true".to_string()));
             }
             let net = config::network(cfg)?;
-            let ignore = config::ignore_policy(cfg, ignore_files.as_deref())?;
+            let ignore = config::ignore_policy(cfg, ignore_files.as_deref(), tracked_only)?;
             let args = commands::DigestArgs {
                 source: &source,
                 topic: topic.as_deref(),
@@ -1659,6 +1698,7 @@ fn run_plugins_and_ingest(
                 depth,
                 ignore: &ignore,
                 verbose,
+                code_only: config::code_only(cfg, code_only),
                 net: &net,
                 plane: &plane.unwrap_or_else(|| commands::default_plane(&source)),
                 apply,

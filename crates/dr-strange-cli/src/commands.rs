@@ -159,6 +159,10 @@ pub struct InitArgs<'a> {
     /// Forwarded verbatim to the spawned `serve watch`, so the watcher reads
     /// the tree the way this command was told to (issue #36).
     pub ignore_files: Option<String>,
+    /// Forwarded likewise (issue #38).
+    pub tracked_only: bool,
+    /// Forwarded likewise (issue #38).
+    pub code_only: bool,
 }
 
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
@@ -204,6 +208,8 @@ pub fn init_bootstrap(
         token,
         rebuild,
         ignore_files,
+        tracked_only,
+        code_only,
     } = args;
     let db_path = if db_path.is_absolute() {
         db_path.to_path_buf()
@@ -212,20 +218,7 @@ pub fn init_bootstrap(
     };
     ensure_gitignore_patterns(&dir)?;
 
-    // The walk `serve watch` is about to do, accounted for here: the child's
-    // stdout goes to /dev/null, so this is the only place an operator can be
-    // told that most of their tree was withheld (issue #36).
-    let policy = dr_strange_llm::IgnorePolicy::from_names(
-        &ignore_files
-            .as_deref()
-            .unwrap_or("gitignore")
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>(),
-    )?;
-    let walked = dr_strange_llm::LocalFiles::with_policy(&dir, policy)?.report()?;
-    report_files(&walked, None, None, verbose, out)?;
+    report_planned_walk(&dir, ignore_files.as_deref(), tracked_only, verbose, out)?;
 
     // What a previous run left behind, and whether it is still answering.
     let recorded = recorded_endpoint(&dir);
@@ -301,6 +294,8 @@ pub fn init_bootstrap(
         token: &token,
         force,
         ignore_files: ignore_files.as_deref(),
+        tracked_only,
+        code_only,
     };
     let (pid, addr) = spawn_watcher(&watch, addr, picked, out)?;
 
@@ -410,6 +405,10 @@ struct Watch<'a> {
     /// Passed on to the child so it reads the tree the way `init` was told to;
     /// `None` leaves the child to read the config itself (issue #36).
     ignore_files: Option<&'a str>,
+    /// Likewise (issue #38); false leaves the child to read the config.
+    tracked_only: bool,
+    /// Likewise (issue #38).
+    code_only: bool,
 }
 
 /// A directory to read, and the rules deciding what in it counts as source.
@@ -422,6 +421,8 @@ struct Watch<'a> {
 struct TreeRead<'a> {
     dir: &'a Path,
     policy: &'a dr_strange_llm::IgnorePolicy,
+    /// Leave the document reader's pile out of the fold (issue #38).
+    code_only: bool,
 }
 
 #[cfg(feature = "digest")]
@@ -438,6 +439,7 @@ impl TreeRead<'_> {
 pub struct WatchTree {
     pub dir: std::path::PathBuf,
     pub policy: dr_strange_llm::IgnorePolicy,
+    pub code_only: bool,
 }
 
 /// Spawn `serve watch` detached, and wait until it is actually listening.
@@ -803,6 +805,8 @@ fn spawn_serve_watch(
         token,
         force,
         ignore_files,
+        tracked_only,
+        code_only,
     } = *watch;
     let mut cmd = std::process::Command::new(exe);
     cmd.current_dir(dir)
@@ -827,6 +831,12 @@ fn spawn_serve_watch(
     // and dropping the flag would silently restore the default instead.
     if let Some(list) = ignore_files {
         cmd.arg("--ignore-files").arg(list);
+    }
+    if tracked_only {
+        cmd.arg("--tracked-only");
+    }
+    if code_only {
+        cmd.arg("--code-only");
     }
     #[cfg(unix)]
     {
@@ -1578,9 +1588,56 @@ const UNBORN_RUN_ID: &str = "working-tree";
 pub const SYNC_COMMIT_PROP: &str = "synced_commit";
 #[cfg(feature = "digest")]
 pub const SYNC_ROOT_PROP: &str = "synced_root";
+/// How far the working tree had drifted from that commit (issue #38).
+#[cfg(feature = "digest")]
+pub const SYNC_MODIFIED_PROP: &str = "synced_modified";
+#[cfg(feature = "digest")]
+pub const SYNC_UNTRACKED_PROP: &str = "synced_untracked";
 
-/// Stamp the plane with the commit and parse basis it now reflects. A quiet
-/// no-op outside a git repository — there is no commit to speak of.
+/// How far the working tree had drifted from the commit when it was parsed.
+///
+/// Counted as git counts it, which is the right basis for the question this
+/// answers: a modified file was read in its modified form, so the graph holds
+/// something that commit does not.
+#[cfg(feature = "digest")]
+struct Drift {
+    modified: i64,
+    untracked: i64,
+}
+
+/// `git status`'s view of the tree, or `None` outside a repository.
+#[cfg(feature = "digest")]
+fn working_tree_drift(dir: &Path) -> Option<Drift> {
+    // `-z` because paths are data; `--porcelain=v1` because the format is
+    // documented stable and this parses it.
+    let out = git(dir, &["status", "--porcelain=v1", "-z"]).ok()?;
+    let mut drift = Drift {
+        modified: 0,
+        untracked: 0,
+    };
+    for entry in out.split(|b| *b == 0) {
+        // `XY <path>`: two status letters, a space, then the path.
+        if entry.len() < 3 {
+            continue;
+        }
+        match &entry[..2] {
+            b"??" => drift.untracked += 1,
+            // Anything else git reported is a tracked path that differs from
+            // HEAD, staged or not.
+            _ => drift.modified += 1,
+        }
+    }
+    Some(drift)
+}
+
+/// Stamp the plane with the commit it was parsed at, the parse basis, and how
+/// far the working tree had drifted from that commit. A quiet no-op outside a
+/// git repository — there is no commit to speak of.
+///
+/// The drift is the point (issue #38). The facts come from the *working tree*,
+/// so a plane can name a commit and hold a symbol from a file that commit never
+/// contained; recording the drift is what lets every reader say so instead of
+/// implying the two agree.
 #[cfg(feature = "digest")]
 fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> {
     let Ok(head) = git_head(dir) else {
@@ -1594,14 +1651,63 @@ fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> 
     let mut props = plane.properties()?;
     props.insert(
         SYNC_COMMIT_PROP.into(),
-        PropDesc::described("commit the plane reflects", PropValue::Str(head)),
+        // Not "the commit the plane reflects": the parse read the working tree,
+        // which that commit may not match. The drift below is how far.
+        PropDesc::described(
+            "commit HEAD was at when these facts were parsed",
+            PropValue::Str(head),
+        ),
     );
+    // Always written, both of them, so a plane that does not carry them is one
+    // an older drsg wrote — unknown drift rather than a clean tree.
+    if let Some(drift) = working_tree_drift(dir) {
+        props.insert(
+            SYNC_MODIFIED_PROP.into(),
+            PropDesc::described(
+                "tracked files differing from that commit when parsed",
+                PropValue::Int(drift.modified),
+            ),
+        );
+        props.insert(
+            SYNC_UNTRACKED_PROP.into(),
+            PropDesc::described(
+                "untracked files present when parsed",
+                PropValue::Int(drift.untracked),
+            ),
+        );
+    }
     props.insert(
         SYNC_ROOT_PROP.into(),
         PropDesc::described("directory the facts were parsed from", PropValue::Str(root)),
     );
     plane.set_properties(props)?;
     Ok(())
+}
+
+/// Account for the walk `serve watch` is about to do, before it is spawned.
+///
+/// Here rather than in the child because the child's stdout goes to /dev/null:
+/// this is the only place an operator can be told that most of their tree was
+/// withheld (issue #36), or that untracked files are being left out (#38).
+#[cfg(feature = "digest")]
+fn report_planned_walk(
+    dir: &Path,
+    ignore_files: Option<&str>,
+    tracked_only: bool,
+    verbose: Verbosity,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let mut policy = dr_strange_llm::IgnorePolicy::from_names(
+        &ignore_files
+            .unwrap_or("gitignore")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>(),
+    )?;
+    policy.tracked_only = tracked_only;
+    let walked = dr_strange_llm::LocalFiles::with_policy(dir, policy)?.report()?;
+    report_files(&walked, None, None, verbose, out)
 }
 
 /// The recorded sync point, if any: `(commit, root)`.
@@ -1637,6 +1743,7 @@ pub fn watch(
     let tree = TreeRead {
         dir: &tree.dir,
         policy: &tree.policy,
+        code_only: tree.code_only,
     };
     if let Err(e) = watch_loop(&db, tree, &plane_name, &plugin_config, embed, force, git) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
@@ -1763,7 +1870,9 @@ fn fold_one_move(
         return Ok(false);
     }
     let host = tree.host()?;
-    let stats = dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, source, now)?;
+    let claimed = dr_strange_llm::ClaimedOnly::new(&host, None, plugins);
+    let routed: &dyn dr_strange_llm::Host = if tree.code_only { &claimed } else { &host };
+    let stats = dr_strange_llm::sync_paths(db, plane_name, routed, &delta, plugins, source, now)?;
     tracing::info!(
         commit = %&now[..12.min(now.len())],
         changed = delta.changed.len(),
@@ -2034,12 +2143,14 @@ fn rebuild_from_tree(
     run_id: &str,
 ) -> Result<dr_strange_llm::SyncStats> {
     let host = tree.host()?;
+    let claimed = dr_strange_llm::ClaimedOnly::new(&host, None, plugins);
+    let routed: &dyn dr_strange_llm::Host = if tree.code_only { &claimed } else { &host };
     // Through tracing rather than the `-v` report: this runs in the server,
     // whose stdout `init` sends to /dev/null, and whose levels already decide
     // what an operator sees. The walk is the whole tree here, so the account is
     // worth its second pass (issue #36).
     trace_walk(&host, tree.dir);
-    dr_strange_llm::resync(db, plane_name, &host, plugins, source, run_id)
+    dr_strange_llm::resync(db, plane_name, routed, plugins, source, run_id)
 }
 
 /// Start watching a directory that has no HEAD to anchor on.
@@ -2715,6 +2826,8 @@ pub struct DigestArgs<'a> {
     pub ignore: &'a dr_strange_llm::IgnorePolicy,
     /// How much to say about which files were read.
     pub verbose: Verbosity,
+    /// Read only files a handler claims, leaving documents out (issue #38).
+    pub code_only: bool,
     /// URL only: where the crawl's requests go. The operator named this URL on
     /// their own command line, so it goes through their proxy — unlike a URL a
     /// caller hands the server, which is address-guarded instead.
@@ -3430,7 +3543,9 @@ fn read_source(
                 args.verbose,
                 out,
             )?;
-            let facts = dr_strange_llm::route_tree(&host, args.handler, plugins)?;
+            let claimed = dr_strange_llm::ClaimedOnly::new(&host, args.handler, plugins);
+            let routed: &dyn dr_strange_llm::Host = if args.code_only { &claimed } else { &host };
+            let facts = dr_strange_llm::route_tree(routed, args.handler, plugins)?;
             return Ok((facts, name));
         }
 
@@ -4213,7 +4328,7 @@ mod tests {
             skipped: (1..=3)
                 .map(|i| dr_strange_llm::Skipped {
                     path: std::path::PathBuf::from(format!("src/f{i}.rs")),
-                    rule: rule.clone(),
+                    reason: dr_strange_llm::SkipReason::Rule(rule.clone()),
                 })
                 .collect(),
         }
@@ -4278,10 +4393,10 @@ mod tests {
                 .collect(),
             skipped: vec![dr_strange_llm::Skipped {
                 path: std::path::PathBuf::from("gen/g.rs"),
-                rule: dr_strange_llm::IgnoreRule {
+                reason: dr_strange_llm::SkipReason::Rule(dr_strange_llm::IgnoreRule {
                     file: std::path::PathBuf::from(".gitignore"),
                     pattern: "gen/".to_string(),
-                },
+                }),
             }],
         };
         let quiet = cap(|o| report_files(&healthy, None, None, Verbosity::new(0), o));
@@ -5892,7 +6007,7 @@ fn report_files(
     }
     if v.withheld() {
         for s in &report.skipped {
-            writeln!(out, "  withheld {}  {}", s.path.display(), s.rule)?;
+            writeln!(out, "  withheld {}  {}", s.path.display(), s.reason)?;
         }
     }
 

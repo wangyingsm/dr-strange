@@ -200,6 +200,40 @@ fn rebuilding_note(props: &Properties) -> Option<String> {
 /// the graph may lag it. Silence means the plane records no sync point (a
 /// plain digest), where staleness is simply the digest's age — unless a
 /// rebuild is in flight, which outranks it and is said instead.
+/// What to add after the commit a plane names, when the tree it was parsed from
+/// did not match that commit (issue #38).
+///
+/// The facts come from the working tree, so a plane can name a commit and hold a
+/// symbol from a file that commit never contained. Saying the number is the
+/// difference between a reader trusting the label and a reader knowing what it
+/// is worth.
+///
+/// Silence means agreement — or a plane written before these were recorded,
+/// which is the same silence and deliberately so: inventing "clean" for a plane
+/// that never measured would be the overclaim this exists to end.
+fn drift_note(props: &crate::Properties) -> String {
+    let count = |k: &str| match props.get(k).map(|d| &d.value) {
+        Some(crate::PropValue::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let (modified, untracked) = (count("synced_modified"), count("synced_untracked"));
+    let mut parts = Vec::new();
+    if let Some(n) = modified.filter(|n| *n > 0) {
+        parts.push(format!("{n} modified"));
+    }
+    if let Some(n) = untracked.filter(|n| *n > 0) {
+        parts.push(format!("{n} untracked"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — parsed from a working tree with {}, so the graph holds what that \
+         commit does not",
+        parts.join(" and ")
+    )
+}
+
 fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
     let props = plane.properties()?;
     if let Some(note) = rebuilding_note(&props) {
@@ -210,8 +244,9 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
     // weighing a miss needs the second more than the first.
     let synced = props.get("synced_commit").and_then(|d| match &d.value {
         crate::PropValue::Str(commit) => Some(format!(
-            "synced: commit {}\n",
-            &commit[..12.min(commit.len())]
+            "synced: commit {}{}\n",
+            &commit[..12.min(commit.len())],
+            drift_note(&props)
         )),
         _ => None,
     });
@@ -1633,6 +1668,71 @@ mod tests {
         let out = history(&db.plane("code").unwrap(), None).unwrap();
         assert!(out.contains("no commits"), "{out}");
         assert!(out.contains("_git"), "it names where to look: {out}");
+    }
+
+    /// A plane whose facts came from a working tree that did not match the
+    /// commit it names says so (issue #38): before this, a graph holding a
+    /// symbol from an untracked file reported only `synced: commit <sha>`.
+    #[test]
+    fn a_plane_parsed_from_a_dirty_tree_says_the_commit_is_not_the_whole_story() {
+        let db = seeded();
+        let set = |modified: i64, untracked: i64| {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            props.insert(
+                "synced_modified".into(),
+                PropDesc::new(PropValue::Int(modified)),
+            );
+            props.insert(
+                "synced_untracked".into(),
+                PropDesc::new(PropValue::Int(untracked)),
+            );
+            p.set_properties(props).unwrap();
+        };
+
+        set(2, 1);
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("synced: commit abcdef012345"), "{out}");
+        assert!(out.contains("2 modified and 1 untracked"), "{out}");
+        assert!(
+            out.contains("the graph holds what that commit does not"),
+            "it says what the drift means: {out}"
+        );
+
+        // Only one kind of drift reads naturally too.
+        set(0, 3);
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("with 3 untracked, so"), "{out}");
+        assert!(!out.contains("modified"), "{out}");
+
+        // A tree that matched says nothing extra: the common case is unchanged.
+        set(0, 0);
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("synced: commit abcdef012345"), "{out}");
+        assert!(!out.contains("working tree"), "{out}");
+    }
+
+    /// A plane an older drsg wrote carries no drift props. That is unknown, not
+    /// clean, and inventing "clean" would be the overclaim this fixes.
+    #[test]
+    fn a_plane_without_drift_props_claims_nothing_about_the_tree() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("synced: commit abcdef012345"), "{out}");
+        assert!(!out.contains("working tree"), "{out}");
     }
 
     #[test]

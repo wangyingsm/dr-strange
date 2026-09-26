@@ -63,7 +63,7 @@ use ignore::overrides::OverrideBuilder;
 
 pub mod report;
 use rayon::prelude::*;
-pub use report::{IgnoreRule, Skipped, WalkReport};
+pub use report::{IgnoreRule, SkipReason, Skipped, WalkReport};
 
 use crate::digest::{DigestEdge, DigestNode, SOURCE_MARKER};
 
@@ -287,7 +287,26 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
     ".mypy_cache",
     ".pytest_cache",
     "vendor",
+    // drsg's own rolling log (`DRSG_LOG_DIR`, default `./logs`). Without this a
+    // `digest .` reads the log it is writing as it writes it — and reads it as
+    // prose, so a pure-code tree demands a chat provider it should not need
+    // (issue #38). `drsg init` puts `logs/` in `.gitignore` for the same
+    // reason; the floor should not depend on having run `init`.
+    "logs",
 ];
+
+/// drsg's own store, beside the tree it describes.
+///
+/// A database opened at `./graph.drsg` sits in the directory being walked, and
+/// its sidecars beside it. Reading them back in is never what anyone meant, and
+/// like `logs/` above it should not take an `init` to avoid (issue #38).
+fn is_own_artifact(name: &str) -> bool {
+    name.ends_with(".drsg")
+        || name.ends_with(".drsg.jsonl")
+        || name.ends_with(".drsg.hnsw")
+        || name.ends_with(".drsg.bm25")
+        || name.ends_with(".drsg.wal")
+}
 
 /// Which files the host will answer for.
 ///
@@ -317,6 +336,19 @@ pub struct IgnorePolicy {
     pub builtin_dirs: bool,
     /// Extra gitignore-syntax patterns from configuration.
     pub extra: Vec<String>,
+    /// Read only what git tracks (issue #38).
+    ///
+    /// An ignore file says what a project considers derived; the index says what
+    /// it has actually taken responsibility for. A generated report sitting
+    /// untracked in a working tree is neither ignored nor source, and it was
+    /// landing in the graph — under a plane that named a commit the file has
+    /// never been in.
+    ///
+    /// The *working tree's* bytes are still what is read, for the paths git
+    /// knows: a tracked file with uncommitted edits is parsed as it stands, not
+    /// as it was committed. That keeps the walk one `git ls-files` rather than a
+    /// `cat-file` per file, and the sync point says when the two differ.
+    pub tracked_only: bool,
 }
 
 impl Default for IgnorePolicy {
@@ -327,6 +359,7 @@ impl Default for IgnorePolicy {
             hidden: true,
             builtin_dirs: true,
             extra: Vec::new(),
+            tracked_only: false,
         }
     }
 }
@@ -379,6 +412,7 @@ impl IgnorePolicy {
             || self.dockerignore
             || self.hidden
             || self.builtin_dirs
+            || self.tracked_only
             || !self.extra.is_empty()
     }
 }
@@ -452,8 +486,11 @@ impl LocalFiles {
         }
         if p.builtin_dirs {
             builder.filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                // A native store is a *directory* (`graph.drsg/wal`), so it is
+                // pruned here rather than filtered per file below.
                 !(e.file_type().is_some_and(|t| t.is_dir())
-                    && IGNORED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                    && (IGNORED_DIRS.contains(&name.as_ref()) || is_own_artifact(&name)))
             });
         }
 
@@ -463,11 +500,43 @@ impl LocalFiles {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
+            // The sidecars sit beside the store, not inside it.
+            if p.builtin_dirs && is_own_artifact(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
             if let Ok(rel) = entry.path().strip_prefix(&self.root) {
                 out.push(rel.to_path_buf());
             }
         }
+        if p.tracked_only {
+            let tracked = self.tracked()?;
+            out.retain(|rel| tracked.contains(rel));
+        }
         Ok(out)
+    }
+
+    /// What git tracks under the root, root-relative.
+    ///
+    /// One `git ls-files` for the whole walk. Refuses rather than returning
+    /// nothing when the directory is not a repository: "tracked only" has no
+    /// meaning there, and silently reading zero files is how the bug this flag
+    /// answers would come back inverted (issue #38).
+    fn tracked(&self) -> Result<AHashSet<PathBuf>> {
+        let git = crate::git::Git::new(&self.root);
+        // Paths come out relative to `-C <root>`, which is the basis the walk
+        // reports in. `--cached` is the index; `--others` would be the untracked
+        // files this exists to exclude.
+        let raw = git.run(&["ls-files", "-z", "--cached"]).with_context(|| {
+            format!(
+                "listing git-tracked files in {} — --tracked-only needs a git repository",
+                self.root.display()
+            )
+        })?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(String::from_utf8_lossy(s).into_owned()))
+            .collect())
     }
 
     /// The walk, plus an account of what the project's own ignore files
@@ -490,6 +559,7 @@ impl LocalFiles {
                 hidden: self.policy.hidden,
                 builtin_dirs: self.policy.builtin_dirs,
                 extra: Vec::new(),
+                tracked_only: false,
             },
         )?
         .walk()?;
@@ -497,6 +567,11 @@ impl LocalFiles {
         let kept: AHashSet<&PathBuf> = admitted.iter().collect();
         let withheld: Vec<&PathBuf> = floor.iter().filter(|p| !kept.contains(*p)).collect();
 
+        let tracked = if self.policy.tracked_only {
+            Some(self.tracked()?)
+        } else {
+            None
+        };
         let skipped = if withheld.is_empty() {
             Vec::new()
         } else {
@@ -507,12 +582,22 @@ impl LocalFiles {
                 .into_iter()
                 .map(|p| Skipped {
                     path: p.clone(),
-                    rule: blame.blame(p, false).unwrap_or(IgnoreRule {
-                        // An `extra` pattern from configuration is in no file,
-                        // and is the only other thing that withholds.
-                        file: PathBuf::from("(configured ignore pattern)"),
-                        pattern: String::new(),
-                    }),
+                    // A rule is asked about first, because a file can be both:
+                    // an ignored file is usually untracked *because* it is
+                    // ignored, and the rule is the half an operator can act on
+                    // — it would withhold the file with `tracked_only` off too.
+                    // "Untracked" is for what passes the ignore files and is
+                    // still not in the index.
+                    reason: match (blame.blame(p, false), &tracked) {
+                        (Some(rule), _) => SkipReason::Rule(rule),
+                        (None, Some(t)) if !t.contains(p) => SkipReason::Untracked,
+                        (None, _) => SkipReason::Rule(IgnoreRule {
+                            // An `extra` pattern from configuration is in no
+                            // file, and is the only other thing that withholds.
+                            file: PathBuf::from("(configured ignore pattern)"),
+                            pattern: String::new(),
+                        }),
+                    },
                 })
                 .collect()
         };
@@ -998,6 +1083,56 @@ pub fn route_tree(
 /// files one commit touched, not the tree. Handlers may still pull *other*
 /// files through the host — that is where cross-file resolution comes from —
 /// but facts are only expected for the paths given.
+/// A [`Host`] that lists only files some installed handler claims (issue #38).
+///
+/// A decorator rather than a flag threaded through routing: `route_tree`,
+/// `resync` and `sync_paths` all already take a `&dyn Host`, so a digest, a
+/// watch fold and a rebuild get this from one place and no signature moves.
+///
+/// What it excludes is the built-in document reader's pile — Markdown, PDF,
+/// spreadsheets, and any extension nothing claims, which is read as plain text.
+/// Those belong in a graph of a *document*; in a graph of a *codebase* they are
+/// what a reporter watched take a plane from 346 nodes to 6,666.
+pub struct ClaimedOnly<'a> {
+    inner: &'a dyn Host,
+    /// `--handler` changes who claims what, so the same choice decides here.
+    handler: Option<&'a str>,
+    plugins: &'a Plugins,
+}
+
+impl<'a> ClaimedOnly<'a> {
+    pub fn new(inner: &'a dyn Host, handler: Option<&'a str>, plugins: &'a Plugins) -> Self {
+        Self {
+            inner,
+            handler,
+            plugins,
+        }
+    }
+}
+
+impl Host for ClaimedOnly<'_> {
+    fn list(&self, suffix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list(suffix)?
+            .into_iter()
+            .filter(|p| owner_of(self.plugins, p, self.handler).is_some())
+            .collect())
+    }
+
+    /// Delegated unfiltered, deliberately. A handler pulls the files *around*
+    /// the one it was given — a manifest, an included header — and those need
+    /// not be claimed by anyone. Narrowing `read` too would break cross-file
+    /// resolution to filter a listing.
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+
+    fn label(&self) -> Option<String> {
+        self.inner.label()
+    }
+}
+
 /// Which handler claims `path`, by the same rule [`route_paths`] buckets with.
 ///
 /// Shared so a report of what was read cannot disagree with what read it:

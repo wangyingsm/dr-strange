@@ -81,6 +81,14 @@ pub struct DigestCfg {
     /// honours neither and reads the tree as it sits (issue #36).
     #[cfg_attr(not(feature = "digest"), allow(dead_code))]
     pub ignore_files: Option<Vec<String>>,
+    /// Read only what git tracks. Omitted: false — the working tree is read,
+    /// which is what `synced_commit` then has to qualify (issue #38).
+    #[cfg_attr(not(feature = "digest"), allow(dead_code))]
+    pub tracked_only: Option<bool>,
+    /// Read only files a handler claims, leaving Markdown, PDFs and unclaimed
+    /// extensions out of a code graph. Omitted: false (issue #38).
+    #[cfg_attr(not(feature = "digest"), allow(dead_code))]
+    pub code_only: Option<bool>,
 }
 
 /// The `[network]` section — where this binary's own requests go.
@@ -340,28 +348,50 @@ pub fn retain_commits(cfg: &Config) -> Option<u64> {
     }
 }
 
-/// Which ignore files decide what is source: `--ignore-files` if given, else
-/// `[digest] ignore_files`, else the default (`gitignore` alone).
+/// What decides which files are source: the ignore files to honour, and
+/// whether to read only what git tracks.
 ///
-/// One reading shared by `digest`, `init` and the watch folds, so a tree is
-/// read the same way however it is reached.
+/// Each is `--flag` if given, else its `[digest]` key, else the default —
+/// `gitignore` alone, and the whole working tree. One reading shared by
+/// `digest`, `init` and the watch folds, so a tree is read the same way however
+/// it is reached.
 #[cfg(feature = "digest")]
-pub fn ignore_policy(cfg: &Config, flag: Option<&str>) -> Result<dr_strange_llm::IgnorePolicy> {
+pub fn ignore_policy(
+    cfg: &Config,
+    ignore_files: Option<&str>,
+    tracked_only: bool,
+) -> Result<dr_strange_llm::IgnorePolicy> {
     // An empty flag value is how a shell says "none", and splitting "" would
     // otherwise yield one empty name and be refused.
-    if let Some(list) = flag {
-        let names: Vec<&str> = list
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        return dr_strange_llm::IgnorePolicy::from_names(&names).context("the --ignore-files flag");
-    }
-    match &cfg.digest.ignore_files {
-        Some(names) => dr_strange_llm::IgnorePolicy::from_names(names)
-            .context("the `ignore_files` key in the [digest] config section"),
-        None => Ok(dr_strange_llm::IgnorePolicy::default()),
-    }
+    let mut policy = match ignore_files {
+        Some(list) => {
+            let names: Vec<&str> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            dr_strange_llm::IgnorePolicy::from_names(&names).context("the --ignore-files flag")?
+        }
+        None => match &cfg.digest.ignore_files {
+            Some(names) => dr_strange_llm::IgnorePolicy::from_names(names)
+                .context("the `ignore_files` key in the [digest] config section")?,
+            None => dr_strange_llm::IgnorePolicy::default(),
+        },
+    };
+    // The flag only turns it on: `--tracked-only` is a request, and its absence
+    // is not a request for the opposite, so the file still decides.
+    policy.tracked_only = tracked_only || cfg.digest.tracked_only.unwrap_or(false);
+    Ok(policy)
+}
+
+/// Whether to read only what a handler claims: `--code-only` if passed, else
+/// `[digest] code_only` (issue #38).
+///
+/// The flag only turns it on, like `--tracked-only`: its absence is not a
+/// request for the opposite, so the file still decides.
+#[cfg(feature = "digest")]
+pub fn code_only(cfg: &Config, flag: bool) -> bool {
+    flag || cfg.digest.code_only.unwrap_or(false)
 }
 
 /// The outbound proxy policy: `[network]` from the file, with the environment
@@ -758,32 +788,35 @@ mod tests {
         let file = parse("[digest]\nignore_files = [\"gitignore\", \"dockerignore\"]\n");
 
         // The default: gitignore alone, `.dockerignore` not read.
-        let d = ignore_policy(&parse("[digest]\n"), None).unwrap();
+        let d = ignore_policy(&parse("[digest]\n"), None, false).unwrap();
         assert_eq!(d.names(), vec!["gitignore"]);
 
         // The file, when there is no flag.
-        let f = ignore_policy(&file, None).unwrap();
+        let f = ignore_policy(&file, None, false).unwrap();
         assert_eq!(f.names(), vec!["gitignore", "dockerignore"]);
 
         // The flag, over the file.
-        let g = ignore_policy(&file, Some("gitignore")).unwrap();
+        let g = ignore_policy(&file, Some("gitignore"), false).unwrap();
         assert_eq!(g.names(), vec!["gitignore"]);
 
         // An empty flag is "none", not "unset" — the difference a shell needs.
-        let n = ignore_policy(&file, Some("")).unwrap();
+        let n = ignore_policy(&file, Some(""), false).unwrap();
         assert!(n.names().is_empty());
 
         // Whitespace around a name is forgiven; a typo is not.
         assert_eq!(
-            ignore_policy(&file, Some(" dockerignore , gitignore "))
+            ignore_policy(&file, Some(" dockerignore , gitignore "), false)
                 .unwrap()
                 .names(),
             vec!["gitignore", "dockerignore"]
         );
-        let err = format!("{:#}", ignore_policy(&file, Some("nope")).unwrap_err());
+        let err = format!(
+            "{:#}",
+            ignore_policy(&file, Some("nope"), false).unwrap_err()
+        );
         assert!(err.contains("--ignore-files"), "{err}");
         let bad = parse("[digest]\nignore_files = [\"nope\"]\n");
-        let err = format!("{:#}", ignore_policy(&bad, None).unwrap_err());
+        let err = format!("{:#}", ignore_policy(&bad, None, false).unwrap_err());
         assert!(err.contains("[digest]"), "{err}");
     }
 }

@@ -258,6 +258,8 @@ embed_provider = "openai"                   # search / write_nodes / watch 重�
 embed_model = "text-embedding-3-small"      # 其模型（各提供方均有默认值）
 embed_key_env = "OPENAI_API_KEY"            # 存放密钥的环境变量
 ignore_files = ["gitignore"]                # 由谁的忽略文件决定什么是源码；[] 表示两者都不读
+tracked_only = false                        # 置为 true 则只读取 git 已跟踪的文件
+code_only = false                           # 置为 true 则只读取处理器认领的文件（不含 Markdown/PDF）
 
 [plugins]                                   # 预处理沙箱调优（均可省略）
 fuel = 200000000000                         # 每次沙箱调用的指令预算（0 为不设限）

@@ -366,6 +366,7 @@ fn the_host_will_not_read_what_it_would_not_list() {
             hidden: false,
             builtin_dirs: false,
             extra: Vec::new(),
+            tracked_only: false,
         },
     )
     .unwrap();
@@ -1491,8 +1492,11 @@ fn the_report_names_the_file_and_pattern_that_withheld_the_source() {
 
     // Every one of them is blamed on the file and the pattern as written.
     for s in &r.skipped {
-        assert_eq!(s.rule.file, std::path::Path::new(".dockerignore"));
-        assert_eq!(s.rule.pattern, "src/");
+        let SkipReason::Rule(rule) = &s.reason else {
+            panic!("expected an ignore rule, got {}", s.reason);
+        };
+        assert_eq!(rule.file, std::path::Path::new(".dockerignore"));
+        assert_eq!(rule.pattern, "src/");
     }
     assert_eq!(
         r.culprits(),
@@ -1535,7 +1539,10 @@ fn the_nearest_ignore_file_is_the_one_blamed() {
     let mut blamed: Vec<(String, String)> = r
         .skipped
         .iter()
-        .map(|s| (s.rule.file.display().to_string(), s.rule.pattern.clone()))
+        .map(|s| match &s.reason {
+            SkipReason::Rule(r) => (r.file.display().to_string(), r.pattern.clone()),
+            other => panic!("expected an ignore rule, got {other}"),
+        })
         .collect();
     blamed.sort();
     blamed.dedup();
@@ -1645,4 +1652,214 @@ fn ignore_file_names_map_to_the_policy_and_a_typo_is_refused() {
         err.contains("dockerignore"),
         "it names the valid ones: {err}"
     );
+}
+
+/// drsg's own store and log are below the floor, so a bare `digest .` in the
+/// directory it writes to does not read its own output back (issue #38).
+///
+/// Before this, `logs/drsg.log.<date>` was read as *prose*, which meant a
+/// pure-code tree demanded a chat provider it had no use for.
+#[test]
+fn drsg_does_not_ingest_its_own_store_or_log() {
+    let t = Tree::new("own-artifacts");
+    t.write("src/a.rs", "fn a() {}")
+        .write("logs/drsg.log.2026-09-26", "INFO opened database")
+        .write("graph.drsg/wal", "binary-ish")
+        .write("graph.drsg/LOCK", "")
+        .write("graph.drsg.hnsw", "sidecar")
+        .write("graph.drsg.bm25", "sidecar")
+        .write("other.drsg", "a store someone named differently");
+
+    let listed = t.host().list("").unwrap();
+    assert_eq!(
+        listed,
+        vec!["src/a.rs".to_string()],
+        "only the source is readable: {listed:?}"
+    );
+
+    // And the floor is what excluded them, so they are not counted against the
+    // project the way an ignore rule would be.
+    let r = t.host().report().unwrap();
+    assert_eq!(r.total, 1);
+    assert_eq!(r.skipped.len(), 0);
+}
+
+/// Run git in `dir`, isolated from the user's configuration.
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git runs")
+        .success();
+    assert!(ok, "git {args:?} failed in {}", dir.display());
+}
+
+/// `tracked_only` reads what git has taken responsibility for, and nothing else
+/// (issue #38): a generated report sitting untracked in a working tree is
+/// neither ignored nor source, and it was landing in the graph under a plane
+/// that named a commit the file had never been in.
+#[test]
+fn tracked_only_reads_the_index_not_the_working_tree() {
+    let t = Tree::new("tracked-only");
+    t.write("src/committed.rs", "fn c() {}")
+        .write("src/also_committed.rs", "fn a() {}");
+    git_in(&t.0, &["init", "-q", "-b", "main"]);
+    git_in(&t.0, &["add", "-A"]);
+    git_in(&t.0, &["commit", "-qm", "init"]);
+
+    // Added after the commit: not ignored, not tracked.
+    t.write("src/generated_report.md", "# generated")
+        .write("src/untracked.rs", "fn u() {}");
+    // And a tracked file edited but not committed: still read, in its working
+    // form, because the index knows the path.
+    t.write("src/committed.rs", "fn c() {}\nfn added_since() {}");
+
+    let all = t.host().list("").unwrap();
+    assert!(
+        all.contains(&"src/untracked.rs".to_string()),
+        "the default reads the working tree: {all:?}"
+    );
+
+    let tracked = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            tracked_only: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let listed = tracked.list("").unwrap();
+    assert_eq!(
+        listed,
+        vec![
+            "src/also_committed.rs".to_string(),
+            "src/committed.rs".to_string()
+        ],
+        "only what the index holds: {listed:?}"
+    );
+    // The working tree's bytes, for a path the index knows.
+    let body = String::from_utf8(tracked.read("src/committed.rs").unwrap()).unwrap();
+    assert!(
+        body.contains("added_since"),
+        "a tracked file is read as it stands: {body}"
+    );
+    // And a file it would not list, it will not read.
+    assert!(tracked.read("src/untracked.rs").is_err());
+}
+
+/// "Tracked only" has no meaning outside a repository, so it refuses instead of
+/// quietly reading nothing — which would be this bug inverted.
+#[test]
+fn tracked_only_refuses_a_directory_that_is_not_a_repository() {
+    let t = Tree::new("tracked-no-repo");
+    t.write("src/a.rs", "fn a() {}");
+    let host = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            tracked_only: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let err = format!("{:#}", host.list("").unwrap_err());
+    assert!(
+        err.contains("--tracked-only needs a git repository"),
+        "{err}"
+    );
+}
+
+/// The two reasons a file can be withheld are kept apart.
+///
+/// Caught by the flags meeting: with `tracked_only` on, an untracked file was
+/// being blamed on `(configured ignore pattern)` and warned about as an ignore
+/// rule. Nothing ignored it — the operator asked for it — so it is neither
+/// blamed nor counted toward the over-exclusion warning.
+#[test]
+fn an_untracked_file_is_not_blamed_on_an_ignore_rule() {
+    let t = Tree::new("skip-reasons");
+    t.write("kept.rs", "fn k() {}")
+        .write("gen/dropped.rs", "fn d() {}")
+        .write(".gitignore", "gen/\n");
+    git_in(&t.0, &["init", "-q", "-b", "main"]);
+    git_in(&t.0, &["add", "-A"]);
+    git_in(&t.0, &["commit", "-qm", "init"]);
+    t.write("untracked.rs", "fn u() {}");
+
+    let host = LocalFiles::with_policy(
+        &t.0,
+        IgnorePolicy {
+            tracked_only: true,
+            ..IgnorePolicy::default()
+        },
+    )
+    .unwrap();
+    let r = host.report().unwrap();
+
+    let mut reasons: Vec<(String, String)> = r
+        .skipped
+        .iter()
+        .map(|s| (s.path.display().to_string(), s.reason.to_string()))
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            (
+                "gen/dropped.rs".to_string(),
+                "`gen/` in .gitignore".to_string()
+            ),
+            ("untracked.rs".to_string(), "untracked".to_string()),
+        ]
+    );
+
+    // Only the ignore rule counts toward the warning, and only it is blamed.
+    assert_eq!(r.by_rule().count(), 1);
+    assert_eq!(
+        r.culprits(),
+        vec![(std::path::PathBuf::from(".gitignore"), 1)]
+    );
+    // 1 rule-withheld of 3 above the floor — below the warning threshold, where
+    // counting the untracked file too would have pushed it over.
+    assert!(r.skipped_share() < 0.5, "{}", r.skipped_share());
+}
+
+/// `ClaimedOnly` lists what a handler claims and nothing else (issue #38): the
+/// Markdown and PDFs a reporter watched take a plane from 346 nodes to 6,666.
+#[test]
+fn claimed_only_lists_code_and_not_the_documents_beside_it() {
+    let t = Tree::new("claimed-only");
+    t.write("src/a.aa", "aa source")
+        .write("README.md", "# prose")
+        .write("report.pdf", "%PDF-1.4 not really")
+        .write("notes.txt", "loose notes")
+        .write("data.mystery", "an extension nothing claims");
+
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+    let host = t.host();
+    // Everything is readable; the decorator narrows only what is *listed*.
+    assert_eq!(host.list("").unwrap().len(), 5);
+
+    let claimed = ClaimedOnly::new(&host, None, &plugins);
+    assert_eq!(
+        claimed.list("").unwrap(),
+        vec!["src/a.aa".to_string()],
+        "only the file a handler claims"
+    );
+
+    // `read` still answers for the rest: a handler pulls the files around the
+    // one it was given, and narrowing that would break cross-file resolution.
+    assert!(claimed.read("README.md").is_ok());
+    assert_eq!(claimed.label(), host.label());
 }

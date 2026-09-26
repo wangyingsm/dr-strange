@@ -300,7 +300,58 @@ $ drsg digest . --ignore-files ''                  # neither; read the tree as i
 
 `[digest] ignore_files` in `drsg.toml` sets it for every run, and the same flag
 is accepted by `drsg init` and `drsg serve watch`. Whatever is chosen, drsg's own
-floor stands: dotfiles and the build directories above are skipped regardless.
+floor stands: dotfiles, the build directories above, and drsg's own store and
+`logs/` are skipped regardless.
+
+### The working tree, not a commit
+
+The walk reads the **working tree**. An ignore file says what a project
+considers derived; git's index says what it has taken responsibility for, and
+those are not the same list. A generated report sitting untracked is neither
+ignored nor source, and by default it is read.
+
+`--tracked-only` reads only what git tracks:
+
+```console
+$ drsg digest . --tracked-only
+```
+
+A tracked file with uncommitted edits is still read **as it stands** — the flag
+filters paths, not content, which is one `git ls-files` rather than a `git
+cat-file` per file. Outside a git repository it refuses rather than quietly
+reading nothing.
+
+Either way, a plane records how far the tree had drifted from the commit it
+names, and every answer read from it says so:
+
+```
+synced: commit ec31cac58593 — parsed from a working tree with 2 modified and
+1 untracked, so the graph holds what that commit does not
+```
+
+Silence there means the tree matched — or that the plane was written before drsg
+recorded this, which is the same silence on purpose: claiming "clean" for a plane
+that never measured would be the overclaim this replaced.
+
+### Code, or the documents beside it
+
+Markdown, PDFs, spreadsheets and any extension no installed handler claims are
+read by the built-in document reader, as prose. That is the point in a graph *of
+a document*; in a graph of a codebase it is how a plane goes from hundreds of
+nodes to thousands. `--code-only` reads only what a handler claims:
+
+```console
+$ drsg digest . --code-only
+```
+
+A useful side effect: prose is what needs a model, so a code-only digest of a
+pure-code tree makes no chat call at all. `read` is deliberately *not* narrowed
+— a handler pulls the files around the one it was given, a manifest or an
+included header, and those need not be claimed by anyone.
+
+`[digest] tracked_only` and `[digest] code_only` set both for every run. Each
+flag only turns its setting **on**: not passing it is not a request for the
+opposite, so the file still decides.
 
 ### Knowing what was read
 
