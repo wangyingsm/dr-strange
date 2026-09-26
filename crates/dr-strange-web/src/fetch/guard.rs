@@ -97,7 +97,14 @@ fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
         return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
     // v4-compatible ::a.b.c.d (deprecated, still routable by some stacks).
-    if s[0..6] == [0, 0, 0, 0, 0, 0] && (s[6] != 0 || s[7] != 0) {
+    //
+    // `::1` is excluded: it is IPv6 *loopback*, not the v4-compatible form of
+    // `0.0.0.1`, and reading it as the latter had `classify` call it "an
+    // unspecified address". Both are refused either way — this is the reason
+    // being right, not the verdict. `::` is excluded for the same reason and is
+    // already unspecified to `classify_v6`. `s[7] > 1` keeps `::0.0.0.2` and
+    // anything above it on the v4 path, where `0.0.0.0/8` refuses them.
+    if s[0..6] == [0, 0, 0, 0, 0, 0] && (s[6] != 0 || s[7] > 1) {
         return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
     // 6to4: the v4 address is the 32 bits after the 2002::/16 prefix.
@@ -224,15 +231,18 @@ pub fn precheck(url: &Url, allow: &[Prefix], net: &Network) -> Result<()> {
     if proxied(url, net) {
         return Ok(());
     }
-    let host = url.host_str().unwrap_or_default();
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<SocketAddr> = (host, port)
+    // Through `destination`, which strips the brackets `Url` keeps around an
+    // IPv6 literal. `(&str, u16)` parses a bare `::1` as an address and needs no
+    // DNS; handed `[::1]` it finds no such host and reports a resolution failure
+    // for something that was never a name.
+    let to = destination(url);
+    let addrs: Vec<SocketAddr> = (to.host, to.port)
         .to_socket_addrs()
-        .map_err(|e| anyhow::anyhow!("cannot resolve {host}: {e}"))?
+        .map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", to.host))?
         .collect();
     match filter(addrs, allow) {
         Ok(_) => Ok(()),
-        Err(why) => bail!("refusing to connect to {host}: {why}"),
+        Err(why) => bail!("refusing to connect to {}: {why}", to.host),
     }
 }
 
@@ -449,6 +459,64 @@ mod tests {
         precheck(u, allow, Network::DIRECT)
             .expect_err("must be refused")
             .to_string()
+    }
+
+    /// `::1` is loopback, not the v4-compatible spelling of `0.0.0.1`.
+    ///
+    /// `embedded_v4` claimed every `::`-prefixed address with any low bit set,
+    /// which swept up loopback and had `classify` report "an unspecified
+    /// address" for it. Refused either way, so this was the reason being wrong
+    /// rather than a hole — and the reason is what an operator reads.
+    #[test]
+    fn loopback_and_unspecified_are_not_v4_compatible_addresses() {
+        assert_eq!(classify(ip("::1")), Some("loopback"));
+        assert_eq!(classify(ip("::")), Some("an unspecified address"));
+
+        // Everything that *was* refused on the v4 path still is: the embedded
+        // address sits in 0.0.0.0/8, which `classify_v4` names.
+        assert_eq!(classify(ip("::0.0.0.2")), Some("an unspecified address"));
+        assert_eq!(classify(ip("::0.1.2.3")), Some("an unspecified address"));
+        // And a real v4-compatible address is still read as its v4 self.
+        assert_eq!(classify(ip("::127.0.0.1")), Some("loopback"));
+        assert_eq!(classify(ip("::10.0.0.1")), Some("a private address"));
+        assert_eq!(
+            classify(ip("::169.254.169.254")),
+            Some("link-local (cloud metadata lives here)")
+        );
+    }
+
+    /// An IPv6-literal URL is refused for the right reason.
+    ///
+    /// `Url::host_str` brackets the literal, and `to_socket_addrs` cannot take
+    /// `[::1]` — so the refusal came out as "cannot resolve", which is a DNS
+    /// story about an address that needs no DNS. It always failed closed, so
+    /// this was a message bug rather than a hole, but the message is what an
+    /// operator debugs from.
+    #[test]
+    fn an_ipv6_literal_is_refused_as_the_address_it_is() {
+        let loopback = guard_err(&url("http://[::1]:8080/x"), &[]);
+        assert!(
+            loopback.contains("loopback"),
+            "it is loopback, and nothing about DNS: {loopback}"
+        );
+        assert!(
+            !loopback.contains("cannot resolve"),
+            "an address literal is not resolved: {loopback}"
+        );
+        assert!(
+            loopback.contains("::1") && !loopback.contains("[::1]"),
+            "the host reads as an address, unbracketed: {loopback}"
+        );
+
+        // A v4-mapped literal is the same address by another spelling.
+        let mapped = guard_err(&url("http://[::ffff:127.0.0.1]:8080/x"), &[]);
+        assert!(mapped.contains("loopback"), "{mapped}");
+
+        // And a public v6 literal still passes.
+        assert!(
+            precheck(&url("http://[2606:4700::1111]/"), &[], Network::DIRECT).is_ok(),
+            "a routable v6 address is fetched"
+        );
     }
 
     /// A policy that proxies everything, as `https_proxy=http://127.0.0.1:7897`
