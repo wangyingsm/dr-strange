@@ -1834,3 +1834,32 @@ fn an_untracked_file_is_not_blamed_on_an_ignore_rule() {
     // counting the untracked file too would have pushed it over.
     assert!(r.skipped_share() < 0.5, "{}", r.skipped_share());
 }
+
+/// `ClaimedOnly` lists what a handler claims and nothing else (issue #38): the
+/// Markdown and PDFs a reporter watched take a plane from 346 nodes to 6,666.
+#[test]
+fn claimed_only_lists_code_and_not_the_documents_beside_it() {
+    let t = Tree::new("claimed-only");
+    t.write("src/a.aa", "aa source")
+        .write("README.md", "# prose")
+        .write("report.pdf", "%PDF-1.4 not really")
+        .write("notes.txt", "loose notes")
+        .write("data.mystery", "an extension nothing claims");
+
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+    let host = t.host();
+    // Everything is readable; the decorator narrows only what is *listed*.
+    assert_eq!(host.list("").unwrap().len(), 5);
+
+    let claimed = ClaimedOnly::new(&host, None, &plugins);
+    assert_eq!(
+        claimed.list("").unwrap(),
+        vec!["src/a.aa".to_string()],
+        "only the file a handler claims"
+    );
+
+    // `read` still answers for the rest: a handler pulls the files around the
+    // one it was given, and narrowing that would break cross-file resolution.
+    assert!(claimed.read("README.md").is_ok());
+    assert_eq!(claimed.label(), host.label());
+}

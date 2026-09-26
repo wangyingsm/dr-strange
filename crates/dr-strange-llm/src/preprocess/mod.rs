@@ -1083,6 +1083,56 @@ pub fn route_tree(
 /// files one commit touched, not the tree. Handlers may still pull *other*
 /// files through the host — that is where cross-file resolution comes from —
 /// but facts are only expected for the paths given.
+/// A [`Host`] that lists only files some installed handler claims (issue #38).
+///
+/// A decorator rather than a flag threaded through routing: `route_tree`,
+/// `resync` and `sync_paths` all already take a `&dyn Host`, so a digest, a
+/// watch fold and a rebuild get this from one place and no signature moves.
+///
+/// What it excludes is the built-in document reader's pile — Markdown, PDF,
+/// spreadsheets, and any extension nothing claims, which is read as plain text.
+/// Those belong in a graph of a *document*; in a graph of a *codebase* they are
+/// what a reporter watched take a plane from 346 nodes to 6,666.
+pub struct ClaimedOnly<'a> {
+    inner: &'a dyn Host,
+    /// `--handler` changes who claims what, so the same choice decides here.
+    handler: Option<&'a str>,
+    plugins: &'a Plugins,
+}
+
+impl<'a> ClaimedOnly<'a> {
+    pub fn new(inner: &'a dyn Host, handler: Option<&'a str>, plugins: &'a Plugins) -> Self {
+        Self {
+            inner,
+            handler,
+            plugins,
+        }
+    }
+}
+
+impl Host for ClaimedOnly<'_> {
+    fn list(&self, suffix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list(suffix)?
+            .into_iter()
+            .filter(|p| owner_of(self.plugins, p, self.handler).is_some())
+            .collect())
+    }
+
+    /// Delegated unfiltered, deliberately. A handler pulls the files *around*
+    /// the one it was given — a manifest, an included header — and those need
+    /// not be claimed by anyone. Narrowing `read` too would break cross-file
+    /// resolution to filter a listing.
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+
+    fn label(&self) -> Option<String> {
+        self.inner.label()
+    }
+}
+
 /// Which handler claims `path`, by the same rule [`route_paths`] buckets with.
 ///
 /// Shared so a report of what was read cannot disagree with what read it:

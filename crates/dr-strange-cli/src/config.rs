@@ -85,6 +85,10 @@ pub struct DigestCfg {
     /// which is what `synced_commit` then has to qualify (issue #38).
     #[cfg_attr(not(feature = "digest"), allow(dead_code))]
     pub tracked_only: Option<bool>,
+    /// Read only files a handler claims, leaving Markdown, PDFs and unclaimed
+    /// extensions out of a code graph. Omitted: false (issue #38).
+    #[cfg_attr(not(feature = "digest"), allow(dead_code))]
+    pub code_only: Option<bool>,
 }
 
 /// The `[network]` section — where this binary's own requests go.
@@ -378,6 +382,16 @@ pub fn ignore_policy(
     // is not a request for the opposite, so the file still decides.
     policy.tracked_only = tracked_only || cfg.digest.tracked_only.unwrap_or(false);
     Ok(policy)
+}
+
+/// Whether to read only what a handler claims: `--code-only` if passed, else
+/// `[digest] code_only` (issue #38).
+///
+/// The flag only turns it on, like `--tracked-only`: its absence is not a
+/// request for the opposite, so the file still decides.
+#[cfg(feature = "digest")]
+pub fn code_only(cfg: &Config, flag: bool) -> bool {
+    flag || cfg.digest.code_only.unwrap_or(false)
 }
 
 /// The outbound proxy policy: `[network]` from the file, with the environment

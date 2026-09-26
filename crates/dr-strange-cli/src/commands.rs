@@ -161,6 +161,8 @@ pub struct InitArgs<'a> {
     pub ignore_files: Option<String>,
     /// Forwarded likewise (issue #38).
     pub tracked_only: bool,
+    /// Forwarded likewise (issue #38).
+    pub code_only: bool,
 }
 
 /// Bootstraps `dir` for agent MCP access: ensures `.gitignore` covers the
@@ -207,6 +209,7 @@ pub fn init_bootstrap(
         rebuild,
         ignore_files,
         tracked_only,
+        code_only,
     } = args;
     let db_path = if db_path.is_absolute() {
         db_path.to_path_buf()
@@ -292,6 +295,7 @@ pub fn init_bootstrap(
         force,
         ignore_files: ignore_files.as_deref(),
         tracked_only,
+        code_only,
     };
     let (pid, addr) = spawn_watcher(&watch, addr, picked, out)?;
 
@@ -403,6 +407,8 @@ struct Watch<'a> {
     ignore_files: Option<&'a str>,
     /// Likewise (issue #38); false leaves the child to read the config.
     tracked_only: bool,
+    /// Likewise (issue #38).
+    code_only: bool,
 }
 
 /// A directory to read, and the rules deciding what in it counts as source.
@@ -415,6 +421,8 @@ struct Watch<'a> {
 struct TreeRead<'a> {
     dir: &'a Path,
     policy: &'a dr_strange_llm::IgnorePolicy,
+    /// Leave the document reader's pile out of the fold (issue #38).
+    code_only: bool,
 }
 
 #[cfg(feature = "digest")]
@@ -431,6 +439,7 @@ impl TreeRead<'_> {
 pub struct WatchTree {
     pub dir: std::path::PathBuf,
     pub policy: dr_strange_llm::IgnorePolicy,
+    pub code_only: bool,
 }
 
 /// Spawn `serve watch` detached, and wait until it is actually listening.
@@ -797,6 +806,7 @@ fn spawn_serve_watch(
         force,
         ignore_files,
         tracked_only,
+        code_only,
     } = *watch;
     let mut cmd = std::process::Command::new(exe);
     cmd.current_dir(dir)
@@ -824,6 +834,9 @@ fn spawn_serve_watch(
     }
     if tracked_only {
         cmd.arg("--tracked-only");
+    }
+    if code_only {
+        cmd.arg("--code-only");
     }
     #[cfg(unix)]
     {
@@ -1660,6 +1673,7 @@ pub fn watch(
     let tree = TreeRead {
         dir: &tree.dir,
         policy: &tree.policy,
+        code_only: tree.code_only,
     };
     if let Err(e) = watch_loop(&db, tree, &plane_name, &plugin_config, embed, force, git) {
         tracing::error!(error = format!("{e:#}"), "repository watch stopped");
@@ -1786,7 +1800,9 @@ fn fold_one_move(
         return Ok(false);
     }
     let host = tree.host()?;
-    let stats = dr_strange_llm::sync_paths(db, plane_name, &host, &delta, plugins, source, now)?;
+    let claimed = dr_strange_llm::ClaimedOnly::new(&host, None, plugins);
+    let routed: &dyn dr_strange_llm::Host = if tree.code_only { &claimed } else { &host };
+    let stats = dr_strange_llm::sync_paths(db, plane_name, routed, &delta, plugins, source, now)?;
     tracing::info!(
         commit = %&now[..12.min(now.len())],
         changed = delta.changed.len(),
@@ -2057,12 +2073,14 @@ fn rebuild_from_tree(
     run_id: &str,
 ) -> Result<dr_strange_llm::SyncStats> {
     let host = tree.host()?;
+    let claimed = dr_strange_llm::ClaimedOnly::new(&host, None, plugins);
+    let routed: &dyn dr_strange_llm::Host = if tree.code_only { &claimed } else { &host };
     // Through tracing rather than the `-v` report: this runs in the server,
     // whose stdout `init` sends to /dev/null, and whose levels already decide
     // what an operator sees. The walk is the whole tree here, so the account is
     // worth its second pass (issue #36).
     trace_walk(&host, tree.dir);
-    dr_strange_llm::resync(db, plane_name, &host, plugins, source, run_id)
+    dr_strange_llm::resync(db, plane_name, routed, plugins, source, run_id)
 }
 
 /// Start watching a directory that has no HEAD to anchor on.
@@ -2738,6 +2756,8 @@ pub struct DigestArgs<'a> {
     pub ignore: &'a dr_strange_llm::IgnorePolicy,
     /// How much to say about which files were read.
     pub verbose: Verbosity,
+    /// Read only files a handler claims, leaving documents out (issue #38).
+    pub code_only: bool,
     /// URL only: where the crawl's requests go. The operator named this URL on
     /// their own command line, so it goes through their proxy — unlike a URL a
     /// caller hands the server, which is address-guarded instead.
@@ -3453,7 +3473,9 @@ fn read_source(
                 args.verbose,
                 out,
             )?;
-            let facts = dr_strange_llm::route_tree(&host, args.handler, plugins)?;
+            let claimed = dr_strange_llm::ClaimedOnly::new(&host, args.handler, plugins);
+            let routed: &dyn dr_strange_llm::Host = if args.code_only { &claimed } else { &host };
+            let facts = dr_strange_llm::route_tree(routed, args.handler, plugins)?;
             return Ok((facts, name));
         }
 
