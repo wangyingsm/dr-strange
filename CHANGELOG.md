@@ -4,6 +4,46 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - 2026-09-27
+
+A plane said `synced: commit <sha>` while holding symbols from files that commit
+never contained. The label now tells the truth, and two flags let a graph be
+narrowed to the code it is supposed to describe.
+
+### Added
+
+- **`--tracked-only`** reads only what git tracks, on `digest`, `init` and `serve
+  watch`, with `[digest] tracked_only` beside it (#38). An ignore file says what a
+  project considers derived; the index says what it has taken responsibility for,
+  and a generated report sitting untracked is neither. It filters *paths, not
+  content*: a tracked file with uncommitted edits is still read as it stands,
+  which is one `git ls-files` rather than a `git cat-file` per file. Outside a
+  repository it refuses rather than quietly reading nothing.
+- **`--code-only`** reads only files an installed handler claims, leaving
+  Markdown, PDFs, spreadsheets and unclaimed extensions to the document reader
+  they belong to (#38). A graph of a codebase, not of the documents beside it —
+  and since prose is what needs a model, a code-only digest of a pure-code tree
+  makes no chat call at all. What a handler may `read` is deliberately not
+  narrowed: it pulls the files *around* the one it was given.
+- **A plane records how far its tree had drifted** from the commit it names, and
+  every answer read from it says so: `synced: commit ec31cac58593 — parsed from a
+  working tree with 2 modified and 1 untracked, so the graph holds what that
+  commit does not`. Silence means the tree matched, or that the plane predates
+  this being recorded — the same silence on purpose, because claiming "clean" for
+  a plane that never measured would be the overclaim this replaced.
+
+### Fixed
+
+- **`synced_commit` stopped overclaiming.** It is stamped from `git_head` at fold
+  time and was described as "commit the plane reflects", while the walk reads the
+  working tree and never consults git's index. It now says what it always meant:
+  the commit HEAD was at when the facts were parsed.
+- **A digest no longer reads drsg's own output back in.** The rolling log
+  (`DRSG_LOG_DIR`, default `./logs`) was read *as prose*, so a pure-code tree
+  demanded a chat provider it had no use for; the `*.drsg` store directory and
+  its sidecars were ingested beside it. All three join the walk's floor, which no
+  longer takes an `init` to arrange.
+
 ## [2.14.0] - 2026-09-26
 
 A repository whose `.dockerignore` excluded `src/` digested to nine nodes instead
