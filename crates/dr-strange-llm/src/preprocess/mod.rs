@@ -74,7 +74,9 @@ pub use catalog::{
     read_cache as cached_catalog, refresh_cache,
 };
 pub use ground::{FactsAndPlane, fold, stamp_run};
-pub use ledger::{BUILT_BY_PROP, LEDGER_PROP, record_built_by, record_ledger};
+pub use ledger::{
+    BUILT_BY_PROP, DRIFT_PROP, LEDGER_PROP, note_plugin_drift, record_built_by, record_ledger,
+};
 
 /// Bytes the loaded wasm plugins hold right now, process-wide: every compiled
 /// plugin image plus the linear memory of every instance mid-call. Zero with

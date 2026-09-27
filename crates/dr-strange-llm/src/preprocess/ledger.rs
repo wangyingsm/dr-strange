@@ -74,6 +74,95 @@ pub fn record_built_by(db: &Database, plane_name: &str, installed: &[Manifest]) 
     plane.set_properties(props)
 }
 
+/// Set when the installed plugin set no longer matches [`BUILT_BY_PROP`].
+///
+/// A property rather than a check at read time because the reader is
+/// `dr_strange_core::compact`, which cannot call into this crate — the same
+/// reason [`LEDGER_PROP`] is a property. Written by whoever knows both sides:
+/// the server at startup and after each fold.
+pub const DRIFT_PROP: &str = "plugin_drift";
+
+/// Compare what is installed now against what built `plane_name`, and record
+/// the answer on the plane (issue #39).
+///
+/// Sets [`DRIFT_PROP`] when they differ and removes it when they agree, so a
+/// rebuild clears the warning without anyone having to remember to.
+///
+/// An incremental fold applies new plugins to the files one commit touched and
+/// leaves the rest of the tree as it was, so a plane can be half-parsed by each
+/// set. Nothing here repairs that — only a rebuild does — but a reader who is
+/// told can stop wondering why half the calls resolve.
+///
+/// A plane with no recorded provenance says nothing: it predates this being
+/// recorded, and "unknown" is not "drifted".
+pub fn note_plugin_drift(db: &Database, plane_name: &str, installed: &[Manifest]) -> Result<()> {
+    let plane = db.plane(plane_name)?;
+    let mut props = plane.properties()?;
+    let Some(built) = props.get(BUILT_BY_PROP).and_then(|d| match &d.value {
+        PropValue::List(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    PropValue::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<String>>(),
+        ),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    let mut now: Vec<String> = installed.iter().map(Manifest::stamp).collect();
+    now.sort();
+    now.dedup();
+
+    if now == built {
+        if props.remove(DRIFT_PROP).is_some() {
+            plane.set_properties(props)?;
+        }
+        return Ok(());
+    }
+
+    // Both directions are named. An added plugin means files it claims were
+    // never parsed; a removed or rebuilt one means facts in the graph came from
+    // something no longer installed, and a hash that moved means the same
+    // version parsed differently.
+    let added: Vec<&String> = now.iter().filter(|m| !built.contains(m)).collect();
+    let gone: Vec<&String> = built.iter().filter(|m| !now.contains(m)).collect();
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!(
+            "added since: {}",
+            added
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !gone.is_empty() {
+        parts.push(format!(
+            "no longer installed: {}",
+            gone.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    props.insert(
+        DRIFT_PROP.into(),
+        described(
+            "the installed plugins no longer match the set this plane was built under, so files \
+             the difference claims are parsed only where a later commit touched them — rebuild to \
+             make the graph whole",
+            PropValue::Str(parts.join("; ")),
+        ),
+    );
+    plane.set_properties(props)
+}
+
 fn described(desc: &str, value: PropValue) -> PropDesc {
     PropDesc::described(desc, value)
 }
@@ -438,5 +527,85 @@ mod tests {
 
         let props = db.plane("code").unwrap().properties().unwrap();
         assert!(props.contains_key("synced_commit"));
+    }
+
+    fn drift(db: &Database) -> Option<String> {
+        let props = db.plane("code").unwrap().properties().unwrap();
+        props.get(DRIFT_PROP).map(|d| match &d.value {
+            PropValue::Str(s) => s.clone(),
+            other => panic!("expected a string, got {other:?}"),
+        })
+    }
+
+    /// Installing a plugin after the build is drift, and it names which (#39).
+    #[test]
+    fn a_plugin_installed_after_the_build_is_named_as_drift() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        record_built_by(&db, "code", &[manifest()]).unwrap();
+
+        // Same set: nothing to say.
+        note_plugin_drift(&db, "code", &[manifest()]).unwrap();
+        assert_eq!(drift(&db), None);
+
+        // One more installed: named, and in the direction that explains a thin
+        // graph.
+        note_plugin_drift(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        let said = drift(&db).expect("drift is recorded");
+        assert!(said.contains("added since: go@2+c0ffee11"), "{said}");
+        assert!(!said.contains("no longer installed"), "{said}");
+
+        // A rebuild under the new set clears it, with nobody having to remember.
+        record_built_by(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        note_plugin_drift(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        assert_eq!(drift(&db), None, "a rebuild clears the warning");
+    }
+
+    /// A rebuilt plugin at the same version is drift too: the build hash is part
+    /// of the identity, because the same version built differently can parse
+    /// differently.
+    #[test]
+    fn a_changed_build_hash_is_drift_even_at_the_same_version() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        record_built_by(&db, "code", &[manifest()]).unwrap();
+
+        let rebuilt = Manifest {
+            build: Some("99999999".into()),
+            ..manifest()
+        };
+        note_plugin_drift(&db, "code", &[rebuilt]).unwrap();
+        let said = drift(&db).expect("a different build is drift");
+        assert!(said.contains("added since: rust@2+99999999"), "{said}");
+        assert!(
+            said.contains("no longer installed: rust@2+5ac6f728"),
+            "{said}"
+        );
+    }
+
+    /// Removing a plugin is drift in the other direction: facts in the graph
+    /// came from something no longer installed.
+    #[test]
+    fn a_removed_plugin_is_named_too() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        record_built_by(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        note_plugin_drift(&db, "code", &[manifest()]).unwrap();
+        let said = drift(&db).expect("drift is recorded");
+        assert!(
+            said.contains("no longer installed: go@2+c0ffee11"),
+            "{said}"
+        );
+    }
+
+    /// A plane that predates this recording says nothing. "Unknown" is not
+    /// "drifted", and warning about every old plane would train readers to
+    /// ignore the warning.
+    #[test]
+    fn a_plane_without_provenance_is_not_reported_as_drifted() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        note_plugin_drift(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        assert_eq!(drift(&db), None);
     }
 }
