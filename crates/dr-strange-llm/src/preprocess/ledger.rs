@@ -14,10 +14,19 @@
 //! [`dr_strange_core::compact`] turns the part that changes how a *miss* should
 //! be read into a note on the answer itself.
 //!
-//! Replaced on every digest and fold rather than accumulated: a watched
-//! repository folds once per commit, and a history of every one of those in a
-//! single property would grow without bound to say something only the newest
-//! entry answers.
+//! Replaced on every digest rather than accumulated: a history of every ingest
+//! in a single property would grow without bound to say something only the
+//! newest entry answers. An incremental fold writes no ledger at all — it reads
+//! the files one commit touched, and an account of *those* would say almost
+//! nothing about the plane as a whole.
+//!
+//! Which leaves a second question this cannot answer: what produced the graph
+//! that is here. The ledger lists the handlers that *contributed facts*, so a
+//! plugin installed but never exercised — no `.go` in the tree — is absent from
+//! it, and comparing it against the installed set would report drift on every
+//! repository that does not use every plugin. [`BUILT_BY_PROP`] records the set
+//! that was *installed* when the plane was built, which is the comparison that
+//! means something (issue #39).
 
 use dr_strange_core::{Database, PropDesc, PropValue, Result};
 
@@ -27,6 +36,43 @@ use super::{Manifest, PreprocessReport};
 /// call into this crate — the property *is* the interface between them, as
 /// `synced_commit` already is.
 pub const LEDGER_PROP: &str = "ledger";
+
+/// The plugin set installed when this plane was built, as `name@version+build`.
+///
+/// Not the same question as [`LEDGER_PROP`]: the ledger is the last ingest's
+/// account and lists only handlers that produced something, while this is the
+/// provenance of the graph — what a reader must compare against the installed
+/// set to know whether the graph predates a plugin change (issue #39).
+///
+/// Written by a full build only. An incremental fold leaves it alone, which is
+/// the point: folding one commit under a new plugin set does not make the rest
+/// of the graph any newer, and a property that moved on each fold would report
+/// agreement while most of the tree was still parsed by the old set.
+pub const BUILT_BY_PROP: &str = "built_by";
+
+/// Record the plugin set that built `plane_name`.
+///
+/// `installed` is everything loaded, not what ran: a plugin that claimed no file
+/// in this tree is still part of what the graph was built under, and leaving it
+/// out would make every unexercised plugin look like drift.
+pub fn record_built_by(db: &Database, plane_name: &str, installed: &[Manifest]) -> Result<()> {
+    let mut marks: Vec<String> = installed.iter().map(Manifest::stamp).collect();
+    // Sorted so the recorded set is a set: the loader's order is not meaningful
+    // and two builds under the same plugins must compare equal.
+    marks.sort();
+    marks.dedup();
+    let plane = db.plane(plane_name)?;
+    let mut props = plane.properties()?;
+    props.insert(
+        BUILT_BY_PROP.into(),
+        described(
+            "the plugin builds installed when this plane was built — compare with what is \
+             installed now to know whether the graph predates a plugin change",
+            list(marks),
+        ),
+    );
+    plane.set_properties(props)
+}
 
 fn described(desc: &str, value: PropValue) -> PropDesc {
     PropDesc::described(desc, value)
@@ -297,5 +343,100 @@ mod tests {
         let stamps = props.keys().filter(|k| k.starts_with("stamp_")).count();
         assert_eq!(stamps, WRITERS * ROUNDS, "every writer's stamp survives");
         assert!(props.contains_key(LEDGER_PROP));
+    }
+
+    /// A second plugin, installed but claiming nothing in this tree.
+    fn idle_manifest() -> Manifest {
+        Manifest {
+            name: "go".into(),
+            version: "2".into(),
+            extensions: vec!["go".into()],
+            logo: None,
+            build: Some("c0ffee11".into()),
+            source: None,
+        }
+    }
+
+    fn built_by(db: &Database) -> Vec<String> {
+        let props = db.plane("code").unwrap().properties().unwrap();
+        match &props.get(BUILT_BY_PROP).unwrap().value {
+            PropValue::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    PropValue::Str(s) => s.clone(),
+                    other => panic!("expected a string, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected a list, got {other:?}"),
+        }
+    }
+
+    /// The provenance records what was *installed*, not what ran — the whole
+    /// reason it is separate from the ledger (issue #39).
+    ///
+    /// A plugin that claimed no file is still part of what the graph was built
+    /// under. Recording only the ones that contributed would make every
+    /// unexercised plugin look like drift, and a repository with no `.go` in it
+    /// would report a stale graph forever.
+    #[test]
+    fn the_provenance_is_what_was_installed_not_what_ran() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        let installed = [manifest(), idle_manifest()];
+
+        record_ledger(&db, "code", &report(), &installed).unwrap();
+        record_built_by(&db, "code", &installed).unwrap();
+
+        // The ledger names only the handler that produced facts…
+        let entries = read(&db);
+        let ran = match &entries.get("plugins").unwrap().value {
+            PropValue::List(v) => v.len(),
+            other => panic!("expected a list, got {other:?}"),
+        };
+        assert_eq!(ran, 1, "only the handler that contributed");
+
+        // …while the provenance names both, with the build hash.
+        assert_eq!(
+            built_by(&db),
+            vec!["go@2+c0ffee11".to_string(), "rust@2+5ac6f728".to_string()],
+            "sorted, and every installed build"
+        );
+    }
+
+    /// Recorded as a set: the loader's order is not meaningful, and two builds
+    /// under the same plugins must compare equal.
+    #[test]
+    fn the_provenance_is_order_independent_and_deduplicated() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        record_built_by(&db, "code", &[idle_manifest(), manifest(), manifest()]).unwrap();
+        assert_eq!(
+            built_by(&db),
+            vec!["go@2+c0ffee11".to_string(), "rust@2+5ac6f728".to_string()]
+        );
+    }
+
+    /// A rebuild replaces it, and it does not disturb what sits beside it.
+    #[test]
+    fn a_later_build_replaces_the_provenance_and_leaves_the_sync_point() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code", Default::default()).unwrap();
+        {
+            let plane = db.plane("code").unwrap();
+            let mut props = plane.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            plane.set_properties(props).unwrap();
+        }
+        record_built_by(&db, "code", &[manifest()]).unwrap();
+        assert_eq!(built_by(&db), vec!["rust@2+5ac6f728".to_string()]);
+
+        record_built_by(&db, "code", &[manifest(), idle_manifest()]).unwrap();
+        assert_eq!(built_by(&db).len(), 2, "replaced, not appended");
+
+        let props = db.plane("code").unwrap().properties().unwrap();
+        assert!(props.contains_key("synced_commit"));
     }
 }

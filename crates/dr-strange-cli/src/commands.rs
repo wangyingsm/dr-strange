@@ -3837,6 +3837,9 @@ fn apply_digest(
     // What this ingest could and could not read, kept where a later reader
     // will be: a miss in the graph is ambiguous until this says otherwise.
     dr_strange_llm::record_ledger(db, args.plane, ingest_account, ran_plugins)?;
+    // And the set the graph was built under, which the ledger cannot answer:
+    // it names only the handlers that produced facts (issue #39).
+    dr_strange_llm::record_built_by(db, args.plane, ran_plugins)?;
     Ok(())
 }
 

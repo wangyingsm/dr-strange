@@ -2284,6 +2284,9 @@ fn digest_logic(
         // report above answers the caller who asked for it, and this answers
         // every later reader who was not here.
         dr_strange_llm::record_ledger(db, &req.plane, &preprocess_account, &ran_plugins)?;
+        // And what the graph was built *under*, which the ledger cannot say: it
+        // lists only handlers that produced facts (issue #39).
+        dr_strange_llm::record_built_by(db, &req.plane, &ran_plugins)?;
         out["nodes_written"] = jval!(stats.written.nodes);
         out["edges_written"] = jval!(stats.written.edges);
         // Named, not just counted: an agent that proposed an entity the plane

@@ -74,7 +74,7 @@ pub use catalog::{
     read_cache as cached_catalog, refresh_cache,
 };
 pub use ground::{FactsAndPlane, fold, stamp_run};
-pub use ledger::{LEDGER_PROP, record_ledger};
+pub use ledger::{BUILT_BY_PROP, LEDGER_PROP, record_built_by, record_ledger};
 
 /// Bytes the loaded wasm plugins hold right now, process-wide: every compiled
 /// plugin image plus the linear memory of every instance mid-call. Zero with
@@ -197,7 +197,7 @@ impl Manifest {
     /// exactly what a reader needs to know before concluding that an absence
     /// means absence: a plane with no `Channel` nodes may hold no channels, or
     /// may predate the parser that could see them. The build says which.
-    fn stamp(&self) -> String {
+    pub(crate) fn stamp(&self) -> String {
         match &self.build {
             Some(build) => format!("{}@{}+{build}", self.name, self.version),
             None => format!("{}@{}", self.name, self.version),

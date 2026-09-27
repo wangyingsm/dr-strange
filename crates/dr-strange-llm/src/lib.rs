@@ -33,6 +33,13 @@ pub use digest::{
 pub use document::to_markdown;
 pub use identity::IdentityReport;
 pub use openai::{CHAT_OMIT_ENV, OpenAiProvider, build_provider};
+pub use preprocess::{
+    BUILT_BY_PROP, ClaimedOnly, CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, IgnoreRule,
+    LEDGER_PROP, LocalFiles, Manifest, PluginConfig, Plugins, Preprocessed, Preprocessor,
+    SkipReason, Skipped, SyncStats, WalkReport, fold, git_dir, owner_of, plugin_memory_bytes,
+    record_built_by, record_ledger, resync, route_document, route_paths, route_repository,
+    route_tree, stamp_run, sync_paths,
+};
 /// The official plugin catalog — data fetched from the extensions repository,
 /// not a constant of this binary.
 #[cfg(feature = "plugins")]
@@ -40,12 +47,6 @@ pub use preprocess::{
     CATALOG_DOWNLOAD_CAP, CATALOG_URL, CONTRACT_VERSION, Catalog, CatalogSource, Compat, Fetched,
     HOST_VERSION, OfficialPlugin, Pick, cached_catalog, load_catalog, load_catalog_within,
     refresh_cache,
-};
-pub use preprocess::{
-    ClaimedOnly, CommitDelta, FactsAndPlane, GitDir, Host, IgnorePolicy, IgnoreRule, LEDGER_PROP,
-    LocalFiles, Manifest, PluginConfig, Plugins, Preprocessed, Preprocessor, SkipReason, Skipped,
-    SyncStats, WalkReport, fold, git_dir, owner_of, plugin_memory_bytes, record_ledger, resync,
-    route_document, route_paths, route_repository, route_tree, stamp_run, sync_paths,
 };
 #[cfg(feature = "plugins")]
 pub use preprocess::{
