@@ -4,6 +4,30 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.1] - 2026-09-27
+
+### Fixed
+
+- **An IPv6-literal URL is refused as the address it is.** `Url` brackets the
+  literal, and `[::1]` is not something `to_socket_addrs` can take, so the
+  address guard reported `cannot resolve [::1]` — a DNS story about an address
+  that needs no DNS. It now says `refusing to connect to ::1: loopback`.
+- **`::1` is loopback, not the v4-compatible spelling of `0.0.0.1`.** The
+  embedded-v4 test claimed every `::`-prefixed address with a low bit set, which
+  swept up IPv6 loopback and had the guard call it "an unspecified address". Both
+  were refused before and after; this is the reason being right.
+
+### Changed
+
+- **ureq 3**, pinned exactly rather than as a caret range: the address guard
+  hooks ureq's `Resolver`, which lives under the `unversioned` module that ureq
+  documents as exempt from semver and breakable in a minor release, so a bump is
+  a decision to re-read the guard. One user-visible consequence: ureq 3 tunnels
+  every HTTP-proxy request with `CONNECT`, where ureq 2 sent absolute-form for a
+  plain-`http://` destination. Both leave resolution to the proxy; a proxy that
+  refuses `CONNECT` to port 80 is the case that changes, and no drsg path but
+  `digest http://…` can reach it.
+
 ## [2.15.0] - 2026-09-27
 
 A plane said `synced: commit <sha>` while holding symbols from files that commit
