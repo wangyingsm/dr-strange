@@ -63,13 +63,25 @@ impl<'a> Route<'a> {
 /// approve the proxy's own address — usually loopback, which it refuses — and
 /// would never see the address it exists to judge. The caller picks which of
 /// the two it is getting rather than believing it has both.
-fn protect(b: ureq::AgentBuilder, url: &Url, route: Route<'_>) -> Result<ureq::AgentBuilder> {
+fn protect(
+    b: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    url: &Url,
+    route: Route<'_>,
+) -> Result<ureq::Agent> {
     if guard::proxied(url, route.net) {
-        return route.net.apply(b, guard::destination(url));
+        let config = route.net.apply(b, guard::destination(url))?.build();
+        return Ok(ureq::Agent::new_with_config(config));
     }
-    Ok(b.resolver(guard::PublicOnly {
-        allow: route.allow.to_vec(),
-    }))
+    // Guarded. In ureq 3 a resolver is not part of the config, so enforcing the
+    // policy means assembling the agent from parts — and `proxy(None)` is
+    // explicit because ureq would otherwise read `ALL_PROXY` itself and route
+    // around the very check this branch exists to make.
+    let config = b.proxy(None).build();
+    Ok(ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        guard::PublicOnly::new(route.allow.to_vec()),
+    ))
 }
 
 /// Identifies the crawler to the sites it reads. A server that will not say who
@@ -214,23 +226,23 @@ pub fn fetch_bytes(url: &str, max_bytes: usize, route: Route<'_>) -> Result<Vec<
     guard::precheck(&url, route.allow, route.net)?;
 
     let agent = protect(
-        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            .max_redirects(5)
+            .timeout_global(Some(std::time::Duration::from_secs(60))),
         &url,
         route,
-    )?
-    .redirects(5)
-    .timeout(std::time::Duration::from_secs(60))
-    .build();
+    )?;
 
     let response = agent
-        .request_url("GET", &url)
+        .get(url.as_str())
         .call()
         .map_err(|e| anyhow::anyhow!("fetching {url}: {}", terse_via(&e, &url, route)))?;
 
     let mut bytes = Vec::new();
     // One byte past the cap distinguishes "exactly at the limit" from "over
     // it", so the error can say which.
-    std::io::Read::take(response.into_reader(), max_bytes as u64 + 1)
+    std::io::Read::take(response.into_body().into_reader(), max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {url}"))?;
     if bytes.len() > max_bytes {
@@ -259,28 +271,34 @@ pub fn redirect_target(url: &str, route: Route<'_>) -> Result<String> {
     guard::precheck(&url, route.allow, route.net)?;
 
     let agent = protect(
-        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            .max_redirects(0)
+            // Both of these matter, and both default the other way. ureq 3
+            // treats hitting the redirect limit as an error and a 3xx status as
+            // an error, and either would throw away the `Location` header that
+            // is the entire answer here.
+            .max_redirects_will_error(false)
+            .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(30))),
         &url,
         route,
-    )?
-    .redirects(0)
-    .timeout(std::time::Duration::from_secs(30))
-    .build();
+    )?;
 
-    // With no redirects allowed, ureq may hand a 3xx back either way depending
-    // on the status; both are the answer here, and only a transport failure is
-    // an error.
-    let response = match agent.request_url("GET", &url).call() {
-        Ok(r) => r,
-        Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => bail!(
+    // Every status arrives as `Ok` now, which is what this wants: a 3xx is the
+    // answer and a 2xx is a "no redirect" to report. Only a failure to connect
+    // is an error.
+    let response = agent.get(url.as_str()).call().map_err(|e| {
+        anyhow::anyhow!(
             "asking {url} where it redirects: {}",
             terse_via(&e, &url, route)
-        ),
-    };
+        )
+    })?;
 
     response
-        .header("location")
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .with_context(|| format!("{url} answered {} with no Location", response.status()))
 }
@@ -296,13 +314,13 @@ pub fn fetch_with_progress(
     // Every hop resolves through the guard, so a redirect cannot walk the
     // request inward after the first address was approved.
     let agent = protect(
-        ureq::AgentBuilder::new().user_agent(USER_AGENT),
+        ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            .max_redirects(5)
+            .timeout_global(Some(opts.request_timeout)),
         &root_url,
         opts.route(),
-    )?
-    .redirects(5)
-    .timeout(opts.request_timeout)
-    .build();
+    )?;
 
     let analyzer = Analyzer::new(opts.language);
     let ctx = Crawl {
@@ -676,7 +694,9 @@ impl Crawl<'_> {
             .call()
             .map_err(|e| anyhow::anyhow!("{}", terse(&e)))?;
         let content_type = resp
-            .header("content-type")
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .split(';')
             .next()
@@ -693,7 +713,8 @@ impl Crawl<'_> {
             bail!("the crawl's total download budget is spent");
         }
         let mut body = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .take(budget as u64 + 1)
             .read_to_end(&mut body)?;
         if body.len() > budget {
@@ -744,7 +765,8 @@ impl Crawl<'_> {
                 u.set_fragment(None);
                 let fetched = match self.agent.get(u.as_str()).call() {
                     Ok(r) if r.status() == 200 => r
-                        .into_string()
+                        .into_body()
+                        .read_to_string()
                         .map(|t| Robots::parse(&t, USER_AGENT))
                         .unwrap_or_else(|_| Robots::allow_all()),
                     _ => Robots::allow_all(),
@@ -788,12 +810,17 @@ impl Crawl<'_> {
 /// a list of dropped pages wants the reason.
 fn terse(e: &ureq::Error) -> String {
     match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
-        ureq::Error::Transport(t) => t
-            .message()
-            .map(str::to_string)
-            .unwrap_or_else(|| "the request failed".into()),
+        ureq::Error::StatusCode(code) => format!("HTTP {code}"),
+        other => other.to_string(),
     }
+}
+
+/// Whether this failure is about reaching the far end rather than what it said.
+///
+/// A status code came back, so the connection worked and the proxy is not the
+/// suspect; everything else is a connection story.
+fn is_transport(e: &ureq::Error) -> bool {
+    !matches!(e, ureq::Error::StatusCode(_))
 }
 
 /// `terse`, plus which hop the caller should go and look at.
@@ -805,7 +832,7 @@ fn terse(e: &ureq::Error) -> String {
 fn terse_via(e: &ureq::Error, url: &Url, route: Route<'_>) -> String {
     let terse = terse(e);
     match route.net.proxy_for(guard::destination(url)) {
-        Some(p) if matches!(e, ureq::Error::Transport(_)) => {
+        Some(p) if is_transport(e) => {
             format!("{terse} (via the proxy {p})")
         }
         _ => terse,

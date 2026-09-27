@@ -203,19 +203,22 @@ async fn fetch_snapshot(opts: &FollowOptions) -> anyhow::Result<Vec<u8>> {
         // Through an agent, not `ureq::get`: a bare call reads no proxy at
         // all, so a replica behind one could never bootstrap (issue #37).
         let parsed = url::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
-        let agent = net
+        let config = net
             .apply(
-                ureq::AgentBuilder::new(),
+                ureq::Agent::config_builder(),
                 crate::fetch::guard::destination(&parsed),
             )?
+            .timeout_global(Some(SNAPSHOT_FETCH_TIMEOUT))
             .build();
-        let mut req = agent.get(&url).timeout(SNAPSHOT_FETCH_TIMEOUT);
+        let agent = ureq::Agent::new_with_config(config);
+        let mut req = agent.get(&url);
         if let Some(t) = &token {
-            req = req.set("Authorization", &format!("Bearer {t}"));
+            req = req.header("Authorization", &format!("Bearer {t}"));
         }
         let mut buf = Vec::new();
         req.call()
             .with_context(|| format!("GET {url}"))?
+            .into_body()
             .into_reader()
             .read_to_end(&mut buf)?;
         Ok(buf)

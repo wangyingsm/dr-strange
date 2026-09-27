@@ -313,11 +313,21 @@ impl Network {
         }
     }
 
-    /// Attach the proxy for `to`, if there is one, to an agent builder.
-    pub fn apply(&self, b: ureq::AgentBuilder, to: Destination<'_>) -> Result<ureq::AgentBuilder> {
+    /// Attach the proxy for `to`, if there is one, to an agent's config.
+    ///
+    /// `Some(None)` is passed explicitly when nothing proxies this
+    /// destination: ureq 3 reads `ALL_PROXY` and friends on its own, and a
+    /// config that merely says nothing would let that happen — sending a local
+    /// model server's traffic through a proxy the operator set for the outside
+    /// world, which [`Network::proxy_for`] exists to prevent.
+    pub fn apply(
+        &self,
+        b: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+        to: Destination<'_>,
+    ) -> Result<ureq::config::ConfigBuilder<ureq::typestate::AgentScope>> {
         match self.proxy_for(to) {
-            Some(p) => Ok(b.proxy(p.clone().into_ureq()?)),
-            None => Ok(b),
+            Some(p) => Ok(b.proxy(Some(p.clone().into_ureq()?))),
+            None => Ok(b.proxy(None)),
         }
     }
 

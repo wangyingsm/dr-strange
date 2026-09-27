@@ -72,7 +72,15 @@ url = "2"
 # because of `AgentBuilder::resolver`: the SSRF guard must be the thing that
 # hands ureq the addresses to connect to, not a check made beforehand that the
 # client is then free to re-resolve. See fetch/guard.rs.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# Pinned exactly, not a caret range: the SSRF guard hooks ureq's `Resolver`,
+# which lives under `unversioned` in 3.x — an API ureq documents as exempt from
+# semver and breakable in any *minor* release. A bump is therefore a decision to
+# re-check the guard, not something that happens during someone else's
+# `cargo update`. (`tls` was renamed `rustls` in 3.x.)
+ureq = { version = "=3.4.2", default-features = false, features = [
+    "rustls",
+    "socks-proxy",
+] }
 # WebSocket client for `serve --follow` (arch/01 §9): the follower dials the
 # master's `/ws/wal`. `rustls-tls-webpki-roots` matches the rustls + ring
 # provider axum-server already installs for inbound TLS, so there's no second
