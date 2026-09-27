@@ -78,10 +78,15 @@ fn an_https_fetch_connects_through_the_proxy_by_name() {
     );
 }
 
-/// A plain `http:` fetch is sent in absolute form instead of tunnelled, and
-/// again carries the name.
+/// A plain `http:` fetch also reaches the proxy carrying the destination's
+/// *name*, which is the property that matters.
+///
+/// Not the wire form: ureq 2 sent absolute-form `GET http://host/path` for a
+/// plain-HTTP destination, ureq 3 tunnels everything with `CONNECT host:80`.
+/// Both leave the resolution to the proxy, which is the whole point of #37, and
+/// a proxy that refuses `CONNECT` to port 80 is the one case this changes.
 #[test]
-fn an_http_fetch_is_sent_to_the_proxy_in_absolute_form() {
+fn an_http_fetch_reaches_the_proxy_by_name_too() {
     let (proxy, rx) = stub_proxy();
     let net = proxied_to(proxy);
     let route = Route {
@@ -93,8 +98,12 @@ fn an_http_fetch_is_sent_to_the_proxy_in_absolute_form() {
 
     let line = first_line(&rx);
     assert!(
-        line.starts_with("GET http://example.invalid/catalog.json"),
-        "{line}"
+        line.contains("example.invalid"),
+        "the destination reaches the proxy as a name: {line}"
+    );
+    assert!(
+        !line.contains("93.184.") && !line.contains("127.0.0.1:18"),
+        "and not as an address we resolved: {line}"
     );
 }
 

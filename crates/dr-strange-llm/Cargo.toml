@@ -26,10 +26,12 @@ dr-strange-core = { workspace = true, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-# `socks-proxy` so a `socks5://` proxy works as well as an HTTP one; ureq's own
-# `proxy-from-env` stays off, because it has no `NO_PROXY` and would send a
-# local provider's traffic through the proxy too (see `net`).
-ureq = { version = "2", features = ["json", "socks-proxy"] }
+# `socks-proxy` so a `socks5://` proxy works as well as an HTTP one. The proxy
+# itself is decided by `net`, not by ureq reading the environment: ours is a
+# per-destination decision and never proxies loopback, which is what keeps a
+# local model server reachable behind a proxy (see `net`).
+# Pinned exactly for the reason `dr-strange-web`'s copy spells out.
+ureq = { version = "=3.4.2", features = ["json", "socks-proxy"] }
 # Parsing a provider or upstream URL into the host the proxy decision needs.
 url = "2"
 # Server-side document → Markdown for the digest page (arch/07, arch/08).

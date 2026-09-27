@@ -17,6 +17,10 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::NextTimeout;
+
 use anyhow::{Result, bail};
 use dr_strange_llm::net::{Destination, Network};
 use url::Url;
@@ -265,19 +269,64 @@ pub fn proxied(url: &Url, net: &Network) -> bool {
     net.proxy_for(destination(url)).is_some()
 }
 
-/// A [`ureq::Resolver`] that resolves normally and then drops every address
-/// that is not publicly routable. This is where the policy is *enforced*, on
-/// the original request and on every redirect hop alike.
+/// A [`Resolver`] that resolves normally and then drops every address that is
+/// not publicly routable. This is where the policy is *enforced*, on the
+/// original request and on every redirect hop alike.
+///
+/// It wraps ureq's own resolver rather than calling `to_socket_addrs` itself, so
+/// the lookup keeps whatever ureq does about timeouts and IP families and this
+/// type is only the filter.
+///
+/// `Resolver` lives under ureq's `unversioned` module, which ureq documents as
+/// exempt from semver and breakable in a minor release. That is why the
+/// dependency is pinned exactly: a bump is a decision to re-read this.
+#[derive(Debug)]
 pub struct PublicOnly {
     /// Prefixes an operator has explicitly re-permitted.
     pub allow: Vec<Prefix>,
+    inner: DefaultResolver,
 }
 
-impl ureq::Resolver for PublicOnly {
-    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
-        let addrs: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
-        filter(addrs, &self.allow)
-            .map_err(|why| io::Error::other(format!("refusing to connect to {netloc}: {why}")))
+impl PublicOnly {
+    /// Enforce the policy, re-permitting `allow`.
+    pub fn new(allow: Vec<Prefix>) -> Self {
+        Self {
+            allow,
+            inner: DefaultResolver::default(),
+        }
+    }
+}
+
+impl Resolver for PublicOnly {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        let host = uri.host().unwrap_or_default();
+        match filter(resolved.iter().copied().collect(), &self.allow) {
+            Ok(kept) => {
+                // `from_fn` fills the backing array with placeholders and starts
+                // empty, so pushing is what sets the length. The kept set is a
+                // subset of what the inner resolver returned, which is already
+                // within the array's capacity.
+                let mut out = ResolvedSocketAddrs::from_fn(|_| {
+                    std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                });
+                for addr in kept {
+                    out.push(addr);
+                }
+                Ok(out)
+            }
+            // `Error::Io` because it is the one variant that carries a message:
+            // ureq's `HostNotFound` would report a resolution failure for a name
+            // that resolved perfectly well and was refused on policy.
+            Err(why) => Err(ureq::Error::Io(io::Error::other(format!(
+                "refusing to connect to {host}: {why}"
+            )))),
+        }
     }
 }
 

@@ -81,17 +81,17 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-/// A transport error as a log line: the kind, the message, the cause — and
-/// not the URL, which ureq's own rendering leads with.
-fn describe_transport(e: &ureq::Transport) -> String {
-    let mut out = e.kind().to_string();
-    if let Some(m) = e.message() {
-        out.push_str(": ");
-        out.push_str(m);
-    }
+/// A connection failure as a log line: the kind and its cause — and not the
+/// URL, which is where a key ends up when an operator was told "give a base
+/// URL", and this line reaches the log.
+fn describe_transport(e: &ureq::Error) -> String {
+    let mut out = e.to_string();
     if let Some(src) = std::error::Error::source(e) {
-        out.push_str(": ");
-        out.push_str(&src.to_string());
+        let cause = src.to_string();
+        if !out.contains(&cause) {
+            out.push_str(": ");
+            out.push_str(&cause);
+        }
     }
     out
 }
@@ -421,16 +421,26 @@ impl OpenAiProvider {
     ///
     /// A base URL that will not parse is the operator's own typo, and it is
     /// reported here rather than being silently sent unproxied.
-    fn agent(&self, url: &str) -> Result<ureq::Agent> {
+    fn agent(&self, url: &str, timeout: Duration) -> Result<ureq::Agent> {
         let parsed = url::Url::parse(url)
             .with_context(|| format!("the provider URL {} is not a URL", self.shown_url()))?;
-        Ok(self
+        let config = self
             .net
             .apply(
-                ureq::AgentBuilder::new(),
+                ureq::Agent::config_builder(),
                 crate::net::Destination::of(&parsed),
             )?
-            .build())
+            // A non-2xx is an answer here, not an error: the provider's message
+            // is in its body, its `retry-after` in its headers, and ureq's
+            // default would discard both in favour of the bare status.
+            .http_status_as_error(false)
+            // ureq applies no deadline of its own, so a provider that accepts
+            // the connection and then stops responding would wedge the caller
+            // forever — an `ask` loop or a digest run with no way out but
+            // Ctrl-C. A generous cap still ends the wait.
+            .timeout_global(Some(timeout))
+            .build();
+        Ok(ureq::Agent::new_with_config(config))
     }
 
     /// Leave `temperature` out of chat completions, for a model that fixes
@@ -488,18 +498,11 @@ impl OpenAiProvider {
         // One agent for every attempt: it carries the proxy (if the operator
         // configured one and this endpoint is not local), and building it can
         // fail on a malformed proxy — which should be said once, not per retry.
-        let agent = self.agent(&url)?;
+        let agent = self.agent(&url, timeout)?;
         for attempt in 1..=MAX_ATTEMPTS {
-            // Bounded: ureq applies no timeout of its own, so a provider that
-            // accepts the connection and then stops responding would wedge the
-            // caller forever — an `ask` loop or a digest run with no way out
-            // but Ctrl-C. A generous cap still ends the wait.
-            let mut req = agent
-                .post(&url)
-                .timeout(timeout)
-                .set("Content-Type", "application/json");
+            let mut req = agent.post(&url).header("Content-Type", "application/json");
             if !self.api_key.is_empty() {
-                req = req.set("Authorization", &format!("Bearer {}", self.api_key));
+                req = req.header("Authorization", &format!("Bearer {}", self.api_key));
             }
             // Held across the send only: a request waiting out its backoff is
             // not in flight, and holding its slot would keep the crowd that
@@ -507,19 +510,30 @@ impl OpenAiProvider {
             let permit = self.throttle.enter();
             // Cloned per attempt: sending consumes the body.
             let (reason, wait) = match req.send_json(body.clone()) {
-                Ok(resp) => {
+                // Any status arrives here: `http_status_as_error(false)` keeps
+                // the body and headers, which the branches below need.
+                Ok(resp) if resp.status().is_success() => {
                     self.throttle.allowed();
                     return resp
-                        .into_json::<Value>()
+                        .into_body()
+                        .read_json::<Value>()
                         .context("decoding provider response");
                 }
-                Err(ureq::Error::Status(code, resp)) => {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    // Read before the body is consumed below.
+                    let asked = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs);
                     if code == 429 {
                         self.throttle.refused(&permit);
                     }
                     if !worth_retrying(code) || attempt == MAX_ATTEMPTS {
                         // Surface the provider's error body — the useful part.
-                        let detail = resp.into_string().unwrap_or_default();
+                        let detail = resp.into_body().read_to_string().unwrap_or_default();
                         if code == 429 {
                             bail!(
                                 "{path} → HTTP {code}: {}\n\
@@ -535,18 +549,15 @@ impl OpenAiProvider {
                         bail!("{path} → HTTP {code}: {}", detail.trim())
                     }
                     // A provider that says how long to wait knows better than
-                    // the schedule does, up to `MAX_RETRY_AFTER`.
-                    let asked = resp
-                        .header("retry-after")
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                        .map(Duration::from_secs);
+                    // the schedule does, up to `MAX_RETRY_AFTER`. Read from the
+                    // headers above, before the body was taken.
                     (format!("HTTP {code}"), retry_wait(asked, attempt + 1))
                 }
-                // Transport: no connection, a dropped one, or the timeout
-                // above. Described without the URL, which ureq leads with:
-                // the URL is where a key ends up when an operator was told
-                // "give a base URL", and this line reaches the log.
-                Err(ureq::Error::Transport(e)) => {
+                // No connection, a dropped one, or the deadline. Described
+                // without the URL, which ureq leads with: the URL is where a key
+                // ends up when an operator was told "give a base URL", and this
+                // line reaches the log.
+                Err(e) => {
                     let why = describe_transport(&e);
                     if attempt == MAX_ATTEMPTS {
                         return Err(anyhow!("{path}: {why}"));
