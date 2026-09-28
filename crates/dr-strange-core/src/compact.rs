@@ -13,8 +13,10 @@
 //! itself the useful reply ("which one did you mean") for one more call.
 
 use crate::api::PlaneHandle;
+use crate::compute::catalog::key_prefix;
 use crate::error::Result;
 use crate::types::{NodeRecord, PropValue, Properties};
+use std::collections::BTreeSet;
 
 /// How a lenient symbol lookup ended.
 pub enum Resolved {
@@ -260,11 +262,57 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
 ///
 /// Its whole job is to keep "not present" and "not yet folded" apart; every
 /// verb routes its empty case through here so no surface can quietly report
-/// absence during a rebuild.
+/// absence during a rebuild. It also names the key prefixes the plane does
+/// hold, because a lookup that guessed the prefix wrong — a TS key is prefixed
+/// with a `package.json` name, not the directory — is otherwise
+/// indistinguishable from one that named nothing at all (issue #40).
 pub fn no_match(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let mut out = format!("no symbol matches `{name}` in this plane\n");
     if let Some(note) = rebuilding_note(&plane.properties()?) {
         out.push_str(&note);
+    }
+    out.push_str(&prefix_hint(plane, name)?);
+    Ok(out)
+}
+
+/// The prefixes this plane's keys carry, and — when the name brought a prefix
+/// of its own that matched none of them — the fragment worth trying instead.
+///
+/// Reads keys only: the catalog would answer this too, but it scans every node
+/// *and* every edge to build label and connectivity statistics, which is not a
+/// price a mistyped name should pay.
+fn prefix_hint(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
+    let nodes = plane.query().scan_all().nodes()?;
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for node in &nodes {
+        if let Some(key) = node.external_key.as_deref()
+            && let Some(prefix) = key_prefix(key)
+        {
+            seen.insert(prefix);
+        }
+    }
+    if seen.is_empty() {
+        return Ok(String::new());
+    }
+    let shown: Vec<&str> = seen.iter().take(FIND_CAP).copied().collect();
+    let mut out = format!("keys here are prefixed: {}\n", shown.join(", "));
+    if seen.len() > FIND_CAP {
+        out.push_str(&format!(
+            "… and {} more prefix(es)\n",
+            seen.len() - FIND_CAP
+        ));
+    }
+    match key_prefix(name) {
+        Some(guessed) if !seen.contains(guessed) => {
+            let rest = name
+                .strip_prefix(guessed)
+                .map(|r| r.trim_start_matches('/').trim_start_matches("::"))
+                .unwrap_or(name);
+            out.push_str(&format!(
+                "`{guessed}` is not one of them; a fragment matches anywhere in a key — try `{rest}`\n"
+            ));
+        }
+        _ => out.push_str("a fragment matches anywhere in a key\n"),
     }
     Ok(out)
 }
@@ -1772,6 +1820,61 @@ mod tests {
         let mut props = p.properties().unwrap();
         props.insert(LEDGER_PROP.into(), PropDesc::new(PropValue::Map(led)));
         p.set_properties(props).unwrap();
+    }
+
+    /// The reported failure: a lookup that guesses the prefix wrong looks
+    /// exactly like one that named nothing. The miss now lists the prefixes the
+    /// plane does hold and points at the fragment that would have matched
+    /// (issue #40).
+    #[test]
+    fn a_miss_names_the_prefixes_it_did_not_match() {
+        let db = seeded();
+        let plane = db.plane("code").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            txn.create_node_with_key("highway_bridge-3.0/src/App", &["Module"], Properties::new())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        let out = no_match(&plane, "highway_bridge/src/App").unwrap();
+        assert!(
+            out.contains("keys here are prefixed:") && out.contains("highway_bridge-3.0"),
+            "the miss must show the prefix that does exist: {out}"
+        );
+        assert!(
+            out.contains("`highway_bridge` is not one of them"),
+            "and name the guess that failed: {out}"
+        );
+        assert!(
+            out.contains("try `src/App`"),
+            "and offer the fragment that would match: {out}"
+        );
+    }
+
+    /// A name with no prefix of its own guessed nothing, so there is nothing to
+    /// correct — it still learns that a fragment matches anywhere.
+    #[test]
+    fn a_miss_on_a_bare_name_offers_the_fragment_rule_without_a_correction() {
+        let db = seeded();
+        let out = no_match(&db.plane("code").unwrap(), "Nope").unwrap();
+        assert!(
+            out.contains("a fragment matches anywhere in a key"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("is not one of them"),
+            "nothing was guessed: {out}"
+        );
+    }
+
+    /// An empty plane has no prefixes to teach, and must not invent one.
+    #[test]
+    fn a_miss_on_a_plane_with_no_keys_says_nothing_about_prefixes() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.create_plane("bare", Properties::new()).unwrap();
+        let out = no_match(&plane, "anything").unwrap();
+        assert_eq!(out, "no symbol matches `anything` in this plane\n");
     }
 
     /// A graph says "nothing" the same way whether nothing is there or nothing
