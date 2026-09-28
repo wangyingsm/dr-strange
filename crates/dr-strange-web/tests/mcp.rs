@@ -174,6 +174,13 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
         tools.tools.iter().any(|t| t.name == "get_node"),
         "the server's own tool set reaches the host"
     );
+    // An agent told "the plugins changed since this plane was built" needs a way
+    // to act on it without leaving the conversation (issue #39).
+    assert!(
+        tools.tools.iter().any(|t| t.name == "rebuild"),
+        "rebuild is advertised: {:?}",
+        tools.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
 
     // And the data is the server's: `alice` exists only in the database this
     // process seeded, never in one the relay could have opened itself.

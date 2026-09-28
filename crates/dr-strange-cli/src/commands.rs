@@ -1585,9 +1585,7 @@ const UNBORN_RUN_ID: &str = "working-tree";
 /// Together they answer "is the graph in sync with the repository?" — and
 /// which basis its `file` props are relative to.
 #[cfg(feature = "digest")]
-pub const SYNC_COMMIT_PROP: &str = "synced_commit";
-#[cfg(feature = "digest")]
-pub const SYNC_ROOT_PROP: &str = "synced_root";
+pub use dr_strange_core::compact::{SYNC_COMMIT_PROP, SYNC_ROOT_PROP};
 /// How far the working tree had drifted from that commit (issue #38).
 #[cfg(feature = "digest")]
 pub const SYNC_MODIFIED_PROP: &str = "synced_modified";

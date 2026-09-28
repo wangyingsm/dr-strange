@@ -132,6 +132,15 @@ pub const LEDGER_PROP: &str = "ledger";
 /// property is the interface between them, as [`LEDGER_PROP`] already is.
 pub const DRIFT_PROP: &str = "plugin_drift";
 
+/// The commit HEAD was at when a plane's facts were parsed, and the directory
+/// they were parsed from.
+///
+/// Named here because this crate is what *reads* them, and because more than
+/// one crate writes them: the CLI on a digest or fold, and anything that
+/// rebuilds a plane — which drops it, and so has to put them back.
+pub const SYNC_COMMIT_PROP: &str = "synced_commit";
+pub const SYNC_ROOT_PROP: &str = "synced_root";
+
 /// What the digest could not read, stated wherever an answer is read — and
 /// only when there was something.
 ///
@@ -264,7 +273,7 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
     // A plane can be both in sync and incomplete: the commit says *when* it
     // was parsed, the ledger says what the parse could not read, and a reader
     // weighing a miss needs the second more than the first.
-    let synced = props.get("synced_commit").and_then(|d| match &d.value {
+    let synced = props.get(SYNC_COMMIT_PROP).and_then(|d| match &d.value {
         crate::PropValue::Str(commit) => Some(format!(
             "synced: commit {}{}\n",
             &commit[..12.min(commit.len())],

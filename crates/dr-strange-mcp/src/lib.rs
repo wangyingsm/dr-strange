@@ -473,6 +473,14 @@ struct Ask {
     embed_model: Option<String>,
 }
 
+/// What `rebuild` takes: only which plane. The directory comes from the plane
+/// itself, so a caller cannot aim a rebuild at a tree it was never built from.
+#[derive(Deserialize, JsonSchema)]
+struct Rebuild {
+    /// The plane to rebuild.
+    plane: String,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct Digest {
     /// The document text to digest into a graph. Give this **or** `path`.
@@ -2547,6 +2555,80 @@ pub fn snippet_logic_in(
 
 // ---- tools (rmcp wrappers) ------------------------------------------------
 
+/// Rebuild `plane` from the tree it was parsed from (issue #39).
+///
+/// The cure for the warning `plugin_drift` raises: an incremental fold applies a
+/// newly installed plugin to the files one commit touched, so the rest of the
+/// tree keeps whatever the old set made of it. Only re-reading everything makes
+/// the graph one thing again.
+///
+/// The tree is the plane's own `synced_root` — not the caller's guess — so this
+/// cannot be pointed at a directory the plane was never built from. A plane that
+/// records no root was not built from a tree, and says so instead of inventing
+/// one.
+fn rebuild_logic(db: &Database, req: Rebuild) -> AnyResult<Value> {
+    let plane = db.plane(&req.plane)?;
+    let props = plane.properties()?;
+    let root = props
+        .get(dr_strange_core::compact::SYNC_ROOT_PROP)
+        .and_then(|d| d.value.as_text().map(|t| t.into_owned()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plane `{}` records no source directory, so there is nothing to \
+                 rebuild it from — it was not built by `digest <path>` or `serve watch`",
+                req.plane
+            )
+        })?;
+    let dir = std::path::Path::new(&root);
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "plane `{}` was built from {root}, which is not readable here",
+            req.plane
+        );
+    }
+
+    let host =
+        dr_strange_llm::LocalFiles::new(dir).map_err(|e| anyhow::anyhow!("reading {root}: {e}"))?;
+    // The store's defaults, as a fold uses them: a rebuild must read the tree
+    // the same way the watcher would, or it would trade one inconsistency for
+    // another.
+    let plugins = dr_strange_llm::Plugins::load(&dr_strange_llm::PluginConfig::default())?;
+    let stats = dr_strange_llm::resync(db, &req.plane, &host, &plugins, &root, "mcp-rebuild")?;
+
+    // `resync` drops the plane, taking the sync point with it. Put it back, or
+    // the next watcher start reports a plane it cannot compare to the
+    // repository and folds forward from HEAD.
+    if let Ok(head) = dr_strange_llm::git::Git::new(dir).run(&["rev-parse", "HEAD"])
+        && let Ok(head) = String::from_utf8(head)
+    {
+        let plane = db.plane(&req.plane)?;
+        let mut props = plane.properties()?;
+        props.insert(
+            dr_strange_core::compact::SYNC_COMMIT_PROP.into(),
+            PropDesc::described(
+                "commit HEAD was at when these facts were parsed",
+                PropValue::Str(head.trim().to_string()),
+            ),
+        );
+        props.insert(
+            dr_strange_core::compact::SYNC_ROOT_PROP.into(),
+            PropDesc::described(
+                "directory the facts were parsed from",
+                PropValue::Str(root.clone()),
+            ),
+        );
+        plane.set_properties(props)?;
+    }
+    // And the warning that sent the caller here clears itself.
+    dr_strange_llm::note_plugin_drift(db, &req.plane, &plugins.manifests())?;
+
+    Ok(Value::String(format!(
+        "rebuilt `{}` from {root}: {} node(s) loaded, {} edge(s) written\n\
+         the graph is now one parse of the whole tree; what was half-parsed is not\n",
+        req.plane, stats.nodes_loaded, stats.edges_written
+    )))
+}
+
 #[tool_router(router = tool_router)]
 impl DrStrange {
     #[tool(description = "List all planes with their node/edge counts and \
@@ -3028,6 +3110,20 @@ impl DrStrange {
             digest_logic(db, req, tuning, local_files, allow.as_ref())
         })
         .await
+    }
+
+    #[tool(description = "Rebuild a plane by re-reading the whole tree it was \
+        parsed from. Use when an answer says the plugins changed since the \
+        plane was built: a fold applies a newly installed plugin only to the \
+        files a commit touched, so the rest of the tree keeps whatever the old \
+        set made of it, and only this makes the graph one parse again. Reads \
+        the plane's own recorded directory, so it cannot be aimed elsewhere. \
+        Costs a full re-parse of the repository.")]
+    async fn rebuild(
+        &self,
+        Parameters(req): Parameters<Rebuild>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run("rebuild", move |db| rebuild_logic(db, req)).await
     }
 }
 
