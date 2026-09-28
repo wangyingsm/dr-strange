@@ -260,6 +260,48 @@ Install pins the artifact's SHA-256 in the store; every later load re-checks
 it, so a file that changes on disk is refused rather than silently run.
 Installing a name again is the upgrade path.
 
+### A plugin installed after the graph was built
+
+Installing a plugin does not reach back into a graph that already exists. A
+watched repository folds **one commit at a time**, so a new parser applies to the
+files the next commits touch and every untouched file keeps whatever the old set
+made of it — half the tree parsed one way, half the other. Nothing is corrupt;
+the graph is simply two parses.
+
+So a plane records the plugin builds installed when it was built, and says so
+when they no longer match:
+
+```
+synced: commit ec31cac58593
+plugins changed since this plane was built (added since: ts@2+d99f6db4) — files
+the difference claims are parsed only where a later commit touched them; rebuild
+to make the graph whole
+```
+
+That line is on every answer read from the plane, including "no symbol matches" —
+the answer where it matters most, because an absence may mean the symbol is not
+there *or* that its file was never parsed.
+
+The comparison is on the full identity, `name@version+build`, so a plugin rebuilt
+at the same version counts as a change: the same version built differently can
+parse differently. Both directions are reported — `added since` for a parser
+whose files were never read, `no longer installed` for facts in the graph that
+came from something the store no longer has.
+
+The cure is a rebuild, which re-reads the whole tree:
+
+```console
+$ drsg init --rebuild
+```
+
+An agent that reads the warning can do it without leaving the conversation, with
+the `rebuild` MCP tool — it takes only a plane name and reads that plane's own
+recorded directory, so it cannot be aimed somewhere else. Either way the warning
+clears itself once the graph is one parse again.
+
+A plane built before drsg recorded this says nothing: unknown is not drifted, and
+warning about every older plane would teach readers to ignore the warning.
+
 Install also compiles the plugin once and keeps the compiled form beside the
 wasm, pinned by a hash of its own. A load — every `digest`, every commit
 `serve watch` folds — deserializes that in milliseconds instead of compiling,
