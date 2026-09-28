@@ -286,7 +286,16 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
 /// absence during a rebuild.
 pub fn no_match(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let mut out = format!("no symbol matches `{name}` in this plane\n");
-    if let Some(note) = rebuilding_note(&plane.properties()?) {
+    let props = plane.properties()?;
+    if let Some(note) = rebuilding_note(&props) {
+        out.push_str(&note);
+    }
+    // For the same reason a rebuild is mentioned here: a plugin that landed
+    // after the build leaves the files it claims unparsed except where a commit
+    // has since touched them, so "no symbol matches" may mean "never read"
+    // rather than "not there" (issue #39). This is the answer that most needs
+    // the distinction.
+    if let Some(note) = plugin_drift_note(&props) {
         out.push_str(&note);
     }
     Ok(out)
@@ -1756,6 +1765,29 @@ mod tests {
         let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
         assert!(out.contains("synced: commit abcdef012345"), "{out}");
         assert!(!out.contains("working tree"), "{out}");
+    }
+
+    /// "No symbol matches" is the answer that most needs the plugin note: the
+    /// symbol may be absent, or its file may never have been parsed (#39).
+    #[test]
+    fn a_miss_says_the_plugins_changed_so_absence_is_ambiguous() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                DRIFT_PROP.into(),
+                PropDesc::new(PropValue::Str("added since: py@2+26f48733".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = no_match(&db.plane("code").unwrap(), "nothing::here").unwrap();
+        assert!(out.contains("no symbol matches"), "{out}");
+        assert!(
+            out.contains("plugins changed since this plane was built"),
+            "{out}"
+        );
+        assert!(out.contains("py@2+26f48733"), "{out}");
     }
 
     /// The plugin-set warning reaches the *answer*, not just a status command
