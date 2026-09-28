@@ -4,6 +4,20 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.2] - 2026-09-28
+
+### Fixed
+
+- **A rebuild reads the tree before it drops what it will replace.** `serve
+  watch --force` dropped the plane, re-created it carrying the `rebuilding_since`
+  marker, and only then routed the tree through the plugins. A parser that failed
+  — or trapped, which a wasm plugin can do on input its author never saw — left
+  the repository with an empty graph and a marker nothing cleared, and every
+  later restart took the "server died, restart it" path and declined to refill.
+  The graph `context`, `impact`, `trace` and `search` answer from was simply
+  gone. The tree is now routed first and the plane is dropped only once the new
+  facts exist, so a rebuild that cannot finish leaves the graph it has standing.
+
 ## [2.15.1] - 2026-09-27
 
 ### Fixed

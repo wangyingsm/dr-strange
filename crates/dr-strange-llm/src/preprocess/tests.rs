@@ -756,6 +756,7 @@ struct Peeking<'a> {
     inner: LocalFiles,
     db: &'a dr_strange_core::Database,
     saw_marker: std::sync::atomic::AtomicBool,
+    saw_previous: std::sync::atomic::AtomicBool,
 }
 
 impl Host for Peeking<'_> {
@@ -764,38 +765,57 @@ impl Host for Peeking<'_> {
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        if let Ok(plane) = self.db.plane("code")
-            && let Ok(props) = plane.properties()
-            && props.contains_key(dr_strange_core::compact::REBUILDING_PROP)
-        {
-            self.saw_marker
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(plane) = self.db.plane("code") {
+            if let Ok(props) = plane.properties()
+                && props.contains_key(dr_strange_core::compact::REBUILDING_PROP)
+            {
+                self.saw_marker.store(true, Relaxed);
+            }
+            if matches!(plane.node_by_key("a.aa::f"), Ok(Some(_))) {
+                self.saw_previous.store(true, Relaxed);
+            }
         }
         self.inner.read(path)
     }
 }
 
-/// `--force` drops the plane and refills it. In between, the plane is not
-/// wrong but *incomplete*, and a lookup for something not yet folded reads
-/// exactly like a lookup for something that does not exist. The plane says so
-/// while it rebuilds, and stops saying it the moment it finishes.
+/// `--force` reads the tree first and only then drops the plane, so while the
+/// parsers run the previous graph is still the one a reader sees — not an empty
+/// plane, and so nothing to be misled by. The marker covers what is left: the
+/// refill itself, after the old plane is gone and before the new facts land.
+/// It comes off the moment the rebuild finishes.
 #[test]
-fn a_rebuild_marks_the_plane_while_it_refills_and_clears_it_after() {
+fn a_rebuild_reads_the_tree_before_it_drops_what_it_will_replace() {
+    use std::sync::atomic::Ordering::Relaxed;
     let tree = Tree::new("resync-marker");
     tree.write("a.aa", "f\n").write("b.aa", "g\n");
     let db = dr_strange_core::Database::in_memory().unwrap();
     let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
 
+    // A plane to protect: the rebuild below must not drop it to read the tree.
+    resync(&db, "code", &tree.host(), &plugins, "test", "r0").unwrap();
+    assert!(
+        key_id(&db, "a.aa::f").is_some(),
+        "the fixture built a plane"
+    );
+
     let host = Peeking {
         inner: tree.host(),
         db: &db,
         saw_marker: std::sync::atomic::AtomicBool::new(false),
+        saw_previous: std::sync::atomic::AtomicBool::new(false),
     };
     resync(&db, "code", &host, &plugins, "test", "r1").unwrap();
 
     assert!(
-        host.saw_marker.load(std::sync::atomic::Ordering::Relaxed),
-        "the plane was refilling and said nothing about it"
+        host.saw_previous.load(Relaxed),
+        "the tree was read against a dropped plane — a parser that fails here \
+         would leave nothing behind"
+    );
+    assert!(
+        !host.saw_marker.load(Relaxed),
+        "the plane was marked as rebuilding before a rebuild could even fail"
     );
     let props = db.plane("code").unwrap().properties().unwrap();
     assert!(
@@ -1862,4 +1882,64 @@ fn claimed_only_lists_code_and_not_the_documents_beside_it() {
     // one it was given, and narrowing that would break cross-file resolution.
     assert!(claimed.read("README.md").is_ok());
     assert_eq!(claimed.label(), host.label());
+}
+
+/// A parser that fails the way a wasm plugin trapping does: the whole route
+/// returns an error, because one file's facts are not separable from the rest.
+struct Trapping;
+
+impl Preprocessor for Trapping {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: "aa".into(),
+            version: "1".into(),
+            extensions: vec!["aa".into()],
+            logo: None,
+            build: None,
+            source: None,
+        }
+    }
+
+    fn preprocess(&self, _input: &Input<'_>, _host: &dyn Host) -> Result<Preprocessed> {
+        anyhow::bail!("call stack exhausted")
+    }
+}
+
+/// A rebuild that cannot route the tree leaves the plane it was going to
+/// replace exactly as it was.
+///
+/// This is what dropping first cost: the rust plugin trapped on a cross-file
+/// type cycle, `--force` had already dropped the plane, and the repository was
+/// left with an empty graph that every later restart declined to refill —
+/// `context`/`impact`/`trace` answering nothing for a day.
+#[test]
+fn a_rebuild_that_cannot_route_the_tree_keeps_the_plane_it_has() {
+    let (tree, db, plugins) = sync_fixture("resync-trap");
+    let before = key_id(&db, "a.aa::f").expect("the fixture built a plane");
+    let edges_before = calls(&db, "b.aa::h");
+
+    let trapping = Plugins::from_handlers(vec![Box::new(Trapping)]);
+    let err = resync(&db, "code", &tree.host(), &trapping, "test", "r1")
+        .expect_err("a trapping parser must fail the rebuild");
+    assert!(
+        format!("{err:#}").contains("routing the tree"),
+        "the failure still names the stage: {err:#}"
+    );
+
+    // The plane, its nodes and its edges are all still there.
+    assert_eq!(
+        key_id(&db, "a.aa::f"),
+        Some(before),
+        "the rebuild dropped the plane before it knew it could refill it"
+    );
+    assert_eq!(calls(&db, "b.aa::h"), edges_before, "edges survived too");
+    let props = db.plane("code").unwrap().properties().unwrap();
+    assert!(
+        !props.contains_key(dr_strange_core::compact::REBUILDING_PROP),
+        "a plane that was never touched must not be marked as rebuilding"
+    );
+
+    // And the good parser still rebuilds it afterwards.
+    resync(&db, "code", &tree.host(), &plugins, "test", "r2").unwrap();
+    assert!(key_id(&db, "a.aa::f").is_some());
 }

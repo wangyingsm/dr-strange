@@ -112,13 +112,79 @@ pub fn sync_paths(
     source: &str,
     run_id: &str,
 ) -> Result<SyncStats> {
-    let mut stats = SyncStats::default();
+    let routed = routed_facts(host, plugins, source, run_id)?;
+    apply_routed(db, plane_name, plugins, routed)
+}
 
+/// The whole tree's facts, before any plane is touched — so that a parser that
+/// fails takes nothing with it.
+struct Routed {
+    facts: crate::Preprocessed,
+    prose_chars: usize,
+    notes: Vec<String>,
+}
+
+/// List the tree and route every file through the plugins. Reads only: the
+/// database is not opened here, which is what lets [`resync`] find out whether
+/// a rebuild can succeed before it drops the plane it would replace.
+///
+/// Does what [`super::route_tree`] does and keeps the context on each failure,
+/// because "routing the tree: plugin `x` trapped" is the whole diagnosis when a
+/// parser dies on input its author never saw.
+fn routed_facts(host: &dyn Host, plugins: &Plugins, source: &str, run_id: &str) -> Result<Routed> {
     let all = host.list("").context("listing the tree")?;
     let mut facts = route_paths(host, all, None, plugins).context("routing the tree")?;
     stamp_run(&mut facts, source, run_id);
-    stats.prose_chars = facts.prose.chars().count();
-    stats.notes = std::mem::take(&mut facts.report.notes);
+    let prose_chars = facts.prose.chars().count();
+    let notes = std::mem::take(&mut facts.report.notes);
+    Ok(Routed {
+        facts,
+        prose_chars,
+        notes,
+    })
+}
+
+/// The asserted edges whose endpoints both resolve, as bulk rows. An edge
+/// naming a key that resolved to nothing is counted, not written: a dangling
+/// endpoint would be a lie about what the tree says.
+fn loadable_edges<'a>(
+    asserted: &'a [&crate::digest::DigestEdge],
+    resolves: &dyn Fn(&str) -> Result<bool>,
+    stats: &mut SyncStats,
+) -> Result<Vec<BulkEdge<'a>>> {
+    let mut edges = Vec::new();
+    for edge in asserted {
+        if resolves(&edge.src)? && resolves(&edge.dst)? {
+            edges.push(BulkEdge {
+                src_key: &edge.src,
+                dst_key: &edge.dst,
+                ty: &edge.ty,
+                props: edge.props.clone(),
+            });
+        } else {
+            stats.edges_dropped += 1;
+        }
+    }
+    Ok(edges)
+}
+
+/// Reconcile already-routed facts into `plane_name`, which must exist.
+fn apply_routed(
+    db: &Database,
+    plane_name: &str,
+    plugins: &Plugins,
+    routed: Routed,
+) -> Result<SyncStats> {
+    let Routed {
+        facts,
+        prose_chars,
+        notes,
+    } = routed;
+    let mut stats = SyncStats {
+        prose_chars,
+        notes,
+        ..Default::default()
+    };
 
     let plane = db.plane(plane_name)?;
 
@@ -192,19 +258,7 @@ pub fn sync_paths(
             props: fact.props.clone(),
         })
         .collect();
-    let mut edges: Vec<BulkEdge> = Vec::new();
-    for edge in &edge_creates {
-        if resolves(&edge.src)? && resolves(&edge.dst)? {
-            edges.push(BulkEdge {
-                src_key: &edge.src,
-                dst_key: &edge.dst,
-                ty: &edge.ty,
-                props: edge.props.clone(),
-            });
-        } else {
-            stats.edges_dropped += 1;
-        }
-    }
+    let edges = loadable_edges(&edge_creates, &resolves, &mut stats)?;
     stats.nodes_loaded = nodes.len();
     stats.edges_written = edges.len();
     let loaded = txn.bulk_load(nodes, edges)?;
@@ -522,6 +576,11 @@ fn reattach(
 /// [`sync_paths`] already routes the whole tree, so this differs only in
 /// starting clean: embeddings, model prose and anything else a digest added
 /// are dropped with the plane and return on the next digest/vectorize.
+///
+/// The tree is routed *before* the plane is dropped. A parser that fails — or
+/// traps, which a wasm plugin can do on input the author never saw — then
+/// leaves the graph that was there standing, instead of replacing it with an
+/// empty one nothing can rebuild.
 pub fn resync(
     db: &Database,
     plane_name: &str,
@@ -530,6 +589,7 @@ pub fn resync(
     source: &str,
     run_id: &str,
 ) -> Result<SyncStats> {
+    let routed = routed_facts(host, plugins, source, run_id)?;
     if let Ok(plane) = db.plane(plane_name) {
         let id = plane.id();
         db.drop_plane(id)?;
@@ -548,15 +608,7 @@ pub fn resync(
         ),
     );
     db.create_plane(plane_name, props)?;
-    let stats = sync_paths(
-        db,
-        plane_name,
-        host,
-        &CommitDelta::default(),
-        plugins,
-        source,
-        run_id,
-    )?;
+    let stats = apply_routed(db, plane_name, plugins, routed)?;
     // Before the marker comes off: a plane that is finished must already say
     // what built it, or a reader between the two sees a complete graph with no
     // provenance and cannot tell whether it predates a plugin change (#39).
