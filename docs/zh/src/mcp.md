@@ -179,7 +179,7 @@ stdio 的宿主同样能接到那个已经持有数据库的进程，其平面�
 | 工具 | 类别 | 用途 |
 |---|---|---|
 | `list_planes` | 读 | 列出各平面及其节点/边计数 |
-| `describe_plane` | 读 | 某个平面的软 schema（标签、属性、边类型） |
+| `describe_plane` | 读 | 某个平面的软 schema（标签、属性、边类型、键前缀） |
 | `get_node` | 读 | 按 id 或外部键获取一个节点 |
 | `search` | 读 | 语义查找——嵌入查询文本，返回最近的 *k* 个节点 |
 | `context` | 读 | 已图化代码平面上一个符号的完整邻域——首选的智能体动词 |
@@ -211,6 +211,24 @@ stdio 的宿主同样能接到那个已经持有数据库的进程，其平面�
 `write_nodes` / `write_edges` / `create_plane` / `drop_plane` / `digest` 对应写入
 与导入接口。每个工具都依据该平面的软 schema 行事，而 `describe_plane` 就是用来
 暴露这份 schema 的，让智能体能在动手之前先了解这张图。
+
+## 精确地指定一个节点
+
+节点的外部键带前缀，而前缀恰恰是任何命名习惯都看不出来的那一段。Rust 键以 crate
+为前缀（`dr_strange_core::compact::resolve`）；TypeScript 键以最近一个
+`package.json` 里声明的 `name` 为前缀，其后是该文件**相对于这个清单所在目录**的
+路径，去掉扩展名——结尾的 `/index` 折叠为其所在目录，而根目录的 `index` 就代表这
+个包本身。若文件之上没有任何 `package.json`，前缀取这棵树的标签，对本地目录来说
+就是目录名。
+
+于是有一条值得记住的推论：TypeScript 键并不以仓库目录为前缀。一个目录名叫
+`bridge`、而清单里声明为 `highway_bridge-3.0` 的项目，它的键都在
+`highway_bridge-3.0/` 之下，按目录名去查将一无所获。
+
+有两处让这件事可被发现，而不必靠记：`describe_plane` 会给出 `key_prefixes`——每个
+产出方的节点实际使用的前缀，由扫描得来而非声明得来，因此不会与已存的键脱节；而一
+次没有命中的查找，会列出该平面确实持有的前缀，因为名字是按键的**片段**匹配的：
+`src/App` 无需知道前缀，也能找到 `highway_bridge-3.0/src/App`。
 
 ## 安全
 
