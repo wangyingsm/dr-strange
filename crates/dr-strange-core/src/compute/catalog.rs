@@ -7,7 +7,7 @@
 //! snapshot is a plain serializable struct — exactly what the MCP layer will
 //! serve to an LLM as "schema" (descriptive, never prescriptive).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::AHashMap;
 
@@ -123,6 +123,10 @@ impl EdgeTypeStats {
     }
 }
 
+/// What `key_prefixes` files a node under when no plugin claims it — a model
+/// entity or a document page, which follow no plugin's naming rule.
+pub const UNATTRIBUTED: &str = "(no producer)";
+
 /// A plane's (or the whole database's, rolled up) descriptive schema.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
@@ -130,6 +134,30 @@ pub struct CatalogSnapshot {
     pub edge_count: u64,
     pub labels: BTreeMap<String, LabelStats>,
     pub edge_types: BTreeMap<String, EdgeTypeStats>,
+    /// The key prefixes each producer's nodes actually use, keyed by
+    /// `_generated_by` (issue #40). A caller has to get the prefix right to name
+    /// a key exactly, and it is the part no naming convention reveals: a TS key
+    /// is prefixed with a `package.json` name, not the directory. Observed by
+    /// scanning rather than declared, so it cannot drift from the keys stored.
+    /// Bounded by the packages a producer parsed, not by node count, because a
+    /// key with no separator has no prefix and contributes nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_prefixes: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The part of an external key before its first separator — what a caller must
+/// reproduce for an exact lookup. `None` when the key has no separator, which
+/// leaves it nothing to teach.
+pub fn key_prefix(key: &str) -> Option<&str> {
+    let slash = key.find('/');
+    let path = key.find("::");
+    let at = match (slash, path) {
+        (Some(i), Some(j)) => i.min(j),
+        (Some(i), None) => i,
+        (None, Some(j)) => j,
+        (None, None) => return None,
+    };
+    Some(&key[..at]).filter(|p| !p.is_empty())
 }
 
 impl CatalogSnapshot {
@@ -153,6 +181,12 @@ impl CatalogSnapshot {
             for c in &stats.connections {
                 dst.add_connection(&c.src_label, &c.dst_label, c.count);
             }
+        }
+        for (producer, prefixes) in &other.key_prefixes {
+            self.key_prefixes
+                .entry(producer.clone())
+                .or_default()
+                .extend(prefixes.iter().cloned());
         }
     }
 }
@@ -249,6 +283,18 @@ pub fn compute(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<CatalogSnaps
             })
             .collect();
         labels_of.insert(id, interned);
+        if let Some(key) = &node.external_key
+            && let Some(prefix) = key_prefix(key)
+        {
+            let producer = match node.properties.get("_generated_by").map(|d| &d.value) {
+                Some(PropValue::Str(by)) => by.clone(),
+                _ => UNATTRIBUTED.to_string(),
+            };
+            cat.key_prefixes
+                .entry(producer)
+                .or_default()
+                .insert(prefix.to_string());
+        }
         for label in &node.labels {
             let ls = cat.labels.entry(label.clone()).or_default();
             ls.count += 1;
@@ -388,5 +434,84 @@ mod tests {
             rev.add_connection(s, d, 1);
         }
         assert_eq!(fwd.connections, rev.connections);
+    }
+
+    /// The prefix is what a caller must reproduce; a key with no separator
+    /// teaches nothing, so it contributes nothing rather than filing itself
+    /// under its own whole name — which is what makes the set bounded by
+    /// packages instead of by nodes (issue #40).
+    #[test]
+    fn a_key_prefix_is_the_segment_before_the_first_separator() {
+        assert_eq!(
+            key_prefix("highway_bridge-3.0/src/App.App"),
+            Some("highway_bridge-3.0")
+        );
+        assert_eq!(
+            key_prefix("dr_strange_core::compact::resolve"),
+            Some("dr_strange_core")
+        );
+        assert_eq!(key_prefix("@acme/web/src/App"), Some("@acme"));
+        assert_eq!(key_prefix("pkg"), None, "no separator, nothing to teach");
+        assert_eq!(key_prefix(""), None);
+        assert_eq!(key_prefix("/leading"), None, "an empty prefix is no prefix");
+        // Whichever separator comes first decides.
+        assert_eq!(key_prefix("a/b::c"), Some("a"));
+        assert_eq!(key_prefix("a::b/c"), Some("a"));
+    }
+
+    #[test]
+    fn merging_catalogs_unions_prefixes_per_producer() {
+        let of = |producer: &str, prefix: &str| {
+            let mut c = CatalogSnapshot::default();
+            c.key_prefixes
+                .entry(producer.into())
+                .or_default()
+                .insert(prefix.into());
+            c
+        };
+
+        let mut a = of("ts@2", "highway_bridge-3.0");
+        a.merge(&of("ts@2", "@acme/web"));
+        a.merge(&of("rust@3", "dr_strange_core"));
+        assert_eq!(
+            a.key_prefixes["ts@2"],
+            ["@acme/web".to_string(), "highway_bridge-3.0".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the same producer's prefixes union rather than overwrite"
+        );
+        assert_eq!(a.key_prefixes["rust@3"].len(), 1);
+
+        // Idempotent: merging the same snapshot twice adds no duplicates.
+        a.merge(&of("ts@2", "@acme/web"));
+        assert_eq!(a.key_prefixes["ts@2"].len(), 2);
+    }
+
+    /// The whole backward-compatibility claim: a plane that has no keyed nodes
+    /// serialises exactly as it did before the field existed.
+    #[test]
+    fn an_empty_prefix_map_is_absent_from_the_serialized_form() {
+        let empty = CatalogSnapshot::default();
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !json.contains("key_prefixes"),
+            "an empty map must not appear: {json}"
+        );
+
+        let mut some = CatalogSnapshot::default();
+        some.key_prefixes
+            .entry("ts@2".into())
+            .or_default()
+            .insert("pkg".into());
+        assert!(
+            serde_json::to_string(&some)
+                .unwrap()
+                .contains("key_prefixes")
+        );
+
+        // And a payload written before the field existed still reads.
+        let old = r#"{"node_count":0,"edge_count":0,"labels":{},"edge_types":{}}"#;
+        let back: CatalogSnapshot = serde_json::from_str(old).unwrap();
+        assert!(back.key_prefixes.is_empty());
     }
 }
