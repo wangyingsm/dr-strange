@@ -64,14 +64,14 @@ tracing.workspace = true
 # parallelism is bounded, though: each compile worker holds ~30 MiB, so the
 # host compiles on a pool of its own (`wasm::COMPILE_THREADS`) rather than on
 # every core the machine has.
-wasmtime = { version = "47", default-features = false, features = [
+wasmtime = { version = "48", default-features = false, features = [
     "runtime",
     "component-model",
     "cranelift",
     "parallel-compilation",
     "std",
 ], optional = true }
-wasmtime-wasi = { version = "47", optional = true }
+wasmtime-wasi = { version = "48", optional = true }
 # Plugin identity: hashed at install, re-checked at every load.
 sha2 = { version = "0.10" }
 # `registry.toml` — what is installed, and what it hashed to.
