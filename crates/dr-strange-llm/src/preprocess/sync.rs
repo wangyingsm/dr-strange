@@ -609,6 +609,10 @@ pub fn resync(
     );
     db.create_plane(plane_name, props)?;
     let stats = apply_routed(db, plane_name, plugins, routed)?;
+    // Before the marker comes off: a plane that is finished must already say
+    // what built it, or a reader between the two sees a complete graph with no
+    // provenance and cannot tell whether it predates a plugin change (#39).
+    super::ledger::record_built_by(db, plane_name, &plugins.manifests())?;
     let plane = db.plane(plane_name)?;
     let mut props = plane.properties()?;
     props.remove(dr_strange_core::compact::REBUILDING_PROP);

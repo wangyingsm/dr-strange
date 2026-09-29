@@ -173,6 +173,14 @@ stay under a provider's rate limit applies to both surfaces, not one of them.
 (The embedded `drsg-mcp` binary has no config file and keeps the built-in
 defaults.)
 
+`rebuild` re-reads the whole tree a plane was built from, which is what an
+answer means when it says the plugins changed since the plane was built — a fold
+applies a newly installed parser only to the files a commit touched. It takes a
+plane name and nothing else: the directory comes from the plane's own recorded
+`synced_root`, so a rebuild cannot be aimed at a tree the plane was never built
+from. It costs a full re-parse of the repository, and clears the warning that
+prompted it. See the [Plugins](./plugins.md) chapter for what the warning means.
+
 One capability differs by transport rather than by configuration. `digest`
 accepts a `path` to a document the server reads — Word, PowerPoint, Excel,
 OpenDocument, RTF, EPUB, CSV, PDF, Markdown or plain text — and **only the
@@ -244,6 +252,7 @@ wait, it does not turn it away.
 | `create_plane` | write | create an empty plane |
 | `drop_plane` | write | delete a plane and its contents (requires confirmation) |
 | `digest` | write | ingest a document (dry-run by default; `mode` sets extraction precision) |
+| `rebuild` | write | re-read the whole tree a plane was built from, making a graph that was parsed by two plugin sets one parse again |
 
 ## Mapping to the rest of the system
 

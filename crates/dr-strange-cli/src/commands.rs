@@ -1585,9 +1585,7 @@ const UNBORN_RUN_ID: &str = "working-tree";
 /// Together they answer "is the graph in sync with the repository?" — and
 /// which basis its `file` props are relative to.
 #[cfg(feature = "digest")]
-pub const SYNC_COMMIT_PROP: &str = "synced_commit";
-#[cfg(feature = "digest")]
-pub const SYNC_ROOT_PROP: &str = "synced_root";
+pub use dr_strange_core::compact::{SYNC_COMMIT_PROP, SYNC_ROOT_PROP};
 /// How far the working tree had drifted from that commit (issue #38).
 #[cfg(feature = "digest")]
 pub const SYNC_MODIFIED_PROP: &str = "synced_modified";
@@ -1775,6 +1773,35 @@ fn watch_embedder(
     }
 }
 
+/// Compare the installed plugins against the set this plane was built under and
+/// record the answer on the plane (issue #39).
+///
+/// Called at startup and after each fold, which is what a warning needs to be
+/// worth reading: a plugin installed while the server runs shows up on the next
+/// commit, and one installed while it was down shows up when it comes back.
+///
+/// Best-effort. A failure here would be a warning about a warning, and the graph
+/// is no less usable for the note being absent.
+#[cfg(feature = "digest")]
+fn note_plugin_drift(db: &Database, plane_name: &str, live: &mut dr_strange_llm::LivePlugins) {
+    let installed = match live.current() {
+        Ok(plugins) => plugins.manifests(),
+        Err(e) => {
+            tracing::debug!(
+                error = format!("{e:#}"),
+                "could not load plugins to check the plane against"
+            );
+            return;
+        }
+    };
+    if let Err(e) = dr_strange_llm::note_plugin_drift(db, plane_name, &installed) {
+        tracing::debug!(
+            error = format!("{e:#}"),
+            "could not record the plugin comparison"
+        );
+    }
+}
+
 /// Where to start folding from, for a plane that is neither brand-new nor
 /// being rebuilt: the plane says which commit it reflects, and that answer
 /// decides whether there is a gap to close.
@@ -1873,6 +1900,15 @@ fn fold_one_move(
     let claimed = dr_strange_llm::ClaimedOnly::new(&host, None, plugins);
     let routed: &dyn dr_strange_llm::Host = if tree.code_only { &claimed } else { &host };
     let stats = dr_strange_llm::sync_paths(db, plane_name, routed, &delta, plugins, source, now)?;
+    // After the fold, because this fold is exactly the event that leaves a plane
+    // half-parsed by two plugin sets: the files this commit touched got the new
+    // set, the rest still have the old one (issue #39).
+    if let Err(e) = dr_strange_llm::note_plugin_drift(db, plane_name, &plugins.manifests()) {
+        tracing::debug!(
+            error = format!("{e:#}"),
+            "could not record the plugin comparison"
+        );
+    }
     tracing::info!(
         commit = %&now[..12.min(now.len())],
         changed = delta.changed.len(),
@@ -1999,6 +2035,10 @@ fn watch_loop(
             ),
         }
     }
+
+    // Before serving, so an agent's first question already carries the note if
+    // a plugin landed while this server was down.
+    note_plugin_drift(db, plane_name, &mut live);
 
     tracing::info!(
         tree.dir = %tree.dir.display(),
@@ -3837,6 +3877,9 @@ fn apply_digest(
     // What this ingest could and could not read, kept where a later reader
     // will be: a miss in the graph is ambiguous until this says otherwise.
     dr_strange_llm::record_ledger(db, args.plane, ingest_account, ran_plugins)?;
+    // And the set the graph was built under, which the ledger cannot answer:
+    // it names only the handlers that produced facts (issue #39).
+    dr_strange_llm::record_built_by(db, args.plane, ran_plugins)?;
     Ok(())
 }
 

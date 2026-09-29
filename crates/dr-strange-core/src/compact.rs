@@ -127,6 +127,20 @@ pub const REBUILDING_PROP: &str = "rebuilding_since";
 /// rather than a call.
 pub const LEDGER_PROP: &str = "ledger";
 
+/// The plane property saying the installed plugins no longer match what built
+/// this plane. Written by `dr-strange-llm`, which can see both sides; the
+/// property is the interface between them, as [`LEDGER_PROP`] already is.
+pub const DRIFT_PROP: &str = "plugin_drift";
+
+/// The commit HEAD was at when a plane's facts were parsed, and the directory
+/// they were parsed from.
+///
+/// Named here because this crate is what *reads* them, and because more than
+/// one crate writes them: the CLI on a digest or fold, and anything that
+/// rebuilds a plane — which drops it, and so has to put them back.
+pub const SYNC_COMMIT_PROP: &str = "synced_commit";
+pub const SYNC_ROOT_PROP: &str = "synced_root";
+
 /// What the digest could not read, stated wherever an answer is read — and
 /// only when there was something.
 ///
@@ -137,6 +151,23 @@ pub const LEDGER_PROP: &str = "ledger";
 /// know before concluding. When it read everything — the ordinary case — this
 /// is silent, on the same terms as [`rebuilding_note`]: a line that says
 /// "nothing unusual" on every answer is noise.
+/// The plugin set changed after this plane was built (issue #39).
+///
+/// Written by the layer that can see both sides — this crate cannot ask what is
+/// installed — and rendered here so it reaches every answer, not only a status
+/// command. An incremental fold parses the files one commit touched, so after a
+/// plugin lands the graph is parsed by the new set where commits have arrived
+/// and by the old set everywhere else. "Half the calls resolve" is the symptom;
+/// this is the cause, and a rebuild is the cure.
+fn plugin_drift_note(props: &Properties) -> Option<String> {
+    let what = props.get(DRIFT_PROP)?.value.as_text()?;
+    Some(format!(
+        "plugins changed since this plane was built ({what}) — files the \
+         difference claims are parsed only where a later commit touched them; \
+         rebuild to make the graph whole\n"
+    ))
+}
+
 fn ledger_note(props: &Properties) -> Option<String> {
     let PropValue::Map(led) = &props.get(LEDGER_PROP)?.value else {
         return None;
@@ -242,7 +273,7 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
     // A plane can be both in sync and incomplete: the commit says *when* it
     // was parsed, the ledger says what the parse could not read, and a reader
     // weighing a miss needs the second more than the first.
-    let synced = props.get("synced_commit").and_then(|d| match &d.value {
+    let synced = props.get(SYNC_COMMIT_PROP).and_then(|d| match &d.value {
         crate::PropValue::Str(commit) => Some(format!(
             "synced: commit {}{}\n",
             &commit[..12.min(commit.len())],
@@ -250,10 +281,11 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
         )),
         _ => None,
     });
-    Ok(match (ledger_note(&props), synced) {
-        (Some(ledger), Some(synced)) => Some(format!("{synced}{ledger}")),
-        (ledger, synced) => ledger.or(synced),
-    })
+    let notes: Vec<String> = [synced, plugin_drift_note(&props), ledger_note(&props)]
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok((!notes.is_empty()).then(|| notes.concat()))
 }
 
 /// What to say when a lenient lookup found nothing.
@@ -263,7 +295,16 @@ fn synced_note(plane: &PlaneHandle<'_>) -> Result<Option<String>> {
 /// absence during a rebuild.
 pub fn no_match(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let mut out = format!("no symbol matches `{name}` in this plane\n");
-    if let Some(note) = rebuilding_note(&plane.properties()?) {
+    let props = plane.properties()?;
+    if let Some(note) = rebuilding_note(&props) {
+        out.push_str(&note);
+    }
+    // For the same reason a rebuild is mentioned here: a plugin that landed
+    // after the build leaves the files it claims unparsed except where a commit
+    // has since touched them, so "no symbol matches" may mean "never read"
+    // rather than "not there" (issue #39). This is the answer that most needs
+    // the distinction.
+    if let Some(note) = plugin_drift_note(&props) {
         out.push_str(&note);
     }
     Ok(out)
@@ -1733,6 +1774,88 @@ mod tests {
         let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
         assert!(out.contains("synced: commit abcdef012345"), "{out}");
         assert!(!out.contains("working tree"), "{out}");
+    }
+
+    /// "No symbol matches" is the answer that most needs the plugin note: the
+    /// symbol may be absent, or its file may never have been parsed (#39).
+    #[test]
+    fn a_miss_says_the_plugins_changed_so_absence_is_ambiguous() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                DRIFT_PROP.into(),
+                PropDesc::new(PropValue::Str("added since: py@2+26f48733".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = no_match(&db.plane("code").unwrap(), "nothing::here").unwrap();
+        assert!(out.contains("no symbol matches"), "{out}");
+        assert!(
+            out.contains("plugins changed since this plane was built"),
+            "{out}"
+        );
+        assert!(out.contains("py@2+26f48733"), "{out}");
+    }
+
+    /// The plugin-set warning reaches the *answer*, not just a status command
+    /// (issue #39): an agent reading `context` is exactly who needs to know that
+    /// half this graph was parsed by a different set of plugins.
+    #[test]
+    fn a_plane_whose_plugins_changed_says_so_on_every_answer() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                DRIFT_PROP.into(),
+                PropDesc::new(PropValue::Str("added since: ts@2+abc123".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(
+            out.contains("plugins changed since this plane was built"),
+            "{out}"
+        );
+        assert!(
+            out.contains("added since: ts@2+abc123"),
+            "it names which: {out}"
+        );
+        assert!(out.contains("rebuild"), "and what to do: {out}");
+    }
+
+    /// Both notes can be true at once, and both are said: the commit line
+    /// answers "how fresh", the plugin line answers "how complete".
+    #[test]
+    fn the_commit_and_the_plugin_notes_both_speak() {
+        let db = seeded();
+        {
+            let p = db.plane("code").unwrap();
+            let mut props = p.properties().unwrap();
+            props.insert(
+                "synced_commit".into(),
+                PropDesc::new(PropValue::Str("abcdef0123456789".into())),
+            );
+            props.insert(
+                DRIFT_PROP.into(),
+                PropDesc::new(PropValue::Str("added since: py@2+def456".into())),
+            );
+            p.set_properties(props).unwrap();
+        }
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(out.contains("synced: commit abcdef012345"), "{out}");
+        assert!(out.contains("plugins changed since"), "{out}");
+    }
+
+    /// A plane whose plugins have not moved says nothing extra — the ordinary
+    /// case stays quiet.
+    #[test]
+    fn a_plane_with_matching_plugins_is_silent_about_them() {
+        let db = seeded();
+        let out = context(&db.plane("code").unwrap(), "m::api::go").unwrap();
+        assert!(!out.contains("plugins changed"), "{out}");
     }
 
     #[test]
