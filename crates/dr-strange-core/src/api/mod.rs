@@ -3421,6 +3421,62 @@ mod change_feed_tests {
         assert_eq!((c.nodes, c.edges), (cat.node_count, cat.edge_count));
     }
 
+    /// A plane reports the key prefixes it holds, grouped by what produced
+    /// them, so a caller can see that a TS key is prefixed with a manifest name
+    /// and not a directory (issue #40). Derived by scanning: nothing declares it.
+    #[test]
+    fn the_catalog_reports_the_key_prefixes_it_scanned() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        let by = |who: &str| {
+            let mut p = Properties::new();
+            p.insert(
+                "_generated_by".into(),
+                PropDesc::new(PropValue::Str(who.into())),
+            );
+            p
+        };
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("highway_bridge-3.0/src/App", &["Module"], by("ts@2"))
+                .unwrap();
+            w.create_node_with_key("highway_bridge-3.0/src/Nav", &["Module"], by("ts@2"))
+                .unwrap();
+            w.create_node_with_key("@acme/web/src/App", &["Module"], by("ts@2"))
+                .unwrap();
+            w.create_node_with_key(
+                "dr_strange_core::compact::resolve",
+                &["Function"],
+                by("rust@3"),
+            )
+            .unwrap();
+            // No separator: nothing to teach, so it files no prefix.
+            w.create_node_with_key("loose", &["Module"], by("ts@2"))
+                .unwrap();
+            // No producer: a model entity or document page follows no plugin.
+            w.create_node_with_key("notes/one", &["Page"], Properties::new())
+                .unwrap();
+            w.commit().unwrap();
+        }
+
+        let cat = plane.catalog().unwrap();
+        assert_eq!(
+            cat.key_prefixes["ts@2"],
+            ["@acme".to_string(), "highway_bridge-3.0".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "two packages, deduplicated, and `loose` contributes nothing"
+        );
+        assert_eq!(cat.key_prefixes["rust@3"].len(), 1);
+        assert_eq!(
+            cat.key_prefixes[crate::compute::catalog::UNATTRIBUTED],
+            ["notes".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a node no plugin claims is filed apart, not attributed to one"
+        );
+    }
+
     /// The database roll-up sums planes, and dropping a plane drops its row
     /// with it.
     #[test]

@@ -229,7 +229,7 @@ wait, it does not turn it away.
 | Tool | Kind | Purpose |
 |---|---|---|
 | `list_planes` | read | list planes with node/edge counts |
-| `describe_plane` | read | a plane's soft schema (labels, properties, edge types) |
+| `describe_plane` | read | a plane's soft schema (labels, properties, edge types, key prefixes) |
 | `get_node` | read | fetch one node by id or external key |
 | `search` | read | semantic lookup — embeds the query, returns the *k* nearest nodes |
 | `context` | read | one symbol's whole neighborhood on a digested code plane — the primary agent verb |
@@ -263,6 +263,29 @@ adapted to an agent's needs: `search` / `traverse` / `query` / `cypher` / `algo`
 `write_edges` / `create_plane` / `drop_plane` / `digest` mirror the write and
 ingestion surface. Each is grounded in the plane's soft schema, which
 `describe_plane` exposes so an agent can discover a graph before acting on it.
+
+## Naming a node exactly
+
+A node's external key is prefixed, and the prefix is the part no convention
+reveals. A Rust key is prefixed with the crate (`dr_strange_core::compact::resolve`);
+a TypeScript key is prefixed with the `name` declared in the nearest
+`package.json`, then the file's path **relative to the directory holding that
+manifest**, without the extension — a trailing `/index` collapses to its
+directory, and a root `index` names the package itself. With no `package.json`
+above the file, the prefix is the tree's label, which for a local directory is
+its name.
+
+The consequence worth knowing: a TypeScript key is not prefixed with the
+repository directory. A project whose directory is `bridge` but whose manifest
+declares `highway_bridge-3.0` has keys under `highway_bridge-3.0/`, and a lookup
+by directory name finds nothing.
+
+Two things make this discoverable rather than something to remember.
+`describe_plane` reports `key_prefixes` — the prefixes each producer's nodes
+actually use, observed by scanning rather than declared, so it cannot drift from
+what is stored. And a lookup that finds nothing names the prefixes the plane does
+hold, because a name matches any *fragment* of a key: `src/App` finds
+`highway_bridge-3.0/src/App` without knowing the prefix at all.
 
 ## Safety
 
