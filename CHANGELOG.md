@@ -4,6 +4,49 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.0] - 2026-09-30
+
+### Security
+
+- **The plugin sandbox is upgraded to wasmtime 48.0.3**, which closes three
+  advisories published after 2.16.0 shipped: fuel accounting dropped by
+  `call_ref` and exception `catch`, letting a guest amplify its fuel budget
+  exponentially ([RUSTSEC-2026-0315]); dynamic record lifting allocating past
+  the hostcall fuel limit ([RUSTSEC-2026-0316]); and a guest panicking the host
+  through a filesystem datetime overflow ([RUSTSEC-2026-0314]). drsg runs
+  third-party parser plugins inside that sandbox, so these are the class of bug
+  it exists to contain. **2.16.0 and every earlier release that shipped the wasm
+  plugin host are affected** — there is no patched 47.x, so upgrading is the
+  only remedy. This raises the minimum supported Rust to 1.95, which wasmtime 48
+  declares.
+
+[RUSTSEC-2026-0314]: https://rustsec.org/advisories/RUSTSEC-2026-0314
+[RUSTSEC-2026-0315]: https://rustsec.org/advisories/RUSTSEC-2026-0315
+[RUSTSEC-2026-0316]: https://rustsec.org/advisories/RUSTSEC-2026-0316
+
+### Added
+
+- **`describe_plane` reports the key prefixes a plane holds.** A node's external
+  key is prefixed, and the prefix is the part no convention reveals: a TypeScript
+  key is prefixed with the `name` declared in the nearest `package.json`, not the
+  repository directory, so a lookup by directory name finds nothing. Each
+  producer's observed prefixes now appear under `key_prefixes`, keyed by
+  `_generated_by` — derived by scanning rather than declared, so they cannot
+  drift from the keys actually stored. A key with no separator contributes none,
+  which keeps the set bounded by the packages a producer parsed rather than by
+  node count.
+
+### Fixed
+
+- **A miss names the prefixes it did not match.** A lookup that guessed the
+  prefix wrong was indistinguishable from one that named nothing at all: both
+  answered "no symbol matches". It now lists the prefixes the plane does hold,
+  says which guess was not among them, and points at the fragment that would
+  have matched — a name matches any *fragment* of a key, so `src/App` finds
+  `highway_bridge-3.0/src/App` without knowing the prefix. Reads keys only,
+  rather than computing the whole catalog, so a mistyped name pays no more than
+  it must (issue #40).
+
 ## [2.16.0] - 2026-09-29
 
 ### Added
