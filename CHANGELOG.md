@@ -4,6 +4,27 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.0] - 2026-09-29
+
+### Added
+
+- **A plane says when the installed plugins no longer match what built it.**
+  Installing a plugin does not reach back into a graph that already exists: the
+  files it claims stay unparsed, and `context` or `search` answer as if they were
+  not there. A watched repository folds one commit at a time, so the tree ends up
+  half parsed one way and half the other, and nothing said so — an empty answer
+  looked exactly like an absent symbol. Every fold now records the plugin set it
+  ran under in `built_by`, on the full identity `name@version+build` so a plugin
+  upgraded in place counts too, and a plane whose installed set has since changed
+  carries a `plugin_drift` note naming both directions. The note rides on every
+  answer, including "no symbol matches" — the one case where the absence is
+  ambiguous and the warning matters most. It is a warning only: nothing refuses
+  to answer, and no fold is forced.
+- **`rebuild`, an MCP tool that re-reads the whole tree a plane was built from**,
+  so an agent can act on the warning it just read without leaving the session.
+  `drsg init --rebuild` is the human twin. Both restore the plane's sync point
+  afterwards, so the watch resumes where it left off.
+
 ## [2.15.2] - 2026-09-28
 
 ### Fixed
