@@ -13,7 +13,7 @@ homepage.workspace = true
 ahash = { workspace = true, features = ["serde"] }
 # Only the plan types, never the json feature — the parser is pure text→plan.
 dr-strange-core = { workspace = true }
-nom = "7"
+nom = "8"
 
 [lints]
 workspace = true
