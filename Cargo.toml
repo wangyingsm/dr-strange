@@ -56,6 +56,6 @@ mimalloc = "0.1"
 # Default features stay on — they carry the `#[tool_router]` / `#[tool]` macros
 # the tool set is written with. Features are additive per package across the
 # build graph, so each member names only the transports it drives.
-rmcp = "2.2.0"
+rmcp = "3.5.1"
 thiserror = "2"
 tracing = "0.1"
