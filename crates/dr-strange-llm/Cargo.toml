@@ -73,7 +73,7 @@ wasmtime = { version = "48", default-features = false, features = [
 ], optional = true }
 wasmtime-wasi = { version = "48", optional = true }
 # Plugin identity: hashed at install, re-checked at every load.
-sha2 = { version = "0.10" }
+sha2 = { version = "0.11" }
 # `registry.toml` — what is installed, and what it hashed to.
 toml = { version = "0.8", optional = true }
 
