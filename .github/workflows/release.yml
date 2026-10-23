@@ -54,7 +54,7 @@ jobs:
       # surfaces as "can't find crate" for something deep in the graph
       # (wasmtime, here) rather than as a cache-miss. `key` scopes the cache
       # to this matrix leg exactly.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -264,7 +264,7 @@ jobs:
           targets: ${{ matrix.target }}
       # Keyed by target for the reason the binaries job records: two legs on
       # one runner would otherwise restore each other's cache.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wheel-${{ matrix.target }}
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
