@@ -4,6 +4,125 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.0] - 2026-10-28
+
+Three things reach past the server this release. The engine opens a graph
+inside a Python process with no socket in between; the ops plane 2.23.0
+introduced now arrives from an ordinary digest rather than being asked for; and
+the accuracy benchmark adds two more tools to score, one of which is no tool at
+all — a plain text search, which turns out to match this project's recall
+exactly and assert 133 calls that do not exist.
+
+### Added
+
+- **`drsg-embedded` — the engine in your own process, as async Python.** One
+  file on disk, opened directly: `db = await drsg.open("graph.drsg")`, then the
+  surface the MCP server and the CLI already use — `db.context(plane, name)`,
+  `db.impact(plane, name, depth=3)`, `db.deployed(plane)`. Every method is a
+  coroutine and every one does its work on a blocking thread, because a point
+  lookup here is microseconds of CPU rather than I/O to wait on, and running it
+  inline would stall every other task for exactly that long. Calls name their
+  plane rather than returning a handle, since a plane borrows the database it
+  came from and a Python object cannot hold a borrow. This wraps the
+  **engine**, not the digest: building a plane needs the sandboxed wasm parser
+  plugins, which would put tens of megabytes into every wheel, so build with
+  the CLI and read from here. Alpha — the surface above is settled, and
+  `cypher`, the change feed and bulk writes are next. Wheels build for five
+  targets (Linux `x86_64`/`aarch64`, macOS Apple Silicon/Intel, Windows
+  `x86_64`) and are tested in CI against the wheel rather than the source tree;
+  they publish once a `PYPI_TOKEN` secret exists. Nothing is on PyPI yet.
+- **An ordinary digest writes the ops plane.** The Compose, Kubernetes and
+  Terraform readers are routed by the normal rules — a compose file by its
+  name, a `.tf` by its extension — so their facts used to arrive mixed in with
+  the code's, where they do not belong: a workload and a function answer
+  different questions, and a chart changes on a different cadence from the code
+  it deploys, so re-reading one must not invalidate the other. They now land in
+  `<plane>_ops`, the plane `deployed` already reads. Nothing has to ask for it,
+  and the split is made on the one thing every fact carries — `_generated_by`,
+  the plugin that produced it — never on a label, because `Namespace` means one
+  thing from the Kubernetes reader and another from a language parser that
+  borrows the word. An incremental fold and a `--force` rebuild route facts the
+  same way, so the plane cannot drift from the tree depending on how it was
+  built.
+- **`drsg token` reads the bearer back, masked.** `init` stopped printing the
+  token (below) and printed a `jq` pipeline over `.mcp.json` in its place,
+  which needed `jq` installed and said nothing useful when no `init` had run
+  here. This is that read, as a command: bare, it masks —
+  `AAAA…LmXw <40 characters>`: enough to tell one token from another,
+  never enough to use, and a token too short for its ends to be given away
+  cheaply is masked whole. `--unhide` prints it for command substitution, which
+  is the form `init` now prints: `export DRSG_TOKEN=$(drsg token --unhide)`.
+- **`[plugins] hostcall_mb` — what one call may copy out of the sandbox.**
+  `parse` returns one file's partial and stays far below wasmtime's 128 MiB,
+  but `assemble` returns the whole tree in one value, so a large repository is
+  the first to pass it. The error now names this setting. Leave it out, or set
+  `0`, and wasmtime's own limit applies; there is no environment variable for
+  it.
+
+### Changed
+
+- **A bulk load is 24% faster again** — 343 → 426 K rows/s, on top of the
+  roughly doubled throughput the `bulk_load` fast path already recorded. Two
+  changes: the write batch is handed buffers it already owns instead of copies,
+  and the CRC reads eight bytes a round off a table rather than one byte, which
+  had been a quarter of a load. Measured as an interleaved old/new A/B in one
+  window, so the delta is the code and not the hour of day.
+- **The accuracy benchmark scores five tools, and a text search is one of
+  them.** GitNexus 1.6.12 joins the recall table, and beneath it a baseline
+  that needs nothing installed, so the comparison's floor is always
+  reproducible. Read the last two columns together, because they are the
+  finding: a plain text search matches this project's recall exactly — 65 of 67
+  — and asserts 133 calls that do not exist. Recall alone therefore does not
+  separate a resolved call graph from `rg`; everything that does is in the row
+  beneath it and in the honesty arm. That arm now reports two rates per tool
+  rather than prose — an **unresolved-reference disclosure rate** (of the
+  ambiguous sites where no edge was drawn, how many were *named*) and an
+  **ambiguity misjudgement rate** (of the sites where a guess was available,
+  how many were guessed at with certainty) — plus a third, traversal-boundary
+  disclosure, recorded as a property of each tool's own reach answer. drsg
+  discloses 24/47 and misjudges 0/47; GitNexus 2/23 and 16/39; text search
+  0/11 and 28/39. The two rates pull in opposite directions by design, which is
+  why neither is reported alone.
+- **The engine benchmark report dates each column from the data it was
+  measured from**, not from the file's mtime, and keeps the sections it used to
+  delete on regeneration. Both harnesses stamp their results with the
+  measurement time to make that possible.
+
+### Fixed
+
+- **`drsg init` wrote a Codex config it could not read back.** The pre-existing
+  `.codex/config.toml` was parsed with `str::parse::<toml::Value>()`, and under
+  toml 1.x `FromStr` reads one *bare value* rather than a document — so a real
+  config ends at its first table header and the rest is rejected as unexpected
+  content. Every Codex user with an existing config therefore had `init` refuse
+  it as invalid TOML. Parsed as a document now.
+- **A scanned PDF is named in the digest report instead of being dropped.** A
+  page with no text layer is not a file we failed to recognise; it is one we
+  read and found nothing in. The conversion error was flattened into a string,
+  so the bytes then failed the UTF-8 fallback and the file left no line at all
+  — a digest quietly lost it. The typed error is kept in the chain now, and the
+  report says which pages need OCR.
+- **`drsg init` no longer prints the bearer token.** The export hints read it
+  back from `.mcp.json` rather than putting the secret in the command's own
+  output.
+- **The Go SDK reports a socket deadline as the context's.** The only deadline
+  on that socket is the one taken from the context, and the two are separate
+  clocks for one instant, so a handshake read could fail on the socket's before
+  the context's timer had set `ctx.Err()`. Leaking `i/o timeout` there left a
+  caller unable to tell its own deadline from a server that had gone quiet, and
+  which of the two it saw depended on a race.
+
+### Security
+
+- **tokio 1.54.1**, for RUSTSEC-2026-0384.
+- **Four zstd advisories cleared** — RUSTSEC-2026-0391, -0398, -0403 and -0410,
+  reached through `jieba-rs → include-flate → zstd`. `cargo update` could not
+  cross the majors involved; `include-flate` 0.3.5 moved to `zstd ^0.14`, which
+  lands all three minimums (zstd 0.14.3, zstd-safe 8.2.0, zstd-sys 2.1.2).
+- Dependencies: reqwest 0.13.4 (which also drops a duplicate copy), anydoc
+  0.2.4, toml 1.1.8, and the cargo group. The three `zip` advisories recorded
+  in `deny.toml` are **not** cleared: anydoc 0.2.4 still requires `zip ^8.6`.
+
 ## [2.23.0] - 2026-10-21
 
 The thesis of this project is that a commit and a production incident are two
