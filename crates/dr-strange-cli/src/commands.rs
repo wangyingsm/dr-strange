@@ -554,9 +554,24 @@ fn write_agent_configs(
     token: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
+    write_agent_configs_with(dir, addr, token, &default_hooks_dir, &user_has, out)
+}
+
+/// [`write_agent_configs`] with its two lookups on this machine passed in —
+/// where the Claude Code hook scripts go, and which markers `$HOME` carries —
+/// so a test can drive every probe without touching the real home directory.
+#[cfg(feature = "digest")]
+fn write_agent_configs_with(
+    dir: &Path,
+    addr: &std::net::SocketAddr,
+    token: &str,
+    hooks_dir: &dyn Fn() -> Result<std::path::PathBuf>,
+    user_has: &dyn Fn(&str) -> bool,
+    out: &mut dyn Write,
+) -> Result<()> {
     write_mcp_json_entry(dir, addr, token)?;
     writeln!(out, "  + wrote {}", dir.join(".mcp.json").display())?;
-    if probe_and_write_claude_hooks(dir, &default_hooks_dir()?, user_has_claude_code())? {
+    if probe_and_write_claude_hooks(dir, &hooks_dir()?, user_has(".claude"))? {
         writeln!(
             out,
             "  + Claude Code: hooks in {} — a shell search or read on code is \
@@ -587,17 +602,17 @@ fn write_agent_configs(
     )? {
         writeln!(
             out,
-            "  + OpenCode: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
-             before launching `opencode` here)",
-            dir.join(".opencode.json").display()
+            "  + OpenCode: wrote {} (no token inside it — {} before launching `opencode` here)",
+            dir.join(".opencode.json").display(),
+            token_export_hint(dir)
         )?;
     }
     if probe_and_write_gemini(dir, addr, user_has(".gemini"))? {
         writeln!(
             out,
-            "  + Gemini CLI: wrote {} (no token inside it — export {CODEX_TOKEN_ENV_VAR}={token} \
-             before launching `gemini` here)",
-            dir.join(".gemini/settings.json").display()
+            "  + Gemini CLI: wrote {} (no token inside it — {} before launching `gemini` here)",
+            dir.join(".gemini/settings.json").display(),
+            token_export_hint(dir)
         )?;
     }
     if probe_and_write_trae(dir, addr, token, user_has(".trae"))? {
@@ -611,9 +626,9 @@ fn write_agent_configs(
     if probe_and_write_kimi(dir, addr, user_has(".kimi-code") || user_has(".kimi"))? {
         writeln!(
             out,
-            "  + Kimi Code: wrote {} (no token inside it — export \
-             {CODEX_TOKEN_ENV_VAR}={token} before launching `kimi` here)",
-            dir.join(".kimi-code/mcp.json").display()
+            "  + Kimi Code: wrote {} (no token inside it — {} before launching `kimi` here)",
+            dir.join(".kimi-code/mcp.json").display(),
+            token_export_hint(dir)
         )?;
     }
     // Qoder and CodeBuddy read the project's own `.mcp.json`, which is
@@ -633,10 +648,10 @@ fn write_agent_configs(
         writeln!(
             out,
             "  + Codex CLI: wrote {} (no token inside it — Codex reads the bearer from its \
-             own process environment; export {CODEX_TOKEN_ENV_VAR}={token} before launching \
-             `codex` here, and mark this project trusted, or its project-scoped MCP config is \
-             ignored)",
-            dir.join(".codex/config.toml").display()
+             own process environment; {} before launching `codex` here, and mark this \
+             project trusted, or its project-scoped MCP config is ignored)",
+            dir.join(".codex/config.toml").display(),
+            token_export_hint(dir)
         )?;
     }
     Ok(())
@@ -1200,6 +1215,20 @@ fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, user: bool) -
 #[cfg(feature = "digest")]
 const CODEX_TOKEN_ENV_VAR: &str = "DRSG_TOKEN";
 
+/// The command to run before launching a terminal client that reads the
+/// bearer from [`CODEX_TOKEN_ENV_VAR`]. It reads the token out of
+/// `.mcp.json` instead of spelling it: `init`'s output lands in terminals,
+/// CI logs and agent transcripts, and the token belongs only in the
+/// gitignored file that already holds it.
+#[cfg(feature = "digest")]
+fn token_export_hint(dir: &Path) -> String {
+    format!(
+        "export {CODEX_TOKEN_ENV_VAR}=$(jq -r \
+         '.mcpServers[\"{MCP_SERVER_NAME}\"].headers.Authorization[7:]' \"{}\")",
+        dir.join(".mcp.json").display()
+    )
+}
+
 /// Codex CLI's project-scoped MCP config, `.codex/config.toml`, is TOML —
 /// parsed and re-emitted as a generic table (like the JSON upserts above,
 /// this preserves every other *key* but not hand-written comments or
@@ -1282,12 +1311,6 @@ fn default_hooks_dir() -> Result<std::path::PathBuf> {
     let home = std::env::home_dir()
         .context("neither $XDG_DATA_HOME nor a home directory — set XDG_DATA_HOME")?;
     Ok(home.join(".local").join("share").join("drsg").join("hooks"))
-}
-
-/// Whether this user runs Claude Code at all: its per-user directory exists.
-#[cfg(feature = "digest")]
-fn user_has_claude_code() -> bool {
-    user_has(".claude")
 }
 
 /// Whether `$HOME` carries `marker` — the signal that this machine has the
@@ -6354,6 +6377,47 @@ mod tests {
         assert!(
             !rendered.contains("Bearer"),
             "the raw token must never land in this file: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `init`'s output lands in terminals, CI logs and agent transcripts, so
+    /// the lines it prints for the terminal clients say where the token is,
+    /// never what it is.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn init_output_never_spells_the_token() {
+        let dir = scratch_dir("token-output");
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let token = "tok-must-stay-in-mcp-json";
+        let hooks = dir.join("hooks");
+        let mut out = Vec::new();
+
+        write_agent_configs_with(
+            &dir,
+            &addr,
+            token,
+            &|| Ok(hooks.clone()),
+            &|_| true,
+            &mut out,
+        )
+        .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+
+        for client in ["OpenCode", "Gemini CLI", "Kimi Code", "Codex CLI"] {
+            assert!(
+                printed.contains(&format!("+ {client}: wrote")),
+                "no {client} line:\n{printed}"
+            );
+        }
+        assert!(
+            !printed.contains(token),
+            "init printed the token:\n{printed}"
+        );
+        assert!(
+            printed.contains(&format!("export {CODEX_TOKEN_ENV_VAR}=$(jq -r ")),
+            "{printed}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
