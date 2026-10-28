@@ -489,6 +489,11 @@ def aggregate_passes(passes):
 
 def write_results(out_path, results):
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # A file's mtime does not survive a clone, so the date the report prints
+    # has to travel inside the results themselves.
+    stamp = int(time.time())
+    for r in results:
+        r["measured_at_unix"] = stamp
     out_path.write_text(json.dumps(results, indent=2))
     print(f"wrote {len(results)} results → {out_path}")
     for r in results:

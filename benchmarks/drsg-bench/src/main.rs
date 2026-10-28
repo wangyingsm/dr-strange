@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -691,7 +691,21 @@ fn run(
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(out, serde_json::to_vec_pretty(&results)?)?;
+    // A file's mtime does not survive a clone, so the date the report prints
+    // has to travel inside the results themselves.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut rows = serde_json::to_value(&results)?;
+    if let Some(arr) = rows.as_array_mut() {
+        for row in arr {
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("measured_at_unix".into(), stamp.into());
+            }
+        }
+    }
+    fs::write(out, serde_json::to_vec_pretty(&rows)?)?;
     println!("wrote {} results → {}", results.len(), out.display());
     for r in &results {
         let spread = r
