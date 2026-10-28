@@ -107,6 +107,22 @@ enum Command {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Print the bearer token a previous `init` recorded, masked.
+    ///
+    /// The clients that read the bearer from their environment rather than
+    /// from a config file need it in a shell, which is what `--unhide` is
+    /// for: `export DRSG_TOKEN=$(drsg token --unhide)`, the line `init`
+    /// prints instead of the token so the secret stays out of its output.
+    #[cfg(feature = "digest")]
+    Token {
+        /// Repository whose `.mcp.json` holds the token.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Print the token itself rather than a masked form of it. For
+        /// command substitution, where nothing reaches the screen.
+        #[arg(long)]
+        unhide: bool,
+    },
     /// Create a new database.
     #[cfg(not(feature = "digest"))]
     Init,
@@ -1147,6 +1163,10 @@ fn run_bootstrap(
                 out,
             )
         }
+        #[cfg(feature = "digest")]
+        // No database: the token lives in `.mcp.json`, and a server already
+        // holding the lock must not be collided with just to read it.
+        Command::Token { dir, unhide } => commands::print_token(&dir, unhide, out),
         #[cfg(not(feature = "digest"))]
         Command::Init => commands::init(db_path, out),
         Command::Plane(cmd) => {

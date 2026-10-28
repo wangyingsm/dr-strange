@@ -704,6 +704,54 @@ fn recorded_endpoint(dir: &Path) -> Option<(std::net::SocketAddr, String)> {
     Some((addr, token))
 }
 
+/// A token with its middle masked: enough to tell one from another, never
+/// enough to use. A token too short for its ends to be given away cheaply is
+/// masked whole, and the length is said either way because that is what tells
+/// a generated token from a hand-written one.
+#[cfg(feature = "digest")]
+fn redacted(token: &str) -> String {
+    let n = token.chars().count();
+    if n < REDACT_FLOOR {
+        return format!("<hidden, {n} characters>");
+    }
+    let head: String = token.chars().take(REDACT_ENDS).collect();
+    let tail: String = token.chars().skip(n - REDACT_ENDS).collect();
+    format!("{head}…{tail} <{n} characters>")
+}
+
+/// Shortest token whose ends may be shown. Below this, four characters at each
+/// end is most of the secret.
+#[cfg(feature = "digest")]
+const REDACT_FLOOR: usize = 16;
+
+/// How much of each end a redacted token keeps.
+#[cfg(feature = "digest")]
+const REDACT_ENDS: usize = 4;
+
+/// Print the bearer token a previous `init` recorded for `dir`, masked unless
+/// `unhide`.
+///
+/// Masked is the default because the common reason to run this is to check
+/// which token a repository holds, and that answer does not need the secret on
+/// screen. `--unhide` is for `export DRSG_TOKEN=$(drsg token --unhide)`, where
+/// nothing is displayed at all — which is the line `init` prints, so the token
+/// never passes through terminal scrollback, a CI log or an agent transcript.
+#[cfg(feature = "digest")]
+pub fn print_token(dir: &Path, unhide: bool, out: &mut dyn Write) -> Result<()> {
+    let (_, token) = recorded_endpoint(dir).ok_or_else(|| {
+        anyhow!(
+            "no drsg endpoint recorded in {} — run `drsg init` here first",
+            dir.join(".mcp.json").display()
+        )
+    })?;
+    if unhide {
+        writeln!(out, "{token}")?;
+    } else {
+        writeln!(out, "{}", redacted(&token))?;
+    }
+    Ok(())
+}
+
 /// Whether a drsg server is answering on `addr`, and which process it is —
 /// `GET /health`, which the server leaves unauthenticated precisely for probes
 /// like this one. `Some(pid)` when one answered and said, `Some(None)` when it
@@ -1233,16 +1281,21 @@ fn probe_and_write_gemini(dir: &Path, addr: &std::net::SocketAddr, user: bool) -
 const CODEX_TOKEN_ENV_VAR: &str = "DRSG_TOKEN";
 
 /// The command to run before launching a terminal client that reads the
-/// bearer from [`CODEX_TOKEN_ENV_VAR`]. It reads the token out of
-/// `.mcp.json` instead of spelling it: `init`'s output lands in terminals,
-/// CI logs and agent transcripts, and the token belongs only in the
-/// gitignored file that already holds it.
+/// bearer from [`CODEX_TOKEN_ENV_VAR`]. It names [`print_token`] rather than
+/// the token itself: `init`'s output lands in terminals, CI logs and agent
+/// transcripts, and the secret belongs only in the gitignored file that holds
+/// it. Through drsg rather than a `jq` filter, so the line needs nothing the
+/// reader may not have installed, and says so itself when there is no token.
+/// `--unhide` because the substitution consumes the token rather than showing
+/// it; without the flag the command masks what it prints.
 #[cfg(feature = "digest")]
 fn token_export_hint(dir: &Path) -> String {
+    if dir == Path::new(".") {
+        return format!("export {CODEX_TOKEN_ENV_VAR}=$(drsg token --unhide)");
+    }
     format!(
-        "export {CODEX_TOKEN_ENV_VAR}=$(jq -r \
-         '.mcpServers[\"{MCP_SERVER_NAME}\"].headers.Authorization[7:]' \"{}\")",
-        dir.join(".mcp.json").display()
+        "export {CODEX_TOKEN_ENV_VAR}=$(drsg token --unhide --dir {})",
+        dir.display()
     )
 }
 
@@ -6431,12 +6484,92 @@ mod tests {
             !printed.contains(token),
             "init printed the token:\n{printed}"
         );
+        // `--unhide` and not merely `drsg token`: the bare command masks what
+        // it prints, so a hint without the flag would export the mask and meet
+        // a 401.
         assert!(
-            printed.contains(&format!("export {CODEX_TOKEN_ENV_VAR}=$(jq -r ")),
+            printed.contains(&format!(
+                "export {CODEX_TOKEN_ENV_VAR}=$(drsg token --unhide"
+            )),
             "{printed}"
         );
+        // And it must need nothing but drsg: a reader without `jq` would
+        // otherwise export an empty token and meet a 401 instead of an error.
+        assert!(!printed.contains("jq"), "the hint needs jq:\n{printed}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--unhide` reads the token back out of `.mcp.json` exactly, so
+    /// `export DRSG_TOKEN=$(drsg token --unhide)` lands the secret `init`
+    /// wrote — and the default shows no usable part of it.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn token_round_trips_only_when_unhidden() {
+        let dir = scratch_dir("token-cmd");
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        // A generated token's length, since that is what the mask is sized for.
+        let token = "A".repeat(INIT_TOKEN_LEN - 8) + "zZ9qLmXw";
+
+        // Nothing written yet: the command says what to do, rather than
+        // printing an empty line a shell would export as an empty token.
+        let mut missing = Vec::new();
+        let err = print_token(&dir, true, &mut missing).expect_err("no .mcp.json yet");
+        assert!(missing.is_empty(), "nothing may reach stdout: {missing:?}");
+        assert!(err.to_string().contains("drsg init"), "{err:#}");
+
+        write_mcp_json_entry(&dir, &addr, &token).unwrap();
+
+        let mut unhidden = Vec::new();
+        print_token(&dir, true, &mut unhidden).unwrap();
+        assert_eq!(
+            String::from_utf8(unhidden).unwrap(),
+            format!("{token}\n"),
+            "`--unhide` is what the export line substitutes"
+        );
+
+        let mut masked = Vec::new();
+        print_token(&dir, false, &mut masked).unwrap();
+        let shown = String::from_utf8(masked).unwrap();
+        assert!(
+            !shown.contains(&token),
+            "the default printed the token: {shown}"
+        );
+        assert_eq!(shown.trim(), "AAAA…LmXw <40 characters>");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The printed line is a command a reader pastes, so both shapes of it
+    /// have to be exactly right: `--unhide`, or the shell exports the mask,
+    /// and `--dir` whenever the repository is not the working directory.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_export_hint_asks_for_the_token_and_the_right_directory() {
+        assert_eq!(
+            token_export_hint(Path::new(".")),
+            "export DRSG_TOKEN=$(drsg token --unhide)"
+        );
+        assert_eq!(
+            token_export_hint(Path::new("/srv/repo")),
+            "export DRSG_TOKEN=$(drsg token --unhide --dir /srv/repo)"
+        );
+    }
+
+    /// The mask keeps four characters at each end to tell one token from
+    /// another — but only where that is a small share of it. A short token,
+    /// which a caller may have set by hand, is covered completely.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_mask_never_gives_away_a_short_token() {
+        assert_eq!(redacted("abcdefghijklmnop"), "abcd…mnop <16 characters>");
+        // One character below the floor: nothing of it is shown.
+        assert_eq!(redacted("abcdefghijklmno"), "<hidden, 15 characters>");
+        assert_eq!(redacted("hunter2"), "<hidden, 7 characters>");
+        assert_eq!(redacted(""), "<hidden, 0 characters>");
+        // Multi-byte characters are counted, not sliced through.
+        let wide = "字".repeat(20);
+        assert_eq!(redacted(&wide), "字字字字…字字字字 <20 characters>");
     }
 }
 

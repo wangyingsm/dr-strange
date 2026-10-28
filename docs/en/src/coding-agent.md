@@ -46,10 +46,18 @@ too — and is gitignored with them. `.opencode.json` and
 committed, so they get an environment reference in the client's own syntax
 (`{env:DRSG_TOKEN}`, `$DRSG_TOKEN`) instead, as the Codex entry always has
 (`bearer_token_env_var`) and as Kimi Code does by naming the variable
-(`bearerTokenEnvVar`); `init` prints the `export DRSG_TOKEN=$(jq …)` line to
-run before launching those clients here. That line reads the token out of
-`.mcp.json` rather than spelling it, because `init`'s output ends up in
-terminal scrollback, CI logs and agent transcripts.
+(`bearerTokenEnvVar`); `init` prints the
+`export DRSG_TOKEN=$(drsg token --unhide)` line to run before launching those
+clients here. That line reads the token out of `.mcp.json` rather than spelling
+it, because `init`'s output ends up in terminal scrollback, CI logs and agent
+transcripts. `drsg token` is what reads it back, so the line needs nothing else
+installed and says what to do when no `init` has run here yet.
+
+**`drsg token` masks what it prints** — `AAAA…LmXw <40 characters>`, enough to
+tell one repository's token from another's and not enough to use. `--unhide`
+prints the token itself, for the command substitution above, where it goes
+straight into the environment without reaching the screen. A token too short
+for its ends to give it away is masked whole.
 
 Trae gates project-scoped MCP behind **Settings > Beta > Enable Project MCP**,
 so the file `init` writes is ignored until that is on; `init` says so on the
@@ -77,7 +85,7 @@ plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mc
   + wrote ./.mcp.json
   + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
-  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(jq -r '.mcpServers["drsg-watch"].headers.Authorization[7:]' "./.mcp.json") before launching `gemini` here)
+  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(drsg token --unhide) before launching `gemini` here)
 ```
 
 **Run `drsg init` again whenever the server is gone.** It spawns `serve

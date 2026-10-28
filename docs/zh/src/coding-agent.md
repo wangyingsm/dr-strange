@@ -40,9 +40,15 @@ shell 环境可供读取——这三个文件都会进入 `init` 维护的 `.git
 提交，因此它们改为按各自客户端的语法写入一个环境变量引用（`{env:DRSG_TOKEN}`、
 `$DRSG_TOKEN`），正如 Codex 条目一直采用的 `bearer_token_env_var`，以及
 Kimi Code 通过写下变量名的 `bearerTokenEnvVar`；`init` 会打印出在这里启动这些
-客户端之前需要执行的 `export DRSG_TOKEN=$(jq …)`。这一行从 `.mcp.json` 里读出令牌，
-而不是把令牌本身打印出来，因为 `init` 的输出会留在终端回滚、CI 日志和智能体的
-对话记录里。
+客户端之前需要执行的 `export DRSG_TOKEN=$(drsg token --unhide)`。这一行从
+`.mcp.json` 里读出令牌，而不是把令牌本身打印出来，因为 `init` 的输出会留在终端回滚、
+CI 日志和智能体的对话记录里。负责读回令牌的是 `drsg token`，因此这一行不依赖任何额外
+安装的工具；当这个目录尚未运行过 `init` 时，它也会直接说明该怎么做。
+
+**`drsg token` 默认只打印遮蔽后的形式**——`AAAA…LmXw <40 characters>`，足以分辨不同
+仓库持有的是哪一个令牌，又不足以拿去使用。`--unhide` 才会打印令牌本身，专供上面那种
+命令替换使用：此时令牌直接进入环境变量，不会出现在屏幕上。若令牌太短，两端字符就会
+泄露过多，这时会被整体遮蔽。
 
 Trae 把项目级 MCP 放在 **Settings > Beta > Enable Project MCP** 之后，没有打开
 这个开关时，`init` 写入的文件不会生效；`init` 打印的那一行会提醒这一点。
@@ -62,7 +68,7 @@ plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mc
   + wrote ./.mcp.json
   + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
-  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(jq -r '.mcpServers["drsg-watch"].headers.Authorization[7:]' "./.mcp.json") before launching `gemini` here)
+  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(drsg token --unhide) before launching `gemini` here)
 ```
 
 令牌的去向取决于各客户端能做什么：`.mcp.json` 与 `.cursor/mcp.json` 直接写入令牌
