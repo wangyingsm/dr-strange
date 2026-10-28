@@ -9,7 +9,7 @@ the generated C client, so it inherits the same guarantee.)
 
 ## Obtaining the SDKs
 
-The SDKs live under `sdk/<language>` in the repository, all at version 2.23.0
+The SDKs live under `sdk/<language>` in the repository, all at version 2.24.0
 in step with the workspace. **None is published to a language registry yet**
 (no PyPI, npm or Maven Central release, no `sdk/go/vX` tags), so each is
 installed from a checkout of this repository:
@@ -19,7 +19,7 @@ installed from a checkout of this repository:
 | TypeScript | `sdk/typescript` | `bun install && bun run build` there, then `"drsg": "file:…/sdk/typescript"` in `package.json` |
 | Python | `sdk/python` | `pip install …/sdk/python` (or `pip install "drsg @ git+https://github.com/wangyingsm/dr-strange.git#subdirectory=sdk/python"`) |
 | Go | `sdk/go` | `go get github.com/wangyingsm/dr-strange/sdk/go@<commit>`, or a `replace … => …/sdk/go` directive |
-| Java | `sdk/java` | `./mvnw install` there, then depend on `io.github.wangyingsm:drsg:2.23.0` |
+| Java | `sdk/java` | `./mvnw install` there, then depend on `io.github.wangyingsm:drsg:2.24.0` |
 | C | `sdk/c` | `make` → `libdrsg.a` + `include/drsg.h` (needs libcurl + json-c) |
 | Zig | `sdk/zig` | `zig build`, or add `src/drsg.zig` as a module (Zig 0.16) |
 

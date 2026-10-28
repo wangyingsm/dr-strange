@@ -10,13 +10,13 @@ OpenRPC schema (`crates/dr-strange-web/openrpc.json`, also served live from
 | Python | [`python/`](python) | none (stdlib) | `pip install sdk/python` (or `-e` for development) |
 | TypeScript | [`typescript/`](typescript) | none (platform `fetch`) | `"drsg": "file:../dr-strange/sdk/typescript"` in `package.json` |
 | Go | [`go/`](go) | none (stdlib) | `go get github.com/wangyingsm/dr-strange/sdk/go@<commit>` |
-| Java | [`java/`](java) | Jackson | `mvn -f sdk/java/pom.xml install`, then depend on `io.github.wangyingsm:drsg:2.23.0` |
+| Java | [`java/`](java) | Jackson | `mvn -f sdk/java/pom.xml install`, then depend on `io.github.wangyingsm:drsg:2.24.0` |
 | C | [`c/`](c) | libcurl, json-c | `make` (→ `libdrsg.a` + `include/drsg.h`) |
 | Zig | [`zig/`](zig) | binds the C client | `zig build` (or add `sdk/zig/src/drsg.zig` as a module) |
 
 **Publication status.** None of the SDKs is published to a package registry yet
 (no PyPI, npm, Maven Central release, and no `sdk/go/vX` tags); all of them are
-versioned `2.23.0` in step with the workspace and are consumed from a checkout of
+versioned `2.24.0` in step with the workspace and are consumed from a checkout of
 this repository. Each directory's `README.md` gives the exact steps for its
 language.
 
