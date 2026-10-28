@@ -554,21 +554,38 @@ fn write_agent_configs(
     token: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
-    write_agent_configs_with(dir, addr, token, &default_hooks_dir, &user_has, out)
+    write_agent_configs_with(dir, addr, token, &Machine::REAL, out)
 }
 
-/// [`write_agent_configs`] with its two lookups on this machine passed in —
-/// where the Claude Code hook scripts go, and which markers `$HOME` carries —
-/// so a test can drive every probe without touching the real home directory.
+/// What [`write_agent_configs`] asks about the machine it is running on: where
+/// Claude Code's hook scripts go, and which markers `$HOME` carries. Behind one
+/// type so a test can answer both without touching the real home directory.
+#[cfg(feature = "digest")]
+struct Machine<'a> {
+    hooks_dir: &'a dyn Fn() -> Result<std::path::PathBuf>,
+    user_has: &'a dyn Fn(&str) -> bool,
+}
+
+#[cfg(feature = "digest")]
+impl Machine<'_> {
+    /// This machine, as the command run by a person sees it.
+    const REAL: Self = Self {
+        hooks_dir: &default_hooks_dir,
+        user_has: &user_has,
+    };
+}
+
+/// [`write_agent_configs`] against a stated [`Machine`], so every probe can be
+/// driven from a test.
 #[cfg(feature = "digest")]
 fn write_agent_configs_with(
     dir: &Path,
     addr: &std::net::SocketAddr,
     token: &str,
-    hooks_dir: &dyn Fn() -> Result<std::path::PathBuf>,
-    user_has: &dyn Fn(&str) -> bool,
+    machine: &Machine<'_>,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let (hooks_dir, user_has) = (machine.hooks_dir, machine.user_has);
     write_mcp_json_entry(dir, addr, token)?;
     writeln!(out, "  + wrote {}", dir.join(".mcp.json").display())?;
     if probe_and_write_claude_hooks(dir, &hooks_dir()?, user_has(".claude"))? {
@@ -6395,15 +6412,13 @@ mod tests {
         let hooks = dir.join("hooks");
         let mut out = Vec::new();
 
-        write_agent_configs_with(
-            &dir,
-            &addr,
-            token,
-            &|| Ok(hooks.clone()),
-            &|_| true,
-            &mut out,
-        )
-        .unwrap();
+        // Every marker present, so every client's line is written and the
+        // assertion below sees all of them.
+        let machine = Machine {
+            hooks_dir: &|| Ok(hooks.clone()),
+            user_has: &|_| true,
+        };
+        write_agent_configs_with(&dir, &addr, token, &machine, &mut out).unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         for client in ["OpenCode", "Gemini CLI", "Kimi Code", "Codex CLI"] {
