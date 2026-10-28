@@ -333,7 +333,7 @@ impl Resolver for PublicOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dr_strange_llm::net::NetworkConfig;
+    use dr_strange_llm::net::{NoProxy, ProxyUrl};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -570,12 +570,14 @@ mod tests {
 
     /// A policy that proxies everything, as `https_proxy=http://127.0.0.1:7897`
     /// gives.
+    /// Built with `Network::through`, not `resolve`: `resolve` lets the
+    /// environment win, and the machine running the suite may well have
+    /// `ALL_PROXY` or `NO_PROXY` set.
     fn through_a_proxy() -> Network {
-        Network::resolve(&NetworkConfig {
-            proxy: Some("http://127.0.0.1:7897".into()),
-            no_proxy: None,
-        })
-        .unwrap()
+        Network::through(
+            "http://127.0.0.1:7897".parse::<ProxyUrl>().unwrap(),
+            NoProxy::default(),
+        )
     }
 
     /// The bug behind issue #37: the reporter's resolver answers `::` for a
@@ -613,11 +615,10 @@ mod tests {
     /// A bypassed host keeps the guard, because nothing proxies it.
     #[test]
     fn a_bypassed_host_is_still_guarded() {
-        let net = Network::resolve(&NetworkConfig {
-            proxy: Some("http://127.0.0.1:7897".into()),
-            no_proxy: Some("169.254.169.254".into()),
-        })
-        .unwrap();
+        let net = Network::through(
+            "http://127.0.0.1:7897".parse::<ProxyUrl>().unwrap(),
+            NoProxy::parse("169.254.169.254"),
+        );
         let inward = url("http://169.254.169.254/latest/meta-data/");
         assert!(!proxied(&inward, &net));
         assert!(precheck(&inward, &[], &net).is_err(), "guard still applies");
@@ -632,11 +633,10 @@ mod tests {
         assert_eq!(d.port, 11434);
         assert_eq!(d.scheme, "http");
 
-        let net = Network::resolve(&NetworkConfig {
-            proxy: Some("http://127.0.0.1:7897".into()),
-            no_proxy: Some("::1".into()),
-        })
-        .unwrap();
+        let net = Network::through(
+            "http://127.0.0.1:7897".parse::<ProxyUrl>().unwrap(),
+            NoProxy::parse("::1"),
+        );
         assert!(
             !proxied(&url("http://[::1]:11434/v1"), &net),
             "the bypass entry has to match what the URL carries"
