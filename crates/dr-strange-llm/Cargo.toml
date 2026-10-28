@@ -42,7 +42,7 @@ url = "2"
 # Pinned exactly, not a caret range: it is a young crate (10 releases in its
 # first fortnight) sitting in the ingestion path, so a bump should be a decision
 # rather than something that happens during someone else's `cargo update`.
-anydoc = "=0.1.8"
+anydoc = "=0.2.4"
 # Deterministic, ignore-aware directory walking. `.gitignore` is a project's own
 # statement of what is derived rather than source — better than a list this
 # crate could guess at — and hand-rolling its precedence, nesting and negation
