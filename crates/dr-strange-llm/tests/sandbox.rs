@@ -173,6 +173,39 @@ fn the_infinite_loop_is_interrupted_at_the_deadline_when_fuel_is_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A call may copy only so much out of the sandbox at once — wasmtime's
+/// hostcall fuel, 128 MiB unless `[plugins] hostcall_mb` says otherwise.
+/// `assemble` returns the whole tree in one value, so it is the call a large
+/// repository breaks first. The limit must be the one the operator set, and
+/// the error must name the setting rather than wasmtime's wording.
+#[test]
+fn a_call_that_copies_past_the_hostcall_budget_names_the_setting() {
+    let (dir, host) = scratch("hostcall");
+    // 4 KiB: enough for `describe` at load and for each one-file `parse`,
+    // not for an `assemble` that returns two hundred nodes at once.
+    let plugin = fixture(
+        "ok",
+        Limits {
+            hostcall_bytes: Some(4096),
+            ..Limits::default()
+        },
+    );
+    let paths: Vec<String> = (0..200).map(|i| format!("{i:0>60}.fix")).collect();
+    let err = plugin
+        .preprocess(&Input::Files { paths: &paths }, &host)
+        .expect_err("a 4 KiB budget cannot carry two hundred nodes");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("fixture"),
+        "the error must name the plugin: {msg}"
+    );
+    assert!(
+        msg.contains("`[plugins] hostcall_mb`"),
+        "and the setting that raises it: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The clock is frozen: a thousand iterations of work measure as **zero**
 /// elapsed nanoseconds, so a plugin cannot fold time into its facts and
 /// re-ingesting a tree yields the same graph whenever it runs.

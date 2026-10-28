@@ -158,6 +158,8 @@ dir = "logs"
 # deadline_secs = 60     # wall-clock per call; 0 disables (DRSG_PLUGINS_DEADLINE_SECS overrides)
 # total_memory_mb = 2048 # linear memory all calls in the process may hold together;
 #                        # 0 keeps the default (DRSG_PLUGINS_TOTAL_MEMORY_MB overrides)
+# hostcall_mb = 1024     # what one call may copy out of the sandbox, MiB; 0 keeps
+#                        # wasmtime's 128 (`assemble` returns a whole tree at once)
 
 # Each plugin's own settings, passed through uninterpreted — what a plugin can
 # be configured to do is the plugin's business, not the database's.

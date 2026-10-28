@@ -169,6 +169,10 @@ pub struct PluginsCfg {
     /// MiB; `0` keeps the default (→ `DRSG_PLUGINS_TOTAL_MEMORY_MB`, which
     /// overrides it).
     pub total_memory_mb: Option<u64>,
+    /// Bytes one sandbox call may copy out of the guest, in MiB; `0` keeps
+    /// wasmtime's default of 128 MiB. `assemble` returns a whole tree at
+    /// once, which is what a large repository outgrows first.
+    pub hostcall_mb: Option<u64>,
     /// An explicit plugin-store directory; defaults to the per-user store.
     pub store_dir: Option<PathBuf>,
     /// `[plugins.<name>]` sub-tables, passed to each plugin uninterpreted.
@@ -207,6 +211,7 @@ pub fn plugin_config(cfg: &Config) -> Result<dr_strange_llm::PluginConfig> {
         memory_bytes: cfg.plugins.memory_mb.map(|mb| (mb as usize) << 20),
         deadline_secs: cfg.plugins.deadline_secs,
         total_memory_mb: cfg.plugins.total_memory_mb,
+        hostcall_mb: cfg.plugins.hostcall_mb,
     })
 }
 
@@ -787,6 +792,17 @@ mod tests {
         let absent = plugin_config(&parse("")).unwrap();
         assert_eq!(absent.deadline_secs, None);
         assert_eq!(absent.total_memory_mb, None);
+    }
+
+    /// `[plugins] hostcall_mb` reaches the llm crate's config as the number
+    /// the file says; the llm crate applies the `0` reading.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn plugin_hostcall_budget_reaches_the_plugin_config() {
+        let cfg = plugin_config(&parse("[plugins]\nhostcall_mb = 1024\n")).unwrap();
+        assert_eq!(cfg.hostcall_mb, Some(1024));
+        let absent = plugin_config(&parse("")).unwrap();
+        assert_eq!(absent.hostcall_mb, None);
     }
 
     #[test]

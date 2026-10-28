@@ -315,6 +315,7 @@ fuel = 200000000000                         # instruction budget per sandbox cal
 memory_mb = 3072                            # guest linear memory per call, MiB (wasm32 allows at most 4096)
 deadline_secs = 300                         # wall-clock ceiling per call, seconds (0 disables)
 total_memory_mb = 6144                      # linear memory all calls may hold together, MiB (0 = twice memory_mb)
+hostcall_mb = 1024                          # what one call may copy out of the sandbox, MiB (0 = wasmtime's 128)
 
 [fetch]                                     # URL ingestion (Chapter 3)
 enabled = true                              # false refuses URL fetching outright

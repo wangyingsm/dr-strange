@@ -46,8 +46,10 @@ too — and is gitignored with them. `.opencode.json` and
 committed, so they get an environment reference in the client's own syntax
 (`{env:DRSG_TOKEN}`, `$DRSG_TOKEN`) instead, as the Codex entry always has
 (`bearer_token_env_var`) and as Kimi Code does by naming the variable
-(`bearerTokenEnvVar`); `init` prints the `export DRSG_TOKEN=…` line to run
-before launching those clients here.
+(`bearerTokenEnvVar`); `init` prints the `export DRSG_TOKEN=$(jq …)` line to
+run before launching those clients here. That line reads the token out of
+`.mcp.json` rather than spelling it, because `init`'s output ends up in
+terminal scrollback, CI logs and agent transcripts.
 
 Trae gates project-scoped MCP behind **Settings > Beta > Enable Project MCP**,
 so the file `init` writes is ignored until that is on; `init` says so on the
@@ -75,7 +77,7 @@ plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mc
   + wrote ./.mcp.json
   + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
   + Cursor: wrote ./.cursor/mcp.json
-  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=… before launching `gemini` here)
+  + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(jq -r '.mcpServers["drsg-watch"].headers.Authorization[7:]' "./.mcp.json") before launching `gemini` here)
 ```
 
 **Run `drsg init` again whenever the server is gone.** It spawns `serve
