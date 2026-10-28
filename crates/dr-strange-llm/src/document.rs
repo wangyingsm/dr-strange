@@ -21,7 +21,7 @@
 //! so a mislabelled upload still converts. The extension is only a fallback for
 //! the signature-less formats (CSV), and the caller's filename is advisory.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// Convert an uploaded document to Markdown.
 ///
@@ -53,9 +53,23 @@ pub fn to_markdown(name: &str, bytes: &[u8]) -> Result<String> {
         );
     };
 
+    // `context`, not a formatted message: it keeps anydoc's typed error in the
+    // chain, which is what [`needs_ocr`] reads. Render with `{e:#}` to print it.
     let markdown = anydoc::to_markdown_bytes(bytes, format)
-        .map_err(|e| anyhow::anyhow!("could not read this {format:?} document: {e}"))?;
+        .with_context(|| format!("could not read this {format:?} document"))?;
     Ok(trim_blank_edges(&markdown))
+}
+
+/// Why a document needs OCR, when that is the only thing wrong with it.
+///
+/// A scanned page is not a document we failed to recognise — it is one we read
+/// and found no text in, so a caller that silently skips unreadable files owes
+/// the reader this reason instead.
+pub(crate) fn needs_ocr(err: &anyhow::Error) -> Option<String> {
+    match err.downcast_ref::<anydoc::ConvertError>() {
+        Some(e @ anydoc::ConvertError::NeedsOcr { .. }) => Some(e.to_string()),
+        _ => None,
+    }
 }
 
 /// Drop leading and trailing blank lines, and nothing else.
@@ -70,7 +84,7 @@ fn trim_blank_edges(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -124,5 +138,54 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unrecognised file type"), "got: {msg}");
         assert!(msg.contains("docx"), "should list what works: {msg}");
+    }
+
+    /// One page, one 1x1 image, no text — what a scanner produces. anydoc 0.2
+    /// refuses the whole document rather than returning the pages it could read.
+    pub(crate) fn scanned_pdf() -> Vec<u8> {
+        let mut p = b"%PDF-1.4\n".to_vec();
+        p.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+        p.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+        p.extend_from_slice(
+            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 99 99] /Resources \
+              << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >> endobj\n",
+        );
+        p.extend_from_slice(
+            b"4 0 obj << /Length 27 >> stream\nq 99 0 0 99 0 0 cm /Im0 Do Q\nendstream endobj\n",
+        );
+        p.extend_from_slice(
+            b"5 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace \
+              /DeviceGray /BitsPerComponent 8 /Length 1 >> stream\n\x00\nendstream endobj\n",
+        );
+        p.extend_from_slice(b"trailer << /Size 6 /Root 1 0 R >>\n%%EOF\n");
+        p
+    }
+
+    /// The reason has to survive two different readers: `needs_ocr` picks the
+    /// typed error out of the chain for the caller that skips files quietly,
+    /// and `{e:#}` still renders it for the upload surfaces that print one line.
+    #[test]
+    fn a_scanned_pdf_says_which_pages_need_ocr() {
+        let err = to_markdown("scan.pdf", &scanned_pdf()).expect_err("no text to extract");
+        assert_eq!(
+            needs_ocr(&err).as_deref(),
+            Some("page 1 of 1 needs OCR"),
+            "the typed error must stay reachable through the context: {err:#}"
+        );
+        let flat = format!("{err:#}");
+        assert!(flat.contains("could not read this Pdf document"), "{flat}");
+        assert!(
+            flat.contains("needs OCR"),
+            "the reason is the useful half: {flat}"
+        );
+    }
+
+    /// Everything else stays what it was: a file we never recognised is not a
+    /// scanned one, and must not be reported as needing OCR.
+    #[test]
+    fn an_unreadable_file_is_not_mistaken_for_a_scan() {
+        let err = to_markdown("archive.tar.zst", b"\x28\xb5\x2f\xfd not a document")
+            .expect_err("an unknown type must be refused");
+        assert!(needs_ocr(&err).is_none(), "{err:#}");
     }
 }

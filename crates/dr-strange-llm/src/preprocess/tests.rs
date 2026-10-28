@@ -213,6 +213,29 @@ fn an_unclaimed_source_class_is_named_in_the_report() {
     );
 }
 
+/// A scanned PDF is a document the reader recognised and found no text in.
+/// anydoc 0.2 refuses the whole conversion for one, and a PDF's bytes are not
+/// UTF-8, so the plain-text fallback drops it with no line at all — a digest
+/// that quietly loses a file the caller can see in the directory.
+#[test]
+fn a_scanned_pdf_is_named_in_the_report_rather_than_dropped() {
+    let t = Tree::new("scanned-pdf");
+    t.write("README.md", "# hi");
+    std::fs::write(t.0.join("scan.pdf"), crate::document::tests::scanned_pdf()).unwrap();
+
+    let out = route_tree(&t.host(), None, &Plugins::builtin()).unwrap();
+    assert!(
+        out.report
+            .notes
+            .iter()
+            .any(|n| n.contains("scan.pdf") && n.contains("needs OCR")),
+        "the scan left no trace in the report: {:?}",
+        out.report.notes
+    );
+    // And the readable file beside it is unaffected.
+    assert!(out.prose.contains("# hi"), "{}", out.prose);
+}
+
 /// Two handlers claiming one key is a plugin bug, kept visible: the first
 /// wins, the collision is named, and the ingest is not failed over it.
 #[test]

@@ -1313,7 +1313,13 @@ fn read_one(host: &dyn Host, path: &str) -> Result<String, Option<String>> {
         // configuration out of its graph. `to_markdown` is right to be strict
         // about a *single upload*, where an unreadable file is a user error;
         // here the file was found rather than chosen.
-        Err(_) => {
+        Err(e) => {
+            // A scanned PDF is the one failure worth naming: it is a document
+            // we read, and its bytes are not UTF-8, so the fallback below drops
+            // it with no line at all and the digest quietly loses a file.
+            if let Some(why) = crate::document::needs_ocr(&e) {
+                return Err(Some(format!("{path}: skipped, {why}")));
+            }
             // Text first, then size: a JPEG is not a large text file, and
             // saying so in the report sends a reader looking for the wrong
             // thing. An image with no handler is simply not prose.

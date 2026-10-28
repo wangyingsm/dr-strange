@@ -788,7 +788,8 @@ async fn extract_http(
         // crawl endpoint shares this reader and does still report progress.
         match dr_strange_llm::to_markdown(&q.name, &body) {
             Ok(text) => send(json!({ "chars": text.chars().count(), "text": text })),
-            Err(e) => send(json!({ "error": e.to_string() })),
+            // `{e:#}`, so the reason keeps its place after the context line.
+            Err(e) => send(json!({ "error": format!("{e:#}") })),
         };
     });
 

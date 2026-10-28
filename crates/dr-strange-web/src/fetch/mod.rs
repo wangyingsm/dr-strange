@@ -741,7 +741,7 @@ impl Crawl<'_> {
             // its prose is what was wanted.
             "application/pdf" => {
                 let text = dr_strange_llm::to_markdown("x.pdf", &body)
-                    .map_err(|e| anyhow::anyhow!("reading the PDF: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("reading the PDF: {e:#}"))?;
                 Ok(Loaded {
                     title: String::new(),
                     text,
