@@ -137,6 +137,12 @@ pub struct Limits {
     /// the whole box. `None` means twice `memory_bytes` — two calls at their
     /// ceiling, or a few dozen at the size an honest parse reaches.
     pub total_memory_bytes: Option<usize>,
+    /// Bytes one call may copy out of the guest — a host function's
+    /// arguments, or an export's return value. `None` keeps wasmtime's own
+    /// default, [`DEFAULT_HOSTCALL`]. `parse` returns one file's partial and
+    /// stays far below it; `assemble` returns the whole tree in one value, so
+    /// a large repository is the first to pass it.
+    pub hostcall_bytes: Option<usize>,
 }
 
 /// Sized from slice 1's measurement (~0.3–0.6 G instructions per MiB of Rust,
@@ -154,6 +160,10 @@ const DEFAULT_MEMORY: usize = 3 << 30;
 /// fast core, so honest work under fuel never sees this; it exists for the
 /// operator who set `fuel = 0` and the plugin that then spins.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// wasmtime 48's own hostcall budget (`DEFAULT_HOSTCALL_FUEL`, private
+/// there), repeated only so an error can say what the limit was.
+const DEFAULT_HOSTCALL: usize = 128 << 20;
 
 /// How often the epoch advances. A deadline is measured in ticks of this, so
 /// it is also the most a deadline can overrun by; a tenth of a second is
@@ -185,6 +195,7 @@ impl Default for Limits {
             memory_bytes: DEFAULT_MEMORY,
             deadline: Some(DEFAULT_DEADLINE),
             total_memory_bytes: None,
+            hostcall_bytes: None,
         }
     }
 }
@@ -776,6 +787,9 @@ impl WasmPlugin {
             // Cannot fail: the engine was configured to consume fuel above.
             let _ = store.set_fuel(fuel);
         }
+        if let Some(bytes) = self.limits.hostcall_bytes {
+            store.set_hostcall_fuel(bytes);
+        }
         // The wall-clock net. Epochs are compiled in unconditionally, and a
         // store's deadline defaults to *now*, so this must be set even when
         // no deadline is wanted — `NEVER_TICKS` beyond now is never.
@@ -835,6 +849,16 @@ impl WasmPlugin {
             return anyhow!(
                 "plugin `{name}` ran out of fuel — either it does not terminate, \
                  or the input is larger than `[plugins] fuel` allows for"
+            );
+        }
+        // wasmtime's error type for this is private, so its wording is the
+        // only handle; the setting is what the operator can act on.
+        if format!("{error:#}").contains("fuel allocated for hostcalls has been exhausted") {
+            return anyhow!(
+                "plugin `{name}` copied more out of the sandbox in one call than the {} MiB \
+                 limit allows — `assemble` returns the whole tree at once, so raise \
+                 `[plugins] hostcall_mb` for a tree this large",
+                self.limits.hostcall_bytes.unwrap_or(DEFAULT_HOSTCALL) >> 20
             );
         }
         if matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt))

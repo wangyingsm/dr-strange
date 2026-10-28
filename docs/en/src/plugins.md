@@ -147,6 +147,7 @@ fuel = 200000000000    # instructions per sandbox call (0 disables the check)
 memory_mb = 3072       # linear memory per call, MiB (wasm32 itself allows at most 4096)
 deadline_secs = 300    # wall-clock ceiling per call, seconds (0 disables it)
 total_memory_mb = 6144 # linear memory all calls in the process may hold together (0 = twice memory_mb)
+hostcall_mb = 1024     # what one call may copy out of the sandbox, MiB (0 = wasmtime's 128)
 
 [plugins.rust]         # a plugin's own settings pass through untouched
 include_source = true
@@ -165,6 +166,21 @@ refusal names the ceiling it hit, so the operator knows which knob it was. Turni
 also switches the sandbox to compiling each plugin from its wasm on every
 load, since the precompiled artifacts carry the fuel instrumentation; the
 first load says so once.
+
+`hostcall_mb` bounds what one call may copy out of the sandbox — a host
+function's arguments, or an export's return value. Leave it out (or set `0`)
+and wasmtime's own 128 MiB applies. `parse` returns one file's partial and stays
+far below it; `assemble` returns the whole tree in one value, so a large
+repository is the first to pass it, and the error then names this setting:
+``plugin `go` copied more out of the sandbox in one call than the 128 MiB limit
+allows``. Raise it in `drsg.toml`:
+
+```toml
+[plugins]
+hostcall_mb = 1024
+```
+
+There is no environment variable for it.
 
 One boundary follows from the pull model: preprocessing runs where the files
 are. The CLI and the stdio MCP server route through it; bytes sent to a shared

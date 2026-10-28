@@ -1556,6 +1556,36 @@ fn the_config_knobs_set_the_deadline_and_the_shared_budget() {
     );
 }
 
+/// `[plugins] hostcall_mb` reaches the limits in bytes, and `0` — like an
+/// absent key — leaves wasmtime's own default in place.
+#[cfg(feature = "plugins")]
+#[test]
+fn the_config_hostcall_budget_reaches_the_limits() {
+    let none = |_: &str| None;
+    let limits = Plugins::limits_from(&PluginConfig::default(), none).unwrap();
+    assert_eq!(limits.hostcall_bytes, None, "absent keeps the default");
+
+    let limits = Plugins::limits_from(
+        &PluginConfig {
+            hostcall_mb: Some(1024),
+            ..Default::default()
+        },
+        none,
+    )
+    .unwrap();
+    assert_eq!(limits.hostcall_bytes, Some(1024 << 20));
+
+    let limits = Plugins::limits_from(
+        &PluginConfig {
+            hostcall_mb: Some(0),
+            ..Default::default()
+        },
+        none,
+    )
+    .unwrap();
+    assert_eq!(limits.hostcall_bytes, None, "0 means the default");
+}
+
 /// The two environment knobs land on the limits over the file's values,
 /// `0` disables what it can, and a value that is not a number is refused by
 /// name rather than kept as a default the operator did not choose. The

@@ -281,6 +281,7 @@ fuel = 200000000000                         # 每次沙箱调用的指令预算�
 memory_mb = 3072                            # 每次调用的线性内存上限，MiB；按照 wasm32 标准，最高支持 4096
 deadline_secs = 300                         # 单次调用的墙钟上限，秒（0 为不设限）
 total_memory_mb = 6144                      # 进程内所有调用合计可持有的线性内存，MiB（0 为 memory_mb 的两倍）
+hostcall_mb = 1024                          # 单次调用最多能从沙箱拷出的数据量，MiB（0 为 wasmtime 默认的 128）
 
 [fetch]                                     # URL 导入（第 3 章）
 enabled = true                              # 置为 false 则彻底拒绝 URL 抓取

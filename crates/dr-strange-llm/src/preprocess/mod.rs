@@ -739,6 +739,9 @@ pub struct PluginConfig {
     /// MiB; `None` or `Some(0)` keeps the default. The config file's spelling
     /// of [`ENV_PLUGIN_TOTAL_MEMORY_MB`], which still overrides it.
     pub total_memory_mb: Option<u64>,
+    /// Bytes one sandbox call may copy out of the guest, in MiB; `None` or
+    /// `Some(0)` keeps wasmtime's default of 128 MiB.
+    pub hostcall_mb: Option<u64>,
 }
 
 /// The wall-clock deadline per sandbox call, in whole seconds; `0` disables
@@ -866,6 +869,9 @@ impl Plugins {
             // Same reading as the environment's: a zero budget would let no
             // store run, so it means "the default".
             limits.total_memory_bytes = (mb > 0).then_some((mb as usize) << 20);
+        }
+        if let Some(mb) = config.hostcall_mb {
+            limits.hostcall_bytes = (mb > 0).then_some((mb as usize) << 20);
         }
         apply_env_limits(&mut limits, lookup)?;
         Ok(limits)
