@@ -6,7 +6,8 @@
     "total_ms": 139.2549390438944,
     "throughput_per_s": 718107.3841013216,
     "runs": 3,
-    "spread_pct": 3.2825274081126614
+    "spread_pct": 3.2825274081126614,
+    "measured_at_unix": 1792658009
   },
   {
     "engine": "sqlite",
@@ -15,7 +16,8 @@
     "total_ms": 528.7557790288702,
     "throughput_per_s": 945616.142330049,
     "runs": 3,
-    "spread_pct": 1.8115838735839787
+    "spread_pct": 1.8115838735839787,
+    "measured_at_unix": 1792658009
   },
   {
     "engine": "sqlite",
@@ -26,7 +28,8 @@
     "p95_us": 3.383960574865341,
     "throughput_per_s": 357579.18017459364,
     "runs": 3,
-    "spread_pct": 1.8552915766738662
+    "spread_pct": 1.8552915766738662,
+    "measured_at_unix": 1792658009
   },
   {
     "engine": "sqlite",
@@ -37,7 +40,8 @@
     "p95_us": 10.560033842921257,
     "throughput_per_s": 149214.09379745615,
     "runs": 3,
-    "spread_pct": 0.7847584901173479
+    "spread_pct": 0.7847584901173479,
+    "measured_at_unix": 1792658009
   },
   {
     "engine": "sqlite",
@@ -48,6 +52,7 @@
     "p95_us": 90.7509820535779,
     "throughput_per_s": 19673.90290158724,
     "runs": 3,
-    "spread_pct": 1.3209751726893528
+    "spread_pct": 1.3209751726893528,
+    "measured_at_unix": 1792658009
   }
 ]

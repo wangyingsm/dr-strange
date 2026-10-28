@@ -6,7 +6,8 @@
     "total_ms": 1315.8357700000001,
     "throughput_per_s": 455983.95611330733,
     "runs": 3,
-    "spread_pct": 12.731075508347276
+    "spread_pct": 12.731075508347276,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -17,7 +18,8 @@
     "p95_us": 9.265,
     "throughput_per_s": 232100.2974086791,
     "runs": 3,
-    "spread_pct": 0.9504608294930852
+    "spread_pct": 0.9504608294930852,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -28,7 +30,8 @@
     "p95_us": 16.647,
     "throughput_per_s": 128393.70563724634,
     "runs": 3,
-    "spread_pct": 17.134442134442146
+    "spread_pct": 17.134442134442146,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -39,7 +42,8 @@
     "p95_us": 50.272999999999996,
     "throughput_per_s": 35666.4181965643,
     "runs": 3,
-    "spread_pct": 7.868839855462446
+    "spread_pct": 7.868839855462446,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -48,7 +52,8 @@
     "total_ms": 4506.71063,
     "throughput_per_s": 22189.1326534981,
     "runs": 3,
-    "spread_pct": 1.7863482348511068
+    "spread_pct": 1.7863482348511068,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -59,7 +64,8 @@
     "p95_us": 308.75899999999996,
     "throughput_per_s": 4166.591963144928,
     "runs": 3,
-    "spread_pct": 4.113633608672329
+    "spread_pct": 4.113633608672329,
+    "measured_at_unix": 1792658006
   },
   {
     "engine": "dr-strange",
@@ -70,6 +76,7 @@
     "runs": 3,
     "spread_pct": 10.431654676258962,
     "recall": 0.278,
-    "k": 10
+    "k": 10,
+    "measured_at_unix": 1792658006
   }
 ]

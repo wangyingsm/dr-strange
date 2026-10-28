@@ -6,7 +6,8 @@
     "total_ms": 2128.2595279917587,
     "throughput_per_s": 46986.75076265757,
     "runs": 3,
-    "spread_pct": 44.08860491464593
+    "spread_pct": 44.08860491464593,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -15,7 +16,8 @@
     "total_ms": 14073.683535010787,
     "throughput_per_s": 35527.30163046236,
     "runs": 3,
-    "spread_pct": 6.074852924566208
+    "spread_pct": 6.074852924566208,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -26,7 +28,8 @@
     "p95_us": 724.5070009957999,
     "throughput_per_s": 2653.3011792064212,
     "runs": 3,
-    "spread_pct": 82.8716111858816
+    "spread_pct": 82.8716111858816,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -37,7 +40,8 @@
     "p95_us": 709.1379957273602,
     "throughput_per_s": 2574.963325617104,
     "runs": 3,
-    "spread_pct": 18.04563647091281
+    "spread_pct": 18.04563647091281,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -48,7 +52,8 @@
     "p95_us": 1488.8669829815626,
     "throughput_per_s": 1091.364424607955,
     "runs": 3,
-    "spread_pct": 9.250996505381663
+    "spread_pct": 9.250996505381663,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -57,7 +62,8 @@
     "total_ms": 23817.99301097635,
     "throughput_per_s": 4198.506564088574,
     "runs": 3,
-    "spread_pct": 2.8449238905330034
+    "spread_pct": 2.8449238905330034,
+    "measured_at_unix": 1792574153
   },
   {
     "engine": "neo4j",
@@ -68,6 +74,7 @@
     "p95_us": 3314.4249755423516,
     "throughput_per_s": 376.3144416516651,
     "runs": 3,
-    "spread_pct": 31.07468408314038
+    "spread_pct": 31.07468408314038,
+    "measured_at_unix": 1792574153
   }
 ]

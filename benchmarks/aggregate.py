@@ -164,13 +164,18 @@ def load_results():
 
 
 def measured_on():
-    """The date each engine's results file was written, by its mtime."""
+    """The date each engine was measured, as its own rows record it."""
     dates = {}
     for eng_key, _ in ENGINES:
         f = RESULTS / f"{eng_key}.json"
-        if f.exists():
-            stamp = dt.datetime.fromtimestamp(f.stat().st_mtime, tz=dt.UTC)
-            dates[eng_key] = stamp.astimezone().date().isoformat()
+        if not f.exists():
+            continue
+        rows = json.loads(f.read_text())
+        stamp = next((r["measured_at_unix"] for r in rows if "measured_at_unix" in r), None)
+        if stamp is None:
+            stamp = f.stat().st_mtime
+        when = dt.datetime.fromtimestamp(stamp, tz=dt.UTC)
+        dates[eng_key] = when.astimezone().date().isoformat()
     return dates
 
 
