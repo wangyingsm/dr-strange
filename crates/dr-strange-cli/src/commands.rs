@@ -1244,8 +1244,9 @@ fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr, user: bool) ->
         return Ok(false);
     }
     let mut root: toml::Value = match std::fs::read_to_string(&path) {
-        Ok(s) => s
-            .parse()
+        // `from_str`, not `parse`: toml 1's `FromStr` reads one bare value, so
+        // a document ends at its first table header.
+        Ok(s) => toml::from_str(&s)
             .with_context(|| format!("{} exists but is not valid TOML", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             toml::Value::Table(Default::default())
@@ -6363,7 +6364,7 @@ mod tests {
 
         assert!(probe_and_write_codex(&dir, &addr, false).unwrap());
         let rendered = std::fs::read_to_string(dir.join(".codex/config.toml")).unwrap();
-        let v: toml::Value = rendered.parse().unwrap();
+        let v: toml::Value = toml::from_str(&rendered).unwrap();
         assert_eq!(
             v["mcp_servers"]["drsg-watch"]["url"].as_str().unwrap(),
             "http://127.0.0.1:12345/mcp"
