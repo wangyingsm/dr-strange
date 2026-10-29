@@ -334,7 +334,7 @@ pub fn build_provider(
     // and the CLI has already folded `[network]` into the environment without
     // overwriting what the operator exported (issue #37). A local endpoint —
     // the `ollama` preset — is loopback and is never proxied regardless.
-    let net = crate::net::Network::resolve(&crate::net::NetworkConfig::default())?;
+    let net = dr_strange_net::Network::resolve(&dr_strange_net::NetworkConfig::default())?;
     let mut provider = OpenAiProvider::new(base, key, model)
         .with_embed_batch(batch)
         .through(net);
@@ -388,7 +388,7 @@ pub struct OpenAiProvider {
     /// Where this provider's requests go. A hosted endpoint is reached through
     /// the operator's proxy; a local one (the `ollama` preset) is loopback and
     /// never proxied (issue #37).
-    net: crate::net::Network,
+    net: dr_strange_net::Network,
 }
 
 impl OpenAiProvider {
@@ -407,12 +407,12 @@ impl OpenAiProvider {
             send_temperature: true,
             send_max_tokens: true,
             throttle: Throttle::new(),
-            net: crate::net::Network::direct(),
+            net: dr_strange_net::Network::direct(),
         }
     }
 
     /// Send this provider's requests through `net`.
-    pub fn through(mut self, net: crate::net::Network) -> Self {
+    pub fn through(mut self, net: dr_strange_net::Network) -> Self {
         self.net = net;
         self
     }
@@ -428,7 +428,7 @@ impl OpenAiProvider {
             .net
             .apply(
                 ureq::Agent::config_builder(),
-                crate::net::Destination::of(&parsed),
+                dr_strange_net::Destination::of(&parsed),
             )?
             // A non-2xx is an answer here, not an error: the provider's message
             // is in its body, its `retry-after` in its headers, and ureq's

@@ -23,6 +23,7 @@ plugins = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:toml"]
 [dependencies]
 ahash = { workspace = true }
 dr-strange-core = { workspace = true, features = ["json"] }
+dr-strange-net.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

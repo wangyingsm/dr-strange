@@ -1213,6 +1213,7 @@ dependencies = [
  "dr-strange-llm",
  "dr-strange-log",
  "dr-strange-mcp",
+ "dr-strange-net",
  "dr-strange-parser",
  "dr-strange-web",
  "libc",
@@ -1253,6 +1254,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dr-strange-core",
+ "dr-strange-net",
  "ignore",
  "rayon",
  "serde",
@@ -1299,6 +1301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dr-strange-net"
+version = "2.24.0"
+dependencies = [
+ "anyhow",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "dr-strange-parser"
 version = "2.24.0"
 dependencies = [
@@ -1329,6 +1340,7 @@ dependencies = [
  "dr-strange-core",
  "dr-strange-llm",
  "dr-strange-mcp",
+ "dr-strange-net",
  "dr-strange-parser",
  "ego-tree",
  "futures-util",

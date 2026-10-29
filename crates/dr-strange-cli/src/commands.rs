@@ -3156,7 +3156,7 @@ pub struct DigestArgs<'a> {
     /// URL only: where the crawl's requests go. The operator named this URL on
     /// their own command line, so it goes through their proxy — unlike a URL a
     /// caller hands the server, which is address-guarded instead.
-    pub net: &'a dr_strange_llm::net::Network,
+    pub net: &'a dr_strange_net::Network,
     pub plane: &'a str,
     pub apply: bool,
     pub chunk_chars: usize,

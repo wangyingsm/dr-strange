@@ -37,6 +37,7 @@ dr-strange-web = { path = "../dr-strange-web" }
 # drift from. No new weight: `dr-strange-web` above already pulls this in.
 dr-strange-mcp = { path = "../dr-strange-mcp", default-features = false }
 dr-strange-log.workspace = true
+dr-strange-net.workspace = true
 dr-strange-parser.workspace = true
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
