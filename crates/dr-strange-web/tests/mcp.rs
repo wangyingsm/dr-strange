@@ -143,8 +143,17 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
     )
     .unwrap();
     let upstream = dr_strange_mcp::relay::discover(repo.path()).expect("declared by .mcp.json");
+    // A proxy that could not carry anything: port 1 refuses at once. Both the
+    // probe and the relay below go to a loopback server, which is never
+    // proxied, so this must make no difference — and before issue #84 was
+    // fixed it made all of it fail (an operator with `http_proxy` set got a
+    // probe that never arrived and a silent fallback to a different graph).
+    let net = dr_strange_net::Network::through(
+        "http://127.0.0.1:1".parse().unwrap(),
+        dr_strange_net::NoProxy::default(),
+    );
     assert!(
-        dr_strange_mcp::relay::alive(&upstream, Duration::from_secs(2)).await,
+        dr_strange_mcp::relay::alive(&upstream, Duration::from_secs(2), &net).await,
         "the probe must find a server that is plainly answering",
     );
 
@@ -156,6 +165,7 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
         dr_strange_mcp::relay::relay_over(
             rmcp::transport::async_rw::AsyncRwTransport::new_server(rx, tx),
             &upstream,
+            &net,
         )
         .await
     });

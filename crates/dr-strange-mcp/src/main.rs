@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use dr_strange_core::Database;
 use dr_strange_mcp::{DrStrange, relay};
+use dr_strange_net::{Network, NetworkConfig};
 use rmcp::ServiceExt;
 
 /// The database served when nothing names one: the path `drsg digest` and
@@ -147,16 +148,24 @@ async fn main() -> anyhow::Result<()> {
     // stdio JSON-RPC protocol. Hold the guard so the writer flushes on exit.
     let _log = dr_strange_log::init("drsg-mcp");
 
+    // One read of the environment, shared by the probe and the relay. Not
+    // fatal when it will not parse: a proxy nobody can use is no reason to
+    // refuse to serve the database, and loopback goes direct either way.
+    let net = Network::resolve(&NetworkConfig::default()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "ignoring an unusable proxy setting; requests go direct");
+        Network::direct()
+    });
+
     // This repository may already run the server that holds this database.
     let cwd = std::env::current_dir()?;
-    if discover && let Some(upstream) = declared_server(&cwd).await {
+    if discover && let Some(upstream) = declared_server(&cwd, &net).await {
         tracing::info!(
             server = %upstream.name,
             url = %upstream.url,
             declared_by = %upstream.source.display(),
             "relaying to the running drsg server",
         );
-        return relay::relay(&upstream).await;
+        return relay::relay(&upstream, &net).await;
     }
 
     require_existing(&path)?;
@@ -209,9 +218,9 @@ fn require_existing(path: &Path) -> anyhow::Result<()> {
 ///
 /// Best-effort: no `.mcp.json`, no drsg entry in one, or nothing listening all
 /// mean "open the database yourself".
-async fn declared_server(from: &Path) -> Option<relay::Upstream> {
+async fn declared_server(from: &Path, net: &Network) -> Option<relay::Upstream> {
     let upstream = relay::discover(from)?;
-    match relay::alive(&upstream, relay::PROBE_TIMEOUT).await {
+    match relay::alive(&upstream, relay::PROBE_TIMEOUT, net).await {
         true => Some(upstream),
         false => {
             tracing::debug!(
@@ -252,7 +261,7 @@ mod tests {
             r#"{"mcpServers":{"drsg-watch":{"url":"http://127.0.0.1:1/mcp"}}}"#,
         )
         .unwrap();
-        assert!(declared_server(dir.path()).await.is_none());
+        assert!(declared_server(dir.path(), Network::DIRECT).await.is_none());
     }
 
     #[test]

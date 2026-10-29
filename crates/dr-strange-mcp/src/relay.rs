@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
+use dr_strange_net::{Destination, Network};
 use rmcp::service::{RoleClient, RoleServer};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, Transport};
@@ -169,14 +171,34 @@ pub fn health_url(url: &str) -> Option<String> {
     }
 }
 
+/// A client builder that will reach `url` the way `net` says to.
+///
+/// reqwest selects a proxy from the environment itself and makes no exception
+/// for loopback, so a declared server at `127.0.0.1` was reached through a
+/// proxy an operator set for the outside world — which answered for it, or
+/// failed for it, and either way received the `Authorization` the `.mcp.json`
+/// carries (issue #84). Stating the proxy, or stating that there is none, also
+/// turns that selection off.
+fn client_for(url: &str, net: &Network) -> anyhow::Result<reqwest::ClientBuilder> {
+    let to = reqwest::Url::parse(url).with_context(|| format!("the declared server URL {url}"))?;
+    let builder = reqwest::Client::builder();
+    Ok(match net.proxy_for(Destination::of(&to)) {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(proxy.as_raw())?),
+        None => builder.no_proxy(),
+    })
+}
+
 /// Whether something is answering at `upstream`.
 ///
 /// Not an MCP `initialize`: that would open a session and abandon it.
-pub async fn alive(upstream: &Upstream, timeout: Duration) -> bool {
+pub async fn alive(upstream: &Upstream, timeout: Duration, net: &Network) -> bool {
     let Some(url) = health_url(&upstream.url) else {
         return false;
     };
-    let Ok(client) = reqwest::Client::builder().timeout(timeout).build() else {
+    let Ok(builder) = client_for(&url, net) else {
+        return false;
+    };
+    let Ok(client) = builder.timeout(timeout).build() else {
         return false;
     };
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
@@ -205,18 +227,51 @@ fn auth_header(value: &str) -> Option<reqwest::header::HeaderValue> {
 /// Returns when either side closes — the host disconnecting, or the server
 /// going away. A host that wants another session starts another process,
 /// which discovers the world as it is then.
-pub async fn relay(upstream: &Upstream) -> anyhow::Result<()> {
+pub async fn relay(upstream: &Upstream, net: &Network) -> anyhow::Result<()> {
     let (stdin, stdout) = rmcp::transport::stdio();
     relay_over(
         rmcp::transport::async_rw::AsyncRwTransport::new_server(stdin, stdout),
         upstream,
+        net,
     )
     .await
 }
 
+/// How many redirects one request may follow.
+const MAX_REDIRECTS: usize = 10;
+
+/// The redirect policy rmcp's own client for this transport uses, restated
+/// because [`client_for`] has to supply a whole client and rmcp 3.6.0 keeps
+/// its copy private.
+///
+/// Only a same-origin 307 or 308 is followed: those keep the method and body,
+/// so the JSON-RPC message arrives intact. A 301, 302 or 303 would turn the
+/// POST into a bodyless GET and lose the message, and a cross-origin hop would
+/// replay the session id and the `Authorization` this relay forwards to a host
+/// nobody declared. Both are returned to the caller as the redirect response.
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let preserves_body = matches!(
+            attempt.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+        );
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|original| original.origin() == attempt.url().origin());
+        if !preserves_body || !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error(format!("exceeded {MAX_REDIRECTS} redirects"))
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// [`relay`] over any host transport, so a test can drive the pump over a
 /// pipe rather than this process's stdio.
-pub async fn relay_over<H>(mut host: H, upstream: &Upstream) -> anyhow::Result<()>
+pub async fn relay_over<H>(mut host: H, upstream: &Upstream, net: &Network) -> anyhow::Result<()>
 where
     H: Transport<RoleServer>,
     H::Error: std::error::Error + Send + Sync + 'static,
@@ -227,9 +282,15 @@ where
             .custom_headers
             .insert(reqwest::header::AUTHORIZATION, value);
     }
-    // The transport's default client: it disables idle connection pooling for
-    // a latency reason particular to this protocol.
-    let mut server = StreamableHttpClientTransport::from_config(config);
+    // Not the transport's `from_config`: its client selects a proxy from the
+    // environment (see `client_for`). Its other two settings are restated —
+    // idle pooling off for a latency reason particular to this protocol, and
+    // the redirect policy below.
+    let client = client_for(&upstream.url, net)?
+        .pool_max_idle_per_host(0)
+        .redirect(same_origin_redirect_policy())
+        .build()?;
+    let mut server = StreamableHttpClientTransport::with_client(client, config);
 
     // A message-level pump: neither side's content is inspected, so a tool
     // added to the server reaches a host through a binary built before it.
@@ -252,6 +313,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     fn write(dir: &Path, body: &str) -> PathBuf {
@@ -415,7 +481,7 @@ mod tests {
             auth: None,
             source: PathBuf::from(MCP_FILE),
         };
-        assert!(!alive(&upstream, Duration::from_millis(500)).await);
+        assert!(!alive(&upstream, Duration::from_millis(500), Network::DIRECT).await);
 
         // A URL with no origin to probe is not alive either — there is
         // nowhere to ask.
@@ -423,6 +489,73 @@ mod tests {
             url: "not a url".into(),
             ..upstream
         };
-        assert!(!alive(&unusable, Duration::from_millis(500)).await);
+        assert!(!alive(&unusable, Duration::from_millis(500), Network::DIRECT).await);
+    }
+
+    /// A loopback listener that counts the connections it accepts and answers
+    /// each with a bare `200 OK` — enough for the probe, and all the proxy
+    /// assertions below need.
+    async fn counting_listener() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        (addr, hits)
+    }
+
+    fn declared(url: String) -> Upstream {
+        Upstream {
+            name: WATCH_SERVER.into(),
+            url,
+            auth: Some("Bearer secret".into()),
+            source: PathBuf::from(MCP_FILE),
+        }
+    }
+
+    /// `through`, not `resolve`: the policy is this test's, and the machine
+    /// running it may well have a proxy of its own set.
+    fn through(proxy: std::net::SocketAddr) -> Network {
+        Network::through(
+            format!("http://{proxy}").parse().unwrap(),
+            dr_strange_net::NoProxy::default(),
+        )
+    }
+
+    /// Issue #84. reqwest picks a proxy out of the environment with no
+    /// loopback exception, so the probe for a server on `127.0.0.1` was sent
+    /// to the operator's proxy — along with the bearer token — and the server
+    /// itself was never asked.
+    #[tokio::test]
+    async fn a_loopback_probe_never_goes_through_a_proxy() {
+        let (server, reached) = counting_listener().await;
+        let (proxy, proxied) = counting_listener().await;
+        let upstream = declared(format!("http://{server}/mcp"));
+
+        assert!(alive(&upstream, PROBE_TIMEOUT, &through(proxy)).await);
+        assert_eq!(reached.load(Ordering::SeqCst), 1, "the server was asked");
+        assert_eq!(proxied.load(Ordering::SeqCst), 0, "the proxy was not");
+    }
+
+    /// The decision is per destination, not a blanket `no_proxy()`: a declared
+    /// server that is not loopback still goes through the proxy. `.invalid`
+    /// never resolves, so a direct attempt could not have answered.
+    #[tokio::test]
+    async fn a_declared_server_elsewhere_still_goes_through_the_proxy() {
+        let (proxy, proxied) = counting_listener().await;
+        let upstream = declared("http://declared.invalid/mcp".into());
+
+        assert!(alive(&upstream, PROBE_TIMEOUT, &through(proxy)).await);
+        assert_eq!(proxied.load(Ordering::SeqCst), 1, "the proxy carried it");
     }
 }
