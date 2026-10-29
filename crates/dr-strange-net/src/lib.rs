@@ -89,6 +89,16 @@ impl fmt::Display for ProxyUrl {
 }
 
 impl ProxyUrl {
+    /// The URL as configured, password included — for a caller building a
+    /// client this crate has no type for.
+    ///
+    /// [`fmt::Display`] redacts the password and is what every message uses;
+    /// this is the value a proxy is actually dialled with, so it goes into a
+    /// client and nowhere a human reads.
+    pub fn as_raw(&self) -> &str {
+        &self.0
+    }
+
     /// The ureq value, built per agent because `ureq::Proxy` is neither `Clone`
     /// nor `Eq` and so cannot be kept in the policy.
     fn into_ureq(self) -> Result<ureq::Proxy> {
@@ -408,6 +418,9 @@ mod tests {
         // Debug is derived and keeps the raw string; it must not be printed at
         // a user, which is why every message uses Display.
         assert!(format!("{p:?}").contains("hunter2"));
+        // `as_raw` is the one way past the redaction, because a client has to
+        // dial the password it was given.
+        assert_eq!(p.as_raw(), "http://alice:hunter2@proxy.example:8080");
         // Nothing to redact, nothing changed.
         let plain = "http://proxy.example:8080".parse::<ProxyUrl>().unwrap();
         assert_eq!(plain.to_string(), "http://proxy.example:8080");
