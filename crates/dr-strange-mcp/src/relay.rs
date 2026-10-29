@@ -188,20 +188,50 @@ fn client_for(url: &str, net: &Network) -> anyhow::Result<reqwest::ClientBuilder
     })
 }
 
+/// Why a declared server could not be reached.
+///
+/// Reported rather than reduced to "not answering": a server that died, a
+/// proxy that refused on its behalf and a URL that cannot be probed at all
+/// are three different things to do about, and the fallback to a local
+/// database looks the same from the outside whichever it was.
+#[derive(Debug, thiserror::Error)]
+pub enum Unreachable {
+    /// The URL has no origin, so there is no `/health` to ask.
+    #[error("the URL has no origin to probe")]
+    NoOrigin,
+    /// No client could be built for it — an unusable proxy setting.
+    #[error("no client could be built for it: {0:#}")]
+    NoClient(anyhow::Error),
+    /// Nothing answered: refused, timed out, or a proxy failed for it.
+    ///
+    /// Held as an [`anyhow::Error`] for `{:#}`, which prints the cause chain
+    /// on one line. reqwest's own `Display` stops at "error sending request",
+    /// and whether that was a refusal, a timeout or a proxy is the whole
+    /// question being asked here.
+    #[error("nothing answered: {0:#}")]
+    NoAnswer(anyhow::Error),
+    /// Something answered, but not with success.
+    #[error("it answered {0}, which is not a running drsg server")]
+    NotDrsg(reqwest::StatusCode),
+}
+
 /// Whether something is answering at `upstream`.
 ///
 /// Not an MCP `initialize`: that would open a session and abandon it.
-pub async fn alive(upstream: &Upstream, timeout: Duration, net: &Network) -> bool {
-    let Some(url) = health_url(&upstream.url) else {
-        return false;
-    };
-    let Ok(builder) = client_for(&url, net) else {
-        return false;
-    };
-    let Ok(client) = builder.timeout(timeout).build() else {
-        return false;
-    };
-    matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
+pub async fn alive(
+    upstream: &Upstream,
+    timeout: Duration,
+    net: &Network,
+) -> Result<(), Unreachable> {
+    let url = health_url(&upstream.url).ok_or(Unreachable::NoOrigin)?;
+    let client = client_for(&url, net)
+        .and_then(|b| b.timeout(timeout).build().map_err(Into::into))
+        .map_err(Unreachable::NoClient)?;
+    match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(Unreachable::NotDrsg(r.status())),
+        Err(e) => Err(Unreachable::NoAnswer(e.into())),
+    }
 }
 
 /// The `Authorization` header to send, or `None` when the file's value cannot
@@ -481,7 +511,10 @@ mod tests {
             auth: None,
             source: PathBuf::from(MCP_FILE),
         };
-        assert!(!alive(&upstream, Duration::from_millis(500), Network::DIRECT).await);
+        assert!(matches!(
+            alive(&upstream, Duration::from_millis(500), Network::DIRECT).await,
+            Err(Unreachable::NoAnswer(_)),
+        ));
 
         // A URL with no origin to probe is not alive either — there is
         // nowhere to ask.
@@ -489,7 +522,10 @@ mod tests {
             url: "not a url".into(),
             ..upstream
         };
-        assert!(!alive(&unusable, Duration::from_millis(500), Network::DIRECT).await);
+        assert!(matches!(
+            alive(&unusable, Duration::from_millis(500), Network::DIRECT).await,
+            Err(Unreachable::NoOrigin),
+        ));
     }
 
     /// A loopback listener that counts the connections it accepts and answers
@@ -542,7 +578,11 @@ mod tests {
         let (proxy, proxied) = counting_listener().await;
         let upstream = declared(format!("http://{server}/mcp"));
 
-        assert!(alive(&upstream, PROBE_TIMEOUT, &through(proxy)).await);
+        assert!(
+            alive(&upstream, PROBE_TIMEOUT, &through(proxy))
+                .await
+                .is_ok()
+        );
         assert_eq!(reached.load(Ordering::SeqCst), 1, "the server was asked");
         assert_eq!(proxied.load(Ordering::SeqCst), 0, "the proxy was not");
     }
@@ -555,7 +595,11 @@ mod tests {
         let (proxy, proxied) = counting_listener().await;
         let upstream = declared("http://declared.invalid/mcp".into());
 
-        assert!(alive(&upstream, PROBE_TIMEOUT, &through(proxy)).await);
+        assert!(
+            alive(&upstream, PROBE_TIMEOUT, &through(proxy))
+                .await
+                .is_ok()
+        );
         assert_eq!(proxied.load(Ordering::SeqCst), 1, "the proxy carried it");
     }
 }

@@ -153,7 +153,9 @@ async fn the_stdio_relay_serves_the_running_servers_database() {
         dr_strange_net::NoProxy::default(),
     );
     assert!(
-        dr_strange_mcp::relay::alive(&upstream, Duration::from_secs(2), &net).await,
+        dr_strange_mcp::relay::alive(&upstream, Duration::from_secs(2), &net)
+            .await
+            .is_ok(),
         "the probe must find a server that is plainly answering",
     );
 

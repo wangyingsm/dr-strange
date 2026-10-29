@@ -221,10 +221,14 @@ fn require_existing(path: &Path) -> anyhow::Result<()> {
 async fn declared_server(from: &Path, net: &Network) -> Option<relay::Upstream> {
     let upstream = relay::discover(from)?;
     match relay::alive(&upstream, relay::PROBE_TIMEOUT, net).await {
-        true => Some(upstream),
-        false => {
-            tracing::debug!(
+        Ok(()) => Some(upstream),
+        // Worth saying out loud rather than at debug: the graph served from
+        // here is not the one the repository declared, and until the reason
+        // was recorded every cause of that looked like a dead server.
+        Err(why) => {
+            tracing::info!(
                 url = %upstream.url,
+                reason = %why,
                 "the declared drsg server is not answering; opening the database here",
             );
             None
