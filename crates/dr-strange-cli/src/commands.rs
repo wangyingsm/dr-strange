@@ -1885,6 +1885,28 @@ fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> 
         .canonicalize()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| dir.display().to_string());
+    stamp_sync_point(db, plane_name, &head, &root, dir)?;
+    // The ops plane beside it, when the tree left one. It is reconciled from
+    // the same tree in the same pass, so it is at the same commit — and a
+    // reader of `<name>_ops` that cannot see one has no way to tell how old
+    // those manifests are. Unlike the plugin stamp, this moves on every fold,
+    // because every fold does re-read the manifests.
+    let ops = dr_strange_core::compact::ops_plane_name(plane_name);
+    if db.plane(&ops).is_ok() {
+        stamp_sync_point(db, &ops, &head, &root, dir)?;
+    }
+    Ok(())
+}
+
+/// Write one plane's sync point: the commit, the drift, and the directory.
+#[cfg(feature = "digest")]
+fn stamp_sync_point(
+    db: &Database,
+    plane_name: &str,
+    head: &str,
+    root: &str,
+    dir: &Path,
+) -> Result<()> {
     let plane = db.plane(plane_name)?;
     let mut props = plane.properties()?;
     props.insert(
@@ -1893,7 +1915,7 @@ fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> 
         // which that commit may not match. The drift below is how far.
         PropDesc::described(
             "commit HEAD was at when these facts were parsed",
-            PropValue::Str(head),
+            PropValue::Str(head.to_string()),
         ),
     );
     // Always written, both of them, so a plane that does not carry them is one
@@ -1916,7 +1938,10 @@ fn record_sync_point(db: &Database, plane_name: &str, dir: &Path) -> Result<()> 
     }
     props.insert(
         SYNC_ROOT_PROP.into(),
-        PropDesc::described("directory the facts were parsed from", PropValue::Str(root)),
+        PropDesc::described(
+            "directory the facts were parsed from",
+            PropValue::Str(root.to_string()),
+        ),
     );
     plane.set_properties(props)?;
     Ok(())
