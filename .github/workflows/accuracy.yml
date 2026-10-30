@@ -40,7 +40,7 @@ jobs:
           dotnet-version: "8.0.x"
       # Pinned exactly, as ci.yml explains: setup-uv stopped publishing a
       # floating major tag after v7, so `@v9` does not resolve.
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       # The one the laptop cannot do.
       - name: C# — Roslyn
