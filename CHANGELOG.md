@@ -4,6 +4,54 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.1] - 2026-10-30
+
+One bug, reported from outside (#84): a proxy an operator set for the outside
+world was swallowing the local server a repository declares for itself. The
+second fix here was found while testing the first.
+
+### Fixed
+
+- **A proxy in the environment no longer swallows the declared server** (#84).
+  reqwest selects a system proxy on its own and makes no exception for
+  loopback, so the liveness probe for the `drsg serve … watch` a repository
+  names in its `.mcp.json` — on `127.0.0.1` — went to the operator's
+  `http_proxy`, and so did the relay's own session, carrying the
+  `Authorization` that file holds to a proxy that had no business seeing it.
+  With no database in the directory the failure was loud: `no database at
+  'graph.drsg'`. With one present it was silent — `initialize` succeeded,
+  `tools/list` answered, the process exited 0, and the host read the local
+  on-disk graph instead of the live plane with nothing on stdout to say so,
+  which is the worse half of this bug. Both of `drsg-mcp`'s HTTP clients now
+  decide per destination: loopback and `NO_PROXY` hosts go direct, and a
+  declared server that is genuinely elsewhere still goes through the proxy.
+- **The fallback says why it fell back.** A dead server, a proxy refusing on
+  its behalf and a URL with no origin to probe were one `false` between them,
+  logged at debug, which is why every one of them read as a dead server. The
+  reason is now named with its cause chain — `Connection refused`, a timeout,
+  a status — and recorded at info, because that line marks the graph being
+  served changing out from under the host.
+- **A host that hangs up before `initialize` no longer wedges the relay.**
+  `drsg-mcp < /dev/null`, or a host that dies between launch and its first
+  message, left the process running until it was killed. The relay's server
+  transport is now closed only if a message ever went through it: rmcp 3.6.0's
+  worker waits for its first one in a bare channel receive with no branch for
+  the cancellation its own `close` sends, so closing an unused transport never
+  returns. The 2.21.0 binary behaves the same way, so this is not new.
+
+### Changed
+
+- **The proxy policy is its own crate, `dr-strange-net`.** It sat in
+  `dr-strange-llm` because that was once the lowest crate making an outbound
+  request, which stopped being true; the MCP relay needs the same decision and
+  had no business reaching through the LLM crate for it. The policy itself is
+  unchanged — the loopback exception, the `NO_PROXY` grammar and the
+  precedence of `ALL_PROXY` over the per-scheme variables are the same code,
+  with the same tests, now shared by the LLM client, the web fetcher and the
+  relay. `dr_strange_llm::net` is gone as a public path; `dr_strange_net`
+  replaces it. These crates are not published to crates.io, so nothing outside
+  this workspace depended on the old one.
+
 ## [2.24.0] - 2026-10-28
 
 Three things reach past the server this release. The engine opens a graph
