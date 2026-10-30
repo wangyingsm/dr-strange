@@ -1,6 +1,6 @@
 [project]
 name = "drsg"
-version = "2.24.1"
+version = "2.24.2"
 description = "Python client for dr-strange (drsg serve JSON-RPC)"
 readme = "README.md"
 requires-python = ">=3.9"

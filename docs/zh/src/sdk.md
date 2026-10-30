@@ -7,7 +7,7 @@ Dr Strange 提供**六种语言**的客户端库：TypeScript、Python、Go、Ja
 
 ## 获取 SDK
 
-各 SDK 位于仓库的 `sdk/<语言>` 目录下，版本号与工作区一致，均为 2.24.1。**目前没有任何
+各 SDK 位于仓库的 `sdk/<语言>` 目录下，版本号与工作区一致，均为 2.24.2。**目前没有任何
 一个 SDK 发布到语言包仓库**（没有 PyPI、npm、Maven Central 发行版，也没有 `sdk/go/vX`
 标签），因此都需从本仓库的检出安装：
 
@@ -16,7 +16,7 @@ Dr Strange 提供**六种语言**的客户端库：TypeScript、Python、Go、Ja
 | TypeScript | `sdk/typescript` | 在该目录 `bun install && bun run build`，然后在 `package.json` 中写 `"drsg": "file:…/sdk/typescript"` |
 | Python | `sdk/python` | `pip install …/sdk/python`（或 `pip install "drsg @ git+https://github.com/wangyingsm/dr-strange.git#subdirectory=sdk/python"`） |
 | Go | `sdk/go` | `go get github.com/wangyingsm/dr-strange/sdk/go@<commit>`，或用 `replace … => …/sdk/go` 指令 |
-| Java | `sdk/java` | 在该目录 `./mvnw install`，然后依赖 `io.github.wangyingsm:drsg:2.24.1` |
+| Java | `sdk/java` | 在该目录 `./mvnw install`，然后依赖 `io.github.wangyingsm:drsg:2.24.2` |
 | C | `sdk/c` | `make` → `libdrsg.a` + `include/drsg.h`（需要 libcurl + json-c） |
 | Zig | `sdk/zig` | `zig build`，或将 `src/drsg.zig` 作为模块引入（Zig 0.16） |
 
