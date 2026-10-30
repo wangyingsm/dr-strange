@@ -1098,6 +1098,38 @@ fn an_ops_readers_facts_land_in_the_plane_beside_the_code() {
     );
 }
 
+/// The ops plane records what built it, as the code plane does (#39). Without
+/// it a reader of `<name>_ops` cannot tell whether those facts predate a
+/// change to the Compose, Kubernetes or Terraform reader that produced them —
+/// and the code plane's stamp says nothing about them.
+#[test]
+fn the_ops_plane_records_the_plugin_set_that_built_it() {
+    let (tree, db, plugins) = ops_fixture("ops-builtby", true);
+    // A rebuild, not a fold: the stamp is written where a whole tree was
+    // reparsed, which is the only point at which it is true of the plane.
+    resync(&db, "code", &tree.host(), &plugins, "test", "r0").unwrap();
+
+    let stamp = |plane: &str| -> Vec<String> {
+        let props = db.plane(plane).unwrap().properties().unwrap();
+        match props.get(super::ledger::BUILT_BY_PROP).map(|d| &d.value) {
+            Some(dr_strange_core::PropValue::List(v)) => v
+                .iter()
+                .map(|p| match p {
+                    dr_strange_core::PropValue::Str(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("plane `{plane}` records no plugin set: {other:?}"),
+        }
+    };
+    assert_eq!(
+        stamp("code_ops"),
+        stamp("code"),
+        "both planes came out of one pass over one plugin set, so they must \
+         record the same one"
+    );
+}
+
 /// Nothing asks for the plane, so a tree with no manifests must not leave an
 /// empty one behind.
 #[test]

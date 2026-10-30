@@ -681,6 +681,18 @@ pub fn resync(
     // what built it, or a reader between the two sees a complete graph with no
     // provenance and cannot tell whether it predates a plugin change (#39).
     super::ledger::record_built_by(db, plane_name, &plugins.manifests())?;
+    // And the ops plane beside it, when the tree left one. It comes out of the
+    // same pass over the same plugin set, so it carries the same stamp — and
+    // without one, a reader of `<name>_ops` had no provenance at all and the
+    // drift check could not say whether those facts predate a change to the
+    // Compose, Kubernetes or Terraform reader that produced them. Here rather
+    // than where the facts are written, for the reason the code plane's stamp
+    // is here: a fold must not move it, or it would claim the whole plane had
+    // been reparsed when one commit's files had.
+    let ops_plane = super::ops::plane_name(plane_name);
+    if db.plane(&ops_plane).is_ok() {
+        super::ledger::record_built_by(db, &ops_plane, &plugins.manifests())?;
+    }
     let plane = db.plane(plane_name)?;
     let mut props = plane.properties()?;
     props.remove(dr_strange_core::compact::REBUILDING_PROP);
