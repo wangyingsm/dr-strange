@@ -32,7 +32,7 @@ anyhow = "1"
 # per-destination decision and never proxies loopback, which is what keeps a
 # local model server reachable behind a proxy (see `net`).
 # Pinned exactly for the reason `dr-strange-web`'s copy spells out.
-ureq = { version = "=3.4.2", features = ["json", "socks-proxy"] }
+ureq = { version = "=3.5.0", features = ["json", "socks-proxy"] }
 # Parsing a provider or upstream URL into the host the proxy decision needs.
 url = "2"
 # Server-side document → Markdown for the digest page (arch/07, arch/08).

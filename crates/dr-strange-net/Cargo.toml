@@ -14,7 +14,7 @@ anyhow = "1"
 # The proxy grammar a configured value is validated against, and the agent
 # config `apply` attaches it to. Pinned exactly for the reason the copy in
 # `dr-strange-llm` spells out.
-ureq = { version = "=3.4.2", features = ["socks-proxy"] }
+ureq = { version = "=3.5.0", features = ["socks-proxy"] }
 # Parsing a destination URL into the host the proxy decision needs.
 url = "2"
 
