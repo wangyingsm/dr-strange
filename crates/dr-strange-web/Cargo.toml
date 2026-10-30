@@ -66,7 +66,7 @@ tracing.workspace = true
 # would render a navigation bar as prose; `ego-tree` is scraper's own tree type,
 # needed to name node handles in the walker and pinned to the version scraper
 # resolves so both see one crate.
-scraper = "0.27"
+scraper = "0.29"
 ego-tree = "0.11"
 url = "2"
 # ureq rather than reqwest (which is only a dev-dependency here, for tests)
