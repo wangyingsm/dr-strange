@@ -4,6 +4,38 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.2] - 2026-10-30
+
+Three fixes around what a plane knows about itself. A rebuild replaces a
+plane's facts, and it was taking the plane's own record with them; the ops
+plane beside it had no record to take.
+
+### Fixed
+
+- **A rebuild keeps what the plane itself records.** `--force` — and so
+  `drsg init --rebuild` — dropped the plane and recreated it carrying only the
+  marker that says a rebuild is in progress, which took every property with
+  it. An attachment is one of those: `plane.attach` records it on the plane,
+  not in a side table, so re-reading a tree silently detached every graph that
+  plane could reach, and anything `plane.set_props` had written went the same
+  way. The properties are now read before the drop and carried into the new
+  plane; the provenance and sync-point ones the rebuild owns are rewritten
+  before it clears the marker, so nothing reads a stale one from a plane that
+  claims to be finished. Mounted databases were never affected — they are
+  recorded on the `startup` plane and replayed on each start.
+- **The ops plane records the plugin set that built it.** `<plane>_ops` carried
+  no provenance at all, so the drift check (#39) could not say whether a
+  workload or image predated a change to the Compose, Kubernetes or Terraform
+  reader that produced it — while the code plane beside it said exactly that
+  about the code. It is stamped on a full rebuild, where the code plane's stamp
+  is written and for the same reason: a stamp that moved on every fold would
+  claim the whole plane had been reparsed when one commit's files had.
+- **The ops plane records its sync point.** The commit, the working-tree drift
+  and the directory — the same three the code plane beside it has long
+  recorded. A reader of `<plane>_ops` could see the workloads but not how old
+  they were. Unlike the plugin stamp this moves on every fold, because every
+  fold does re-read the manifests.
+
 ## [2.24.1] - 2026-10-30
 
 One bug, reported from outside (#84): a proxy an operator set for the outside
