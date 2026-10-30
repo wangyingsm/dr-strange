@@ -7,6 +7,7 @@ members = [
     "crates/dr-strange-web",
     "crates/dr-strange-llm",
     "crates/dr-strange-log",
+    "crates/dr-strange-net",
     "crates/dr-strange-parser",
     "crates/dr-strange-py",
     "benchmarks/drsg-bench",
@@ -41,6 +42,11 @@ too_many_lines = "warn"
 # members that just need core's types (e.g. the parser) get a backend-free core.
 dr-strange-core = { path = "crates/dr-strange-core", default-features = false }
 dr-strange-log = { path = "crates/dr-strange-log" }
+# Outbound proxy policy, shared by every crate that makes an outbound request:
+# the LLM client, the web fetcher and the MCP relay. Its own crate because the
+# relay reaching into `dr-strange-llm` for it said something untrue about what
+# the policy is for.
+dr-strange-net = { path = "crates/dr-strange-net" }
 dr-strange-parser = { path = "crates/dr-strange-parser" }
 # The workspace-standard hash map/set (fast keyed hashing, DoS-resistant via
 # per-process random seed): use ahash::{AHashMap, AHashSet} instead of std's

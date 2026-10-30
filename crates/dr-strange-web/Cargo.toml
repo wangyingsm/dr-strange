@@ -21,6 +21,7 @@ native-backend = ["dr-strange-core/native-backend", "dr-strange-mcp/native-backe
 ahash = { workspace = true }
 dr-strange-core = { workspace = true, features = ["json"] }
 dr-strange-llm = { path = "../dr-strange-llm" }
+dr-strange-net.workspace = true
 # The MCP tool set (arch/06), reused (not reimplemented) to host it at `/mcp`
 # (ROADMAP §10) — the served endpoint and the `drsg-mcp` stdio binary drive
 # the identical tool code, just over different transports.

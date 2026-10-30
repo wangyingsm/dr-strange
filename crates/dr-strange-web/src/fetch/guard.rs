@@ -22,7 +22,7 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::NextTimeout;
 
 use anyhow::{Result, bail};
-use dr_strange_llm::net::{Destination, Network};
+use dr_strange_net::{Destination, Network};
 use url::Url;
 
 /// A CIDR prefix an operator has deliberately re-permitted, e.g. to let the
@@ -333,7 +333,7 @@ impl Resolver for PublicOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dr_strange_llm::net::{NoProxy, ProxyUrl};
+    use dr_strange_net::{NoProxy, ProxyUrl};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

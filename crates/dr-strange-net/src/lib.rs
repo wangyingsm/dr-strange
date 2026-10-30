@@ -1,15 +1,15 @@
 //! Outbound network policy: the proxy a request goes through, and the hosts
 //! that bypass it (issue #37).
 //!
-//! It lives in this crate rather than in `dr-strange-web` because the LLM
-//! client is the lowest crate that makes an outbound request, and
-//! `dr-strange-web` depends on this one.
+//! A crate of its own because three unrelated callers make the same decision —
+//! the LLM client, the web fetcher and the MCP relay — and none of them is
+//! below the others.
 //!
-//! ureq 2 reads no proxy variables of its own here (the `proxy-from-env`
-//! feature is off) and has no `NO_PROXY` support at all, so both are resolved
-//! here. That is what makes a bypass list possible: an agent is built per call
-//! against a known destination, so the proxy is a per-request decision rather
-//! than a property of a shared agent.
+//! The clients underneath select a proxy from the environment on their own, and
+//! neither ureq 3 nor reqwest has `NO_PROXY` support worth the name, so the
+//! whole policy is resolved here and then stated to them explicitly. That is
+//! what makes a bypass list possible: the decision is made per destination,
+//! against a known host, rather than once for a shared client.
 
 use std::fmt;
 use std::str::FromStr;
@@ -89,6 +89,16 @@ impl fmt::Display for ProxyUrl {
 }
 
 impl ProxyUrl {
+    /// The URL as configured, password included — for a caller building a
+    /// client this crate has no type for.
+    ///
+    /// [`fmt::Display`] redacts the password and is what every message uses;
+    /// this is the value a proxy is actually dialled with, so it goes into a
+    /// client and nowhere a human reads.
+    pub fn as_raw(&self) -> &str {
+        &self.0
+    }
+
     /// The ureq value, built per agent because `ureq::Proxy` is neither `Clone`
     /// nor `Eq` and so cannot be kept in the policy.
     fn into_ureq(self) -> Result<ureq::Proxy> {
@@ -408,6 +418,9 @@ mod tests {
         // Debug is derived and keeps the raw string; it must not be printed at
         // a user, which is why every message uses Display.
         assert!(format!("{p:?}").contains("hunter2"));
+        // `as_raw` is the one way past the redaction, because a client has to
+        // dial the password it was given.
+        assert_eq!(p.as_raw(), "http://alice:hunter2@proxy.example:8080");
         // Nothing to redact, nothing changed.
         let plain = "http://proxy.example:8080".parse::<ProxyUrl>().unwrap();
         assert_eq!(plain.to_string(), "http://proxy.example:8080");

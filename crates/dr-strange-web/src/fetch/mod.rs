@@ -28,10 +28,9 @@ use dr_strange_core::{Analyzer, Language};
 use dr_strange_llm::SOURCE_MARKER;
 use url::Url;
 
-// Re-exported so a caller need not depend on the llm crate for them: the
-// CLI's own dependency on it is optional (`digest`), but every build of it
-// has a proxy policy to resolve.
-pub use dr_strange_llm::net::{Destination, Network, NetworkConfig, NoProxy, ProxyUrl};
+// Re-exported so this crate and its callers keep naming them through `fetch`,
+// where the address guard and the proxy decision are made together.
+pub use dr_strange_net::{Destination, Network, NetworkConfig, NoProxy, ProxyUrl};
 pub use guard::Prefix;
 use relevance::Target;
 use robots::Robots;

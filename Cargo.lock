@@ -1213,6 +1213,7 @@ dependencies = [
  "dr-strange-llm",
  "dr-strange-log",
  "dr-strange-mcp",
+ "dr-strange-net",
  "dr-strange-parser",
  "dr-strange-web",
  "libc",
@@ -1253,6 +1254,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dr-strange-core",
+ "dr-strange-net",
  "ignore",
  "rayon",
  "serde",
@@ -1283,6 +1285,7 @@ dependencies = [
  "dr-strange-core",
  "dr-strange-llm",
  "dr-strange-log",
+ "dr-strange-net",
  "dr-strange-parser",
  "libc",
  "mimalloc",
@@ -1296,6 +1299,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dr-strange-net"
+version = "2.24.0"
+dependencies = [
+ "anyhow",
+ "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1329,6 +1341,7 @@ dependencies = [
  "dr-strange-core",
  "dr-strange-llm",
  "dr-strange-mcp",
+ "dr-strange-net",
  "dr-strange-parser",
  "ego-tree",
  "futures-util",

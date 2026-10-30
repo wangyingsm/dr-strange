@@ -12,7 +12,7 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use dr_strange_llm::net::{Network, NoProxy, ProxyUrl};
+use dr_strange_net::{Network, NoProxy, ProxyUrl};
 use dr_strange_web::fetch::{Route, fetch_bytes, redirect_target};
 
 /// A stub HTTP proxy: records the first request line it is sent, answers 502
