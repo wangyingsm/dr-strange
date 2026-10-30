@@ -324,10 +324,14 @@ where
 
     // A message-level pump: neither side's content is inspected, so a tool
     // added to the server reaches a host through a binary built before it.
+    let mut opened = false;
     loop {
         tokio::select! {
             from_host = host.receive() => match from_host {
-                Some(message) => server.send(message).await?,
+                Some(message) => {
+                    opened = true;
+                    server.send(message).await?;
+                }
                 None => break,
             },
             from_server = server.receive() => match from_server {
@@ -337,7 +341,15 @@ where
         }
     }
     let _ = host.close().await;
-    let _ = Transport::<RoleClient>::close(&mut server).await;
+    // Closed only if a message ever went through it. rmcp 3.6.0's worker waits
+    // for its first one in a bare `recv`, with no branch for the cancellation
+    // `close` sends, and the sender that would end that wait belongs to the
+    // transport `close` is borrowing — so closing an unused transport never
+    // returns. Dropping it closes that channel instead, which the worker does
+    // act on. A host that hangs up before `initialize` took that path.
+    if opened {
+        let _ = Transport::<RoleClient>::close(&mut server).await;
+    }
     Ok(())
 }
 
@@ -601,5 +613,32 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(proxied.load(Ordering::SeqCst), 1, "the proxy carried it");
+    }
+
+    /// A host that hangs up before it says anything — `drsg-mcp < /dev/null`,
+    /// or a host that dies between launch and `initialize`. The relay must
+    /// return instead of sitting there with a session nobody will ever use.
+    #[tokio::test]
+    async fn a_host_that_closes_before_speaking_does_not_wedge_the_relay() {
+        let (host_side, relay_side) = tokio::io::duplex(1024);
+        drop(host_side);
+        let (rx, tx) = tokio::io::split(relay_side);
+        // Port 1: nothing is listening, and nothing should need to be — no
+        // message is ever forwarded.
+        let upstream = declared("http://127.0.0.1:1/mcp".into());
+
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_over(
+                rmcp::transport::async_rw::AsyncRwTransport::new_server(rx, tx),
+                &upstream,
+                Network::DIRECT,
+            ),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the relay must return once its host end is closed",
+        );
     }
 }
