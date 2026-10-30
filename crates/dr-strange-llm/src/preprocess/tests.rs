@@ -847,6 +847,63 @@ fn a_rebuild_reads_the_tree_before_it_drops_what_it_will_replace() {
     );
 }
 
+/// A rebuild replaces a plane's facts, not the plane. An attachment is
+/// recorded on the plane itself, so dropping the property map detached every
+/// graph this one could reach — and `drsg init --rebuild`, whose whole job is
+/// to re-read the tree, did exactly that.
+#[test]
+fn a_rebuild_keeps_what_the_plane_itself_records() {
+    let tree = Tree::new("resync-props");
+    tree.write("a.aa", "f\n");
+    let db = dr_strange_core::Database::in_memory().unwrap();
+    let plugins = Plugins::from_handlers(vec![Box::new(AaLang)]);
+
+    resync(&db, "code", &tree.host(), &plugins, "test", "r0").unwrap();
+    // A second plane to attach, and a property of the operator's own.
+    db.create_plane("notes", dr_strange_core::Properties::new())
+        .unwrap();
+    dr_strange_core::attach::record(
+        &db,
+        "code",
+        dr_strange_core::attach::Attachment::new("notes", None, None),
+    )
+    .unwrap();
+    let plane = db.plane("code").unwrap();
+    let mut props = plane.properties().unwrap();
+    props.insert(
+        "owner".into(),
+        dr_strange_core::PropDesc::new(dr_strange_core::PropValue::Str("platform".into())),
+    );
+    plane.set_properties(props).unwrap();
+
+    tree.write("b.aa", "g\n");
+    resync(&db, "code", &tree.host(), &plugins, "test", "r1").unwrap();
+
+    assert!(
+        key_id(&db, "b.aa::g").is_some(),
+        "the rebuild did re-read the tree"
+    );
+    let attached = dr_strange_core::attach::Attachments::of(&db.plane("code").unwrap()).unwrap();
+    assert_eq!(
+        attached
+            .list()
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["notes"],
+        "the attachment must survive a rebuild of the plane's facts"
+    );
+    let props = db.plane("code").unwrap().properties().unwrap();
+    assert!(
+        props.contains_key("owner"),
+        "so must an operator's own property"
+    );
+    assert!(
+        !props.contains_key(dr_strange_core::compact::REBUILDING_PROP),
+        "and the marker still comes off"
+    );
+}
+
 // ---- P0 eval harness: fold-vs-full convergence -----------------------------
 
 /// A handler that resolves cross-file the way the real parsers do: a call

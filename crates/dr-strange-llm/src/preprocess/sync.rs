@@ -646,16 +646,28 @@ pub fn resync(
     run_id: &str,
 ) -> Result<SyncStats> {
     let routed = routed_facts(host, plugins, source, run_id)?;
-    if let Ok(plane) = db.plane(plane_name) {
-        let id = plane.id();
-        db.drop_plane(id)?;
-    }
-    // Created already carrying the marker, in the same call: a plane that is
-    // empty *and* silent about why is the window this closes, so there must
+    // The plane's own properties outlive its contents. An attachment is one —
+    // `plane.attach` records it here, not in a side table — and so is whatever
+    // `plane.set_props` wrote. They describe the plane rather than the facts
+    // in it, and dropping them silently detached every graph this one could
+    // reach. Read before the drop, and propagated rather than defaulted: a map
+    // this cannot read is not one it may discard.
+    let mut props = match db.plane(plane_name) {
+        Ok(plane) => {
+            let kept = plane.properties()?;
+            db.drop_plane(plane.id())?;
+            kept
+        }
+        Err(_) => Properties::new(),
+    };
+    // The marker goes on in the same call that creates the plane: a plane that
+    // is empty *and* silent about why is the window this closes, so there must
     // not be an instant where one exists without the other. Cleared below only
     // on success — a rebuild that dies halfway leaves a plane that really is
-    // incomplete, and the marker is then exactly the right thing to find.
-    let mut props = Properties::new();
+    // incomplete, and the marker is then exactly the right thing to find. The
+    // provenance and sync-point properties carried over above are rewritten by
+    // the rebuild before it clears the marker, so nothing reads them as this
+    // plane's while it still says it is being rebuilt.
     props.insert(
         dr_strange_core::compact::REBUILDING_PROP.into(),
         PropDesc::described(
