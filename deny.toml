@@ -5,9 +5,9 @@
 # why the check could not be wired up before it existed.
 
 [advisories]
-# An advisory with a fix is an upgrade, not an entry here. These two have none:
-# both are transitive, neither is reachable from a dependency this workspace
-# names, and both are noise until their own upstreams move.
+# An advisory with a fix is an upgrade, not an entry here. None of the entries
+# below has one: each is transitive, none is reachable from a dependency this
+# workspace names, and all are noise until their own upstreams move.
 ignore = [
     # heapless 0.7 → postcard → cranelift → wasmtime. Only compiled for targets
     # that need the polyfill at all, which does not include any we ship. Gone
@@ -17,17 +17,18 @@ ignore = [
     # Reached only when a digest is handed a PDF, and unmaintained is not the
     # same as vulnerable.
     "RUSTSEC-2026-0192",
-    # zip 8.6.0 → anydoc / calamine. One family, three IDs, all of them about
-    # `ZipArchive::extract()` / `ZipStreamReader::extract()` writing to the
-    # filesystem: SUID/SGID bits preserved on extraction (0367), a symlink
-    # whose target escapes the destination (0368), and Unix permissions
-    # applied through such a symlink (0369).
+    # zip 8.6.0 → anydoc / calamine. One family, four IDs, every one of them
+    # inside `ZipArchive::extract()` / `ZipStreamReader::extract()`: SUID/SGID
+    # bits preserved on extraction (0367), a symlink whose target escapes the
+    # destination (0368), Unix permissions applied through such a symlink
+    # (0369), and a symlink entry whose declared uncompressed size is used to
+    # reserve the target buffer, aborting the process (0429).
     #
     # Nothing here extracts. anydoc opens `ZipArchive<Cursor<&[u8]>>` and
     # pulls parts out with `by_name` (`src/package/archive.rs`) — that is how
     # a .docx or .xlsx is read, entirely in memory — and calamine calls no
     # extract-to-path either. The vulnerable functions are not reached from
-    # this workspace, and no filesystem write happens on this path at all.
+    # this workspace.
     #
     # The fix is zip >= 9.0.0, and every published anydoc (through 0.2.4)
     # requires `^8.6.0`, so there is nothing to upgrade to. Re-check when
@@ -35,6 +36,7 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 ]
 
 [licenses]
