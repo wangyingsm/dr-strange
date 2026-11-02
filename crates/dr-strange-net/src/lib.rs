@@ -52,6 +52,10 @@ impl FromStr for ProxyUrl {
 
     /// Validated against ureq's own grammar, so a bad value is refused where
     /// it was written rather than at the first request.
+    ///
+    /// Credentials are percent-encoded, so a literal `%` is written `%25`.
+    /// Both clients decode them exactly once, which is what makes one
+    /// configured value authenticate the same way whichever one dials.
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.is_empty() {
@@ -427,6 +431,55 @@ mod tests {
         // No scheme, and a password still redacted.
         let bare = "bob:s3cret@proxy.example:8080".parse::<ProxyUrl>().unwrap();
         assert_eq!(bare.to_string(), "bob:***@proxy.example:8080");
+    }
+
+    #[test]
+    fn a_percent_encoded_credential_is_decoded_once_for_the_wire() {
+        // The configured string keeps its encoding — that is the value handed
+        // to a client — and the client decodes it on the way to the proxy.
+        for (configured, user, pass) in [
+            ("http://alice:p%40ss@proxy.example:8080", "alice", "p@ss"),
+            ("http://alice:50%25@proxy.example:8080", "alice", "50%"),
+            ("http://alice:plain@proxy.example:8080", "alice", "plain"),
+            ("socks5://a%20b:p%40ss@proxy.example:1080", "a b", "p@ss"),
+        ] {
+            let p = configured.parse::<ProxyUrl>().unwrap();
+            assert_eq!(p.as_raw(), configured);
+            let u = p.into_ureq().unwrap();
+            assert_eq!(u.username(), Some(user), "{configured}");
+            assert_eq!(u.password(), Some(pass), "{configured}");
+        }
+    }
+
+    #[test]
+    fn a_credential_that_does_not_decode_is_refused_where_it_is_written() {
+        let err = "http://alice:%FF@proxy.example:8080"
+            .parse::<ProxyUrl>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a proxy URL"), "{err}");
+        // The password is still redacted in the refusal that quotes the value.
+        assert!(!err.contains("%FF"), "{err}");
+    }
+
+    #[test]
+    fn an_applied_proxy_brings_no_bypass_list_of_its_own() {
+        // The whole bypass decision is this crate's, taken in `proxy_for`
+        // before a proxy is built at all. A proxy that carried a list read
+        // from the environment would apply it a second time, over a policy
+        // that has already said yes.
+        let net = Network::through(
+            "http://proxy.example:8080".parse().unwrap(),
+            NoProxy::parse("*.internal"),
+        );
+        let bypassed = to("https", "wiki.internal", 443);
+        assert!(net.proxy_for(bypassed).is_none(), "ours bypasses it");
+        let proxied = to("https", "elsewhere.example", 443);
+        let p = net.proxy_for(proxied).unwrap().clone().into_ureq().unwrap();
+        for host in ["https://wiki.internal/", "https://elsewhere.example/"] {
+            let uri: ureq::http::Uri = host.parse().unwrap();
+            assert!(!p.is_no_proxy(&uri), "{host}");
+        }
     }
 
     #[test]
