@@ -78,7 +78,7 @@ url = "2"
 # semver and breakable in any *minor* release. A bump is therefore a decision to
 # re-check the guard, not something that happens during someone else's
 # `cargo update`. (`tls` was renamed `rustls` in 3.x.)
-ureq = { version = "=3.4.2", default-features = false, features = [
+ureq = { version = "=3.5.0", default-features = false, features = [
     "rustls",
     "socks-proxy",
 ] }
