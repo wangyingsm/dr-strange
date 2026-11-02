@@ -4,6 +4,53 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.3] - 2026-11-03
+
+A dependency release. The plugin sandbox takes four upstream security patches,
+and one of the clients under the proxy policy changed how it reads a
+password — the only thing here an operator may notice.
+
+### Security
+
+- **The plugin sandbox takes wasmtime 48.0.8.** RUSTSEC-2026-0420, -0422,
+  -0423 and -0424: a wasip3 UDP `send` able to reach an address only allowed
+  for receiving, a panic on typed functions with `i31` or `nullref` arguments,
+  cross-engine type confusion through host-created struct types with
+  supertypes, and unchecked memory use when borrowed resources move between
+  components. All four were published about four hours after 2.24.2's own CI
+  had run green, so the release that shipped them was green when it was cut.
+  That sandbox is the whole of the plugin security story — a plugin reaches
+  nothing but three host functions, rooted at the digested directory — so an
+  advisory with a fix is taken, not reasoned about. A patch bump inside the
+  pinned major; the guards it exists for (no filesystem, no sockets, fuel and
+  deadline) are unchanged and still asserted.
+- **A fourth zip advisory is recorded as unreachable.** RUSTSEC-2026-0429
+  joins the family `deny.toml` already documents: a symlink entry whose
+  declared uncompressed size sizes the target buffer, aborting the process
+  rather than panicking. Like its three siblings it lives inside
+  `ZipArchive::extract()`, and nothing here extracts — a `.docx` or `.xlsx` is
+  read in memory through `by_name`. The fix is zip >= 9.0.0 and every
+  published anydoc requires `^8.6.0`, so there is still nothing to upgrade to.
+
+### Changed
+
+- **A `%` in a proxy password now means what the URL says it means.** ureq
+  3.5.0 decodes proxy credentials exactly once, where 3.4.2 put the raw
+  substring of the URL on the wire. An operator whose proxy password contains
+  a percent sign was authenticating with the encoded text and must now write a
+  literal one as `%25`. This closes a divergence rather than opening one: the
+  MCP relay dials the same configured value through reqwest, which has always
+  decoded it, so one password could authenticate two different ways depending
+  on which client made the request. A credential that does not decode to UTF-8
+  is now refused where it is written instead of at the first request. The
+  bypass list is untouched: `NO_PROXY` is decided here, before a proxy is
+  built, and the proxy handed to a client carries no list of its own.
+- **One WebSocket stack instead of two.** tokio-tungstenite 0.24 → 0.29 meets
+  the 0.29 already in the tree, so the duplicate pair is gone. `scraper`
+  0.27 → 0.29, `rmcp` 3.6 → 3.8, `reqwest` 0.13.5, `ego-tree` 0.11.1 and
+  `ignore` 0.4.34 come with it, and the `socks` crate leaves the tree — ureq
+  3.5.0 dropped the dependency.
+
 ## [2.24.2] - 2026-10-30
 
 Three fixes around what a plane knows about itself. A rebuild replaces a
