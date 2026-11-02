@@ -86,7 +86,7 @@ ureq = { version = "=3.4.2", default-features = false, features = [
 # master's `/ws/wal`. `rustls-tls-webpki-roots` matches the rustls + ring
 # provider axum-server already installs for inbound TLS, so there's no second
 # TLS stack in the binary.
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # `StreamExt`/`SinkExt` for the `WebSocketStream` in `follow.rs` — a direct
 # dependency because a transitive crate's traits can't be named in `use`.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
