@@ -28,6 +28,7 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 - **Identity**: the string key `n{i}` is the primary key in every engine, so point lookups and edge loads use each engine's PK index (Kùzu only indexes the PK, so a non-PK lookup would be an unfair scan).
 - **Graph load** is nodes + edges through each engine's bulk path (drsg `bulk_load` / Kùzu `COPY` / SQLite `executemany` / Neo4j `UNWIND`) and includes building the adjacency/indexes that make expansion fast — insert + index, not insert alone. It's one combined throughput number (total rows / total load time). Where the CSV is parsed differs by engine and is not equalised: drsg parses inside its timer, SQLite's `executemany` consumes the row generator inside its timer, Kùzu's `COPY` reads and parses the file inside its timer, but Neo4j's rows are materialised in Python before the timer starts (only the Bolt round trips are timed), so the Neo4j load figure is slightly flattered relative to the other three.
 - **expand/traverse** resolve the start node by key first (as any client must), then expand; `traverse_2hop` is the distinct set reachable in 1–2 hops.
+- **upsert** is drsg-only — no other engine here is driven through an equivalent — and is three rows over one batch, all built before the timer starts, so the only difference between them is what the engine does about a key that is already taken. `upsert-fresh` writes into an empty plane (every key new); `upsert-skip` and `upsert-update` re-offer the batch the `load` row already wrote, so every key collides. They run last in the pass: `upsert-update` rewrites every node's properties, and measured before the read rows it would be their noise rather than its own number. Not comparable with `load`, which also times parsing and edges — comparable with each other, which is the question a re-ingest asks.
 - **Vector index build** times the index build alone, for every engine: loading the vectors happens before the timer starts (drsg inserts them into a separate plane, Kùzu `COPY`s, Neo4j `UNWIND`s). Earlier reports timed Neo4j's load together with its build; a Neo4j figure from before that fix understates Neo4j.
 - Each engine runs **alone** (no CPU contention), **pinned to the same P-core set** (`bench_pin` in the justfile; the Neo4j container gets the same `--cpuset-cpus`), for `bench_repeat` passes with a fresh database each pass — pinning removes the hybrid-CPU scheduling lottery, repeats make the residual noise visible as a recorded spread. Note the pin gives parallel index builds fewer threads than the unpinned machine has; the spread on a pinned run is the trustworthy part. drsg is a `--release` build.
 
@@ -117,6 +118,20 @@ grepped with word boundaries, finding every real call site plus some noise.
 
 - **Strong — low-latency point & graph queries.** The embedded KV design gives microsecond point lookups and single-digit-µs 1-hop expansion, on par with SQLite and orders of magnitude below the query-engine round-trips of Kùzu/Neo4j. That's the embedded, agent-in-the-loop sweet spot dr-strange is built for.
 - **Improved — bulk load.** A `bulk_load` fast path (contiguous id reservation, in-memory interning, and sorted batched writes) roughly doubled load throughput over the old per-record loop, moving drsg past Neo4j. It still trails Kùzu's columnar `COPY` and SQLite: drsg writes three sorted index entries per edge (record + two adjacency) where a columnar store appends — closing that further is an on-disk-layout change, not just faster inserts. Two later changes — handing owned buffers to the write batch instead of copying them, and a slice-by-8 CRC in place of one byte per round — added a further **24%** (343 → 426 K rows/s), measured as an interleaved old/new A/B in one window so the delta is the code rather than the hour of day.
+- **Known — a re-ingest costs what it writes.** Re-offering a batch the plane
+  already holds is three different prices. Skipping is the cheapest of the
+  three — the same point lookup per key a fresh insert already pays, and then
+  nothing written — though its margin over inserting is inside the noise on
+  anything but a quiet machine, so read it as the same class rather than as a
+  win. Updating is roughly **4× slower
+  than a fresh insert** — the same lookups, plus a read-modify-write per node
+  through the property path, which is where index membership and the change
+  feed are maintained and so cannot be batched the way the loader's writes
+  are. The ratio is the trustworthy part here: all three rows are measured in
+  one pass on one machine, so it survives the machine noise the absolute
+  figures do not. Fixing it would mean a batched property-update path, which
+  is an engine change and not yet worth it — a re-ingest is rarer than a load.
+
 - **Strong — vector-index build.** The hand-rolled HNSW originally built ~10× slower than Kùzu/Neo4j. Cached per-vector norms (every metric reduces to one dot), a multi-accumulator AVX2+FMA dot kernel, reused search scratch, and a parallel multi-threaded build (arch/01 §5) moved it from ~10× behind to ahead of both — by less over Neo4j than the table shows, since the Neo4j build cell was measured with the load included (see Methodology).
 - **Strong — vector query.** drsg's top-k latency is well below both Kùzu and Neo4j — the same cached-norm + SIMD path that sped up build also sharpened search, and the `ef` clamp keeps deep-k recall honest (see `measure_ef_multiplier_sweep` in the hnsw tests).
 

@@ -29,7 +29,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dr_strange_core::{BulkEdge, BulkNode, Database, Dir, Metric, PropDesc, PropValue, Properties};
+use dr_strange_core::{
+    BulkEdge, BulkNode, Database, Dir, Metric, OnConflict, PropDesc, PropValue, Properties,
+};
 use serde::Serialize;
 
 // A few labels / edge types so the catalog and colouring have variety; kept
@@ -380,6 +382,36 @@ fn parse_vector(s: &str) -> Vec<f32> {
     s.split_whitespace().map(|t| t.parse().unwrap()).collect()
 }
 
+/// The node CSV as parallel owned columns — `BulkNode` borrows its key and
+/// labels, so they have to outlive the batch that points at them.
+struct NodeColumns {
+    keys: Vec<String>,
+    labels: Vec<String>,
+    props: Vec<Properties>,
+}
+
+fn parse_nodes(lines: &[String]) -> NodeColumns {
+    let n = lines.len().saturating_sub(1);
+    let mut cols = NodeColumns {
+        keys: Vec::with_capacity(n),
+        labels: Vec::with_capacity(n),
+        props: Vec::with_capacity(n),
+    };
+    for line in lines.iter().skip(1) {
+        let mut f = line.splitn(5, ',');
+        let _id = f.next().unwrap();
+        cols.keys.push(f.next().unwrap().to_string());
+        cols.labels.push(f.next().unwrap().to_string());
+        let name = f.next().unwrap();
+        let value: i64 = f.next().unwrap().parse().unwrap();
+        let mut props: Properties = BTreeMap::new();
+        props.insert("name".into(), prop(PropValue::Str(name.into())));
+        props.insert("value".into(), prop(PropValue::Int(value)));
+        cols.props.push(props);
+    }
+    cols
+}
+
 /// One full measurement pass: fresh database, load, then every query set.
 /// Nodes and edges through the bulk fast path, in one write transaction.
 ///
@@ -397,21 +429,11 @@ fn time_bulk_load(db: &Database, data: &Path, engine: &str) -> Result<OpResult> 
     {
         // Owned buffers keep the &str borrows in BulkNode/BulkEdge alive for
         // the bulk_load call.
-        let mut nkeys: Vec<String> = Vec::with_capacity(n_nodes as usize);
-        let mut nlabels: Vec<String> = Vec::with_capacity(n_nodes as usize);
-        let mut nprops: Vec<Properties> = Vec::with_capacity(n_nodes as usize);
-        for line in node_lines.iter().skip(1) {
-            let mut f = line.splitn(5, ',');
-            let _id = f.next().unwrap();
-            nkeys.push(f.next().unwrap().to_string());
-            nlabels.push(f.next().unwrap().to_string());
-            let name = f.next().unwrap();
-            let value: i64 = f.next().unwrap().parse().unwrap();
-            let mut props: Properties = BTreeMap::new();
-            props.insert("name".into(), prop(PropValue::Str(name.into())));
-            props.insert("value".into(), prop(PropValue::Int(value)));
-            nprops.push(props);
-        }
+        let NodeColumns {
+            keys: nkeys,
+            labels: nlabels,
+            props: nprops,
+        } = parse_nodes(&node_lines);
         let label_slots: Vec<[&str; 1]> = nlabels.iter().map(|l| [l.as_str()]).collect();
 
         let mut esrc: Vec<String> = Vec::with_capacity(n_edges as usize);
@@ -641,8 +663,68 @@ fn run_pass(data: &Path, db_path: &Path, k: u64, recall_queries: u64) -> Result<
     }
 
     results.extend(time_vectors(&db, data, k, recall_queries, &engine)?);
+    // Last in the pass, and deliberately: `upsert-update` rewrites every
+    // node's properties, which grows the WAL. Measured before the reads, it
+    // would be their noise rather than its own number.
+    results.extend(time_upsert(&db, data, &engine)?);
 
     Ok(results)
+}
+
+/// What a re-ingest costs. Three rows over the same batch, all prepared
+/// outside the timer, so the only difference between them is what the engine
+/// does about keys that are already there:
+///
+/// - `upsert-fresh` — into an empty plane, every key new. The baseline.
+/// - `upsert-skip` — every key collides and is kept: one point lookup each,
+///   no writes.
+/// - `upsert-update` — every key collides and is revised: the same lookups,
+///   plus a read-modify-write per node through the property path.
+///
+/// Not comparable with `load` above, which times parsing and edges too. These
+/// three are comparable with each other, which is the question — a re-ingest
+/// of data already held is the case the policy exists for.
+fn time_upsert(db: &Database, data: &Path, engine: &str) -> Result<Vec<OpResult>> {
+    let node_lines = read_lines(&data.join("nodes.csv"))?;
+    let cols = parse_nodes(&node_lines);
+    let n = cols.keys.len() as u64;
+    let label_slots: Vec<[&str; 1]> = cols.labels.iter().map(|l| [l.as_str()]).collect();
+
+    let batch = || -> Vec<BulkNode<'_>> {
+        cols.keys
+            .iter()
+            .zip(&label_slots)
+            .zip(cols.props.iter().cloned())
+            .map(|((k, ls), props)| BulkNode {
+                external_key: Some(k),
+                labels: ls,
+                props,
+            })
+            .collect()
+    };
+
+    let run = |plane_name: &str, policy: OnConflict, op: &str| -> Result<OpResult> {
+        let plane = db.plane(plane_name)?;
+        let nodes = batch();
+        let t = Instant::now();
+        let mut txn = plane.write()?;
+        txn.bulk_upsert(nodes, Vec::new(), policy)?;
+        txn.commit()?;
+        Ok(throughput_result(
+            engine,
+            op,
+            n,
+            t.elapsed().as_secs_f64() * 1000.0,
+        ))
+    };
+
+    // A plane of its own for the baseline: `startup` already holds these keys,
+    // which is precisely what the other two rows are measuring.
+    db.create_plane("upsert_fresh", Properties::new())?;
+    let fresh = run("upsert_fresh", OnConflict::Error, "upsert-fresh")?;
+    let skip = run("startup", OnConflict::Skip, "upsert-skip")?;
+    let update = run("startup", OnConflict::Update, "upsert-update")?;
+    Ok(vec![fresh, skip, update])
 }
 
 /// Median of a small sample (by value; passes are few, cloning is fine).
