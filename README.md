@@ -165,6 +165,20 @@ script run as a block rather than piped to `iex`:
 PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
 ```
 
+**From a package manager.** If you already have one of these toolchains, the
+same CLI arrives without the installer:
+
+```console
+$ npm install -g @yingge/drsg   # or `npx @yingge/drsg` to run it without installing
+$ cargo install drsg
+```
+
+npm ships the same prebuilt binary the installer downloads, dashboard embedded.
+`cargo install` compiles from source instead, and that build has no
+[bun](https://bun.sh) in it, so the dashboard is the placeholder page — the
+CLI, the MCP server and the JSON-RPC backend are complete either way. The
+in-process Python binding is a separate package: `pip install drsg-embedded`.
+
 **On a slow network.** GitHub serves the releases, and from some networks that
 is reachable but slow enough to look like a hang. `--mirror <base-url>`
 (`DRSG_MIRROR`, `-Mirror` on Windows) names a mirror holding the same layout:

@@ -157,6 +157,19 @@ PS> irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/i
 PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.ps1))) -Bin drsg-mcp
 ```
 
+**从包管理器安装。** 如果你手上已经有下面任意一种工具链，同一个 CLI 无需安装脚本
+即可获得：
+
+```console
+$ npm install -g @yingge/drsg   # 或用 `npx @yingge/drsg` 直接运行，不必安装
+$ cargo install drsg
+```
+
+npm 分发的就是安装脚本所下载的那个预编译二进制，控制台已嵌入其中。`cargo install`
+则改为从源码编译，而那次构建里没有 [bun](https://bun.sh)，因此控制台会是那张占位
+页面——无论走哪一条路，CLI、MCP 服务器与 JSON-RPC 后端都是完整的。进程内的 Python
+绑定是另一个包：`pip install drsg-embedded`。
+
 **网络较慢时。** 发行版由 GitHub 提供，而从某些网络访问它虽然通，却慢到看起来像
 卡死。`--mirror <base-url>`（`DRSG_MIRROR`，Windows 上为 `-Mirror`）用于指定一个
 布局相同的镜像：仍然先试 GitHub，当这一次尝试失败或龟速时，再由镜像接手。无论由
