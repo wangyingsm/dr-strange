@@ -1,6 +1,6 @@
 {
   "name": "drsg",
-  "version": "2.24.3",
+  "version": "2.24.4",
   "description": "TypeScript client for dr-strange (drsg serve JSON-RPC)",
   "type": "module",
   "license": "MIT",
