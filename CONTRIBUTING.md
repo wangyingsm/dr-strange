@@ -19,6 +19,7 @@ taste. Where a rule exists because something once broke, the reason is given
 | MCP server | `crates/dr-strange-mcp` | The MCP surface over the engine. |
 | Web | `crates/dr-strange-web` | `drsg serve`: JSON-RPC 2.0 backend, dashboard, change feed. Frontend in `crates/dr-strange-web/frontend` (Svelte 5 + Vite, built with bun). |
 | LLM | `crates/dr-strange-llm` | Embeddings, digestion, entity resolution, `ask`. |
+| Network | `crates/dr-strange-net` | Outbound proxy policy, shared by every crate that makes a request: the LLM client, the web fetcher, the MCP relay. |
 | Logging | `crates/dr-strange-log` | Tracing setup for the binaries. |
 | SDKs | `sdk/{typescript,python,go,java,c,zig}` | Six clients over the JSON-RPC surface. |
 | Docs | `docs/en`, `docs/zh` | The mdBook, in two editions. |
@@ -162,7 +163,16 @@ it prints the soft schema the plane actually holds.
 
 ## Maintainers
 
-Module ownership is being assigned; until it is recorded here, open an issue
-or a PR and it will be routed. Contributions are accepted under the same dual
-licence as the project ([MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option).
+Every module above is maintained by [@wangyingsm](https://github.com/wangyingsm).
+One name for all of them is a statement of fact rather than a structure: it is
+who reviews and merges today, and saying so is more use to a contributor than
+an empty table would be.
+
+That is meant to change. A module here is handed over when someone has sent
+enough changes to it to have opinions about where it should go — so the way
+to become its maintainer is to send those changes, not to ask first. Parser
+plugins are the easiest place to start, and they live in their own
+repository: see [`extensions`](https://github.com/wangyingsm/dr-strange-extension).
+
+Contributions are accepted under the same dual licence as the project
+([MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option).
