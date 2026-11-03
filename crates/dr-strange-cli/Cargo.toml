@@ -30,12 +30,12 @@ mimalloc = { workspace = true }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 dr-strange-core = { workspace = true, features = ["json"] }
-dr-strange-llm = { path = "../dr-strange-llm", optional = true }
-dr-strange-web = { path = "../dr-strange-web" }
+dr-strange-llm = { workspace = true, optional = true }
+dr-strange-web = { workspace = true }
 # `snippet`, `grep` and `traverse` were written for the MCP surface and live
 # there; the CLI calls the same functions rather than growing a second copy to
 # drift from. No new weight: `dr-strange-web` above already pulls this in.
-dr-strange-mcp = { path = "../dr-strange-mcp", default-features = false }
+dr-strange-mcp = { workspace = true }
 dr-strange-log.workspace = true
 dr-strange-net.workspace = true
 dr-strange-parser.workspace = true

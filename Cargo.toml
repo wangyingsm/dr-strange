@@ -38,16 +38,27 @@ homepage = "https://github.com/wangyingsm/dr-strange"
 too_many_lines = "warn"
 
 [workspace.dependencies]
+# Every intra-workspace dependency is declared here, with a version beside the
+# path: `cargo publish` strips the path and resolves the version from the
+# registry, and refuses a manifest that gives it only a path. One place, so a
+# release cannot ship a crate that depends on the previous one — `just
+# bump-version` rewrites these with the package version and checks it did.
+#
 # default-features off so each member picks the storage backend (redb/native);
 # members that just need core's types (e.g. the parser) get a backend-free core.
-dr-strange-core = { path = "crates/dr-strange-core", default-features = false }
-dr-strange-log = { path = "crates/dr-strange-log" }
+dr-strange-core = { path = "crates/dr-strange-core", version = "2.24.3", default-features = false }
+dr-strange-log = { path = "crates/dr-strange-log", version = "2.24.3" }
+dr-strange-llm = { path = "crates/dr-strange-llm", version = "2.24.3" }
+# `default-features = false` for the reason core's line gives: both consumers
+# forward the backend choice rather than letting this crate's default decide.
+dr-strange-mcp = { path = "crates/dr-strange-mcp", version = "2.24.3", default-features = false }
+dr-strange-web = { path = "crates/dr-strange-web", version = "2.24.3" }
 # Outbound proxy policy, shared by every crate that makes an outbound request:
 # the LLM client, the web fetcher and the MCP relay. Its own crate because the
 # relay reaching into `dr-strange-llm` for it said something untrue about what
 # the policy is for.
-dr-strange-net = { path = "crates/dr-strange-net" }
-dr-strange-parser = { path = "crates/dr-strange-parser" }
+dr-strange-net = { path = "crates/dr-strange-net", version = "2.24.3" }
+dr-strange-parser = { path = "crates/dr-strange-parser", version = "2.24.3" }
 # The workspace-standard hash map/set (fast keyed hashing, DoS-resistant via
 # per-process random seed): use ahash::{AHashMap, AHashSet} instead of std's
 # SipHash-backed collections everywhere.

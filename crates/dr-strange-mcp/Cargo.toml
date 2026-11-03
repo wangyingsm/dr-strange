@@ -26,7 +26,7 @@ dr-strange-core = { workspace = true, features = ["json"] }
 # Non-optional: the rmcp #[tool_router] macro doesn't compose with #[cfg] on
 # individual tool methods, and the MCP server exists to be driven by LLM
 # agents, so the `digest` tool (arch/07) is always compiled in.
-dr-strange-llm = { path = "../dr-strange-llm" }
+dr-strange-llm = { workspace = true }
 dr-strange-log.workspace = true
 # The proxy decision for the probe and the relay: loopback goes direct, so a
 # proxy set for the outside world cannot swallow the declared server.
