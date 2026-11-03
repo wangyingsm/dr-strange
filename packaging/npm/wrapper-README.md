@@ -1,4 +1,4 @@
-# drsg
+# @yingge/drsg
 
 A code-intelligence graph for coding agents. Digests a repository into a
 resolved call graph and answers *who calls this*, *what would a change reach*,
@@ -6,7 +6,7 @@ resolved call graph and answers *who calls this*, *what would a change reach*,
 trip each, with no model in the loop.
 
 ```console
-$ npx drsg init     # digest this repository, serve it, write the MCP config
+$ npx @yingge/drsg init   # digest, serve, and write the MCP config
 ```
 
 Your agent then has `context`, `impact`, `trace`, `wire`, `grep` and the rest.
@@ -15,7 +15,8 @@ seconds, and answering "who calls this and what would a change reach" costs a
 median 925 tokens against 53,720 for grepping the name and reading the files
 that matched.
 
-Installing `drsg` pulls exactly one prebuilt binary, chosen by your platform:
+The installed command is `drsg`. Installing the package pulls exactly one
+prebuilt binary, chosen by your platform:
 `drsg-linux-x64`, `drsg-linux-arm64`, `drsg-darwin-x64`, `drsg-darwin-arm64`
 or `drsg-win32-x64`.
 

@@ -40,9 +40,9 @@ publishes to GHCR is the one honest entry today.
 
 That image serves MCP over HTTP; it does not give a client the
 repository-local `drsg init` flow, which is how drsg is actually meant to be
-used. **npm distribution (`npx drsg`) is what makes this listing match the
-product**, and it is already on the Q4 plan — redo the `packages` block as
-`npm` when it lands, and the entry stops being a compromise.
+used. **npm distribution (`npx @yingge/drsg`) is what makes this listing
+match the product**, and it is already on the Q4 plan — redo the `packages`
+block as `npm` when it lands, and the entry stops being a compromise.
 
 ## 2. Smithery, Glama, mcp.so
 

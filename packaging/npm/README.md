@@ -1,7 +1,7 @@
 # Publishing drsg to npm
 
-`npx drsg` is the install path most developers already have, and the one the
-official MCP registry wants to see — the registry fetches servers through npm,
+`npx @yingge/drsg` is the install path most developers already have, and the
+one the official MCP registry wants to see — the registry fetches through npm,
 pypi, oci, nuget or mcpb, and drsg currently offers it only an OCI image that
 cannot do the repository-local `drsg init` flow. npm is what makes that
 listing describe the product. See `../mcp-registry/README.md`.
@@ -10,9 +10,9 @@ listing describe the product. See `../mcp-registry/README.md`.
 
 Six packages, the way esbuild and swc do it:
 
-- **`drsg`** — a few kilobytes: a `bin` wrapper and nothing else. Its
+- **`@yingge/drsg`** — a few kilobytes: a `bin` wrapper and nothing else. Its
   `optionalDependencies` name all five platform packages, and npm installs the
-  one whose `os`/`cpu` match.
+  one whose `os`/`cpu` match. It installs the command as `drsg`.
 - **`drsg-linux-x64`**, **`drsg-linux-arm64`**, **`drsg-darwin-x64`**,
   **`drsg-darwin-arm64`**, **`drsg-win32-x64`** — one prebuilt binary each,
   50–65 MB.
@@ -38,8 +38,8 @@ directory. The script writes `packaging/npm/dist/` and publishes nothing.
 
 Needs an npm account with publish rights and `npm login`. **Platform packages
 first, wrapper last** — the wrapper's `optionalDependencies` pin the exact
-version, so publishing it first leaves a window where `npm install drsg`
-resolves to packages that do not exist.
+version, so publishing it first leaves a window where installing it resolves
+to packages that do not exist.
 
 ```console
 $ for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
@@ -51,22 +51,34 @@ $ (cd packaging/npm/dist/drsg && npm publish --access public)
 Then check the thing a reader will actually run:
 
 ```console
-$ npx --yes drsg@2.21.0 --version
+$ npx --yes @yingge/drsg@2.21.0 --version
 ```
 
 ## Names
 
-`drsg` and all five platform names were unregistered as of 2026-10-17;
-`dr-strange` is taken by an unrelated package and is not an option. Claiming
-`drsg` with a first publish is itself worth doing early.
+The five platform names published as they are. **The bare name `drsg` cannot
+be had**: npm answers a first publish with
+
+```
+403 Forbidden - PUT https://registry.npmjs.org/drsg
+  Package name too similar to existing package arg
+```
+
+which is its typosquatting filter, not a permission or a token problem — the
+five `drsg-*` names went through on the same token seconds earlier. The
+wrapper is therefore scoped, `@yingge/drsg`, which the filter does not apply
+to. `dr-strange` is taken by an unrelated package and was never an option.
+
+The `bin` field maps the command independently of the package name, so this
+costs the install string and nothing else: the binary is still `drsg`.
 
 ## After the first publish
 
 Three things become true, and none of them is automatic:
 
 1. **The README should say so.** Until the package exists, neither edition
-   advertises `npx drsg` — a README promising a command that fails is worse
-   than one that omits it.
+   advertises `npx @yingge/drsg` — a README promising a command that fails is
+   worse than one that omits it.
 2. **The MCP registry entry should move to `registryType: "npm"`**, replacing
    the OCI compromise.
 3. **Every release publishes the six packages automatically.** `release.yml`

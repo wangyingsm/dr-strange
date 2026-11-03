@@ -209,14 +209,19 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           # A hyphen is semver's pre-release marker, as the release job reads
-          # it: such a version must not become what `npm install drsg` gets.
+          # it: such a version must not become what a plain install gets.
           tag=latest
           case "$version" in *-*) tag=next ;; esac
           # The wrapper goes last: its optionalDependencies pin this exact
           # version, so publishing it first leaves a window where installing
           # drsg resolves to packages that do not exist yet.
-          for pkg in drsg-linux-x64 drsg-linux-arm64 drsg-darwin-x64 \
-                     drsg-darwin-arm64 drsg-win32-x64 drsg; do
+          #
+          # `dir:name` where the two differ — npm refuses the bare name `drsg`
+          # as too similar to `arg`, so the wrapper publishes under a scope.
+          for entry in drsg-linux-x64 drsg-linux-arm64 drsg-darwin-x64 \
+                       drsg-darwin-arm64 drsg-win32-x64 drsg:@yingge/drsg; do
+            dir="${entry%%:*}"
+            pkg="${entry#*:}"
             # Re-running a release must not fail on what it already did. Only
             # a real 404 means "not published": any other failure is the
             # registry being unreachable, and guessing "publish" there would
@@ -229,7 +234,7 @@ jobs:
               echo "could not ask the registry about $pkg@$version" >&2
               exit 1
             fi
-            (cd "packaging/npm/dist/$pkg" \
+            (cd "packaging/npm/dist/$dir" \
               && npm publish --access public --provenance --tag "$tag")
           done
 

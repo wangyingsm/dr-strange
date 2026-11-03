@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Lay out the npm packages for a release, ready to publish.
 
-`npx drsg` is the install path developers already have, and the one the
-official MCP registry wants to see. The binary reaches them the way esbuild's
-does: one wrapper package, `drsg`, with an `optionalDependencies` entry per
+`npx @yingge/drsg` is the install path developers already have, and the one
+the official MCP registry wants to see. The binary reaches them the way
+esbuild's does: one wrapper package with an `optionalDependencies` entry per
 platform, each holding a single prebuilt binary and declaring its `os`/`cpu`.
 npm installs only the one that matches.
 
@@ -46,6 +46,11 @@ from pathlib import Path
 
 REPO = "wangyingsm/dr-strange"
 ROOT = Path(__file__).resolve().parent
+
+# npm refuses the bare name `drsg` as too similar to the existing `arg`, so
+# the wrapper is scoped. The five platform names below were accepted as they
+# are, and the installed command stays `drsg` either way.
+WRAPPER = "@yingge/drsg"
 
 # The release's target triples, and the `os`/`cpu` npm selects them by.
 PLATFORMS = [
@@ -142,12 +147,12 @@ def write_platform(out: Path, version: str, triple: str, slug: str,
 
 
 def write_wrapper(out: Path, version: str, packages: list[str]) -> None:
-    d = out / "drsg"
+    d = out / WRAPPER.rpartition("/")[2]
     if d.exists():
         shutil.rmtree(d)
     (d / "bin").mkdir(parents=True)
     (d / "package.json").write_text(json.dumps({
-        "name": "drsg",
+        "name": WRAPPER,
         "version": version,
         "description": DESCRIPTION,
         "license": "MIT OR Apache-2.0",
@@ -183,13 +188,14 @@ def main() -> int:
         ]
     write_wrapper(out, args.version, names)
 
+    wrapper = WRAPPER.rpartition("/")[2]
     print(f"npm packages for {args.version} in {out}:")
-    for n in names + ["drsg"]:
+    for n, label in [(n, n) for n in names] + [(wrapper, WRAPPER)]:
         size = sum(f.stat().st_size for f in (out / n).rglob("*") if f.is_file())
-        print(f"  {n:<20} {size / 1_048_576:6.1f} MB")
-    print("\npublish the platform packages first, then drsg:")
+        print(f"  {label:<20} {size / 1_048_576:6.1f} MB")
+    print(f"\npublish the platform packages first, then {WRAPPER}:")
     print("  " + " && ".join(f"(cd {out}/{n} && npm publish --access public)" for n in names))
-    print(f"  (cd {out}/drsg && npm publish --access public)")
+    print(f"  (cd {out}/{wrapper} && npm publish --access public)")
     return 0
 
 
