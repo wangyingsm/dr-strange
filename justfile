@@ -125,7 +125,7 @@ drsg_bin := env_var_or_default("CARGO_TARGET_DIR", justfile_directory() / "targe
 # change the other in the same commit.
 #
 # Everything CI runs, locally: run this before pushing.
-gate: gate-rust gate-features gate-frontend gate-docs gate-hooks gate-sdk gate-supply
+gate: gate-rust gate-features gate-frontend gate-docs gate-hooks gate-sdk gate-supply gate-publish
     @echo "gate: every CI job passed locally"
 
 # CI's `hooks` job: the usage-report hook's watermark handling, pinned by the
@@ -184,6 +184,34 @@ gate-features:
     RUSTFLAGS="-D warnings" cargo test -p dr-strange-llm --no-default-features
     RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-mcp --no-default-features --features redb-backend --all-targets
     RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-web --no-default-features --features redb-backend --all-targets
+
+# A build script that writes into the source tree passes every local build and
+# fails `cargo publish`, which builds the extracted package and then diffs the
+# directory. That is how `dr-strange-web` reached the registry's door with a
+# `build.rs` backfilling `frontend/dist/` and six crates already published.
+#
+# Checked in a detached worktree, because the bug only shows where the build
+# output is absent and a developer's tree always has it. The target directory
+# is shared, so this compiles the workspace crates and nothing else.
+gate-publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkgs=$(find crates -name build.rs -printf '%h\n' | xargs -r -n1 basename \
+           | sed 's/^dr-strange-cli$/drsg/' | sed 's/^/-p /' | tr '\n' ' ')
+    test -n "$pkgs" || { echo "publish: no build script to check"; exit 0; }
+    tree=$(mktemp -d)
+    trap 'git worktree remove --force "$tree" >/dev/null 2>&1 || true' EXIT
+    git worktree add --detach --quiet "$tree" HEAD
+    before=$(cd "$tree" && find crates -type f | sort)
+    (cd "$tree" && CARGO_TARGET_DIR="{{justfile_directory()}}/target" \
+        cargo build --quiet $pkgs)
+    after=$(cd "$tree" && find crates -type f | sort)
+    if [ "$before" != "$after" ]; then
+        echo "a build script wrote into the source tree:" >&2
+        diff <(echo "$before") <(echo "$after") >&2 || true
+        exit 1
+    fi
+    echo "publish: no build script wrote into the source tree"
 
 # `bun install --frozen-lockfile`, as CI does — the gate must fail, not
 # silently re-resolve, when package.json and the committed bun.lock disagree.

@@ -331,6 +331,21 @@ jobs:
         run: cargo deny check
       - name: Unused dependencies
         run: cargo machete
+      # A build script writing into the source tree builds fine everywhere and
+      # fails only at `cargo publish`, which diffs the package directory after
+      # building it — after earlier crates in the release are already up and
+      # cannot be taken back. The checkout here has no build output in it,
+      # which is the condition that exposes it.
+      - name: No build script writes into the source tree
+        run: |
+          before=$(find crates -type f | sort)
+          cargo build --quiet -p dr-strange-web
+          after=$(find crates -type f | sort)
+          if [ "$before" != "$after" ]; then
+            echo "a build script wrote into the source tree:" >&2
+            diff <(echo "$before") <(echo "$after") >&2 || true
+            exit 1
+          fi
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Lint
         run: uv run --locked --with ruff ruff check .
