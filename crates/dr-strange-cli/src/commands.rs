@@ -4358,11 +4358,9 @@ enum Ref {
 /// What [`import`] does when an incoming node's external key already exists in
 /// the target plane.
 ///
-/// This needs a policy at all because `bulk_load` is a trusting fast path: it
-/// rejects duplicates *within* a batch but does not check keys already in the
-/// plane. Unguarded, a re-import therefore wrote a second node under the same
-/// key — reachable by scan, invisible to `key(n) = …` (which resolves through
-/// the index to exactly one), and reported healthy by `drsg check`.
+/// The clap surface over the engine's own [`dr_strange_core::OnConflict`],
+/// which decides and applies all three. Kept separate only so `clap` stays
+/// out of the engine's dependencies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnConflict {
     /// Write nothing and report the offending keys. The default: a colliding
@@ -4375,6 +4373,16 @@ pub enum OnConflict {
     /// its labels when the line carries a non-empty `labels`. Properties the
     /// line omits are left alone — soft schema, so absence is not a deletion.
     Update,
+}
+
+impl From<OnConflict> for dr_strange_core::OnConflict {
+    fn from(c: OnConflict) -> Self {
+        match c {
+            OnConflict::Error => Self::Error,
+            OnConflict::Skip => Self::Skip,
+            OnConflict::Update => Self::Update,
+        }
+    }
 }
 
 /// Imports JSONL: each line is a node `{"id"?, "labels":[…], "external_key"?,
@@ -4455,12 +4463,12 @@ fn read_jsonl(reader: impl BufRead) -> Result<Batch> {
 /// collides on every line, and a thousand-key error helps nobody.
 fn refuse_conflicts(
     keys: &[Option<String>],
-    conflicted: &AHashMap<usize, NodeId>,
+    conflicted: &[(usize, NodeId)],
     plane_name: &str,
 ) -> Result<()> {
     let mut names: Vec<&str> = conflicted
-        .keys()
-        .filter_map(|&i| keys[i].as_deref())
+        .iter()
+        .filter_map(|&(i, _)| keys[i].as_deref())
         .collect();
     names.sort_unstable();
     let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
@@ -4497,71 +4505,53 @@ pub fn import(
 
     let mut txn = p.write()?;
 
-    // Which incoming keys already exist. Done under the open write transaction
-    // so no other writer can land between the check and the load.
-    let mut conflicted: AHashMap<usize, NodeId> = AHashMap::new();
-    for (i, key) in keys.iter().enumerate() {
-        if let Some(key) = key
-            && let Some(node) = p.node_by_key(key)?
-        {
-            conflicted.insert(i, node.id);
+    // `Error` is settled before anything is written. The engine refuses on the
+    // first collision it meets, which is the right answer but a poor message:
+    // a refusal is far more use when it names every key the file would have
+    // trodden on. Scanned under the open write transaction, so no other writer
+    // can land between the check and the load.
+    if on_conflict == OnConflict::Error {
+        let mut conflicted: Vec<(usize, NodeId)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(key) = key
+                && let Some(node) = p.node_by_key(key)?
+            {
+                conflicted.push((i, node.id));
+            }
+        }
+        if !conflicted.is_empty() {
+            refuse_conflicts(&keys, &conflicted, plane_name)?;
         }
     }
-    if on_conflict == OnConflict::Error && !conflicted.is_empty() {
-        refuse_conflicts(&keys, &conflicted, plane_name)?;
-    }
 
-    // Node phase (fast path): one batch, contiguous ids. Conflicting lines are
-    // held back so `bulk_load` keeps its fresh-keys precondition.
+    // Node phase (fast path): one batch, the engine deciding what to do with a
+    // key a live node already owns and reporting what each line resolved to.
     let label_refs: Vec<Vec<&str>> = labels
         .iter()
         .map(|ls| ls.iter().map(String::as_str).collect())
         .collect();
-    let kept: Vec<usize> = (0..keys.len())
-        .filter(|i| !conflicted.contains_key(i))
-        .collect();
-    let bnodes: Vec<BulkNode> = kept
-        .iter()
-        .map(|&i| BulkNode {
+    let bnodes: Vec<BulkNode> = (0..keys.len())
+        .map(|i| BulkNode {
             external_key: keys[i].as_deref(),
             labels: &label_refs[i],
             props: std::mem::take(&mut node_props[i]),
         })
         .collect();
-    let n_nodes = bnodes.len() as u64;
-    let stats = txn.bulk_load(bnodes, Vec::new())?;
+    let stats = txn.bulk_upsert(bnodes, Vec::new(), on_conflict.into())?;
+    let n_nodes = stats.nodes;
 
     // Maps from this batch's identifiers to the node ids edges must resolve to.
+    // A skipped or updated line names a real node too, so edges in this file
+    // reach the one already in the plane rather than failing — which is why
+    // this reads the engine's positional resolution rather than a range.
     let mut old_to_new = AHashMap::new();
     let mut key_to_new = AHashMap::new();
-    for (n, &i) in kept.iter().enumerate() {
-        let id = NodeId(stats.node_start + n as u64);
+    for (i, id) in stats.node_ids.iter().copied().enumerate() {
         if let Some(o) = old_ids[i] {
             old_to_new.insert(o, id);
         }
         if let Some(k) = &keys[i] {
             key_to_new.insert(k.clone(), id);
-        }
-    }
-    // A skipped or updated line still names a real node, so edges in this file
-    // resolve to the one already in the plane rather than failing.
-    for (&i, &id) in &conflicted {
-        if let Some(o) = old_ids[i] {
-            old_to_new.insert(o, id);
-        }
-        if let Some(k) = &keys[i] {
-            key_to_new.insert(k.clone(), id);
-        }
-    }
-    if on_conflict == OnConflict::Update {
-        for (&i, &id) in &conflicted {
-            for (key, prop) in std::mem::take(&mut node_props[i]) {
-                txn.set_prop(id, &key, prop)?;
-            }
-            if !labels[i].is_empty() {
-                let ls: Vec<&str> = labels[i].iter().map(String::as_str).collect();
-                txn.set_labels(id, &ls)?;
-            }
         }
     }
 
@@ -4582,8 +4572,8 @@ pub fn import(
     // silent "imported 2 nodes" after skipping both is how you end up trusting
     // an import that did nothing.
     let (verb, n_conflicted) = match on_conflict {
-        OnConflict::Skip => ("skipped", conflicted.len()),
-        OnConflict::Update => ("updated", conflicted.len()),
+        OnConflict::Skip => ("skipped", stats.existing.len()),
+        OnConflict::Update => ("updated", stats.existing.len()),
         OnConflict::Error => ("skipped", 0),
     };
     tracing::info!(
