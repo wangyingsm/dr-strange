@@ -41,7 +41,7 @@ def _free_port() -> int:
 def base_url():
     binary = _find_binary()
     if not binary:
-        pytest.skip("drsg binary not found; run `cargo build -p dr-strange-cli`")
+        pytest.skip("drsg binary not found; run `cargo build -p drsg`")
     port = _free_port()
     tmp = tempfile.mkdtemp()
     db = pathlib.Path(tmp) / "sdk-test.drsg"

@@ -183,7 +183,7 @@ updated with it. A build already current is told so and nothing is downloaded.
 Alternatives: the container image `ghcr.io/wangyingsm/dr-strange:latest`, the
 archives and checksums on the [releases
 page](https://github.com/wangyingsm/dr-strange/releases), or from source with a
-[Rust toolchain](https://rustup.rs) — `cargo build --release -p dr-strange-cli`,
+[Rust toolchain](https://rustup.rs) — `cargo build --release -p drsg`,
 after `just web-build` ([bun](https://bun.sh)), since the dashboard is embedded
 at compile time and the binary otherwise ships a placeholder page.
 

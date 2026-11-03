@@ -97,7 +97,7 @@ class ClientE2ETest {
 
     @Test
     void crudRoundtrip() throws Exception {
-        assumeTrue(baseUrl != null, "drsg binary not found; run `cargo build -p dr-strange-cli`");
+        assumeTrue(baseUrl != null, "drsg binary not found; run `cargo build -p drsg`");
         try (Drsg db = new Drsg(baseUrl, TOKEN)) {
             db.planeCreate(Drsg.PlaneCreateParams.of("crud"));
             Drsg.DbStats before = db.dbStats();

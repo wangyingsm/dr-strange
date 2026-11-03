@@ -15,7 +15,7 @@ taste. Where a rule exists because something once broke, the reason is given
 |---|---|---|
 | Engine | `crates/dr-strange-core` | Storage, cache, computation, the public API. Both backends live here behind features. |
 | Query language | `crates/dr-strange-parser` | The openCypher subset: text in, a core plan out. |
-| CLI | `crates/dr-strange-cli` | `drsg` itself — `init`, `digest`, `serve`, the agent verbs. |
+| CLI | `crates/dr-strange-cli` | `drsg` itself — `init`, `digest`, `serve`, the agent verbs. The package is `drsg`, so `cargo` selects it as `-p drsg`. |
 | MCP server | `crates/dr-strange-mcp` | The MCP surface over the engine. |
 | Web | `crates/dr-strange-web` | `drsg serve`: JSON-RPC 2.0 backend, dashboard, change feed. Frontend in `crates/dr-strange-web/frontend` (Svelte 5 + Vite, built with bun). |
 | LLM | `crates/dr-strange-llm` | Embeddings, digestion, entity resolution, `ask`. |

@@ -82,4 +82,4 @@ go test ./...         # spins up a real drsg serve (needs the built binary)
 
 `TestGeneratedIsCurrent` fails if the committed client has drifted from the
 schema. The e2e suite skips (does not fail) if no `drsg` binary is found; point
-it at one with `$DRSG_BIN`, or build with `cargo build -p dr-strange-cli`.
+it at one with `$DRSG_BIN`, or build with `cargo build -p drsg`.

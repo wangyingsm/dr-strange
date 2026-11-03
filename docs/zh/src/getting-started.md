@@ -128,7 +128,7 @@ Dr Strange v2.24.3 (x86_64-unknown-linux-gnu)
 Dr Strange 是一个 Cargo 工作区。编译命令行二进制 `drsg`：
 
 ```console
-$ cargo build --release -p dr-strange-cli
+$ cargo build --release -p drsg
 ```
 
 产物为 `target/release/drsg`。默认构建选用原生 LSM 存储引擎；遗留的 redb 后端仍可
@@ -139,7 +139,7 @@ Web 仪表盘由 web crate 的构建脚本在编译期嵌入二进制。若要�
 
 ```console
 $ just web-build          # bun install && vite build
-$ cargo build --release -p dr-strange-cli
+$ cargo build --release -p drsg
 ```
 
 面向 LLM 智能体的 **MCP 服务**（[第 8 章](./mcp.md)）是一个独立的二进制 `drsg-mcp`：

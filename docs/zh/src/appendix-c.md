@@ -59,7 +59,7 @@ API 密钥都从服务端环境（或 `[llm]` 配置节）读取，绝不从请�
 构建，即可得到一个完全没有模型依赖的精简二进制：
 
 ```console
-$ cargo build --release -p dr-strange-cli --no-default-features --features native-backend
+$ cargo build --release -p drsg --no-default-features --features native-backend
 ```
 
 所得的 `drsg` 省去了 `ask` 与 `digest` 命令，其它命令都保持不变：平面、导入/导出、

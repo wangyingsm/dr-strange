@@ -71,5 +71,5 @@ in the `sdk-zig` job of `.github/workflows/ci.yml`, beside the other SDK jobs;
 `just gate-sdk` runs the same locally.
 
 The e2e suite skips (does not fail) if no `drsg` binary is found; point it at
-one with `$DRSG_BIN`, or build with `cargo build -p dr-strange-cli`. Needs
+one with `$DRSG_BIN`, or build with `cargo build -p drsg`. Needs
 `libcurl` and `json-c` development packages.

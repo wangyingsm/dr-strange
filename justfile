@@ -33,12 +33,12 @@ docs-serve lang="en":
 # Uses the native LSM backend (the default). The db path is a directory here
 # (WAL + SSTs live inside it).
 serve db="graph.drsg":
-    cargo run -p dr-strange-cli -- --db {{db}} serve
+    cargo run -p drsg -- --db {{db}} serve
 
 # Same, but on the legacy redb backend (native LSM not compiled in). A redb db
 # is a single file, so don't point it at a native db's directory path.
 serve-redb db="graph.redb":
-    cargo run -p dr-strange-cli --no-default-features --features redb-backend,digest -- --db {{db}} serve
+    cargo run -p drsg --no-default-features --features redb-backend,digest -- --db {{db}} serve
 
 # ---- benchmarks (see BENCHMARKS.md) --------------------------------------
 # Cross-engine comparison vs Kùzu / SQLite / Neo4j. The dataset is generated
@@ -177,9 +177,9 @@ gate-rust: _rust-matches-ci
 #
 # CI's `features` job: every optional build still compiles.
 gate-features:
-    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-cli --no-default-features --features native-backend --all-targets
-    RUSTFLAGS="-D warnings" cargo test -p dr-strange-cli --no-default-features --features native-backend
-    RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-cli --no-default-features --features redb-backend --all-targets
+    RUSTFLAGS="-D warnings" cargo clippy -p drsg --no-default-features --features native-backend --all-targets
+    RUSTFLAGS="-D warnings" cargo test -p drsg --no-default-features --features native-backend
+    RUSTFLAGS="-D warnings" cargo clippy -p drsg --no-default-features --features redb-backend --all-targets
     RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-llm --no-default-features --all-targets
     RUSTFLAGS="-D warnings" cargo test -p dr-strange-llm --no-default-features
     RUSTFLAGS="-D warnings" cargo clippy -p dr-strange-mcp --no-default-features --features redb-backend --all-targets
@@ -246,7 +246,7 @@ gate-sdk: _drsg-for-sdk
 #
 # The binary the SDK suites drive, as CI's `rust` job uploads it.
 _drsg-for-sdk:
-    RUSTFLAGS="-D warnings" cargo build -p dr-strange-cli
+    RUSTFLAGS="-D warnings" cargo build -p drsg
 
 # CI installs the latest stable (`dtolnay/rust-toolchain@stable`), and an older
 # stable has a strictly smaller clippy lint set — so a green gate here still

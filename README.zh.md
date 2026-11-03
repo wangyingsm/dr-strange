@@ -172,7 +172,7 @@ PS> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/wangyingsm/d
 其他方式：容器镜像 `ghcr.io/wangyingsm/dr-strange:latest`、[发布
 页](https://github.com/wangyingsm/dr-strange/releases)上的归档与校验和，或从源码
 构建——需要 [Rust 工具链](https://rustup.rs)，执行
-`cargo build --release -p dr-strange-cli`，并先跑 `just web-build`
+`cargo build --release -p drsg`，并先跑 `just web-build`
 （需要 [bun](https://bun.sh)），因为控制台是在编译期嵌入的，否则二进制里只有一个
 占位页面。
 

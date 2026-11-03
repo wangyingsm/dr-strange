@@ -147,7 +147,7 @@ inspection before use.
 Dr Strange is a Cargo workspace. Compile the command-line binary, `drsg`:
 
 ```console
-$ cargo build --release -p dr-strange-cli
+$ cargo build --release -p drsg
 ```
 
 The artifact is `target/release/drsg`. The default build selects the native LSM
@@ -159,7 +159,7 @@ build the single-page application before the binary:
 
 ```console
 $ just web-build          # bun install && vite build
-$ cargo build --release -p dr-strange-cli
+$ cargo build --release -p drsg
 ```
 
 The **MCP server** for LLM agents ([Chapter 8](./mcp.md)) is a separate binary,

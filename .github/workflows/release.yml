@@ -69,7 +69,7 @@ jobs:
           bun run build
         working-directory: crates/dr-strange-web/frontend
       - name: Build binaries
-        run: cargo build --release --target ${{ matrix.target }} -p dr-strange-cli -p dr-strange-mcp
+        run: cargo build --release --target ${{ matrix.target }} -p drsg -p dr-strange-mcp
       # bash on every runner (Git Bash on Windows) so one script covers all
       # platforms; Windows ships .exe binaries and a .zip, the rest tar.gz.
       - name: Package

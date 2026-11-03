@@ -20,7 +20,7 @@ find_binary() {
 
 bin="$(find_binary)"
 if [[ -z "$bin" ]]; then
-    echo "SKIP: drsg binary not found; run 'cargo build -p dr-strange-cli'"
+    echo "SKIP: drsg binary not found; run 'cargo build -p drsg'"
     exit 0
 fi
 

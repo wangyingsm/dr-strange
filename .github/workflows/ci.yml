@@ -42,7 +42,7 @@ jobs:
       # absent, so `drsg` builds here without the bun toolchain — the SDK e2e
       # suites exercise /rpc and /ws, not the SPA.
       - name: Build drsg
-        run: cargo build -p dr-strange-cli
+        run: cargo build -p drsg
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: drsg
@@ -74,10 +74,10 @@ jobs:
       # line below names one.
       - name: CLI without the digest pipeline (native backend)
         run: |
-          cargo clippy -p dr-strange-cli --no-default-features --features native-backend --all-targets
-          cargo test -p dr-strange-cli --no-default-features --features native-backend
+          cargo clippy -p drsg --no-default-features --features native-backend --all-targets
+          cargo test -p drsg --no-default-features --features native-backend
       - name: CLI without the digest pipeline (redb backend)
-        run: cargo clippy -p dr-strange-cli --no-default-features --features redb-backend --all-targets
+        run: cargo clippy -p drsg --no-default-features --features redb-backend --all-targets
       # The wasm plugin host ships on; `--no-default-features` drops the whole
       # runtime, which is the build for anyone who does not want it.
       - name: LLM crate without the plugin host

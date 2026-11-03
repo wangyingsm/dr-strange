@@ -1203,29 +1203,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dr-strange-cli"
-version = "2.24.3"
-dependencies = [
- "ahash",
- "anyhow",
- "clap",
- "dr-strange-core",
- "dr-strange-llm",
- "dr-strange-log",
- "dr-strange-mcp",
- "dr-strange-net",
- "dr-strange-parser",
- "dr-strange-web",
- "libc",
- "mimalloc",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "toml",
- "tracing",
-]
-
-[[package]]
 name = "dr-strange-core"
 version = "2.24.3"
 dependencies = [
@@ -1366,6 +1343,29 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "drsg"
+version = "2.24.3"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "clap",
+ "dr-strange-core",
+ "dr-strange-llm",
+ "dr-strange-log",
+ "dr-strange-mcp",
+ "dr-strange-net",
+ "dr-strange-parser",
+ "dr-strange-web",
+ "libc",
+ "mimalloc",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

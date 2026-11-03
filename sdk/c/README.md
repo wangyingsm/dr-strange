@@ -109,4 +109,4 @@ Besides the real server, the e2e suite runs the client against
 `test/fake_ws.py`, a deliberately misbehaving WebSocket peer (oversized frame
 header, forged `Sec-WebSocket-Accept`, token needing URL escaping).
 The e2e suite skips (does not fail) if no `drsg` binary is found; point it at
-one with `$DRSG_BIN`, or build with `cargo build -p dr-strange-cli`.
+one with `$DRSG_BIN`, or build with `cargo build -p drsg`.

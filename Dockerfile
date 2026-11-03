@@ -25,7 +25,7 @@ COPY . .
 COPY --from=web /web/dist crates/dr-strange-web/frontend/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p dr-strange-cli && \
+    cargo build --release -p drsg && \
     install -Dm755 target/release/drsg /out/drsg
 
 # ---- Stage 3: runtime -------------------------------------------------------

@@ -55,7 +55,7 @@ func serve(t *testing.T) *Client {
 	t.Helper()
 	bin := findBinary()
 	if bin == "" {
-		t.Skip("drsg binary not found; run `cargo build -p dr-strange-cli`")
+		t.Skip("drsg binary not found; run `cargo build -p drsg`")
 	}
 	port := freePort(t)
 	addr := "127.0.0.1:" + strconv.Itoa(port)

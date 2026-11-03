@@ -68,7 +68,7 @@ which pulls in the LLM crate. Build without it for a lean binary that has no mod
 dependency at all:
 
 ```console
-$ cargo build --release -p dr-strange-cli --no-default-features --features native-backend
+$ cargo build --release -p drsg --no-default-features --features native-backend
 ```
 
 The resulting `drsg` omits the `ask` and `digest` commands; every other command
