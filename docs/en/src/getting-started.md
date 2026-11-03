@@ -85,7 +85,7 @@ there is nothing to do it says so and stops:
 
 ```console
 $ drsg update
-drsg 2.24.4 is the latest release — nothing to do
+drsg 2.24.5 is the latest release — nothing to do
 ```
 
 When there is, it prints the command it is about to run and then *becomes* it:
@@ -95,10 +95,10 @@ that has just been overwritten.
 
 ```console
 $ drsg update
-drsg 2.24.3 -> 2.24.4
-$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.24.4/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.24.4' --dir '/home/me/.local/bin'
-Dr Strange v2.24.4 (x86_64-unknown-linux-gnu)
-  downloading dr-strange-v2.24.4-x86_64-unknown-linux-gnu.tar.gz
+drsg 2.24.4 -> 2.24.5
+$ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.24.5/scripts/install.sh | sh -s -- --bin 'drsg' --version 'v2.24.5' --dir '/home/me/.local/bin'
+Dr Strange v2.24.5 (x86_64-unknown-linux-gnu)
+  downloading dr-strange-v2.24.5-x86_64-unknown-linux-gnu.tar.gz
   checksum verified
   installed /home/me/.local/bin/drsg
 ```
