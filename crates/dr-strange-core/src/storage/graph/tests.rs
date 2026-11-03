@@ -731,7 +731,10 @@ fn a_kept_key_resolves_to_its_owner_and_the_reserved_id_goes_unused() {
 
         assert_eq!(stats.nodes, 1, "{policy:?}: only `fresh` is created");
         assert_eq!(stats.existing, vec![(0, owner)], "{policy:?}");
-        assert_eq!(stats.node_ids[0], owner, "{policy:?}: position 0 is the owner");
+        assert_eq!(
+            stats.node_ids[0], owner,
+            "{policy:?}: position 0 is the owner"
+        );
         // Ids are reserved for both lines, so the created one takes the
         // *second* slot and the first is simply never written.
         assert_eq!(
@@ -745,7 +748,9 @@ fn a_kept_key_resolves_to_its_owner_and_the_reserved_id_goes_unused() {
             "{policy:?}: the key never moved"
         );
         assert!(
-            get_node(&txn, PlaneId::STARTUP, NodeId(stats.node_start)).unwrap().is_none(),
+            get_node(&txn, PlaneId::STARTUP, NodeId(stats.node_start))
+                .unwrap()
+                .is_none(),
             "{policy:?}: nothing was written at the unused id"
         );
     }
