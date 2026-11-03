@@ -1,7 +1,8 @@
 //! The bundled single-page app (arch/08 §1 — "serving a bundled SPA", no
 //! separate frontend deployment). The Svelte build output in `frontend/dist`
-//! is compiled into the binary via `rust-embed`; `build.rs` guarantees the
-//! folder exists so `cargo build` works without the JS toolchain.
+//! is compiled into the binary via `rust-embed`; `build.rs` stages it under
+//! `OUT_DIR` so `cargo build` works without the JS toolchain, and so nothing
+//! is written into the source tree — which `cargo publish` refuses.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use rust_embed::RustEmbed;
 use crate::server::AppState;
 
 #[derive(RustEmbed)]
-#[folder = "frontend/dist"]
+#[folder = "$OUT_DIR/web-assets"]
 struct Assets;
 
 /// Whether a path is asking for a built asset rather than a client-side route.
