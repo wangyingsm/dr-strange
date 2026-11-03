@@ -681,7 +681,7 @@ fn bulk_load_rejects_external_key_owned_by_existing_node() {
         },
     ];
     assert!(matches!(
-        bulk_load(&mut txn, PlaneId::STARTUP, &nodes, &[]),
+        bulk_load(&mut txn, PlaneId::STARTUP, &nodes, &[], OnConflict::Error),
         Err(Error::Conflict(_))
     ));
     // Nothing from the failed batch landed: the owner still holds "k" and
@@ -696,7 +696,89 @@ fn bulk_load_rejects_external_key_owned_by_existing_node() {
     );
     // Same key in another plane is fine, as for the per-record path.
     let p2 = create_plane(&mut txn, "other", &Properties::new()).unwrap();
-    assert!(bulk_load(&mut txn, p2, &nodes[1..], &[]).is_ok());
+    assert!(bulk_load(&mut txn, p2, &nodes[1..], &[], OnConflict::Error).is_ok());
+}
+
+#[test]
+fn a_kept_key_resolves_to_its_owner_and_the_reserved_id_goes_unused() {
+    for policy in [OnConflict::Skip, OnConflict::Update] {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let owner =
+            create_node_with_key(&mut txn, PlaneId::STARTUP, "k", &[], &Properties::new()).unwrap();
+        let nodes = [
+            BulkNode {
+                external_key: Some("k"),
+                labels: &[],
+                props: Properties::new(),
+            },
+            BulkNode {
+                external_key: Some("fresh"),
+                labels: &[],
+                props: Properties::new(),
+            },
+        ];
+        // An edge naming the taken key must reach the node already there —
+        // that is what keeping the id is for.
+        let edges = [BulkEdge {
+            src_key: "fresh",
+            dst_key: "k",
+            ty: "R",
+            props: Properties::new(),
+        }];
+        let stats = bulk_load(&mut txn, PlaneId::STARTUP, &nodes, &edges, policy).unwrap();
+
+        assert_eq!(stats.nodes, 1, "{policy:?}: only `fresh` is created");
+        assert_eq!(stats.existing, vec![(0, owner)], "{policy:?}");
+        assert_eq!(stats.node_ids[0], owner, "{policy:?}: position 0 is the owner");
+        // Ids are reserved for both lines, so the created one takes the
+        // *second* slot and the first is simply never written.
+        assert_eq!(
+            stats.node_ids[1],
+            NodeId(stats.node_start + 1),
+            "{policy:?}: the hole is left where the collision was"
+        );
+        assert_eq!(
+            node_id_by_external_key(&txn, PlaneId::STARTUP, "k").unwrap(),
+            Some(owner),
+            "{policy:?}: the key never moved"
+        );
+        assert!(
+            get_node(&txn, PlaneId::STARTUP, NodeId(stats.node_start)).unwrap().is_none(),
+            "{policy:?}: nothing was written at the unused id"
+        );
+    }
+}
+
+#[test]
+fn an_in_batch_duplicate_is_refused_whatever_the_policy_says() {
+    // Two lines claiming one key is a malformed batch: there is no existing
+    // node to defer to, so no policy can make it meaningful.
+    for policy in [OnConflict::Error, OnConflict::Skip, OnConflict::Update] {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        let nodes = [
+            BulkNode {
+                external_key: Some("dup"),
+                labels: &[],
+                props: Properties::new(),
+            },
+            BulkNode {
+                external_key: Some("dup"),
+                labels: &[],
+                props: Properties::new(),
+            },
+        ];
+        assert!(
+            matches!(
+                bulk_load(&mut txn, PlaneId::STARTUP, &nodes, &[], policy),
+                Err(Error::Conflict(_))
+            ),
+            "{policy:?}"
+        );
+    }
 }
 
 // ---- deletes -------------------------------------------------------

@@ -62,13 +62,46 @@ pub struct BulkEdgeById<'a> {
     pub props: Properties,
 }
 
-/// Outcome of a bulk load. `node_start` is the first assigned node id, so
-/// callers (e.g. the API layer's index-event mirroring) can recover each
-/// node's id as `node_start + i`.
+/// What to do with an incoming node whose external key a live node already
+/// owns. The loader's own precondition is `Error`; the other two make a
+/// re-ingest of overlapping data safe to repeat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Refuse the batch and write nothing. A colliding key usually means the
+    /// same source was ingested twice.
+    #[default]
+    Error,
+    /// Keep the existing node untouched and drop the incoming one. Edges in
+    /// the batch still resolve to the node already in the plane.
+    Skip,
+    /// Keep the existing node — **and its id**, so nothing incident to it
+    /// moves — and let the caller merge the incoming content into it. The
+    /// loader only reports which input lines these were; applying the merge
+    /// is the API layer's job, because properties and labels carry index and
+    /// change-feed consequences this layer cannot see.
+    Update,
+}
+
+/// Outcome of a bulk load.
 pub struct BulkStats {
+    /// Nodes actually created. Under [`OnConflict::Error`] this is every
+    /// input node, since any collision fails the batch instead.
     pub nodes: u64,
     pub edges: u64,
+    /// First id of the reservation. Ids are reserved for *every* input node,
+    /// so one belonging to a line that turned out to collide is simply never
+    /// written — the range stays contiguous and positional, and no second
+    /// reservation is needed once the collisions are known.
     pub node_start: u64,
+    /// The id each input node resolved to, by position: its own for a created
+    /// node, the surviving node's where the key already existed. Edge
+    /// resolution and the API layer's index mirroring both read this rather
+    /// than recomputing `node_start + i`, which is only right when nothing
+    /// collided.
+    pub node_ids: Vec<NodeId>,
+    /// Input positions whose key a live node already owned, paired with it.
+    /// Empty under [`OnConflict::Error`].
+    pub existing: Vec<(usize, NodeId)>,
 }
 
 type Batch = Vec<(Vec<u8>, Vec<u8>)>;
@@ -106,6 +139,10 @@ struct StagedNodes<'a> {
     node_plane: Batch,
     label_idx: Batch,
     ext_keys: Batch,
+    /// Positional resolution and the collisions — see [`BulkStats`], whose
+    /// fields of the same names these become.
+    node_ids: Vec<NodeId>,
+    existing: Vec<(usize, NodeId)>,
 }
 
 /// Encode every node's record, plane entry, label-index entries, and external
@@ -114,6 +151,7 @@ fn stage_nodes<'a>(
     txn: &mut dyn WriteTransaction,
     plane: PlaneId,
     nodes: &'a [BulkNode],
+    on_conflict: OnConflict,
 ) -> Result<StagedNodes<'a>> {
     let node_start = reserve_id_batch(txn, keys::META_NEXT_NODE_ID, nodes.len() as u64)?;
     let mut label_ids: AHashMap<&str, u32> = AHashMap::new();
@@ -124,18 +162,18 @@ fn stage_nodes<'a>(
         node_plane: Vec::with_capacity(nodes.len()),
         label_idx: Vec::new(),
         ext_keys: Vec::new(),
+        node_ids: Vec::with_capacity(nodes.len()),
+        existing: Vec::new(),
     };
 
     for (i, node) in nodes.iter().enumerate() {
         let id = NodeId(node_start + i as u64);
 
-        let mut lids = Vec::with_capacity(node.labels.len());
-        for &l in node.labels {
-            lids.push(intern_cached(&mut label_ids, txn, l, intern_label)?);
-        }
-
         if let Some(key) = node.external_key {
-            if staged.key_to_id.insert(key, id).is_some() {
+            // Two different collisions. A repeat *inside* the batch is a
+            // malformed batch whatever the policy says — there is no existing
+            // node to defer to, only two lines claiming one key.
+            if staged.key_to_id.contains_key(key) {
                 return Err(Error::Conflict(format!(
                     "duplicate external key '{key}' in bulk batch"
                 )));
@@ -143,18 +181,34 @@ fn stage_nodes<'a>(
             // Against the KV too: the batch is staged before anything is
             // written, so `txn` still sees exactly the pre-batch plane, and a
             // hit here is a key some live node already owns.
-            if node_id_by_external_key(txn, plane, key)?.is_some() {
-                return Err(Error::Conflict(format!(
-                    "external key '{key}' already exists in plane {}",
-                    plane.0
-                )));
+            if let Some(owner) = node_id_by_external_key(txn, plane, key)? {
+                if on_conflict == OnConflict::Error {
+                    return Err(Error::Conflict(format!(
+                        "external key '{key}' already exists in plane {}",
+                        plane.0
+                    )));
+                }
+                // The owner keeps the key and the id. Edges naming this key
+                // — in this batch or already in the plane — go on resolving
+                // to it, which is the whole point of not moving it.
+                staged.key_to_id.insert(key, owner);
+                staged.node_ids.push(owner);
+                staged.existing.push((i, owner));
+                continue;
             }
+            staged.key_to_id.insert(key, id);
             staged.ext_keys.push((
                 keys::ext_key_key(plane, key).to_vec(),
                 id.0.to_be_bytes().to_vec(),
             ));
         }
 
+        let mut lids = Vec::with_capacity(node.labels.len());
+        for &l in node.labels {
+            lids.push(intern_cached(&mut label_ids, txn, l, intern_label)?);
+        }
+
+        staged.node_ids.push(id);
         staged.nodes.push((
             keys::node_key(plane, id).to_vec(),
             codec::encode_node_record(node.external_key, &lids, &node.props),
@@ -247,8 +301,9 @@ pub fn bulk_load(
     plane: PlaneId,
     nodes: &[BulkNode],
     edges: &[BulkEdge],
+    on_conflict: OnConflict,
 ) -> Result<BulkStats> {
-    let staged = stage_nodes(txn, plane, nodes)?;
+    let mut staged = stage_nodes(txn, plane, nodes, on_conflict)?;
 
     let edge_start = reserve_id_batch(txn, keys::META_NEXT_EDGE_ID, edges.len() as u64)?;
     let mut type_ids: AHashMap<&str, u32> = AHashMap::new();
@@ -262,13 +317,18 @@ pub fn bulk_load(
     }
 
     let node_start = staged.node_start;
+    let created = staged.nodes.len() as u64;
+    let node_ids = std::mem::take(&mut staged.node_ids);
+    let existing = std::mem::take(&mut staged.existing);
     staged.write(txn)?;
     batches.write(txn)?;
 
     Ok(BulkStats {
-        nodes: nodes.len() as u64,
+        nodes: created,
         edges: edges.len() as u64,
         node_start,
+        node_ids,
+        existing,
     })
 }
 

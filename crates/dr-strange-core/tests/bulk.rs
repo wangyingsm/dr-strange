@@ -197,3 +197,107 @@ fn bulk_rejects_key_already_owned_by_a_live_node() {
     // ordinary case — its lookup row goes with it.
     assert_eq!(plane.node_by_key("taken").unwrap().unwrap().id, owner);
 }
+
+/// The point of keeping the existing id: a re-ingest must not cost the node
+/// its relationships. `delete_node` cascades to incident edges, so a policy
+/// that replaced the node instead of updating it would silently empty the
+/// graph around every key it touched.
+#[test]
+fn an_upsert_keeps_the_node_its_id_and_its_edges() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.plane("startup").unwrap();
+
+    let mut txn = plane.write().unwrap();
+    let kept = txn
+        .create_node_with_key("k", &["Person"], props("before"))
+        .unwrap();
+    let other = txn
+        .create_node_with_key("other", &["Person"], Properties::new())
+        .unwrap();
+    txn.create_edge(other, kept, "KNOWS", Properties::new())
+        .unwrap();
+    txn.commit().unwrap();
+
+    let mut txn = plane.write().unwrap();
+    let stats = txn
+        .bulk_upsert(
+            vec![BulkNode {
+                external_key: Some("k"),
+                labels: &["Person", "Admin"],
+                props: props("after"),
+            }],
+            vec![],
+            dr_strange_core::OnConflict::Update,
+        )
+        .unwrap();
+    assert_eq!(stats.nodes, 0, "nothing was created");
+    assert_eq!(stats.existing, vec![(0, kept)]);
+    txn.commit().unwrap();
+
+    let node = plane.node_by_key("k").unwrap().unwrap();
+    assert_eq!(node.id, kept, "the id did not move");
+    assert_eq!(
+        node.properties.get("name").map(|p| &p.value),
+        Some(&PropValue::Str("after".into())),
+        "the incoming property won"
+    );
+    let mut labels = node.labels.clone();
+    labels.sort();
+    assert_eq!(labels, vec!["Admin".to_string(), "Person".to_string()]);
+    // The edge that pointed at it is still there.
+    let inbound = plane.neighbors(kept, Dir::In, None).unwrap();
+    assert_eq!(inbound.len(), 1, "the incident edge survived the upsert");
+}
+
+/// `Skip` leaves the existing node exactly as it was, but an edge in the same
+/// batch still has to find it — otherwise a re-ingest would drop the edges it
+/// was carrying for an already-known node.
+#[test]
+fn a_skipped_node_still_anchors_this_batch_s_edges() {
+    let db = Database::in_memory().unwrap();
+    let plane = db.plane("startup").unwrap();
+
+    let mut txn = plane.write().unwrap();
+    let kept = txn
+        .create_node_with_key("k", &["Person"], props("before"))
+        .unwrap();
+    txn.commit().unwrap();
+
+    let mut txn = plane.write().unwrap();
+    txn.bulk_upsert(
+        vec![
+            BulkNode {
+                external_key: Some("k"),
+                labels: &["Person"],
+                props: props("ignored"),
+            },
+            BulkNode {
+                external_key: Some("new"),
+                labels: &["Person"],
+                props: props("new"),
+            },
+        ],
+        vec![BulkEdge {
+            src_key: "new",
+            dst_key: "k",
+            ty: "KNOWS",
+            props: Properties::new(),
+        }],
+        dr_strange_core::OnConflict::Skip,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    let node = plane.node_by_key("k").unwrap().unwrap();
+    assert_eq!(node.id, kept);
+    assert_eq!(
+        node.properties.get("name").map(|p| &p.value),
+        Some(&PropValue::Str("before".into())),
+        "skip left the existing properties alone"
+    );
+    assert_eq!(
+        plane.neighbors(kept, Dir::In, None).unwrap().len(),
+        1,
+        "the batch's edge resolved to the node already in the plane"
+    );
+}

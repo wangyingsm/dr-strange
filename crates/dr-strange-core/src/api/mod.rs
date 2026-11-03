@@ -43,7 +43,9 @@ use crate::keyword::KeywordRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
 #[cfg(feature = "native-backend")]
 use crate::storage::engine::{ReplicatedBatch, WalObserver};
-use crate::storage::graph::{self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator};
+use crate::storage::graph::{
+    self, BulkEdge, BulkEdgeById, BulkNode, BulkStats, IdAllocator, OnConflict,
+};
 use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 #[cfg(feature = "native-backend")]
 use crate::storage::native::{NativeEngine, NativeWriteTxn};
@@ -1805,34 +1807,89 @@ impl WriteTxn<'_> {
     /// once.
     ///
     /// Edge endpoints are named by external key and must resolve within this
-    /// batch or already exist in the plane. External keys are assumed fresh:
-    /// in-batch duplicates are rejected, but uniqueness is not checked against
-    /// the pre-existing KV — use `create_node_with_key` when you need that.
+    /// batch or already exist in the plane. External keys must be fresh:
+    /// duplicates are rejected both within the batch and against the plane's
+    /// existing keys. [`WriteTxn::bulk_upsert`] is the same path for a batch
+    /// that may overlap what is already there.
     pub fn bulk_load(
         &mut self,
         nodes: Vec<BulkNode<'_>>,
         edges: Vec<BulkEdge<'_>>,
     ) -> Result<BulkStats> {
+        self.bulk_upsert(nodes, edges, OnConflict::Error)
+    }
+
+    /// Bulk-loads `nodes` then `edges`, deciding by `on_conflict` what to do
+    /// with a node whose external key a live node already owns — so a batch
+    /// that overlaps the plane can be ingested instead of refused.
+    ///
+    /// A kept node keeps its id, so edges already incident to it are
+    /// untouched; the id reserved for the line that collided is simply never
+    /// used. Under [`OnConflict::Update`] the incoming properties are written
+    /// over the existing node's and the labels replace its own when the line
+    /// carries any — absence is not a deletion, the soft schema's rule.
+    pub fn bulk_upsert(
+        &mut self,
+        nodes: Vec<BulkNode<'_>>,
+        edges: Vec<BulkEdge<'_>>,
+        on_conflict: OnConflict,
+    ) -> Result<BulkStats> {
         let plane = self.plane;
-        let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges)?;
-        for n in &nodes {
-            self.counters.node_added(n.labels);
+        let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges, on_conflict)?;
+
+        // The merge runs here rather than in the loader because properties and
+        // labels move index membership and the change feed, which `set_prop`
+        // and `set_labels` already maintain and the KV layer cannot see.
+        if on_conflict == OnConflict::Update {
+            for &(i, id) in &stats.existing {
+                for (key, prop) in nodes[i].props.clone() {
+                    self.set_prop(id, &key, prop)?;
+                }
+                if !nodes[i].labels.is_empty() {
+                    self.set_labels(id, nodes[i].labels)?;
+                }
+            }
+        }
+
+        // Built once: three loops below ask "was this position created?", and
+        // a linear scan of `existing` inside each would be quadratic on a
+        // batch that mostly collides — which is exactly the re-ingest case
+        // this policy exists for.
+        let kept: ahash::AHashSet<usize> = stats.existing.iter().map(|&(i, _)| i).collect();
+
+        // Counters and the change feed count what was created. A kept node was
+        // not added, and an updated one is recorded by `set_prop` itself.
+        for (i, n) in nodes.iter().enumerate() {
+            if !kept.contains(&i) {
+                self.counters.node_added(n.labels);
+            }
         }
         for e in &edges {
             self.counters.edge_added(e.ty);
         }
 
-        // Change feed (ROADMAP §5): bulk-loaded nodes are creates over a known
-        // contiguous id range. Edges are omitted (bulk assigns their ids
-        // internally and the endpoints-by-key path doesn't surface them);
-        // subscribers on a bulk ingest can time-travel the seq for the edges.
-        // The buffer caps itself; past the cap every further node is one
-        // overflow flag, so there is no point walking the whole range.
-        for i in 0..stats.nodes {
+        // Change feed (ROADMAP §5): bulk-loaded nodes are creates. Edges are
+        // omitted (bulk assigns their ids internally and the endpoints-by-key
+        // path doesn't surface them); subscribers on a bulk ingest can
+        // time-travel the seq for the edges. The buffer caps itself; past the
+        // cap every further node is one overflow flag, so there is no point
+        // walking the rest.
+        //
+        // Driven off the staged ids rather than a range from `node_start`:
+        // once a conflict is kept, the reserved ids have holes in them and a
+        // range would name ids that were never written.
+        let created: Vec<u64> = stats
+            .node_ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !kept.contains(i))
+            .map(|(_, id)| id.0)
+            .collect();
+        for id in created {
             if self.changes.overflowed {
                 break;
             }
-            self.record_change(ChangeKind::Node, stats.node_start + i, ChangeOp::Created);
+            self.record_change(ChangeKind::Node, id, ChangeOp::Created);
         }
 
         // Mirror bulk-loaded vectors into any declared in-memory index. Almost
@@ -1840,8 +1897,10 @@ impl WriteTxn<'_> {
         // from the KV), so `decls` is empty here.
         if !self.decls.is_empty() {
             let mut new_events = Vec::new();
-            for (i, node) in nodes.iter().enumerate() {
-                let node_id = NodeId(stats.node_start + i as u64);
+            // Created nodes only: a kept one either was not written at all
+            // (`Skip`) or went through `set_prop`, which emits its own event.
+            for (i, node) in nodes.iter().enumerate().filter(|(i, _)| !kept.contains(i)) {
+                let node_id = stats.node_ids[i];
                 for (label, property, _metric) in &self.decls {
                     if node.labels.contains(&label.as_str())
                         && let Some(PropValue::Vector(v)) =
@@ -1861,8 +1920,8 @@ impl WriteTxn<'_> {
         // Same for bulk-loaded text into any declared keyword index.
         if !self.kw_decls.is_empty() {
             let mut new_events = Vec::new();
-            for (i, node) in nodes.iter().enumerate() {
-                let node_id = NodeId(stats.node_start + i as u64);
+            for (i, node) in nodes.iter().enumerate().filter(|(i, _)| !kept.contains(i)) {
+                let node_id = stats.node_ids[i];
                 for (label, property, _lang) in &self.kw_decls {
                     if node.labels.contains(&label.as_str())
                         && let Some(PropValue::Str(s)) = node.props.get(property).map(|p| &p.value)

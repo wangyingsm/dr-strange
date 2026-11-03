@@ -48,7 +48,7 @@ pub use compute::{
 };
 pub use error::{Error, Result};
 pub use instance::{Instance, Mount, Mounted, Mounting, Served, Serving, Unmounted};
-pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats};
+pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats, OnConflict};
 pub use storage::vector::Metric;
 /// Replication wire types (`serve --follow`, arch/01 §9) — ship regardless of
 /// backend feature; only [`Database::apply_replicated`]/[`Database::on_wal_commit`]
