@@ -386,6 +386,67 @@ async fn digest_write_never_shadows_an_existing_key() {
     );
 }
 
+/// `on_conflict: "update"` is the other half: the caller who *does* mean to
+/// revise what is already known says so, and the node is revised in place —
+/// keeping its id, so everything already pointing at it still does. The
+/// default stays `skip`, so the test above and this one are the two contracts.
+#[tokio::test]
+async fn digest_write_can_update_an_existing_key_without_moving_it() {
+    let addr = spawn_server();
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    wait_ready(&client, &base).await;
+
+    let created = rpc(
+        &client,
+        &base,
+        "node.create",
+        json!({ "plane": "startup", "key": "proj", "labels": ["Project"],
+                "properties": { "path": "/before", "keep": "me" } }),
+    )
+    .await;
+    let original = created["result"]["id"].as_u64().unwrap();
+
+    let w = rpc(
+        &client,
+        &base,
+        "digest.write",
+        json!({
+            "plane": "startup",
+            "on_conflict": "update",
+            "nodes": [
+                { "key": "proj",  "label": "Project", "properties": { "path": "/after" } },
+                { "key": "fresh", "label": "Note",    "properties": {} }
+            ],
+            "edges": [ { "src": "fresh", "dst": "proj", "type": "ABOUT" } ],
+        }),
+    )
+    .await["result"]
+        .clone();
+
+    assert_eq!(w["nodes_written"], 1, "only `fresh` is new");
+    assert_eq!(w["nodes_updated"], 1);
+    assert_eq!(w["updated_keys"], json!(["proj"]));
+    assert_eq!(
+        w["nodes_skipped"], 0,
+        "an updated key was not skipped, and must not be reported as one"
+    );
+
+    let got = rpc(
+        &client,
+        &base,
+        "node.get",
+        json!({ "plane": "startup", "key": "proj" }),
+    )
+    .await;
+    assert_eq!(got["result"]["id"], original, "the id did not move");
+    assert_eq!(got["result"]["properties"]["path"], "/after", "revised");
+    assert_eq!(
+        got["result"]["properties"]["keep"], "me",
+        "a property the proposal omitted is left alone — absence is not a deletion"
+    );
+}
+
 /// Completion reads the plane it will run against: the labels it holds, the
 /// edges between them, the properties they carry — none of which an editor
 /// could know on its own.

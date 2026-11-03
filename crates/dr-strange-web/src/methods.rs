@@ -2707,6 +2707,37 @@ pub struct DigestWrite {
     nodes: Vec<WriteNode>,
     #[serde(default)]
     edges: Vec<WriteEdge>,
+    /// What to do with a proposed key the plane already owns. Defaults to
+    /// `skip` here, unlike every other write surface: see [`digest_write`].
+    #[serde(default = "default_digest_conflict")]
+    on_conflict: ConflictArg,
+}
+
+/// `skip`, because a distillation proposes every entity as new — so a key the
+/// plane already owns is the normal case for *this* method, where everywhere
+/// else it is a mistake.
+fn default_digest_conflict() -> ConflictArg {
+    ConflictArg::Skip
+}
+
+/// The wire surface over the engine's [`dr_strange_core::OnConflict`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictArg {
+    #[default]
+    Error,
+    Skip,
+    Update,
+}
+
+impl From<ConflictArg> for dr_strange_core::OnConflict {
+    fn from(c: ConflictArg) -> Self {
+        match c {
+            ConflictArg::Error => Self::Error,
+            ConflictArg::Skip => Self::Skip,
+            ConflictArg::Update => Self::Update,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2744,30 +2775,24 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: DigestWrite = params(p)?;
     let plane = ctx.plane(&req.plane)?;
 
-    // Only nodes whose key is genuinely free get written.
-    //
-    // `bulk_load` writes the external-key index unconditionally: a proposed key
-    // that already exists overwrites the index entry, leaving the original node
-    // in place but reachable only by id. Every `key(...)` read against it then
-    // returns empty while the data sits there untouched. Observed, not
-    // theorised: one run shadowed two nodes an application addressed by key,
-    // and every key-filtered read for them went empty at the same moment —
-    // no error, no log line. `node.create` has always rejected a taken key;
-    // this path was the way around it.
-    //
-    // Skipping rather than failing the batch: a distillation proposes every
-    // entity as new (`link: false`), so naming something already known is the
-    // normal case, not an error — rejecting the batch would drop the run
-    // exactly when it had learned something. Edges are kept either way:
-    // `resolve` falls back to the plane's existing keys, so an edge onto a
-    // skipped key attaches to the node that was already there, which is what
+    // What happens to a key the plane already owns is the engine's decision
+    // now (`on_conflict`), and `skip` is this method's default for a reason:
+    // a distillation proposes every entity as new (`link: false`), so naming
+    // something already known is the normal case, not an error — rejecting
+    // the batch would drop the run exactly when it had learned something.
+    // Edges are kept whichever way it goes: a kept node keeps its id, so an
+    // edge onto that key attaches to the node already there, which is what
     // "this distillation mentions something we know" ought to mean.
+    //
+    // Repeats *within* one proposal are still settled here. The engine
+    // refuses a batch that names one key twice whatever its policy for the
+    // plane — rightly, since there is no existing node to defer to — but a
+    // distillation naming the same entity twice is ordinary, not malformed.
     let mut seen: HashSet<&str> = HashSet::new();
     let mut fresh: Vec<&WriteNode> = Vec::with_capacity(req.nodes.len());
     let mut skipped: Vec<&str> = Vec::new();
     for n in &req.nodes {
-        // Intra-batch duplicates would make bulk_load reject the whole call.
-        if !seen.insert(n.key.as_str()) || app(plane.node_by_key(&n.key))?.is_some() {
+        if !seen.insert(n.key.as_str()) {
             skipped.push(n.key.as_str());
             continue;
         }
@@ -2816,8 +2841,24 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         .collect();
 
     let mut txn = app(plane.write())?;
-    let stats = app(txn.bulk_load(bnodes, bedges))?;
+    let stats = app(txn.bulk_upsert(bnodes, bedges, req.on_conflict.into()))?;
     app(txn.commit())?;
+
+    // Keys the plane already owned, split by what was done with them. Under
+    // `update` they are not skipped at all, so calling them that would be a
+    // lie to anyone reading the reply to decide whether the run landed.
+    let existing: Vec<&str> = stats
+        .existing
+        .iter()
+        .map(|&(i, _)| fresh[i].key.as_str())
+        .collect();
+    let updated: Vec<&str> = if req.on_conflict == ConflictArg::Update {
+        existing
+    } else {
+        skipped.extend(existing);
+        Vec::new()
+    };
+
     // `skipped_keys` is reported, not just counted: a silent skip is how the
     // client-side guard managed to do nothing for weeks without anyone noticing.
     Ok(jval!({
@@ -2825,6 +2866,8 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         "edges_written": stats.edges,
         "nodes_skipped": skipped.len(),
         "skipped_keys": skipped,
+        "nodes_updated": updated.len(),
+        "updated_keys": updated,
     }))
 }
 

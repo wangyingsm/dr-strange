@@ -1487,7 +1487,7 @@
     },
     {
       "name": "digest.write",
-      "summary": "Write a previously-computed proposal into the plane via the bulk path (no LLM call).",
+      "summary": "Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new.",
       "x-access": "write",
       "params": [
         {
@@ -1516,6 +1516,20 @@
               "type": "object"
             }
           }
+        },
+        {
+          "name": "on_conflict",
+          "required": false,
+          "description": "What to do with a proposed key a live node already owns: `skip` (default) keeps the existing node, `update` writes the proposed properties over it keeping its id and its edges, and `error` refuses the whole batch.",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "error",
+              "skip",
+              "update"
+            ],
+            "default": "skip"
+          }
         }
       ],
       "result": {
@@ -1528,6 +1542,24 @@
             },
             "edges_written": {
               "type": "integer"
+            },
+            "nodes_skipped": {
+              "type": "integer"
+            },
+            "skipped_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "nodes_updated": {
+              "type": "integer"
+            },
+            "updated_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
