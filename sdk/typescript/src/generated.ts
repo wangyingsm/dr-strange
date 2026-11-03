@@ -219,9 +219,9 @@ export class Drsg extends Client {
     return this._call("digest.run", params) as Promise<Record<string, unknown>>;
   }
 
-  /** Write a previously-computed proposal into the plane via the bulk path (no LLM call). (access: write) */
-  digestWrite(params: { plane: string; nodes: Array<Record<string, unknown>>; edges?: Array<Record<string, unknown>> }): Promise<{ nodes_written?: number; edges_written?: number }> {
-    return this._call("digest.write", params) as Promise<{ nodes_written?: number; edges_written?: number }>;
+  /** Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. (access: write) */
+  digestWrite(params: { plane: string; nodes: Array<Record<string, unknown>>; edges?: Array<Record<string, unknown>>; on_conflict?: "error" | "skip" | "update" }): Promise<{ nodes_written?: number; edges_written?: number; nodes_skipped?: number; skipped_keys?: Array<string>; nodes_updated?: number; updated_keys?: Array<string> }> {
+    return this._call("digest.write", params) as Promise<{ nodes_written?: number; edges_written?: number; nodes_skipped?: number; skipped_keys?: Array<string>; nodes_updated?: number; updated_keys?: Array<string> }>;
   }
 
   /** Add a node with an optional stable external key and labels. (access: write) */

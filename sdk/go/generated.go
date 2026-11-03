@@ -307,14 +307,19 @@ type DigestRunParams struct {
 }
 
 type DigestWriteResult struct {
-	EdgesWritten *int64 `json:"edges_written,omitempty"`
-	NodesWritten *int64 `json:"nodes_written,omitempty"`
+	EdgesWritten *int64   `json:"edges_written,omitempty"`
+	NodesSkipped *int64   `json:"nodes_skipped,omitempty"`
+	NodesUpdated *int64   `json:"nodes_updated,omitempty"`
+	NodesWritten *int64   `json:"nodes_written,omitempty"`
+	SkippedKeys  []string `json:"skipped_keys,omitempty"`
+	UpdatedKeys  []string `json:"updated_keys,omitempty"`
 }
 
 type DigestWriteParams struct {
-	Plane string           `json:"plane"`
-	Nodes []map[string]any `json:"nodes"`
-	Edges []map[string]any `json:"edges,omitempty"`
+	Plane      string           `json:"plane"`
+	Nodes      []map[string]any `json:"nodes"`
+	Edges      []map[string]any `json:"edges,omitempty"`
+	OnConflict *string          `json:"on_conflict,omitempty"`
 }
 
 type NodeCreateParams struct {
@@ -592,7 +597,7 @@ func (c *Client) DigestRun(ctx context.Context, p DigestRunParams) (map[string]a
 	return out, err
 }
 
-// DigestWrite Write a previously-computed proposal into the plane via the bulk path (no LLM call). (access: write)
+// DigestWrite Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. (access: write)
 func (c *Client) DigestWrite(ctx context.Context, p DigestWriteParams) (*DigestWriteResult, error) {
 	var out *DigestWriteResult
 	err := c.call(ctx, "digest.write", p, &out)

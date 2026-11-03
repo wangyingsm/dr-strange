@@ -397,13 +397,14 @@ struct json_object *drsg_digest_run(drsg_client *c, const char *plane, const cha
     return rc == 0 ? result : NULL;
 }
 
-/* Write a previously-computed proposal into the plane via the bulk path (no LLM call). (access: write) */
+/* Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. (access: write) */
 struct json_object *drsg_digest_write(drsg_client *c, const char *plane, struct json_object *nodes, const drsg_digest_write_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
     json_object_object_add(p, "nodes", json_object_get(nodes));
     if (opts) {
         if (opts->edges) json_object_object_add(p, "edges", json_object_get(opts->edges));
+        if (opts->on_conflict) json_object_object_add(p, "on_conflict", json_object_new_string(opts->on_conflict));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "digest.write", p, &result, err);

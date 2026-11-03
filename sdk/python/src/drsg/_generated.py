@@ -399,8 +399,8 @@ class Drsg(_Client):
             _p["mode"] = mode
         return self._call("digest.run", _p)
 
-    def digest_write(self, plane, nodes, edges=None) -> Any:
-        """Write a previously-computed proposal into the plane via the bulk path (no LLM call).
+    def digest_write(self, plane, nodes, edges=None, on_conflict=None) -> Any:
+        """Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new.
 
         Access: write."""
         _p: dict = {}
@@ -408,6 +408,8 @@ class Drsg(_Client):
         _p["nodes"] = nodes
         if edges is not None:
             _p["edges"] = edges
+        if on_conflict is not None:
+            _p["on_conflict"] = on_conflict
         return self._call("digest.write", _p)
 
     def node_create(self, plane, key=None, labels=None, properties=None) -> Any:

@@ -726,20 +726,29 @@ public class Drsg extends Client {
 
     public record DigestWriteResult(
             Long nodesWritten,
-            Long edgesWritten) {
+            Long edgesWritten,
+            Long nodesSkipped,
+            List<String> skippedKeys,
+            Long nodesUpdated,
+            List<String> updatedKeys) {
     }
 
     public record DigestWriteParams(
             String plane,
             List<Map<String, Object>> nodes,
-            List<Map<String, Object>> edges) {
+            List<Map<String, Object>> edges,
+            String onConflict) {
 
         public static DigestWriteParams of(String plane, List<Map<String, Object>> nodes) {
-            return new DigestWriteParams(plane, nodes, null);
+            return new DigestWriteParams(plane, nodes, null, null);
         }
 
         public DigestWriteParams withEdges(List<Map<String, Object>> edges) {
-            return new DigestWriteParams(plane, nodes, edges);
+            return new DigestWriteParams(plane, nodes, edges, onConflict);
+        }
+
+        public DigestWriteParams withOnConflict(String onConflict) {
+            return new DigestWriteParams(plane, nodes, edges, onConflict);
         }
     }
 
@@ -1086,7 +1095,7 @@ public class Drsg extends Client {
         return call("digest.run", params, new TypeReference<Map<String, Object>>() {});
     }
 
-    /** Write a previously-computed proposal into the plane via the bulk path (no LLM call). (access: write) */
+    /** Write a previously-computed proposal into the plane via the bulk path (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. (access: write) */
     public DigestWriteResult digestWrite(DigestWriteParams params) throws DrsgException {
         return call("digest.write", params, new TypeReference<DigestWriteResult>() {});
     }
