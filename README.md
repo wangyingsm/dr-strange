@@ -18,6 +18,12 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/@yingge/drsg"><img src="https://img.shields.io/npm/v/@yingge/drsg?logo=npm&label=npm&color=cb3837" alt="npm"></a>
+  <a href="https://crates.io/crates/drsg"><img src="https://img.shields.io/crates/v/drsg?logo=rust&label=crates.io&color=e43717" alt="crates.io"></a>
+  <a href="https://pypi.org/project/drsg-embedded/"><img src="https://img.shields.io/pypi/v/drsg-embedded?logo=pypi&logoColor=white&label=PyPI&color=3775a9" alt="PyPI"></a>
+</p>
+
+<p align="center">
   <em>One command configures the agent you already use:</em><br>
   <img src="https://img.shields.io/badge/Claude%20Code-ready-6d28d9" alt="Claude Code">
   <img src="https://img.shields.io/badge/GitHub%20Copilot-ready-6d28d9" alt="GitHub Copilot">
@@ -62,6 +68,9 @@ $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scri
 $ drsg plugin install          # choose parsers from the official catalog; 0 = all
 $ drsg init                    # digest, serve, and write the MCP config your agent reads
 ```
+
+Already have a toolchain? `npx @yingge/drsg init` or `cargo install drsg`
+work the same way — see [Install](#install) for what each one gets you.
 
 `drsg init` digests the working tree, spawns a watcher that folds every commit
 into the graph, and writes `.mcp.json` plus a matching config for whichever of

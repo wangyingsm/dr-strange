@@ -18,6 +18,12 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/@yingge/drsg"><img src="https://img.shields.io/npm/v/@yingge/drsg?logo=npm&label=npm&color=cb3837" alt="npm"></a>
+  <a href="https://crates.io/crates/drsg"><img src="https://img.shields.io/crates/v/drsg?logo=rust&label=crates.io&color=e43717" alt="crates.io"></a>
+  <a href="https://pypi.org/project/drsg-embedded/"><img src="https://img.shields.io/pypi/v/drsg-embedded?logo=pypi&logoColor=white&label=PyPI&color=3775a9" alt="PyPI"></a>
+</p>
+
+<p align="center">
   <em>一条命令配好你正在用的那个智能体：</em><br>
   <img src="https://img.shields.io/badge/Claude%20Code-ready-6d28d9" alt="Claude Code">
   <img src="https://img.shields.io/badge/GitHub%20Copilot-ready-6d28d9" alt="GitHub Copilot">
@@ -61,6 +67,9 @@ $ curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scri
 $ drsg plugin install          # 从官方目录中挑选解析器；0 表示全选
 $ drsg init                    # 消化、起服务，并写入你的智能体会读的 MCP 配置
 ```
+
+手上已有工具链？`npx @yingge/drsg init` 或 `cargo install drsg` 同样可用——
+各自装到什么，见[安装](#安装)。
 
 `drsg init` 消化当前工作区，起一个把每次提交折叠进图的 watcher，写入 `.mcp.json`，
 并为本仓库或本机留有痕迹的那些智能体写好对应配置。此后你的智能体便拥有 `context`、
