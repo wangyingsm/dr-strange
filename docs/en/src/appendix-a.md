@@ -63,7 +63,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
 - **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
 - **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string (`coarse` \| `fine` \| `super`, default `fine` — see [Chapter 3](./ai-native.md#extraction-precision); `super` costs ~15× the input tokens).
-- **`digest.write`** · write — write a previously-computed proposal (no LLM call). Params: `plane` string!, `nodes` array!, `edges` array.
+- **`digest.write`** · write — write a previously-computed proposal (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. Params: `plane` string!, `nodes` array!, `edges` array, `on_conflict` string (`error` / `skip` / `update`; default `skip`).
 - **`plane.vectorize`** · write — embed every node in a plane (unchanged texts are skipped) and ensure a vector index on `embedding` per label; the provider key comes from the server's environment. Params: `plane` string!, `embed` string, `embed_model` string, `metric` string.
 
 ## Plugins

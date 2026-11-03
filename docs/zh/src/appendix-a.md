@@ -60,7 +60,7 @@
 
 - **`index.ensure`** · admin —— 在 `(标签, 属性)` 上声明一个向量或关键词索引。参数：`plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string。
 - **`digest.run`** · write —— 经由 LLM 从文本抽取节点/边方案（dry-run）。参数：`plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string（`coarse` \| `fine` \| `super`，默认 `fine`——见[第 3 章](./ai-native.md#抽取精度)；`super` 的输入 token 用量约为 15 倍）。
-- **`digest.write`** · write —— 写入一个先前算得的方案（不调用 LLM）。参数：`plane` string!, `nodes` array!, `edges` array。
+- **`digest.write`** · write —— 写入一个先前算得的方案（不调用 LLM）。方案中已被本平面占用的键默认跳过——蒸馏把每个实体都当作新的提出，因此提到已知的东西是常态。参数：`plane` string!, `nodes` array!, `edges` array, `on_conflict` string（`error` / `skip` / `update`，默认 `skip`）。
 - **`plane.vectorize`** · write —— 为平面中的每个节点生成向量嵌入（文本未变的节点会跳过），并按标签确保 `embedding` 上的向量索引。提供方密钥来自服务端环境。参数：`plane` string!, `embed` string, `embed_model` string, `metric` string。
 
 ## 插件
