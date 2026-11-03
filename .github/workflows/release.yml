@@ -309,6 +309,60 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: uv publish dist/*.whl
 
+  crates:
+    name: Publish to crates.io
+    # After the GitHub release, for the reason the npm job gives: a version on
+    # a registry that cannot be yanked must not point at a release that never
+    # appeared. crates.io yanks but never deletes, so this one is final.
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # A fork, or this repository before the secret exists, has no token.
+      # That skips the publish rather than failing the release, the way the
+      # npm and PyPI jobs do.
+      - name: Is a token configured?
+        id: token
+        env:
+          CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: echo "present=${CARGO_TOKEN:+yes}" >> "$GITHUB_OUTPUT"
+      - name: Publish
+        if: steps.token.outputs.present == 'yes'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Dependency order: a crate cannot be published before the crates it
+          # names are on the index. `cargo publish` waits for each to appear
+          # there before returning, so the next one resolves it.
+          for pkg in dr-strange-core dr-strange-log dr-strange-net \
+                     dr-strange-parser dr-strange-llm dr-strange-mcp \
+                     dr-strange-web drsg; do
+            # Re-running a release must not fail on what it already did, and
+            # only a definite "absent" means publish: 404 is that answer,
+            # anything else is the registry being unreachable and must not be
+            # read as "not published". The User-Agent is not optional —
+            # crates.io answers 403 to a request without one, which would
+            # otherwise look exactly like an outage.
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "dr-strange-release (+https://github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/$pkg/$version")
+            if [ "$code" = "200" ]; then
+              echo "$pkg@$version is already published — skipping"
+              continue
+            elif [ "$code" != "404" ]; then
+              echo "could not ask crates.io about $pkg@$version (HTTP $code)" >&2
+              exit 1
+            fi
+            cargo publish -p "$pkg" --locked
+          done
+
   docker:
     name: Docker image → GHCR
     permissions:
