@@ -1,6 +1,9 @@
 [package]
 name = "drsg-bench"
 description = "Cross-engine benchmark harness for dr-strange (dev-only; not part of the shipped product)"
+# A harness for measuring this workspace against other engines, run from a
+# checkout. There is nothing for a dependant to depend on.
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

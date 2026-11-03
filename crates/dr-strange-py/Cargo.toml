@@ -1,6 +1,10 @@
 [package]
 name = "dr-strange-py"
 description = "In-process Python bindings for the dr-strange graph engine"
+# Ships to PyPI as `drsg-embedded`, built by maturin into a wheel per
+# platform. A crates.io copy would be a Python extension module no Rust crate
+# can link against.
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
