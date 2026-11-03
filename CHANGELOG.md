@@ -4,6 +4,68 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.25.0] - 2026-11-04
+
+A batch that overlaps what a plane already holds can now be ingested instead
+of refused. The query language has had `MERGE` for a long time; the bulk path
+had not, so a re-ingest was the caller's problem and only `drsg import` had
+solved it.
+
+### Added
+
+- **The bulk path takes a conflict policy**, through `WriteTxn::bulk_upsert`
+  and `OnConflict`. `Error` refuses the batch and stays the default, so every
+  existing caller is unchanged; `Skip` keeps the existing node and drops the
+  incoming one; `Update` writes the incoming properties over it and replaces
+  its labels when the incoming node carries any — properties not mentioned
+  are left alone, the soft schema's rule that absence is not a deletion.
+
+  **A kept node keeps its id**, which is the point rather than a detail:
+  `delete_node` cascades to incident edges, so a policy that replaced the
+  node would have silently emptied the graph around every key it touched. Ids
+  are still reserved for every input line in one go, and the one belonging to
+  a line that turned out to collide is simply never used.
+
+  Reachable from `drsg import --on-conflict` (where it already was), the MCP
+  `write_nodes` tool, `digest.write` over JSON-RPC, and the five generated
+  SDKs. A repeat *within* one batch stays an error whatever the policy says:
+  two lines claiming one key have no existing node to defer to.
+- **`digest.write` reports what it updated** — `nodes_updated` and
+  `updated_keys` beside the skip counts. Both are empty unless the policy
+  asked for updates, so a client that never sets one sees the reply it saw
+  before. Calling an updated node "skipped" is the kind of half-true report
+  that let a silent skip go unnoticed for weeks once already.
+- **A benchmark for what a re-ingest costs** — `upsert-fresh`, `upsert-skip`
+  and `upsert-update` over one batch, so the three prices are comparable.
+  Updating runs about 4× slower than a fresh insert: the merge goes through
+  the property path, which is where index membership and the change feed are
+  maintained and therefore cannot be batched the way the loader's writes are.
+
+### Changed
+
+- **The MCP `write_nodes` tool writes through the bulk path.** It looped
+  `create_node_with_key` before, one record at a time. The reply is unchanged
+  for a caller who sets no policy.
+- **`digest.write` defaults to `skip`, not `error`**, unlike every other write
+  surface. It is not new behaviour — it is what the method already did, now
+  said out loud as a parameter. A distillation proposes every entity as new,
+  so a key the plane already owns is the normal case there, and refusing the
+  batch would drop the run exactly when it had learned something.
+- **The package managers are on the first screen.** npm, crates.io and PyPI
+  version badges in the README header, and a line in "Three commands" naming
+  `npx @yingge/drsg` and `cargo install drsg`. All three channels opened in
+  2.24.4–2.24.5 and the README mentioned them only 170 lines down.
+- **Every module has a maintainer named** in `CONTRIBUTING.md`, and
+  `dr-strange-net` joins the module table it had been missing from.
+
+### Fixed
+
+- **The change feed and the index mirroring no longer assume a dense id
+  range.** Both walked `node_start + i` over a bulk load's reservation, which
+  is only correct while nothing collides. They read the loader's positional
+  resolution now — a latent wrong only reachable once the reservation could
+  have holes in it, which is to say, once this release's policies existed.
+
 ## [2.24.5] - 2026-11-03
 
 Finishes what 2.24.4 started. Two of the eight crates could not be published,
