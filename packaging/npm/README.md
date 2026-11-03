@@ -88,10 +88,17 @@ Three things become true, and none of them is automatic:
 ## The automatic path
 
 The `npm` job needs one thing that is not in this repository: an **`NPM_TOKEN`
-secret** (Settings → Secrets and variables → Actions), an automation token
-from an npm account with publish rights. Without it the job skips itself and
-says so — a fork, or this repository before the token is added, still gets a
-complete GitHub release.
+secret** (Settings → Secrets and variables → Actions), a granular access
+token with write access and **Bypass 2FA** enabled, which is off by default.
+Classic automation tokens no longer exist: npm stopped issuing them in
+November 2025 and revoked the rest that December. Without the secret the job
+skips itself and says so — a fork, or this repository before the token is
+added, still gets a complete GitHub release.
+
+Direct publishing with a granular token is itself on the way out — npm says
+it goes in January 2027, replaced by a stage-only token and an approval step.
+Trusted publishing (OIDC) is the replacement to move to, and it can do every
+publish *except* a package's first, which is why the token exists at all.
 
 What it does, in order: downloads the release artifacts, verifies each against
 its own SHA-256, publishes the five platform packages and then the wrapper,
