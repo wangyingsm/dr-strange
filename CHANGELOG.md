@@ -4,6 +4,47 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.4] - 2026-11-03
+
+A distribution release. No engine change: `drsg` reaches two package managers
+it was not on before, and the npm wrapper takes the name npm will actually
+give it.
+
+### Added
+
+- **The crates are published to crates.io.** `cargo install drsg` installs the
+  binary, and the seven libraries behind it — core, log, net, parser, llm,
+  mcp, web — are on the registry so they can be depended on directly. The
+  release job publishes them in dependency order, skips a version already
+  there so a re-run is safe, and skips itself entirely where no token is
+  configured, the way the npm and PyPI jobs already did. The benchmark
+  harness and the PyO3 crate are marked `publish = false`: one is a
+  development tool, the other ships to PyPI as a wheel no Rust crate can
+  link against.
+- **`drsg-embedded` is on PyPI**, five `cp39-abi3` wheels covering Linux
+  x86_64 and aarch64, macOS x86_64 and arm64, and Windows x86_64. The
+  in-process binding is alpha and says so; `cypher`, the change feed and bulk
+  writes are the next additions.
+
+### Changed
+
+- **The CLI crate is named `drsg`.** It was `dr-strange-cli`, which would have
+  made the install command `cargo install dr-strange-cli` for a binary called
+  `drsg`. The directory keeps its name, so `crates/dr-strange-cli` is
+  unchanged and only the cargo selector moves: `-p dr-strange-cli` is now
+  `-p drsg`.
+- **The npm wrapper is `@yingge/drsg`.** The bare name cannot be had — npm
+  refuses it as too similar to the existing package `arg`, which is its
+  typosquatting filter and not something a publish can argue with. The five
+  platform packages keep their `drsg-*` names, and the installed command is
+  still `drsg`, so this costs the install string and nothing else.
+- **Every intra-workspace dependency carries a version beside its path.**
+  `cargo publish` strips the path and resolves against the registry, and
+  refuses a manifest that offers only a path. They are declared in one place,
+  and `just bump-version` now rewrites them and fails if one is left behind —
+  a local build resolves through the path and never reads these, so a stale
+  version is invisible until it ships a crate depending on the last release.
+
 ## [2.24.3] - 2026-11-03
 
 A dependency release. The plugin sandbox takes four upstream security patches,
