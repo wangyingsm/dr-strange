@@ -4,6 +4,36 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.5] - 2026-11-03
+
+Finishes what 2.24.4 started. Two of the eight crates could not be published,
+for a reason that only appears at the registry's door, and the check that
+would have caught it now runs on every push.
+
+### Fixed
+
+- **The embedded web assets are staged in `OUT_DIR`.** `dr-strange-web`'s
+  build script backfilled a placeholder `frontend/dist/index.html` so a build
+  works without the JS toolchain — writing into the source tree, which
+  `cargo publish` rejects outright: it builds the extracted package and then
+  diffs the directory. The bundle is now copied into `OUT_DIR` and
+  `rust-embed` reads it from there, so nothing outside it is touched. The
+  placeholder behaviour is unchanged, and a real `just web-build` bundle still
+  wins when one exists.
+- **`dr-strange-web` and `drsg` reach crates.io.** They are the two 2.24.4
+  could not publish; the other six went up before the failure and stay at
+  2.24.4 there. All eight are at 2.24.5, so `cargo install drsg` works from
+  this release on.
+
+### Added
+
+- **The gate and CI refuse a build script that writes into the source tree.**
+  It is invisible to every local build and to `cargo package --no-verify`,
+  and surfaces only during a publish — by which point the crates ahead of it
+  in the release are already on a registry that does not take them back. The
+  check builds where no build output exists and fails on any file that
+  appears.
+
 ## [2.24.4] - 2026-11-03
 
 A distribution release. No engine change: `drsg` reaches two package managers
