@@ -32,8 +32,8 @@ use tokio::sync::Semaphore;
 use anyhow::Result as AnyResult;
 use dr_strange_core::attach::Remote;
 use dr_strange_core::{
-    Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId, PageRankOptions,
-    PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions, json,
+    BulkNode, Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId,
+    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions, json,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -696,6 +696,38 @@ struct WriteNodes {
     #[serde(default = "default_plane")]
     plane: String,
     nodes: Vec<NodeInput>,
+    /// What to do with a node whose `external_key` is already taken.
+    #[serde(default)]
+    on_conflict: OnConflictArg,
+}
+
+/// The JSON surface over the engine's [`dr_strange_core::OnConflict`], which
+/// decides and applies all three. Separate only so `serde` and `schemars`
+/// stay out of the engine's dependencies.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum OnConflictArg {
+    /// Refuse the batch and write nothing. The default: a key already taken
+    /// usually means the same facts are being written twice.
+    #[default]
+    Error,
+    /// Keep the existing node as it is and drop the incoming one.
+    Skip,
+    /// Write the incoming properties over the existing node's, and its labels
+    /// when the incoming node carries any. The node keeps its id, so edges
+    /// already pointing at it are untouched; properties not mentioned are
+    /// left alone.
+    Update,
+}
+
+impl From<OnConflictArg> for dr_strange_core::OnConflict {
+    fn from(c: OnConflictArg) -> Self {
+        match c {
+            OnConflictArg::Error => Self::Error,
+            OnConflictArg::Skip => Self::Skip,
+            OnConflictArg::Update => Self::Update,
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2468,18 +2500,38 @@ fn write_nodes_logic(
         }
     }
 
+    // Split first: `BulkNode` borrows its labels as `&[&str]`, so the owned
+    // `String`s have to sit still while the properties move out from under
+    // them.
+    let (inputs, props): (Vec<NodeInput>, Vec<Properties>) = decoded.into_iter().unzip();
+    let label_refs: Vec<Vec<&str>> = inputs
+        .iter()
+        .map(|node| node.labels.iter().map(String::as_str).collect())
+        .collect();
+    let nodes: Vec<BulkNode> = props
+        .into_iter()
+        .enumerate()
+        .map(|(i, props)| BulkNode {
+            external_key: inputs[i].external_key.as_deref(),
+            labels: &label_refs[i],
+            props,
+        })
+        .collect();
+
     let mut txn = p.write()?;
-    let mut ids = Vec::new();
-    for (node, props) in decoded {
-        let labels: Vec<&str> = node.labels.iter().map(String::as_str).collect();
-        let id = match &node.external_key {
-            Some(key) => txn.create_node_with_key(key, &labels, props)?,
-            None => txn.create_node(&labels, props)?,
-        };
-        ids.push(id.0);
-    }
+    let stats = txn.bulk_upsert(nodes, Vec::new(), req.on_conflict.into())?;
+    let kept: Vec<u64> = stats.existing.iter().map(|&(_, id)| id.0).collect();
+    let created: Vec<u64> = stats
+        .node_ids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !stats.existing.iter().any(|&(j, _)| j == *i))
+        .map(|(_, id)| id.0)
+        .collect();
     txn.commit()?;
-    Ok(jval!({ "created": ids, "embedded": embedded }))
+    // `existing` is empty under the default, so a caller that never asked for
+    // a policy sees exactly the reply it saw before.
+    Ok(jval!({ "created": created, "existing": kept, "embedded": embedded }))
 }
 
 fn write_edges_logic(db: &Database, req: WriteEdges) -> AnyResult<Value> {
@@ -3645,7 +3697,11 @@ impl DrStrange {
     }
 
     #[tool(description = "Create nodes (batched). Each: {external_key?, labels, \
-        properties?}. Returns the created ids.")]
+        properties?}. `on_conflict` decides what happens to a node whose \
+        external_key is taken: `error` (default, write nothing), `skip` (keep \
+        the existing node), or `update` (write the incoming properties over \
+        it, keeping its id and its edges). Returns the created ids, and the \
+        ids kept under skip/update.")]
     async fn write_nodes(
         &self,
         Parameters(req): Parameters<WriteNodes>,
@@ -3876,6 +3932,105 @@ mod tests {
                 other => panic!("{key}: expected a vector, got {other:?}"),
             }
         }
+    }
+
+    /// Writing the same keys twice is the ordinary agent mistake, and with no
+    /// policy it must still be refused rather than quietly doubling the graph.
+    #[test]
+    fn write_nodes_refuses_a_taken_key_unless_asked_otherwise() {
+        let db = Database::in_memory().unwrap();
+        let batch = jval!({"nodes": [{"external_key": "a", "labels": ["Doc"]}]});
+        write_nodes_logic(&db, from_value(batch.clone()).unwrap(), None).unwrap();
+        let err = write_nodes_logic(&db, from_value(batch).unwrap(), None).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    /// `update` is what makes a re-write safe to repeat: the node keeps its id,
+    /// so whatever points at it still does, and only the properties move.
+    #[test]
+    fn write_nodes_update_keeps_the_id_and_the_edges() {
+        let db = Database::in_memory().unwrap();
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"nodes": [
+                {"external_key": "a", "labels": ["Doc"], "properties": {"title": "before"}},
+                {"external_key": "b", "labels": ["Doc"]}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        write_edges_logic(
+            &db,
+            from_value(jval!({"edges": [{"src_key": "b", "dst_key": "a", "type": "CITES"}]}))
+                .unwrap(),
+        )
+        .unwrap();
+        let p = db.plane("startup").unwrap();
+        let before = p.node_by_key("a").unwrap().unwrap().id;
+
+        let out = write_nodes_logic(
+            &db,
+            from_value(jval!({"on_conflict": "update", "nodes": [
+                {"external_key": "a", "labels": ["Doc"], "properties": {"title": "after"}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(out["created"], jval!([]), "nothing new was made");
+        assert_eq!(out["existing"], jval!([before.0]));
+        let node = p.node_by_key("a").unwrap().unwrap();
+        assert_eq!(node.id, before, "the id did not move");
+        assert_eq!(
+            node.properties.get("title").map(|p| &p.value),
+            Some(&PropValue::Str("after".into()))
+        );
+        assert_eq!(
+            p.neighbors(before, Dir::In, None).unwrap().len(),
+            1,
+            "the edge that pointed at it survived"
+        );
+    }
+
+    /// `skip` leaves the existing node untouched — including the properties
+    /// the second write carried.
+    #[test]
+    fn write_nodes_skip_leaves_the_existing_node_alone() {
+        let db = Database::in_memory().unwrap();
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"nodes": [
+                {"external_key": "a", "labels": ["Doc"], "properties": {"title": "before"}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let out = write_nodes_logic(
+            &db,
+            from_value(jval!({"on_conflict": "skip", "nodes": [
+                {"external_key": "a", "labels": ["Doc"], "properties": {"title": "after"}},
+                {"external_key": "fresh", "labels": ["Doc"]}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(out["created"].as_array().unwrap().len(), 1, "only `fresh`");
+        assert_eq!(out["existing"].as_array().unwrap().len(), 1);
+        let p = db.plane("startup").unwrap();
+        assert_eq!(
+            p.node_by_key("a")
+                .unwrap()
+                .unwrap()
+                .properties
+                .get("title")
+                .map(|p| &p.value),
+            Some(&PropValue::Str("before".into()))
+        );
     }
 
     /// A caller who supplied their own embedding always wins.
