@@ -294,6 +294,15 @@ bump-version old new:
     test "{{old}}" != "{{new}}" || { echo "bump: old and new are both {{new}}" >&2; exit 1; }
     # The workspace, the wire protocol's own version, and the two READMEs.
     sed -i 's/^version = "{{old}}"$/version = "{{new}}"/' Cargo.toml
+    # The versions beside the intra-workspace paths. A local build resolves
+    # these through the path and never reads them, so nothing here fails when
+    # they are stale — only `cargo publish` does, by shipping a crate that
+    # depends on the previous release. Hence the check rather than trust.
+    sed -i 's|\(path = "crates/dr-strange-[a-z]*", version = \)"{{old}}"|\1"{{new}}"|' Cargo.toml
+    if grep -qE '^dr-strange-[a-z]+ = \{ path = .*version = "{{old}}"' Cargo.toml; then
+        echo "bump: an intra-workspace dependency still names {{old}}" >&2
+        exit 1
+    fi
     sed -i 's/"version": "{{old}}",/"version": "{{new}}",/' crates/dr-strange-web/openrpc.json
     sed -i 's/drsg {{old}} is the latest release/drsg {{new}} is the latest release/' README.md README.zh.md
     # The book's `drsg update` transcript: the example moves one release on.
