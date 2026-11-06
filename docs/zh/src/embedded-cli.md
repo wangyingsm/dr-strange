@@ -29,7 +29,7 @@
 | `context \| describe \| trace \| impact \| fathom <名称> --plane` | 已图化代码平面上的智能体动词 |
 | `impact <名称> --plane [--depth] [--across [attached\|all]]` | `--across` 把半径扩到本仓库之外：本平面所附着的那些平面，或本实例持有的每一个平面 |
 | `snippet <名称 \| path:start-end> --plane` | 一个符号的源码文本，或被解析树中任一文件的某个行区间 |
-| `grep <模式> --plane [--regex] [--path]` | 在该树上做文本检索；每个命中都标出所在的符号 |
+| `grep <模式> --plane [--regex] [--path] [--all-files]` | 在该树上做文本检索，被 ignore 的文件除非指定 `--all-files` 否则不在范围内；每个命中都标出所在的符号 |
 | `traverse <键> --plane [--edge-type]` | 一跳（或数跳）之外的邻居 |
 | `history --plane [--limit]` | 平面背后的代码仓库：HEAD、分支与标签指向、变基、最新的提交 |
 | `deployed [<目标>] --plane [--ops] [--history]` | 某个运行中的东西是由哪次提交构建的，以及哪些东西在跑某次提交：通过镜像标签所携带的修订号，把运维平面连到它旁边的历史平面 |

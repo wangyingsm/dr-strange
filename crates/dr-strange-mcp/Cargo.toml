@@ -56,6 +56,10 @@ schemars = "1"
 # `grep`'s `regex: true` — the one thing a shell `rg` could do that the verb
 # could not, and the reason agents kept reaching past it.
 regex = "1"
+# The same ignore-aware walker the digest uses, so `grep` searches what the
+# graph was built from. Two walks with two notions of what the tree holds is
+# how a generated bundle came to outrank the source it was built from.
+ignore = "0.4"
 tracing.workspace = true
 
 # `relay` forwards the `Authorization` a `.mcp.json` carries, so it reads

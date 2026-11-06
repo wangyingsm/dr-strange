@@ -33,7 +33,7 @@ access, and the CLI for offline operations.
 | `context \| describe \| trace \| impact \| fathom <name> --plane` | the agent verbs over a digested code plane |
 | `impact <name> --plane [--depth] [--across [attached\|all]]` | `--across` widens the radius past this repository: the planes this one attaches, or every plane this instance holds |
 | `snippet <name \| path:start-end> --plane` | a symbol's source text, or a range of any file in the parsed tree |
-| `grep <pattern> --plane [--regex] [--path]` | text search over that tree; each hit names the symbol it falls in |
+| `grep <pattern> --plane [--regex] [--path] [--all-files]` | text search over that tree, ignored files excluded unless `--all-files`; each hit names the symbol it falls in |
 | `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
 | `history --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits |
 | `deployed [<target>] --plane [--ops] [--history]` | what commit a running thing was built from, and what runs a commit: the ops plane joined to the history beside it through the revision an image's tag carries |

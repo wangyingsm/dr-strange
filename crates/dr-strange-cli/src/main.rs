@@ -381,6 +381,11 @@ enum Command {
         /// Max matching lines (default 50, max 200).
         #[arg(long)]
         max_results: Option<usize>,
+        /// Search what `.gitignore` excludes too — build output, vendored
+        /// trees. Off by default, so the search covers what the graph was
+        /// built from.
+        #[arg(long)]
+        all_files: bool,
         /// The tree to search, when the plane records none of its own.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -1666,6 +1671,7 @@ fn run_tree_verbs(
             path,
             context,
             max_results,
+            all_files,
             root,
         } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
@@ -1685,6 +1691,7 @@ fn run_tree_verbs(
                     path,
                     context,
                     max_results,
+                    all_files: Some(all_files),
                     plane: Some(plane),
                 },
             )?;

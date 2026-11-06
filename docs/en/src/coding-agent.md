@@ -163,7 +163,7 @@ names when the plane records none of its own):
 | `context` | everything about one symbol — definition, callers with call sites, callees, references — the primary verb |
 | `search` | "I don't know the name": semantic top-k over the plane's embeddings |
 | `describe` | one symbol's properties — the lightweight node-only view |
-| `grep` | text over the watched source tree — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; bounded and counted |
+| `grep` | text over the watched source tree, docs and config as much as code — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; what the tree's ignore files exclude is left out unless `all_files`; bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
 | `impact` | blast radius: everything reaching a symbol, grouped by distance — and, asked `--across`, which other repositories the radius reaches |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |

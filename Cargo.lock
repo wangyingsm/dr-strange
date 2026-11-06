@@ -1285,6 +1285,7 @@ dependencies = [
  "dr-strange-log",
  "dr-strange-net",
  "dr-strange-parser",
+ "ignore",
  "libc",
  "mimalloc",
  "regex",

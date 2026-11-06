@@ -1289,6 +1289,12 @@ pub struct GrepReq {
     /// Max matching lines returned (default 50, capped at 200).
     #[serde(default)]
     pub max_results: Option<usize>,
+    /// Search what `.gitignore` excludes as well — build output, vendored
+    /// trees, generated bundles (default false). The graph is built from the
+    /// files the ignore rules admit, so by default this searches the same set:
+    /// a hit in a generated file is not a hit in the source it came from.
+    #[serde(default)]
+    pub all_files: Option<bool>,
     /// The plane whose symbols the hits are placed in — each hit names the
     /// symbol it falls inside, the key `context`/`snippet` take next. Unset,
     /// the plane parsed from this tree (its `synced_root`) is used.
@@ -1615,22 +1621,25 @@ fn plane_for_root<'a>(
     Ok(None)
 }
 
+/// Directories no text search of a source tree wants, ignore files or not: a
+/// build output, a dependency cache, another tool's store.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    ".codegraph",
+    ".codebase-memory",
+];
+
 fn grep_tree(
     root: &std::path::Path,
     req: &GrepReq,
     symbols: Option<&SymbolIndex>,
 ) -> anyhow::Result<String> {
-    const SKIP_DIRS: &[&str] = &[
-        ".git",
-        "target",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".venv",
-        ".codegraph",
-        ".codebase-memory",
-    ];
     const MAX_FILE: u64 = 2 * 1024 * 1024;
     let matcher = Matcher::new(req)?;
     let filter = req.path.as_deref();
@@ -1650,68 +1659,100 @@ fn grep_tree(
     let root = &root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("source tree {}: {e}", root.display()))?;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    for entry in walker(root, req, filter).build() {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
             continue;
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(meta) = entry.metadata() else { continue };
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            if meta.is_dir() {
-                if !name.starts_with('.')
-                    && !SKIP_DIRS.contains(&name.as_str())
-                    && dir_worth_entering(filter, &rel)
-                {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if !path_admits(filter, &rel) || meta.len() > MAX_FILE {
-                continue;
-            }
-            // `DirEntry::metadata` does not follow links, so a linked
-            // directory is never entered; a linked file is read only where
-            // it lands inside the tree.
-            if meta.file_type().is_symlink() {
-                let Ok(target) = contained(root, &rel) else {
-                    continue;
-                };
-                // The link's own metadata described the link; size and kind
-                // are the target's.
-                let readable = std::fs::metadata(&target)
-                    .map(|m| m.is_file() && m.len() <= MAX_FILE)
-                    .unwrap_or(false);
-                if !readable {
-                    continue;
-                }
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if !path_admits(filter, &rel) || meta.len() > MAX_FILE {
+            continue;
+        }
+        // The walk does not follow links, so a linked directory is never
+        // entered and `metadata` here described the link itself; a linked file
+        // is read only where it lands inside the tree.
+        if meta.file_type().is_symlink() {
+            let Ok(target) = contained(root, &rel) else {
                 continue;
             };
-            if bytes[..bytes.len().min(4096)].contains(&0) {
-                continue; // binary
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let lines: Vec<&str> = text.lines().collect();
-            g.file(&rel, &lines, &matcher);
-            if g.capped {
-                break;
+            // The link's own metadata described the link; size and kind are
+            // the target's.
+            let readable = std::fs::metadata(&target)
+                .map(|m| m.is_file() && m.len() <= MAX_FILE)
+                .unwrap_or(false);
+            if !readable {
+                continue;
             }
         }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if bytes[..bytes.len().min(4096)].contains(&0) {
+            continue; // binary
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        g.file(&rel, &lines, &matcher);
         if g.capped {
             break;
         }
     }
     Ok(g.finish(req))
+}
+
+/// `grep`'s walk over the attached tree, in the tree's own sorted order.
+///
+/// Ignore files are a project's own statement of what is derived rather than
+/// source, and the digest already reads them — so unless `all_files` is set
+/// this walk reads the same ones, and the graph and the text search agree on
+/// what the tree holds.
+fn walker(root: &std::path::Path, req: &GrepReq, filter: Option<&str>) -> ignore::WalkBuilder {
+    let honour_ignores = !req.all_files.unwrap_or(false);
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .git_ignore(honour_ignores)
+        .git_global(honour_ignores)
+        .git_exclude(honour_ignores)
+        .parents(honour_ignores)
+        .ignore(honour_ignores)
+        // A tree an agent was pointed at need not be a checkout for its
+        // `.gitignore` to mean what it says.
+        .require_git(false)
+        // A dotfile is source (`.gitignore`, `.rustfmt.toml`) and is searched;
+        // a dot-*directory* is some tool's own store, pruned below with the
+        // build directories.
+        .hidden(false)
+        .follow_links(false)
+        .sort_by_file_name(std::ffi::OsStr::cmp);
+    let (root, scope) = (root.to_path_buf(), filter.map(str::to_owned));
+    builder.filter_entry(move |entry| {
+        if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            return true;
+        }
+        // Depth 0 is the root itself: it is where the walk was pointed, so its
+        // own name is not a reason to refuse it.
+        if entry.depth() == 0 {
+            return true;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+            return false;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        dir_worth_entering(scope.as_deref(), &rel)
+    });
+    builder
 }
 
 /// The model half of a digest: build the providers, extract, and fold the
@@ -1938,6 +1979,14 @@ impl GrepOut<'_> {
             if let Some(f) = req.path.as_deref() {
                 self.out
                     .push_str(&format!("(searched only `{f}`; drop `path` to widen)\n"));
+            }
+            // What was not searched has to be said where the absence is read,
+            // or an ignored file reads as a file that does not exist.
+            if !req.all_files.unwrap_or(false) {
+                self.out.push_str(
+                    "(ignored files were not searched — build output, vendored trees; \
+                     `all_files: true` includes them)\n",
+                );
             }
             // A regex-shaped pattern sent to a literal search fails exactly like a
             // real absence: both say "no matches". That silence is what turns a
@@ -3133,7 +3182,10 @@ impl DrStrange {
         directory, file or `.ext`, `context: n` for surrounding lines (`-` \
         marks them, as `rg -C`). For log messages, config values, comments — \
         anything the graph does not model — and for finding where to point \
-        `context` when the name is only half known.")]
+        `context` when the name is only half known. Searches every file the \
+        tree holds, docs and config as much as code, but not what its ignore \
+        files exclude — `all_files: true` for build output and vendored \
+        trees.")]
     async fn grep(
         &self,
         Parameters(req): Parameters<GrepReq>,
@@ -5039,6 +5091,17 @@ mod grep_tests {
         assert!(out.contains("src/a.rs:2:"), "{out}");
         assert!(!out.contains("target/"), "build dirs are skipped: {out}");
         assert!(!out.contains("blob.bin"), "binaries are skipped: {out}");
+        // Sorted, depth-first: which hits survive `max_results` depends on it,
+        // so the order is part of the answer and not an accident of the walk.
+        let order: Vec<&str> = out.lines().filter(|l| l.contains(':')).collect();
+        assert!(
+            order
+                .iter()
+                .position(|l| l.starts_with("docs/c.md"))
+                .zip(order.iter().position(|l| l.starts_with("src/a.rs")))
+                .is_some_and(|(docs, src)| docs < src),
+            "{out}"
+        );
 
         let none = grep_tree(&dir, &req("absent-text"), None).unwrap();
         assert!(none.contains("no matches"));
@@ -5054,13 +5117,72 @@ mod grep_tests {
             None,
         )
         .unwrap();
-        assert!(folded.contains("src/a.rs:2:"), "{folded}");
+        assert!(folded.contains("docs/c.md:1:"), "{folded}");
         assert!(folded.contains("capped at 1"), "{folded}");
 
         assert!(
             grep_tree(&dir, &req("  "), None).is_err(),
             "empty pattern refused"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a project calls derived, this search calls derived: a generated
+    /// file is not the source it was generated from, and a hit in it buries
+    /// the hit that matters. `all_files` is how to see it anyway, and a zero
+    /// result says the rules were applied rather than letting an ignored file
+    /// read as a file that does not exist.
+    #[test]
+    fn ignored_files_are_skipped_unless_all_files_is_asked_for() {
+        let dir = tree("ignored");
+        std::fs::write(dir.join(".gitignore"), "generated/\n*.min.js\n").unwrap();
+        std::fs::create_dir_all(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("generated/page.html"), "needle rendered\n").unwrap();
+        std::fs::write(dir.join("bundle.min.js"), "needle bundled\n").unwrap();
+        std::fs::write(dir.join("src/keep.rs"), "// needle kept\n").unwrap();
+
+        let out = grep_tree(&dir, &req("needle"), None).unwrap();
+        assert!(out.contains("src/keep.rs:1:"), "{out}");
+        assert!(!out.contains("generated/page.html"), "{out}");
+        assert!(!out.contains("bundle.min.js"), "{out}");
+        // The ignore file itself is source: it is a dotfile, not a dot-dir.
+        let dotfile = grep_tree(&dir, &req("generated/"), None).unwrap();
+        assert!(dotfile.contains(".gitignore:1:"), "{dotfile}");
+
+        let all = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "needle".into(),
+                all_files: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(all.contains("generated/page.html:1:"), "{all}");
+        assert!(all.contains("bundle.min.js:1:"), "{all}");
+        // `all_files` reaches what the rules exclude, never what is not source
+        // at all: a build directory and a binary stay out either way.
+        assert!(!all.contains("target/"), "{all}");
+        assert!(!all.contains("blob.bin"), "{all}");
+
+        let none = grep_tree(&dir, &req("absent-text"), None).unwrap();
+        assert!(none.contains("ignored files were not searched"), "{none}");
+        let none_all = grep_tree(
+            &dir,
+            &GrepReq {
+                pattern: "absent-text".into(),
+                all_files: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            !none_all.contains("ignored files were not searched"),
+            "{none_all}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
