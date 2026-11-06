@@ -588,13 +588,20 @@ fn write_agent_configs_with(
     let (hooks_dir, user_has) = (machine.hooks_dir, machine.user_has);
     write_mcp_json_entry(dir, addr, token)?;
     writeln!(out, "  + wrote {}", dir.join(".mcp.json").display())?;
-    if probe_and_write_claude_hooks(dir, &hooks_dir()?, user_has(".claude"))? {
+    if let Some(kept) = probe_and_write_claude_hooks(dir, &hooks_dir()?, user_has(".claude"))? {
         writeln!(
             out,
             "  + Claude Code: hooks in {} — a shell search or read on code is \
              redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)",
             dir.join(".claude/settings.local.json").display()
         )?;
+        for backup in kept {
+            writeln!(
+                out,
+                "  ! that replaced an edited hook — the version you had is {}",
+                backup.display()
+            )?;
+        }
     }
 
     // Beyond Claude Code's `.mcp.json`, add a file for an agent this
@@ -1401,20 +1408,28 @@ fn user_has(marker: &str) -> bool {
 /// team shares. Written when Claude Code shows itself: a `.claude/` in the
 /// repository, or (`user_has_claude`) the user's own `~/.claude`. Idempotent:
 /// an entry already pointing at a script of ours is repointed, not repeated.
+///
+/// `None` when no Claude Code was found. Otherwise the `.bak` files kept for
+/// hooks whose installed body had been edited — a newer drsg still brings its
+/// own hooks, but it no longer takes someone's tuned guard with it.
 #[cfg(feature = "digest")]
 fn probe_and_write_claude_hooks(
     dir: &Path,
     hooks_dir: &Path,
     user_has_claude: bool,
-) -> Result<bool> {
+) -> Result<Option<Vec<std::path::PathBuf>>> {
     if !dir.join(".claude").is_dir() && !user_has_claude {
-        return Ok(false);
+        return Ok(None);
     }
     std::fs::create_dir_all(hooks_dir)
         .with_context(|| format!("creating {}", hooks_dir.display()))?;
     let mut scripts = Vec::with_capacity(CLAUDE_HOOKS.len());
+    let mut kept = Vec::new();
     for (name, body) in CLAUDE_HOOKS {
         let path = hooks_dir.join(name);
+        if let Some(backup) = keep_edited_hook(&path, body)? {
+            kept.push(backup);
+        }
         write_executable(&path, body)?;
         scripts.push(path);
     }
@@ -1424,7 +1439,24 @@ fn probe_and_write_claude_hooks(
     let settings = settings_dir.join("settings.local.json");
     upsert_claude_hook(&settings, "PreToolUse", Some("Bash"), &scripts[0])?;
     upsert_claude_hook(&settings, "SessionStart", None, &scripts[1])?;
-    Ok(true)
+    Ok(Some(kept))
+}
+
+/// Copy an installed hook aside when it differs from the body about to
+/// replace it, returning where it went. Nothing to keep — absent, or already
+/// what we would write — is `None`, so re-running `init` cannot overwrite a
+/// backup with the copy it made itself.
+#[cfg(feature = "digest")]
+fn keep_edited_hook(path: &Path, body: &str) -> Result<Option<std::path::PathBuf>> {
+    let Ok(installed) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    if installed == body {
+        return Ok(None);
+    }
+    let backup = path.with_extension("bak");
+    std::fs::write(&backup, installed).with_context(|| format!("writing {}", backup.display()))?;
+    Ok(Some(backup))
 }
 
 /// Write-then-rename, executable — a hook the host runs must never be seen
@@ -6030,7 +6062,11 @@ mod tests {
         assert!(!dir.join(".opencode.json").exists());
         assert!(!dir.join(".gemini").exists());
         assert!(!dir.join(".codex").exists());
-        assert!(!probe_and_write_claude_hooks(&dir, &dir.join("hooks"), false).unwrap());
+        assert!(
+            probe_and_write_claude_hooks(&dir, &dir.join("hooks"), false)
+                .unwrap()
+                .is_none()
+        );
         assert!(!dir.join(".claude").exists());
         assert!(!dir.join("hooks").exists());
 
@@ -6043,8 +6079,13 @@ mod tests {
         let dir = scratch_dir("claude-hooks");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         let hooks = dir.join("data").join("hooks");
+        let installed = |at: &Path, user_has_claude: bool| {
+            probe_and_write_claude_hooks(&dir, at, user_has_claude)
+                .unwrap()
+                .is_some()
+        };
 
-        assert!(probe_and_write_claude_hooks(&dir, &hooks, false).unwrap());
+        assert!(installed(&hooks, false));
         for (name, _) in CLAUDE_HOOKS {
             let script = hooks.join(name);
             assert!(script.is_file(), "{name} written");
@@ -6074,7 +6115,7 @@ mod tests {
 
         // Again, from a moved data directory: repointed, and still one each.
         let moved = dir.join("elsewhere").join("hooks");
-        assert!(probe_and_write_claude_hooks(&dir, &moved, true).unwrap());
+        assert!(installed(&moved, true));
         let v = read();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -6097,7 +6138,7 @@ mod tests {
             ]}}"#,
         )
         .unwrap();
-        assert!(probe_and_write_claude_hooks(&dir, &hooks, true).unwrap());
+        assert!(installed(&hooks, true));
         let v = read();
         assert_eq!(v["permissions"]["allow"][0], "Bash(git:*)");
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
@@ -6132,8 +6173,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
-        assert!(probe_and_write_claude_hooks(&dir, &spaced, true).unwrap());
+        assert!(installed(&spaced, true));
+        assert!(installed(&spaced, true));
         let v = read();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -6141,6 +6182,46 @@ mod tests {
             format!("'{}'", spaced.join("drsg-shell-guard").display())
         );
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hook someone has edited is copied aside before `init` replaces it,
+    /// and the path is reported. A hook that is already what the binary would
+    /// write is left alone, so a second `init` cannot overwrite that backup
+    /// with a copy of its own output.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn an_edited_hook_is_kept_when_init_replaces_it() {
+        let dir = scratch_dir("claude-hooks-edited");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let hooks = dir.join("data").join("hooks");
+        let install = || {
+            probe_and_write_claude_hooks(&dir, &hooks, false)
+                .unwrap()
+                .unwrap()
+        };
+        let (name, shipped) = CLAUDE_HOOKS[0];
+        let guard = hooks.join(name);
+        let backup = guard.with_extension("bak");
+
+        // A first install, and a re-run over untouched hooks, keep nothing.
+        assert!(install().is_empty());
+        assert!(!backup.exists());
+        assert!(install().is_empty());
+        assert!(!backup.exists());
+
+        // A tuned guard survives as a `.bak`, and the hook in place is the
+        // one this binary carries.
+        let mine = format!("{shipped}# a rule of my own\n");
+        std::fs::write(&guard, &mine).unwrap();
+        assert_eq!(install(), vec![backup.clone()]);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), mine);
+        assert_eq!(std::fs::read_to_string(&guard).unwrap(), shipped);
+
+        // The next `init` has nothing to keep, so the backup is still theirs.
+        assert!(install().is_empty());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), mine);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
