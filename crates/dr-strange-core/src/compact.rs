@@ -98,20 +98,72 @@ pub fn resolve(plane: &PlaneHandle<'_>, name: &str) -> Result<Resolved> {
         }
     }
     let hits = if suffix.is_empty() { contains } else { suffix };
-    Ok(match hits.len() {
-        0 => Resolved::None,
-        1 => Resolved::One(hits.into_iter().next().unwrap()),
+    // An unresolved reference is one end of a call the parser could not bind,
+    // recorded once per file that makes it — never a definition, so never an
+    // answer to "what is this". Only the definitions decide whether a name is
+    // ambiguous: one of them among a dozen stubs is an answer, not a choice.
+    // The stubs travel on so the reply can say how many there were.
+    let defined = hits.iter().filter(|n| !is_unresolved(n)).count();
+    Ok(match (defined, hits.len()) {
+        (_, 0) => Resolved::None,
+        (1, _) => Resolved::One(hits.into_iter().find(|n| !is_unresolved(n)).unwrap()),
+        (0, 1) => Resolved::One(hits.into_iter().next().unwrap()),
         _ => Resolved::Many(hits),
     })
+}
+
+/// The label a plugin gives a reference it recorded but could not bind to a
+/// definition — a placeholder for one end of a call, not a symbol.
+pub const UNRESOLVED_LABEL: &str = "UnresolvedRef";
+
+/// Whether this node is an unresolved reference rather than a definition.
+pub fn is_unresolved(n: &NodeRecord) -> bool {
+    n.labels.iter().any(|l| l == UNRESOLVED_LABEL)
 }
 
 /// The one-call reply to an ambiguous name: the candidates, one per line, so
 /// the exact-key retry costs one call. Public because every verb that
 /// resolves a name — in this crate and in the MCP layer — answers ambiguity
 /// the same way.
+///
+/// Unresolved references are counted and named as a group rather than listed:
+/// the same name unbound in eleven files is one fact about the parse, and
+/// eleven lines of it crowd out the definitions that can actually be picked.
 pub fn candidates(name: &str, hits: &[NodeRecord]) -> String {
+    let (real, unresolved): (Vec<_>, Vec<_>) = hits.iter().partition(|n| !is_unresolved(n));
+    if real.is_empty() {
+        return unresolved_only(name, &unresolved);
+    }
     let mut out = format!(
         "`{name}` is ambiguous — {} matches; call again with an exact key:\n",
+        real.len()
+    );
+    for n in real.iter().take(FIND_CAP) {
+        out.push_str(&one_line(n));
+        out.push('\n');
+    }
+    if real.len() > FIND_CAP {
+        out.push_str(&format!("… and {} more\n", real.len() - FIND_CAP));
+    }
+    if !unresolved.is_empty() {
+        out.push_str(&format!(
+            "note: {} further match(es) are unresolved references to this name — \
+             calls this parse could not bind, one per file, with no definition to \
+             read. Nothing to pick among them.\n",
+            unresolved.len()
+        ));
+    }
+    out
+}
+
+/// The reply when every match is an unresolved reference: the name is called
+/// and never defined in this plane, which is an answer and not an ambiguity.
+fn unresolved_only(name: &str, hits: &[&NodeRecord]) -> String {
+    let mut out = format!(
+        "`{name}` matches {} unresolved reference(s) in this plane and no \
+         definition — it is called here, but what it names is not parsed into \
+         this graph (a dependency, a macro's output, or a receiver this parse \
+         could not type). The call sites:\n",
         hits.len()
     );
     for n in hits.iter().take(FIND_CAP) {
@@ -121,6 +173,7 @@ pub fn candidates(name: &str, hits: &[NodeRecord]) -> String {
     if hits.len() > FIND_CAP {
         out.push_str(&format!("… and {} more\n", hits.len() - FIND_CAP));
     }
+    out.push_str("next: `grep` finds the text; `context` on the caller shows the edge\n");
     out
 }
 
@@ -610,7 +663,7 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
                 }
                 // The unresolved ledger (P1): a boundary is announced, not
                 // hidden — the reason travels on the edge.
-                if other.labels.first().map(String::as_str) == Some("UnresolvedRef")
+                if is_unresolved(&other)
                     && let Some(reason) = prop_str(&edge.properties, "_reason")
                 {
                     line.push_str(&format!("  [{reason}]"));
@@ -3652,6 +3705,69 @@ mod tests {
         let p = db.plane("code").unwrap();
         assert!(fathom(&p, "go", 1).unwrap().contains("ambiguous"));
         assert!(fathom(&p, "zzz", 1).unwrap().contains("no symbol"));
+    }
+
+    /// An unresolved reference is one end of a call the parser could not bind,
+    /// recorded once per file that makes it. Offered as a candidate it is a key
+    /// that resolves to a stub, and a dozen of them bury the definitions that
+    /// can be picked — so they stop being candidates, and are counted instead.
+    #[test]
+    fn unresolved_references_are_not_offered_as_candidates() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let props = |file: &str| {
+            let mut props = Properties::new();
+            props.insert(
+                "file".into(),
+                PropDesc::described("file", PropValue::Str(file.into())),
+            );
+            props
+        };
+        for (key, labels) in [
+            ("m::api::wrap", &["Function"][..]),
+            ("m::util::wrap", &["Function"][..]),
+            ("?::src/a.rs::wrap", &[UNRESOLVED_LABEL][..]),
+            ("?::src/b.rs::wrap", &[UNRESOLVED_LABEL][..]),
+            ("?::src/c.rs::wrap", &[UNRESOLVED_LABEL][..]),
+        ] {
+            txn.create_node_with_key(key, labels, props("src/x.rs"))
+                .unwrap();
+        }
+        // A name whose only matches are unresolved: called, never defined here.
+        for key in ["?::src/a.rs::absent", "?::src/b.rs::absent"] {
+            txn.create_node_with_key(key, &[UNRESOLVED_LABEL], props("src/x.rs"))
+                .unwrap();
+        }
+        // One definition among stubs: not ambiguous once the stubs are out.
+        txn.create_node_with_key("m::api::solo", &["Function"], props("src/x.rs"))
+            .unwrap();
+        for key in ["?::src/a.rs::solo", "?::src/b.rs::solo"] {
+            txn.create_node_with_key(key, &[UNRESOLVED_LABEL], props("src/x.rs"))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Two definitions and three stubs: the stubs are summarised, not listed,
+        // and the count is of what can be picked.
+        let out = context(&p, "wrap").unwrap();
+        assert!(out.contains("ambiguous — 2 matches"), "{out}");
+        assert!(
+            out.contains("m::api::wrap") && out.contains("m::util::wrap"),
+            "{out}"
+        );
+        assert!(!out.contains("?::src/a.rs::wrap"), "{out}");
+        assert!(out.contains("3 further match(es) are unresolved"), "{out}");
+
+        // One definition among stubs is not ambiguous at all: it resolves.
+        assert!(matches!(resolve(&p, "solo").unwrap(), Resolved::One(_)));
+
+        // All stubs: an answer about the parse, with the next call named —
+        // never "no symbol matches", which would deny the name is used here.
+        let only = context(&p, "absent").unwrap();
+        assert!(only.contains("2 unresolved reference(s)"), "{only}");
+        assert!(only.contains("no definition"), "{only}");
+        assert!(only.contains("next: `grep`"), "{only}");
     }
 
     #[test]
