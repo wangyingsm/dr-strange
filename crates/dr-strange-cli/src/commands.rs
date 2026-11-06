@@ -6145,6 +6145,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Shell commands the guard must redirect: a search or a read of code,
+    /// however it is spelled.
+    #[cfg(feature = "digest")]
+    const GUARD_REDIRECTS: &[&str] = &[
+        "rg 'fn main' crates/",
+        "grep -rn needle src",
+        "cat src/lib.rs",
+        "sed -n '10,40p' src/lib.rs",
+        "head -50 src/lib.rs",
+        "RUST_LOG=debug rg needle",
+        "rtk grep needle src",
+        "/usr/bin/grep needle x",
+        "rg needle | head",
+        "git show HEAD~3:src/lib.rs",
+        "rtk git show v1:README.md",
+        "git grep needle v1",
+        "git log -p src/a.rs",
+        "git log -L 10,20:src/a.rs",
+        "git log --patch -3",
+        // A redirect *inside a pattern* is a search, not a write: the guard
+        // used to wave anything with a `>` through.
+        "rg '>' src",
+        "grep -rn \"a -> b\" src",
+        "rg 'impl<T> Foo' src",
+        "rg \\> src",
+        "grep -rn 'x << 1' src",
+        // stderr to /dev/null is still a read.
+        "rg needle src 2>/dev/null",
+        // The hatch is an env assignment, not a substring. Searching for it,
+        // or naming it in a comment, used to turn the guard off — which made
+        // auditing this hook a way of disabling it.
+        "grep -n DRSG_RAW=1 foo.rs",
+        "rg 'DRSG_RAW=1' crates/",
+        "cat notes.md # mentions DRSG_RAW=1",
+    ];
+
+    /// Shell commands the guard must leave alone: a write, a build, a prefixed
+    /// read, and every `git` subcommand that is not a read of old code.
+    #[cfg(feature = "digest")]
+    const GUARD_PASSES: &[&str] = &[
+        "git status",
+        "git log --oneline -5",
+        "git log --pretty=oneline",
+        "git show --stat HEAD",
+        "git commit -m 'fix: the thing'",
+        "git diff HEAD~1",
+        "cargo test -p x",
+        "DRSG_RAW=1 rg needle src",
+        "RUST_LOG=debug DRSG_RAW=1 rg needle src",
+        "cat > out.txt <<'EOF'\nhello\nEOF",
+        "cat a.txt > b.txt",
+        "grep -v junk in.txt >> out.txt",
+        "cat <<EOF > notes.md\nx\nEOF",
+        "sed -i 's/a/b/' src/lib.rs",
+        "echo hi | grep h",
+        "ls -la",
+    ];
+
     /// The guard blocks a shell search or read on code and lets everything
     /// else through, by the host's exit-code protocol. Runs the real script,
     /// so it needs bash and a JSON parser (jq or python3) — skipped without.
@@ -6187,55 +6245,18 @@ mod tests {
             )
         };
 
-        for blocked in [
-            "rg 'fn main' crates/",
-            "grep -rn needle src",
-            "cat src/lib.rs",
-            "sed -n '10,40p' src/lib.rs",
-            "head -50 src/lib.rs",
-            "RUST_LOG=debug rg needle",
-            "rtk grep needle src",
-            "/usr/bin/grep needle x",
-            "rg needle | head",
-            "git show HEAD~3:src/lib.rs",
-            "rtk git show v1:README.md",
-            "git grep needle v1",
-            "git log -p src/a.rs",
-            "git log -L 10,20:src/a.rs",
-            "git log --patch -3",
-            // A redirect *inside a pattern* is a search, not a write: the
-            // guard used to wave anything with a `>` through.
-            "rg '>' src",
-            "grep -rn \"a -> b\" src",
-            "rg 'impl<T> Foo' src",
-            "rg \\> src",
-            "grep -rn 'x << 1' src",
-            // stderr to /dev/null is still a read.
-            "rg needle src 2>/dev/null",
-        ] {
+        for blocked in GUARD_REDIRECTS {
             let (code, err) = run(blocked);
             assert_eq!(code, 2, "`{blocked}` should be redirected");
             assert!(err.contains("snippet(name | path:start-end)"), "{err}");
             assert!(err.contains("recall(name | pattern, at, vs?)"), "{err}");
             assert!(err.contains("DRSG_RAW=1"), "{err}");
+            // The vocabulary comes before the blunt bypass: the first thing
+            // the message teaches is how to say why the shell is right.
+            assert!(err.contains("DRSG_RAW=notcode <command>"), "{err}");
+            assert!(err.contains("DRSG_RAW=git <command>"), "{err}");
         }
-        for allowed in [
-            "git status",
-            "git log --oneline -5",
-            "git log --pretty=oneline",
-            "git show --stat HEAD",
-            "git commit -m 'fix: the thing'",
-            "git diff HEAD~1",
-            "cargo test -p x",
-            "DRSG_RAW=1 rg needle src",
-            "cat > out.txt <<'EOF'\nhello\nEOF",
-            "cat a.txt > b.txt",
-            "grep -v junk in.txt >> out.txt",
-            "cat <<EOF > notes.md\nx\nEOF",
-            "sed -i 's/a/b/' src/lib.rs",
-            "echo hi | grep h",
-            "ls -la",
-        ] {
+        for allowed in GUARD_PASSES {
             let (code, _) = run(allowed);
             assert_eq!(code, 0, "`{allowed}` should pass");
         }
@@ -6251,6 +6272,108 @@ mod tests {
             child.stdin.take().unwrap().write_all(b"not json").unwrap();
         }
         assert_eq!(child.wait().unwrap().code(), Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The escape hatch: a named reason passes unremarked however often it is
+    /// leaned on, a reasonless one is counted, and every `DRSG_NAG_EVERY` uses
+    /// print the verbs once and reset the tally — so the retry the message
+    /// promises always goes through.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_shell_guard_counts_the_reasonless_escape_hatch() {
+        let has = |tool: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !has("bash") || !(has("jq") || has("python3")) {
+            eprintln!("bash and jq/python3 are needed to run the guard — skipping");
+            return;
+        }
+        let dir = scratch_dir("guard-hatch");
+        let script = dir.join("drsg-shell-guard");
+        write_executable(&script, CLAUDE_HOOKS[0].1).unwrap();
+        let tally = dir.join("tally");
+        std::fs::create_dir_all(&tally).unwrap();
+        let run = |command: &str, session: Option<&str>| -> (i32, String) {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("bash")
+                .arg(&script)
+                .env("TMPDIR", &tally)
+                .env("DRSG_NAG_EVERY", "3")
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut input = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+            if let Some(s) = session {
+                input["session_id"] = Value::String(s.to_string());
+            }
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        // A stated reason is never counted, however long it is leaned on.
+        for i in 0..100 {
+            let (code, _) = run("DRSG_RAW=git git log -p src/a.rs", Some("named"));
+            assert_eq!(code, 0, "use {i} of a reasoned hatch should pass");
+        }
+        for reason in ["notcode", "mine", "logs", "lag"] {
+            for _ in 0..3 {
+                let (code, _) = run(&format!("DRSG_RAW={reason} cat notes.md"), Some("named"));
+                assert_eq!(code, 0, "`{reason}` should pass unremarked");
+            }
+        }
+
+        // A reasonless one passes twice, is answered on the third, and the
+        // retry that answer promises goes through.
+        let mut nagged = 0;
+        for (i, expected) in [0, 0, 2, 0, 0, 2, 0].into_iter().enumerate() {
+            let (code, err) = run("DRSG_RAW=1 rg needle src", Some("bare"));
+            assert_eq!(code, expected, "use {i} of a reasonless hatch");
+            if code == 2 {
+                nagged += 1;
+                assert!(err.contains("3 shell reads past the graph"), "{err}");
+                assert!(err.contains("impact(name)"), "{err}");
+                assert!(err.contains("DRSG_RAW=notcode"), "{err}");
+            }
+        }
+        assert_eq!(nagged, 2);
+
+        // An unrecognised word is a reasonless hatch, not a free one — or the
+        // prefix would be as cheap as before with one more character.
+        for (i, expected) in [0, 0, 2].into_iter().enumerate() {
+            let (code, _) = run("DRSG_RAW=whatever rg needle src", Some("unknown"));
+            assert_eq!(code, expected, "use {i} of an unnamed reason");
+        }
+
+        // Only a command the guard would have blocked is counted: the prefix
+        // on a build, or on a write, says nothing about reading code.
+        for _ in 0..6 {
+            assert_eq!(run("DRSG_RAW=1 cargo build", Some("neither")).0, 0);
+            assert_eq!(run("DRSG_RAW=1 cat a.txt > b.txt", Some("neither")).0, 0);
+        }
+        assert!(!tally.join("drsg-guard-neither.count").exists());
+
+        // A payload with no session id falls back to the parent pid rather
+        // than crashing, and counts the same way.
+        for (i, expected) in [0, 0, 2].into_iter().enumerate() {
+            let (code, _) = run("DRSG_RAW=1 rg needle src", None);
+            assert_eq!(code, expected, "use {i} without a session id");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
