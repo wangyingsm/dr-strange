@@ -70,12 +70,18 @@ an agent where the graph is; the hooks tell it *when* to use it. The
 `SessionStart` hook puts the rule in the agent's context — drsg first for
 every code question, shell last — where it survives a resume and a
 compaction. The `PreToolUse` hook meets an `rg`, `grep`, `cat` or `sed -n`
-on code with the verb that answers instead, and `DRSG_RAW=1 <command>` runs
-any command untouched, for the file no plane holds. A redirect or heredoc is
-a write and passes; a search whose *pattern* holds an arrow (`rg '>'`,
-`grep "a -> b"`) is still a search and is redirected. Re-running `init` after
-the scripts' directory moved repoints the entries — only entries whose
-command is exactly one of drsg's scripts; a team's own hooks, even one named
+on code with the verb that answers instead. A leading `DRSG_RAW=<reason>`
+runs the command untouched, and naming the reason is the whole of its cost:
+`git` for history, `notcode` for docs and config, `mine` for one's own logs,
+`logs` for program output, `lag` for a file this session has edited. Bare
+`DRSG_RAW=1` is there for the case none of those names, and is counted rather
+than silent — every twenty-fifth use reprints the verbs once, then lets the
+immediate retry through (`DRSG_NAG_EVERY` sets the interval). A redirect or
+heredoc is a write and passes; a search whose *pattern* holds an arrow
+(`rg '>'`) or the hatch itself (`grep -n DRSG_RAW=1 x.rs`) is still a search
+and is redirected — only a real leading assignment is a hatch. Re-running
+`init` after the scripts' directory moved repoints the entries — only entries
+whose command is exactly one of drsg's scripts; a team's own hooks, even one named
 `my-drsg-shell-guard`, are left alone. The other hosts have no hooks; they get the same rule from the server's own MCP instructions, which
 every host places in the system prompt.
 
@@ -83,7 +89,7 @@ every host places in the system prompt.
 $ drsg init
 plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
   + wrote ./.mcp.json
-  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)
+  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=git|notcode|mine|logs|lag <command> passes unremarked; bare DRSG_RAW=1 is counted)
   + Cursor: wrote ./.cursor/mcp.json
   + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(drsg token --unhide) before launching `gemini` here)
 ```

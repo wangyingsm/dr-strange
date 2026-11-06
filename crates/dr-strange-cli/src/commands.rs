@@ -592,7 +592,8 @@ fn write_agent_configs_with(
         writeln!(
             out,
             "  + Claude Code: hooks in {} — a shell search or read on code is \
-             redirected to the drsg tools (DRSG_RAW=1 <command> runs it anyway)",
+             redirected to the drsg tools (DRSG_RAW=git|notcode|mine|logs|lag \
+             <command> passes unremarked; bare DRSG_RAW=1 is counted)",
             dir.join(".claude/settings.local.json").display()
         )?;
         for backup in kept {
@@ -1362,7 +1363,7 @@ fn probe_and_write_codex(dir: &Path, addr: &std::net::SocketAddr, user: bool) ->
 /// The MCP config tells an agent where the graph is; these tell it *when*
 /// to use it. `drsg-shell-guard` is a `PreToolUse` hook on `Bash` that meets
 /// an `rg`/`grep`/`cat`/`sed -n` on code with the verb that answers instead
-/// (`DRSG_RAW=1 <command>` runs it anyway); `drsg-session-brief` is a
+/// (a leading `DRSG_RAW=<reason>` runs it anyway); `drsg-session-brief` is a
 /// `SessionStart` hook that puts the same rule in the agent's context, where
 /// it survives a resume, a clear and a compaction. Claude Code is the host
 /// with hooks; the other hosts get the rule from the server's own MCP
