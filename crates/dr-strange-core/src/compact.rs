@@ -370,17 +370,86 @@ pub fn no_match(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     if let Some(note) = plugin_drift_note(&props) {
         out.push_str(&note);
     }
-    out.push_str(&prefix_hint(plane, name)?);
+    out.push_str(&miss_hint(plane, name)?);
     Ok(out)
 }
 
-/// The prefixes this plane's keys carry, and — when the name brought a prefix
-/// of its own that matched none of them — the fragment worth trying instead.
+/// A key's own last path segment — what a re-export offers under a shorter
+/// path, and the one part of two spellings of a single symbol that agrees.
+pub fn leaf(key: &str) -> &str {
+    let tail = key.rsplit("::").next().unwrap_or(key);
+    tail.rsplit('.').next().unwrap_or(tail)
+}
+
+/// Whether this node stands in for something the tree does not declare — the
+/// `External` label a plugin carries alongside whatever kind it proved.
+pub fn is_stand_in(n: &NodeRecord) -> bool {
+    n.labels.iter().any(|l| l == "External")
+}
+
+/// Definitions in this plane whose own last segment is `wanted`, excluding
+/// `besides` — what a shorter path was probably reaching for.
+fn declarations_named(
+    plane: &PlaneHandle<'_>,
+    wanted: &str,
+    besides: &str,
+) -> Result<Vec<NodeRecord>> {
+    let mut found: Vec<NodeRecord> = plane
+        .query()
+        .scan_all()
+        .nodes()?
+        .into_iter()
+        .filter(|n| {
+            !is_stand_in(n)
+                && !is_unresolved(n)
+                && n.external_key
+                    .as_deref()
+                    .is_some_and(|k| k != besides && leaf(k) == wanted)
+        })
+        .collect();
+    found.sort_by(|a, b| a.external_key.cmp(&b.external_key));
+    Ok(found)
+}
+
+/// What a miss is worth saying: where the name is declared under a longer key,
+/// or failing that the prefixes this plane's keys do carry.
 ///
-/// Reads keys only: the catalog would answer this too, but it scans every node
-/// *and* every edge to build label and connectivity statistics, which is not a
-/// price a mistyped name should pay.
-fn prefix_hint(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
+/// The first case is a re-export. `pub use capability::Grant` makes
+/// `ip_core::Grant` a path the source writes and the compiler accepts, while
+/// this graph keys a symbol by where it is defined — so the prefix was right,
+/// the middle was elided, and listing the prefixes answers a question nobody
+/// asked. In a workspace whose every `lib.rs` re-exports its types, that is
+/// the common miss, not the rare one.
+///
+/// Reads keys only: the catalog would answer the prefix half too, but it scans
+/// every node *and* every edge to build label and connectivity statistics,
+/// which is not a price a mistyped name should pay.
+fn miss_hint(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
+    // A path that ends in something declared here under a longer key: say
+    // where, and stop — the prefix listing below is noise once the answer is
+    // in hand. A name with a `/` in it is a file path, not a symbol path, and
+    // its last segment is an extension: `src/zzz.rs` must not go looking for
+    // everything whose key ends in `rs`.
+    if !name.contains('/') && (name.contains("::") || name.contains('.')) {
+        let declared = declarations_named(plane, leaf(name), name)?;
+        if !declared.is_empty() {
+            let mut out = format!(
+                "`{}` is declared here under a longer key — a re-export makes both \
+                 paths valid in source, and this graph keys a symbol by where it is \
+                 declared:\n",
+                leaf(name)
+            );
+            for n in declared.iter().take(FIND_CAP) {
+                out.push_str("  ");
+                out.push_str(&one_line(n));
+                out.push('\n');
+            }
+            if declared.len() > FIND_CAP {
+                out.push_str(&format!("  … and {} more\n", declared.len() - FIND_CAP));
+            }
+            return Ok(out);
+        }
+    }
     let nodes = plane.query().scan_all().nodes()?;
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for node in &nodes {
@@ -414,6 +483,56 @@ fn prefix_hint(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         _ => out.push_str("a fragment matches anywhere in a key\n"),
     }
     Ok(out)
+}
+
+/// One symbol's description and the caveats that belong to it before any edge
+/// is listed: how fresh the plane is, how the name was routed to this node,
+/// and whether the node is a stand-in for a declaration elsewhere.
+fn head(plane: &PlaneHandle<'_>, node: &NodeRecord, name: &str) -> Result<String> {
+    let mut out = describe_record(plane, node)?;
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    if let Some(note) = route_note(node, name) {
+        out.push_str(&note);
+    }
+    if let Some(note) = stand_in_note(plane, node)? {
+        out.push_str(&note);
+    }
+    Ok(out)
+}
+
+/// Where a stand-in's declaration is, when this plane holds one.
+///
+/// A `pub use` makes two paths name one symbol, and a plugin that saw only the
+/// short one minted a stand-in for it: labelled, edged, and empty. Answering
+/// about that node without saying so describes a type with no source, no doc
+/// and almost no edges — the shape of a dead symbol rather than of a
+/// re-export, and the reason an `impact` on it reads zero.
+fn stand_in_note(plane: &PlaneHandle<'_>, node: &NodeRecord) -> Result<Option<String>> {
+    if !is_stand_in(node) {
+        return Ok(None);
+    }
+    let key = node.external_key.as_deref().unwrap_or_default();
+    let declared = declarations_named(plane, leaf(key), key)?;
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    let mut out = String::from(
+        "note: this key is a stand-in — nothing in this tree declares it, so it \
+         carries no source and only the edges that named it. Counts taken from \
+         here, `impact` included, are about the stand-in and not the declaration. \
+         The declaration is in this plane; ask about it instead:\n",
+    );
+    for n in declared.iter().take(FIND_CAP) {
+        out.push_str("  ");
+        out.push_str(&one_line(n));
+        out.push('\n');
+    }
+    if declared.len() > FIND_CAP {
+        out.push_str(&format!("  … and {} more\n", declared.len() - FIND_CAP));
+    }
+    Ok(Some(out))
 }
 
 /// The honesty footer every call listing carries: what a recorded edge set
@@ -597,13 +716,7 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         Resolved::Many(hits) => return Ok(candidates(name, &hits)),
         Resolved::None => return no_match(plane, name),
     };
-    let mut out = describe_record(plane, &node)?;
-    if let Some(note) = synced_note(plane)? {
-        out.push_str(&note);
-    }
-    if let Some(note) = route_note(&node, name) {
-        out.push_str(&note);
-    }
+    let out = head(plane, &node, name)?;
 
     // Group every edge by (direction, type). CONTAINS-in is rendered as the
     // parent ("contained by"); CALLS carry their call-site lines.
@@ -3768,6 +3881,75 @@ mod tests {
         assert!(only.contains("2 unresolved reference(s)"), "{only}");
         assert!(only.contains("no definition"), "{only}");
         assert!(only.contains("next: `grep`"), "{only}");
+    }
+
+    /// A `pub use` makes two paths name one symbol while this graph keys by
+    /// where a thing is declared, so the path the source writes can miss — or,
+    /// worse, land on the stand-in a plugin minted for it. Both answers name
+    /// the declaration instead of describing an empty node or reciting the
+    /// prefixes the plane happens to hold.
+    #[test]
+    fn a_re_export_path_is_pointed_at_the_declaration() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let mut props = Properties::new();
+        props.insert(
+            "file".into(),
+            PropDesc::described("file", PropValue::Str("src/capability.rs".into())),
+        );
+        props.insert("line".into(), PropDesc::new(PropValue::Int(14)));
+        txn.create_node_with_key("ip_core::capability::Grant", &["Struct"], props)
+            .unwrap();
+        // What a plugin mints when it saw only the re-exported path: a kind, the
+        // `External` label, and nothing else.
+        txn.create_node_with_key("ip_core::Grant", &["Type", "External"], Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+
+        // The miss: the prefix was right and the middle elided, so the prefix
+        // listing is not the answer — the declaration's key is.
+        let miss = context(&p, "ip_core::other::Grant").unwrap();
+        assert!(miss.contains("no symbol matches"), "{miss}");
+        assert!(miss.contains("declared here under a longer key"), "{miss}");
+        assert!(
+            miss.contains("ip_core::capability::Grant  Struct"),
+            "{miss}"
+        );
+        assert!(!miss.contains("keys here are prefixed"), "{miss}");
+
+        // The hit on the stand-in: described, but said to be a stand-in, with
+        // the declaration named and the effect on counts stated.
+        let stub = context(&p, "ip_core::Grant").unwrap();
+        assert!(stub.contains("this key is a stand-in"), "{stub}");
+        assert!(stub.contains("`impact` included"), "{stub}");
+        assert!(
+            stub.contains("ip_core::capability::Grant  Struct"),
+            "{stub}"
+        );
+
+        // The declaration itself carries no such note.
+        let real = context(&p, "ip_core::capability::Grant").unwrap();
+        assert!(!real.contains("stand-in"), "{real}");
+
+        // A name with no path cannot be a re-export miss, and a stand-in with
+        // nothing of its name declared here says nothing extra.
+        let bare = context(&p, "Absent").unwrap();
+        assert!(!bare.contains("declared here under a longer key"), "{bare}");
+
+        // A file path is not a symbol path: its last segment is an extension,
+        // and chasing it would offer every key that ends the same way.
+        let mut file_props = Properties::new();
+        file_props.insert(
+            "file".into(),
+            PropDesc::described("file", PropValue::Str("src/capability.rs".into())),
+        );
+        let mut txn = p.write().unwrap();
+        txn.create_node_with_key("src/capability.rs", &["File"], file_props)
+            .unwrap();
+        txn.commit().unwrap();
+        let path = context(&p, "src/zzz.rs").unwrap();
+        assert!(!path.contains("declared here under a longer key"), "{path}");
     }
 
     #[test]
