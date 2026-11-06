@@ -3,15 +3,16 @@
 # by `drsg init` and pointed at from the repository's .claude/settings.local.json.
 #
 # A repository that ran `drsg init` has its graph and its source tree attached
-# to the drsg-watch MCP server, whose verbs read and search them: grep (text,
-# regex, path scope, context lines — each hit placed in its symbol), snippet
+# to the drsg-watch MCP server, whose verbs read and search them: grep (text in
+# any file the tree holds — code, docs, config alike — with regex, path scope
+# and context lines, each hit placed in its symbol), snippet
 # (a symbol's body, or any file's line range), context (what a symbol is and
 # who calls it), search (by meaning), recall (the code as it was at any commit).
 # Given both, an agent still reaches for `rg`, `sed -n` or `git show <rev>:<path>`
 # out of habit; this hook meets that habit at the moment of
 # the call and names the verb that answers instead. It is a redirect, not a
 # wall: a leading `DRSG_RAW=<reason>` runs the command untouched, and naming
-# the reason — `git`, `notcode`, `mine`, `logs`, `lag` — is the whole of its
+# the reason — `git`, `outside`, `mine`, `logs`, `lag` — is the whole of its
 # cost. Bare `DRSG_RAW=1` is there for the case none of those names.
 #
 # Blocks by the documented protocol — exit 2, the reason on stderr, which the
@@ -103,9 +104,18 @@ lead=$(printf '%s' "$bare" | sed -E \
 # and the tally reset, so the immediate retry always goes through. Silence was
 # what let the prefix stop being the exception.
 case "$lead" in
-  *DRSG_RAW=git[[:space:]]* | *DRSG_RAW=notcode[[:space:]]* | \
+  *DRSG_RAW=git[[:space:]]* | *DRSG_RAW=outside[[:space:]]* | \
   *DRSG_RAW=mine[[:space:]]* | *DRSG_RAW=logs[[:space:]]* | \
   *DRSG_RAW=lag[[:space:]]*) exit 0 ;;
+  # A retired name is corrected where it is typed, not counted as reasonless:
+  # `=notcode` claimed docs and config for the shell, and the plane holds them.
+  *DRSG_RAW=notcode[[:space:]]*)
+    cat >&2 <<'MSG'
+drsg: `=notcode` is retired — it said docs, config and markdown were the shell's,
+and the plane holds every text file in the tree, so grep and snippet answer those.
+`=outside` is the reason for a file no plane holds. Re-run with that and it passes.
+MSG
+    exit 2 ;;
   *DRSG_RAW=*)
     tally=$(tally_path)
     n=0
@@ -130,20 +140,20 @@ again:
   recall(name, at)   the code as it was at a revision
 Re-run the command exactly as it stands and it goes through. If the shell is
 genuinely the tool here, name which in the prefix instead and this will not
-ask: DRSG_RAW=notcode / =git / =mine / =logs / =lag <command>
+ask: DRSG_RAW=outside / =git / =mine / =logs / =lag <command>
 MSG
     exit 2 ;;
 esac
 
 cat >&2 <<'MSG'
 drsg: this repository's graph and source tree are attached to the drsg-watch MCP server, which reads and searches them — use its tools instead of the shell:
-  grep(pattern, path?, regex?, context?)   find text; each hit names the symbol it is in
+  grep(pattern, path?, regex?, context?)   find text in any file the tree holds — code, docs, config alike; each hit names the symbol it is in
   snippet(name | path:start-end)            a symbol's body, or a range of any file
   context(name)                             what a symbol is, who calls it, what it calls
   search(query)                             find by meaning when no name is known
   recall(name | pattern, at, vs?)           code as it was at a revision: a file, a symbol, a search, a diff
 When the shell really is the tool here, name which in the prefix and it passes unremarked:
-  DRSG_RAW=notcode <command>   docs, config, markdown, shell — nothing a plane parses
+  DRSG_RAW=outside <command>   a file no plane holds — outside this tree, or no tree attached
   DRSG_RAW=git <command>       what a commit carried, a rebase, the index — history, not the tree
   DRSG_RAW=mine <command>      my own logs and scratch files, not this repository's code
   DRSG_RAW=logs <command>      program output, not source

@@ -72,8 +72,12 @@ every code question, shell last — where it survives a resume and a
 compaction. The `PreToolUse` hook meets an `rg`, `grep`, `cat` or `sed -n`
 on code with the verb that answers instead. A leading `DRSG_RAW=<reason>`
 runs the command untouched, and naming the reason is the whole of its cost:
-`git` for history, `notcode` for docs and config, `mine` for one's own logs,
-`logs` for program output, `lag` for a file this session has edited. Bare
+`git` for history, `outside` for a file no plane holds, `mine` for one's own
+logs, `logs` for program output, `lag` for a file this session has edited.
+There is no reason for docs or config: the tree a plane attaches holds every
+text file in it, so `grep` and `snippet` answer a markdown or TOML question as
+readily as a Rust one, and the retired `=notcode` — which said otherwise — is
+corrected where it is typed rather than honoured. Bare
 `DRSG_RAW=1` is there for the case none of those names, and is counted rather
 than silent — every twenty-fifth use reprints the verbs once, then lets the
 immediate retry through (`DRSG_NAG_EVERY` sets the interval). A redirect or
@@ -89,7 +93,7 @@ every host places in the system prompt.
 $ drsg init
 plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
   + wrote ./.mcp.json
-  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=git|notcode|mine|logs|lag <command> passes unremarked; bare DRSG_RAW=1 is counted)
+  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=git|outside|mine|logs|lag <command> passes unremarked; bare DRSG_RAW=1 is counted)
   + Cursor: wrote ./.cursor/mcp.json
   + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(drsg token --unhide) before launching `gemini` here)
 ```

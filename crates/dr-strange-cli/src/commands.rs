@@ -592,7 +592,7 @@ fn write_agent_configs_with(
         writeln!(
             out,
             "  + Claude Code: hooks in {} — a shell search or read on code is \
-             redirected to the drsg tools (DRSG_RAW=git|notcode|mine|logs|lag \
+             redirected to the drsg tools (DRSG_RAW=git|outside|mine|logs|lag \
              <command> passes unremarked; bare DRSG_RAW=1 is counted)",
             dir.join(".claude/settings.local.json").display()
         )?;
@@ -6285,47 +6285,71 @@ mod tests {
         "ls -la",
     ];
 
-    /// The guard blocks a shell search or read on code and lets everything
-    /// else through, by the host's exit-code protocol. Runs the real script,
-    /// so it needs bash and a JSON parser (jq or python3) — skipped without.
+    /// Whether the guard can be driven here at all — it is a bash script that
+    /// parses its payload with jq or python3.
     #[cfg(feature = "digest")]
-    #[test]
-    fn the_shell_guard_redirects_searches_and_reads_and_nothing_else() {
+    fn guard_runnable() -> bool {
         let has = |tool: &str| {
             std::process::Command::new("sh")
                 .args(["-c", &format!("command -v {tool}")])
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        if !has("bash") || !(has("jq") || has("python3")) {
+        has("bash") && (has("jq") || has("python3"))
+    }
+
+    /// Drive the installed guard with one `PreToolUse` payload, returning its
+    /// exit code and what it wrote to stderr.
+    #[cfg(feature = "digest")]
+    fn run_guard(
+        script: &Path,
+        command: &str,
+        session: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
+        use std::io::Write as _;
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(script);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+        if let Some(id) = session {
+            input["session_id"] = Value::String(id.to_string());
+        }
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The guard blocks a shell search or read on code and lets everything
+    /// else through, by the host's exit-code protocol. Runs the real script,
+    /// so it needs bash and a JSON parser (jq or python3) — skipped without.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn the_shell_guard_redirects_searches_and_reads_and_nothing_else() {
+        if !guard_runnable() {
             eprintln!("bash and jq/python3 are needed to run the guard — skipping");
             return;
         }
         let dir = scratch_dir("guard");
         let script = dir.join("drsg-shell-guard");
         write_executable(&script, CLAUDE_HOOKS[0].1).unwrap();
-        let run = |command: &str| -> (i32, String) {
-            use std::io::Write as _;
-            let mut child = std::process::Command::new("bash")
-                .arg(&script)
-                .stdin(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let input = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.to_string().as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            (
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            )
-        };
+        let run = |command: &str| run_guard(&script, command, None, &[]);
 
         for blocked in GUARD_REDIRECTS {
             let (code, err) = run(blocked);
@@ -6335,7 +6359,7 @@ mod tests {
             assert!(err.contains("DRSG_RAW=1"), "{err}");
             // The vocabulary comes before the blunt bypass: the first thing
             // the message teaches is how to say why the shell is right.
-            assert!(err.contains("DRSG_RAW=notcode <command>"), "{err}");
+            assert!(err.contains("DRSG_RAW=outside <command>"), "{err}");
             assert!(err.contains("DRSG_RAW=git <command>"), "{err}");
         }
         for allowed in GUARD_PASSES {
@@ -6365,13 +6389,7 @@ mod tests {
     #[cfg(feature = "digest")]
     #[test]
     fn the_shell_guard_counts_the_reasonless_escape_hatch() {
-        let has = |tool: &str| {
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v {tool}")])
-                .output()
-                .is_ok_and(|o| o.status.success())
-        };
-        if !has("bash") || !(has("jq") || has("python3")) {
+        if !guard_runnable() {
             eprintln!("bash and jq/python3 are needed to run the guard — skipping");
             return;
         }
@@ -6380,40 +6398,16 @@ mod tests {
         write_executable(&script, CLAUDE_HOOKS[0].1).unwrap();
         let tally = dir.join("tally");
         std::fs::create_dir_all(&tally).unwrap();
-        let run = |command: &str, session: Option<&str>| -> (i32, String) {
-            use std::io::Write as _;
-            let mut child = std::process::Command::new("bash")
-                .arg(&script)
-                .env("TMPDIR", &tally)
-                .env("DRSG_NAG_EVERY", "3")
-                .stdin(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let mut input = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
-            if let Some(s) = session {
-                input["session_id"] = Value::String(s.to_string());
-            }
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.to_string().as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            (
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            )
-        };
+        let home = tally.to_string_lossy().into_owned();
+        let env = [("TMPDIR", home.as_str()), ("DRSG_NAG_EVERY", "3")];
+        let run = |command: &str, session: Option<&str>| run_guard(&script, command, session, &env);
 
         // A stated reason is never counted, however long it is leaned on.
         for i in 0..100 {
             let (code, _) = run("DRSG_RAW=git git log -p src/a.rs", Some("named"));
             assert_eq!(code, 0, "use {i} of a reasoned hatch should pass");
         }
-        for reason in ["notcode", "mine", "logs", "lag"] {
+        for reason in ["outside", "mine", "logs", "lag"] {
             for _ in 0..3 {
                 let (code, _) = run(&format!("DRSG_RAW={reason} cat notes.md"), Some("named"));
                 assert_eq!(code, 0, "`{reason}` should pass unremarked");
@@ -6430,10 +6424,20 @@ mod tests {
                 nagged += 1;
                 assert!(err.contains("3 shell reads past the graph"), "{err}");
                 assert!(err.contains("impact(name)"), "{err}");
-                assert!(err.contains("DRSG_RAW=notcode"), "{err}");
+                assert!(err.contains("DRSG_RAW=outside"), "{err}");
             }
         }
         assert_eq!(nagged, 2);
+
+        // `=notcode` is retired, so it is corrected rather than counted: the
+        // word said docs were the shell's, and the plane holds them.
+        for _ in 0..4 {
+            let (code, err) = run("DRSG_RAW=notcode cat notes.md", Some("retired"));
+            assert_eq!(code, 2, "a retired reason should be corrected");
+            assert!(err.contains("`=notcode` is retired"), "{err}");
+            assert!(err.contains("`=outside` is the reason"), "{err}");
+        }
+        assert!(!tally.join("drsg-guard-retired.count").exists());
 
         // An unrecognised word is a reasonless hatch, not a free one — or the
         // prefix would be as cheap as before with one more character.

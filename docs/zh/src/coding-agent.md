@@ -59,8 +59,11 @@ Trae 把项目级 MCP 放在 **Settings > Beta > Enable Project MCP** 之后，�
 的上下文——每个代码问题先问 drsg，shell 是最后手段——恢复会话和压缩上下文之后
 它仍然在。`PreToolUse` 钩子在智能体对代码执行 `rg`、`grep`、`cat` 或 `sed -n`
 的那一刻，改为指出能回答这个问题的动词。命令前加一个 `DRSG_RAW=<理由>` 即可原样
-执行，而说出理由就是它全部的代价：`git` 指历史，`notcode` 指文档与配置，`mine`
-指自己的日志，`logs` 指程序输出，`lag` 指本次会话刚改过的文件。不带理由的
+执行，而说出理由就是它全部的代价：`git` 指历史，`outside` 指任何 plane 都不持有
+的文件，`mine` 指自己的日志，`logs` 指程序输出，`lag` 指本次会话刚改过的文件。
+文档与配置没有对应的理由：plane 挂载的代码树持有其中的每一个文本文件，`grep` 和
+`snippet` 回答 markdown 或 TOML 的问题与回答 Rust 的问题一样直接，而曾经声称相反
+的 `=notcode` 已经废弃——它会在被输入的那一刻得到纠正，而不是被放行。不带理由的
 `DRSG_RAW=1` 留给以上都叫不出名字的那一种情况，并且会被计数而不是默许——每第
 二十五次重新打印一遍动词表，随后紧接着的重试照常通过（间隔由 `DRSG_NAG_EVERY`
 决定）。重定向和 heredoc 是写入，直接放行；而*模式*里带箭头（`rg '>'`）或带这个
@@ -72,7 +75,7 @@ MCP instructions 里得到同一条规则——每个宿主都会把它放进系
 $ drsg init
 plane 'myrepo' bootstrapped — serve watch pid 48213, http://127.0.0.1:51900/mcp
   + wrote ./.mcp.json
-  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=git|notcode|mine|logs|lag <command> passes unremarked; bare DRSG_RAW=1 is counted)
+  + Claude Code: hooks in ./.claude/settings.local.json — a shell search or read on code is redirected to the drsg tools (DRSG_RAW=git|outside|mine|logs|lag <command> passes unremarked; bare DRSG_RAW=1 is counted)
   + Cursor: wrote ./.cursor/mcp.json
   + Gemini CLI: wrote ./.gemini/settings.json (no token inside it — export DRSG_TOKEN=$(drsg token --unhide) before launching `gemini` here)
 ```
