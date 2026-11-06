@@ -165,7 +165,7 @@ names when the plane records none of its own):
 | `describe` | one symbol's properties — the lightweight node-only view |
 | `grep` | text over the watched source tree, docs and config as much as code — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; what the tree's ignore files exclude is left out unless `all_files`; bounded and counted |
 | `trace` | how one symbol reaches another: the shortest recorded call path |
-| `impact` | blast radius: everything reaching a symbol, grouped by distance — and, asked `--across`, which other repositories the radius reaches |
+| `impact` | blast radius: everything reaching a symbol, grouped by distance, with what the parse could not bind counted beside the total rather than in it — and, asked `--across`, which other repositories the radius reaches |
 | `fathom` | what kind of place a symbol sits in: the region within a few hops, by label and edge type, with its hubs |
 | `snippet` | a symbol's source text, or a range of a file (`path:start-end`) — the `sed -n` an agent no longer needs |
 | `recall` | the code as it was at a commit — a file, a symbol's declaration then, a search of that tree, or a diff between two revisions — the `git show` and `git log -p` an agent no longer needs |

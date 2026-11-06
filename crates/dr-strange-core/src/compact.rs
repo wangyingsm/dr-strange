@@ -384,7 +384,7 @@ pub fn leaf(key: &str) -> &str {
 /// Whether this node stands in for something the tree does not declare — the
 /// `External` label a plugin carries alongside whatever kind it proved.
 pub fn is_stand_in(n: &NodeRecord) -> bool {
-    n.labels.iter().any(|l| l == "External")
+    n.labels.iter().any(|l| l == EXTERNAL_LABEL)
 }
 
 /// Definitions in this plane whose own last segment is `wanted`, excluding
@@ -1002,6 +1002,16 @@ const IMPACT_EDGES: &[&str] = &[
     "USES_COLUMN",
 ];
 
+/// The edge a parse writes when a name is the only evidence: the source names
+/// this symbol at a site whose binding could not be proved — a call through a
+/// construct the parser does not expand, or a receiver it cannot type.
+///
+/// Deliberately absent from [`IMPACT_EDGES`]. A radius is what *would* break
+/// if a symbol changed, and a candidate is not that; counted in the total it
+/// would turn a documented lower bound into a guess. It is reported beside the
+/// total instead, which is the whole point of writing it down.
+pub const MAY_CALL: &str = "MAY_CALL";
+
 /// What one `impact` call is asked, and how far it may look.
 pub struct Impact<'a> {
     /// The plane the question is asked in.
@@ -1032,6 +1042,10 @@ pub struct Impact<'a> {
 /// INCOMING structural edges (CALLS, REFERENCES, INSTANTIATES, IMPORTS,
 /// EXTENDS, IMPLEMENTS, USES_TYPE, READS, WRITES, USES_COLUMN), grouped by
 /// distance, counts always exact even when listings elide.
+///
+/// [`MAY_CALL`] is not one of them. What a parse could not bind is counted
+/// beside the total rather than in it, so a zero radius says whether it is an
+/// absence or a boundary — see [`unproven`].
 ///
 /// With [`Impact::across`] set it then says which *other* graphs the radius
 /// reaches — the question a shared library asks, where a change is local to
@@ -1104,10 +1118,69 @@ pub fn impact(db: &Database, req: Impact<'_>) -> Result<String> {
         }
     }
     out.push_str(&format!("total affected within depth {depth}: {total}\n"));
+    out.push_str(&unproven(plane, &node, total)?);
     out.push_str(CALLS_NOTE);
     if req.across.is_some() {
         let offered = Offered::new(plane, offered)?;
         out.push_str(&across(&mut graphs, &offered)?);
+    }
+    Ok(out)
+}
+
+/// What names this symbol without proving it does: the `MAY_CALL` candidates
+/// a parse recorded, and the unresolved references that merely share its name.
+///
+/// Printed beside a radius and never inside one. The case this exists for is a
+/// zero: "nothing reaches this" and "the parse could not tell" are the same
+/// number and not the same answer, and nothing in a bare `0` lets a reader
+/// tell them apart — so a zero with either of these non-zero says which it is.
+fn unproven(plane: &PlaneHandle<'_>, node: &NodeRecord, total: usize) -> Result<String> {
+    // One hop only. A candidate is already unproven; a chain of candidates
+    // would be a guess about a guess, and counting it would say more than the
+    // parse knows.
+    let candidates = walk(
+        plane,
+        node.id,
+        Bounds {
+            dirs: INWARD,
+            ty: Some(MAY_CALL),
+            depth: 1,
+            budget: usize::MAX,
+        },
+        |_| Ok(Step::Take),
+    )?
+    .levels
+    .first()
+    .map_or(0, Vec::len);
+
+    // Scanned by label, not over the plane: the unresolved refs are a slice of
+    // it, and this runs on every radius.
+    let wanted = node.external_key.as_deref().map(leaf).unwrap_or_default();
+    let by_name = if wanted.is_empty() {
+        0
+    } else {
+        plane
+            .query()
+            .scan_label(UNRESOLVED_LABEL)
+            .nodes()?
+            .iter()
+            .filter(|n| n.external_key.as_deref().is_some_and(|k| leaf(k) == wanted))
+            .count()
+    };
+
+    let mut out = String::new();
+    if candidates > 0 {
+        out.push_str(&format!("may-call candidates: {candidates}\n"));
+    }
+    if by_name > 0 {
+        out.push_str(&format!("unresolved by name: {by_name}\n"));
+    }
+    if total == 0 && (candidates > 0 || by_name > 0) {
+        out.push_str(
+            "note: this zero is empty, not negative — nothing *recorded* reaches this \
+             symbol, while the lines above are sites that name it and whose binding this \
+             parse could not prove. `grep` the name, or `context` a candidate.\n",
+        );
     }
     Ok(out)
 }
@@ -3881,6 +3954,75 @@ mod tests {
         assert!(only.contains("2 unresolved reference(s)"), "{only}");
         assert!(only.contains("no definition"), "{only}");
         assert!(only.contains("next: `grep`"), "{only}");
+    }
+
+    /// A radius of zero is the answer that most needs qualifying: "nothing
+    /// reaches this" and "the parse could not tell" print the same `0`. The
+    /// candidates a parse did record, and the unresolved references that share
+    /// the name, are counted beside the total and never inside it.
+    #[test]
+    fn a_radius_counts_what_names_a_symbol_without_proving_it() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let props = |file: &str, line: i64| {
+            let mut props = Properties::new();
+            props.insert(
+                "file".into(),
+                PropDesc::described("file", PropValue::Str(file.into())),
+            );
+            props.insert("line".into(), PropDesc::new(PropValue::Int(line)));
+            props
+        };
+        let target = txn
+            .create_node_with_key("m::db::purge", &["Function"], props("src/db.rs", 10))
+            .unwrap();
+        let guesser = txn
+            .create_node_with_key("m::api::handle", &["Function"], props("src/api.rs", 4))
+            .unwrap();
+        let prover = txn
+            .create_node_with_key("m::api::direct", &["Function"], props("src/api.rs", 9))
+            .unwrap();
+        // Two unresolved references sharing the name, in two files.
+        for key in ["?::src/a.rs::purge", "?::src/b.rs::purge"] {
+            txn.create_node_with_key(key, &[UNRESOLVED_LABEL], props("src/a.rs", 1))
+                .unwrap();
+        }
+        txn.create_edge(guesser, target, MAY_CALL, Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+
+        // No recorded edge reaches it, but two things name it: the zero says so
+        // rather than reading as "nothing calls this".
+        let empty = radius(&db, "m::db::purge", 3).unwrap();
+        assert!(
+            empty.contains("total affected within depth 3: 0"),
+            "{empty}"
+        );
+        assert!(empty.contains("may-call candidates: 1"), "{empty}");
+        assert!(empty.contains("unresolved by name: 2"), "{empty}");
+        assert!(
+            empty.contains("this zero is empty, not negative"),
+            "{empty}"
+        );
+
+        // A real caller counts in the total; the candidate still does not, and
+        // with a non-zero total the note is not printed.
+        let mut txn = p.write().unwrap();
+        txn.create_edge(prover, target, "CALLS", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        let some = radius(&db, "m::db::purge", 3).unwrap();
+        assert!(some.contains("total affected within depth 3: 1"), "{some}");
+        assert!(some.contains("may-call candidates: 1"), "{some}");
+        assert!(!some.contains("this zero is empty"), "{some}");
+        // The candidate is not listed among what would break.
+        assert!(!some.contains("m::api::handle"), "{some}");
+
+        // A symbol nothing names at all carries neither line.
+        let quiet = radius(&db, "m::api::direct", 3).unwrap();
+        assert!(!quiet.contains("may-call candidates"), "{quiet}");
+        assert!(!quiet.contains("unresolved by name"), "{quiet}");
     }
 
     /// A `pub use` makes two paths name one symbol while this graph keys by

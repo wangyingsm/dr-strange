@@ -3224,7 +3224,10 @@ impl DrStrange {
         through incoming structural edges (CALLS, REFERENCES, INSTANTIATES, \
         IMPORTS, EXTENDS, IMPLEMENTS, USES_TYPE — so a type's radius includes \
         what is typed by it, not only what builds it), grouped by distance \
-        with exact counts. Fuzzy name; depth defaults to 3. `across` widens \
+        with exact counts. What the parse could not bind — a macro's dispatch, \
+        an untyped receiver — is counted beside the total and never in it, so a \
+        zero says whether it is an absence or a boundary. Fuzzy name; depth \
+        defaults to 3. `across` widens \
         it past this repository: with `attached` (the planes this one \
         attaches) or `all` (every plane this instance holds) the answer also \
         names the graphs the radius reaches, by the keys they already state \
