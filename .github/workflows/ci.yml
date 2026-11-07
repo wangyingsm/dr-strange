@@ -28,6 +28,16 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # `dr-strange-py` is in the workspace, and without its `extension-module`
+      # feature — which only maturin turns on — it links against whatever
+      # interpreter is installed. The runner image stopped shipping a linkable
+      # one: Python 3.12 is present, `libpython3.12.so` is not, and
+      # `cargo test --workspace` fails at the link step with
+      # `unable to find library -lpython3.12`. This action's CPython is built
+      # `--enable-shared`, which is the whole reason PyO3 projects reach for it.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (native backend)
