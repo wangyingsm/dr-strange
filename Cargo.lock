@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-core"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "criterion",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-llm"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "anydoc",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-log"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "tracing",
  "tracing-appender",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-mcp"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "anyhow",
  "dr-strange-core",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-net"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "anyhow",
  "ureq",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-parser"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "dr-strange-core",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-py"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "dr-strange-core",
  "pyo3",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "dr-strange-web"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "drsg"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "drsg-bench"
-version = "2.25.0"
+version = "2.26.0"
 dependencies = [
  "ahash",
  "anyhow",
