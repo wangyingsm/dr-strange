@@ -218,6 +218,12 @@ impl PlaneCounters {
             .map_err(|e| crate::error::Error::Corrupt(format!("counters row: {e}")))
     }
 
+    /// The postcard bytes of this row.
+    ///
+    /// # Panics
+    ///
+    /// If postcard cannot serialize them, which this shape — integers and
+    /// string-keyed counts — gives it no way to fail at.
     pub fn encode(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("counters serialize cannot fail")
     }

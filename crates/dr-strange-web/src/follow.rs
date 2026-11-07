@@ -50,7 +50,7 @@ const SNAPSHOT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// it has even started.
 pub const REPLICATION_QUEUE: usize = 1024;
 
-fn token_query(token: &Option<String>) -> String {
+fn token_query(token: Option<&str>) -> String {
     match token {
         Some(t) => format!(
             "?token={}",
@@ -61,7 +61,11 @@ fn token_query(token: &Option<String>) -> String {
 }
 
 fn ws_url(opts: &FollowOptions) -> String {
-    format!("{}/ws/wal{}", opts.upstream, token_query(&opts.token))
+    format!(
+        "{}/ws/wal{}",
+        opts.upstream,
+        token_query(opts.token.as_deref())
+    )
 }
 
 fn snapshot_url(opts: &FollowOptions) -> String {

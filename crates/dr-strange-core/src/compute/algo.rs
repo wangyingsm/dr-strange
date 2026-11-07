@@ -162,6 +162,11 @@ pub fn pagerank<R: GraphReader + ?Sized>(
 /// `(node, component)` where `component` is the smallest [`NodeId`] in the
 /// node's component (a stable, deterministic representative), plus the total
 /// component count. Rows are ordered by ascending node id.
+///
+/// # Panics
+///
+/// If a union-find root held no representative, which the loop above gives
+/// every root.
 pub fn connected_components<R: GraphReader + ?Sized>(
     reader: &R,
     label: Option<&str>,

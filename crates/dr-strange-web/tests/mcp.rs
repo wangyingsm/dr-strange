@@ -49,6 +49,8 @@ fn free_addr() -> SocketAddr {
 /// threads spawned below, after it returns.
 fn set_token_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: serialised by `Once`, and the only readers are the server threads
+    // spawned after it returns — the reasoning above, in full.
     ONCE.call_once(|| unsafe { std::env::set_var("DRSG_TOKEN", TOKEN) });
 }
 

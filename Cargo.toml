@@ -37,6 +37,24 @@ homepage = "https://github.com/wangyingsm/dr-strange"
 [workspace.lints.clippy]
 too_many_lines = "warn"
 
+# The rules below come from Google's Rust style guide, kept to the ones a lint
+# can actually decide. Most of that guide is not machine-checkable (crate
+# layout, naming, when to define a trait) and stays a review matter; six of the
+# lints it names — `ptr_arg`, `borrowed_box`, `new_without_default`,
+# `should_implement_trait`, `len_without_is_empty`, `wrong_self_convention` —
+# are warn-by-default in clippy and so were already gated by CI's `-D warnings`.
+# These seven are the ones that needed turning on.
+#
+# The last three cost nothing today. They are here to keep it that way: a lint
+# at zero is a decision that holds, where a convention only written down is one
+# the next commit can quietly drop.
+undocumented_unsafe_blocks = "warn"
+missing_panics_doc = "warn"
+ref_option = "warn"
+fn_params_excessive_bools = "warn"
+string_add_assign = "warn"
+disallowed_methods = "warn"
+
 [workspace.dependencies]
 # Every intra-workspace dependency is declared here, with a version beside the
 # path: `cargo publish` strips the path and resolves the version from the

@@ -127,6 +127,12 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+    // SAFETY: every load is bounded by `i + lanes <= n` with `n = a.len()`, so
+    // reads of `a` stay in range; the same offsets index `b`, which therefore
+    // must be at least as long as `a`. `dot` is the only caller and asserts
+    // that with `debug_assert_eq!`, so in release a shorter `b` would read out
+    // of bounds. The intrinsics themselves require avx2+fma, which `dot` gates
+    // on `is_x86_feature_detected!`.
     unsafe {
         let n = a.len();
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
@@ -260,6 +266,8 @@ fn l2sq_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2sq_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+    // SAFETY: as in [`dot_avx2`] — loads bounded by `i + lanes <= a.len()`,
+    // `b` required to be at least that long, and avx2+fma gated by the caller.
     unsafe {
         let n = a.len();
         let (pa, pb) = (a.as_ptr(), b.as_ptr());

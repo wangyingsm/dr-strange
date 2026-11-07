@@ -247,7 +247,7 @@ fn compile_hops(
             Hop::Beam(b) => steps.push(Step::ExpandBeam {
                 dir: b.dir,
                 edge_type: b.edge_type.clone(),
-                property: vector_property(&b.property),
+                property: vector_property(b.property.as_deref()),
                 query: resolve(&b.query, embedder)?,
                 metric: b.metric,
                 width: b.width,
@@ -509,10 +509,8 @@ fn unknown_column(text: &str, items: &[ProjItem]) -> String {
 const DEFAULT_VECTOR_PROPERTY: &str = "embedding";
 
 /// Resolve an optional `ON <prop>` against that convention.
-fn vector_property(property: &Option<String>) -> String {
-    property
-        .clone()
-        .unwrap_or_else(|| DEFAULT_VECTOR_PROPERTY.to_string())
+fn vector_property(property: Option<&str>) -> String {
+    property.unwrap_or(DEFAULT_VECTOR_PROPERTY).to_string()
 }
 
 /// Compile a query's source clause into a plan [`Source`]. The first node's
@@ -536,7 +534,7 @@ fn compile_source(
             k,
         } => Source::VectorTopK {
             label,
-            property: vector_property(property),
+            property: vector_property(property.as_deref()),
             query: resolve(query, embedder)?,
             metric: *metric,
             k: *k,
@@ -595,7 +593,7 @@ fn compile_hybrid(
                 weights.vector = w;
             }
             Some(VectorChannel {
-                property: vector_property(&v.property),
+                property: vector_property(v.property.as_deref()),
                 query: resolve(&v.query, embedder)?,
                 metric: v.metric,
             })

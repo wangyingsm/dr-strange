@@ -3,3 +3,9 @@
 # limit and the lint that enforces it are written in two files; changing one
 # without the other is the mistake to watch for.
 too-many-lines-threshold = 100
+
+# `catch_unwind` is prohibited outright by Google's Rust style guide, and nothing
+# here calls it. Named rather than left to habit: unwinding across it is only
+# defined when the binary is built `panic = "unwind"`, so code that relies on it
+# changes meaning under a profile this workspace does not set and may later.
+disallowed-methods = ["std::panic::catch_unwind"]

@@ -374,6 +374,11 @@ pub fn create_plane(
 }
 
 /// Reads a plane's `(name, properties)`; `None` if the plane doesn't exist.
+///
+/// # Panics
+///
+/// If the length prefix is not four bytes, which the `get(..4)` above already
+/// decided — a truncated record is an `Error::Corrupt`, not a panic.
 pub fn read_plane(txn: &dyn ReadTransaction, id: PlaneId) -> Result<Option<(String, Properties)>> {
     let Some(buf) = txn.get(TableId::Planes, &keys::plane_key(id))? else {
         return Ok(None);

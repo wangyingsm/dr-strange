@@ -145,7 +145,7 @@ pub fn run<R: GraphReader + ?Sized>(reader: &R, spec: &HybridSpec) -> Result<Vec
             hits: graph_proximity(
                 reader,
                 label,
-                &top_seeds(&vector, &keyword, g.seeds),
+                &top_seeds(vector.as_ref(), keyword.as_ref(), g.seeds),
                 g.hops,
                 g.decay,
             )?,
@@ -262,8 +262,8 @@ pub(crate) fn fuse(
 /// Seed nodes for the graph channel: the top `n` hits from each of the vector
 /// and keyword channels (each already sorted best-first), deduplicated.
 pub(crate) fn top_seeds(
-    vector: &Option<Channel>,
-    keyword: &Option<Channel>,
+    vector: Option<&Channel>,
+    keyword: Option<&Channel>,
     n: usize,
 ) -> Vec<NodeId> {
     let mut seeds: BTreeSet<NodeId> = BTreeSet::new();
@@ -401,7 +401,7 @@ mod tests {
     fn top_seeds_unions_both_channels() {
         let vector = ch(&[(1, 0.0), (2, 0.5)], false);
         let keyword = ch(&[(3, 9.0), (1, 2.0)], true);
-        let seeds = top_seeds(&Some(vector), &Some(keyword), 1);
+        let seeds = top_seeds(Some(&vector), Some(&keyword), 1);
         // top-1 of each: vector→1, keyword→3.
         assert_eq!(seeds, vec![NodeId(1), NodeId(3)]);
     }

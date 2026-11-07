@@ -534,7 +534,7 @@ fn apply_step<'r>(
         Step::Expand { dir, edge_type } => {
             let dir = *dir;
             let ty = edge_type.clone();
-            Box::new(iter.flat_map(move |rr| expand_one(reader, rr, dir, &ty)))
+            Box::new(iter.flat_map(move |rr| expand_one(reader, rr, dir, ty.as_deref())))
         }
         Step::ExpandVar {
             dir,
@@ -612,7 +612,7 @@ fn apply_step<'r>(
                 reader,
                 frontier,
                 *dir,
-                edge_type,
+                edge_type.as_deref(),
                 property,
                 query,
                 *metric,
@@ -646,7 +646,7 @@ fn expand_beam(
     reader: &dyn GraphReader,
     start: Vec<Row>,
     dir: Dir,
-    edge_type: &Option<String>,
+    edge_type: Option<&str>,
     property: &str,
     query: &[f32],
     metric: Metric,
@@ -659,10 +659,7 @@ fn expand_beam(
         // Score every neighbor of the current frontier.
         let mut candidates: Vec<(f32, Row)> = Vec::new();
         for row in &frontier {
-            for n in reader
-                .neighbors(row.head, dir, edge_type.as_deref())?
-                .iter()
-            {
+            for n in reader.neighbors(row.head, dir, edge_type)?.iter() {
                 let sim = match node_vector(reader, n.node, property)? {
                     Some(v) => metric.similarity(query, &v),
                     None => f32::NEG_INFINITY,
@@ -686,13 +683,13 @@ fn expand_one(
     reader: &dyn GraphReader,
     rr: Result<Row>,
     dir: Dir,
-    ty: &Option<String>,
+    ty: Option<&str>,
 ) -> Box<dyn Iterator<Item = Result<Row>>> {
     let row = match rr {
         Ok(r) => r,
         Err(e) => return Box::new(std::iter::once(Err(e))),
     };
-    match reader.neighbors(row.head, dir, ty.as_deref()) {
+    match reader.neighbors(row.head, dir, ty) {
         Err(e) => Box::new(std::iter::once(Err(e))),
         // Lazy: `step` is O(1) and the neighbour rows are produced on demand,
         // so a following `Limit` can stop without materialising the whole

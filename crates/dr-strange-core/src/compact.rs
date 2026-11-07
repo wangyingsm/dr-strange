@@ -106,8 +106,14 @@ pub fn resolve(plane: &PlaneHandle<'_>, name: &str) -> Result<Resolved> {
     let defined = hits.iter().filter(|n| !is_unresolved(n)).count();
     Ok(match (defined, hits.len()) {
         (_, 0) => Resolved::None,
-        (1, _) => Resolved::One(hits.into_iter().find(|n| !is_unresolved(n)).unwrap()),
-        (0, 1) => Resolved::One(hits.into_iter().next().unwrap()),
+        (1, _) => hits
+            .into_iter()
+            .find(|n| !is_unresolved(n))
+            .map_or(Resolved::None, Resolved::One),
+        (0, 1) => hits
+            .into_iter()
+            .next()
+            .map_or(Resolved::None, Resolved::One),
         _ => Resolved::Many(hits),
     })
 }

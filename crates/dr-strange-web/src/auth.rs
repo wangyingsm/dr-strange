@@ -98,7 +98,7 @@ impl SharedToken {
         self.token.is_some()
     }
 
-    fn token_ok(&self, bearer: &Option<String>) -> bool {
+    fn token_ok(&self, bearer: Option<&str>) -> bool {
         match (&self.token, bearer) {
             (Some(want), Some(got)) => ct_eq(want.as_bytes(), got.as_bytes()),
             _ => false,
@@ -114,7 +114,7 @@ impl Authorizer for SharedToken {
         //
         // A valid token authorizes any client — an SDK, curl, or the browser
         // once the token is injected into the page.
-        if self.token_ok(&creds.bearer) {
+        if self.token_ok(creds.bearer.as_deref()) {
             return true;
         }
         // Zero-config desktop: with NO token set, our own same-origin browser

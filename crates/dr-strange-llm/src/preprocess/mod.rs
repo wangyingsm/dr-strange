@@ -926,6 +926,10 @@ impl LivePlugins {
     /// nothing changed since, a fresh load otherwise. A load that fails
     /// leaves the previous plugins in place, so a half-written store is an
     /// error for this call rather than a watcher left with nothing.
+    ///
+    /// # Panics
+    ///
+    /// If nothing is loaded once the branch above has loaded it.
     pub fn current(&mut self) -> Result<&Plugins> {
         let store = Plugins::store(&self.config)?;
         let stamp = store.stamp()?;
