@@ -4,6 +4,49 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.0] - 2026-11-07
+
+Two halves of one problem, found while building a plugin that reads the SQL a
+repository writes. A parser can mint keys only for what it parses, and an edge
+onto a key no node declares fails the entire write — so when two parsers
+describe the same lines, neither can say so, and the graph was quietly the
+poorer for it in both directions at once.
+
+### Added
+
+- **`context` joins what no edge relates.** A node that records `file`, `line`
+  and `end_line` now also lists the nodes whose span holds it and the nodes its
+  span holds, under `inside (by span)` and `holds (by span)`. The occasion is an
+  SQL statement written in a Rust string literal: the statement and the function
+  around it are facts from two different parsers, each unable to name the
+  other's key, and the lines they both record are enough to tell a reader which
+  function issues which query. Reported as position and labelled as such, never
+  as an edge, because a reader who cannot tell the two apart is reading a claim
+  the graph never made.
+
+  It stays silent unless it has something to say. A pair that *any* edge already
+  relates is left to that edge, so the sections are empty for code one parser
+  read on its own — a module and its functions, a table and its columns — and
+  speak only where two parsers met. Equal extents are not containment in either
+  direction: two parsers describing the same lines is not one holding the other.
+
+### Fixed
+
+- **A declaration outranks a stand-in in either order.** When two plugins claim
+  one key, the one that parsed the real thing wins and the stand-in's extra
+  labels are absorbed into it. That was already the intent, but the rule fired
+  only when the stand-in arrived *second*. Handler order is install order, read
+  from the plugin store, which no plugin author can see or rely on — so the
+  outcome depended on the order two plugins happened to be installed in.
+
+  What it cost: a Java repository with MyBatis mappers and SQL migrations lost
+  the real `Table` and every `Column` on it — their types, their nullability,
+  their primary key — in favour of the empty stand-ins a mapper writes for the
+  tables it queries, and said so only as four collision notes. The same
+  asymmetry would have destroyed `java`'s own `Method` declarations had `xml`
+  been installed ahead of it. Node and edge counts were unchanged throughout,
+  which is why nothing looked wrong.
+
 ## [2.26.0] - 2026-11-07
 
 Another repository reported what driving the MCP server felt like from the
