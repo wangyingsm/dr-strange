@@ -1,0 +1,63 @@
+# Who reviews what, by module.
+#
+# The modules are the ones CONTRIBUTING.md lists under "Where things live", in
+# that order, so a reader comparing the two sees the same division twice rather
+# than two that have drifted apart.
+#
+# Every line names the same person today. That is a fact about who merges, not
+# a structure pretending to be one — but the lines are per module on purpose:
+# handing one over is then a one-line edit, and the file says which line.
+#
+# A module is handed over when someone has sent enough changes to it to have
+# opinions about where it should go. Sending those changes is how it happens;
+# asking first is not.
+#
+# Language plugins are not here. They live in the `extensions` repository and
+# ship as wasm components through its catalog, so this file cannot name their
+# owners — that repository's own CODEOWNERS is where they belong.
+
+# Anything no rule below claims.
+*                                   @wangyingsm
+
+# Engine — storage, cache, computation, the public API.
+/crates/dr-strange-core/            @wangyingsm
+
+# Query language — the openCypher subset.
+/crates/dr-strange-parser/          @wangyingsm
+
+# CLI — `drsg` itself, including the agent verbs.
+/crates/dr-strange-cli/             @wangyingsm
+
+# MCP server.
+/crates/dr-strange-mcp/             @wangyingsm
+
+# Web — JSON-RPC backend, dashboard, change feed.
+/crates/dr-strange-web/             @wangyingsm
+
+# LLM — embeddings, digestion, entity resolution, `ask`.
+/crates/dr-strange-llm/             @wangyingsm
+
+# Network — outbound proxy policy, shared by every requesting crate.
+/crates/dr-strange-net/             @wangyingsm
+
+# Logging — tracing setup for the binaries.
+/crates/dr-strange-log/             @wangyingsm
+
+# Python binding — PyO3, published as `drsg-embedded`.
+/crates/dr-strange-py/              @wangyingsm
+
+# SDKs — six clients over the JSON-RPC surface.
+/sdk/                               @wangyingsm
+
+# Docs — the mdBook, both editions.
+/docs/                              @wangyingsm
+
+# Benchmarks — engine comparison, accuracy, token cost.
+/benchmarks/                        @wangyingsm
+
+# The gate and the release path. A change here changes what every other
+# module is held to, so it is reviewed as its own module.
+/.github/                           @wangyingsm
+/justfile                           @wangyingsm
+/deny.toml                          @wangyingsm
+/scripts/                           @wangyingsm

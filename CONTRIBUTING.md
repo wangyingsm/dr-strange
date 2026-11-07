@@ -163,10 +163,13 @@ it prints the soft schema the plane actually holds.
 
 ## Maintainers
 
-Every module above is maintained by [@wangyingsm](https://github.com/wangyingsm).
+Every module above is maintained by [@wangyingsm](https://github.com/wangyingsm),
+and [`.github/CODEOWNERS`](.github/CODEOWNERS) says so per module, so a pull
+request reaches the right reviewer without anyone naming one.
 One name for all of them is a statement of fact rather than a structure: it is
 who reviews and merges today, and saying so is more use to a contributor than
-an empty table would be.
+an empty table would be. The file is split by module anyway, because that is
+what makes handing one over a one-line edit.
 
 That is meant to change. A module here is handed over when someone has sent
 enough changes to it to have opinions about where it should go — so the way
