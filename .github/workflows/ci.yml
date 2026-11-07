@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: mdbook
       - name: Links and EN/ZH parity
@@ -191,7 +191,7 @@ jobs:
           echo "DRSG_BIN=$GITHUB_WORKSPACE/bin/drsg" >> "$GITHUB_ENV"
       # Pinned exactly: setup-uv stopped publishing a floating major tag after
       # v7, so `@v9` does not resolve even though v9.0.0 is the latest release.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Test (drift + e2e)
         run: uv run --locked pytest -q
         working-directory: sdk/python
@@ -207,7 +207,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Pinned exactly: setup-uv stopped publishing a floating major tag after
       # v7, so `@v9` does not resolve even though v9.0.0 is the latest release.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # Against the built wheel rather than the source tree: an extension
       # module that imports from `target/` is not the thing anyone installs,
       # and the abi3 tag is part of what is being checked.
@@ -334,7 +334,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-deny,cargo-machete
       - name: Licences, advisories, sources
@@ -356,7 +356,7 @@ jobs:
             diff <(echo "$before") <(echo "$after") >&2 || true
             exit 1
           fi
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Lint
         run: uv run --locked --with ruff ruff check .
         working-directory: sdk/python
