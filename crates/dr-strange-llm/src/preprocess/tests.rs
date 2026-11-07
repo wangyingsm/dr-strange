@@ -1613,6 +1613,103 @@ mod manifests {
         }
     }
 
+    /// A declaration and a stand-in for one key meet whichever order the two
+    /// handlers run in.
+    ///
+    /// Handler order is install order, read from the plugin store, which no
+    /// plugin author can see: while this rule applied only to a stand-in
+    /// arriving second, `java` installed after `xml` lost its real `Method`
+    /// declarations to the stand-ins a MyBatis mapper writes for them.
+    #[test]
+    fn a_declaration_outranks_a_standin_in_either_order() {
+        const KEY: &str = "com.example.Mapper.find";
+
+        /// One key, minted either as the parser that read the method or as
+        /// the reader that only knows the method's name.
+        struct Mint {
+            name: &'static str,
+            ext: &'static str,
+            declares: bool,
+        }
+
+        impl Preprocessor for Mint {
+            fn manifest(&self) -> Manifest {
+                Manifest {
+                    name: self.name.into(),
+                    version: "1".into(),
+                    extensions: vec![self.ext.into()],
+                    logo: None,
+                    build: None,
+                    source: None,
+                }
+            }
+
+            fn preprocess(&self, _i: &Input<'_>, _h: &dyn Host) -> Result<Preprocessed> {
+                let mut props = dr_strange_core::Properties::new();
+                let mut extra_labels = Vec::new();
+                if self.declares {
+                    props.insert(
+                        "signature".into(),
+                        dr_strange_core::PropDesc::new(dr_strange_core::PropValue::Str(
+                            "find(Long)".into(),
+                        )),
+                    );
+                } else {
+                    extra_labels.push("Mapped".to_string());
+                    extra_labels.push("External".to_string());
+                }
+                Ok(Preprocessed {
+                    nodes: vec![DigestNode {
+                        key: KEY.into(),
+                        label: "Method".into(),
+                        extra_labels,
+                        props,
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        for declares_first in [true, false] {
+            let t = Tree::new(&format!("standin-decl-{declares_first}"));
+            t.write("a.one", "x").write("b.two", "y");
+            let plugins = Plugins::from_handlers(vec![
+                Box::new(Mint {
+                    name: "first",
+                    ext: "one",
+                    declares: declares_first,
+                }),
+                Box::new(Mint {
+                    name: "second",
+                    ext: "two",
+                    declares: !declares_first,
+                }),
+            ]);
+            let out = route_tree(&t.host(), None, &plugins).unwrap();
+            let nodes: Vec<&DigestNode> = out.nodes.iter().filter(|n| n.key == KEY).collect();
+            assert_eq!(nodes.len(), 1, "one method, one node");
+            assert!(
+                nodes[0].props.contains_key("signature"),
+                "the declaration survives, declares_first={declares_first}"
+            );
+            assert!(
+                !nodes[0].extra_labels.iter().any(|l| l == "External"),
+                "and is not left merely asserted: {:?}",
+                nodes[0].extra_labels
+            );
+            assert!(
+                nodes[0].extra_labels.iter().any(|l| l == "Mapped"),
+                "what else the stand-in asserted is kept: {:?}",
+                nodes[0].extra_labels
+            );
+            assert!(
+                out.report.collisions.is_empty(),
+                "a stand-in is not a collision: {:?}",
+                out.report.collisions
+            );
+        }
+    }
+
     /// An explicit `--handler` outranks the filename, as it outranks the
     /// extension: the operator's statement is the most explicit one there is.
     #[test]

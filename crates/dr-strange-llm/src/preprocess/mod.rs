@@ -1351,6 +1351,77 @@ fn read_one(host: &dyn Host, path: &str) -> Result<String, Option<String>> {
     Ok(format!("{SOURCE_MARKER} {path} -->\n\n{text}"))
 }
 
+/// Whether a node is a stand-in for something the handler did not parse.
+fn foreign(node: &DigestNode) -> bool {
+    node.extra_labels.iter().any(|l| l == "External")
+}
+
+/// What [`reconcile`] did with a second node under one key.
+enum Reconciled {
+    /// The node already there kept its place.
+    Kept,
+    /// A declaration replaced a stand-in, so the key changes hands.
+    Replaced,
+    /// Neither is a stand-in, so the two disagree: the caller reports it and
+    /// drops the one handed back.
+    Collided(DigestNode),
+}
+
+/// Fold a second node under one key into the first.
+///
+/// One exception to plugin-versus-plugin having no authority ordering, and it
+/// is what makes reading a build manifest worth anything: `External` is an
+/// *assertion* that the key names something outside the tree, so two handlers
+/// naming one foreign key are agreeing, not conflicting. The ts parser writes
+/// `express` because a file imports it; the manifest reader writes `express`
+/// because `package.json` declares it. That is one package, and the whole
+/// point is that they meet.
+///
+/// The declaration is the side that carries facts, so it wins **whichever
+/// order the two arrive in**. Handler order is install order, read from the
+/// plugin store, which no plugin author can see or rely on: when this rule
+/// applied only to a stand-in arriving second, installing `xml` before `java`
+/// dropped java's real `Method` declarations in favour of the stand-ins a
+/// MyBatis mapper writes for them.
+///
+/// Anything else is still a plugin bug: two parsers claiming one *declaration*
+/// have no authority ordering between them, and a key that carries its file
+/// path should not collide at all.
+fn reconcile(prev: &mut DigestNode, node: DigestNode) -> Reconciled {
+    match (foreign(prev), foreign(&node)) {
+        // Two stand-ins: keep the first, and take whatever the second knew
+        // that the first did not.
+        (true, true) => {
+            for (k, v) in node.props {
+                prev.props.entry(k).or_insert(v);
+            }
+            Reconciled::Kept
+        }
+        // A stand-in met the tree's own declaration of the same key. The
+        // declaration keeps its label and its properties; the stand-in has
+        // nothing to add but its assertion.
+        (false, true) => {
+            absorb(prev, node.extra_labels);
+            Reconciled::Kept
+        }
+        (true, false) => {
+            let standin = std::mem::replace(prev, node);
+            absorb(prev, standin.extra_labels);
+            Reconciled::Replaced
+        }
+        (false, false) => Reconciled::Collided(node),
+    }
+}
+
+/// Keep every label the stand-in asserted except the assertion itself.
+fn absorb(decl: &mut DigestNode, from: Vec<String>) {
+    let add: Vec<String> = from
+        .into_iter()
+        .filter(|l| l != "External" && !decl.extra_labels.contains(l))
+        .collect();
+    decl.extra_labels.extend(add);
+}
+
 /// Fold one handler's output into the running result.
 fn merge(
     into: &mut Preprocessed,
@@ -1362,46 +1433,26 @@ fn merge(
     for node in from.nodes {
         // Plugin-beats-model has an authority ordering; plugin-versus-plugin
         // has none, and a well-formed key carries its file path — so a
-        // collision here means a plugin bug. Keep the first and say so:
+        // collision here means a plugin bug, which [`reconcile`] tells apart
+        // from the stand-in meeting its declaration. Say it and keep going:
         // failing an entire ingest over it would be worse than reporting it.
-        if let Some(owner) = owners.get(&node.key) {
-            // One exception, and it is what makes reading a build manifest
-            // worth anything: `External` is an *assertion* that the key names
-            // something outside the tree, so two handlers naming one foreign
-            // key are agreeing, not conflicting. The ts parser writes
-            // `express` because a file imports it; the manifest reader writes
-            // `express` because `package.json` declares it. That is one
-            // package, and the whole point is that they meet.
-            //
-            // Anything else is still a plugin bug: two parsers claiming one
-            // *declaration* have no authority ordering between them, and a
-            // key that carries its file path should not collide at all.
-            let foreign = |n: &DigestNode| n.extra_labels.iter().any(|l| l == "External");
-            if foreign(&node)
-                && let Some(prev) = into.nodes.iter_mut().find(|n| n.key == node.key)
-            {
-                if foreign(prev) {
-                    // Two stand-ins: keep the first, and take whatever the
-                    // second knew that the first did not.
-                    for (k, v) in node.props {
-                        prev.props.entry(k).or_insert(v);
-                    }
-                } else {
-                    // A stand-in met the tree's own declaration of the same
-                    // key. The declaration outranks it and keeps its label;
-                    // the stand-in has nothing to add but its assertion.
-                    let add: Vec<String> = node
-                        .extra_labels
-                        .into_iter()
-                        .filter(|l| l != "External" && !prev.extra_labels.contains(l))
-                        .collect();
-                    prev.extra_labels.extend(add);
-                }
+        if let Some(owner) = owners.get(&node.key).cloned() {
+            let Some(prev) = into.nodes.iter_mut().find(|n| n.key == node.key) else {
+                into.report
+                    .collisions
+                    .push(format!("{} (kept {owner}'s, dropped {who}'s)", node.key));
                 continue;
+            };
+            match reconcile(prev, node) {
+                Reconciled::Kept => {}
+                Reconciled::Replaced => {
+                    owners.insert(prev.key.clone(), who.to_string());
+                }
+                Reconciled::Collided(node) => into
+                    .report
+                    .collisions
+                    .push(format!("{} (kept {owner}'s, dropped {who}'s)", node.key)),
             }
-            into.report
-                .collisions
-                .push(format!("{} (kept {owner}'s, dropped {who}'s)", node.key));
             continue;
         }
         owners.insert(node.key.clone(), who.to_string());
