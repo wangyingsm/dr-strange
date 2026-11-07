@@ -293,10 +293,19 @@ The point of a tool-neutral key. Same fixture, same key, same questions,
 scored by the same code — `--tool codegraph`, `--tool codebase-memory-mcp`,
 `--tool gitnexus` or `--tool text-search`.
 
-drsg 2.22.0 with the 2026-10-17 plugins, codegraph 1.6.2,
+drsg 2.27.0 with the catalog plugins of 2026-11-08, codegraph 1.6.2,
 codebase-memory-mcp 0.12.1, GitNexus 1.6.12, every fixture. The second column
 is drsg as this benchmark first scored it, before the six releases it caused —
 kept because a comparison that quietly improves one side is not one:
+
+Re-scored at 2.27.0 on 2026-11-08, five releases after the figures were first
+published at 2.22.0: every cell reproduced, drsg's and GitNexus's alike. The
+interval includes a fix to which of two declarations outranks the other, so
+the graph those releases resolve is not the graph 2.22.0 resolved — and no
+scored answer moved. The two columns this run could not refresh say their own
+version: codegraph is not installed here, and the `codebase-memory-mcp` on
+this machine is older than the 0.12.1 measured, so replacing its figures
+would have made the comparison worse rather than newer.
 
 | | drsg, first run | drsg now | codegraph | codebase-memory-mcp | GitNexus | text search |
 |---|---|---|---|---|---|---|
