@@ -160,7 +160,7 @@ names when the plane records none of its own):
 
 | Verb | The question it answers |
 |---|---|
-| `context` | everything about one symbol — definition, callers with call sites, callees, references — the primary verb |
+| `context` | everything about one symbol — definition, callers with call sites, callees, references, and what encloses it by span where no edge relates them — the primary verb |
 | `search` | "I don't know the name": semantic top-k over the plane's embeddings |
 | `describe` | one symbol's properties — the lightweight node-only view |
 | `grep` | text over the watched source tree, docs and config as much as code — literal or regex, path-scoped, with context lines; each hit names the symbol it falls in; what the tree's ignore files exclude is left out unless `all_files`; bounded and counted |

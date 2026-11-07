@@ -379,6 +379,9 @@ struct PlaneOnly {
 
 #[derive(Deserialize, JsonSchema)]
 struct GetNode {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Node id (mutually exclusive with `key`).
@@ -391,6 +394,9 @@ struct GetNode {
 struct Algo {
     /// Algorithm to run: `pagerank` | `components` | `shortest_path` | `louvain`.
     algo: String,
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Restrict the run to nodes carrying this label (and edges among them).
@@ -432,6 +438,9 @@ struct Algo {
 struct Hybrid {
     /// Query text: embedded for the vector channel, tokenized for keyword.
     query: String,
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Label scope (required when the keyword channel is used).
@@ -452,12 +461,16 @@ struct Hybrid {
     /// Per-hop decay for the graph channel (default 0.5).
     #[serde(default)]
     graph_decay: Option<f32>,
+    /// Weight of the vector channel in the fused score (default 1.0).
     #[serde(default)]
     w_vector: Option<f32>,
+    /// Weight of the BM25 keyword channel (default 1.0).
     #[serde(default)]
     w_keyword: Option<f32>,
+    /// Weight of the graph-proximity channel (default 1.0).
     #[serde(default)]
     w_graph: Option<f32>,
+    /// Rows returned after fusing the channels (default 10).
     #[serde(default)]
     k: Option<usize>,
     /// Embedding provider for the vector channel: a preset or the provider
@@ -470,6 +483,7 @@ struct Hybrid {
     /// params.
     #[serde(default)]
     key_env: Option<String>,
+    /// Embedding model override; the provider's own default otherwise.
     #[serde(default)]
     embed_model: Option<String>,
 }
@@ -478,6 +492,9 @@ struct Hybrid {
 struct Ask {
     /// A natural-language question about the graph.
     question: String,
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Return the generated plan without executing it.
@@ -499,6 +516,7 @@ struct Ask {
     /// params.
     #[serde(default)]
     key_env: Option<String>,
+    /// Chat model override; the provider's own default otherwise.
     #[serde(default)]
     model: Option<String>,
     /// Embedding provider for the find_edge/find_entity grounding tools (should
@@ -508,6 +526,7 @@ struct Ask {
     /// The same, for the embedding provider.
     #[serde(default)]
     embed_key_env: Option<String>,
+    /// Embedding model override; the provider's own default otherwise.
     #[serde(default)]
     embed_model: Option<String>,
 }
@@ -540,6 +559,9 @@ struct Digest {
     /// server files into the graph and query them back out.
     #[serde(default)]
     path: Option<String>,
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Write the result. Default `false` — a dry-run that returns the proposed
@@ -603,22 +625,30 @@ struct Digest {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct Traverse {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     pub plane: String,
     /// Start node id (or use `from_key`).
     pub from_id: Option<u64>,
+    /// Start node by external key (or use `from_id`).
     pub from_key: Option<String>,
     /// `out` (default), `in`, or `both`.
     pub direction: Option<String>,
     /// Restrict to an edge type.
     pub edge_type: Option<String>,
-    /// Min hops (default 1) and max hops (default 1) — >1 gives multi-hop.
+    /// Fewest hops a reached node may be away (default 1).
     pub min: Option<u32>,
+    /// Most hops to walk (default 1); above 1 the walk is multi-hop.
     pub max: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct Query {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// A serialized logical plan (same shape the CLI `query` accepts).
@@ -627,6 +657,9 @@ struct Query {
 
 #[derive(Deserialize, JsonSchema)]
 struct Cypher {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// A query in the openCypher-subset language, e.g.
@@ -693,8 +726,12 @@ struct NodeInput {
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteNodes {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
+    /// The nodes to create, each `{external_key?, labels, properties?}`.
     nodes: Vec<NodeInput>,
     /// What to do with a node whose `external_key` is already taken.
     #[serde(default)]
@@ -742,18 +779,25 @@ struct EdgeInput {
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteEdges {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
+    /// The edges to create, each `{src_key, dst_key, type, properties?}`;
+    /// both endpoint keys must already name a node.
     edges: Vec<EdgeInput>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct CreatePlane {
+    /// Name for the new plane; it must not already exist here.
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct DropPlane {
+    /// The plane to delete, with everything on it.
     name: String,
     /// Must be `true` — dropping a plane deletes everything on it (arch/06 §3).
     #[serde(default)]
@@ -1258,6 +1302,9 @@ fn describe_plane_logic(db: &Database, req: PlaneOnly) -> AnyResult<Value> {
 /// The compact agent verbs' shared request: a fuzzy name and a plane.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SymbolReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Symbol name: an exact key, a `::name`/`.name` suffix, or a substring.
@@ -1305,6 +1352,9 @@ pub struct GrepReq {
 /// `trace`'s request: two symbols, fuzzy like everywhere else.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct TraceReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Where the flow starts.
@@ -1331,8 +1381,13 @@ fn across_scope(asked: Option<&str>) -> AnyResult<Option<dr_strange_core::compac
 /// `impact`'s request: one symbol, how far to look, and across which graphs.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ImpactReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
+    /// The symbol whose radius to measure (fuzzy: an exact key, a
+    /// `::name`/`.name` suffix, or a substring).
     name: String,
     /// Hops of incoming structural edges to walk (default 3, max 6).
     #[serde(default)]
@@ -1358,12 +1413,16 @@ struct MountReq {
 /// `unmount`'s request: the name the mount is known by.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct UnmountReq {
+    /// The mount to stop serving, by the name it was mounted under.
     name: String,
 }
 
 /// `wire`'s request: a path or a symbol, and optionally one verb.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct WireReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// A path (`/bridge/check`), a handler, or the function making a call.
@@ -1399,6 +1458,9 @@ struct AttachReq {
 /// `detach`'s request: the name an attachment was made under.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DetachReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// The name it was attached under.
@@ -1408,6 +1470,9 @@ struct DetachReq {
 /// `attachments`' request: one plane.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AttachmentsReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// Ask each attachment served elsewhere whether it answers now, rather
@@ -1419,8 +1484,12 @@ struct AttachmentsReq {
 /// `fathom`'s request: one symbol and how wide a region around it.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct FathomReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
+    /// The symbol at the centre of the region (fuzzy, as `context` takes it).
     name: String,
     /// Hops to walk, out and in (default 2, max 6).
     #[serde(default)]
@@ -1462,6 +1531,9 @@ struct DeployedReq {
 /// `snippet`'s request: one symbol's source.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SnippetReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     pub plane: String,
     /// A symbol (fuzzy: an exact key, a `::name`/`.name` suffix, or a
@@ -1478,6 +1550,9 @@ pub struct SnippetReq {
 /// `search`'s request: free text and a plane.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchReq {
+    /// Plane to operate in. Defaults to `startup`, which is empty on a
+    /// normal install — pass the plane whose `synced_root` is this
+    /// directory, as `list_planes` reports it.
     #[serde(default = "default_plane")]
     plane: String,
     /// What to look for, in plain words — no identifier needed.
@@ -3114,10 +3189,16 @@ impl DrStrange {
     #[tool(description = "The primary code-context tool: one symbol's whole \
         neighborhood in a single call — definition, signature, doc comment, \
         fields, callers with call sites, callees, containment and every \
-        other edge, as compact text. Accepts a fuzzy name (exact key, \
-        `::name`/`.name` suffix, or substring); ambiguity returns the \
-        candidates. Use this first for any what-is/who-calls/what-calls \
-        question, before opening the file: it answers what a grep-then-read \
+        other edge, as compact text. Where two parsers described the same \
+        lines and neither could name the other's key, it also lists what \
+        holds this node and what it holds by span (`inside (by span)` / \
+        `holds (by span)`) — position, never an edge, and silent unless no \
+        edge already relates the pair: that is how an SQL statement in a \
+        string literal names the function that issues it. Accepts a fuzzy \
+        name (exact key, `::name`/`.name` suffix, or substring); ambiguity \
+        returns the candidates. Use this first for any \
+        what-is/who-calls/what-calls/what-encloses question, before \
+        opening the file: it answers what a grep-then-read \
         loop reconstructs, in one call, and `snippet` gives the body when \
         the text itself is needed. On a module or file node it lists what \
         the file defines.")]
@@ -3726,7 +3807,10 @@ impl DrStrange {
         `trace`, `impact` and `fathom` first; come here for aggregations \
         (`RETURN f.file, count(*) AS calls`), history questions over a \
         `<name>_git` plane, `AS OF` snapshots, and shapes of your own. \
-        Sources: MATCH one linear path; SEARCH (vector NEAR / BM25 MATCHING); \
+        Sources: MATCH one linear path, with no relationship variable — \
+        an edge cannot be bound, returned or filtered on yet, so \
+        `-[:TYPE]->` and never `-[r:TYPE]->`; SEARCH (vector NEAR / BM25 \
+        MATCHING); \
         HYBRID; CALL pagerank|components|shortest_path|louvain. Then WHERE, \
         RETURN var|* (records; compact text on a digested plane) or a \
         projection with count/sum/avg/min/max/collect (grouped implicitly, \

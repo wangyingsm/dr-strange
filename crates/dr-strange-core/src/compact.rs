@@ -714,8 +714,11 @@ const INWARD: &[crate::Dir] = &[crate::Dir::In];
 /// graph around it — who contains it, who calls it (with call sites), what
 /// it calls, and every other edge type grouped — so callers/callees/what-is
 /// questions are all answered by this one call, and the agent never has to
-/// choose among narrower verbs. Ambiguity returns the candidate list, which
-/// is itself the useful one-call reply.
+/// choose among narrower verbs. Last, and only where it has anything to say,
+/// what [`spanned`] finds: the nodes whose lines hold this one and the nodes
+/// its lines hold, among those no edge relates — position, labelled as
+/// position. Ambiguity returns the candidate list, which is itself the
+/// useful one-call reply.
 /// What the `by span` sections are, said once wherever one appears.
 const SPAN_NOTE: &str = "note: `by span` is position — same file, lines inside — \
      and not an edge any parser wrote. It lists only what no edge relates, \

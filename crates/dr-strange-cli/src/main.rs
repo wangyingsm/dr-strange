@@ -131,7 +131,10 @@ enum Command {
     Plane(PlaneCmd),
     /// Import JSONL nodes/edges into a plane.
     Import {
+        /// The JSONL file to read nodes and edges from.
         file: PathBuf,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// What to do when a node's external key already exists in the plane:
@@ -141,12 +144,17 @@ enum Command {
     },
     /// Export a plane as JSONL.
     Export {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
     /// Fetch one node by id or `@external-key`.
     Get {
+        /// A node id, or `@external-key` for one keyed by name.
         node: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
@@ -154,6 +162,8 @@ enum Command {
     Query {
         /// The plan as JSON, or `-` to read it from stdin.
         plan: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
@@ -195,10 +205,15 @@ enum Command {
     },
     /// One symbol's whole neighborhood in one call: definition, signature,
     /// doc, fields, callers with call sites, callees, containment and every
-    /// other edge — the primary agent verb. Fuzzy names allowed; ambiguity
+    /// other edge, plus what holds it or it holds by span where no edge
+    /// relates them — the primary agent verb. Fuzzy names allowed; ambiguity
     /// returns candidates.
     Context {
+        /// The symbol to ask about (fuzzy: an exact key, a `::name`/`.name`
+        /// suffix, or a substring).
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
@@ -206,21 +221,29 @@ enum Command {
     /// cosine top-k over the plane's `embedding` vectors, expands the best
     /// hit. Requires the plane to be vectorized.
     Search {
+        /// What to look for, in plain words; it is embedded and compared.
         query: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
         #[arg(long, default_value = "openai")]
         embed: String,
+        /// Embedding model override; the provider's own default otherwise.
         #[arg(long)]
         embed_model: Option<String>,
+        /// How many hits to return (default 8).
         #[arg(long, default_value_t = 8)]
         k: u64,
     },
     /// One symbol's content as `prop: value` lines (vectors elided) — the
-    /// lightweight node-only view; `context` adds the edges.
+    /// lightweight node-only view; `context` adds the edges and the spans.
     Describe {
+        /// The symbol to read (fuzzy, as `context` takes it).
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
@@ -228,8 +251,12 @@ enum Command {
     /// one hop per line; the reverse direction is tried and said when the
     /// forward holds nothing.
     Trace {
+        /// The symbol the path starts at (fuzzy).
         from: String,
+        /// The symbol the path should reach (fuzzy).
         to: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
@@ -240,7 +267,10 @@ enum Command {
     /// reaches, by the two keys they already state: a build coordinate this
     /// plane's manifests publish, and a symbol their source references.
     Impact {
+        /// The symbol whose radius to measure (fuzzy, as `context` takes it).
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Hops to walk (max 6).
@@ -300,13 +330,18 @@ enum Command {
     /// Stop serving a mounted database. An absent name is reported, not an
     /// error; nothing is deleted.
     Unmount {
+        /// The mount to stop serving, by the name it was mounted under.
         name: String,
+        /// The running drsg to ask, as `http://host:port`; the local `--db`
+        /// otherwise.
         #[arg(long)]
         url: Option<String>,
     },
     /// What a running drsg serves: each mounted database with its directory
     /// and planes, and every plane with the source tree it records.
     Mounts {
+        /// The running drsg to ask, as `http://host:port`; the local `--db`
+        /// otherwise.
         #[arg(long)]
         url: Option<String>,
     },
@@ -314,11 +349,15 @@ enum Command {
     Detach {
         /// The name it was attached under.
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
     },
     /// What a plane attaches, and whether each is there to be asked.
     Attachments {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Ask each attachment served elsewhere whether it answers now,
@@ -334,6 +373,8 @@ enum Command {
     Wire {
         /// A path, a handler, or the function making a call.
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Narrow a path to one method — `GET`, `post`.
@@ -349,6 +390,8 @@ enum Command {
     Snippet {
         /// A symbol (fuzzy), or `path:line` / `path:start-end`.
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Lines from the declaration down. Default: exactly the declaration.
@@ -364,6 +407,8 @@ enum Command {
     Grep {
         /// What to find. Literal text unless `--regex`.
         pattern: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Treat the pattern as a Rust regular expression.
@@ -394,6 +439,8 @@ enum Command {
     Traverse {
         /// Where to start — an external key.
         from: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// `out` (default), `in`, or `both`.
@@ -412,7 +459,10 @@ enum Command {
     /// Read one region closely: what is within a few hops of this symbol, by
     /// label and edge type, with the hubs that hold it together.
     Fathom {
+        /// The symbol at the centre of the region (fuzzy, as `context` takes it).
         name: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Hops to walk, out and in (max 6).
@@ -443,6 +493,7 @@ enum Command {
     Recall(RecallArgs),
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
+        /// One plane's catalog; every plane in the database otherwise.
         #[arg(long)]
         plane: Option<String>,
     },
@@ -453,8 +504,11 @@ enum Command {
     Hybrid {
         /// The query text (embedded for the vector channel, tokenized for keyword).
         query: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Restrict to one label; the keyword channel requires it.
         #[arg(long)]
         label: Option<String>,
         /// Embedding property to enable the vector channel (needs `digest`).
@@ -463,18 +517,22 @@ enum Command {
         /// String property to enable the BM25 keyword channel.
         #[arg(long)]
         keyword: Option<String>,
+        /// How vector similarity is measured (default cosine).
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
         /// Enable the graph-proximity channel with this many hops.
         #[arg(long)]
         graph_hops: Option<u32>,
+        /// Per-hop decay for the graph channel (default 0.5).
         #[arg(long, default_value_t = 0.5)]
         graph_decay: f32,
+        /// Rows returned after fusing the channels (default 10).
         #[arg(long, default_value_t = 10)]
         k: usize,
         /// Embedding provider for the vector channel (preset or base URL).
         #[arg(long, default_value = "openai")]
         embed: String,
+        /// Embedding model override; the provider's own default otherwise.
         #[arg(long)]
         embed_model: Option<String>,
     },
@@ -528,6 +586,8 @@ enum Command {
     Ask {
         /// The question, in plain language.
         question: String,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Show the generated plan without executing it.
@@ -562,6 +622,8 @@ enum Command {
     #[cfg(feature = "digest")]
     #[command(alias = "vec")]
     Vectorize {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Embedding provider: preset (openai/deepseek/qwen/ollama) or a base URL.
@@ -818,6 +880,8 @@ enum PlaneCmd {
 enum AlgoCmd {
     /// PageRank importance, most-important first.
     Pagerank {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Restrict to nodes carrying this label.
@@ -826,26 +890,38 @@ enum AlgoCmd {
         /// How many top-ranked nodes to print.
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Probability a walk follows an edge rather than restarting
+        /// (default 0.85).
         #[arg(long, default_value_t = 0.85)]
         damping: f64,
+        /// Most iterations to run before stopping (default 20).
         #[arg(long, default_value_t = 20)]
         max_iters: u32,
     },
     /// Weakly connected components (representative = smallest id).
     Components {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Restrict to nodes carrying this label.
         #[arg(long)]
         label: Option<String>,
+        /// How many of the largest components to print (default 50).
         #[arg(long, default_value_t = 50)]
         top: usize,
     },
     /// Weighted shortest path between two node ids.
     ShortestPath {
+        /// Node id the path starts at.
         src: u64,
+        /// Node id the path should reach.
         dst: u64,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Restrict to nodes carrying this label.
         #[arg(long)]
         label: Option<String>,
         /// Edge direction to follow.
@@ -857,10 +933,14 @@ enum AlgoCmd {
     },
     /// Louvain community detection.
     Louvain {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// Restrict to nodes carrying this label.
         #[arg(long)]
         label: Option<String>,
+        /// How many of the largest communities to print (default 50).
         #[arg(long, default_value_t = 50)]
         top: usize,
     },
@@ -910,12 +990,17 @@ enum IndexCmd {
     /// property to `embedding` — so `drsg index ensure --plane <p>` is the
     /// whole follow-up to `drsg vectorize`.
     Ensure {
+        /// The label to index, or the property when given alone.
         #[arg(value_name = "LABEL|PROPERTY", default_value = "embedding")]
         first: String,
+        /// The property to index, when a label was given first.
         #[arg(value_name = "PROPERTY")]
         second: Option<String>,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// How similarity is measured at query time (default cosine).
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
     },
@@ -923,10 +1008,14 @@ enum IndexCmd {
     /// (`LABEL PROPERTY`) index one label; one argument (`PROPERTY`) indexes
     /// every label in the plane that carries the property.
     Keyword {
+        /// The label to index, or the property when given alone.
         #[arg(value_name = "LABEL|PROPERTY")]
         first: String,
+        /// The property to index, when a label was given first.
         #[arg(value_name = "PROPERTY")]
         second: Option<String>,
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
         #[arg(long, default_value = "startup")]
         plane: String,
         /// Analyzer language (name or code, e.g. `english`/`en`, `french`/`fr`).
@@ -1011,6 +1100,8 @@ struct RecallArgs {
     /// RFC-3339) or `<rev>@{<date>}`, each optionally followed by `~n` / `^n`.
     #[arg(long)]
     at: String,
+    /// Plane to read. Defaults to `startup`, which is empty on a normal
+    /// install — name the plane this tree was digested into.
     #[arg(long, default_value = "startup")]
     plane: String,
     /// An older revision: print what changed in the name since then.
