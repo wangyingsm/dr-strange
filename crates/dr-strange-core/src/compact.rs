@@ -19,8 +19,8 @@ use crate::compute::expr::LogicOp;
 use crate::compute::plan::Step as PlanStep;
 use crate::compute::{Expr, LogicalPlan, Source};
 use crate::error::Result;
-use crate::types::{NodeRecord, PropValue, Properties};
-use std::collections::BTreeSet;
+use crate::types::{NodeId, NodeRecord, PropValue, Properties};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// How a lenient symbol lookup ended.
@@ -716,6 +716,111 @@ const INWARD: &[crate::Dir] = &[crate::Dir::In];
 /// questions are all answered by this one call, and the agent never has to
 /// choose among narrower verbs. Ambiguity returns the candidate list, which
 /// is itself the useful one-call reply.
+/// What the `by span` sections are, said once wherever one appears.
+const SPAN_NOTE: &str = "note: `by span` is position — same file, lines inside — \
+     and not an edge any parser wrote. It lists only what no edge relates, \
+     which is where two parsers described the same lines and neither could \
+     name the other's key.\n";
+
+/// The lines a node covers in one file.
+struct Span<'a> {
+    file: &'a str,
+    from: i64,
+    to: i64,
+}
+
+impl<'a> Span<'a> {
+    /// A node's span, when it records one.
+    fn of(props: &'a Properties) -> Option<Self> {
+        let file = prop_str(props, "file")?;
+        let from = prop_int(props, "line")?;
+        Some(Self {
+            file,
+            from,
+            to: prop_int(props, "end_line").unwrap_or(from).max(from),
+        })
+    }
+
+    /// Whether this span holds `other` and is wider than it. Two parsers
+    /// describing the same lines is not containment either way.
+    fn holds(&self, other: &Span<'_>) -> bool {
+        self.file == other.file
+            && self.from <= other.from
+            && self.to >= other.to
+            && (self.from < other.from || self.to > other.to)
+    }
+}
+
+/// Edge groups as titled sections, in fixed order: the named four first, then
+/// whatever edge vocabulary remains (IMPLEMENTS, EXTENDS, HAS_METHOD,
+/// IMPORTS, …) under its own name, direction marked.
+fn titled(mut groups: BTreeMap<(&'static str, String), Vec<String>>) -> Vec<(String, Vec<String>)> {
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for (title, (dir, ty)) in [
+        ("contained by", ("in", "CONTAINS")),
+        ("callers", ("in", "CALLS")),
+        ("callees", ("out", "CALLS")),
+        ("contains", ("out", "CONTAINS")),
+    ] {
+        if let Some(lines) = groups.remove(&(dir, ty.to_string())) {
+            sections.push((title.to_string(), lines));
+        }
+    }
+    for ((dir, ty), lines) in groups {
+        let arrow = if dir == "in" { "←" } else { "→" };
+        sections.push((format!("{ty} {arrow}"), lines));
+    }
+    sections
+}
+
+/// What this node's lines hold, and what holds them, among the nodes no edge
+/// relates it to.
+///
+/// Position is not an edge, and this is the only answer `context` reads from
+/// it. The reason it has to: a plugin can mint keys only for what it parses,
+/// and an edge onto a key no node declares fails the entire write — so a
+/// plugin that reads an SQL statement sitting inside a Rust function cannot
+/// say so, however plainly the two overlap. Both sides record `file`, `line`
+/// and `end_line`, which is enough to tell the reader. A pair some edge
+/// already relates is left to that edge, so this stays silent for code one
+/// parser read on its own and speaks where two parsers met.
+fn spanned(
+    plane: &PlaneHandle<'_>,
+    node: &NodeRecord,
+    related: &BTreeSet<NodeId>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let Some(span) = Span::of(&node.properties) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let (mut holds, mut inside) = (Vec::new(), Vec::new());
+    for other in plane
+        .query()
+        .scan_all()
+        .filter(Expr::Property("file".into()).eq(span.file))
+        .nodes()?
+    {
+        if other.id == node.id || related.contains(&other.id) {
+            continue;
+        }
+        let Some(theirs) = Span::of(&other.properties) else {
+            continue;
+        };
+        if span.holds(&theirs) {
+            holds.push((theirs.from, theirs.to, one_line(&other)));
+        } else if theirs.holds(&span) {
+            inside.push((theirs.from, theirs.to, one_line(&other)));
+        }
+    }
+    Ok((ordered(holds), ordered(inside)))
+}
+
+/// Spans in reading order: where they start, then the wider one first, so a
+/// nesting reads outermost down.
+fn ordered(mut spans: Vec<(i64, i64, String)>) -> Vec<String> {
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    spans.into_iter().map(|(_, _, line)| line).collect()
+}
+
 pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     let node = match resolve(plane, name)? {
         Resolved::One(n) => n,
@@ -729,13 +834,15 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
     //
     // One hop, and nothing taken: the neighborhood *is* the answer here, so
     // the walk is swept for its hops alone and no region is built.
-    use std::collections::BTreeMap;
     let mut groups: BTreeMap<(&'static str, String), Vec<String>> = BTreeMap::new();
     let mut had_calls = false;
     // How the shown call edges were bound: everything, and the ones that rest
     // on a name matched in scope. Counted over what is rendered, so the note
     // agrees with the listing above it.
     let (mut calls_shown, mut calls_by_name) = (0usize, 0usize);
+    // Everything an edge already reaches, so the span sections can say only
+    // what no edge does.
+    let mut related: BTreeSet<NodeId> = BTreeSet::new();
     walk(
         plane,
         node.id,
@@ -749,6 +856,7 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
             let (Some(other), Some(edge)) = (plane.node(hop.node)?, plane.edge(hop.edge)?) else {
                 return Ok(Step::Skip);
             };
+            related.insert(hop.node);
             let tag = if hop.dir == crate::Dir::In {
                 "in"
             } else {
@@ -793,23 +901,16 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         },
     )?;
 
-    // Sections in fixed order: the named four first, then whatever edge
-    // vocabulary remains (IMPLEMENTS, EXTENDS, HAS_METHOD, IMPORTS, …) under
-    // its own name, direction marked.
-    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-    for (title, key) in [
-        ("contained by", ("in", "CONTAINS")),
-        ("callers", ("in", "CALLS")),
-        ("callees", ("out", "CALLS")),
-        ("contains", ("out", "CONTAINS")),
-    ] {
-        if let Some(lines) = groups.remove(&(key.0, key.1.to_string())) {
+    let mut sections = titled(groups);
+
+    // Last, and marked: a reader who cannot tell an edge from an overlap is
+    // reading a claim the graph never made.
+    let (holds, inside) = spanned(plane, &node, &related)?;
+    let had_span = !holds.is_empty() || !inside.is_empty();
+    for (title, lines) in [("inside (by span)", inside), ("holds (by span)", holds)] {
+        if !lines.is_empty() {
             sections.push((title.to_string(), lines));
         }
-    }
-    for ((dir, ty), lines) in std::mem::take(&mut groups) {
-        let arrow = if dir == "in" { "←" } else { "→" };
-        sections.push((format!("{ty} {arrow}"), lines));
     }
 
     let render = |cap: usize| -> String {
@@ -827,6 +928,9 @@ pub fn context(plane: &PlaneHandle<'_>, name: &str) -> Result<String> {
         }
         if had_calls {
             buf.push_str(&calls_note(calls_shown, calls_by_name));
+        }
+        if had_span {
+            buf.push_str(SPAN_NOTE);
         }
         buf
     };
@@ -4098,6 +4202,83 @@ mod tests {
         txn.commit().unwrap();
         let path = context(&p, "src/zzz.rs").unwrap();
         assert!(!path.contains("declared here under a longer key"), "{path}");
+    }
+
+    /// A plugin can key only what it parses, so the SQL statement inside a
+    /// Rust function and the function around it are written by two parsers
+    /// that cannot name each other. Both record their lines, which is enough
+    /// to join them — and the join is reported as position, never as an edge.
+    #[test]
+    fn a_span_joins_what_no_edge_relates() {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let at = |file: &str, from: i64, to: i64| {
+            let mut props = Properties::new();
+            props.insert(
+                "file".into(),
+                PropDesc::described("file", PropValue::Str(file.into())),
+            );
+            props.insert("line".into(), PropDesc::new(PropValue::Int(from)));
+            props.insert("end_line".into(), PropDesc::new(PropValue::Int(to)));
+            props
+        };
+        let load = txn
+            .create_node_with_key("m::dao::load", &["Function"], at("src/dao.rs", 10, 20))
+            .unwrap();
+        txn.create_node_with_key("src/dao.rs:12", &["Statement"], at("src/dao.rs", 12, 13))
+            .unwrap();
+        // Inside the same lines, but an edge already says so.
+        let inner = txn
+            .create_node_with_key(
+                "m::dao::load::inner",
+                &["Function"],
+                at("src/dao.rs", 14, 16),
+            )
+            .unwrap();
+        txn.create_edge(load, inner, "CONTAINS", Properties::new())
+            .unwrap();
+        // Same file, no overlap.
+        txn.create_node_with_key("m::dao::other", &["Function"], at("src/dao.rs", 30, 40))
+            .unwrap();
+        // The same lines in another file.
+        txn.create_node_with_key("m::far::load", &["Function"], at("src/far.rs", 12, 13))
+            .unwrap();
+        // Exactly the same extent: two parsers describing one thing, which is
+        // not one holding the other.
+        txn.create_node_with_key("src/dao.rs#block", &["Block"], at("src/dao.rs", 10, 20))
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Up: the statement names the function it was written in.
+        let stmt = context(&p, "src/dao.rs:12").unwrap();
+        assert!(stmt.contains("inside (by span) (2)"), "{stmt}");
+        assert!(stmt.contains("m::dao::load  Function"), "{stmt}");
+        assert!(stmt.contains("src/dao.rs#block  Block"), "{stmt}");
+        assert!(!stmt.contains("m::dao::other"), "{stmt}");
+        assert!(!stmt.contains("m::far::load"), "{stmt}");
+        assert!(stmt.contains("`by span` is position"), "{stmt}");
+
+        // Down: the function lists the statement, and leaves to `contains`
+        // the child an edge already reaches.
+        let fun = context(&p, "m::dao::load").unwrap();
+        assert!(fun.contains("holds (by span) (1)"), "{fun}");
+        assert!(fun.contains("src/dao.rs:12  Statement"), "{fun}");
+        assert!(fun.contains("contains (1)"), "{fun}");
+        assert!(
+            !fun.split("holds (by span)")
+                .nth(1)
+                .unwrap()
+                .contains("inner"),
+            "{fun}"
+        );
+        // `#block` covers exactly the same lines as `load`: two parsers
+        // describing one thing, which is neither holding the other.
+        assert!(!fun.contains("src/dao.rs#block"), "{fun}");
+
+        // Code one parser read on its own says nothing about spans.
+        let other = context(&p, "m::dao::other").unwrap();
+        assert!(!other.contains("by span"), "{other}");
     }
 
     #[test]
