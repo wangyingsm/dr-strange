@@ -4,6 +4,81 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.26.0] - 2026-11-07
+
+Another repository reported what driving the MCP server felt like from the
+outside, and most of this release is that report. Four of its findings
+reproduced here, two of them worse than described, and they share a shape: an
+answer that was true and read as something else. A radius of zero that looked
+like "nothing calls this". A candidate list whose entries could not be picked.
+A re-export path that resolved to an empty node instead of missing honestly. A
+`grep` that searched generated output as readily as source.
+
+Pairs with the `rust` parser plugin's own release, which closes the two halves
+of this a parser owns.
+
+### Added
+
+- **A zero radius says whether it is an absence or a boundary.** `impact` now
+  prints, beside the total and never inside it, the `MAY_CALL` candidates a
+  parse recorded and the count of unresolved references that merely share the
+  symbol's name — and when the total is zero and either is not, it says so
+  outright. "Nothing reaches this" and "the parse could not tell" were the same
+  `0`, with the same honesty note under it, and nothing in the answer let a
+  reader tell them apart. That is how a symbol whose caller a `grep` finds
+  immediately came to read as dead.
+- **`MAY_CALL`, an edge for a call a parse cannot prove.** Deliberately absent
+  from the radius: what *would* break if a symbol changed is what `impact`
+  counts, and a candidate is not that — counted in the total it would turn a
+  documented lower bound into a guess. It is queryable like any other edge
+  type, so `cypher` and `traverse` reach it, and the basis of each one rides on
+  the edge rather than being inferred from its existence.
+- **A miss on a re-export path names the declaration.** `pub use
+  capability::Grant` makes `ip_core::Grant` a path the source writes and the
+  compiler accepts, while the graph keys a symbol by where it is declared — so
+  the lookup missed and the answer recited the prefixes the plane holds, which
+  answers a question nobody asked. It now names the key instead, and suppresses
+  the prefix listing when it has. A lookup that lands on a definition-less
+  stand-in says the same thing, and adds that counts taken from there are about
+  the stand-in and not the declaration.
+- **`grep` takes `all_files`** (`--all-files` on the CLI) for the cases where
+  build output is the thing being searched.
+
+### Changed
+
+- **`grep` honours the tree's ignore files by default**, and walks it with the
+  same `ignore` crate the digest uses rather than a second hand-rolled walker.
+  The graph is built from the files those rules admit, so the text search now
+  covers the same set: a hit in a generated bundle is not a hit in the source
+  it was built from, and it used to bury it. Two visible consequences, which
+  is why this is a minor and not a patch — the default result set is smaller,
+  and hits now arrive in lexicographic depth-first order, where the previous
+  order ran sibling directories backwards as an artifact of the walk. Which
+  hits survive `max_results` depends on that order, so it is now a pinned
+  contract rather than an accident.
+- **The shell guard's reason vocabulary: `=outside` replaces `=notcode`.** The
+  retired word claimed docs, config and markdown for the shell, and the plane
+  holds every text file in the tree — `grep` and `snippet` answer a markdown or
+  TOML question as readily as a Rust one. So the word routed agents to the
+  shell for precisely the searches drsg answers. `DRSG_RAW=notcode` is now
+  corrected where it is typed rather than counted as a reasonless hatch, since
+  the alternative is twenty-four silent passes before the nag mentions the new
+  name.
+
+### Fixed
+
+- **An unresolved reference is no longer offered as an ambiguity candidate.**
+  A plugin that cannot bind a call records the far end as a stub, one per file
+  that makes the call, and those stubs were competing with the definitions:
+  `context with_context` returned fifteen candidates of which eleven were the
+  same unbound name, once per file, none of them a key that resolves to
+  anything readable. Only declarations decide whether a name is ambiguous now —
+  so one declaration among a dozen stubs simply resolves — and whatever stubs
+  remain are counted in one line rather than listed. A name that matches
+  *only* stubs gets its own answer, naming the call sites and the next call to
+  make, instead of the bare "no symbol matches" that would deny the name is
+  used here at all.
+
 ## [2.25.0] - 2026-11-04
 
 A batch that overlaps what a plane already holds can now be ingested instead
