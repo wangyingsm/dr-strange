@@ -319,11 +319,13 @@ fn compile_return(
         vars,
         current: last,
     };
-    let node_rows = q
-        .ret
-        .items
-        .iter()
-        .any(|i| matches!(i, ReturnItem::Star | ReturnItem::Var(_)));
+    // A relationship variable is a *value*, not a row: `RETURN r` projects a
+    // column, so only `*` and node variables keep the rows themselves.
+    let node_rows = q.ret.items.iter().any(|i| match i {
+        ReturnItem::Star => true,
+        ReturnItem::Var(v) => !vars.rels.contains_key(v.as_str()),
+        _ => false,
+    });
     if node_rows && q.ret.items.len() > 1 {
         return Err(
             "RETURN mixes a node with columns of values; a node isn't a value, \
@@ -336,12 +338,6 @@ fn compile_return(
     }
 
     if let Some(ReturnItem::Var(v)) = q.ret.items.first() {
-        if vars.rels.contains_key(v.as_str()) {
-            return Err(format!(
-                "returning a relationship (`{v}`) isn't supported yet — project its \
-                 values instead (`RETURN {v}._confidence, type({v})`)"
-            ));
-        }
         let slot = *vars
             .nodes
             .get(v.as_str())
@@ -411,8 +407,14 @@ fn projection(
                     },
                 )
             }
-            // Excluded by the caller: these are what `node_rows` matched on.
-            ReturnItem::Star | ReturnItem::Var(_) => unreachable!("node RETURN"),
+            // A relationship is a value, so it projects as one column named
+            // after the variable. Node variables never reach here — they are
+            // what `node_rows` matched on.
+            ReturnItem::Var(v) => match scope.hop_of(v) {
+                Some(hop) => ProjItem::value(v.clone(), scope.read_hop(hop, Expr::EdgeValue)),
+                None => unreachable!("a node RETURN never projects"),
+            },
+            ReturnItem::Star => unreachable!("a node RETURN never projects"),
         });
     }
     let order_by = order_columns(&q.order_by, &items, embedder, params, scope)?;

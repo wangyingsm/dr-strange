@@ -26,8 +26,8 @@ pub use algo::{
 pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};
 pub use exec::{Row, Table};
 pub use expr::{
-    Binding, BindingNeed, Expr, at_edge, at_node, distance, edge_dir, edge_type, ep, external_key,
-    has_label, hops, lit, node_id, p, score, similarity,
+    Binding, BindingNeed, Expr, at_edge, at_node, distance, edge_dir, edge_type, edge_value, ep,
+    external_key, has_label, hops, lit, node_id, p, score, similarity,
 };
 pub use hybrid::{
     GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, VectorChannel,

@@ -4,9 +4,9 @@
 
 use dr_strange_core::{
     Agg, AggFunc, Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
-    Metric, NodeId, NodeRef, ProjItem, PropValue, SortKey, Source, Step, TupleSortKey,
-    VectorChannel, at_edge, at_node, distance, edge_dir, edge_type, ep, external_key, has_label,
-    hops, lit, p, score, similarity,
+    Metric, NodeId, NodeRef, ProjItem, Projection, PropValue, SortKey, Source, Step, TupleSortKey,
+    VectorChannel, at_edge, at_node, distance, edge_dir, edge_type, edge_value, ep, external_key,
+    has_label, hops, lit, p, score, similarity,
 };
 use dr_strange_parser::{
     Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
@@ -1793,9 +1793,32 @@ fn a_relationship_variable_is_refused_where_it_could_not_name_one_edge() {
 }
 
 #[test]
-fn returning_a_relationship_points_at_its_values() {
-    let said = unsupported("MATCH (a:P)-[r:R]->(b) RETURN r");
-    assert!(said.contains("type(r)"), "{said}");
+fn returning_a_relationship_projects_it_as_a_column() {
+    // A relationship is a value, not a row, so `RETURN r` is a projection of
+    // one column named after the variable — not node records.
+    let p = plan("MATCH (a:P)-[r:R]->(b) RETURN r");
+    assert_eq!(
+        p.project,
+        Some(Projection {
+            items: vec![ProjItem::value("r", at_edge(0, edge_value()))],
+            distinct: false,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        })
+    );
+
+    // It mixes with its own values and with folds over them, which a node
+    // variable cannot do.
+    assert!(parse("MATCH (a:P)-[r:R]->(b) RETURN r, r._confidence").is_ok());
+    assert!(parse("MATCH (a:P)-[r:R]->(b) RETURN type(r) AS t, count(*) AS n").is_ok());
+    // DISTINCT and ORDER BY work over it: a map has a total order.
+    assert!(parse("MATCH (a:P)-[r:R]->(b) RETURN DISTINCT r").is_ok());
+
+    // A node and a relationship together is still the refused mix: one is a
+    // row, the other a value.
+    let said = unsupported("MATCH (a:P)-[r:R]->(b) RETURN b, r");
+    assert!(said.contains("isn't a value"), "{said}");
 }
 
 #[test]
