@@ -3864,9 +3864,10 @@ impl DrStrange {
         `trace`, `impact` and `fathom` first; come here for aggregations \
         (`RETURN f.file, count(*) AS calls`), history questions over a \
         `<name>_git` plane, `AS OF` snapshots, and shapes of your own. \
-        Sources: MATCH one linear path, with no relationship variable — \
-        an edge cannot be bound, returned or filtered on yet, so \
-        `-[:TYPE]->` and never `-[r:TYPE]->`; SEARCH (vector NEAR / BM25 \
+        Sources: MATCH one linear path, binding a relationship where you \
+        need its own facts — `-[r:CALLS]->` then `r._confidence`, `type(r)`, \
+        `direction(r)`, or `RETURN r` for the whole edge as a map (one hop \
+        per variable, so not on a `*1..3`); SEARCH (vector NEAR / BM25 \
         MATCHING); \
         HYBRID; CALL pagerank|components|shortest_path|louvain. Then WHERE, \
         RETURN var|* (records; compact text on a digested plane) or a \
@@ -3880,7 +3881,9 @@ impl DrStrange {
         DELETE or REMOVE destroys and requires `confirm: true`, as drop_plane \
         does; CREATE/MERGE/SET do not. Examples: `MATCH (f:Fn)-[:CALLS]->(g:Fn) WHERE key(g) = \"m::run\" \
         RETURN f`; `MATCH (f:Fn)-[:CALLS]->(g:Fn) RETURN f.file, count(*) \
-        AS calls ORDER BY calls DESC LIMIT 10`.")]
+        AS calls ORDER BY calls DESC LIMIT 10`; which calls were inferred \
+        rather than written: `MATCH (f:Fn)-[r:CALLS]->(g:Fn) WHERE \
+        r._confidence < 1.0 RETURN g.name, r._resolved_by`.")]
     async fn cypher(
         &self,
         Parameters(req): Parameters<Cypher>,
