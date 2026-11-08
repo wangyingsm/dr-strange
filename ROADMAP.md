@@ -25,6 +25,21 @@ overlays PageRank size / community + component colour / shortest-path highlight
 onto the graph plot). (Follow-ups: subgraph/seeded scoping and optional
 property-materialization of scores; SDK regeneration from the new OpenRPC entry.)
 
+**Open: `toposort` in the dashboard** (issue #98). The algorithm and the RPC
+arm exist; the Explore view's "Analyze" bar does not offer it. It needs more
+than another entry in that menu, which is why it is not done yet:
+
+- An **edge-type input**, since an order is a statement about one relation.
+  The existing overlays read every edge, so this is the bar's first control
+  that changes which edges an algorithm sees at all.
+- **Colour by `generation`**, not by category. The component/community overlay
+  assigns an arbitrary colour per group; generation is ordered, so it wants a
+  sequential ramp, with the legend reading as a scale rather than a key — the
+  point being to see at a glance which nodes can run together.
+- **A cyclic plane answers with an error**, not an empty overlay. The node it
+  names is on the cycle, so the view should select and centre it: that node is
+  the whole reason the question failed.
+
 **Goal.** A library of classic graph algorithms exposed as first-class
 operations: **PageRank / centrality** (node importance), **shortest path**
 (weighted Dijkstra / A\*), **community detection** (Louvain — clustering for
