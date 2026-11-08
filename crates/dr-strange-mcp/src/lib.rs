@@ -32,9 +32,9 @@ use tokio::sync::Semaphore;
 use anyhow::Result as AnyResult;
 use dr_strange_core::attach::Remote;
 use dr_strange_core::{
-    BulkNode, Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions, TopoOrder,
-    TopoSortOptions, json,
+    AlgoBuilder, BulkNode, CyclesOptions, Database, Dir, HybridWeights, LogicalPlan,
+    LouvainOptions, Metric, NodeId, PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties,
+    ShortestPathOptions, TopoOrder, TopoSortOptions, json,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -394,7 +394,7 @@ struct GetNode {
 #[derive(Deserialize, JsonSchema)]
 struct Algo {
     /// Algorithm to run: `pagerank` | `components` | `shortest_path` |
-    /// `louvain` | `toposort`.
+    /// `louvain` | `toposort` | `cycles`.
     algo: String,
     /// Plane to operate in. Defaults to `startup`, which is empty on a
     /// normal install — pass the plane whose `synced_root` is this
@@ -435,8 +435,8 @@ struct Algo {
     /// Louvain minimum modularity gain to move a node.
     #[serde(default)]
     min_gain: Option<f64>,
-    /// toposort: the one edge type that claims the order (default: every
-    /// type, which an unrelated edge can then turn into a false cycle).
+    /// toposort/cycles: the one edge type to follow (default: every type,
+    /// which an unrelated edge can then turn into a false cycle).
     #[serde(default)]
     edge_type: Option<String>,
 }
@@ -2273,31 +2273,8 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
                 .collect();
             Ok(jval!({ "algo": "louvain", "results": results, "count": count }))
         }
-        "toposort" => {
-            let opts = TopoSortOptions {
-                dir: parse_dir(req.dir.as_deref()),
-                edge_type: req.edge_type.clone(),
-            };
-            match builder.toposort(&opts)? {
-                TopoOrder::Sorted(order) => {
-                    let count = order.len();
-                    let results: Vec<Value> = order
-                        .into_iter()
-                        .enumerate()
-                        .take(limit)
-                        .map(|(i, t)| {
-                            jval!({ "id": t.node.0, "order": i, "generation": t.generation })
-                        })
-                        .collect();
-                    Ok(jval!({ "algo": "toposort", "results": results, "count": count }))
-                }
-                // A truncated order reads as a complete one, so the cycle is
-                // the answer, not a shorter list.
-                TopoOrder::Cyclic(node) => {
-                    anyhow::bail!("no topological order: node {} is on a cycle", node.0)
-                }
-            }
-        }
+        "toposort" => algo_toposort(&builder, &req, limit),
+        "cycles" => algo_cycles(&builder, &req, limit),
         "shortest_path" => {
             let (Some(src), Some(dst)) = (req.src, req.dst) else {
                 anyhow::bail!("shortest_path requires `src` and `dst`");
@@ -2317,9 +2294,50 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
             Ok(jval!({ "algo": "shortest_path", "found": path.is_some(), "path": path }))
         }
         other => anyhow::bail!(
-            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain|toposort)"
+            "unknown algo `{other}` \
+             (expected pagerank|components|shortest_path|louvain|toposort|cycles)"
         ),
     }
+}
+
+/// The `toposort` arm of [`algo_logic`].
+fn algo_toposort(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> AnyResult<Value> {
+    let opts = TopoSortOptions {
+        dir: parse_dir(req.dir.as_deref()),
+        edge_type: req.edge_type.clone(),
+    };
+    match builder.toposort(&opts)? {
+        TopoOrder::Sorted(order) => {
+            let count = order.len();
+            let results: Vec<Value> = order
+                .into_iter()
+                .enumerate()
+                .take(limit)
+                .map(|(i, t)| jval!({ "id": t.node.0, "order": i, "generation": t.generation }))
+                .collect();
+            Ok(jval!({ "algo": "toposort", "results": results, "count": count }))
+        }
+        // A truncated order reads as a complete one, so the cycle is the
+        // answer, not a shorter list.
+        TopoOrder::Cyclic(node) => {
+            anyhow::bail!("no topological order: node {} is on a cycle", node.0)
+        }
+    }
+}
+
+/// The `cycles` arm of [`algo_logic`]. `limit` caps the search itself, so
+/// `count` is what was reported rather than what the graph holds.
+fn algo_cycles(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> AnyResult<Value> {
+    let opts = CyclesOptions {
+        edge_type: req.edge_type.clone(),
+        limit,
+    };
+    let results: Vec<Value> = builder
+        .cycles(&opts)?
+        .into_iter()
+        .map(|cycle| jval!({ "cycle": cycle.iter().map(|n| n.0).collect::<Vec<_>>() }))
+        .collect();
+    Ok(jval!({ "algo": "cycles", "count": results.len(), "results": results }))
 }
 
 fn hybrid_logic(db: &Database, req: Hybrid, allow: Option<&EmbedProvider>) -> AnyResult<Value> {
@@ -3786,10 +3804,13 @@ impl DrStrange {
         weighted Dijkstra with optional `dir` out|in|both and numeric edge \
         `weight` property; returns {found, path:{nodes, edges, cost}}), \
         `louvain` (community detection; [{id, community}] + community count), \
-        or `toposort` (dependency order over one `edge_type`, `dir` out|in; \
+        `toposort` (dependency order over one `edge_type`, `dir` out|in; \
         returns [{id, order, generation}] + count, where generation is depth, \
         so one generation can run in parallel — a cyclic scope is an error \
-        naming a node on the cycle, never a partial order). \
+        naming a node on the cycle, never a partial order), or `cycles` \
+        (returns [{cycle:[id,…,id]}] + count, each list closing its own loop; \
+        count 0 means the scope is a DAG, and `limit: 1` asks only whether \
+        there is a cycle and where). \
         `limit` caps the ranked/labelled rows (default 100).")]
     async fn algo(
         &self,
@@ -4672,6 +4693,11 @@ mod tests {
         assert_eq!(topo["results"][0]["id"], jval!(1)); // d0 cites, so it comes first
         assert_eq!(topo["results"][0]["order"], jval!(0));
         assert_eq!(topo["results"][1]["generation"], jval!(1));
+
+        // The fixture is a DAG, which is the answer `cycles` exists to give.
+        let none = algo_logic(&db, from_value(jval!({"algo": "cycles"})).unwrap()).unwrap();
+        assert_eq!(none["count"], jval!(0));
+        assert_eq!(none["results"], jval!([]));
 
         // Missing endpoints and unknown algo are tool-level errors.
         assert!(algo_logic(&db, from_value(jval!({"algo": "shortest_path"})).unwrap()).is_err());
