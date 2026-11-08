@@ -810,7 +810,7 @@
     },
     {
       "name": "plane.algo",
-      "summary": "Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot.",
+      "summary": "Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort | cycles) over the plane or one label subset, read-only over a single snapshot.",
       "x-access": "read",
       "params": [
         {
@@ -830,7 +830,8 @@
               "components",
               "shortest_path",
               "louvain",
-              "toposort"
+              "toposort",
+              "cycles"
             ]
           }
         },
@@ -934,7 +935,7 @@
         "name": "result",
         "schema": {
           "type": "object",
-          "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}. toposort: {algo, results:[{id, order, generation}], count}; a cyclic scope is an error naming a node on the cycle."
+          "description": "pagerank/louvain/components: {algo, results, count}. shortest_path: {algo, found, path:{nodes, edges, cost}|null}. toposort: {algo, results:[{id, order, generation}], count}; a cyclic scope is an error naming a node on the cycle. cycles: {algo, results:[{cycle:[id,…,id]}], count}, count 0 meaning the scope is a DAG."
         }
       }
     },

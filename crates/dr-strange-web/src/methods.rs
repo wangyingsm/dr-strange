@@ -9,10 +9,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use dr_strange_core::{
-    BulkEdge, BulkNode, Change, ChangeKind, ChangeOp, ChangeSet, Database, Dir, EdgeId, EdgeRecord,
-    HybridWeights, Language, LogicalPlan, LouvainOptions, Metric, NodeId, NodeRecord,
-    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, TopoOrder, TopoSortOptions,
-    json,
+    AlgoBuilder, BulkEdge, BulkNode, Change, ChangeKind, ChangeOp, ChangeSet, CyclesOptions,
+    Database, Dir, EdgeId, EdgeRecord, HybridWeights, Language, LogicalPlan, LouvainOptions,
+    Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
+    TopoOrder, TopoSortOptions, json,
 };
 // Time-travel address type — ships only with the native backend (ROADMAP §4).
 #[cfg(feature = "native-backend")]
@@ -1976,7 +1976,7 @@ const ALGO_LIMIT: usize = 100;
 pub struct Algo {
     plane: String,
     /// Which algorithm: `pagerank` | `components` | `shortest_path` |
-    /// `louvain` | `toposort`.
+    /// `louvain` | `toposort` | `cycles`.
     algo: String,
     /// Restrict to nodes carrying this label (and the edges among them).
     #[serde(default)]
@@ -2005,7 +2005,7 @@ pub struct Algo {
     max_levels: Option<u32>,
     #[serde(default)]
     min_gain: Option<f64>,
-    // toposort
+    // toposort / cycles
     #[serde(default)]
     edge_type: Option<String>,
 }
@@ -2020,6 +2020,9 @@ pub struct Algo {
 /// - `toposort` (honours `dir`, `edge_type`) → `{ algo, results: [{id, order,
 ///   generation}], count }`; a cyclic scope is an error naming a node on the
 ///   cycle, never a partial order
+/// - `cycles` (honours `edge_type`, `limit`) → `{ algo, results: [{cycle}],
+///   count }`, each `cycle` the node list closing it; `count: 0` means the
+///   scope is a DAG
 pub fn plane_algo(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Algo = params(p)?;
     let plane = ctx.plane(&req.plane)?;
@@ -2089,36 +2092,53 @@ pub fn plane_algo(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             });
             Ok(jval!({ "algo": "shortest_path", "found": path.is_some(), "path": path }))
         }
-        "toposort" => {
-            let opts = TopoSortOptions {
-                dir: parse_dir(req.dir.as_deref()),
-                edge_type: req.edge_type.clone(),
-            };
-            match app(builder.toposort(&opts))? {
-                TopoOrder::Sorted(order) => {
-                    let count = order.len();
-                    let results: Vec<Value> = order
-                        .into_iter()
-                        .enumerate()
-                        .take(limit)
-                        .map(|(i, t)| {
-                            jval!({ "id": t.node.0, "order": i, "generation": t.generation })
-                        })
-                        .collect();
-                    Ok(jval!({ "algo": "toposort", "results": results, "count": count }))
-                }
-                // A truncated order reads as a complete one, so the cycle is
-                // the answer, not a shorter list.
-                TopoOrder::Cyclic(node) => Err(RpcError::server(format!(
-                    "no topological order: node {} is on a cycle",
-                    node.0
-                ))),
-            }
-        }
+        "toposort" => toposort(&builder, &req, limit),
+        "cycles" => cycles(&builder, &req, limit),
         other => Err(RpcError::invalid_params(format!(
-            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain|toposort)"
+            "unknown algo `{other}` \
+             (expected pagerank|components|shortest_path|louvain|toposort|cycles)"
         ))),
     }
+}
+
+/// The `toposort` arm of [`plane_algo`].
+fn toposort(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> Result<Value, RpcError> {
+    let opts = TopoSortOptions {
+        dir: parse_dir(req.dir.as_deref()),
+        edge_type: req.edge_type.clone(),
+    };
+    match app(builder.toposort(&opts))? {
+        TopoOrder::Sorted(order) => {
+            let count = order.len();
+            let results: Vec<Value> = order
+                .into_iter()
+                .enumerate()
+                .take(limit)
+                .map(|(i, t)| jval!({ "id": t.node.0, "order": i, "generation": t.generation }))
+                .collect();
+            Ok(jval!({ "algo": "toposort", "results": results, "count": count }))
+        }
+        // A truncated order reads as a complete one, so the cycle is the
+        // answer, not a shorter list.
+        TopoOrder::Cyclic(node) => Err(RpcError::server(format!(
+            "no topological order: node {} is on a cycle",
+            node.0
+        ))),
+    }
+}
+
+/// The `cycles` arm of [`plane_algo`]. `limit` caps the search itself, so
+/// `count` is what was reported rather than what the graph holds.
+fn cycles(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> Result<Value, RpcError> {
+    let opts = CyclesOptions {
+        edge_type: req.edge_type.clone(),
+        limit,
+    };
+    let results: Vec<Value> = app(builder.cycles(&opts))?
+        .into_iter()
+        .map(|cycle| jval!({ "cycle": cycle.iter().map(|n| n.0).collect::<Vec<_>>() }))
+        .collect();
+    Ok(jval!({ "algo": "cycles", "count": results.len(), "results": results }))
 }
 
 #[derive(Deserialize)]

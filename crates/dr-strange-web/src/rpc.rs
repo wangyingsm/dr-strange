@@ -1380,6 +1380,44 @@ mod tests {
     }
 
     #[test]
+    fn plane_algo_cycles_answers_the_dag_question_both_ways() {
+        let (db, alice, bob) = seeded_graph();
+        // alice -> bob and nothing back: a DAG.
+        let dag = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"cycles"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(dag["result"]["count"], 0);
+        assert_eq!(dag["result"]["results"].as_array().unwrap().len(), 0);
+
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_edge(
+            dr_strange_core::NodeId(bob),
+            dr_strange_core::NodeId(alice),
+            "KNOWS",
+            Properties::new(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let found = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"cycles","limit":1},"id":1}"#,
+        )
+        .unwrap();
+        let r = &found["result"];
+        assert_eq!(r["algo"], "cycles");
+        assert_eq!(r["count"], 1);
+        // The witness closes the loop: alice, bob, alice.
+        assert_eq!(
+            r["results"][0]["cycle"],
+            serde_json::json!([alice, bob, alice])
+        );
+    }
+
+    #[test]
     fn plane_algo_unknown_name_is_invalid_params() {
         let (db, _, _) = seeded_graph();
         let resp = call(
