@@ -85,6 +85,17 @@ Three decisions in the file are worth knowing before anyone edits it:
 `just bump-version` does not touch this file, so the version is the one thing
 here that goes stale by itself — see §0.
 
+### The package has to claim the server name back
+
+Ownership of an npm package is proved by an **`mcpName` in its
+`package.json`** that matches `name` above — `io.github.wangyingsm/dr-strange`
+— and the registry reads it from the published package, not from this
+repository. `@yingge/drsg` 2.27.0 was published without it, so a publish of
+that version is refused however the login went. `packaging/npm/build.py`
+writes the field now, which makes the **next** release the first publishable
+one; the version in this file and the version that carries `mcpName` have to
+be the same release.
+
 ## 2. Glama
 
 **Status: verified** — `glama.ai/mcp/servers` answers.

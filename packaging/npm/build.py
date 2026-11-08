@@ -154,6 +154,8 @@ def write_wrapper(out: Path, version: str, packages: list[str]) -> None:
     (d / "package.json").write_text(json.dumps({
         "name": WRAPPER,
         "version": version,
+        # Matched against server.json's `name` to verify npm ownership.
+        "mcpName": f"io.github.{REPO}",
         "description": DESCRIPTION,
         "license": "MIT OR Apache-2.0",
         "repository": {"type": "git", "url": f"git+https://github.com/{REPO}.git"},
