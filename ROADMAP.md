@@ -985,12 +985,21 @@ says which plane holds which repository's history, and the server's
 instructions carry the vocabulary, so an agent does not have to discover the
 schema before it can ask a question.
 
-*Open.* Two things. A tag or a branch created **without a commit** reaches the
-history plane on the next HEAD move rather than immediately: the watcher wakes
-on HEAD, and polling every ref would double its git calls for a rare case.
-And nothing yet **links the two planes**: a `Commit` to the symbols it changed
-would need tree diffing, which is a different order of cost and a decision of
-its own.
+*A ref that moves without a commit lands too.* This was open on the grounds
+that polling every ref would double the watcher's git calls — true, and beside
+the point: refs are *stated* by the filesystem, so the same two-second tick
+hashes each ref's size and mtime (plus `packed-refs`) and runs no git at all,
+which is cheaper than the `rev-parse HEAD` it was already spawning. HEAD
+unchanged but the fingerprint moved refreshes the history plane alone, since no
+file changed and the code plane has nothing to do. `git tag v1` on a commit
+already folded therefore reaches `<plane>_git` within one tick. Git writes a ref
+by renaming a fresh temp file over it, so content and metadata move together;
+the gap is deleting a ref and recreating it at the same sha inside one mtime
+tick, which describes a plane that is already correct.
+
+*Open.* Nothing yet **links the two planes**: a `Commit` to the symbols it
+changed would need tree diffing, which is a different order of cost and a
+decision of its own.
 
 ### The catalog is data, and it lives with the plugins  *(shipped)*
 

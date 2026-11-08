@@ -35,6 +35,16 @@ these calls were inferred* had to read every edge through `context` instead.
   row has walked all of them — so it still filters as early as it can rather
   than waiting for the end of the path.
 
+- **A tag or a branch now reaches the history plane without waiting for a
+  commit** (ROADMAP §11). `serve watch` woke on HEAD, so `git tag v1` on a
+  commit already folded sat outside `<plane>_git` until something else moved
+  HEAD. The watcher now also fingerprints the refs — each one's size and mtime,
+  plus `packed-refs` — on the tick it already runs, and refreshes history alone
+  when that moves while HEAD does not. It costs no git call: refs are stated by
+  the filesystem, so this is a directory walk and a `stat`, cheaper than the
+  `rev-parse HEAD` the poll already spawned. The code plane is untouched by
+  such a tick, because no file changed.
+
 ### Fixed
 
 - **A condition that read a variable across a variable-length hop was
