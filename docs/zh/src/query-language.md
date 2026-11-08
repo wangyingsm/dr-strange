@@ -357,9 +357,10 @@ $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
 ```
 
-`toposort` 有意不在其中。`CALL` 通过 `score()` 报告逐节点的结果，那是一个标量；而
-拓扑顺序为每个节点给出两个值——它的位次和它的 generation。因此它只作为直接命令提
-供，以便用自己的形状作答：`drsg algo toposort`、RPC `plane.algo`、MCP `algo`。
+`toposort` 与 `cycles` 有意不在其中。`CALL` 通过 `score()` 报告逐节点的结果，那是
+一个标量；而拓扑顺序为每个节点给出两个值——它的位次和它的 generation，一个环则根本
+不是节点而是一条路径。因此两者都只作为直接命令提供，以便用自己的形状作答：
+`drsg algo toposort` / `drsg algo cycles`、RPC `plane.algo`、MCP `algo`。
 
 ## 时间旅行
 

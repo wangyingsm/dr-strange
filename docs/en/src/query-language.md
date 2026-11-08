@@ -402,11 +402,11 @@ $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
 ```
 
-`toposort` is deliberately not one of them. `CALL` reports a per-node result
-through `score()`, a single scalar, and a topological order gives each node
-two — its position and its generation. So it stays a direct command, where it
-can answer in its own shape: `drsg algo toposort`, RPC `plane.algo`, MCP
-`algo`.
+`toposort` and `cycles` are deliberately not among them. `CALL` reports a
+per-node result through `score()`, a single scalar; a topological order gives
+each node two — its position and its generation — and a cycle is a path, not a
+node at all. So both stay direct commands, where they can answer in their own
+shape: `drsg algo toposort` / `drsg algo cycles`, RPC `plane.algo`, MCP `algo`.
 
 ## Time-travel
 

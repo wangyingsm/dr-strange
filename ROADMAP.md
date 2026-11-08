@@ -34,6 +34,16 @@ node *on* the cycle instead of the partial order Kahn's algorithm leaves
 behind. On `plane.algo`, the CLI and the MCP tool; not a Cypher `CALL`, since
 `CALL` reports one scalar per node through `score()` and an order gives two.
 
+**Added later: `cycles`** (issue #99), the other half of that question — a
+write that must not create a loop has to refuse *naming the nodes at fault*.
+Each result is the node list closing one cycle (`[12, 7, 9, 12]`); an empty
+result is the "is this a DAG" answer, which `components` cannot give, since a
+DAG and a cyclic graph are both one weakly connected component. `limit` caps
+the search rather than the output, so `limit: 1` stops at the first cycle. One
+depth-first pass reporting one cycle per back edge: enough to prove a graph is
+cyclic and to name the fault, not an enumeration of every cycle, which is
+exponential. No `dir` — reversing every edge maps a cycle onto its reverse.
+
 **Open: `toposort` in the dashboard** (issue #98). The algorithm and the RPC
 arm exist; the Explore view's "Analyze" bar does not offer it. It needs more
 than another entry in that menu, which is why it is not done yet:

@@ -148,6 +148,7 @@ $ drsg --db graph.drsg algo components    --plane social
 $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
 $ drsg --db graph.drsg algo toposort      --plane social --edge-type FEEDS
+$ drsg --db graph.drsg algo cycles        --plane social --edge-type FEEDS --top 1
 ```
 
 `toposort` prints the plane in dependency order, each node with a generation —
@@ -156,6 +157,13 @@ parallel. Name the relation that claims the order with `--edge-type`: left
 unset every edge counts, and an edge that means something else can deny the
 order altogether. `--dir in` reads edges as "depends on" rather than "feeds".
 A cyclic scope is an error naming a node on the cycle, never a partial order.
+
+`cycles` is the other half of that answer: it prints each cycle as the node
+list that closes it, `1 -> 2 -> 1`, and says plainly when there are none —
+which is how you check that a plane is a DAG. `--top 1` stops at the first
+one, the usual question before a write that must not create a loop. Note that
+`components` cannot answer this: a DAG and a cyclic graph are both a single
+weakly connected component.
 
 ## Retrieval and ingestion
 

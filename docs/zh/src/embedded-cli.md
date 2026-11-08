@@ -136,6 +136,7 @@ $ drsg --db graph.drsg algo components    --plane social
 $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
 $ drsg --db graph.drsg algo toposort      --plane social --edge-type FEEDS
+$ drsg --db graph.drsg algo cycles        --plane social --edge-type FEEDS --top 1
 ```
 
 `toposort` 按依赖顺序打印整个平面，并为每个节点给出一个 generation——即它的深度，
@@ -143,6 +144,11 @@ $ drsg --db graph.drsg algo toposort      --plane social --edge-type FEEDS
 一种关系决定了这个顺序：不指定时每条边都参与计算，一条含义无关的边就足以让顺序不
 成立。`--dir in` 把边读作“依赖于”而非“流向”。若作用范围内存在环，命令会报错并指
 出环上的某个节点，绝不会给出一个看起来完整的局部顺序。
+
+`cycles` 是这个答案的另一半：它把每一个环打印为闭合的节点列表，形如 `1 -> 2 -> 1`，
+没有环时也会明确说出来——要确认一个平面是 DAG，就看它。`--top 1` 在找到第一个环时
+即停止，这正是“写入之前确认不会造出环”所要问的问题。注意 `components` 回答不了这
+个问题：DAG 与有环图同样都是一个弱连通分量。
 
 ## 检索与导入
 

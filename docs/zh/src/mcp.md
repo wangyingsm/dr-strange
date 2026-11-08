@@ -214,7 +214,7 @@ stdio 的宿主同样能接到那个已经持有数据库的进程，其平面�
 | `traverse` | 读 | 从某个节点进行邻域扩展（1 跳及以上） |
 | `query` | 读 | 运行一个序列化的逻辑计划 |
 | `cypher` | 读 / 写 | 运行一条 openCypher 子集语句——任何具名动词都未预见的问题，由它兜底；`DELETE`/`REMOVE` 需要 `confirm: true` |
-| `algo` | 读 | 一个图算法（pagerank / components / shortest_path / louvain / toposort） |
+| `algo` | 读 | 一个图算法（pagerank / components / shortest_path / louvain / toposort / cycles） |
 | `hybrid` | 读 | 融合的向量 + 关键词 + 图邻近度检索 |
 | `ask` | 读 | 一个自然语言问题，编译为计划并执行 |
 | `write_nodes` | 写 | 创建节点（批量） |
