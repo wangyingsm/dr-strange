@@ -147,7 +147,15 @@ $ drsg --db graph.drsg algo pagerank      --plane social --top 10
 $ drsg --db graph.drsg algo components    --plane social
 $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
+$ drsg --db graph.drsg algo toposort      --plane social --edge-type FEEDS
 ```
+
+`toposort` prints the plane in dependency order, each node with a generation —
+its depth, so one generation has no path within it and can be processed in
+parallel. Name the relation that claims the order with `--edge-type`: left
+unset every edge counts, and an edge that means something else can deny the
+order altogether. `--dir in` reads edges as "depends on" rather than "feeds".
+A cyclic scope is an error naming a node on the cycle, never a partial order.
 
 ## Retrieval and ingestion
 

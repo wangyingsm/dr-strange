@@ -269,7 +269,7 @@ it keeps its slot until it finishes, so the ceiling still counts it.
 | `traverse` | read | neighborhood expansion from a node (1+ hops) |
 | `query` | read | run a serialized logical plan |
 | `cypher` | read / write | run an openCypher-subset statement — the escape hatch for what no verb anticipated; `DELETE`/`REMOVE` require `confirm: true` |
-| `algo` | read | a graph algorithm (pagerank / components / shortest_path / louvain) |
+| `algo` | read | a graph algorithm (pagerank / components / shortest_path / louvain / toposort) |
 | `hybrid` | read | fused vector + keyword + graph-proximity search |
 | `ask` | read | a natural-language question, compiled to a plan and run |
 | `write_nodes` | write | create nodes (batched) |

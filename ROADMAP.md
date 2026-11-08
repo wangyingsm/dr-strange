@@ -25,6 +25,15 @@ overlays PageRank size / community + component colour / shortest-path highlight
 onto the graph plot). (Follow-ups: subgraph/seeded scoping and optional
 property-materialization of scores; SDK regeneration from the new OpenRPC entry.)
 
+**Added later: `toposort`** (issue #98), for a plane whose edges mean *feeds*.
+Whole-plane or label-scoped like the rest, plus an `edge_type` naming the one
+relation that claims the order and a `dir` for planes whose edges point
+dependent→dependency. Each node carries a `generation` — its longest-path
+depth, so one generation can run in parallel. A cyclic scope answers with a
+node *on* the cycle instead of the partial order Kahn's algorithm leaves
+behind. On `plane.algo`, the CLI and the MCP tool; not a Cypher `CALL`, since
+`CALL` reports one scalar per node through `score()` and an order gives two.
+
 **Open: `toposort` in the dashboard** (issue #98). The algorithm and the RPC
 arm exist; the Explore view's "Analyze" bar does not offer it. It needs more
 than another entry in that menu, which is why it is not done yet:

@@ -135,7 +135,14 @@ $ drsg --db graph.drsg algo pagerank      --plane social --top 10
 $ drsg --db graph.drsg algo components    --plane social
 $ drsg --db graph.drsg algo shortest-path --plane social --src 1 --dst 42
 $ drsg --db graph.drsg algo louvain       --plane social
+$ drsg --db graph.drsg algo toposort      --plane social --edge-type FEEDS
 ```
+
+`toposort` 按依赖顺序打印整个平面，并为每个节点给出一个 generation——即它的深度，
+因此同一 generation 内的节点之间没有通路，可以并行处理。用 `--edge-type` 指明是哪
+一种关系决定了这个顺序：不指定时每条边都参与计算，一条含义无关的边就足以让顺序不
+成立。`--dir in` 把边读作“依赖于”而非“流向”。若作用范围内存在环，命令会报错并指
+出环上的某个节点，绝不会给出一个看起来完整的局部顺序。
 
 ## 检索与导入
 
