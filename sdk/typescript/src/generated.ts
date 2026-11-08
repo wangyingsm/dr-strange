@@ -179,8 +179,8 @@ export class Drsg extends Client {
     return this._call("plane.find", params) as Promise<FindResult>;
   }
 
-  /** Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
-  planeAlgo(params: { plane: string; algo: "pagerank" | "components" | "shortest_path" | "louvain"; label?: string; limit?: number; damping?: number; max_iters?: number; tolerance?: number; src?: number; dst?: number; dir?: "out" | "in" | "both"; weight?: string; max_levels?: number; min_gain?: number }): Promise<Record<string, unknown>> {
+  /** Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+  planeAlgo(params: { plane: string; algo: "pagerank" | "components" | "shortest_path" | "louvain" | "toposort"; label?: string; limit?: number; damping?: number; max_iters?: number; tolerance?: number; src?: number; dst?: number; dir?: "out" | "in" | "both"; weight?: string; max_levels?: number; min_gain?: number; edge_type?: string }): Promise<Record<string, unknown>> {
     return this._call("plane.algo", params) as Promise<Record<string, unknown>>;
   }
 

@@ -396,54 +396,59 @@ public class Drsg extends Client {
             String dir,
             String weight,
             Long maxLevels,
-            Double minGain) {
+            Double minGain,
+            String edgeType) {
 
         public static PlaneAlgoParams of(String plane, String algo) {
-            return new PlaneAlgoParams(plane, algo, null, null, null, null, null, null, null, null, null, null, null);
+            return new PlaneAlgoParams(plane, algo, null, null, null, null, null, null, null, null, null, null, null, null);
         }
 
         public PlaneAlgoParams withLabel(String label) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withLimit(Long limit) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withDamping(Double damping) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withMaxIters(Long maxIters) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withTolerance(Double tolerance) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withSrc(Long src) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withDst(Long dst) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withDir(String dir) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withWeight(String weight) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withMaxLevels(Long maxLevels) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
 
         public PlaneAlgoParams withMinGain(Double minGain) {
-            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain);
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
+        }
+
+        public PlaneAlgoParams withEdgeType(String edgeType) {
+            return new PlaneAlgoParams(plane, algo, label, limit, damping, maxIters, tolerance, src, dst, dir, weight, maxLevels, minGain, edgeType);
         }
     }
 
@@ -1055,7 +1060,7 @@ public class Drsg extends Client {
         return call("plane.find", params, new TypeReference<FindResult>() {});
     }
 
-    /** Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+    /** Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
     public Map<String, Object> planeAlgo(PlaneAlgoParams params) throws DrsgException {
         return call("plane.algo", params, new TypeReference<Map<String, Object>>() {});
     }

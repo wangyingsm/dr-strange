@@ -242,7 +242,7 @@ struct json_object *drsg_plane_find(drsg_client *c, const char *plane, const cha
     return rc == 0 ? result : NULL;
 }
 
-/* Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+/* Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
 struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const char *algo, const drsg_plane_algo_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
@@ -259,6 +259,7 @@ struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const cha
         if (opts->weight) json_object_object_add(p, "weight", json_object_new_string(opts->weight));
         if (opts->max_levels) json_object_object_add(p, "max_levels", json_object_new_int64(*opts->max_levels));
         if (opts->min_gain) json_object_object_add(p, "min_gain", json_object_new_double(*opts->min_gain));
+        if (opts->edge_type) json_object_object_add(p, "edge_type", json_object_new_string(opts->edge_type));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.algo", p, &result, err);

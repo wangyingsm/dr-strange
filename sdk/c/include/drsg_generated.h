@@ -127,9 +127,10 @@ typedef struct {
     const char *weight;
     const int64_t *max_levels;
     const double *min_gain;
+    const char *edge_type;
 } drsg_plane_algo_opts;
 
-/* Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+/* Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
 struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const char *algo, const drsg_plane_algo_opts *opts, drsg_error *err);
 
 typedef struct {

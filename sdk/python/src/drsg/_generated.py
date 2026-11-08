@@ -220,8 +220,8 @@ class Drsg(_Client):
             _p["as_of_ms"] = as_of_ms
         return self._call("plane.find", _p)
 
-    def plane_algo(self, plane, algo, label=None, limit=None, damping=None, max_iters=None, tolerance=None, src=None, dst=None, dir=None, weight=None, max_levels=None, min_gain=None) -> Any:
-        """Run a graph algorithm (pagerank | components | shortest_path | louvain) over the plane or one label subset, read-only over a single snapshot.
+    def plane_algo(self, plane, algo, label=None, limit=None, damping=None, max_iters=None, tolerance=None, src=None, dst=None, dir=None, weight=None, max_levels=None, min_gain=None, edge_type=None) -> Any:
+        """Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot.
 
         Access: read."""
         _p: dict = {}
@@ -249,6 +249,8 @@ class Drsg(_Client):
             _p["max_levels"] = max_levels
         if min_gain is not None:
             _p["min_gain"] = min_gain
+        if edge_type is not None:
+            _p["edge_type"] = edge_type
         return self._call("plane.algo", _p)
 
     def plane_hybrid(self, plane, q, label=None, vector_prop=None, keyword_prop=None, metric=None, graph_hops=None, graph_decay=None, w_vector=None, w_keyword=None, w_graph=None, k=None, candidates=None, provider=None, embed_model=None) -> Any:
