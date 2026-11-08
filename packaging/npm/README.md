@@ -74,13 +74,15 @@ costs the install string and nothing else: the binary is still `drsg`.
 
 ## After the first publish
 
-Three things become true, and none of them is automatic:
+Three things become true, and none of them is automatic. The first two were
+done at 2.27.0:
 
-1. **The README should say so.** Until the package exists, neither edition
-   advertises `npx @yingge/drsg` — a README promising a command that fails is
-   worse than one that omits it.
-2. **The MCP registry entry should move to `registryType: "npm"`**, replacing
-   the OCI compromise.
+1. **The README says so.** Until the package existed, neither edition
+   advertised `npx @yingge/drsg` — a README promising a command that fails is
+   worse than one that omits it. Both editions now carry it.
+2. **The MCP registry entry moved to `registryType: "npm"`**, replacing the
+   OCI compromise — see `../mcp-registry/README.md` for what it declares and
+   why.
 3. **Every release publishes the six packages automatically.** `release.yml`
    has an `npm` job that runs after the GitHub release, builds from the same
    artifacts the release was cut from, and publishes with npm provenance.
