@@ -2411,6 +2411,149 @@ fn run_plugins_and_ingest(
 mod tests {
     use super::*;
 
+    /// A database path nothing else in this run will use. Built from the pid
+    /// and the clock, as `commands`' own tests do, because the CLI has no
+    /// `tempfile` dependency and a test is not a reason to add one.
+    fn unique_db(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("drsg-run-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    /// The database and the sidecars that sit *beside* it, not inside.
+    fn remove_db(db: &Path) {
+        let _ = std::fs::remove_dir_all(db);
+        let _ = std::fs::remove_file(db);
+        for ext in ["hnsw", "bm25"] {
+            let _ = std::fs::remove_file(format!("{}.{ext}", db.display()));
+        }
+    }
+
+    /// Dispatch one invocation against `db` and hand back what it printed.
+    ///
+    /// Through `run`, not the group functions, because the routing is the part
+    /// under test: every group hands what it does not recognise to the next,
+    /// and a verb landing in the wrong group is the failure this catches.
+    fn drsg(db: &Path, args: &[&str]) -> Result<String> {
+        let argv: Vec<String> = ["drsg", "--db", &db.display().to_string()]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(args.iter().map(|s| s.to_string()))
+            .collect();
+        let cli = Cli::try_parse_from(&argv).expect("the test's own invocation parses");
+        let mut out: Vec<u8> = Vec::new();
+        run(cli, &config::Config::default(), &mut out)?;
+        Ok(String::from_utf8(out).expect("verbs print UTF-8"))
+    }
+
+    /// A session over one database: the read verbs, in the order a reader
+    /// would reach for them, each against what the one before it wrote.
+    ///
+    /// One test rather than a dozen because they share a database, and setting
+    /// one up per verb would be the slow half of the work.
+    #[test]
+    fn the_read_verbs_dispatch_and_answer_over_a_real_database() {
+        let db = unique_db("read");
+        let jsonl = unique_db("read-in").with_extension("jsonl");
+        std::fs::write(
+            &jsonl,
+            "{\"id\":1,\"external_key\":\"m::caller\",\"labels\":[\"Fn\"],\
+             \"properties\":{\"name\":\"caller\"}}\n\
+             {\"id\":2,\"external_key\":\"m::callee\",\"labels\":[\"Fn\"],\
+             \"properties\":{\"name\":\"callee\"}}\n\
+             {\"id\":1,\"src\":1,\"dst\":2,\"type\":\"CALLS\",\"properties\":{\"_confidence\":0.8}}\n",
+        )
+        .unwrap();
+
+        let got = drsg(&db, &["import", &jsonl.display().to_string()]).expect("import");
+        assert!(got.contains('2') && got.contains("node"), "{got}");
+
+        // `get` by id, and the node carries what was imported.
+        let got = drsg(&db, &["get", "1"]).expect("get");
+        assert!(got.contains("caller"), "{got}");
+
+        // Cypher, including the relationship variable §15 added — the whole
+        // chain from this binary's argument down to the edge map.
+        let got = drsg(
+            &db,
+            &[
+                "cypher",
+                "MATCH (a:Fn)-[r:CALLS]->(b:Fn) RETURN b.name, r._confidence",
+            ],
+        )
+        .expect("cypher");
+        assert!(got.contains("callee") && got.contains("0.8"), "{got}");
+
+        // The catalog observes what the import declared.
+        let got = drsg(&db, &["catalog"]).expect("catalog");
+        assert!(got.contains("Fn"), "{got}");
+
+        // Counts, integrity, and the plane listing all answer.
+        assert!(drsg(&db, &["stats"]).expect("stats").contains('2'));
+        assert!(!drsg(&db, &["check"]).expect("check").is_empty());
+        assert!(
+            drsg(&db, &["plane", "list"])
+                .expect("plane list")
+                .contains("startup")
+        );
+
+        // A traversal from a node. `traverse` addresses it by external key —
+        // the stable identifier, not the id a reimport may renumber.
+        let got = drsg(&db, &["traverse", "m::caller"]).expect("traverse");
+        assert!(got.contains("callee") || got.contains("m::callee"), "{got}");
+        let got = drsg(&db, &["algo", "pagerank"]).expect("pagerank");
+        assert!(!got.is_empty(), "pagerank printed nothing");
+
+        // And the queries this session ran are recorded.
+        let got = drsg(&db, &["queries"]).expect("queries");
+        assert!(got.contains("MATCH") || got.contains("startup"), "{got}");
+
+        // Export round-trips what import read.
+        let got = drsg(&db, &["export"]).expect("export");
+        assert!(got.contains("caller") && got.contains("CALLS"), "{got}");
+
+        remove_db(&db);
+        let _ = std::fs::remove_file(&jsonl);
+    }
+
+    /// What a verb says when it cannot do the thing. These are the paths a
+    /// reader actually meets, and an unclear one costs more than a missing
+    /// feature: the message has to name what was wrong, not merely fail.
+    #[test]
+    fn a_verb_that_cannot_answer_says_why() {
+        let db = unique_db("errs");
+        drsg(&db, &["stats"]).expect("an empty database still answers");
+
+        // A node that is not there.
+        let said = format!(
+            "{:#}",
+            drsg(&db, &["get", "9999"]).expect_err("no such node")
+        );
+        assert!(
+            said.contains("9999") || said.to_lowercase().contains("not found"),
+            "{said}"
+        );
+
+        // A query the subset refuses: the error names the shape, which is the
+        // whole point of refusing rather than misreading it.
+        let said = format!(
+            "{:#}",
+            drsg(&db, &["cypher", "MATCH (a)-->(b), (a)-->(c) RETURN a"])
+                .expect_err("several paths are refused")
+        );
+        assert!(said.to_lowercase().contains("path"), "{said}");
+
+        // And a plan that is not a plan.
+        let said = format!(
+            "{:#}",
+            drsg(&db, &["query", "{not json"]).expect_err("a malformed plan is refused")
+        );
+        assert!(!said.is_empty(), "the parse failure should say something");
+
+        remove_db(&db);
+    }
+
     /// The zero-argument invocations are the contract: `drsg digest` alone
     /// must mean "this repository, into graph.drsg's startup plane".
     #[cfg(feature = "digest")]
