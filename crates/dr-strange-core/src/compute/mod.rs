@@ -19,7 +19,10 @@ pub mod expr;
 pub mod hybrid;
 pub mod plan;
 
-pub use algo::{LouvainOptions, PageRankOptions, Path, ShortestPathOptions};
+pub use algo::{
+    LouvainOptions, PageRankOptions, Path, ShortestPathOptions, TopoNode, TopoOrder,
+    TopoSortOptions,
+};
 pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};
 pub use exec::{Row, Table};
 pub use expr::{

@@ -25,7 +25,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use ahash::AHashSet;
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
-use crate::compute::algo::{self, LouvainOptions, PageRankOptions, ShortestPathOptions};
+use crate::compute::algo::{
+    self, LouvainOptions, PageRankOptions, ShortestPathOptions, TopoSortOptions,
+};
 use std::collections::BTreeMap;
 
 use crate::compute::catalog::{self, CatalogSnapshot, PlaneCounters};
@@ -3011,6 +3013,12 @@ impl<'db> AlgoBuilder<'db> {
     /// (representative = smallest id in the community) plus the community count.
     pub fn louvain(&self, opts: LouvainOptions) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
         self.with_reader(|r| algo::louvain(r, self.label.as_deref(), opts))
+    }
+
+    /// Topological order of the scope, or a node on a cycle when the scope
+    /// admits no order.
+    pub fn toposort(&self, opts: &TopoSortOptions) -> Result<algo::TopoOrder> {
+        self.with_reader(|r| algo::toposort(r, self.label.as_deref(), opts))
     }
 }
 

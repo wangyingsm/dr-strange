@@ -23,7 +23,7 @@ use std::collections::BinaryHeap;
 use ahash::AHashMap;
 
 use crate::cache::GraphReader;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{Dir, EdgeId, NodeId, PropValue};
 
 /// A materialized, index-compact view of the plane's graph for whole-graph
@@ -39,9 +39,14 @@ struct Frame {
 
 impl Frame {
     /// Materialize the scanned universe (whole plane, or one `label`) and its
-    /// internal-to-internal out-adjacency. Edges to nodes outside the universe
-    /// (only possible under a label subset) are dropped.
-    fn build<R: GraphReader + ?Sized>(reader: &R, label: Option<&str>) -> Result<Self> {
+    /// internal-to-internal out-adjacency, following `edge_type` only (`None`
+    /// = every type). Edges to nodes outside the universe (only possible under
+    /// a label subset) are dropped.
+    fn build<R: GraphReader + ?Sized>(
+        reader: &R,
+        label: Option<&str>,
+        edge_type: Option<&str>,
+    ) -> Result<Self> {
         let nodes = match label {
             Some(l) => reader.scan_label(l)?,
             None => reader.scan_all()?,
@@ -50,7 +55,7 @@ impl Frame {
             nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
         let mut out: Vec<Vec<(usize, EdgeId)>> = vec![Vec::new(); nodes.len()];
         for (i, &nid) in nodes.iter().enumerate() {
-            for nb in reader.neighbors(nid, Dir::Out, None)?.iter() {
+            for nb in reader.neighbors(nid, Dir::Out, edge_type)?.iter() {
                 if let Some(&j) = index.get(&nb.node) {
                     out[i].push((j, nb.edge));
                 }
@@ -107,7 +112,7 @@ pub fn pagerank<R: GraphReader + ?Sized>(
     label: Option<&str>,
     opts: PageRankOptions,
 ) -> Result<Vec<(NodeId, f64)>> {
-    let frame = Frame::build(reader, label)?;
+    let frame = Frame::build(reader, label, None)?;
     let n = frame.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -171,7 +176,7 @@ pub fn connected_components<R: GraphReader + ?Sized>(
     reader: &R,
     label: Option<&str>,
 ) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
-    let frame = Frame::build(reader, label)?;
+    let frame = Frame::build(reader, label, None)?;
     let n = frame.len();
     let mut uf = UnionFind::new(n);
     for i in 0..n {
@@ -274,7 +279,7 @@ pub fn shortest_path<R: GraphReader + ?Sized>(
     dst: NodeId,
     opts: &ShortestPathOptions,
 ) -> Result<Option<Path>> {
-    let frame = Frame::build(reader, label)?;
+    let frame = Frame::build(reader, label, None)?;
     let index: AHashMap<NodeId, usize> = frame
         .nodes
         .iter()
@@ -427,7 +432,7 @@ pub fn louvain<R: GraphReader + ?Sized>(
     label: Option<&str>,
     opts: LouvainOptions,
 ) -> Result<(Vec<(NodeId, NodeId)>, usize)> {
-    let frame = Frame::build(reader, label)?;
+    let frame = Frame::build(reader, label, None)?;
     let n = frame.len();
     if n == 0 {
         return Ok((Vec::new(), 0));
@@ -611,6 +616,150 @@ fn renumber(labels: &[usize]) -> Vec<usize> {
     out
 }
 
+// ---- Topological order ---------------------------------------------------
+
+/// Toposort tuning knobs.
+#[derive(Debug, Clone)]
+pub struct TopoSortOptions {
+    /// Which way an edge points: `Out` when an edge means *feeds* (source
+    /// before target), `In` when it means *depends on*. `Both` is rejected.
+    pub dir: Dir,
+    /// The one relation that claims an order; `None` follows every edge type.
+    /// An order is a statement about a single relation, so a plane holding
+    /// more than one kind of edge wants this set: left open, an edge that
+    /// means something else constrains the order, and a cycle among those
+    /// edges denies it altogether.
+    pub edge_type: Option<String>,
+}
+
+impl Default for TopoSortOptions {
+    fn default() -> Self {
+        Self {
+            dir: Dir::Out,
+            edge_type: None,
+        }
+    }
+}
+
+/// One node's place in a topological order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopoNode {
+    /// The node.
+    pub node: NodeId,
+    /// Longest-path depth: `0` with no predecessor, else `1 + max(generation
+    /// of the predecessors)`. Nodes of one generation have no path between
+    /// them, so they can be processed in parallel.
+    pub generation: usize,
+}
+
+/// What [`toposort`] found: a complete order, or proof that none exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopoOrder {
+    /// Every scanned node in a valid linear order — position is the order.
+    Sorted(Vec<TopoNode>),
+    /// No order exists. The named node lies *on* a cycle rather than merely
+    /// downstream of one, so a caller can report it as the fault.
+    Cyclic(NodeId),
+}
+
+/// Topologically order the scanned universe — Kahn's algorithm, peeled in
+/// waves so each node's `generation` is its longest-path depth. Deterministic:
+/// within a generation nodes come out in ascending id order.
+///
+/// A cyclic graph yields [`TopoOrder::Cyclic`] rather than the partial order
+/// Kahn leaves behind: a truncated order looks complete, which is the more
+/// dangerous answer.
+pub fn toposort<R: GraphReader + ?Sized>(
+    reader: &R,
+    label: Option<&str>,
+    opts: &TopoSortOptions,
+) -> Result<TopoOrder> {
+    if matches!(opts.dir, Dir::Both) {
+        return Err(Error::InvalidArgument(
+            "toposort needs one direction: read both ways, every edge is a cycle of two".into(),
+        ));
+    }
+    let frame = Frame::build(reader, label, opts.edge_type.as_deref())?;
+    let n = frame.len();
+    let succ: Cow<'_, [Vec<(usize, EdgeId)>]> = match opts.dir {
+        Dir::In => Cow::Owned(frame.transpose()),
+        _ => Cow::Borrowed(&frame.out),
+    };
+
+    let mut indeg = vec![0usize; n];
+    for adj in succ.iter() {
+        for &(j, _) in adj {
+            indeg[j] += 1;
+        }
+    }
+    let mut wave: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    wave.sort_unstable_by_key(|&i| frame.nodes[i].0);
+
+    let mut order = Vec::with_capacity(n);
+    let mut generation = 0usize;
+    while !wave.is_empty() {
+        let mut next = Vec::new();
+        for &i in &wave {
+            order.push(TopoNode {
+                node: frame.nodes[i],
+                generation,
+            });
+            for &(j, _) in &succ[i] {
+                indeg[j] -= 1;
+                if indeg[j] == 0 {
+                    next.push(j);
+                }
+            }
+        }
+        next.sort_unstable_by_key(|&i| frame.nodes[i].0);
+        wave = next;
+        generation += 1;
+    }
+
+    if order.len() == n {
+        return Ok(TopoOrder::Sorted(order));
+    }
+    // A placed node reached in-degree 0 and stays there, so what is left over
+    // is exactly the part no order covers.
+    Ok(TopoOrder::Cyclic(
+        frame.nodes[cycle_witness(&frame, &succ, &indeg)],
+    ))
+}
+
+/// Name a node lying on a cycle, from the residual in-degrees [`toposort`]
+/// left behind (`indeg[i] > 0` marks a node it could not place).
+///
+/// Every unplaced node still has an unplaced predecessor, so walking
+/// predecessors must revisit a node, and that node closes a cycle. The
+/// smallest id is taken at each step, which makes the witness deterministic.
+fn cycle_witness(frame: &Frame, succ: &[Vec<(usize, EdgeId)>], indeg: &[usize]) -> usize {
+    let n = frame.len();
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        if indeg[i] == 0 {
+            continue;
+        }
+        for &(j, _) in &succ[i] {
+            if indeg[j] > 0 {
+                pred[j].push(i);
+            }
+        }
+    }
+    let mut cur = (0..n)
+        .filter(|&i| indeg[i] > 0)
+        .min_by_key(|&i| frame.nodes[i].0)
+        .expect("a short order leaves a node unplaced");
+    let mut seen = vec![false; n];
+    while !seen[cur] {
+        seen[cur] = true;
+        cur = *pred[cur]
+            .iter()
+            .min_by_key(|&&p| frame.nodes[p].0)
+            .expect("an unplaced node has an unplaced predecessor");
+    }
+    cur
+}
+
 #[cfg(test)]
 mod tests {
     use crate::types::{PropDesc, PropValue, Properties};
@@ -775,5 +924,173 @@ mod tests {
         let (rows, scoped) = plane.algo().label("Doc").connected_components().unwrap();
         assert_eq!(scoped, 1);
         assert_eq!(rows.len(), 2);
+    }
+
+    fn sorted(order: TopoOrder) -> Vec<TopoNode> {
+        match order {
+            TopoOrder::Sorted(v) => v,
+            TopoOrder::Cyclic(n) => panic!("expected an order, got a cycle at {n:?}"),
+        }
+    }
+
+    #[test]
+    fn toposort_generation_is_longest_path_depth() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..4)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // A diamond with a long side: 0->1->2->3 and 0->3.
+        for &(a, b) in &[(0, 1), (1, 2), (2, 3), (0, 3)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let order = sorted(plane.algo().toposort(&TopoSortOptions::default()).unwrap());
+        assert_eq!(order.len(), 4);
+        let gen_of = |id: NodeId| order.iter().find(|t| t.node == id).unwrap().generation;
+        // 3 waits for the long side, not just for the direct edge.
+        assert_eq!(
+            [gen_of(g[0]), gen_of(g[1]), gen_of(g[2]), gen_of(g[3])],
+            [0, 1, 2, 3]
+        );
+        // Position agrees with the order the edges demand.
+        let pos = |id: NodeId| order.iter().position(|t| t.node == id).unwrap();
+        assert!(pos(g[0]) < pos(g[1]) && pos(g[1]) < pos(g[2]) && pos(g[2]) < pos(g[3]));
+    }
+
+    #[test]
+    fn toposort_marks_one_generation_independent() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..4)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // 0 feeds 1 and 2, both feed 3: {1,2} are independent of each other.
+        for &(a, b) in &[(0, 1), (0, 2), (1, 3), (2, 3)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let order = sorted(plane.algo().toposort(&TopoSortOptions::default()).unwrap());
+        let gen_of = |id: NodeId| order.iter().find(|t| t.node == id).unwrap().generation;
+        assert_eq!(gen_of(g[1]), gen_of(g[2]), "siblings run in parallel");
+        assert_eq!(gen_of(g[3]), 2);
+    }
+
+    #[test]
+    fn toposort_follows_the_requested_direction() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..3)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        for &(a, b) in &[(0, 1), (1, 2)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let forward = sorted(plane.algo().toposort(&TopoSortOptions::default()).unwrap());
+        assert_eq!(forward[0].node, g[0]);
+        // Edges read as "depends on" put the last node first.
+        let reverse = sorted(
+            plane
+                .algo()
+                .toposort(&TopoSortOptions {
+                    dir: Dir::In,
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        assert_eq!(reverse[0].node, g[2]);
+        assert_eq!(reverse[2].node, g[0]);
+    }
+
+    #[test]
+    fn toposort_orders_by_one_edge_type() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..3)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // FEEDS is the chain that claims the order; SEES points back and is
+        // nothing to do with it.
+        txn.create_edge(g[0], g[1], "FEEDS", Properties::new())
+            .unwrap();
+        txn.create_edge(g[1], g[2], "FEEDS", Properties::new())
+            .unwrap();
+        txn.create_edge(g[2], g[0], "SEES", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let opts = TopoSortOptions {
+            edge_type: Some("FEEDS".to_string()),
+            ..Default::default()
+        };
+        let order = sorted(plane.algo().toposort(&opts).unwrap());
+        assert_eq!(order.iter().map(|t| t.node).collect::<Vec<_>>(), g);
+        // Every edge type at once: the unrelated relation closes a loop and
+        // denies an order the FEEDS relation plainly has.
+        assert!(matches!(
+            plane.algo().toposort(&TopoSortOptions::default()).unwrap(),
+            TopoOrder::Cyclic(_)
+        ));
+    }
+
+    #[test]
+    fn toposort_names_a_node_on_the_cycle() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..4)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // 0 feeds the cycle 1->2->1, which feeds 3: only 1 and 2 are at fault.
+        for &(a, b) in &[(0, 1), (1, 2), (2, 1), (2, 3)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let order = plane.algo().toposort(&TopoSortOptions::default()).unwrap();
+        match order {
+            TopoOrder::Cyclic(n) => assert!(
+                n == g[1] || n == g[2],
+                "witness {n:?} must be on the cycle, not upstream or downstream of it"
+            ),
+            TopoOrder::Sorted(v) => panic!("a cyclic plane cannot be ordered: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn toposort_reports_a_self_loop_as_a_cycle() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let a = txn.create_node(&["N"], Properties::new()).unwrap();
+        txn.create_edge(a, a, "E", Properties::new()).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            plane.algo().toposort(&TopoSortOptions::default()).unwrap(),
+            TopoOrder::Cyclic(a)
+        );
+    }
+
+    #[test]
+    fn toposort_rejects_an_undirected_read() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let err = plane
+            .algo()
+            .toposort(&TopoSortOptions {
+                dir: Dir::Both,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("needs one direction"), "{err}");
     }
 }

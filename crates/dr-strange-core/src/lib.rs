@@ -42,9 +42,9 @@ pub use compute::{
     Agg, AggFunc, Algo, Binding, BindingNeed, CatalogSnapshot, Connection, EdgeTypeStats, Expr,
     GraphChannel, HybridHit, HybridSpec, HybridWeights, KeywordChannel, LabelStats, LogicalPlan,
     LouvainOptions, NodeRef, PageRankOptions, Path, ProjExpr, ProjItem, Projection, PropStats, Row,
-    ShortestPathOptions, SortKey, Source, Step, Table, TupleSortKey, ValueType, VectorChannel,
-    at_edge, at_node, distance, edge_dir, edge_type, ep, external_key, has_label, hops, lit,
-    node_id, p, score, similarity,
+    ShortestPathOptions, SortKey, Source, Step, Table, TopoNode, TopoOrder, TopoSortOptions,
+    TupleSortKey, ValueType, VectorChannel, at_edge, at_node, distance, edge_dir, edge_type, ep,
+    external_key, has_label, hops, lit, node_id, p, score, similarity,
 };
 pub use error::{Error, Result};
 pub use instance::{Instance, Mount, Mounted, Mounting, Served, Serving, Unmounted};
