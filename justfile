@@ -110,6 +110,25 @@ eval:
 
 # ---- the gate ------------------------------------------------------------
 
+# How many cores the gate may use. Unset, cargo takes every one: on a 32-thread
+# laptop that is 32 concurrent rustc processes, and since each is a process the
+# ceiling is memory as much as CPU — enough of both that the desktop and the
+# terminal running the gate have starved. Capped here rather than in CI, where
+# a runner has the machine to itself.
+#
+# This bounds how the gate runs, never what it checks, so it leaves the
+# mirror-CI rule below intact. The cap also stays well above any GitHub
+# runner's core count, so it cannot hide a concurrency bug CI would find.
+# Raise or drop it per machine: `just gate_jobs=8 gate` (or DRSG_GATE_JOBS).
+gate_jobs := env_var_or_default("DRSG_GATE_JOBS", "20")
+
+# Compilation and the test harness are separate pools, so capping one alone
+# leaves the other at every core. Exported, so every recipe in this file
+# inherits the cap and not just the gate — a `just serve` rebuild has the same
+# appetite and no more claim to the machine.
+export CARGO_BUILD_JOBS := gate_jobs
+export RUST_TEST_THREADS := gate_jobs
+
 # Where `cargo build` actually drops the binary. CARGO_TARGET_DIR moves it, and
 # the SDK suites treat a DRSG_BIN that points at nothing as *skip*, not fail —
 # so the gate asserts this path rather than trusting it. Derived, not hardcoded,
