@@ -4,6 +4,35 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.1] - 2026-11-08
+
+Packaging only: the npm wrapper could not prove it belonged to this project,
+which is the one thing standing between drsg and a listing in the official MCP
+registry. Nothing in the engine, the CLI or the SDKs changed.
+
+### Fixed
+
+- **The npm wrapper declares its MCP server name.** The registry verifies that
+  a package belongs to the server it is listed under by reading `mcpName` from
+  the published `package.json` and matching it against the record's `name`.
+  `@yingge/drsg` was published without the field, so a publish of the record
+  was refused however the namespace login went — and nothing on the npm side
+  said anything was missing, because npm does not care about the field. It is
+  derived from the repository rather than written out, so the two cannot
+  drift apart.
+
+### Changed
+
+- **The registry record is the npm package, at the current version.**
+  `packaging/mcp-registry/server.json` listed the OCI image at 2.21.0, a
+  compromise from when the only other option was a platform tarball, which is
+  not a package type the registry fetches. It now names `@yingge/drsg`, runs
+  `serve` on a stated address rather than a defaulted one, and marks
+  `DRSG_TOKEN` required — `/mcp` is gated at write level and a tokenless
+  server trusts only its own browser UI, so a client following the old record
+  would have connected and then been refused every call with nothing
+  explaining why. `just bump-version` now moves this file with the rest.
+
 ## [2.27.0] - 2026-11-07
 
 Two halves of one problem, found while building a plugin that reads the SQL a
