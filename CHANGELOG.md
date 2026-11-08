@@ -4,6 +4,60 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.28.0] - 2026-11-08
+
+Two algorithms for a plane whose edges mean *depends on*, from two issues filed
+against this repository. A graph database that can rank, cluster and connect
+nodes but cannot say what order to process them in leaves its caller to walk
+the edges by hand — and the hand-written version is the one that returns a
+partial answer looking like a whole one when the graph turns out to have a
+loop.
+
+### Added
+
+- **`toposort`: dependency order, with a generation per node.** `plane.algo`,
+  `drsg algo toposort` and the MCP `algo` tool answer `[{id, order,
+  generation}]`, where `generation` is the node's longest-path depth — so two
+  nodes of one generation have no path between them and can be processed in
+  parallel. That is the whole point of reporting it, and it is why the order is
+  peeled in waves rather than drained from a single queue: the naive version
+  numbers a node by whichever predecessor released it, which is not its depth.
+
+  An `edge_type` names the one relation that claims the order. It matters more
+  than it looks: an order is a statement about a single relation, and a plane
+  holding several kinds of edge can be a DAG under the one you mean while some
+  unrelated edge closes a loop across it. Left unset, every type counts, which
+  is the old whole-plane behaviour and rarely what a mixed plane wants. `dir`
+  reads edges the other way, for a plane whose edges point dependent to
+  dependency.
+
+  A cyclic scope is refused, naming a node the cycle actually contains — not
+  the partial order Kahn's algorithm leaves behind, which has every appearance
+  of a complete answer. The named node is reached by walking predecessors
+  through what the algorithm could not place, so it lies *on* the cycle rather
+  than merely downstream of one.
+
+- **`cycles`: the loop itself, not a boolean.** Each result is the node list
+  that closes one cycle — `[12, 7, 9, 12]` — so a write that must not create a
+  loop can refuse while naming the nodes at fault. No result means the scope is
+  a DAG, which is the other reason to ask; `components` cannot answer that, a
+  DAG and a cyclic graph being alike one weakly connected component. `limit`
+  caps the search rather than the output, so `limit: 1` stops at the first
+  cycle. One depth-first pass reporting one cycle per back edge: enough to
+  prove a graph cyclic and name the fault, not an enumeration of every cycle,
+  which is exponential in the worst case. No direction option — reversing every
+  edge maps a cycle onto its own reverse.
+
+Neither is a Cypher `CALL`. That surface reports one scalar per node through
+`score()`; an order gives each node two, and a cycle is a path rather than a
+node at all. The five SDKs that bind `plane.algo` are regenerated, the
+TypeScript union of algorithm names among them.
+
+The pair ships with property tests over random small graphs — duplicate edges
+and self-loops included, since parallel edges are what in-degree counting gets
+wrong — checked against a naive model written beside them rather than against
+each other, which one bug in the shared frame would satisfy twice over.
+
 ## [2.27.1] - 2026-11-08
 
 Packaging only: the npm wrapper could not prove it belonged to this project,
