@@ -73,9 +73,11 @@ var-len        ::= '*' [ uint ] [ '..' [ uint ] ]
 ```
 
 A relationship's direction comes from its arrows: `-[…]->` out, `<-[…]-` in,
-`-[…]-` both. `<-…->` is rejected. A relationship variable parses but is not
-bound. `var-len` must have an upper bound (`*1..3`, `*2`, `*..4`); an unbounded
-`*` or `*2..` is a clear error.
+`-[…]-` both. `<-…->` is rejected. A relationship variable binds that hop's
+edge, readable as `r.key`, `type(r)`, `direction(r)` or whole with `RETURN r`;
+it is refused on a `var-len` hop, which walks more than one edge. `var-len`
+must have an upper bound (`*1..3`, `*2`, `*..4`); an unbounded `*` or `*2..` is
+a clear error.
 
 ### Tail clauses
 

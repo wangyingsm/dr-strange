@@ -136,6 +136,31 @@ stricter than openCypher: under `NOT`, a compound predicate whose false branch
 would have absorbed the null — `NOT (d.a = 1 AND d.b = 2)` keeps a node with
 `b = 3` and no `a` in openCypher, and drops it here.
 
+### Reading the relationship itself
+
+Naming a relationship — `-[r:CALLS]->` — binds the edge the row walked, so its
+own facts become ordinary terms: `r.key` for a property, `type(r)` for the
+relationship type, `direction(r)` for the way this row walked it (`"OUT"` or
+`"IN"`, never `"BOTH"`, since a row's traversal is concrete even where the
+pattern asked for `-[r]-`).
+
+```text
+MATCH (f:Function)-[r:CALLS]->(g:Function)
+WHERE r._confidence < 1.0
+RETURN g.name, r._resolved_by
+```
+
+That is the question an edge property exists to answer: *which of these calls
+were inferred rather than written*. `RETURN r` hands back the whole edge as a
+map — `id`, `type`, `src`, `dst`, and `properties` nested, so an edge property
+named `type` cannot shadow the relationship's type.
+
+A relationship is addressed by which hop it is, so a variable is refused where
+that would not name one edge: on a variable-length hop (`-[r:T*1..3]->` walks
+several), bound twice in one pattern, or sharing a name with a node. A label
+test (`r:Q`) and `key(r)` are node terms and are refused with the edge form to
+use instead.
+
 ### Anchoring on a known entity
 
 `key(n)` reads a node's external key — the stable identifier it was created
@@ -265,8 +290,11 @@ silently misread:
   pattern with several paths (`MATCH (a)-->(b), (a)-->(c)`): a query holds
   one linear path, ending in one `RETURN`. Run one query per pattern or
   branch and combine the results in the caller.
-- Relationship variables (`-[r:KNOWS]->`): an edge cannot be bound, returned
-  or filtered on. Drop the variable: `-[:KNOWS]->`.
+- An earlier variable read across a variable-length hop
+  (`MATCH (a)-[*1..2]->(b)-[:R]->(c) WHERE b.x < c.x`): past such a hop a
+  row's own length decides which node a slot holds. A term at that variable's
+  own slot (`WHERE b.x = 1`) is unaffected; a `WHERE` that spans the hop is
+  refused, and a projection of it is a known gap rather than an error.
 - Inline property predicates in a `MATCH` node (`(n:Person {name: "x"})`):
   write them in `WHERE` (`WHERE n.name = "x"`, or `key(n) = "…"`). In
   `CREATE` and `MERGE` the same map is the node's properties.
