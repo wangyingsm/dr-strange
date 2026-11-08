@@ -944,6 +944,28 @@ enum AlgoCmd {
         #[arg(long, default_value_t = 50)]
         top: usize,
     },
+    /// Dependency order; a node's generation is its depth, so one generation
+    /// can be processed in parallel.
+    Toposort {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Restrict to nodes carrying this label.
+        #[arg(long)]
+        label: Option<String>,
+        /// The one edge type that claims the order. Left unset, every type
+        /// counts, and an unrelated edge can deny the order altogether.
+        #[arg(long)]
+        edge_type: Option<String>,
+        /// Edge direction: `out` when an edge means "feeds", `in` when it
+        /// means "depends on". `both` orders nothing and is refused.
+        #[arg(long, value_enum, default_value_t = DirArg::Out)]
+        dir: DirArg,
+        /// How many ordered nodes to print (default 50).
+        #[arg(long, default_value_t = 50)]
+        top: usize,
+    },
 }
 
 /// How far beyond its own plane a verb looks.
@@ -1899,6 +1921,23 @@ fn run_analytics(
                 AlgoCmd::Louvain { plane, label, top } => {
                     commands::algo_louvain(&db, &plane, label.as_deref(), top, out)
                 }
+                AlgoCmd::Toposort {
+                    plane,
+                    label,
+                    edge_type,
+                    dir,
+                    top,
+                } => commands::algo_toposort(
+                    &db,
+                    &commands::ToposortArgs {
+                        plane: &plane,
+                        label: label.as_deref(),
+                        edge_type: edge_type.as_deref(),
+                        dir: dir.into(),
+                        top,
+                    },
+                    out,
+                ),
             }
         }
         other => run_retrieval(other, db_path, cfg, verbose, out),

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
     BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
+    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, TopoOrder, TopoSortOptions,
 };
 // Only `vectorize` and the digest pipeline write property *descriptions*; the
 // rest of the CLI reads and writes plain values.
@@ -2894,6 +2894,48 @@ pub fn algo_louvain(
     Ok(())
 }
 
+/// What `drsg algo toposort` was asked for.
+pub struct ToposortArgs<'a> {
+    /// Plane to read.
+    pub plane: &'a str,
+    /// Restrict to nodes carrying this label.
+    pub label: Option<&'a str>,
+    /// The one edge type that claims the order.
+    pub edge_type: Option<&'a str>,
+    /// Which way an edge points.
+    pub dir: Dir,
+    /// How many ordered nodes to print.
+    pub top: usize,
+}
+
+/// Print the plane in dependency order, or name a node on the cycle that
+/// denies one.
+pub fn algo_toposort(db: &Database, args: &ToposortArgs<'_>, out: &mut dyn Write) -> Result<()> {
+    let opts = TopoSortOptions {
+        dir: args.dir,
+        edge_type: args.edge_type.map(str::to_string),
+    };
+    let order = match algo_scoped(db, args.plane, args.label)?.toposort(&opts)? {
+        TopoOrder::Sorted(order) => order,
+        TopoOrder::Cyclic(node) => {
+            bail!("no topological order: node {} is on a cycle", node.0)
+        }
+    };
+    let generations = order.last().map_or(0, |t| t.generation + 1);
+    writeln!(
+        out,
+        "order: {} nodes in {generations} generations",
+        order.len()
+    )?;
+    for (i, t) in order.iter().take(args.top).enumerate() {
+        writeln!(out, "  {i}\tgen {}\t{}", t.generation, t.node.0)?;
+    }
+    if order.len() > args.top {
+        writeln!(out, "  … and {} more", order.len() - args.top)?;
+    }
+    Ok(())
+}
+
 pub fn index_ensure(
     db: &Database,
     plane_name: &str,
@@ -5026,6 +5068,20 @@ mod tests {
 
         let lv = cap(|o| algo_louvain(&db, "startup", None, 50, o));
         assert!(lv.contains("communities: 1"), "{lv}");
+
+        let args = ToposortArgs {
+            plane: "startup",
+            label: None,
+            edge_type: Some("CITES"),
+            dir: Dir::Out,
+            top: 50,
+        };
+        let topo = cap(|o| algo_toposort(&db, &args, o));
+        assert!(topo.contains("order: 2 nodes in 2 generations"), "{topo}");
+        assert!(
+            topo.contains("0\tgen 0\t1") && topo.contains("1\tgen 1\t2"),
+            "{topo}"
+        );
     }
 
     #[test]
