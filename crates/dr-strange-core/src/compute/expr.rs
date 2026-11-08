@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::storage::vector::Metric;
-use crate::types::{Dir, EdgeRecord, NodeRecord, PropValue};
+use crate::types::{Dir, EdgeRecord, NodeRecord, PropDesc, PropValue, Properties};
 
 /// A predicate or scalar over the row's current node.
 ///
@@ -71,6 +71,13 @@ pub enum Expr {
     /// The traversed edge's value for a property key (`Null` if absent) —
     /// `r.weight`.
     EdgeProperty(String),
+    /// The bound edge itself as a `Map` — the query language's `RETURN r`.
+    ///
+    /// Carries `id`, `type`, `src`, `dst` and `properties` (the edge's own map,
+    /// nested so a property named `type` cannot shadow the relationship's).
+    /// `Null` when the row has no edge bound there. Bare it is the edge the row
+    /// arrived on; wrapped in [`Expr::At`] it is that hop's.
+    EdgeValue,
     /// The current node's caller-supplied external key as a `Str` (`Null` if
     /// the node was created without one). The query language's `key(n)`; an
     /// equality on it at the source compiles to a `SeekKeys` seek instead.
@@ -352,6 +359,11 @@ pub fn ep(key: impl Into<String>) -> Expr {
     Expr::EdgeProperty(key.into())
 }
 
+/// The bound edge itself, as a map — `RETURN r`.
+pub fn edge_value() -> Expr {
+    Expr::EdgeValue
+}
+
 /// Read `inner` against the node bound at pattern slot `slot`:
 /// `at_node(0, p("name"))` is the source node's name.
 pub fn at_node(slot: u32, inner: Expr) -> Expr {
@@ -475,7 +487,7 @@ impl BindingNeed {
                     self.walk(inner, true);
                 }
             },
-            Expr::EdgeType | Expr::EdgeDir | Expr::EdgeProperty(_) => {
+            Expr::EdgeType | Expr::EdgeDir | Expr::EdgeProperty(_) | Expr::EdgeValue => {
                 if !in_edge_swap {
                     self.last_edge = true;
                 }
@@ -540,6 +552,20 @@ impl<'a> EvalCtx<'a> {
     }
 }
 
+/// One relationship as a map — what [`Expr::EdgeValue`] evaluates to.
+fn edge_map(e: &EdgeRecord) -> PropValue {
+    let mut map = Properties::new();
+    map.insert("id".into(), PropDesc::new(PropValue::Int(e.id.0 as i64)));
+    map.insert("type".into(), PropDesc::new(PropValue::Str(e.ty.clone())));
+    map.insert("src".into(), PropDesc::new(PropValue::Int(e.src.0 as i64)));
+    map.insert("dst".into(), PropDesc::new(PropValue::Int(e.dst.0 as i64)));
+    map.insert(
+        "properties".into(),
+        PropDesc::new(PropValue::Map(e.properties.clone())),
+    );
+    PropValue::Map(map)
+}
+
 /// Evaluates `expr` against `ctx`. Total: returns a value, never an error.
 pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
     match expr {
@@ -599,6 +625,11 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> PropValue {
             .edge
             .and_then(|(e, _)| e.properties.get(key))
             .map(|p| p.value.clone())
+            .unwrap_or(PropValue::Null),
+        Expr::EdgeValue => ctx
+            .bindings
+            .edge
+            .map(|(e, _)| edge_map(e))
             .unwrap_or(PropValue::Null),
         Expr::Score => ctx
             .score
@@ -1231,6 +1262,52 @@ mod tests {
             PropValue::Str("OUT".into())
         );
         assert_eq!(eval(&at_edge(0, ep("weight")), &ctx), PropValue::Int(3));
+    }
+
+    /// `RETURN r` hands back the relationship itself — the stamps a plugin
+    /// wrote, plus the endpoints and id needed to act on it afterwards.
+    #[test]
+    fn an_edge_value_carries_the_relationship_and_its_endpoints() {
+        let n = node(&[], &[]);
+        let first = edge("IMPORTS", 1, 2, &[("weight", PropValue::Int(3))]);
+        let last = edge(
+            "CALLS",
+            9,
+            2,
+            &[("_resolved_by", PropValue::Str("name".into()))],
+        );
+        let hops_bound = [Some((Arc::new(first), Dir::Out))];
+        let ctx = EvalCtx {
+            node: Some(&n),
+            bindings: Bindings {
+                edges: &hops_bound,
+                edge: Some((&last, Dir::In)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let PropValue::Map(m) = eval(&edge_value(), &ctx) else {
+            panic!("an edge value is a map");
+        };
+        assert_eq!(m["id"].value, PropValue::Int(1));
+        assert_eq!(m["type"].value, PropValue::Str("CALLS".into()));
+        assert_eq!(m["src"].value, PropValue::Int(9));
+        assert_eq!(m["dst"].value, PropValue::Int(2));
+        // The edge's own properties are nested, so one named `type` or `src`
+        // cannot shadow the relationship's.
+        let PropValue::Map(props) = &m["properties"].value else {
+            panic!("`properties` is a map");
+        };
+        assert_eq!(props["_resolved_by"].value, PropValue::Str("name".into()));
+
+        // A named hop reads that hop's relationship …
+        let PropValue::Map(hop) = eval(&at_edge(0, edge_value()), &ctx) else {
+            panic!("an edge value is a map");
+        };
+        assert_eq!(hop["type"].value, PropValue::Str("IMPORTS".into()));
+        // … and a hop no row walked is `Null`, like every other term here.
+        assert_eq!(eval(&at_edge(7, edge_value()), &ctx), PropValue::Null);
     }
 
     #[test]
