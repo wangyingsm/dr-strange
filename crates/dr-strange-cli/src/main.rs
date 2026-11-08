@@ -2675,4 +2675,248 @@ mod tests {
             _ => panic!("should parse as Plugin(Install)"),
         }
     }
+
+    /// clap's own audit of the whole surface: duplicate long or short flags,
+    /// a `default_value` that its own type rejects, a positional after an
+    /// optional one. Thirty-odd variants is past the size where reading the
+    /// definition catches these, and the panic names the offender.
+    #[test]
+    fn the_command_surface_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    /// Every verb parses from the shortest invocation a reader would type, and
+    /// lands on the variant that dispatch expects.
+    ///
+    /// The point is the *mapping*, not each field: `run` routes on the variant,
+    /// so a verb that parses into the wrong one is a verb that silently does
+    /// something else. Fields with defaults worth defending get their own
+    /// assertions below.
+    #[test]
+    fn every_verb_parses_into_its_own_variant() {
+        /// An invocation and the variant it must land on.
+        type Case = (Vec<&'static str>, fn(&Command) -> bool);
+        let cases: Vec<Case> = vec![
+            (vec!["token"], |c| matches!(c, Command::Token { .. })),
+            (vec!["import", "in.jsonl"], |c| {
+                matches!(c, Command::Import { .. })
+            }),
+            (vec!["export"], |c| matches!(c, Command::Export { .. })),
+            (vec!["get", "7"], |c| matches!(c, Command::Get { .. })),
+            (vec!["query", "{}"], |c| matches!(c, Command::Query { .. })),
+            (vec!["cypher", "MATCH (n) RETURN n"], |c| {
+                matches!(c, Command::Cypher { .. })
+            }),
+            (vec!["queries"], |c| matches!(c, Command::Queries { .. })),
+            (vec!["attach", "other"], |c| {
+                matches!(c, Command::Attach { .. })
+            }),
+            (vec!["mount", "/srv/other.drsg"], |c| {
+                matches!(c, Command::Mount { .. })
+            }),
+            (vec!["unmount", "other"], |c| {
+                matches!(c, Command::Unmount { .. })
+            }),
+            (vec!["mounts"], |c| matches!(c, Command::Mounts { .. })),
+            (vec!["detach", "other"], |c| {
+                matches!(c, Command::Detach { .. })
+            }),
+            (vec!["attachments"], |c| {
+                matches!(c, Command::Attachments { .. })
+            }),
+            (vec!["wire", "/v1/health"], |c| {
+                matches!(c, Command::Wire { .. })
+            }),
+            (vec!["traverse", "7"], |c| {
+                matches!(c, Command::Traverse { .. })
+            }),
+            (vec!["fathom", "run"], |c| {
+                matches!(c, Command::Fathom { .. })
+            }),
+            (vec!["history"], |c| matches!(c, Command::History { .. })),
+            (vec!["catalog"], |c| matches!(c, Command::Catalog { .. })),
+            (vec!["stats"], |c| matches!(c, Command::Stats)),
+            (vec!["check"], |c| matches!(c, Command::Check)),
+            (vec!["upgrade"], |c| matches!(c, Command::Upgrade)),
+            (vec!["snapshot", "out.drsg"], |c| {
+                matches!(c, Command::Snapshot { .. })
+            }),
+            (vec!["restore", "in.drsg"], |c| {
+                matches!(c, Command::Restore { .. })
+            }),
+            (vec!["serve"], |c| matches!(c, Command::Serve { .. })),
+            (vec!["update"], |c| matches!(c, Command::Update { .. })),
+            (vec!["plane", "list"], |c| matches!(c, Command::Plane(_))),
+            (vec!["algo", "pagerank"], |c| matches!(c, Command::Algo(_))),
+            (vec!["index", "keyword", "body"], |c| {
+                matches!(c, Command::Index(_))
+            }),
+            (vec!["hybrid", "ferns"], |c| {
+                matches!(c, Command::Hybrid { .. })
+            }),
+        ];
+        for (args, want) in cases {
+            let argv: Vec<&str> = std::iter::once("drsg")
+                .chain(args.iter().copied())
+                .collect();
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("`drsg {}` should parse: {e}", args.join(" ")));
+            assert!(
+                want(&cli.command),
+                "`drsg {}` parsed into the wrong variant",
+                args.join(" ")
+            );
+        }
+    }
+
+    /// The defaults a reader relies on without typing them. Each of these is a
+    /// promise: `--db` naming the file in this directory, the empty `startup`
+    /// plane, and a `serve` that listens on the configured address rather than
+    /// a watcher.
+    #[test]
+    fn the_defaults_a_bare_invocation_promises() {
+        let cli = Cli::try_parse_from(["drsg", "stats"]).unwrap();
+        assert_eq!(cli.db, PathBuf::from("graph.drsg"));
+        assert_eq!(cli.verbose, 0, "quiet unless asked");
+        assert!(cli.config.is_none());
+
+        // `-v` stacks: the count is what `Verbosity` reads.
+        let loud = Cli::try_parse_from(["drsg", "-vv", "stats"]).unwrap();
+        assert_eq!(loud.verbose, 2);
+
+        // A plane-scoped read defaults to `startup`, which is empty on a
+        // normal install — the fallback that makes the misses explainable.
+        let cli = Cli::try_parse_from(["drsg", "export"]).unwrap();
+        match cli.command {
+            Command::Export { plane, .. } => assert_eq!(plane, "startup"),
+            _ => panic!("should parse as Export"),
+        }
+
+        // `serve` with no mode is the server itself, not `serve watch`.
+        let cli = Cli::try_parse_from(["drsg", "serve"]).unwrap();
+        match cli.command {
+            Command::Serve { mode: None, .. } => {}
+            _ => panic!("bare `serve` must not imply a mode"),
+        }
+    }
+
+    /// The argument enums exist to keep clap's vocabulary out of the core
+    /// types; each spelling has to arrive as the value it names.
+    #[test]
+    fn the_value_enums_convert_to_the_core_types() {
+        assert!(matches!(Dir::from(DirArg::Out), Dir::Out));
+        assert!(matches!(Dir::from(DirArg::In), Dir::In));
+        assert!(matches!(Dir::from(DirArg::Both), Dir::Both));
+        assert!(matches!(Metric::from(MetricArg::Cosine), Metric::Cosine));
+        assert!(matches!(Metric::from(MetricArg::Dot), Metric::Dot));
+        assert!(matches!(Metric::from(MetricArg::L2), Metric::L2));
+
+        // And they parse from the spellings a reader types. `toposort --dir in`
+        // is the one that matters: `in` is what an edge meaning "depends on"
+        // needs, and getting it backwards reverses the whole answer.
+        let cli = Cli::try_parse_from(["drsg", "algo", "toposort", "--dir", "in"]).unwrap();
+        match cli.command {
+            Command::Algo(AlgoCmd::Toposort { dir, top, .. }) => {
+                assert!(matches!(Dir::from(dir), Dir::In));
+                assert_eq!(top, 50, "the printed-rows default");
+            }
+            _ => panic!("should parse as Algo(Toposort)"),
+        }
+        // Unset, it is `out`.
+        let cli = Cli::try_parse_from(["drsg", "algo", "toposort"]).unwrap();
+        match cli.command {
+            Command::Algo(AlgoCmd::Toposort { dir, .. }) => {
+                assert!(matches!(Dir::from(dir), Dir::Out))
+            }
+            _ => panic!("should parse as Algo(Toposort)"),
+        }
+    }
+
+    /// A reader's verb answers with JSON; a string answer is its text, and
+    /// anything else is printed as it stands rather than quoted.
+    #[test]
+    fn as_text_unwraps_a_string_answer_only() {
+        assert_eq!(as_text(&serde_json::json!("fn run() {}")), "fn run() {}");
+        assert_eq!(as_text(&serde_json::json!({"a": 1})), r#"{"a":1}"#);
+        assert_eq!(as_text(&serde_json::json!(7)), "7");
+        assert_eq!(as_text(&serde_json::Value::Null), "null");
+    }
+
+    /// The mount verbs print facts, one per line. These answers come off the
+    /// wire, so every field is optional in practice and a missing one must not
+    /// panic or print `null`.
+    #[test]
+    fn render_mounts_prints_one_fact_per_line() {
+        let got = render_mounts(
+            "db.mount",
+            &serde_json::json!({
+                "name": "other", "path": "/srv/other.drsg",
+                "planes": ["other::code"], "skipped": ["other::ops"],
+            }),
+        );
+        assert_eq!(
+            got,
+            "mounted 'other' from /srv/other.drsg\n  serves  other::code\n  \
+             held, not served: other::ops\n"
+        );
+
+        // Nothing held: the line is absent rather than empty.
+        let got = render_mounts(
+            "db.mount",
+            &serde_json::json!({"name": "o", "path": "/p", "planes": []}),
+        );
+        assert_eq!(got, "mounted 'o' from /p\n");
+
+        // An unmount that could not free the store says so — an operator
+        // unmounting in order to open it elsewhere would otherwise meet a lock
+        // with no explanation.
+        let got = render_mounts(
+            "db.unmount",
+            &serde_json::json!({"unmounted": true, "name": "o", "path": "/p", "freed": false}),
+        );
+        assert!(got.starts_with("unmounted 'o' at /p\n"), "{got}");
+        assert!(got.contains("still locked"), "{got}");
+
+        // Freed, or silent about it: no second line.
+        let got = render_mounts(
+            "db.unmount",
+            &serde_json::json!({"unmounted": true, "name": "o", "path": "/p", "freed": true}),
+        );
+        assert_eq!(got, "unmounted 'o' at /p\n");
+
+        // Absent is reported, not an error.
+        let got = render_mounts(
+            "db.unmount",
+            &serde_json::json!({"unmounted": false, "name": "o"}),
+        );
+        assert_eq!(got, "nothing mounted as 'o'\n");
+
+        // The listing: mounts, then every plane with where it lives.
+        let got = render_mounts(
+            "db.mounts",
+            &serde_json::json!({
+                "mounts": [{"name": "other", "path": "/srv/o.drsg", "planes": ["a", "b"]}],
+                "planes": [
+                    {"plane": "here", "synced_root": "/home/me/repo"},
+                    {"plane": "a", "mount": "other"},
+                ],
+                "mount_root": "/home/me",
+            }),
+        );
+        assert_eq!(
+            got,
+            "other  /srv/o.drsg  (2 plane(s))\n  here  here  /home/me/repo\n  \
+             a  in other\nmounts may come from /home/me\n"
+        );
+
+        // An empty server says so rather than printing a blank line.
+        let got = render_mounts("db.mounts", &serde_json::json!({"mounts": []}));
+        assert_eq!(got, "this server mounts nothing\n");
+        // And a malformed answer is still survivable.
+        assert_eq!(
+            render_mounts("db.mounts", &serde_json::json!({})),
+            "this server mounts nothing\n"
+        );
+    }
 }
