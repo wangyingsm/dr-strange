@@ -25,8 +25,9 @@ the npm publication the first step also depends on.
 
 - **`server.json` names the current version.** The registry treats each
   version as its own record, so a listing left at an old number advertises an
-  old binary. `just bump-version` does not touch this file; until it does,
-  the number here is updated by hand at release time.
+  old binary. `just bump-version` sets it with the rest — both the record's
+  version and the npm package's — so this is true by default rather than by
+  anyone remembering.
 - **The install line a reader will paste actually works.** Every directory
   below reproduces it, and a reader arriving from one of these pages has no
   other source for it.
@@ -82,8 +83,8 @@ Three decisions in the file are worth knowing before anyone edits it:
   environment variable, so a client asks for the secret once and it reaches
   both places.
 
-`just bump-version` does not touch this file, so the version is the one thing
-here that goes stale by itself — see §0.
+The version is the one field a release has to move, and `just bump-version`
+moves it — see §0.
 
 ### The package has to claim the server name back
 

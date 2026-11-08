@@ -332,6 +332,10 @@ bump-version old new:
         exit 1
     fi
     sed -i 's/"version": "{{old}}",/"version": "{{new}}",/' crates/dr-strange-web/openrpc.json
+    # The MCP registry entry, twice: the record's version and the npm package's.
+    # The registry treats each version as its own record, so one left behind
+    # lists an old binary under a current name.
+    sed -i 's/"version": "{{old}}",/"version": "{{new}}",/' packaging/mcp-registry/server.json
     sed -i 's/drsg {{old}} is the latest release/drsg {{new}} is the latest release/' README.md README.zh.md
     # The book's `drsg update` transcript: the example moves one release on.
     for f in docs/en/src/getting-started.md docs/zh/src/getting-started.md; do
