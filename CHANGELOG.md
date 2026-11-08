@@ -4,6 +4,49 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+An edge's own facts, readable from a query (ROADMAP §15). `_confidence` and
+`_resolved_by` on a `CALLS` edge say whether a call was written or inferred,
+`role` on `USES_TYPE` says whether a type is a field, a parameter or a return
+— and until now a query could reach none of them, so an agent asking *which of
+these calls were inferred* had to read every edge through `context` instead.
+
+### Added
+
+- **A bound relationship.** `MATCH (f:Function)-[r:CALLS]->(g)` binds the edge
+  the row walked, and `r._confidence`, `type(r)` and `direction(r)` are
+  ordinary terms from there — in `WHERE`, in a projection and in `ORDER BY`.
+  `direction(r)` is `"OUT"` or `"IN"` and never `"BOTH"`: a row's traversal is
+  concrete even where the pattern asked for `-[r]-`.
+
+  A relationship is addressed by which hop it is, so a variable is refused
+  where that would not name one edge — on a variable-length hop, bound twice,
+  or sharing a name with a node — each with the form that does work.
+
+- **`RETURN r`.** The whole edge as a map: `id`, `type`, `src`, `dst`, and the
+  edge's own properties nested under `properties`, so one named `type` cannot
+  shadow the relationship's. `id` is there so a returned edge can be handed
+  straight to `edge.update` / `edge.delete`.
+
+- **Cross-variable `WHERE`.** `WHERE a.name = b.name` and `WHERE r.w > a.x`
+  compile, where a condition could name only one pattern variable before. Each
+  is placed at the latest slot its variables name — the first point where the
+  row has walked all of them — so it still filters as early as it can rather
+  than waiting for the end of the path.
+
+### Fixed
+
+- **A condition that read a variable across a variable-length hop was
+  miscompiled; it is now refused.** `Expr::At` addresses the row's trail while
+  the compiler numbers pattern slots, and a variable-length hop walks a number
+  of edges that varies per row, so past it the two disagree: on an `a→b→c→d`
+  chain, `MATCH (a)-[*1..2]->(b)-[:E]->(c) WHERE hops() = 0 OR b.name = "b"`
+  matched a row whose `b` was really `c`. A term at its own slot is unaffected.
+  The same mismatch still affects a *projection* across such a hop, which
+  needs the executor to learn the per-row mapping — recorded in ROADMAP's
+  low-priority section rather than papered over.
+
 ## [2.28.0] - 2026-11-08
 
 Two algorithms for a plane whose edges mean *depends on*, from two issues filed

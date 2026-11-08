@@ -1171,38 +1171,54 @@ a tracked `.env` that a digest would have passed over.
 
 ---
 
-## 15. Edge properties a query can read — relationship variables in Cypher
+## 15. Edge properties a query can read — relationship variables in Cypher  *(shipped)*
 
-**Status.** TODO. An edge already carries the facts a reader most wants to
-filter on, and no query can reach any of them: `_resolved_by` / `_confidence` /
-`_ref` on a `CALLS` edge say how that call was bound, `role` on `USES_TYPE`
-says whether a type is a field, a parameter or a return, and the java plugin's
-Spring work (§11, issue #46) puts an injection point's evidence and an
-annotation's arguments there as well. Cypher refuses the syntax outright —
-*"relationship variables aren't supported (`[r:T]`); an edge can't be bound,
-returned or filtered on yet"* — so every one of those facts is visible to
-`context` and `get_node` and invisible to a query.
+**Status.** Shipped. An edge carries the facts a reader most wants to filter
+on — `_resolved_by` / `_confidence` / `_ref` on a `CALLS` edge say how that
+call was bound, `role` on `USES_TYPE` says whether a type is a field, a
+parameter or a return, and the java plugin's Spring work (§11, issue #46) puts
+an injection point's evidence and an annotation's arguments there as well — and
+a query now reads all of them:
 
-**Scope.**
+```text
+MATCH (f:Function)-[r:CALLS]->(g:Function)
+WHERE r._confidence < 1.0
+RETURN g.name, r._resolved_by
+```
 
-- Bind a relationship (`MATCH (a)-[r:CALLS]->(b)`), return it, and project its
-  properties (`RETURN r._confidence`).
-- Filter on them (`WHERE r.role = "field"`), on a typed hop and an untyped one.
-- The plan IR gains the same, so `plane.query` and the five SDKs reach it with
-  the language rather than after it.
+**What this entry got wrong.** It was written as a query-engine feature, and
+the engine already had it. The plan IR carried `Expr::At { binding:
+Binding::Edge(hop) }` with `EdgeType` / `EdgeDir` / `EdgeProperty`, a per-hop
+`resolve_bindings` deriving the traversal direction from the endpoints, and
+builders re-exported at core's root — all of it reachable from `plane.query`
+and the five SDKs the whole time. Only the Cypher front end never reached it:
+the parser dropped the variable and the compiler refused the syntax. The work
+was a parser and compiler job, not an engine one.
 
-**Why AI-native.** The stamps are how a plugin states the bounds of its own
-answer — written by the source, inferred from a receiver's type, or wired by a
-DI container. An agent asking *which of these calls are inferred rather than
-written* is asking a graph question, and today it has to read every edge
-through `context` to answer it.
+**Shipped.**
 
-**Forks to settle.** Whether a bound edge becomes a first-class row value (a
-map carrying its endpoints) or only its properties are projectable; whether a
-relationship variable may repeat across a path, which openCypher forbids; and
-what a cross-variable predicate costs, since `WHERE` holds one pattern
-variable today — the same limit that keeps a name match between two bound
-nodes (`WHERE m.name = d.name`) out of reach.
+- Bind a relationship on a typed hop or an untyped one (`-[r]->`, `<-[r:S]-`),
+  read `r.key`, `type(r)` and `direction(r)` (`"OUT"`/`"IN"` — a row's
+  traversal is concrete even where the pattern asked for `-[r]-`).
+- `RETURN r`: the whole edge as a map — `id`, `type`, `src`, `dst` and
+  `properties` nested, so an edge property named `type` cannot shadow the
+  relationship's. A map is an ordinary `PropValue`, so this needed no new
+  result contract and no SDK regeneration, and `DISTINCT` / `GROUP BY` over it
+  work through the existing total order.
+- Cross-variable predicates (`WHERE r.w > a.x`, `WHERE a.name = b.name`),
+  placed at the latest slot their variables name — the first point where the
+  row has walked all of them, so a predicate still filters as early as it can.
+
+**Forks, as settled.** A bound edge *is* a first-class value (the map above),
+not only projectable properties. A variable may not repeat across a path,
+matching openCypher — and is likewise refused on a variable-length hop, which
+walks several edges, or sharing a name with a node, since a relationship is
+addressed by which hop it is. Cross-variable predicates cost nothing in the
+IR, which supported them already.
+
+**Deferred.** Reading an earlier variable *across* a variable-length hop — see
+the low-priority section. A `WHERE` that would need it is refused rather than
+miscompiled; a projection of it is still wrong.
 
 ---
 
@@ -1418,3 +1434,18 @@ These are real graph-DB table stakes but explicitly **not** a current priority.
 - **Constraints / schema validation** (uniqueness, required properties,
   edge-cardinality enforcement). The soft-schema catalog *observes* structure
   but doesn't *enforce* it. Nice for integrity; not a differentiator.
+
+- **A pattern slot past a variable-length hop, read from a later slot.**
+  `Expr::At` addresses the row's trail, while the compiler numbers pattern
+  slots; a variable-length hop walks a number of edges that varies per row, so
+  from there on the two disagree. `MATCH (a)-[*1..2]->(b)-[:E]->(c) RETURN
+  b.name, c.name` therefore reports the node one hop along the trail rather
+  than whichever node `b` matched — on an `a→b→c→d` chain the row whose hop
+  took two edges says `b` where it means `c`. The compiler refuses this in a
+  `WHERE` (§15) and a term read at its own slot is always right, so what is
+  left is a projection or `ORDER BY` naming an earlier variable across such a
+  hop. Fixing it means the executor learning the pattern→trail mapping, which
+  is per-row: the plan would have to mark which expansions were
+  variable-length and a `Row` carry its slot boundaries. Deferred because
+  variable-length hops are mostly asked as reachability (`RETURN c`), where
+  nothing is read off the middle of the path.
