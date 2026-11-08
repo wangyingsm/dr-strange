@@ -1337,6 +1337,49 @@ mod tests {
     }
 
     #[test]
+    fn plane_algo_toposort_orders_and_numbers_generations() {
+        let (db, alice, bob) = seeded_graph();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"toposort","edge_type":"KNOWS"},"id":1}"#,
+        )
+        .unwrap();
+        let r = &resp["result"];
+        assert_eq!(r["algo"], "toposort");
+        assert_eq!(r["count"], 2);
+        assert_eq!(r["results"][0]["id"], alice);
+        assert_eq!(r["results"][0]["order"], 0);
+        assert_eq!(r["results"][0]["generation"], 0);
+        assert_eq!(r["results"][1]["id"], bob);
+        assert_eq!(r["results"][1]["generation"], 1);
+    }
+
+    #[test]
+    fn plane_algo_toposort_refuses_a_cyclic_plane() {
+        let (db, alice, bob) = seeded_graph();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        txn.create_edge(
+            dr_strange_core::NodeId(bob),
+            dr_strange_core::NodeId(alice),
+            "KNOWS",
+            Properties::new(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.algo","params":{"plane":"startup","algo":"toposort"},"id":1}"#,
+        )
+        .unwrap();
+        // An application-level fact about the graph, not a malformed call.
+        assert_eq!(err_code(&resp), -32000);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("on a cycle"), "{msg}");
+    }
+
+    #[test]
     fn plane_algo_unknown_name_is_invalid_params() {
         let (db, _, _) = seeded_graph();
         let resp = call(
