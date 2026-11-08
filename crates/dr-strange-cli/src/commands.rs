@@ -9,8 +9,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dr_strange_core::{
-    BulkEdgeById, BulkNode, Database, Dir, Language, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, TopoOrder, TopoSortOptions,
+    BulkEdgeById, BulkNode, CyclesOptions, Database, Dir, Language, LogicalPlan, LouvainOptions,
+    Metric, NodeId, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions, TopoOrder,
+    TopoSortOptions,
 };
 // Only `vectorize` and the digest pipeline write property *descriptions*; the
 // rest of the CLI reads and writes plain values.
@@ -2936,6 +2937,33 @@ pub fn algo_toposort(db: &Database, args: &ToposortArgs<'_>, out: &mut dyn Write
     Ok(())
 }
 
+/// Print the cycles in a plane, each as the node list closing it. Says so
+/// plainly when there are none: that is the answer, not an empty report.
+pub fn algo_cycles(
+    db: &Database,
+    plane_name: &str,
+    label: Option<&str>,
+    edge_type: Option<&str>,
+    limit: usize,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let opts = CyclesOptions {
+        edge_type: edge_type.map(str::to_string),
+        limit,
+    };
+    let found = algo_scoped(db, plane_name, label)?.cycles(&opts)?;
+    if found.is_empty() {
+        writeln!(out, "cycles: none — this scope is a DAG")?;
+        return Ok(());
+    }
+    writeln!(out, "cycles: {}", found.len())?;
+    for cycle in &found {
+        let path: Vec<String> = cycle.iter().map(|n| n.0.to_string()).collect();
+        writeln!(out, "  {}", path.join(" -> "))?;
+    }
+    Ok(())
+}
+
 pub fn index_ensure(
     db: &Database,
     plane_name: &str,
@@ -5076,11 +5104,35 @@ mod tests {
             dir: Dir::Out,
             top: 50,
         };
+        // Nothing cites back, so the fixture is a DAG.
+        let none = cap(|o| algo_cycles(&db, "startup", None, None, 50, o));
+        assert!(none.contains("none — this scope is a DAG"), "{none}");
+
         let topo = cap(|o| algo_toposort(&db, &args, o));
         assert!(topo.contains("order: 2 nodes in 2 generations"), "{topo}");
         assert!(
             topo.contains("0\tgen 0\t1") && topo.contains("1\tgen 1\t2"),
             "{topo}"
+        );
+
+        // Close the loop: the order goes away and the cycle is named.
+        {
+            let plane = db.plane("startup").unwrap();
+            let mut txn = plane.write().unwrap();
+            txn.create_edge(NodeId(2), NodeId(1), "CITES", Properties::new())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let found = cap(|o| algo_cycles(&db, "startup", None, Some("CITES"), 50, o));
+        assert!(
+            found.contains("cycles: 1") && found.contains("1 -> 2 -> 1"),
+            "{found}"
+        );
+        assert!(
+            algo_toposort(&db, &args, &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("is on a cycle")
         );
     }
 

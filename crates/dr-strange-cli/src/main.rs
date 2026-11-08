@@ -966,6 +966,24 @@ enum AlgoCmd {
         #[arg(long, default_value_t = 50)]
         top: usize,
     },
+    /// Cycles, each as the node list that closes it. No output rows means the
+    /// scope is a DAG.
+    Cycles {
+        /// Plane to read. Defaults to `startup`, which is empty on a normal
+        /// install — name the plane this tree was digested into.
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Restrict to nodes carrying this label.
+        #[arg(long)]
+        label: Option<String>,
+        /// The one edge type to look for cycles in. Left unset, two edges that
+        /// mean different things can close a loop between them.
+        #[arg(long)]
+        edge_type: Option<String>,
+        /// Stop after this many cycles; `1` asks only whether there is one.
+        #[arg(long, default_value_t = 50)]
+        top: usize,
+    },
 }
 
 /// How far beyond its own plane a verb looks.
@@ -1936,6 +1954,19 @@ fn run_analytics(
                         dir: dir.into(),
                         top,
                     },
+                    out,
+                ),
+                AlgoCmd::Cycles {
+                    plane,
+                    label,
+                    edge_type,
+                    top,
+                } => commands::algo_cycles(
+                    &db,
+                    &plane,
+                    label.as_deref(),
+                    edge_type.as_deref(),
+                    top,
                     out,
                 ),
             }
