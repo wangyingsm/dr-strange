@@ -1854,6 +1854,55 @@ const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(feature = "digest")]
 const UNBORN_RUN_ID: &str = "working-tree";
 
+/// A number that changes when any ref does — so `git tag v1` on the commit
+/// already folded, which moves no HEAD, still reaches the history plane.
+///
+/// Metadata only: the refs are *stated* by the filesystem, so a tick costs a
+/// directory walk and a `stat` per ref and runs no git. That is what makes
+/// this affordable at all — asking git would double the subprocess the poll
+/// already spawns for HEAD, which is why this was left open. Git writes a ref
+/// by renaming a fresh temp file over it, so size and mtime move together with
+/// the content; `packed-refs` is one file and counted the same way. Deleting a
+/// ref and recreating it at the same sha inside one mtime tick is the gap, and
+/// it describes a plane that is already correct.
+#[cfg(feature = "digest")]
+fn refs_fingerprint(git_dir: &Path) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut facts: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
+    let mut note = |path: &Path, name: String| {
+        if let Ok(m) = std::fs::metadata(path)
+            && m.is_file()
+        {
+            facts.push((name, m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        }
+    };
+    note(&git_dir.join("packed-refs"), "packed-refs".into());
+    // Loose refs win over packed ones, so both have to be seen. Depth is
+    // whatever the repository uses (`refs/remotes/origin/main` is three).
+    let mut dirs = vec![git_dir.join("refs")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            match path.is_dir() {
+                true => dirs.push(path),
+                false => {
+                    let name = path.strip_prefix(git_dir).unwrap_or(&path);
+                    note(&path, name.display().to_string())
+                }
+            }
+        }
+    }
+    // Sorted: a directory walk has no guaranteed order, and an unordered hash
+    // would change on its own and refold history for nothing.
+    facts.sort();
+    let mut h = DefaultHasher::new();
+    facts.hash(&mut h);
+    h.finish()
+}
+
 /// Plane properties recording what the graph reflects: the commit the last
 /// digest or fold left it at, and the directory the facts were parsed from.
 /// Together they answer "is the graph in sync with the repository?" — and
@@ -2379,11 +2428,8 @@ fn watch_loop(
         plane = plane_name,
         head = %head,
         history = git,
-        // Said once, because it is the bound of what follows: the watcher wakes
-        // on HEAD, so a tag or a branch created without a commit reaches the
-        // history plane on the next commit rather than immediately.
-        "watching repository — each commit folds into the graph, and \
-         into the history plane on the next HEAD move"
+        "watching repository — each commit folds into the graph, and a \
+         commit or a ref that moves without one into the history plane"
     );
     poll_commits(
         held,
@@ -2414,6 +2460,16 @@ fn poll_commits(
     mut head: String,
     revectorize: &dyn Fn(&Database, &str),
 ) -> Result<()> {
+    // Only when history is being followed at all: with no `git` plugin there
+    // is no plane for a ref to reach, so the walk is never made.
+    let refs_dir = match git {
+        true => match dr_strange_llm::git_dir(tree.dir) {
+            dr_strange_llm::GitDir::Here(d) => Some(d),
+            _ => None,
+        },
+        false => None,
+    };
+    let mut refs_seen = refs_dir.as_deref().map(refs_fingerprint);
     loop {
         std::thread::sleep(WATCH_POLL);
         // Taken per tick and never held across the sleep: a mounted database
@@ -2434,6 +2490,22 @@ fn poll_commits(
             }
         };
         if now == head {
+            // HEAD is where it was, but a ref may still have moved — a tag, or
+            // a branch created or deleted on a commit already folded. History
+            // only: no file changed, so the code plane has nothing to do.
+            if let (Some(dir), Some(seen)) = (refs_dir.as_deref(), refs_seen) {
+                let fresh = refs_fingerprint(dir);
+                if fresh != seen {
+                    refs_seen = Some(fresh);
+                    match live.current() {
+                        Ok(plugins) => fold_history(db, tree.dir, plane_name, plugins, "ref moved"),
+                        Err(e) => tracing::warn!(
+                            error = format!("{e:#}"),
+                            "a ref moved but the plugin set could not be read; will retry"
+                        ),
+                    }
+                }
+            }
             continue;
         }
         match fold_one_move(db, tree, plane_name, live, source, git, &head, &now) {
@@ -2459,6 +2531,10 @@ fn poll_commits(
             }
         }
         head = now;
+        // The commit moved a branch, so these refs are current as of this
+        // fold. Re-read rather than left stale, which would spend the next
+        // tick refolding history that is already there.
+        refs_seen = refs_dir.as_deref().map(refs_fingerprint);
     }
 }
 
@@ -5679,6 +5755,78 @@ mod tests {
         assert!(!is_git_repo(&plain));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The fingerprint that lets a ref reach the history plane without a
+    /// commit behind it (ROADMAP §11).
+    ///
+    /// Built against a real repository and the real `git` binary, because what
+    /// is being relied on is how git *writes* a ref — the claim that a tag or a
+    /// branch changes the file metadata the walk reads. A hand-made directory
+    /// would only test the walk.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn a_ref_that_moves_without_a_commit_changes_the_fingerprint() {
+        let dir = unique_path("refs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.invalid"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-qm", "one"]);
+
+        let git_dir = dir.join(".git");
+        let head = git_head(&dir).unwrap();
+        let first = refs_fingerprint(&git_dir);
+
+        // Nothing happened: the same repository reads the same. Without this
+        // the watcher would refold history every two seconds.
+        assert_eq!(refs_fingerprint(&git_dir), first, "stable while idle");
+
+        // A tag on the commit already folded. HEAD does not move — which is
+        // exactly why this case was open — but the fingerprint does.
+        run(&["tag", "v1"]);
+        assert_eq!(git_head(&dir).unwrap(), head, "tagging moves no HEAD");
+        let tagged = refs_fingerprint(&git_dir);
+        assert_ne!(tagged, first, "a tag has to be noticed");
+
+        // So does a branch created on it, and deleting one again.
+        run(&["branch", "side"]);
+        let branched = refs_fingerprint(&git_dir);
+        assert_ne!(branched, tagged, "a branch has to be noticed");
+        assert_eq!(git_head(&dir).unwrap(), head);
+        run(&["branch", "-D", "side"]);
+        assert_ne!(refs_fingerprint(&git_dir), branched, "so does removing it");
+
+        // And packing the refs away is a change to the same answer: the
+        // fingerprint has to follow refs out of loose files into `packed-refs`
+        // rather than go blind when git tidies up.
+        let loose = refs_fingerprint(&git_dir);
+        run(&["pack-refs", "--all"]);
+        assert!(
+            git_dir.join("packed-refs").is_file(),
+            "the test's premise: git packed the refs"
+        );
+        assert_ne!(refs_fingerprint(&git_dir), loose, "packing is a move too");
+
+        // A directory that is not a repository answers rather than panicking:
+        // the watcher calls this every tick and must not care.
+        let _ = refs_fingerprint(Path::new("/nonexistent-git-dir"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `git diff --name-status -z` per status letter: one path each, except
