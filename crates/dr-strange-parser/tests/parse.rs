@@ -5,7 +5,8 @@
 use dr_strange_core::{
     Agg, AggFunc, Algo, Dir, GraphChannel, HybridSpec, HybridWeights, KeywordChannel, LogicalPlan,
     Metric, NodeId, NodeRef, ProjItem, PropValue, SortKey, Source, Step, TupleSortKey,
-    VectorChannel, at_node, distance, external_key, has_label, hops, lit, p, score, similarity,
+    VectorChannel, at_edge, at_node, distance, edge_dir, edge_type, ep, external_key, has_label,
+    hops, lit, p, score, similarity,
 };
 use dr_strange_parser::{
     Embedder, Params, ParseError, Statement, parse, parse_statement, parse_statement_full,
@@ -1694,19 +1695,107 @@ fn clauses_this_cut_lacks_are_refused_by_name() {
 }
 
 #[test]
-fn a_relationship_variable_is_refused_with_the_form_that_works() {
-    for q in [
-        "MATCH (a:P)-[r:R]->(b) RETURN b",
-        "MATCH (a:P)-[r]->(b) RETURN b",
-        "MATCH (a:P)<-[r:R*1..2]-(b) RETURN b",
-        "MATCH (a:P)-[r:R]->(b) SET b.x = 1",
-    ] {
-        let m = unsupported(q);
-        assert!(m.contains("relationship variables"), "`{q}`: {m}");
-        assert!(m.contains("`-[:T]->`"), "`{q}`: {m}");
-    }
-    // The form that works still does.
+fn a_relationship_variable_binds_the_hops_edge() {
+    // A relationship is addressed by *which hop it is*, so every term about
+    // `r` reads hop 0's edge out of the trail the row already carries — the
+    // filter lands after the expansion that walked it.
+    assert_eq!(
+        plan(r#"MATCH (a:P)-[r:R]->(b) WHERE r.role = "field" RETURN b"#),
+        LogicalPlan {
+            source: Source::ScanLabel("P".into()),
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Out,
+                    edge_type: Some("R".into()),
+                },
+                Step::Filter(at_edge(0, ep("role")).eq("field")),
+            ],
+            project: None,
+        }
+    );
+
+    // `type()` and `direction()` are the two facts a relationship has that are
+    // not properties of it. An untyped hop is where `type(r)` earns its keep.
+    assert_eq!(
+        plan("MATCH (a:P)-[r]->(b) WHERE type(r) = 'CALLS' RETURN b"),
+        LogicalPlan {
+            source: Source::ScanLabel("P".into()),
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Out,
+                    edge_type: None,
+                },
+                Step::Filter(at_edge(0, edge_type()).eq("CALLS")),
+            ],
+            project: None,
+        }
+    );
+    assert_eq!(
+        plan("MATCH (a:P)-[r]-(b) WHERE direction(r) = 'IN' RETURN b"),
+        LogicalPlan {
+            source: Source::ScanLabel("P".into()),
+            steps: vec![
+                Step::Expand {
+                    dir: Dir::Both,
+                    edge_type: None,
+                },
+                Step::Filter(at_edge(0, edge_dir()).eq("IN")),
+            ],
+            project: None,
+        }
+    );
+
+    // The second hop's edge is hop 1, whichever end the pattern reads from.
+    assert_eq!(
+        plan("MATCH (a:P)-[:R]->(b)<-[r:S]-(c) WHERE r.w > 1 RETURN c")
+            .steps
+            .last()
+            .unwrap(),
+        &Step::Filter(at_edge(1, ep("w")).gt(1))
+    );
+
+    // Projecting its values needs no node variable in the RETURN at all.
+    assert!(parse("MATCH (a:P)-[r:R]->(b) RETURN r.w AS w, type(r) AS t").is_ok());
+    // And the anonymous form still parses, unchanged.
     assert!(parse("MATCH (a:P)-[:R]->(b) RETURN b").is_ok());
+}
+
+#[test]
+fn a_relationship_variable_is_refused_where_it_could_not_name_one_edge() {
+    let cases = [
+        // A variable-length hop walks several edges, so there is no single
+        // edge for the name to mean.
+        (
+            "MATCH (a:P)<-[r:R*1..2]-(b) RETURN b",
+            "variable-length hop",
+        ),
+        // Reused, it would have to be two hops at once.
+        ("MATCH (a:P)-[r:R]->(b)-[r:S]->(c) RETURN c", "bound twice"),
+        // Shared with a node, it would be ambiguous which one a term reads.
+        ("MATCH (r:P)-[r:R]->(b) RETURN b", "already names a node"),
+        // A label and an external key are node properties; a relationship has
+        // neither.
+        ("MATCH (a:P)-[r:R]->(b) WHERE r:Q RETURN b", "relationship"),
+        (
+            "MATCH (a:P)-[r:R]->(b) WHERE key(r) = 'x' RETURN b",
+            "relationship",
+        ),
+        // And the two edge functions want a relationship, not a node.
+        (
+            "MATCH (a:P)-[r:R]->(b) WHERE type(a) = 'R' RETURN b",
+            "isn't a relationship variable",
+        ),
+    ];
+    for (q, want) in cases {
+        let m = unsupported(q);
+        assert!(m.contains(want), "`{q}`: {m}");
+    }
+}
+
+#[test]
+fn returning_a_relationship_points_at_its_values() {
+    let said = unsupported("MATCH (a:P)-[r:R]->(b) RETURN r");
+    assert!(said.contains("type(r)"), "{said}");
 }
 
 #[test]

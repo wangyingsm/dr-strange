@@ -167,6 +167,10 @@ pub struct NodePat {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelPat {
+    /// `-[r:T]->` binds the relationship, so its properties, type and
+    /// direction can be read. A hop is one edge, so the compiler refuses a
+    /// variable on a variable-length hop.
+    pub var: Option<String>,
     pub dir: Dir,
     pub ty: Option<String>,
     /// `Some` for a variable-length relationship (`*`, `*n`, `*n..m`, `*..m`).
@@ -258,6 +262,16 @@ pub enum PExpr {
     /// `key(v)` — the node's external key. An equality (or `IN`) on the
     /// source variable compiles to a `SeekKeys` seek rather than a filter.
     ExternalKey {
+        var: String,
+    },
+    /// `type(r)` — the bound relationship's type name.
+    EdgeTypeOf {
+        var: String,
+    },
+    /// `direction(r)` — which way the row walked the bound relationship,
+    /// `"OUT"` or `"IN"`. Never `"BOTH"`: a row's traversal is concrete even
+    /// when the pattern asked for `-[r]-`.
+    EdgeDirOf {
         var: String,
     },
     /// `x IN [a, b, …]` — sugar for a chain of equalities.

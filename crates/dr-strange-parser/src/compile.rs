@@ -69,17 +69,22 @@ pub fn compile(
     nodes.extend(hops.iter().map(|(_, n)| *n));
     let last = nodes.len() - 1;
 
-    let var_slot = bind_variables(&nodes)?;
+    let node_vars = bind_variables(&nodes)?;
+    let rel_vars = bind_relationships(&hops, &node_vars)?;
+    let vars = Vars {
+        nodes: node_vars,
+        rels: rel_vars,
+    };
     // Taken rather than borrowed: the conjuncts are consumed into the slots,
     // and `q` is still read whole by `compile_return` below.
     let where_clause = q.where_clause.take();
-    let mut slot_filters = push_down_where(where_clause, &var_slot, nodes.len())?;
+    let mut slot_filters = push_down_where(where_clause, &vars, nodes.len())?;
     let source = key_seek_rewrite(source, &mut slot_filters[0], first_node, params)?;
 
     let mut steps: Vec<Step> = Vec::new();
     for e in slot_filters[0].drain(..) {
         let scope = Scope {
-            var_slot: &var_slot,
+            vars: &vars,
             current: 0,
         };
         steps.push(Step::Filter(compile_expr(&e, embedder, params, &scope)?));
@@ -89,17 +94,50 @@ pub fn compile(
         &hops,
         &nodes,
         &mut slot_filters,
-        &var_slot,
+        &vars,
         embedder,
         params,
     )?;
 
-    let project = compile_return(&q, &mut steps, &var_slot, last, embedder, params)?;
+    let project = compile_return(&q, &mut steps, &vars, last, embedder, params)?;
     Ok(LogicalPlan {
         source,
         steps,
         project,
     })
+}
+
+/// Relationship variable → the hop it binds. A relationship is addressed by
+/// which hop it is, so a variable is refused where that address would not be
+/// one edge: on a variable-length hop (which walks several), bound twice, or
+/// already naming a node.
+fn bind_relationships<'a>(
+    hops: &[(Hop<'a>, &NodePat)],
+    var_slot: &AHashMap<&str, usize>,
+) -> Result<AHashMap<&'a str, usize>, String> {
+    let mut rel_slot: AHashMap<&'a str, usize> = AHashMap::new();
+    for (hop, (h, _)) in hops.iter().enumerate() {
+        let Hop::Rel(r) = h else { continue };
+        let Some(v) = r.var.as_deref() else { continue };
+        if r.var_len.is_some() {
+            return Err(format!(
+                "relationship variable `{v}` is on a variable-length hop, which walks \
+                 several edges rather than one; bind a single hop instead"
+            ));
+        }
+        if var_slot.contains_key(v) {
+            return Err(format!(
+                "`{v}` already names a node in this pattern; give the relationship \
+                 another name"
+            ));
+        }
+        if rel_slot.insert(v, hop).is_some() {
+            return Err(format!(
+                "relationship variable `{v}` is bound twice; reusing one isn't supported"
+            ));
+        }
+    }
+    Ok(rel_slot)
 }
 
 /// Variable → slot index. Reusing a variable would mean a graph constraint
@@ -125,7 +163,7 @@ fn bind_variables<'a>(nodes: &[&'a NodePat]) -> Result<AHashMap<&'a str, usize>,
 /// rewrite can still recognise `key(n) = "…"` before the qualifier is dropped.
 fn push_down_where(
     where_clause: Option<PExpr>,
-    var_slot: &AHashMap<&str, usize>,
+    vars: &Vars<'_>,
     slots: usize,
 ) -> Result<Vec<Vec<PExpr>>, String> {
     let mut slot_filters: Vec<Vec<PExpr>> = vec![Vec::new(); slots];
@@ -133,8 +171,8 @@ fn push_down_where(
         return Ok(slot_filters);
     };
     for conj in split_and(w) {
-        let vars = referenced_vars(&conj);
-        let slot = match vars.len() {
+        let named = referenced_vars(&conj);
+        let slot = match named.len() {
             // No variable: a constant, or the row channels `score()` /
             // `hops()`. Those are only settled once the whole path has been
             // walked — `hops()` counts the hops taken so far, and a BEAM
@@ -143,9 +181,9 @@ fn push_down_where(
             // yet, and silently drop every row.
             0 => slots - 1,
             1 => {
-                let v = vars.iter().next().unwrap();
-                let slot = *var_slot
-                    .get(v.as_str())
+                let v = named.iter().next().unwrap();
+                let slot = vars
+                    .slot_of(v.as_str())
                     .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?;
                 // The same channels mixed with an earlier variable in one
                 // conjunct (`hops() = 2 OR a.x = 1`) cannot be split off, and
@@ -214,7 +252,7 @@ fn compile_hops(
     hops: &[(Hop<'_>, &NodePat)],
     nodes: &[&NodePat],
     slot_filters: &mut [Vec<PExpr>],
-    var_slot: &AHashMap<&str, usize>,
+    vars: &Vars<'_>,
     embedder: Option<&dyn Embedder>,
     params: &crate::Params,
 ) -> Result<(), String> {
@@ -258,10 +296,7 @@ fn compile_hops(
         if let Some(l) = &nodes[idx].label {
             steps.push(Step::Filter(Expr::HasLabel(l.clone())));
         }
-        let scope = Scope {
-            var_slot,
-            current: idx,
-        };
+        let scope = Scope { vars, current: idx };
         for e in slot_filters[idx].drain(..) {
             steps.push(Step::Filter(compile_expr(&e, embedder, params, &scope)?));
         }
@@ -275,13 +310,13 @@ fn compile_hops(
 fn compile_return(
     q: &Query,
     steps: &mut Vec<Step>,
-    var_slot: &AHashMap<&str, usize>,
+    vars: &Vars<'_>,
     last: usize,
     embedder: Option<&dyn Embedder>,
     params: &crate::Params,
 ) -> Result<Option<Projection>, String> {
     let scope = Scope {
-        var_slot,
+        vars,
         current: last,
     };
     let node_rows = q
@@ -301,7 +336,14 @@ fn compile_return(
     }
 
     if let Some(ReturnItem::Var(v)) = q.ret.items.first() {
-        let slot = *var_slot
+        if vars.rels.contains_key(v.as_str()) {
+            return Err(format!(
+                "returning a relationship (`{v}`) isn't supported yet — project its \
+                 values instead (`RETURN {v}._confidence, type({v})`)"
+            ));
+        }
+        let slot = *vars
+            .nodes
             .get(v.as_str())
             .ok_or_else(|| format!("RETURN refers to unknown variable `{v}`"))?;
         // The pipeline ends on the last pattern node, so returning the *rows*
@@ -321,7 +363,7 @@ fn compile_return(
     if !q.order_by.is_empty() {
         steps.push(Step::Sort(compile_sort(
             &q.order_by,
-            var_slot,
+            vars,
             last,
             embedder,
             params,
@@ -389,7 +431,7 @@ fn projection(
 /// `ORDER BY` over node rows: keys evaluated on the row's current node.
 fn compile_sort(
     keys: &[OrderKey],
-    var_slot: &AHashMap<&str, usize>,
+    vars: &Vars<'_>,
     last: usize,
     embedder: Option<&dyn Embedder>,
     params: &crate::Params,
@@ -414,8 +456,8 @@ fn compile_sort(
             }
         };
         for v in referenced_vars(e) {
-            let slot = *var_slot
-                .get(v.as_str())
+            let slot = vars
+                .slot_of(v.as_str())
                 .ok_or_else(|| format!("ORDER BY refers to unknown variable `{v}`"))?;
             if slot != last {
                 return Err("ORDER BY may reference only the returned (last) variable".to_string());
@@ -427,7 +469,7 @@ fn compile_sort(
                 embedder,
                 params,
                 &Scope {
-                    var_slot,
+                    vars,
                     current: last,
                 },
             )?,
@@ -864,6 +906,8 @@ fn reads_row_channel(e: &PExpr) -> bool {
         | PExpr::Prop { .. }
         | PExpr::HasLabel { .. }
         | PExpr::ExternalKey { .. }
+        | PExpr::EdgeTypeOf { .. }
+        | PExpr::EdgeDirOf { .. }
         | PExpr::Similarity { .. }
         | PExpr::Distance { .. } => false,
         PExpr::In { lhs, list } => reads_row_channel(lhs) || list.iter().any(reads_row_channel),
@@ -883,6 +927,8 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
             PExpr::Prop { var, .. }
             | PExpr::HasLabel { var, .. }
             | PExpr::ExternalKey { var }
+            | PExpr::EdgeTypeOf { var }
+            | PExpr::EdgeDirOf { var }
             | PExpr::Similarity { var, .. }
             | PExpr::Distance { var, .. } => {
                 out.insert(var.clone());
@@ -928,20 +974,46 @@ fn referenced_vars(e: &PExpr) -> BTreeSet<String> {
 /// reads that slot's binding out of the trail the row already carries. This
 /// is what lets a projection say `a.name, b.name` about two ends of a hop.
 struct Scope<'a, 'b> {
-    var_slot: &'a AHashMap<&'b str, usize>,
+    vars: &'a Vars<'b>,
     current: usize,
 }
 
+/// What a pattern's variables name: nodes by the slot they are current at,
+/// relationships by the hop they are.
+struct Vars<'a> {
+    nodes: AHashMap<&'a str, usize>,
+    rels: AHashMap<&'a str, usize>,
+}
+
+impl Vars<'_> {
+    /// The slot a term about `var` can be evaluated at. A node's own slot; for
+    /// a relationship, the slot just past its hop — the first point where the
+    /// row has walked that edge and can read it.
+    fn slot_of(&self, var: &str) -> Option<usize> {
+        self.nodes
+            .get(var)
+            .copied()
+            .or_else(|| self.rels.get(var).map(|hop| hop + 1))
+    }
+}
+
 impl Scope<'_, '_> {
-    /// `inner`, read against whatever `var` names.
+    /// `inner`, read against whatever node `var` names.
     fn read(&self, var: &str, inner: Expr) -> Result<Expr, String> {
         // An anonymous pattern node (`(:Paper)`) has no name to look up; it is
         // always the slot its predicate was placed at.
         if var.is_empty() {
             return Ok(inner);
         }
+        if self.vars.rels.contains_key(var) {
+            return Err(format!(
+                "`{var}` is a relationship, not a node — read its properties \
+                 (`{var}.key`), `type({var})` or `direction({var})`"
+            ));
+        }
         let slot = *self
-            .var_slot
+            .vars
+            .nodes
             .get(var)
             .ok_or_else(|| format!("unknown variable `{var}`"))?;
         Ok(match slot == self.current {
@@ -951,6 +1023,33 @@ impl Scope<'_, '_> {
                 inner: Box::new(inner),
             },
         })
+    }
+
+    /// Which hop a relationship variable binds, if it names one.
+    fn hop_of(&self, var: &str) -> Option<usize> {
+        self.vars.rels.get(var).copied()
+    }
+
+    /// `inner`, read against the relationship bound at `hop`. Always through
+    /// [`Expr::At`]: a hop's edge is addressed by index, never by being the
+    /// row's current anything, so there is no slot for it to compile away at.
+    fn read_hop(&self, hop: usize, inner: Expr) -> Expr {
+        Expr::At {
+            binding: Binding::Edge(hop as u32),
+            inner: Box::new(inner),
+        }
+    }
+
+    /// `inner`, read against the relationship `var` names — for the terms that
+    /// only a relationship has, so a node variable here is the user's mistake.
+    fn read_edge(&self, var: &str, inner: Expr) -> Result<Expr, String> {
+        let hop = self.hop_of(var).ok_or_else(|| {
+            format!(
+                "`{var}` isn't a relationship variable; `type()` and `direction()` read \
+                 a bound relationship, as in `-[{var}:TYPE]->`"
+            )
+        })?;
+        Ok(self.read_hop(hop, inner))
     }
 }
 
@@ -964,9 +1063,16 @@ fn compile_expr(
     Ok(match e {
         PExpr::Lit(v) => Expr::Literal(v.clone()),
         PExpr::Param(name) => Expr::Literal(crate::resolve_param(params, name)?),
-        PExpr::Prop { var, key } => scope.read(var, Expr::Property(key.clone()))?,
+        // A qualifier naming a relationship reads that hop's edge; everything
+        // else is a node property.
+        PExpr::Prop { var, key } => match scope.hop_of(var) {
+            Some(hop) => scope.read_hop(hop, Expr::EdgeProperty(key.clone())),
+            None => scope.read(var, Expr::Property(key.clone()))?,
+        },
         PExpr::HasLabel { var, label } => scope.read(var, Expr::HasLabel(label.clone()))?,
         PExpr::ExternalKey { var } => scope.read(var, Expr::ExternalKey)?,
+        PExpr::EdgeTypeOf { var } => scope.read_edge(var, Expr::EdgeType)?,
+        PExpr::EdgeDirOf { var } => scope.read_edge(var, Expr::EdgeDir)?,
         // `x IN [a, b]` is sugar for `x = a OR x = b`; an empty list is
         // constantly false. (A source-anchored `key(n) IN […]` never reaches
         // here — it became a `SeekKeys` seek.)
@@ -1089,8 +1195,12 @@ fn is_non_null_constant(e: &PExpr, params: &crate::Params) -> bool {
 fn nullable_leaves<'e>(roots: &[&'e PExpr]) -> Vec<&'e PExpr> {
     fn go<'e>(e: &'e PExpr, out: &mut Vec<&'e PExpr>) {
         match e {
+            // An edge term reads `Null` where the hop was never walked, so it
+            // is guarded like a property rather than assumed present.
             PExpr::Prop { .. }
             | PExpr::ExternalKey { .. }
+            | PExpr::EdgeTypeOf { .. }
+            | PExpr::EdgeDirOf { .. }
             | PExpr::Score
             | PExpr::Similarity { .. }
             | PExpr::Distance { .. }

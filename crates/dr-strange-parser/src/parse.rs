@@ -125,7 +125,7 @@ fn descend(i: &str) -> IResult<&str, Nesting> {
 // ---- unsupported shapes -----------------------------------------------------
 //
 // Some openCypher the grammar can *recognise* but this cut cannot run: a
-// second MATCH, WITH, UNION, a relationship variable, a list literal outside
+// second MATCH, WITH, UNION, a list literal outside
 // IN. Left to the plain grammar they would surface as "near `WITH n`" — true,
 // and useless. Instead the point where the shape is recognised fails *hard*
 // (so no enclosing `alt` re-reads the text as something else) and leaves a
@@ -572,6 +572,17 @@ fn func_call<'a>(name: &str, i: &'a str) -> IResult<&'a str, PExpr> {
             let (i, _) = symbol(")").parse(i)?;
             Ok((i, PExpr::ExternalKey { var }))
         }
+        // `type(r)` / `direction(r)` — facts about a bound relationship that
+        // are not properties of it.
+        "type" | "direction" => {
+            let (i, var) = ident(i)?;
+            let (i, _) = symbol(")").parse(i)?;
+            let out = match name == "type" {
+                true => PExpr::EdgeTypeOf { var },
+                false => PExpr::EdgeDirOf { var },
+            };
+            Ok((i, out))
+        }
         "similarity" | "distance" => {
             let (i, (var, key)) = prop_ref(i)?;
             let (i, _) = symbol(",").parse(i)?;
@@ -771,24 +782,22 @@ fn var_range(i: &str) -> IResult<&str, VarLen> {
     }
 }
 
-/// The bracketed body of a relationship: `[(:Type)? (*range)?]`. A
-/// relationship variable (`[r:T]`) is refused, not ignored: the row model
-/// binds nodes only, so nothing could read `r` — silently dropping it would
-/// let `RETURN r.since` fail somewhere else for an unrelated reason.
-fn rel_body(i: &str) -> IResult<&str, (Option<String>, Option<VarLen>)> {
+/// What a relationship's brackets carry, before its arrows settle which way it
+/// points.
+#[derive(Default)]
+struct RelBody {
+    var: Option<String>,
+    ty: Option<String>,
+    var_len: Option<VarLen>,
+}
+
+/// The bracketed body of a relationship: `[(var)? (:Type)? (*range)?]`.
+fn rel_body(i: &str) -> IResult<&str, RelBody> {
     let (i, _) = multispace0(i)?;
-    if let Ok((_, relvar)) = ident(i) {
-        return unsupported(
-            i,
-            format!(
-                "relationship variables aren't supported (`[{relvar}:T]`); an edge can't \
-                 be bound, returned or filtered on yet — drop the variable: `-[:T]->`"
-            ),
-        );
-    }
+    let (i, var) = opt(ident).parse(i)?;
     let (i, ty) = opt(preceded(preceded(multispace0, char(':')), ident)).parse(i)?;
     let (i, var_len) = opt(var_range).parse(i)?;
-    Ok((i, (ty, var_len)))
+    Ok((i, RelBody { var, ty, var_len }))
 }
 
 fn rel_pat(i: &str) -> IResult<&str, RelPat> {
@@ -811,8 +820,16 @@ fn rel_pat(i: &str) -> IResult<&str, RelPat> {
             )));
         }
     };
-    let (ty, var_len) = body.unwrap_or((None, None));
-    Ok((i, RelPat { dir, ty, var_len }))
+    let body = body.unwrap_or_default();
+    Ok((
+        i,
+        RelPat {
+            var: body.var,
+            dir,
+            ty: body.ty,
+            var_len: body.var_len,
+        },
+    ))
 }
 
 fn pattern(i: &str) -> IResult<&str, Pattern> {

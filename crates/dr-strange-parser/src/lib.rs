@@ -43,6 +43,11 @@
 //!   external key `key(a)`, and the scoring terms `score()`, `hops()`,
 //!   `similarity(a.prop, "text"|[..][, metric])`, `distance(...)` (usable in
 //!   `ORDER BY` too — a brute-force rank).
+//! - **A bound relationship** — `-[r:T]->` — read with `r.key`, `type(r)` and
+//!   `direction(r)` (`"OUT"`/`"IN"`, the way the row walked it, never
+//!   `"BOTH"`). A relationship is addressed by which hop it is, so a variable
+//!   is refused where that would not name one edge: on a variable-length hop,
+//!   bound twice, or sharing a node's name.
 //! - `RETURN [DISTINCT] <var|*>` — node records — or a **projection**:
 //!   `RETURN a.name, count(*) AS n, …`, each item a column named by its alias
 //!   or its own text, over any variable the pattern bound (an earlier one
@@ -113,8 +118,8 @@
 //! - a second `MATCH`, `OPTIONAL MATCH`, `UNION`, `UNWIND`, and a pattern with
 //!   several paths (`(a)-->(b), (a)-->(c)`): a query holds one linear path —
 //!   run one query per pattern or branch;
-//! - relationship variables (`-[r:T]->`): an edge can't be bound, returned or
-//!   filtered on — drop the variable;
+//! - returning a bound relationship (`RETURN r`): its values project
+//!   (`RETURN r.key, type(r)`);
 //! - inline property predicates in a `MATCH` node (`(n {name: "x"})`): write
 //!   them in `WHERE`;
 //! - list and map literals as values (`RETURN [1, 2]`, `n.x = {a: 1}`); a
