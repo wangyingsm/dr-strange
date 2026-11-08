@@ -108,12 +108,20 @@ drsg needs no credential to answer, so nothing has to be provisioned for it.
 
 ## 3. mcp.so
 
-**Status: verified** — `mcp.so/submit` answers.
+**Status: verified** — the form at https://mcp.so/submit was opened on
+2026-11-08.
 
-Submit at https://mcp.so/submit. Sources disagree on whether listing is free
-with a review queue or paid for immediate publication, and the page is the
-only authority — **read the terms on it before paying anything**, and treat
-any figure quoted elsewhere, including here, as unverified.
+**Listing is paid only: $39, one time.** The submission card is pre-selected
+with no free-with-review alternative beside it; "publish immediately without
+review" is one of the paid benefits rather than a faster lane past a free
+queue. The form itself asks for only a repository URL and a name.
+
+What the fee buys is stated on the page, and it is worth reading literally: a
+verified badge, featured placement, and a **dofollow** link from a DR 74
+domain with 144K backlinks. That is an SEO placement, which is a different
+good from the registry record in §1 — one makes drsg findable by a search
+engine, the other makes it resolvable by an MCP client. Neither substitutes
+for the other, and only the second is a precondition for anything else here.
 
 ## 4. Lists and catalogs submitted by hand
 
