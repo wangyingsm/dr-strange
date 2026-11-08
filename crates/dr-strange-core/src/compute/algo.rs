@@ -760,6 +760,111 @@ fn cycle_witness(frame: &Frame, succ: &[Vec<(usize, EdgeId)>], indeg: &[usize]) 
     cur
 }
 
+// ---- Cycle detection -----------------------------------------------------
+
+/// Cycle-detection knobs. There is deliberately no direction here: reversing
+/// every edge maps a cycle onto its own reverse, so a direction would change
+/// only the order the nodes are printed in.
+#[derive(Debug, Clone)]
+pub struct CyclesOptions {
+    /// The one relation to look for cycles in; `None` follows every edge type,
+    /// which can close a loop out of two edges that mean different things.
+    pub edge_type: Option<String>,
+    /// Stop after this many cycles. `1` answers "is there a cycle, and where",
+    /// which is the common case.
+    pub limit: usize,
+}
+
+impl Default for CyclesOptions {
+    fn default() -> Self {
+        Self {
+            edge_type: None,
+            limit: 100,
+        }
+    }
+}
+
+/// Find cycles in the scanned universe, each returned as the node list that
+/// closes it — `[12, 7, 9, 12]`, first id repeated last. An empty result means
+/// the scope is a DAG.
+///
+/// One depth-first pass, reporting one cycle per back edge it meets, so two
+/// results are always closed by different edges. This is **not** an
+/// enumeration of every cycle — that count is exponential in the worst case —
+/// but it is enough to prove a graph is cyclic and to name the nodes at fault,
+/// which is what a write refusing to create one needs.
+pub fn cycles<R: GraphReader + ?Sized>(
+    reader: &R,
+    label: Option<&str>,
+    opts: &CyclesOptions,
+) -> Result<Vec<Vec<NodeId>>> {
+    let mut found: Vec<Vec<NodeId>> = Vec::new();
+    if opts.limit == 0 {
+        return Ok(found);
+    }
+    let frame = Frame::build(reader, label, opts.edge_type.as_deref())?;
+    let n = frame.len();
+
+    /// Not yet reached.
+    const WHITE: u8 = 0;
+    /// On the current path — an edge arriving here closes a cycle.
+    const GREY: u8 = 1;
+    /// Finished; every cycle through it has been reported already.
+    const BLACK: u8 = 2;
+
+    let mut colour = vec![WHITE; n];
+    // Where each grey node sits in `path`, so a back edge can slice the cycle
+    // straight out of it.
+    let mut depth = vec![usize::MAX; n];
+    let mut path: Vec<usize> = Vec::new();
+    // The recursion, made explicit: (node, the next out-edge to examine).
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    for root in 0..n {
+        if colour[root] != WHITE {
+            continue;
+        }
+        colour[root] = GREY;
+        depth[root] = 0;
+        path.push(root);
+        stack.push((root, 0));
+
+        while let Some(top) = stack.last_mut() {
+            let (node, edge) = (top.0, top.1);
+            top.1 += 1;
+            let adj = &frame.out[node];
+            if edge >= adj.len() {
+                colour[node] = BLACK;
+                path.pop();
+                stack.pop();
+                continue;
+            }
+            let next = adj[edge].0;
+            match colour[next] {
+                GREY => {
+                    let mut cycle: Vec<NodeId> = path[depth[next]..]
+                        .iter()
+                        .map(|&i| frame.nodes[i])
+                        .collect();
+                    cycle.push(frame.nodes[next]);
+                    found.push(cycle);
+                    if found.len() >= opts.limit {
+                        return Ok(found);
+                    }
+                }
+                WHITE => {
+                    colour[next] = GREY;
+                    depth[next] = path.len();
+                    path.push(next);
+                    stack.push((next, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::types::{PropDesc, PropValue, Properties};
@@ -1092,5 +1197,152 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("needs one direction"), "{err}");
+    }
+
+    /// Three nodes wired into one triangle, plus a fourth hanging off it.
+    fn triangle() -> (Database, Vec<NodeId>) {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let g: Vec<NodeId> = {
+            let mut txn = plane.write().unwrap();
+            let g: Vec<NodeId> = (0..4)
+                .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+                .collect();
+            for &(a, b) in &[(0, 1), (1, 2), (2, 0), (2, 3)] {
+                txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+            }
+            txn.commit().unwrap();
+            g
+        };
+        (db, g)
+    }
+
+    #[test]
+    fn cycles_returns_the_node_list_that_closes_the_loop() {
+        let (db, g) = triangle();
+        let plane = db.plane("startup").unwrap();
+        let found = plane.algo().cycles(&CyclesOptions::default()).unwrap();
+        assert_eq!(found.len(), 1, "one back edge ⇒ one cycle: {found:?}");
+        let c = &found[0];
+        assert_eq!(c.first(), c.last(), "the list closes");
+        assert_eq!(c.len(), 4, "three nodes, the first repeated: {c:?}");
+        // Only the triangle is at fault; the node hanging off it is not.
+        assert!(!c.contains(&g[3]), "{c:?}");
+        for node in &g[..3] {
+            assert!(c.contains(node), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn cycles_answers_empty_for_a_dag() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..4)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // A diamond: two paths to the same node is not a cycle.
+        for &(a, b) in &[(0, 1), (0, 2), (1, 3), (2, 3)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(
+            plane
+                .algo()
+                .cycles(&CyclesOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cycles_stops_at_the_limit() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..6)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        // Two triangles that share nothing.
+        for &(a, b) in &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)] {
+            txn.create_edge(g[a], g[b], "E", Properties::new()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let all = plane.algo().cycles(&CyclesOptions::default()).unwrap();
+        assert_eq!(all.len(), 2);
+        let one = plane
+            .algo()
+            .cycles(&CyclesOptions {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(one.len(), 1, "the common case: is there one, and where");
+    }
+
+    #[test]
+    fn cycles_counts_a_self_loop() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let a = txn.create_node(&["N"], Properties::new()).unwrap();
+        txn.create_edge(a, a, "E", Properties::new()).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            plane.algo().cycles(&CyclesOptions::default()).unwrap(),
+            vec![vec![a, a]]
+        );
+    }
+
+    #[test]
+    fn cycles_scopes_to_one_edge_type() {
+        let db = db();
+        let plane = db.plane("startup").unwrap();
+        let mut txn = plane.write().unwrap();
+        let g: Vec<NodeId> = (0..3)
+            .map(|_| txn.create_node(&["N"], Properties::new()).unwrap())
+            .collect();
+        txn.create_edge(g[0], g[1], "FEEDS", Properties::new())
+            .unwrap();
+        txn.create_edge(g[1], g[2], "FEEDS", Properties::new())
+            .unwrap();
+        txn.create_edge(g[2], g[0], "SEES", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let scoped = CyclesOptions {
+            edge_type: Some("FEEDS".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            plane.algo().cycles(&scoped).unwrap().is_empty(),
+            "the FEEDS relation is a DAG"
+        );
+        // Both relations at once close a loop neither one has.
+        assert_eq!(
+            plane
+                .algo()
+                .cycles(&CyclesOptions::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cycles_and_toposort_agree_on_the_same_plane() {
+        let (db, _) = triangle();
+        let plane = db.plane("startup").unwrap();
+        let witness = match plane.algo().toposort(&TopoSortOptions::default()).unwrap() {
+            TopoOrder::Cyclic(node) => node,
+            TopoOrder::Sorted(v) => panic!("a triangle cannot be ordered: {v:?}"),
+        };
+        // The node toposort refuses on is one the cycle actually contains —
+        // the two verbs are answering about the same loop.
+        let found = plane.algo().cycles(&CyclesOptions::default()).unwrap();
+        assert!(found[0].contains(&witness), "{witness:?} in {found:?}");
     }
 }

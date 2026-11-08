@@ -20,7 +20,7 @@ pub mod hybrid;
 pub mod plan;
 
 pub use algo::{
-    LouvainOptions, PageRankOptions, Path, ShortestPathOptions, TopoNode, TopoOrder,
+    CyclesOptions, LouvainOptions, PageRankOptions, Path, ShortestPathOptions, TopoNode, TopoOrder,
     TopoSortOptions,
 };
 pub use catalog::{CatalogSnapshot, Connection, EdgeTypeStats, LabelStats, PropStats, ValueType};

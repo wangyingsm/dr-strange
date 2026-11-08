@@ -26,7 +26,7 @@ use ahash::AHashSet;
 
 use crate::cache::{CachedReader, GraphCache, GraphReader};
 use crate::compute::algo::{
-    self, LouvainOptions, PageRankOptions, ShortestPathOptions, TopoSortOptions,
+    self, CyclesOptions, LouvainOptions, PageRankOptions, ShortestPathOptions, TopoSortOptions,
 };
 use std::collections::BTreeMap;
 
@@ -3019,6 +3019,12 @@ impl<'db> AlgoBuilder<'db> {
     /// admits no order.
     pub fn toposort(&self, opts: &TopoSortOptions) -> Result<algo::TopoOrder> {
         self.with_reader(|r| algo::toposort(r, self.label.as_deref(), opts))
+    }
+
+    /// Cycles in the scope, each as the node list that closes it; empty when
+    /// the scope is a DAG.
+    pub fn cycles(&self, opts: &CyclesOptions) -> Result<Vec<Vec<NodeId>>> {
+        self.with_reader(|r| algo::cycles(r, self.label.as_deref(), opts))
     }
 }
 
