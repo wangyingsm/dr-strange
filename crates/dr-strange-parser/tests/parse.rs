@@ -260,11 +260,58 @@ fn err(q: &str) -> ParseError {
 }
 
 #[test]
-fn rejects_cross_variable_predicate() {
-    assert!(matches!(
-        err("MATCH (p)-[:R]->(q) WHERE p.x < q.x RETURN q"),
-        ParseError::Compile(_)
-    ));
+fn a_cross_variable_predicate_filters_where_both_ends_are_known() {
+    // Placed at the later variable's slot, where the earlier one is reached
+    // through `Expr::At` — the same trick row-channel terms already use.
+    let pl = plan("MATCH (p)-[:R]->(q) WHERE p.x < q.x RETURN q");
+    assert_eq!(
+        pl.steps,
+        vec![
+            Step::Expand {
+                dir: Dir::Out,
+                edge_type: Some("R".into()),
+            },
+            Step::Filter(at_node(0, p("x")).lt(p("x"))),
+        ]
+    );
+
+    // A relationship joins in the same way, at the slot past its hop.
+    let pl = plan("MATCH (a)-[r:R]->(b) WHERE r.w > a.x RETURN b");
+    assert_eq!(
+        pl.steps,
+        vec![
+            Step::Expand {
+                dir: Dir::Out,
+                edge_type: Some("R".into()),
+            },
+            Step::Filter(at_edge(0, ep("w")).gt(at_node(0, p("x")))),
+        ]
+    );
+
+    // Three slots: the predicate waits for the last variable it names, and no
+    // longer — it filters at slot 1, not on the final frontier.
+    let pl = plan("MATCH (a)-[:R]->(b)-[:R]->(c) WHERE a.x < b.x RETURN c");
+    assert_eq!(pl.steps[1], Step::Filter(at_node(0, p("x")).lt(p("x"))));
+}
+
+#[test]
+fn a_predicate_is_refused_where_a_variable_length_hop_moves_the_slot() {
+    // Past a variable-length hop a row's own length decides which node a slot
+    // holds, so reading `b` from a later slot would read a different node per
+    // row.
+    let said = unsupported("MATCH (a)-[*1..2]->(b)-[:R]->(c) WHERE b.x < c.x RETURN c");
+    assert!(said.contains("variable-length hop"), "{said}");
+    // A row channel forces the last slot, which runs into the same wall.
+    let said = unsupported("MATCH (a)-[*1..2]->(b)-[:R]->(c) WHERE hops() = 2 OR b.x = 1 RETURN c");
+    assert!(said.contains("variable-length hop"), "{said}");
+
+    // What stays allowed. At its own slot `b` is the row's current node,
+    // whatever the walk was.
+    assert!(parse("MATCH (a)-[*1..2]->(b)-[:R]->(c) WHERE b.x = 1 RETURN c").is_ok());
+    // Slot 0 is the row's origin in every row, so the hop cannot move it.
+    assert!(parse("MATCH (a)-[*1..2]->(b)-[:R]->(c) WHERE a.x < b.x RETURN c").is_ok());
+    // Before the hop, every slot is still addressed the same way in every row.
+    assert!(parse("MATCH (a)-[:R]->(b)-[*1..2]->(c) WHERE a.x < b.x RETURN c").is_ok());
 }
 
 #[test]

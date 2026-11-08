@@ -74,6 +74,7 @@ pub fn compile(
     let vars = Vars {
         nodes: node_vars,
         rels: rel_vars,
+        exact_through: exact_through(&hops),
     };
     // Taken rather than borrowed: the conjuncts are consumed into the slots,
     // and `q` is still read whole by `compile_return` below.
@@ -172,37 +173,42 @@ fn push_down_where(
     };
     for conj in split_and(w) {
         let named = referenced_vars(&conj);
-        let slot = match named.len() {
-            // No variable: a constant, or the row channels `score()` /
-            // `hops()`. Those are only settled once the whole path has been
-            // walked — `hops()` counts the hops taken so far, and a BEAM
-            // rewrites `score()` — so the predicate goes on the last slot. At
-            // the source it would read hops() = 0 and a score no MATCH has
-            // yet, and silently drop every row.
-            0 => slots - 1,
-            1 => {
-                let v = named.iter().next().unwrap();
-                let slot = vars
-                    .slot_of(v.as_str())
-                    .ok_or_else(|| format!("WHERE refers to unknown variable `{v}`"))?;
-                // The same channels mixed with an earlier variable in one
-                // conjunct (`hops() = 2 OR a.x = 1`) cannot be split off, and
-                // at the variable's own slot would read the same unsettled
-                // values. Evaluated at the last slot instead, where the
-                // variable is reached through `Expr::At`.
-                match reads_row_channel(&conj) {
-                    true => slots - 1,
-                    false => slot,
-                }
+        for v in &named {
+            if vars.slot_of(v.as_str()).is_none() {
+                return Err(format!("WHERE refers to unknown variable `{v}`"));
             }
-            _ => {
-                return Err(
-                    "a WHERE condition may reference only one pattern variable; \
-                     cross-variable predicates aren't supported yet"
-                        .to_string(),
-                );
-            }
+        }
+        // The row channels `score()` / `hops()` are only settled once the whole
+        // path has been walked — `hops()` counts the hops taken so far, and a
+        // BEAM rewrites `score()` — so a conjunct reading one goes on the last
+        // slot, even mixed with a variable (`hops() = 2 OR a.x = 1`, which
+        // cannot be split). At an earlier slot it would read hops() = 0 and a
+        // score no MATCH has yet, and silently drop every row.
+        //
+        // Everything else goes to the latest slot its variables name: the
+        // first point where the row has walked all of them, so a predicate
+        // still filters as early as it can. One variable means its own slot;
+        // several, the last of them, the earlier ones reached by `Expr::At`.
+        let slot = match reads_row_channel(&conj) {
+            true => slots - 1,
+            false => named
+                .iter()
+                .filter_map(|v| vars.slot_of(v.as_str()))
+                .max()
+                // No variable at all: a constant, true or false for every row,
+                // so the source is as good a place as any.
+                .unwrap_or(0),
         };
+        for v in &named {
+            if !vars.readable_at(v.as_str(), slot) {
+                return Err(format!(
+                    "this condition is evaluated at slot {slot}, and `{v}` sits past a \
+                     variable-length hop, where a row's own length decides which node \
+                     that slot holds; split the condition so each part names only \
+                     variables on one side of the hop"
+                ));
+            }
+        }
         slot_filters[slot].push(conj);
     }
     Ok(slot_filters)
@@ -985,6 +991,13 @@ struct Scope<'a, 'b> {
 struct Vars<'a> {
     nodes: AHashMap<&'a str, usize>,
     rels: AHashMap<&'a str, usize>,
+    /// The last slot whose place in a row's trail is certain.
+    ///
+    /// [`Expr::At`] addresses the trail, which a variable-length hop makes a
+    /// different length per row, so past such a hop a pattern slot names
+    /// different nodes in different rows. Only a term read at its own slot is
+    /// safe there. [`usize::MAX`] when every hop walks one edge.
+    exact_through: usize,
 }
 
 impl Vars<'_> {
@@ -997,6 +1010,22 @@ impl Vars<'_> {
             .copied()
             .or_else(|| self.rels.get(var).map(|hop| hop + 1))
     }
+
+    /// Whether a term about `var` may be read from `at` instead of the
+    /// variable's own slot. Its own slot always can; another only when the
+    /// trail addresses it the same way in every row.
+    fn readable_at(&self, var: &str, at: usize) -> bool {
+        self.slot_of(var)
+            .is_none_or(|own| own == at || own <= self.exact_through)
+    }
+}
+
+/// The last slot a row's trail addresses the same way every time — the first
+/// variable-length hop ends it, since from there on a row's length varies.
+fn exact_through(hops: &[(Hop<'_>, &NodePat)]) -> usize {
+    hops.iter()
+        .position(|(h, _)| matches!(h, Hop::Rel(r) if r.var_len.is_some()))
+        .unwrap_or(usize::MAX)
 }
 
 impl Scope<'_, '_> {
