@@ -33,7 +33,8 @@ use anyhow::Result as AnyResult;
 use dr_strange_core::attach::Remote;
 use dr_strange_core::{
     BulkNode, Database, Dir, HybridWeights, LogicalPlan, LouvainOptions, Metric, NodeId,
-    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions, json,
+    PageRankOptions, PlaneHandle, PropDesc, PropValue, Properties, ShortestPathOptions, TopoOrder,
+    TopoSortOptions, json,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -392,7 +393,8 @@ struct GetNode {
 
 #[derive(Deserialize, JsonSchema)]
 struct Algo {
-    /// Algorithm to run: `pagerank` | `components` | `shortest_path` | `louvain`.
+    /// Algorithm to run: `pagerank` | `components` | `shortest_path` |
+    /// `louvain` | `toposort`.
     algo: String,
     /// Plane to operate in. Defaults to `startup`, which is empty on a
     /// normal install — pass the plane whose `synced_root` is this
@@ -420,7 +422,8 @@ struct Algo {
     /// shortest_path: destination node id (required for that algo).
     #[serde(default)]
     dst: Option<u64>,
-    /// shortest_path: edge direction `out` | `in` | `both` (default `out`).
+    /// shortest_path/toposort: edge direction `out` | `in` | `both` (default
+    /// `out`; toposort refuses `both`).
     #[serde(default)]
     dir: Option<String>,
     /// shortest_path: numeric edge property used as weight (default unit).
@@ -432,6 +435,10 @@ struct Algo {
     /// Louvain minimum modularity gain to move a node.
     #[serde(default)]
     min_gain: Option<f64>,
+    /// toposort: the one edge type that claims the order (default: every
+    /// type, which an unrelated edge can then turn into a false cycle).
+    #[serde(default)]
+    edge_type: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2266,6 +2273,31 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
                 .collect();
             Ok(jval!({ "algo": "louvain", "results": results, "count": count }))
         }
+        "toposort" => {
+            let opts = TopoSortOptions {
+                dir: parse_dir(req.dir.as_deref()),
+                edge_type: req.edge_type.clone(),
+            };
+            match builder.toposort(&opts)? {
+                TopoOrder::Sorted(order) => {
+                    let count = order.len();
+                    let results: Vec<Value> = order
+                        .into_iter()
+                        .enumerate()
+                        .take(limit)
+                        .map(|(i, t)| {
+                            jval!({ "id": t.node.0, "order": i, "generation": t.generation })
+                        })
+                        .collect();
+                    Ok(jval!({ "algo": "toposort", "results": results, "count": count }))
+                }
+                // A truncated order reads as a complete one, so the cycle is
+                // the answer, not a shorter list.
+                TopoOrder::Cyclic(node) => {
+                    anyhow::bail!("no topological order: node {} is on a cycle", node.0)
+                }
+            }
+        }
         "shortest_path" => {
             let (Some(src), Some(dst)) = (req.src, req.dst) else {
                 anyhow::bail!("shortest_path requires `src` and `dst`");
@@ -2285,7 +2317,7 @@ fn algo_logic(db: &Database, req: Algo) -> AnyResult<Value> {
             Ok(jval!({ "algo": "shortest_path", "found": path.is_some(), "path": path }))
         }
         other => anyhow::bail!(
-            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain)"
+            "unknown algo `{other}` (expected pagerank|components|shortest_path|louvain|toposort)"
         ),
     }
 }
@@ -3752,8 +3784,12 @@ impl DrStrange {
         (weakly connected; [{id, component}] where component is the smallest \
         member id, + component count), `shortest_path` (needs `src`/`dst`; \
         weighted Dijkstra with optional `dir` out|in|both and numeric edge \
-        `weight` property; returns {found, path:{nodes, edges, cost}}), or \
-        `louvain` (community detection; [{id, community}] + community count). \
+        `weight` property; returns {found, path:{nodes, edges, cost}}), \
+        `louvain` (community detection; [{id, community}] + community count), \
+        or `toposort` (dependency order over one `edge_type`, `dir` out|in; \
+        returns [{id, order, generation}] + count, where generation is depth, \
+        so one generation can run in parallel — a cyclic scope is an error \
+        naming a node on the cycle, never a partial order). \
         `limit` caps the ranked/labelled rows (default 100).")]
     async fn algo(
         &self,
@@ -4627,9 +4663,27 @@ mod tests {
         assert_eq!(sp["found"], jval!(true));
         assert_eq!(sp["path"]["cost"], jval!(1.0));
 
+        let topo = algo_logic(
+            &db,
+            from_value(jval!({"algo": "toposort", "edge_type": "CITES"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topo["count"], jval!(2));
+        assert_eq!(topo["results"][0]["id"], jval!(1)); // d0 cites, so it comes first
+        assert_eq!(topo["results"][0]["order"], jval!(0));
+        assert_eq!(topo["results"][1]["generation"], jval!(1));
+
         // Missing endpoints and unknown algo are tool-level errors.
         assert!(algo_logic(&db, from_value(jval!({"algo": "shortest_path"})).unwrap()).is_err());
         assert!(algo_logic(&db, from_value(jval!({"algo": "nope"})).unwrap()).is_err());
+        // So is asking for an order the graph cannot have.
+        assert!(
+            algo_logic(
+                &db,
+                from_value(jval!({"algo": "toposort", "dir": "both"})).unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]
