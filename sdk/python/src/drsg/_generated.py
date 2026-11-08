@@ -221,7 +221,7 @@ class Drsg(_Client):
         return self._call("plane.find", _p)
 
     def plane_algo(self, plane, algo, label=None, limit=None, damping=None, max_iters=None, tolerance=None, src=None, dst=None, dir=None, weight=None, max_levels=None, min_gain=None, edge_type=None) -> Any:
-        """Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot.
+        """Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort | cycles) over the plane or one label subset, read-only over a single snapshot.
 
         Access: read."""
         _p: dict = {}

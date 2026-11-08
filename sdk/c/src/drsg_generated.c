@@ -242,7 +242,7 @@ struct json_object *drsg_plane_find(drsg_client *c, const char *plane, const cha
     return rc == 0 ? result : NULL;
 }
 
-/* Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+/* Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort | cycles) over the plane or one label subset, read-only over a single snapshot. (access: read) */
 struct json_object *drsg_plane_algo(drsg_client *c, const char *plane, const char *algo, const drsg_plane_algo_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));

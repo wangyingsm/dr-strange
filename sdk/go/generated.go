@@ -542,7 +542,7 @@ func (c *Client) PlaneFind(ctx context.Context, p PlaneFindParams) (*FindResult,
 	return out, err
 }
 
-// PlaneAlgo Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read)
+// PlaneAlgo Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort | cycles) over the plane or one label subset, read-only over a single snapshot. (access: read)
 func (c *Client) PlaneAlgo(ctx context.Context, p PlaneAlgoParams) (map[string]any, error) {
 	var out map[string]any
 	err := c.call(ctx, "plane.algo", p, &out)

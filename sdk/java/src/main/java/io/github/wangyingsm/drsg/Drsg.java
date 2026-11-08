@@ -1060,7 +1060,7 @@ public class Drsg extends Client {
         return call("plane.find", params, new TypeReference<FindResult>() {});
     }
 
-    /** Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort) over the plane or one label subset, read-only over a single snapshot. (access: read) */
+    /** Run a graph algorithm (pagerank | components | shortest_path | louvain | toposort | cycles) over the plane or one label subset, read-only over a single snapshot. (access: read) */
     public Map<String, Object> planeAlgo(PlaneAlgoParams params) throws DrsgException {
         return call("plane.algo", params, new TypeReference<Map<String, Object>>() {});
     }
