@@ -1574,29 +1574,33 @@ fn is_our_hook_command(command: &str, name: &str) -> bool {
         && Path::new(bare).file_name().and_then(|f| f.to_str()) == Some(name)
 }
 
-/// `drsg history` — a repository's history at a glance.
+/// `drsg history` — a repository's history at a glance, or the commits that
+/// changed one symbol or path.
 ///
-/// The plane argument is forgiving in one direction only: naming the **code**
-/// plane finds the history plane beside it, because `myrepo` is what a reader
-/// has in mind and `myrepo_git` is an implementation detail of where the
-/// digest put it. The reverse is not guessed at — a plane that holds no
-/// commits and has no `_git` beside it says so.
-pub fn history(db: &Database, plane_name: &str, limit: usize, out: &mut dyn Write) -> Result<()> {
-    let history_plane = dr_strange_core::compact::history_plane_name(plane_name);
-    let (name, p) = match db.plane(&history_plane) {
-        // A `_git` plane beside the one named: that is the history, whatever
-        // the named plane happens to hold.
-        Ok(p) if !plane_name.ends_with(dr_strange_core::compact::HISTORY_SUFFIX) => {
-            (history_plane, p)
-        }
-        _ => (plane_name.to_string(), plane(db, plane_name)?),
+/// The plane argument is forgiving in both directions: `myrepo` and
+/// `myrepo_git` name the same repository, and the pair is derived from
+/// whichever was given, because `myrepo` is what a reader has in mind and
+/// `myrepo_git` is an implementation detail of where the digest put it. A
+/// plane that holds no commits and has no `_git` beside it says so.
+pub fn history(
+    db: &Database,
+    plane_name: &str,
+    name: Option<&str>,
+    limit: usize,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let (history, code) = dr_strange_core::touched::planes(db, plane_name)?;
+    writeln!(out, "plane '{}':", history.name()?)?;
+    let text = match name {
+        Some(name) => dr_strange_core::touched::touched(&dr_strange_core::touched::Asked {
+            history: &history,
+            code: code.as_ref(),
+            name,
+            limit: Some(limit),
+        })?,
+        None => dr_strange_core::compact::history(&history, Some(limit))?,
     };
-    writeln!(out, "plane '{name}':")?;
-    write!(
-        out,
-        "{}",
-        dr_strange_core::compact::history(&p, Some(limit))?
-    )?;
+    write!(out, "{text}")?;
     Ok(())
 }
 
@@ -5091,6 +5095,54 @@ mod tests {
         assert!(list.contains("startup") && list.contains("scratch"));
         assert!(cap(|o| plane_drop(&db, "scratch", o)).contains("dropped"));
         assert!(db.plane("scratch").is_err());
+    }
+
+    /// `history` with a name joins the code plane to the history beside it —
+    /// the whole CLI path, from the symbol a reader types to the commit line.
+    /// Without a name the same arm still prints the overview.
+    #[test]
+    fn history_with_a_name_reaches_the_commits_that_changed_a_symbols_file() {
+        const CODE: &str = concat!(
+            r#"{"external_key":"demo::alpha","labels":["Function"],"properties":{"file":"src/a.rs","line":10}}"#,
+            "\n",
+        );
+        const GIT: &str = concat!(
+            r#"{"external_key":"commit:aaa","labels":["Commit"],"properties":{"short":"aaa","#,
+            r#""summary":"touch a","author_name":"Jane Roe","committed_at":"2026-10-12T10:00:00+00:00","#,
+            r#""committed_ts":1760263200,"files":["src/a.rs"],"files_count":1}}"#,
+            "\n",
+            r#"{"external_key":"commit:bbb","labels":["Commit"],"properties":{"short":"bbb","#,
+            r#""summary":"touch b","author_name":"Jane Roe","committed_at":"2026-10-11T10:00:00+00:00","#,
+            r#""committed_ts":1760176800,"files":["src/b.rs"],"files_count":1}}"#,
+            "\n",
+        );
+
+        let db = Database::in_memory().unwrap();
+        db.create_plane("demo", Properties::new()).unwrap();
+        db.create_plane("demo_git", Properties::new()).unwrap();
+        cap(|o| import(&db, "demo", CODE.as_bytes(), OnConflict::Error, o));
+        cap(|o| import(&db, "demo_git", GIT.as_bytes(), OnConflict::Error, o));
+
+        let out = cap(|o| history(&db, "demo", Some("demo::alpha"), 15, o));
+        assert!(out.starts_with("plane 'demo_git':\n"), "{out}");
+        assert!(
+            out.contains("src/a.rs — the file declaring `demo::alpha`"),
+            "{out}"
+        );
+        assert!(out.contains("1 of 2 commit(s) changed it"), "{out}");
+        assert!(out.contains("aaa") && !out.contains("bbb"), "{out}");
+        assert!(
+            out.contains("read the history plane `demo_git` against the code plane `demo`"),
+            "{out}"
+        );
+
+        // The same arm, no name: the repository at a glance, as before.
+        let glance = cap(|o| history(&db, "demo", None, 15, o));
+        assert!(glance.contains("2 commit(s)"), "{glance}");
+        assert!(
+            glance.contains("touch a") && glance.contains("touch b"),
+            "{glance}"
+        );
     }
 
     /// A manifest tree's facts and a repository's history, as two planes the

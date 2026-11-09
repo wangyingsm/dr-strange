@@ -1503,13 +1503,18 @@ struct FathomReq {
     depth: Option<usize>,
 }
 
-/// `history`'s request: which repository, and how much of it.
+/// `history`'s request: which repository, what of it, and how much.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct HistoryReq {
     /// The history plane, or the code plane beside it — naming `myrepo` finds
     /// `myrepo_git`, because the first is what a reader has in mind.
     #[serde(default = "default_plane")]
     plane: String,
+    /// A symbol (fuzzy, as `context` takes it) or a repository-relative path:
+    /// the answer is the commits that changed the file it lives in, newest
+    /// first, instead of the repository at a glance.
+    #[serde(default)]
+    name: Option<String>,
     /// Commits to list, newest first (default 15).
     #[serde(default)]
     limit: Option<usize>,
@@ -2129,6 +2134,21 @@ fn compact_logic(
 ) -> AnyResult<Value> {
     let plane = db.plane(&req.plane)?;
     Ok(Value::String(render(&plane, &req.name)?))
+}
+
+/// `history`: a repository at a glance, or the commits that changed one name.
+fn history_logic(db: &Database, req: HistoryReq) -> AnyResult<Value> {
+    let (history, code) = dr_strange_core::touched::planes(db, &req.plane)?;
+    let out = match &req.name {
+        Some(name) => dr_strange_core::touched::touched(&dr_strange_core::touched::Asked {
+            history: &history,
+            code: code.as_ref(),
+            name,
+            limit: req.limit,
+        })?,
+        None => dr_strange_core::compact::history(&history, req.limit)?,
+    };
+    Ok(Value::String(out))
 }
 
 /// `deployed`: the ops plane joined to the history plane beside it.
@@ -3650,31 +3670,19 @@ impl DrStrange {
         naming the code plane finds it. Use this for when/who/why questions \
         — when something changed, who changed it, what a release contains, \
         whether history was rewritten — where `context` answers what the \
-        code is now. Rebases come from the reflog, which is local to one \
-        clone and expires, so the answer says what it can and cannot know.")]
+        code is now. Pass `name` (a symbol or a path) for the narrower \
+        question: the commits that changed the file it lives in, newest \
+        first, which is the join between the code plane and the history \
+        beside it. That join is file-level and says so — the answer names \
+        the `recall ... vs` call that settles whether one of those commits \
+        moved the symbol's own declaration. Rebases come from the reflog, \
+        which is local to one clone and expires, so the answer says what it \
+        can and cannot know.")]
     async fn history(
         &self,
         Parameters(req): Parameters<HistoryReq>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_in("history", req, move |db, req| {
-            // Naming the code plane finds the history beside it; naming the
-            // history plane is taken at its word.
-            let history = dr_strange_core::compact::history_plane_name(&req.plane);
-            let plane = match db.plane(&history) {
-                Ok(p)
-                    if !req
-                        .plane
-                        .ends_with(dr_strange_core::compact::HISTORY_SUFFIX) =>
-                {
-                    p
-                }
-                _ => db.plane(&req.plane)?,
-            };
-            Ok(Value::String(dr_strange_core::compact::history(
-                &plane, req.limit,
-            )?))
-        })
-        .await
+        self.run_in("history", req, history_logic).await
     }
 
     #[tool(description = "What commit a running thing was built from, and what \
@@ -6124,6 +6132,96 @@ mod deployed_tests {
     fn a_plane_that_does_not_exist_is_an_error_rather_than_an_empty_answer() {
         let db = Database::in_memory().unwrap();
         let err = deployed_logic(&db, from_value(jval!({"plane": "nope"})).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+}
+
+/// `history`: the overview, and the join to a symbol's own commits.
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use dr_strange_core::types::Properties;
+    use serde_json::{from_value, json as jval};
+
+    /// A code plane with one symbol and the history beside it, where one of
+    /// two commits changed that symbol's file.
+    fn repo() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("myrepo", Properties::new()).unwrap();
+        db.create_plane("myrepo_git", Properties::new()).unwrap();
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"plane": "myrepo", "nodes": [
+                {"external_key": "myrepo::alpha", "labels": ["Function"],
+                 "properties": {"file": "src/a.rs", "line": 10}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        write_nodes_logic(
+            &db,
+            from_value(jval!({"plane": "myrepo_git", "nodes": [
+                {"external_key": "commit:aaa", "labels": ["Commit"],
+                 "properties": {"short": "aaa", "summary": "touch a", "author_name": "Ada",
+                                "committed_at": "2026-10-12T10:00:00+00:00", "committed_ts": 3000,
+                                "files": ["src/a.rs"], "files_count": 1}},
+                {"external_key": "commit:bbb", "labels": ["Commit"],
+                 "properties": {"short": "bbb", "summary": "touch b", "author_name": "Ada",
+                                "committed_at": "2026-10-11T10:00:00+00:00", "committed_ts": 2000,
+                                "files": ["src/b.rs"], "files_count": 1}}
+            ]}))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        db
+    }
+
+    fn answer(db: &Database, req: Value) -> String {
+        match history_logic(db, from_value(req).unwrap()).unwrap() {
+            Value::String(out) => out,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn naming_the_code_plane_finds_the_history_beside_it_for_either_question() {
+        let db = repo();
+        let glance = answer(&db, jval!({"plane": "myrepo"}));
+        assert!(glance.starts_with("2 commit(s)"), "{glance}");
+
+        let joined = answer(&db, jval!({"plane": "myrepo", "name": "myrepo::alpha"}));
+        assert!(
+            joined.contains("src/a.rs — the file declaring `myrepo::alpha`"),
+            "{joined}"
+        );
+        assert!(joined.contains("1 of 2 commit(s) changed it"), "{joined}");
+        assert!(
+            joined.contains("read the history plane `myrepo_git` against the code plane `myrepo`"),
+            "{joined}"
+        );
+    }
+
+    /// Naming the history plane answers the same, which is what makes the
+    /// argument forgiving in both directions rather than one.
+    #[test]
+    fn naming_the_history_plane_resolves_the_same_pair() {
+        let db = repo();
+        let out = answer(&db, jval!({"plane": "myrepo_git", "name": "myrepo::alpha"}));
+        assert!(out.contains("1 of 2 commit(s) changed it"), "{out}");
+        assert!(
+            out.contains("read the history plane `myrepo_git` against the code plane `myrepo`"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_plane_that_does_not_exist_is_an_error_rather_than_an_empty_answer() {
+        let db = Database::in_memory().unwrap();
+        let err = history_logic(&db, from_value(jval!({"plane": "nope"})).unwrap())
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"), "{err}");

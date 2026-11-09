@@ -472,12 +472,16 @@ enum Command {
     /// A repository's history at a glance: where HEAD is, what the branches
     /// and tags point at, what was rebased, and the newest commits. Reads the
     /// `_git` plane a digest of a git checkout writes — naming the code plane
-    /// finds it.
+    /// finds it. Name a symbol or a path for the commits that changed it.
     History {
         /// The history plane, or the code plane beside it (`<plane>_git` is
         /// tried when the one named holds no commits).
         #[arg(long, default_value = "startup")]
         plane: String,
+        /// A symbol or a repository-relative path: the commits that changed
+        /// the file it lives in, newest first. **Omitted**: the whole
+        /// repository at a glance.
+        name: Option<String>,
         /// How many commits to list, newest first.
         #[arg(long, default_value_t = 15)]
         limit: usize,
@@ -1875,9 +1879,9 @@ fn run_tree_verbs(
             )?;
             Ok(())
         }
-        Command::History { plane, limit } => {
+        Command::History { plane, name, limit } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
-            commands::history(&db, &plane, limit, out)
+            commands::history(&db, &plane, name.as_deref(), limit, out)
         }
         Command::Deployed(args) => run_deployed(args, db_path, cfg, out),
         Command::Recall(args) => run_recall(args, db_path, cfg, out),
