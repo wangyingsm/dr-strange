@@ -18,6 +18,10 @@
 //! `recall <name> at <sha> vs <sha>~1`, over a list this answer has already
 //! bounded to one file's history.
 //!
+//! That reading needs a checkout and the parsers, which this layer has
+//! neither of, so a caller which does passes what it found back through
+//! [`Marks`] rather than rendering a second answer of its own.
+//!
 //! ## Why a short list is not silence
 //!
 //! Three different facts can make a commit missing from an answer, and each
@@ -32,10 +36,28 @@
 //! give is stated beside them — an unexplained disagreement with `git log`
 //! reads as a wrong answer rather than a fuller one.
 
+use std::collections::BTreeMap;
+
 use crate::api::{Database, PlaneHandle};
 use crate::compact::{self, Resolved, history_plane_name, prop_bool, prop_int, prop_str};
 use crate::error::Result;
 use crate::types::{NodeRecord, PropValue};
+
+/// What a caller found out about the commits, folded into the answer.
+///
+/// A caller that can read the declaration at each revision knows two things
+/// this module cannot: what it found per commit, and how much of the listing
+/// it got through. Both come back here rather than into a second renderer,
+/// because the plain answer and the annotated one are the same answer with
+/// more known about it.
+#[derive(Default)]
+pub struct Marks {
+    /// Per commit, by [`Row::short`] — appended to that commit's line.
+    pub per_commit: BTreeMap<String, String>,
+    /// One line about the pass itself: how many commits it read, and what it
+    /// left unread. The caller owns it because the caller did the work.
+    pub note: Option<String>,
+}
 
 /// The label every history reader mints a commit under.
 const COMMIT: &str = "Commit";
@@ -109,6 +131,86 @@ enum Named {
     Placeless(String),
 }
 
+/// One commit of the answer, for a caller that wants to say more about it
+/// than this module can — whether the symbol's own declaration moved there,
+/// which needs a checkout and the parsers.
+pub struct Row {
+    /// The full sha, which is what opens a tree.
+    pub sha: String,
+    /// The abbreviation the listing prints, and the key a mark is given under.
+    pub short: String,
+}
+
+/// The join, before it is rendered.
+///
+/// Returned by [`candidates`] so that a caller can annotate each commit and
+/// still render through [`Touched::stated`]. One renderer on purpose: the
+/// plain answer and the annotated one are the same answer with more known
+/// about it, and two copies of a sentence are one sentence with a
+/// disagreement waiting.
+pub struct Touched {
+    /// Resolved before the scan, so a caller can see what the join was made
+    /// on without re-resolving the name.
+    target: Target,
+    found: Found,
+    /// Set when the name could not be joined on at all; rendering says so
+    /// and the caller has nothing to annotate.
+    refused: Option<String>,
+}
+
+impl Touched {
+    /// The path the commits were matched against.
+    pub fn path(&self) -> &str {
+        &self.target.path
+    }
+
+    /// The symbol the path was reached through, when the name named one.
+    pub fn symbol(&self) -> Option<&str> {
+        self.target.symbol.as_deref()
+    }
+
+    /// The matching commits, newest first and already cut to the limit —
+    /// exactly the ones the listing will print, so a caller does not pay to
+    /// annotate a commit no reader will see.
+    pub fn rows(&self) -> Vec<Row> {
+        self.shown()
+            .into_iter()
+            .map(|commit| Row {
+                sha: prop_str(&commit.properties, "sha")
+                    .unwrap_or_else(|| prop_str(&commit.properties, "short").unwrap_or_default())
+                    .to_string(),
+                short: prop_str(&commit.properties, "short")
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// The answer, with a note of its own per commit where `marks` has one,
+    /// keyed by [`Row::short`].
+    pub fn stated(&self, asked: &Asked<'_>, marks: &Marks) -> Result<String> {
+        if let Some(refused) = &self.refused {
+            return Ok(refused.clone());
+        }
+        let mut out = head(&self.target, &self.found);
+        out.push_str(&rows(self.shown(), asked.limit, &marks.per_commit));
+        out.push_str(&notes(&self.target, &self.found, marks));
+        out.push_str(&planes_read(asked)?);
+        Ok(out)
+    }
+
+    /// The commits the listing shows: newest first, cut to the limit.
+    fn shown(&self) -> Vec<&NodeRecord> {
+        let mut commits: Vec<&NodeRecord> = self.found.rows.iter().collect();
+        commits.sort_by(|a, b| {
+            prop_int(&b.properties, "committed_ts")
+                .unwrap_or(0)
+                .cmp(&prop_int(&a.properties, "committed_ts").unwrap_or(0))
+        });
+        commits
+    }
+}
+
 /// When was this touched, and by whom — `history <name>`.
 ///
 /// Answers at file granularity and says so: the commits listed are the ones
@@ -117,22 +219,36 @@ enum Named {
 /// and it ends by naming the planes it read, because a verb that joined the
 /// wrong pair would otherwise look like one that found nothing.
 pub fn touched(asked: &Asked<'_>) -> Result<String> {
+    candidates(asked)?.stated(asked, &Marks::default())
+}
+
+/// The same join, left unrendered so each commit can be annotated first.
+pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
+    let refuse = |why: String| Touched {
+        target: Target {
+            path: String::new(),
+            symbol: None,
+            literal: false,
+        },
+        found: Found::default(),
+        refused: Some(why),
+    };
     let target = match resolve(asked)? {
         Named::Target(target) => target,
-        Named::Ambiguous(candidates) => return Ok(candidates),
+        Named::Ambiguous(candidates) => return Ok(refuse(candidates)),
         Named::Placeless(key) => {
-            return Ok(format!(
+            return Ok(refuse(format!(
                 "`{key}` records no file, so there is no path to join its history on — \
                  `describe {key}` shows what it does record\n"
-            ));
+            )));
         }
     };
-    let mut found = scan(asked.history, &target.path)?;
-    let mut out = head(&target, &found);
-    out.push_str(&rows(std::mem::take(&mut found.rows), asked.limit));
-    out.push_str(&notes(&target, &found));
-    out.push_str(&planes_read(asked)?);
-    Ok(out)
+    let found = scan(asked.history, &target.path)?;
+    Ok(Touched {
+        target,
+        found,
+        refused: None,
+    })
 }
 
 /// The path to join on, from a symbol, a file-level node, or the name itself.
@@ -184,6 +300,7 @@ fn placed(node: &NodeRecord) -> Named {
 }
 
 /// What a scan of the history plane found, and what it could not say.
+#[derive(Default)]
 struct Found {
     /// The commits whose paths hold the one asked about.
     rows: Vec<NodeRecord>,
@@ -267,19 +384,22 @@ fn head(target: &Target, found: &Found) -> String {
 }
 
 /// The matching commits, newest first, one line each.
-fn rows(mut commits: Vec<NodeRecord>, limit: Option<usize>) -> String {
+///
+/// A mark from `marks` is appended to its commit's line, keyed by the short
+/// sha — how a caller that read the declaration at each revision says what
+/// it found without owning a second copy of this format.
+fn rows(
+    commits: Vec<&NodeRecord>,
+    limit: Option<usize>,
+    marks: &BTreeMap<String, String>,
+) -> String {
     let limit = limit.unwrap_or(COMMITS_SHOWN).max(1);
-    commits.sort_by(|a, b| {
-        prop_int(&b.properties, "committed_ts")
-            .unwrap_or(0)
-            .cmp(&prop_int(&a.properties, "committed_ts").unwrap_or(0))
-    });
     let mut out = String::new();
     for commit in commits.iter().take(limit) {
         let p = &commit.properties;
+        let short = prop_str(p, "short").unwrap_or_default();
         out.push_str(&format!(
-            "  {}  {}  {:<18} {}{}{}\n",
-            prop_str(p, "short").unwrap_or_default(),
+            "  {short}  {}  {:<18} {}{}{}{}\n",
             compact::day(p, "committed_at"),
             prop_str(p, "author_name").unwrap_or_default(),
             prop_str(p, "summary").unwrap_or_default(),
@@ -293,6 +413,10 @@ fn rows(mut commits: Vec<NodeRecord>, limit: Option<usize>) -> String {
                 (false, true) => "  [left behind]",
                 (false, false) => "",
             },
+            match marks.get(short) {
+                Some(mark) => format!("  {mark}"),
+                None => String::new(),
+            },
         ));
     }
     if commits.len() > limit {
@@ -305,7 +429,13 @@ fn rows(mut commits: Vec<NodeRecord>, limit: Option<usize>) -> String {
 }
 
 /// What the answer is, and each way it could be short of the truth.
-fn notes(target: &Target, found: &Found) -> String {
+///
+/// Where `marks` carries per-commit findings, a caller has already read the
+/// declaration at each commit: the file-level caveat is then answered rather
+/// than owed, and repeating it would tell a reader to go and do what was
+/// just done.
+fn notes(target: &Target, found: &Found, marks: &Marks) -> String {
+    let settled = !marks.per_commit.is_empty();
     let mut out = String::new();
     if found.total == 0 {
         out.push_str(
@@ -353,15 +483,23 @@ fn notes(target: &Target, found: &Found) -> String {
             target.path
         ));
     }
-    match &target.symbol {
-        Some(symbol) => out.push_str(&format!(
+    match (&target.symbol, settled) {
+        (Some(_), true) => out.push_str(
+            "note: each commit was read at its own revision and at its first parent, so the \
+             mark is about the declaration itself, not about the file\n",
+        ),
+        (Some(symbol), false) => out.push_str(&format!(
             "note: a commit is listed for changing the *file*; `recall {symbol} at <sha> vs \
-             <sha>~1` says whether that commit moved the declaration itself\n"
+             <sha>~1` says whether that commit moved the declaration itself, and `exact` \
+             does it for every commit above\n"
         )),
-        None => out.push_str(
+        (None, _) => out.push_str(
             "note: git records a tree, not a rename, so a path the file was moved from \
              carries its earlier commits under that other name\n",
         ),
+    }
+    if let Some(note) = &marks.note {
+        out.push_str(&format!("note: {note}\n"));
     }
     out
 }
