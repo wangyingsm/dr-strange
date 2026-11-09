@@ -65,6 +65,24 @@ these calls were inferred* had to read every edge through `context` instead.
   `git log -- <path>` lists, since that walks from the refs and never reaches
   them.
 
+- **`history <name> --exact` settles it at the declaration.** The listing
+  above is file-level; `--exact` (`exact: true` over MCP) reads the symbol's
+  declaration at each listed commit and at that commit's *first* parent, and
+  marks each row `← declaration changed`, `— file only`, `+ declared here` or
+  `− removed here`. First parent, not any parent, so a merge is compared
+  against the line it was made on rather than the branch it absorbed. This is
+  the difference between "this commit touched the file" and "this commit
+  touched the function", which on a thousand-line file is most of the
+  question.
+
+  It needs the checkout the plane was parsed from and the installed parsers,
+  so it is asked for rather than assumed: ~300ms a commit, capped at fifteen
+  — the listing's own default — and the answer says how many it read and how
+  many it left. A comparison that could not be made carries `?` with the
+  reason rather than counting as unchanged, and asking for `exact` where it
+  cannot run (a path, no code plane, no checkout) says which rather than
+  silently answering at the file level.
+
 ### Fixed
 
 - **A condition that read a variable across a variable-length hop was

@@ -1020,11 +1020,37 @@ before the reader wrote any paths, a commit whose own list stopped short, a
 rename (git stores a tree, not a rename), and the commits a rewrite left
 behind, which `git log -- <path>` never walks to.
 
-*Open.* Running that `recall` comparison per commit **inside** the verb, so
-an agent gets the symbol-level answer in one call rather than composing it.
-It needs a git checkout and the parsers, so it belongs beside `recall` in the
-MCP layer rather than in core, and it needs a cap: a symbol in a much-edited
-file would otherwise parse one file at two revisions a few dozen times.
+*That comparison now runs inside the verb.* `history <name> --exact` reads
+the declaration at each listed commit and at that commit's **first** parent
+— the line the commit was made on, so a merge is compared against what it
+was merged into rather than against the branch it absorbed — and marks each
+row `← declaration changed`, `— file only`, `+ declared here` or
+`− removed here`. It lives beside `recall` in the MCP layer, which is where
+the checkout and the parsers are; core keeps the one renderer and takes the
+marks back through a `Marks` struct, so the plain answer and the exact one
+cannot drift into two different sentences.
+
+Compared by the declaration's own lines, not by an edit script: the question
+is whether it moved, and a longest-common-subsequence table is the price of
+saying *how*, which this caller does not ask. It is capped at fifteen commits
+— the listing's own default length — and says how many it read and how many
+it left. Measured: ~300ms a commit on a thousand-line file, so 4.5s for a
+full fifteen. That is why it is asked for rather than assumed, and why a
+comparison that could not be made carries `?` with the reason instead of
+counting as unchanged.
+
+A tempting optimisation that is **wrong**: since the listing holds every
+commit that touched the file, commit *k*'s parent appears to have the same
+file content as commit *k+1* in the list, which would halve the parses. It
+does not hold — the plane keeps the commits a rewrite left behind, so the
+listing is not a linear ancestry, and the chain breaks exactly where this
+section already takes care to be honest. Caching parses by revision instead
+is always safe and measured at ~1.5% here, because a file's commits are
+usually not parent and child.
+
+*Open.* Nothing yet reads the marks in bulk: "which commits changed any of
+these twenty symbols" is twenty passes, where one walk of each tree could
+answer them together.
 
 *Open, and the honest reading of that 383ms.* It is per **fold**, and it
 grows with the length of the history, because the reader diffs every commit

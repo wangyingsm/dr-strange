@@ -35,7 +35,7 @@ access, and the CLI for offline operations.
 | `snippet <name \| path:start-end> --plane` | a symbol's source text, or a range of any file in the parsed tree |
 | `grep <pattern> --plane [--regex] [--path] [--all-files]` | text search over that tree, ignored files excluded unless `--all-files`; each hit names the symbol it falls in |
 | `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
-| `history [<name>] --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits. With a symbol or a path, the commits that changed the file it lives in — the code plane joined to the history beside it through the paths each commit records |
+| `history [<name>] --plane [--exact] [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits. With a symbol or a path, the commits that changed the file it lives in — the code plane joined to the history beside it through the paths each commit records. `--exact` reads the declaration at each of those commits and its first parent, so each line says whether the commit moved the symbol or only the file around it |
 | `deployed [<target>] --plane [--ops] [--history]` | what commit a running thing was built from, and what runs a commit: the ops plane joined to the history beside it through the revision an image's tag carries |
 | `recall <name> --at <rev> --plane [--vs <rev>] [--pattern]` | code as it was at a revision: a file, a range, a directory or a symbol; a search of that tree; or a diff from an older revision |
 | `wire <path \| name> --plane [--verb]` | what serves an HTTP path and what asks for it, across every language in the plane and across the planes it attaches |
