@@ -35,7 +35,7 @@ access, and the CLI for offline operations.
 | `snippet <name \| path:start-end> --plane` | a symbol's source text, or a range of any file in the parsed tree |
 | `grep <pattern> --plane [--regex] [--path] [--all-files]` | text search over that tree, ignored files excluded unless `--all-files`; each hit names the symbol it falls in |
 | `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
-| `history --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits |
+| `history [<name>] --plane [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits. With a symbol or a path, the commits that changed the file it lives in — the code plane joined to the history beside it through the paths each commit records |
 | `deployed [<target>] --plane [--ops] [--history]` | what commit a running thing was built from, and what runs a commit: the ops plane joined to the history beside it through the revision an image's tag carries |
 | `recall <name> --at <rev> --plane [--vs <rev>] [--pattern]` | code as it was at a revision: a file, a range, a directory or a symbol; a search of that tree; or a diff from an older revision |
 | `wire <path \| name> --plane [--verb]` | what serves an HTTP path and what asks for it, across every language in the plane and across the planes it attaches |

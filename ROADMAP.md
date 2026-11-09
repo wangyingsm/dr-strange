@@ -997,9 +997,34 @@ by renaming a fresh temp file over it, so content and metadata move together;
 the gap is deleting a ref and recreating it at the same sha inside one mtime
 tick, which describes a plane that is already correct.
 
-*Open.* Nothing yet **links the two planes**: a `Commit` to the symbols it
-changed would need tree diffing, which is a different order of cost and a
-decision of its own.
+*The two planes are linked.* This was worded as an edge from a `Commit` to
+the symbols it changed, which the storage layer rejects — planes are hard
+namespaces (§3). The join is a read of both, the shape `deployed` already
+uses, and the thread is a path: the git reader records the paths each commit
+changed, a symbol records the file it is declared in, and `history <name>`
+puts the two together. Tree diffing turned out to be affordable rather than a
+different order of cost — git names a tree by the hash of its contents, so an
+unchanged directory is one oid comparison however large it is, and recursing
+only where subtree oids differ makes a commit cost what it changed rather
+than what the repository holds. Measured on 1636 commits: 78ms to read the
+history, 383ms with the paths, ~0.19ms a commit, 6202 paths. A merge records
+only what differs from *every* parent — git's own `TREESAME` rule — so an
+ordinary merge lists nothing and its side commits carry the changes.
+
+The join is file-level and says so in those words, because the honest
+symbol-level answer is to read the declaration at each of those commits and
+the one before, which `recall <name> at <sha> vs <sha>~1` already does over a
+list this verb has bounded to one file's history. Each way the answer can
+fall short is a note of its own rather than a silent omission: a plane folded
+before the reader wrote any paths, a commit whose own list stopped short, a
+rename (git stores a tree, not a rename), and the commits a rewrite left
+behind, which `git log -- <path>` never walks to.
+
+*Open.* Running that `recall` comparison per commit **inside** the verb, so
+an agent gets the symbol-level answer in one call rather than composing it.
+It needs a git checkout and the parsers, so it belongs beside `recall` in the
+MCP layer rather than in core, and it needs a cap: a symbol in a much-edited
+file would otherwise parse one file at two revisions a few dozen times.
 
 ### The catalog is data, and it lives with the plugins  *(shipped)*
 

@@ -45,6 +45,26 @@ these calls were inferred* had to read every edge through `context` instead.
   `rev-parse HEAD` the poll already spawned. The code plane is untouched by
   such a tick, because no file changed.
 
+- **`history <name>` — when a symbol was last touched, and by whom** (ROADMAP
+  §11). This is the join between a repository's code plane and the history
+  plane beside it, and it is a read of both rather than an edge, because a
+  cross-plane edge is rejected at storage by design. The thread is a path: the
+  `git` reader now records the paths each commit changed (plugin `git` 1.1.0),
+  a symbol records the file it is declared in, and `history dr_strange::foo`
+  lists the commits that changed that file, newest first. Naming either plane
+  finds the other, and the answer names both so a wrong pairing is visible.
+
+  The join is file-level and says so. For the symbol's own declaration the
+  answer names the call that settles it — `recall <name> at <sha> vs <sha>~1`
+  — over a list already bounded to one file's history. Four ways the answer
+  can fall short are each stated rather than left to look like silence: a
+  plane folded before the reader wrote any paths, a commit whose own list
+  stopped short, a rename (git stores a tree, not a rename, so the file's
+  earlier commits are under the other name), and the commits a rewrite left
+  behind, which are marked `[left behind]` and reconciled against what
+  `git log -- <path>` lists, since that walks from the refs and never reaches
+  them.
+
 ### Fixed
 
 - **A condition that read a variable across a variable-length hop was
