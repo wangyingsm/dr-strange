@@ -1584,22 +1584,23 @@ fn is_our_hook_command(command: &str, name: &str) -> bool {
 /// plane that holds no commits and has no `_git` beside it says so.
 pub fn history(
     db: &Database,
-    plane_name: &str,
-    name: Option<&str>,
-    limit: usize,
+    asked: dr_strange_mcp::HistoryReq,
+    parsers: &dyn dr_strange_mcp::Parsers,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let (history, code) = dr_strange_core::touched::planes(db, plane_name)?;
+    let (history, _) = dr_strange_core::touched::planes(db, &asked.plane)?;
     writeln!(out, "plane '{}':", history.name()?)?;
-    let text = match name {
-        Some(name) => dr_strange_core::touched::touched(&dr_strange_core::touched::Asked {
-            history: &history,
-            code: code.as_ref(),
-            name,
-            limit: Some(limit),
-        })?,
-        None => dr_strange_core::compact::history(&history, Some(limit))?,
+    // The CLI runs as the user whose files these are, so a plane's own
+    // recorded root is readable — the same policy `recall` and `snippet` use
+    // here, and the reason `exact` can read a declaration at all.
+    let access = dr_strange_mcp::TreeAccess {
+        plane_roots: true,
+        ..Default::default()
     };
+    let rendered = dr_strange_mcp::history_logic(db, access, parsers, asked)?;
+    let text = rendered
+        .as_str()
+        .map_or_else(|| rendered.to_string(), str::to_string);
     write!(out, "{text}")?;
     Ok(())
 }
@@ -5123,7 +5124,14 @@ mod tests {
         cap(|o| import(&db, "demo", CODE.as_bytes(), OnConflict::Error, o));
         cap(|o| import(&db, "demo_git", GIT.as_bytes(), OnConflict::Error, o));
 
-        let out = cap(|o| history(&db, "demo", Some("demo::alpha"), 15, o));
+        let parsers = dr_strange_llm::Plugins::from_handlers(Vec::new());
+        let asked = |name: Option<&str>| dr_strange_mcp::HistoryReq {
+            plane: "demo".to_string(),
+            name: name.map(str::to_string),
+            exact: None,
+            limit: Some(15),
+        };
+        let out = cap(|o| history(&db, asked(Some("demo::alpha")), &parsers, o));
         assert!(out.starts_with("plane 'demo_git':\n"), "{out}");
         assert!(
             out.contains("src/a.rs — the file declaring `demo::alpha`"),
@@ -5137,7 +5145,7 @@ mod tests {
         );
 
         // The same arm, no name: the repository at a glance, as before.
-        let glance = cap(|o| history(&db, "demo", None, 15, o));
+        let glance = cap(|o| history(&db, asked(None), &parsers, o));
         assert!(glance.contains("2 commit(s)"), "{glance}");
         assert!(
             glance.contains("touch a") && glance.contains("touch b"),

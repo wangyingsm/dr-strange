@@ -473,19 +473,7 @@ enum Command {
     /// and tags point at, what was rebased, and the newest commits. Reads the
     /// `_git` plane a digest of a git checkout writes — naming the code plane
     /// finds it. Name a symbol or a path for the commits that changed it.
-    History {
-        /// The history plane, or the code plane beside it (`<plane>_git` is
-        /// tried when the one named holds no commits).
-        #[arg(long, default_value = "startup")]
-        plane: String,
-        /// A symbol or a repository-relative path: the commits that changed
-        /// the file it lives in, newest first. **Omitted**: the whole
-        /// repository at a glance.
-        name: Option<String>,
-        /// How many commits to list, newest first.
-        #[arg(long, default_value_t = 15)]
-        limit: usize,
-    },
+    History(HistoryArgs),
     /// What commit a running thing was built from, and what runs a commit.
     /// Joins the `_ops` plane — the workloads, images and infrastructure a
     /// digest of manifests records — to the `_git` plane beside it, through
@@ -1101,6 +1089,28 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `drsg history`'s arguments: which repository, what of it, and how much.
+#[derive(clap::Args)]
+struct HistoryArgs {
+    /// A symbol or a repository-relative path: the commits that changed the
+    /// file it lives in, newest first. **Omitted**: the whole repository at
+    /// a glance.
+    name: Option<String>,
+    /// The history plane, or the code plane beside it (`<plane>_git` is
+    /// tried when the one named holds no commits).
+    #[arg(long, default_value = "startup")]
+    plane: String,
+    /// With a symbol: read its declaration at each listed commit and at that
+    /// commit's first parent, so each line says whether the commit moved the
+    /// declaration or only the file around it. Two parses of one file per
+    /// commit, so it is asked for rather than assumed.
+    #[arg(long)]
+    exact: bool,
+    /// How many commits to list, newest first.
+    #[arg(long, default_value_t = 15)]
+    limit: usize,
+}
+
 /// `drsg deployed`'s arguments: what to ask about, and where to look.
 #[derive(clap::Args)]
 struct DeployedArgs {
@@ -1205,6 +1215,25 @@ fn recall_parsers(cfg: &config::Config) -> Result<std::sync::Arc<dyn dr_strange_
 #[cfg(not(feature = "digest"))]
 fn recall_parsers(_cfg: &config::Config) -> Result<std::sync::Arc<dyn dr_strange_mcp::Parsers>> {
     Ok(dr_strange_mcp::default_parsers())
+}
+
+/// `drsg history` — the parsers come along because `--exact` reads a
+/// declaration at each commit, the same way `recall` reads one at a revision.
+fn run_history(
+    args: HistoryArgs,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let db = commands::open(db_path, config::retain_commits(cfg))?;
+    let parsers = recall_parsers(cfg)?;
+    let asked = dr_strange_mcp::HistoryReq {
+        plane: args.plane,
+        name: args.name,
+        exact: Some(args.exact),
+        limit: Some(args.limit),
+    };
+    commands::history(&db, asked, &*parsers, out)
 }
 
 /// `drsg recall`: the MCP tool's body over flags, printed as its text.
@@ -1879,10 +1908,7 @@ fn run_tree_verbs(
             )?;
             Ok(())
         }
-        Command::History { plane, name, limit } => {
-            let db = commands::open(db_path, config::retain_commits(cfg))?;
-            commands::history(&db, &plane, name.as_deref(), limit, out)
-        }
+        Command::History(args) => run_history(args, db_path, cfg, out),
         Command::Deployed(args) => run_deployed(args, db_path, cfg, out),
         Command::Recall(args) => run_recall(args, db_path, cfg, out),
         other => run_analytics(other, db_path, cfg, verbose, out),
