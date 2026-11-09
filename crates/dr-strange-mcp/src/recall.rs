@@ -1,6 +1,8 @@
 //! `recall`: code as it was at a git revision. The revision is resolved over
 //! the plane's `<plane>_git` history; the bytes come from git's object store.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -359,7 +361,7 @@ fn path_lines(
 }
 
 /// A symbol as today's graph knows it.
-struct Symbol {
+pub struct Symbol {
     key: String,
     /// Its file as the graph records it.
     file: String,
@@ -380,14 +382,26 @@ struct Located {
 
 /// Resolve the request's name in today's graph; `at` only words the answer when nothing matches.
 fn symbol(plane: &PlaneHandle<'_>, req: &RecallReq, at: &str) -> AnyResult<Symbol> {
-    let node = match compact::resolve(plane, req.name())? {
+    resolve_symbol(plane, &req.plane, req.name(), at)
+}
+
+/// The same, for a caller that is not serving a `recall` request.
+///
+/// Public because `history <name>` resolves the same symbol against the same
+/// plane and then reads it at a succession of revisions: one resolution rule
+/// for both, so a name that `recall` accepts is not one `history` refuses.
+pub fn resolve_symbol(
+    plane: &PlaneHandle<'_>,
+    plane_name: &str,
+    name: &str,
+    at: &str,
+) -> AnyResult<Symbol> {
+    let node = match compact::resolve(plane, name)? {
         Resolved::One(node) => node,
-        Resolved::Many(hits) => bail!("{}", compact::candidates(req.name(), &hits).trim_end()),
+        Resolved::Many(hits) => bail!("{}", compact::candidates(name, &hits).trim_end()),
         Resolved::None => bail!(
-            "`{}` is neither a path at {at} nor a symbol in plane `{}` — recall a directory \
-             at {at} to see what the tree held",
-            req.name(),
-            req.plane
+            "`{name}` is neither a path at {at} nor a symbol in plane `{plane_name}` — recall \
+             a directory at {at} to see what the tree held"
         ),
     };
     let key = node.external_key.clone().unwrap_or_default();
@@ -651,6 +665,129 @@ fn side(tree: &GitTree, parsers: &dyn Parsers, sym: &Symbol) -> AnyResult<Side> 
         first: found.line,
         lines,
     })
+}
+
+/// What one commit did to a symbol's own declaration, against its parent.
+pub enum Moved {
+    /// The declaration differs between the two revisions.
+    Yes,
+    /// Byte-identical at both: this commit changed the file elsewhere.
+    No,
+    /// Declared at the commit and not at its parent.
+    Added,
+    /// Declared at the parent and not at the commit.
+    Removed,
+    /// Could not be settled, and the first line of why — an unreadable tree,
+    /// a file the parsers place nothing in, a root commit with no parent.
+    /// Said rather than counted as "no": a comparison that did not happen is
+    /// not evidence the declaration stood still.
+    Unsettled(String),
+}
+
+impl Moved {
+    /// The mark this puts on the commit's line.
+    pub fn mark(&self) -> String {
+        match self {
+            Moved::Yes => "← declaration changed".to_string(),
+            Moved::No => "— file only".to_string(),
+            Moved::Added => "+ declared here".to_string(),
+            Moved::Removed => "− removed here".to_string(),
+            Moved::Unsettled(why) => format!("? {why}"),
+        }
+    }
+
+    /// Whether the comparison reached an answer at all.
+    pub fn settled(&self) -> bool {
+        !matches!(self, Moved::Unsettled(_))
+    }
+}
+
+/// Reads one symbol's declaration at a succession of revisions.
+///
+/// Holds the checkout and the parsers so that a per-commit loop names them
+/// once. Each commit costs two tree opens and two parses of one file, which
+/// is why the caller caps how many it asks about rather than this deciding
+/// for it — the cap belongs where the listing's length is known.
+pub struct Declarations<'a> {
+    root: &'a Path,
+    parsers: &'a dyn Parsers,
+    sym: Symbol,
+    /// The declaration already read at a revision, by sha.
+    ///
+    /// A listed commit's parent is sometimes another listed commit — adjacent
+    /// edits to one file — and then the same parse serves both sides. An oid
+    /// names one immutable tree, so a revision read once is correct for the
+    /// whole pass. `None` records "not declared there", which is an answer
+    /// worth not recomputing.
+    read: RefCell<BTreeMap<String, Option<Vec<String>>>>,
+}
+
+impl<'a> Declarations<'a> {
+    /// A reader of one symbol over one checkout.
+    pub fn new(root: &'a Path, parsers: &'a dyn Parsers, sym: Symbol) -> Declarations<'a> {
+        Declarations {
+            root,
+            parsers,
+            sym,
+            read: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// Whether `newer` moved the declaration, against `older`.
+    ///
+    /// `older` is `None` for a root commit, which has no parent to compare
+    /// against: a symbol declared there was declared by it.
+    ///
+    /// Compared by the declaration's own lines rather than by an edit script:
+    /// the question is whether it moved, and a longest-common-subsequence
+    /// table is the price of saying *how*, which this caller does not ask.
+    pub fn moved(&self, newer: &str, older: Option<&str>) -> Moved {
+        let new = self.at(newer);
+        let old = match older {
+            Some(older) => self.at(older),
+            None => Ok(None),
+        };
+        match (new, old) {
+            (Ok(Some(new)), Ok(Some(old))) => match new == old {
+                true => Moved::No,
+                false => Moved::Yes,
+            },
+            (Ok(Some(_)), Ok(None)) => Moved::Added,
+            (Ok(None), Ok(Some(_))) => Moved::Removed,
+            (Ok(None), Ok(None)) => Moved::Unsettled(format!(
+                "`{}` is declared at neither revision",
+                self.sym.key
+            )),
+            (Err(e), _) | (_, Err(e)) => Moved::Unsettled(first_line(&e)),
+        }
+    }
+
+    /// The declaration's lines at one revision, or `None` where the symbol is
+    /// not declared there.
+    ///
+    /// Absent is an answer here, where it is a failure in a diff: a commit
+    /// that introduced a symbol has no older side, and that is the most
+    /// interesting row in the listing.
+    fn at(&self, rev: &str) -> AnyResult<Option<Vec<String>>> {
+        if let Some(hit) = self.read.borrow().get(rev) {
+            return Ok(hit.clone());
+        }
+        let sha = Sha::parse(rev).ok_or_else(|| anyhow!("`{rev}` is no full object name"))?;
+        let tree = GitTree::open(self.root, sha)?;
+        let lines = side(&tree, self.parsers, &self.sym)
+            .ok()
+            .map(|found| found.lines);
+        self.read
+            .borrow_mut()
+            .insert(rev.to_string(), lines.clone());
+        Ok(lines)
+    }
+}
+
+/// An error's first line — a mark sits on one row, so it gets one line.
+fn first_line(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    text.lines().next().unwrap_or_default().to_string()
 }
 
 /// `+` and `−` line counts of a unified diff, file headers excluded.
@@ -1082,9 +1219,36 @@ mod tests {
         let p = db.create_plane("repo_git", Properties::new()).unwrap();
         let mut txn = p.write().unwrap();
         let mut ids = Vec::new();
-        for (sha, summary, day, ts) in [
-            (one, "one", "01", 1_785_578_400),
-            (two, "two", "02", 1_785_664_800),
+        // `files` as the git reader writes it, so `history <name>` can join
+        // on this plane — what each commit changed, this fixture's own tree.
+        let paths = |of: &[&str]| {
+            PropValue::List(
+                of.iter()
+                    .map(|p| PropValue::Str((*p).to_string()))
+                    .collect(),
+            )
+        };
+        for (sha, summary, day, ts, files) in [
+            (
+                one,
+                "one",
+                "01",
+                1_785_578_400,
+                paths(&["docs/a.md", "src/lib.rs", "src/old.rs", "src/sym.rs"]),
+            ),
+            (
+                two,
+                "two",
+                "02",
+                1_785_664_800,
+                paths(&[
+                    "blob.bin",
+                    "src/lib.rs",
+                    "src/new.rs",
+                    "src/old.rs",
+                    "src/sym.rs",
+                ]),
+            ),
         ] {
             let node = props(vec![
                 ("sha", PropValue::Str(sha.into())),
@@ -1095,6 +1259,8 @@ mod tests {
                     PropValue::Str(format!("2026-08-{day}T10:00:00+00:00")),
                 ),
                 ("committed_ts", PropValue::Int(ts)),
+                ("short", PropValue::Str(sha[..7].to_string())),
+                ("files", files),
             ]);
             let key = format!("commit:{sha}");
             ids.push(txn.create_node_with_key(&key, &["Commit"], node).unwrap());
@@ -1131,6 +1297,97 @@ mod tests {
         let parsers = Plugins::from_handlers(vec![Box::new(LineLang)]);
         let out = recall_logic_in(db, access, &parsers, from_value(req).unwrap())?;
         Ok(out.as_str().unwrap().to_string())
+    }
+
+    /// `history <name> --exact` over this same checkout: the verb that reads
+    /// the declaration at each commit uses the machinery here, so it is
+    /// tested against the fixture that already has a real git repository.
+    fn history_exact(db: &Database, name: &str) -> AnyResult<String> {
+        let parsers = Plugins::from_handlers(vec![Box::new(LineLang)]);
+        let out = crate::history_logic(
+            db,
+            TreeAccess {
+                plane_roots: true,
+                ..Default::default()
+            },
+            &parsers,
+            from_value(serde_json::json!({
+                "plane": "repo", "name": name, "exact": true
+            }))
+            .unwrap(),
+        )?;
+        Ok(out.as_str().unwrap().to_string())
+    }
+
+    /// The distinction the whole verb exists for: both commits changed
+    /// `src/sym.rs`, and only one of them changed `beta`.
+    #[test]
+    fn exact_tells_a_commit_that_moved_the_declaration_from_one_that_moved_the_file() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "m::beta").unwrap();
+        assert!(
+            out.contains("src/sym.rs — the file declaring `m::beta`"),
+            "{out}"
+        );
+        assert!(out.contains("2 of 2 commit(s) changed it"), "{out}");
+        // `two` rewrote beta's body; `one` is where it first appeared, and
+        // has no parent to compare against.
+        let line = |sha: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with(&sha[..7]))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line(&f.two).contains("← declaration changed"), "{out}");
+        assert!(line(&f.one).contains("+ declared here"), "{out}");
+        assert!(
+            out.contains("the mark is about the declaration itself, not about the file"),
+            "{out}"
+        );
+        assert!(out.contains("`exact` read 2 commit(s)"), "{out}");
+    }
+
+    /// `gamma` is added by `two` and absent at `one`, where there is also no
+    /// parent — so one row is an addition and the other cannot be settled.
+    /// Unsettled is said, not folded into "unchanged".
+    #[test]
+    fn exact_says_which_rows_it_could_not_settle() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "m::gamma").unwrap();
+        let line = |sha: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with(&sha[..7]))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line(&f.two).contains("+ declared here"), "{out}");
+        assert!(line(&f.one).contains('?'), "{out}");
+        assert!(
+            out.contains(
+                "1 could not be settled and carry `?` with the reason, which is not \
+                          the same as unchanged"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A file renamed between the two commits: `moved` is in `src/new.rs`
+    /// now and was `src/old.rs` before, so the path join finds both commits
+    /// only because the reader records a delete and an add as two paths.
+    #[test]
+    fn exact_follows_a_declaration_across_the_rename_of_its_file() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "m::moved").unwrap();
+        assert!(
+            out.contains("src/new.rs — the file declaring `m::moved`"),
+            "{out}"
+        );
+        // Only `two` lists `src/new.rs`; `one` had the body under the old
+        // name, which is the honest limit this answer states.
+        assert!(out.contains("1 of 2 commit(s) changed it"), "{out}");
+        // Unmoved content under a new name: git has no rename, but recall's
+        // own rename lookup finds the older side, so this is "file only".
+        assert!(out.contains("— file only"), "{out}");
     }
 
     /// A plane's `synced_root` is data — `plane.set_props` writes it — so on a

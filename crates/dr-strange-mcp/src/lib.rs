@@ -1504,20 +1504,27 @@ struct FathomReq {
 }
 
 /// `history`'s request: which repository, what of it, and how much.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct HistoryReq {
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct HistoryReq {
     /// The history plane, or the code plane beside it — naming `myrepo` finds
     /// `myrepo_git`, because the first is what a reader has in mind.
     #[serde(default = "default_plane")]
-    plane: String,
+    pub plane: String,
     /// A symbol (fuzzy, as `context` takes it) or a repository-relative path:
     /// the answer is the commits that changed the file it lives in, newest
     /// first, instead of the repository at a glance.
     #[serde(default)]
-    name: Option<String>,
+    pub name: Option<String>,
+    /// With a `name` that is a symbol: read its declaration at each listed
+    /// commit and at that commit's first parent, so each line says whether
+    /// the commit moved the declaration or only the file around it. Costs
+    /// two parses of one file per commit and needs the checkout, so it is
+    /// asked for rather than assumed.
+    #[serde(default)]
+    pub exact: Option<bool>,
     /// Commits to list, newest first (default 15).
     #[serde(default)]
-    limit: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 /// `deployed`'s request: which repository, and what is being asked about.
@@ -2136,19 +2143,133 @@ fn compact_logic(
     Ok(Value::String(render(&plane, &req.name)?))
 }
 
-/// `history`: a repository at a glance, or the commits that changed one name.
-fn history_logic(db: &Database, req: HistoryReq) -> AnyResult<Value> {
+/// Commits whose declaration `exact` reads before it says it stopped.
+///
+/// Each costs two tree opens and two parses of one file, so a symbol in a
+/// much-edited file would otherwise spend a minute of wasm on rows a reader
+/// has not asked to see. Fifteen is the listing's own default length, which
+/// makes the common call exact all the way down.
+const EXACT_COMMITS: usize = 15;
+
+/// `history`: a repository at a glance, the commits that changed one name,
+/// or those commits with the declaration read at each.
+///
+/// `access` and `parsers` are consulted only by `exact`: a call that asks for
+/// the listing alone must still answer where there is no tree to read.
+pub fn history_logic(
+    db: &Database,
+    access: TreeAccess<'_>,
+    parsers: &dyn recall::Parsers,
+    req: HistoryReq,
+) -> AnyResult<Value> {
     let (history, code) = dr_strange_core::touched::planes(db, &req.plane)?;
-    let out = match &req.name {
-        Some(name) => dr_strange_core::touched::touched(&dr_strange_core::touched::Asked {
-            history: &history,
-            code: code.as_ref(),
-            name,
-            limit: req.limit,
-        })?,
-        None => dr_strange_core::compact::history(&history, req.limit)?,
+    let Some(name) = req.name.clone() else {
+        return Ok(Value::String(dr_strange_core::compact::history(
+            &history, req.limit,
+        )?));
     };
-    Ok(Value::String(out))
+    let asked = dr_strange_core::touched::Asked {
+        history: &history,
+        code: code.as_ref(),
+        name: &name,
+        limit: req.limit,
+    };
+    let found = dr_strange_core::touched::candidates(&asked)?;
+    let marks = match (req.exact.unwrap_or(false), found.symbol(), code.as_ref()) {
+        (true, Some(symbol), Some(code)) => exact_marks(
+            ExactPass {
+                history: &history,
+                code,
+                access,
+                parsers,
+                symbol,
+            },
+            &found,
+        )?,
+        // A path has no declaration to read, and without a code plane there
+        // is no symbol either — say so rather than ignore the request.
+        (true, _, _) => dr_strange_core::touched::Marks {
+            note: Some(
+                "`exact` reads a symbol's declaration at each commit, and this name is a \
+                 path — a path's own diff is `recall <path> at <sha> vs <sha>~1`"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        (false, _, _) => Default::default(),
+    };
+    Ok(Value::String(found.stated(&asked, &marks)?))
+}
+
+/// What one `exact` pass reads from.
+struct ExactPass<'a> {
+    history: &'a dr_strange_core::PlaneHandle<'a>,
+    code: &'a dr_strange_core::PlaneHandle<'a>,
+    access: TreeAccess<'a>,
+    parsers: &'a dyn recall::Parsers,
+    symbol: &'a str,
+}
+
+/// Read the symbol's declaration at each listed commit and at its first
+/// parent, as a mark per commit.
+fn exact_marks(
+    pass: ExactPass<'_>,
+    found: &dr_strange_core::touched::Touched,
+) -> AnyResult<dr_strange_core::touched::Marks> {
+    let Some(root) = pass
+        .access
+        .plane_root(recorded_root(pass.code).as_deref())?
+    else {
+        return Ok(dr_strange_core::touched::Marks {
+            note: Some(
+                "`exact` needs the git checkout the plane was parsed from, and this process \
+                 has none — the listing above is file-level"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+    };
+    let sym = recall::resolve_symbol(pass.code, "", pass.symbol, "HEAD")?;
+    let reader = recall::Declarations::new(&root, pass.parsers, sym);
+    let rows = found.rows();
+    let mut marks = dr_strange_core::touched::Marks::default();
+    let mut unsettled = 0;
+    for row in rows.iter().take(EXACT_COMMITS) {
+        let parent = first_parent(pass.history, &row.sha);
+        let verdict = reader.moved(&row.sha, parent.as_deref());
+        if !verdict.settled() {
+            unsettled += 1;
+        }
+        marks.per_commit.insert(row.short.clone(), verdict.mark());
+    }
+    let read = rows.len().min(EXACT_COMMITS);
+    let mut note = format!("`exact` read {read} commit(s)");
+    if rows.len() > EXACT_COMMITS {
+        note.push_str(&format!(
+            ", leaving {} older unread — narrow with `limit`",
+            rows.len() - EXACT_COMMITS
+        ));
+    }
+    if unsettled > 0 {
+        note.push_str(&format!(
+            "; {unsettled} could not be settled and carry `?` with the reason, which is not \
+             the same as unchanged"
+        ));
+    }
+    marks.note = Some(note);
+    Ok(marks)
+}
+
+/// The first parent of a commit, or `None` for a root.
+///
+/// First parent, not any parent: that is the line the commit was made on, so
+/// a merge is compared against what it was merged into rather than against
+/// the branch it absorbed.
+fn first_parent(history: &dr_strange_core::PlaneHandle<'_>, sha: &str) -> Option<String> {
+    match dr_strange_core::rev::resolve_rev(history, None, &format!("{sha}~1")) {
+        Ok(dr_strange_core::rev::RevAnswer::One(commit)) => Some(commit.sha.as_str().to_string()),
+        _ => None,
+    }
 }
 
 /// `deployed`: the ops plane joined to the history plane beside it.
@@ -3682,7 +3803,18 @@ impl DrStrange {
         &self,
         Parameters(req): Parameters<HistoryReq>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_in("history", req, history_logic).await
+        let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
+        let granted = self.mount_root.clone();
+        let plane_roots = self.local_files;
+        self.run_in("history", req, move |db, req| {
+            let access = TreeAccess {
+                attached: root.as_deref(),
+                granted: granted.as_deref(),
+                plane_roots,
+            };
+            history_logic(db, access, &*parsers, req)
+        })
+        .await
     }
 
     #[tool(description = "What commit a running thing was built from, and what \
@@ -6180,8 +6312,18 @@ mod history_tests {
         db
     }
 
+    /// No tree and no handlers: these cases ask for the listing, which must
+    /// answer without either. `exact` has its own test over a real checkout.
     fn answer(db: &Database, req: Value) -> String {
-        match history_logic(db, from_value(req).unwrap()).unwrap() {
+        let parsers = dr_strange_llm::Plugins::from_handlers(Vec::new());
+        match history_logic(
+            db,
+            TreeAccess::default(),
+            &parsers,
+            from_value(req).unwrap(),
+        )
+        .unwrap()
+        {
             Value::String(out) => out,
             other => panic!("{other:?}"),
         }
@@ -6221,9 +6363,52 @@ mod history_tests {
     #[test]
     fn a_plane_that_does_not_exist_is_an_error_rather_than_an_empty_answer() {
         let db = Database::in_memory().unwrap();
-        let err = history_logic(&db, from_value(jval!({"plane": "nope"})).unwrap())
-            .unwrap_err()
-            .to_string();
+        let parsers = dr_strange_llm::Plugins::from_handlers(Vec::new());
+        let err = history_logic(
+            &db,
+            TreeAccess::default(),
+            &parsers,
+            from_value(jval!({"plane": "nope"})).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    /// `exact` is about a declaration, so a path has nothing for it to read.
+    /// Saying so beats quietly ignoring the flag.
+    #[test]
+    fn exact_on_a_path_says_it_has_no_declaration_to_read() {
+        let db = repo();
+        let out = answer(
+            &db,
+            jval!({"plane": "myrepo", "name": "src/a.rs", "exact": true}),
+        );
+        assert!(
+            out.contains(
+                "`exact` reads a symbol's declaration at each commit, and this name \
+                          is a path"
+            ),
+            "{out}"
+        );
+    }
+
+    /// With no checkout the listing still answers and says the pass could
+    /// not run — the failure to avoid is a file-level answer that looks like
+    /// a declaration-level one.
+    #[test]
+    fn exact_without_a_checkout_says_so_and_still_lists() {
+        let db = repo();
+        let out = answer(
+            &db,
+            jval!({"plane": "myrepo", "name": "myrepo::alpha", "exact": true}),
+        );
+        assert!(out.contains("1 of 2 commit(s) changed it"), "{out}");
+        assert!(out.contains("`exact` needs the git checkout"), "{out}");
+        // And the file-level caveat is still owed, since nothing settled it.
+        assert!(
+            out.contains("a commit is listed for changing the *file*"),
+            "{out}"
+        );
     }
 }
