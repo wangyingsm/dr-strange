@@ -28,6 +28,8 @@ pub mod rev;
 pub mod storage;
 pub mod text;
 pub mod time;
+#[cfg(feature = "json")]
+pub mod touched;
 pub mod types;
 
 /// Time-travel address (ROADMAP §4) — only the native LSM backend keeps the
