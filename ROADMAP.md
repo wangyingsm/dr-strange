@@ -1026,6 +1026,18 @@ It needs a git checkout and the parsers, so it belongs beside `recall` in the
 MCP layer rather than in core, and it needs a cap: a symbol in a much-edited
 file would otherwise parse one file at two revisions a few dozen times.
 
+*Open, and the honest reading of that 383ms.* It is per **fold**, and it
+grows with the length of the history, because the reader diffs every commit
+it walks whether or not the plane already holds that commit's paths. A
+commit is immutable, so this is pure repetition — the second fold of a
+repository recomputes exactly what the first one wrote. The fix is not a
+faster diff but a plugin that knows where to stop: the host would have to
+tell a reader what the plane already has, which the preprocessor contract
+has no way to say (input is pull-not-push, and a plugin sees files, never
+the graph). Until then the cost is bounded by the two-second tick rather
+than by anything principled, and a repository an order of magnitude older
+than this one would feel it.
+
 ### The catalog is data, and it lives with the plugins  *(shipped)*
 
 The official list started as a `const` here: nine entries, a release URL and a
