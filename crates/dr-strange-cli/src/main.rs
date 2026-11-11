@@ -1100,10 +1100,10 @@ struct HistoryArgs {
     /// tried when the one named holds no commits).
     #[arg(long, default_value = "startup")]
     plane: String,
-    /// With a symbol: read its declaration at each listed commit and at that
-    /// commit's first parent, so each line says whether the commit moved the
-    /// declaration or only the file around it. Two parses of one file per
-    /// commit, so it is asked for rather than assumed.
+    /// Read declarations at each listed commit and at its first parent: with
+    /// a symbol, whether the commit moved it or only the file around it; with
+    /// a path, which of the file's declarations moved. Two parses of one file
+    /// per commit, so it is asked for rather than assumed.
     #[arg(long)]
     exact: bool,
     /// How many commits to list, newest first.

@@ -1515,11 +1515,11 @@ pub struct HistoryReq {
     /// first, instead of the repository at a glance.
     #[serde(default)]
     pub name: Option<String>,
-    /// With a `name` that is a symbol: read its declaration at each listed
-    /// commit and at that commit's first parent, so each line says whether
-    /// the commit moved the declaration or only the file around it. Costs
-    /// two parses of one file per commit and needs the checkout, so it is
-    /// asked for rather than assumed.
+    /// Read declarations at each listed commit and at that commit's first
+    /// parent: with a symbol, whether the commit moved it or only the file
+    /// around it; with a path, which of the file's declarations moved.
+    /// Costs two parses of one file per commit and needs the checkout the
+    /// plane was parsed from, so it is asked for rather than assumed.
     #[serde(default)]
     pub exact: Option<bool>,
     /// Commits to list, newest first (default 15).
@@ -2175,28 +2175,28 @@ pub fn history_logic(
         limit: req.limit,
     };
     let found = dr_strange_core::touched::candidates(&asked)?;
-    let marks = match (req.exact.unwrap_or(false), found.symbol(), code.as_ref()) {
-        (true, Some(symbol), Some(code)) => exact_marks(
+    let marks = match (req.exact.unwrap_or(false), code.as_ref()) {
+        (true, Some(code)) => exact_marks(
             ExactPass {
                 history: &history,
                 code,
                 access,
                 parsers,
-                symbol,
+                symbol: found.symbol(),
             },
             &found,
         )?,
-        // A path has no declaration to read, and without a code plane there
-        // is no symbol either — say so rather than ignore the request.
-        (true, _, _) => dr_strange_core::touched::Marks {
+        // The code plane is where the tree a declaration is read from is
+        // recorded, so without it there is nothing to read at any revision.
+        (true, None) => dr_strange_core::touched::Marks {
             note: Some(
-                "`exact` reads a symbol's declaration at each commit, and this name is a \
-                 path — a path's own diff is `recall <path> at <sha> vs <sha>~1`"
+                "`exact` reads declarations out of the tree the code plane beside this \
+                 history records, and there is no such plane here"
                     .to_string(),
             ),
             ..Default::default()
         },
-        (false, _, _) => Default::default(),
+        (false, _) => Default::default(),
     };
     Ok(Value::String(found.stated(&asked, &marks)?))
 }
@@ -2207,7 +2207,33 @@ struct ExactPass<'a> {
     code: &'a dr_strange_core::PlaneHandle<'a>,
     access: TreeAccess<'a>,
     parsers: &'a dyn recall::Parsers,
-    symbol: &'a str,
+    /// The symbol asked about, or `None` when the name was a path and every
+    /// declaration in the file is in scope.
+    symbol: Option<&'a str>,
+}
+
+/// Each commit's verdict, from a reader that can compare one against its
+/// parent.
+///
+/// Taken as a closure so the cap, the tally and the note are written once:
+/// a file pass and a symbol pass differ in what they read, not in how much
+/// of the listing they get through or how they report stopping.
+fn walk_commits(
+    history: &dr_strange_core::PlaneHandle<'_>,
+    rows: &[dr_strange_core::touched::Row],
+    verdict: impl Fn(&str, Option<&str>) -> (String, bool),
+) -> (std::collections::BTreeMap<String, String>, usize) {
+    let mut per_commit = std::collections::BTreeMap::new();
+    let mut unsettled = 0;
+    for row in rows.iter().take(EXACT_COMMITS) {
+        let parent = first_parent(history, &row.sha);
+        let (mark, settled) = verdict(&row.sha, parent.as_deref());
+        if !settled {
+            unsettled += 1;
+        }
+        per_commit.insert(row.short.clone(), mark);
+    }
+    (per_commit, unsettled)
 }
 
 /// Read the symbol's declaration at each listed commit and at its first
@@ -2229,19 +2255,31 @@ fn exact_marks(
             ..Default::default()
         });
     };
-    let sym = recall::resolve_symbol(pass.code, "", pass.symbol, "HEAD")?;
-    let reader = recall::Declarations::new(&root, pass.parsers, sym);
     let rows = found.rows();
-    let mut marks = dr_strange_core::touched::Marks::default();
-    let mut unsettled = 0;
-    for row in rows.iter().take(EXACT_COMMITS) {
-        let parent = first_parent(pass.history, &row.sha);
-        let verdict = reader.moved(&row.sha, parent.as_deref());
-        if !verdict.settled() {
-            unsettled += 1;
+    let (per_commit, unsettled) = match pass.symbol {
+        Some(symbol) => {
+            let sym = recall::resolve_symbol(pass.code, "", symbol, "HEAD")?;
+            let reader = recall::Declarations::new(&root, pass.parsers, sym);
+            walk_commits(pass.history, &rows, |newer, older| {
+                let verdict = reader.moved(newer, older);
+                (verdict.mark(), verdict.settled())
+            })
         }
-        marks.per_commit.insert(row.short.clone(), verdict.mark());
-    }
+        // A path: one parse of the file yields every declaration in it, so
+        // this costs what the single-symbol pass costs and says more.
+        None => {
+            let reader =
+                recall::FileDeclarations::new(&root, pass.parsers, found.path().to_string());
+            walk_commits(pass.history, &rows, |newer, older| {
+                let verdict = reader.moved(newer, older);
+                (verdict.mark(), verdict.settled())
+            })
+        }
+    };
+    let mut marks = dr_strange_core::touched::Marks {
+        per_commit,
+        ..Default::default()
+    };
     let read = rows.len().min(EXACT_COMMITS);
     let mut note = format!("`exact` read {read} commit(s)");
     if rows.len() > EXACT_COMMITS {
@@ -6375,22 +6413,18 @@ mod history_tests {
         assert!(err.contains("nope"), "{err}");
     }
 
-    /// `exact` is about a declaration, so a path has nothing for it to read.
-    /// Saying so beats quietly ignoring the flag.
+    /// A path is in scope for `exact` — one parse of the file names every
+    /// declaration that moved — so it is not turned away for being a path.
+    /// What stops it here is the missing checkout, and that is what it says.
     #[test]
-    fn exact_on_a_path_says_it_has_no_declaration_to_read() {
+    fn exact_on_a_path_is_not_refused_for_being_a_path() {
         let db = repo();
         let out = answer(
             &db,
             jval!({"plane": "myrepo", "name": "src/a.rs", "exact": true}),
         );
-        assert!(
-            out.contains(
-                "`exact` reads a symbol's declaration at each commit, and this name \
-                          is a path"
-            ),
-            "{out}"
-        );
+        assert!(out.contains("`exact` needs the git checkout"), "{out}");
+        assert!(!out.contains("is a path"), "{out}");
     }
 
     /// With no checkout the listing still answers and says the pass could

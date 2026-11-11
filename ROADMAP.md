@@ -1048,9 +1048,25 @@ section already takes care to be honest. Caching parses by revision instead
 is always safe and measured at ~1.5% here, because a file's commits are
 usually not parent and child.
 
-*Open.* Nothing yet reads the marks in bulk: "which commits changed any of
-these twenty symbols" is twenty passes, where one walk of each tree could
-answer them together.
+*The bulk reading is the path form, and it now works.* `history <path>
+--exact` marks each commit with the declarations that moved in that file —
+`← call_names` against a ten-path commit, where the file-level listing could
+only say the file was touched. One parse of a file yields every declaration
+in it, so the whole file costs what one symbol in it cost: the twenty-symbol
+framing this item first had was the wrong instance of the question, because
+nobody asks it that way and a file is the unit a commit changes.
+
+Three readings it keeps apart rather than collapsing into "nothing moved":
+a file absent at one side means everything on the other arrived or left with
+it; a file the parsers place no declaration in says that; and a file that
+could not be read says which. An empty parse and an unchanged file look
+identical otherwise, and only one of them is an answer.
+
+*Open.* Several files at once — "what moved anywhere under this directory,
+by commit" — is still one pass per file. The tree walk is already shared per
+revision, so the saving is real but the output shape is the open question: a
+commit that moved thirty declarations across nine files does not fit the one
+line per commit this listing is built on.
 
 *Open, and the honest reading of that 383ms.* It is per **fold**, and it
 grows with the length of the history, because the reader diffs every commit

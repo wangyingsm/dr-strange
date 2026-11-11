@@ -80,8 +80,25 @@ these calls were inferred* had to read every edge through `context` instead.
   — the listing's own default — and the answer says how many it read and how
   many it left. A comparison that could not be made carries `?` with the
   reason rather than counting as unchanged, and asking for `exact` where it
-  cannot run (a path, no code plane, no checkout) says which rather than
-  silently answering at the file level.
+  cannot run (no code plane, no checkout) says which rather than silently
+  answering at the file level.
+
+- **`--exact` on a path names the declarations that moved.** Given a file
+  rather than a symbol, each commit's line lists what changed in it —
+  `← call_names` beside a ten-path commit the file-level listing could only
+  call "touched". One parse of a file yields every declaration in it, so a
+  whole file costs what one symbol in it costs.
+
+  A file absent at one side means everything on the other arrived or left
+  with it; a file the parsers place no declaration in says so; a file that
+  could not be read says which. An empty parse is otherwise indistinguishable
+  from an unchanged one, and only one of them is an answer.
+
+- A name that matched only unresolved references — every `?::…/object.rs::<method>`
+  stub in a plane, for `history plugins/.../object.rs` — was reported as an
+  ambiguous symbol. An unresolved reference is one end of a call the parser
+  could not bind, so it declares nothing and cannot say which file declares a
+  name; candidates that are all stubs are now read as the path the name is.
 
 ### Fixed
 

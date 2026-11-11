@@ -505,10 +505,19 @@ fn notes(target: &Target, found: &Found, marks: &Marks) -> String {
              <sha>~1` says whether that commit moved the declaration itself, and `exact` \
              does it for every commit above\n"
         )),
-        (None, _) => out.push_str(
-            "note: git records a tree, not a rename, so a path the file was moved from \
-             carries its earlier commits under that other name\n",
-        ),
+        (None, settled) => {
+            if settled {
+                out.push_str(
+                    "note: each commit was read at its own revision and at its first parent, \
+                     so the marks name the declarations that moved — a commit with none \
+                     changed the file around them\n",
+                );
+            }
+            out.push_str(
+                "note: git records a tree, not a rename, so a path the file was moved from \
+                 carries its earlier commits under that other name\n",
+            );
+        }
     }
     if let Some(note) = &marks.note {
         out.push_str(&format!("note: {note}\n"));

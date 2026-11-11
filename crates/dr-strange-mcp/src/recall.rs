@@ -702,6 +702,231 @@ impl Moved {
     }
 }
 
+/// What one commit did to the declarations in one file.
+///
+/// The file-wide answer to [`Moved`]'s single-symbol one. A file is the unit
+/// a commit actually changes, so this is the question `exact` is usually
+/// being asked: not "did this one function move" but "which of them did".
+pub struct Moves {
+    /// Keys declared at both revisions, with different lines.
+    changed: Vec<String>,
+    /// Declared at the commit and not at its parent.
+    added: Vec<String>,
+    /// Declared at the parent and not at the commit.
+    removed: Vec<String>,
+    /// Set when the comparison could not be made, and why.
+    unsettled: Option<String>,
+}
+
+/// Declarations named on one line before the rest are counted instead.
+const NAMED: usize = 3;
+
+impl Moves {
+    /// The mark this puts on the commit's line.
+    pub fn mark(&self) -> String {
+        if let Some(why) = &self.unsettled {
+            return format!("? {why}");
+        }
+        let groups = [
+            ("←", &self.changed),
+            ("+", &self.added),
+            ("−", &self.removed),
+        ];
+        if groups.iter().all(|(_, keys)| keys.is_empty()) {
+            return "— file only".to_string();
+        }
+        // Leaves where they are distinct: every key here is declared in the
+        // one file the listing is headed by, so the module path they share
+        // is noise. Two that end alike would not be, and then the whole key
+        // is the only honest name.
+        let shown: Vec<&String> = groups
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().take(NAMED))
+            .collect();
+        let leaves: Vec<&str> = shown.iter().map(|key| leaf(key)).collect();
+        let distinct = leaves
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let name = |key: &str| match distinct == leaves.len() {
+            true => leaf(key).to_string(),
+            false => key.to_string(),
+        };
+        groups
+            .iter()
+            .filter(|(_, keys)| !keys.is_empty())
+            .map(|(sign, keys)| {
+                let named: Vec<String> = keys.iter().take(NAMED).map(|k| name(k)).collect();
+                let rest = match keys.len() > NAMED {
+                    true => format!(" and {} more", keys.len() - NAMED),
+                    false => String::new(),
+                };
+                format!("{sign} {}{rest}", named.join(", "))
+            })
+            .collect::<Vec<String>>()
+            .join("  ")
+    }
+
+    /// Whether the comparison reached an answer at all.
+    pub fn settled(&self) -> bool {
+        self.unsettled.is_none()
+    }
+
+    fn unsettled(why: String) -> Moves {
+        Moves {
+            changed: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            unsettled: Some(why),
+        }
+    }
+}
+
+/// A key's last segment, under either language's separator.
+fn leaf(key: &str) -> &str {
+    let cut = key
+        .rfind("::")
+        .map(|i| i + 2)
+        .or_else(|| key.rfind('.').map(|i| i + 1));
+    match cut {
+        Some(i) if i < key.len() => &key[i..],
+        _ => key,
+    }
+}
+
+/// Reads every declaration in one file at a succession of revisions.
+///
+/// One parse of the file yields all of them, so asking about a whole file
+/// costs what asking about one symbol in it costs — which is why `exact` on
+/// a path is an answer rather than a refusal.
+///
+/// No parse cache, unlike [`Declarations`]: that one was measured at ~1.5%
+/// because a file's commits are usually not parent and child, and here the
+/// cached value is every declaration in the file rather than one, so the
+/// copy would cost more than the parse it saved.
+pub struct FileDeclarations<'a> {
+    root: &'a Path,
+    parsers: &'a dyn Parsers,
+    path: String,
+}
+
+impl<'a> FileDeclarations<'a> {
+    /// A reader of one file over one checkout.
+    pub fn new(root: &'a Path, parsers: &'a dyn Parsers, path: String) -> FileDeclarations<'a> {
+        FileDeclarations {
+            root,
+            parsers,
+            path,
+        }
+    }
+
+    /// Which declarations `newer` moved, against `older`.
+    ///
+    /// `older` is `None` for a root commit, where nothing existed before, so
+    /// every declaration the file holds was added by it.
+    pub fn moved(&self, newer: &str, older: Option<&str>) -> Moves {
+        let new = self.at(newer);
+        // A root commit has no parent, which is the same thing to this
+        // comparison as a revision where the file is not there yet.
+        let old = match older {
+            Some(older) => self.at(older),
+            None => Ok(AtRev::Absent),
+        };
+        let (new, old) = match (new, old) {
+            (Ok(AtRev::Parsed(new)), Ok(AtRev::Parsed(old))) => (new, old),
+            // The file arrived or left here, so every declaration on the
+            // side that has it moved — which is the most interesting row in
+            // the listing, not a comparison that failed.
+            (Ok(AtRev::Parsed(new)), Ok(AtRev::Absent)) => (new, BTreeMap::new()),
+            (Ok(AtRev::Absent), Ok(AtRev::Parsed(old))) => (BTreeMap::new(), old),
+            (Ok(AtRev::Absent), Ok(AtRev::Absent)) => {
+                return Moves::unsettled(format!(
+                    "{} is in the tree at neither revision",
+                    self.path
+                ));
+            }
+            (Ok(AtRev::Opaque(why)), _) | (_, Ok(AtRev::Opaque(why))) => {
+                return Moves::unsettled(why);
+            }
+            (Err(e), _) | (_, Err(e)) => return Moves::unsettled(first_line(&e)),
+        };
+        if new.is_empty() && old.is_empty() {
+            return Moves::unsettled(format!(
+                "the installed parsers place no declaration in {}",
+                self.path
+            ));
+        }
+        let mut moves = Moves {
+            changed: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            unsettled: None,
+        };
+        for (key, body) in &new {
+            match old.get(key) {
+                Some(before) if before == body => {}
+                Some(_) => moves.changed.push(key.clone()),
+                None => moves.added.push(key.clone()),
+            }
+        }
+        for key in old.keys() {
+            if !new.contains_key(key) {
+                moves.removed.push(key.clone());
+            }
+        }
+        moves
+    }
+
+    /// Every declaration in the file at one revision, by key.
+    fn at(&self, rev: &str) -> AnyResult<AtRev> {
+        let sha = Sha::parse(rev).ok_or_else(|| anyhow!("`{rev}` is no full object name"))?;
+        let tree = GitTree::open(self.root, sha)?;
+        // Read before parse, because a read that fails at a revision is the
+        // file not being there — which is an answer — while a parse that
+        // fails is one that cannot be given.
+        let text = match text_at(&tree, &self.path) {
+            Ok(Text::Shown(text)) => text,
+            Ok(Text::Withheld(why)) => return Ok(AtRev::Opaque(why.trim_end().to_string())),
+            Err(_) => return Ok(AtRev::Absent),
+        };
+        let Ok(parsed) = self.parsers.parse(&tree, &self.path) else {
+            return Ok(AtRev::Opaque(format!(
+                "no installed parser claims {} at {}",
+                self.path,
+                tree.sha().short()
+            )));
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = BTreeMap::new();
+        for node in &parsed.nodes {
+            let Some(first) = int_prop(&node.props, "line") else {
+                continue;
+            };
+            let last = int_prop(&node.props, "end_line")
+                .filter(|end| *end >= first)
+                .unwrap_or(first);
+            let body: Vec<String> = lines
+                .iter()
+                .skip(first - 1)
+                .take(last + 1 - first)
+                .map(|line| (*line).to_string())
+                .collect();
+            out.insert(node.key.clone(), body);
+        }
+        Ok(AtRev::Parsed(out))
+    }
+}
+
+/// What reading one file at one revision found.
+enum AtRev {
+    /// Its declarations, by key.
+    Parsed(BTreeMap<String, Vec<String>>),
+    /// The file is not in the tree there.
+    Absent,
+    /// There, but nothing could be read out of it, and why.
+    Opaque(String),
+}
+
 /// Reads one symbol's declaration at a succession of revisions.
 ///
 /// Holds the checkout and the parsers so that a per-commit loop names them
@@ -1302,7 +1527,7 @@ mod tests {
     /// `history <name> --exact` over this same checkout: the verb that reads
     /// the declaration at each commit uses the machinery here, so it is
     /// tested against the fixture that already has a real git repository.
-    fn history_exact(db: &Database, name: &str) -> AnyResult<String> {
+    fn history_req(db: &Database, req: serde_json::Value) -> AnyResult<String> {
         let parsers = Plugins::from_handlers(vec![Box::new(LineLang)]);
         let out = crate::history_logic(
             db,
@@ -1311,12 +1536,16 @@ mod tests {
                 ..Default::default()
             },
             &parsers,
-            from_value(serde_json::json!({
-                "plane": "repo", "name": name, "exact": true
-            }))
-            .unwrap(),
+            from_value(req).unwrap(),
         )?;
         Ok(out.as_str().unwrap().to_string())
+    }
+
+    fn history_exact(db: &Database, name: &str) -> AnyResult<String> {
+        history_req(
+            db,
+            serde_json::json!({"plane": "repo", "name": name, "exact": true}),
+        )
     }
 
     /// The distinction the whole verb exists for: both commits changed
@@ -1369,6 +1598,60 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// `exact` on a path: one parse of the file per revision names every
+    /// declaration that moved, which `src/sym.rs` exercises all three ways
+    /// at once — `beta` rewritten, `gamma` new, `alpha` gone.
+    #[test]
+    fn exact_on_a_path_names_every_declaration_the_commit_moved() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "src/sym.rs").unwrap();
+        let line = |sha: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with(&sha[..7]))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line(&f.two).contains("← beta  + gamma  − alpha"), "{out}");
+        // `one` created the file, so everything it holds arrived with it.
+        assert!(line(&f.one).contains("+ alpha, beta"), "{out}");
+        assert!(
+            out.contains("the marks name the declarations that moved"),
+            "{out}"
+        );
+    }
+
+    /// A path the parsers place nothing in has no declarations to compare,
+    /// and that is said rather than rendered as "nothing moved" — which is
+    /// what an empty parse would otherwise be indistinguishable from.
+    #[test]
+    fn exact_on_a_path_with_no_declarations_says_so_instead_of_nothing_moved() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "docs/a.md").unwrap();
+        assert!(
+            out.contains("? the installed parsers place no declaration in docs/a.md"),
+            "{out}"
+        );
+        assert!(!out.contains("— file only"), "{out}");
+    }
+
+    /// `exact` reads exactly the commits the listing prints: annotating one
+    /// that is cut off is work no reader sees, and a note that counted it
+    /// would overstate what was settled.
+    #[test]
+    fn exact_reads_only_the_commits_the_limit_shows() {
+        let f = fixture(true);
+        let out = history_req(
+            &f.db,
+            serde_json::json!({"plane": "repo", "name": "src/sym.rs", "exact": true, "limit": 1}),
+        )
+        .unwrap();
+        assert!(out.contains("`exact` read 1 commit(s)"), "{out}");
+        assert!(!out.contains("leaving"), "{out}");
+        // The newest is the one kept, and the older is only counted.
+        assert!(out.contains(&f.two[..7]), "{out}");
+        assert!(!out.contains(&f.one[..7]), "{out}");
     }
 
     /// A file renamed between the two commits: `moved` is in `src/new.rs`
