@@ -156,6 +156,11 @@ pub struct Touched {
     /// Set when the name could not be joined on at all; rendering says so
     /// and the caller has nothing to annotate.
     refused: Option<String>,
+    /// How many commits the listing shows, resolved once here so that
+    /// [`Touched::rows`] and the rendering cannot disagree about it — a
+    /// caller that annotated more commits than are printed would pay for
+    /// work no reader sees and then report having done it.
+    limit: usize,
 }
 
 impl Touched {
@@ -175,6 +180,7 @@ impl Touched {
     pub fn rows(&self) -> Vec<Row> {
         self.shown()
             .into_iter()
+            .take(self.limit)
             .map(|commit| Row {
                 sha: prop_str(&commit.properties, "sha")
                     .unwrap_or_else(|| prop_str(&commit.properties, "short").unwrap_or_default())
@@ -193,7 +199,7 @@ impl Touched {
             return Ok(refused.clone());
         }
         let mut out = head(&self.target, &self.found);
-        out.push_str(&rows(self.shown(), asked.limit, &marks.per_commit));
+        out.push_str(&rows(self.shown(), self.limit, &marks.per_commit));
         out.push_str(&notes(&self.target, &self.found, marks));
         out.push_str(&planes_read(asked)?);
         Ok(out)
@@ -232,6 +238,7 @@ pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
         },
         found: Found::default(),
         refused: Some(why),
+        limit: 0,
     };
     let target = match resolve(asked)? {
         Named::Target(target) => target,
@@ -248,6 +255,7 @@ pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
         target,
         found,
         refused: None,
+        limit: asked.limit.unwrap_or(COMMITS_SHOWN).max(1),
     })
 }
 
@@ -388,12 +396,7 @@ fn head(target: &Target, found: &Found) -> String {
 /// A mark from `marks` is appended to its commit's line, keyed by the short
 /// sha — how a caller that read the declaration at each revision says what
 /// it found without owning a second copy of this format.
-fn rows(
-    commits: Vec<&NodeRecord>,
-    limit: Option<usize>,
-    marks: &BTreeMap<String, String>,
-) -> String {
-    let limit = limit.unwrap_or(COMMITS_SHOWN).max(1);
+fn rows(commits: Vec<&NodeRecord>, limit: usize, marks: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for commit in commits.iter().take(limit) {
         let p = &commit.properties;
