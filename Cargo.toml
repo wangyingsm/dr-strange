@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.28.0"
+version = "2.29.0"
 edition = "2024"
 # 1.95: wasmtime 48 (the plugin sandbox, ROADMAP §11) declares it. Said out
 # loud rather than arriving silently — CI tracks stable, which is well past it.
@@ -64,19 +64,19 @@ disallowed_methods = "warn"
 #
 # default-features off so each member picks the storage backend (redb/native);
 # members that just need core's types (e.g. the parser) get a backend-free core.
-dr-strange-core = { path = "crates/dr-strange-core", version = "2.28.0", default-features = false }
-dr-strange-log = { path = "crates/dr-strange-log", version = "2.28.0" }
-dr-strange-llm = { path = "crates/dr-strange-llm", version = "2.28.0" }
+dr-strange-core = { path = "crates/dr-strange-core", version = "2.29.0", default-features = false }
+dr-strange-log = { path = "crates/dr-strange-log", version = "2.29.0" }
+dr-strange-llm = { path = "crates/dr-strange-llm", version = "2.29.0" }
 # `default-features = false` for the reason core's line gives: both consumers
 # forward the backend choice rather than letting this crate's default decide.
-dr-strange-mcp = { path = "crates/dr-strange-mcp", version = "2.28.0", default-features = false }
-dr-strange-web = { path = "crates/dr-strange-web", version = "2.28.0" }
+dr-strange-mcp = { path = "crates/dr-strange-mcp", version = "2.29.0", default-features = false }
+dr-strange-web = { path = "crates/dr-strange-web", version = "2.29.0" }
 # Outbound proxy policy, shared by every crate that makes an outbound request:
 # the LLM client, the web fetcher and the MCP relay. Its own crate because the
 # relay reaching into `dr-strange-llm` for it said something untrue about what
 # the policy is for.
-dr-strange-net = { path = "crates/dr-strange-net", version = "2.28.0" }
-dr-strange-parser = { path = "crates/dr-strange-parser", version = "2.28.0" }
+dr-strange-net = { path = "crates/dr-strange-net", version = "2.29.0" }
+dr-strange-parser = { path = "crates/dr-strange-parser", version = "2.29.0" }
 # The workspace-standard hash map/set (fast keyed hashing, DoS-resistant via
 # per-process random seed): use ahash::{AHashMap, AHashSet} instead of std's
 # SipHash-backed collections everywhere.

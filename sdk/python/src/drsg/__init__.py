@@ -15,4 +15,4 @@ from ._client import DrsgAuthError, DrsgError, DrsgProtocolError
 from ._generated import Drsg
 
 __all__ = ["Drsg", "DrsgAuthError", "DrsgError", "DrsgProtocolError"]
-__version__ = "2.28.0"
+__version__ = "2.29.0"

@@ -3,7 +3,7 @@
   "name": "io.github.wangyingsm/dr-strange",
   "title": "Dr Strange",
   "description": "Code graph for coding agents: who calls this, what a change reaches, in one round trip.",
-  "version": "2.28.0",
+  "version": "2.29.0",
   "websiteUrl": "https://wangyingsm.github.io/dr-strange/en/book/introduction.html",
   "repository": {
     "url": "https://github.com/wangyingsm/dr-strange",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@yingge/drsg",
-      "version": "2.28.0",
+      "version": "2.29.0",
       "runtimeHint": "npx",
       "packageArguments": [
         {
