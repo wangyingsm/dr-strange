@@ -139,6 +139,10 @@ pub struct Row {
     pub sha: String,
     /// The abbreviation the listing prints, and the key a mark is given under.
     pub short: String,
+    /// The paths this commit changed that the target holds — the one path
+    /// for a file, every path beneath it for a directory, in the order the
+    /// commit lists them.
+    pub paths: Vec<String>,
 }
 
 /// The join, before it is rendered.
@@ -174,6 +178,12 @@ impl Touched {
         self.target.symbol.as_deref()
     }
 
+    /// Whether the name was read as a directory, so each row names several
+    /// paths rather than one.
+    pub fn dir(&self) -> bool {
+        self.found.dir
+    }
+
     /// The matching commits, newest first and already cut to the limit —
     /// exactly the ones the listing will print, so a caller does not pay to
     /// annotate a commit no reader will see.
@@ -188,6 +198,7 @@ impl Touched {
                 short: prop_str(&commit.properties, "short")
                     .unwrap_or_default()
                     .to_string(),
+                paths: matched(commit, &self.target.path, self.found.dir),
             })
             .collect()
     }
@@ -230,6 +241,7 @@ pub fn touched(asked: &Asked<'_>) -> Result<String> {
 
 /// The same join, left unrendered so each commit can be annotated first.
 pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
+    let limit = asked.limit.unwrap_or(COMMITS_SHOWN).max(1);
     let refuse = |why: String| Touched {
         target: Target {
             path: String::new(),
@@ -240,9 +252,26 @@ pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
         refused: Some(why),
         limit: 0,
     };
+    let directory = |found: Found| Touched {
+        target: Target {
+            path: asked.name.to_string(),
+            symbol: None,
+            literal: false,
+        },
+        found,
+        refused: None,
+        limit,
+    };
     let target = match resolve(asked)? {
         Named::Target(target) => target,
-        Named::Ambiguous(candidates) => return Ok(refuse(candidates)),
+        // Several hits on a name that is a directory are several files under
+        // it, which is not an ambiguity about the name — it is the answer.
+        Named::Ambiguous(candidates) => {
+            return Ok(match as_dir(asked)? {
+                Some(found) => directory(found),
+                None => refuse(candidates),
+            });
+        }
         Named::Placeless(key) => {
             return Ok(refuse(format!(
                 "`{key}` records no file, so there is no path to join its history on — \
@@ -250,13 +279,29 @@ pub fn candidates(asked: &Asked<'_>) -> Result<Touched> {
             )));
         }
     };
+    // A fuzzy hit on some other file's path says nothing about this name:
+    // `src` is no abbreviation of `src/b.rs`, it is the directory above it.
+    // A symbol is a different matter — a qualified key is matched by part of
+    // itself because nobody types one in full.
+    if target.symbol.is_none()
+        && target.path != asked.name
+        && let Some(found) = as_dir(asked)?
+    {
+        return Ok(directory(found));
+    }
     let found = scan(asked.history, &target.path)?;
     Ok(Touched {
         target,
         found,
         refused: None,
-        limit: asked.limit.unwrap_or(COMMITS_SHOWN).max(1),
+        limit,
     })
+}
+
+/// The name read as a directory, where the history bears that reading out.
+fn as_dir(asked: &Asked<'_>) -> Result<Option<Found>> {
+    let found = scan(asked.history, asked.name)?;
+    Ok(found.dir.then_some(found))
 }
 
 /// The path to join on, from a symbol, a file-level node, or the name itself.
@@ -337,44 +382,86 @@ struct Found {
     /// never sees them, and an answer longer than git's with no reason given
     /// reads as a wrong answer.
     left_behind: usize,
+    /// Set when the rows were matched by what lies beneath the path rather
+    /// than by the path itself.
+    dir: bool,
+    /// Distinct paths beneath it that changed, when it is a directory.
+    paths: usize,
 }
 
-/// Every commit of the plane, kept when its paths hold this one.
+/// Every commit of the plane, kept when its paths hold this one — or, where
+/// none of them does, when its paths lie beneath it.
 ///
 /// A label scan and a property test rather than a query: `files` is a list,
 /// and a list membership test is not something the index answers, so the
 /// whole of the work is reading the commits that a listing reads anyway.
+///
+/// Both readings are collected in the one pass and only then chosen between,
+/// because a directory is not something this layer can be told: the code
+/// plane holds files and symbols, never the directories above them, and a
+/// directory the tree no longer has could not be probed for either. What a
+/// name is, is therefore measured — a path the commits record itself is a
+/// file, and a path only ever recorded with something beneath it is a
+/// directory. Git has no commit where both are true at once.
 fn scan(history: &PlaneHandle<'_>, path: &str) -> Result<Found> {
     let commits = history.query().scan_label(COMMIT).nodes()?;
+    let under = format!("{path}/");
     let mut found = Found {
-        rows: Vec::new(),
-        matched: 0,
         total: commits.len(),
-        silent: 0,
-        partial: 0,
-        left_behind: 0,
+        ..Default::default()
     };
+    let mut beneath = Vec::new();
+    let mut paths = std::collections::BTreeSet::new();
     for commit in commits {
         if prop_bool(&commit.properties, FILES_PARTIAL) {
             found.partial += 1;
         }
         match commit.properties.get(FILES).map(|d| &d.value) {
-            Some(PropValue::List(paths)) => {
-                if paths
-                    .iter()
-                    .any(|p| p.as_text().is_some_and(|text| text == path))
-                {
-                    if unreachable(&commit) {
-                        found.left_behind += 1;
+            Some(PropValue::List(listed)) => {
+                let mut itself = false;
+                let mut below = false;
+                for text in listed.iter().filter_map(|p| p.as_text()) {
+                    if text == path {
+                        itself = true;
+                    } else if text.starts_with(&under) {
+                        below = true;
+                        paths.insert(text.to_string());
                     }
-                    found.rows.push(commit);
+                }
+                match itself {
+                    true => found.rows.push(commit),
+                    false if below => beneath.push(commit),
+                    false => {}
                 }
             }
             _ => found.silent += 1,
         }
     }
+    if found.rows.is_empty() && !beneath.is_empty() {
+        found.dir = true;
+        found.paths = paths.len();
+        found.rows = beneath;
+    }
+    found.left_behind = found.rows.iter().filter(|c| unreachable(c)).count();
     found.matched = found.rows.len();
     Ok(found)
+}
+
+/// The paths of one commit that the target holds.
+fn matched(commit: &NodeRecord, path: &str, dir: bool) -> Vec<String> {
+    let under = format!("{path}/");
+    match commit.properties.get(FILES).map(|d| &d.value) {
+        Some(PropValue::List(listed)) => listed
+            .iter()
+            .filter_map(|p| p.as_text())
+            .map(|text| text.to_string())
+            .filter(|text| match dir {
+                true => text.starts_with(&under),
+                false => text == path,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether no branch or tag can still reach this commit.
@@ -390,13 +477,22 @@ fn unreachable(commit: &NodeRecord) -> bool {
 
 /// The line that states what was asked and how much of the plane answered.
 fn head(target: &Target, found: &Found) -> String {
-    let what = match &target.symbol {
-        Some(symbol) => format!("{} — the file declaring `{symbol}`", target.path),
-        None => target.path.clone(),
+    let what = match (&target.symbol, found.dir) {
+        (Some(symbol), _) => format!("{} — the file declaring `{symbol}`", target.path),
+        (None, true) => format!(
+            "{} — a directory, {} path(s) of it changed",
+            target.path, found.paths
+        ),
+        (None, false) => target.path.clone(),
     };
     format!(
-        "{what}\n{} of {} commit(s) changed it\n",
-        found.matched, found.total
+        "{what}\n{} of {} commit(s) changed {}\n",
+        found.matched,
+        found.total,
+        match found.dir {
+            true => "one of them",
+            false => "it",
+        }
     )
 }
 
@@ -488,7 +584,13 @@ fn notes(target: &Target, found: &Found, marks: &Marks) -> String {
             found.matched.saturating_sub(found.left_behind)
         ));
     }
-    if target.literal {
+    if found.dir {
+        out.push_str(&format!(
+            "note: no commit records `{}` itself and {} record paths beneath it, so it was \
+             read as a directory\n",
+            target.path, found.matched
+        ));
+    } else if target.literal {
         out.push_str(&format!(
             "note: the code plane knows no `{}`, so it was read as a path; a symbol that \
              matched would have named its own file\n",
@@ -506,17 +608,29 @@ fn notes(target: &Target, found: &Found, marks: &Marks) -> String {
              does it for every commit above\n"
         )),
         (None, settled) => {
-            if settled {
-                out.push_str(
+            match (settled, found.dir) {
+                (true, false) => out.push_str(
                     "note: each commit was read at its own revision and at its first parent, \
                      so the marks name the declarations that moved — a commit with none \
                      changed the file around them\n",
-                );
+                ),
+                (true, true) => out.push_str(
+                    "note: each file was read at the commit and at its first parent, so a \
+                     commit's line counts the declarations that moved and the lines beneath \
+                     it name them, one file each\n",
+                ),
+                (false, _) => {}
             }
-            out.push_str(
-                "note: git records a tree, not a rename, so a path the file was moved from \
-                 carries its earlier commits under that other name\n",
-            );
+            match found.dir {
+                true => out.push_str(
+                    "note: git records a tree, not a rename, so a file moved into this \
+                     directory carries its earlier commits under the path it came from\n",
+                ),
+                false => out.push_str(
+                    "note: git records a tree, not a rename, so a path the file was moved \
+                     from carries its earlier commits under that other name\n",
+                ),
+            }
         }
     }
     if let Some(note) = &marks.note {
@@ -891,5 +1005,51 @@ mod tests {
         .expect("touched");
         assert!(out.contains("c2"), "{out}");
         assert!(out.contains("… and 1 older; raise `limit`"), "{out}");
+    }
+
+    /// A name no commit records itself, with commits recording paths beneath
+    /// it, is a directory — and is said to be one rather than reported as a
+    /// path the code plane happens not to know.
+    #[test]
+    fn a_directory_is_matched_by_what_lies_beneath_it() {
+        let db = planes();
+        let out = asked(&db, "src");
+        assert!(
+            out.contains("src — a directory, 2 path(s) of it changed"),
+            "{out}"
+        );
+        assert!(
+            out.contains("2 of 3 commit(s) changed one of them"),
+            "{out}"
+        );
+        assert!(out.contains("c1") && out.contains("c2"), "{out}");
+        assert!(!out.contains("c3"), "{out}");
+        assert!(
+            out.contains("no commit records `src` itself and 2 record paths beneath it"),
+            "{out}"
+        );
+        // The literal note would say a symbol would have named its own file,
+        // which is the wrong sentence about a directory.
+        assert!(!out.contains("the code plane knows no `src`"), "{out}");
+    }
+
+    /// A row names the paths beneath the target that its commit changed, so
+    /// a caller can read each of them without re-deriving the join.
+    #[test]
+    fn a_directory_row_names_the_paths_beneath_it_that_commit_changed() {
+        let db = planes();
+        let history = db.plane("repo_git").expect("history");
+        let code = db.plane("repo").expect("code");
+        let found = candidates(&Asked {
+            history: &history,
+            code: Some(&code),
+            name: "src",
+            limit: None,
+        })
+        .expect("candidates");
+        assert!(found.dir());
+        let rows = found.rows();
+        assert_eq!(rows[0].paths, vec!["src/a.rs", "src/b.rs"], "newest first");
+        assert_eq!(rows[1].paths, vec!["src/a.rs"]);
     }
 }
