@@ -139,20 +139,24 @@ impl RecallReq {
 
 /// Where `recall` gets the preprocessors that find a symbol in a file as it was.
 pub trait Parsers: Send + Sync {
-    /// Route `file`, read through `host`, through the installed preprocessors.
-    fn parse(&self, host: &dyn Host, file: &str) -> AnyResult<Preprocessed>;
+    /// Route `files`, read through `host`, through the installed preprocessors.
+    ///
+    /// A set rather than one path because the routing underneath buckets by
+    /// plugin and hands each its whole bucket: twenty files of one language
+    /// cost one invocation, where twenty calls cost twenty.
+    fn parse(&self, host: &dyn Host, files: &[String]) -> AnyResult<Preprocessed>;
 }
 
 impl Parsers for Plugins {
-    fn parse(&self, host: &dyn Host, file: &str) -> AnyResult<Preprocessed> {
-        route_paths(host, vec![file.to_string()], None, self)
+    fn parse(&self, host: &dyn Host, files: &[String]) -> AnyResult<Preprocessed> {
+        route_paths(host, files.to_vec(), None, self)
     }
 }
 
 impl Parsers for Mutex<LivePlugins> {
-    fn parse(&self, host: &dyn Host, file: &str) -> AnyResult<Preprocessed> {
+    fn parse(&self, host: &dyn Host, files: &[String]) -> AnyResult<Preprocessed> {
         let mut live = self.lock().unwrap_or_else(PoisonError::into_inner);
-        route_paths(host, vec![file.to_string()], None, live.current()?)
+        route_paths(host, files.to_vec(), None, live.current()?)
     }
 }
 
@@ -419,7 +423,7 @@ fn locate(tree: &GitTree, parsers: &dyn Parsers, sym: &Symbol) -> AnyResult<Loca
     let at = tree.sha().short();
     let key = &sym.key;
     let (file, note) = file_at(tree, &sym.file, &sym.later)?;
-    let parsed = parsers.parse(tree, &file)?;
+    let parsed = parsers.parse(tree, std::slice::from_ref(&file))?;
     let Some(fact) = parsed.nodes.iter().find(|n| n.key == *key) else {
         return Err(not_declared(key, &file, at, &parsed));
     };
@@ -794,111 +798,148 @@ fn leaf(key: &str) -> &str {
     }
 }
 
-/// Reads every declaration in one file at a succession of revisions.
+/// Reads every declaration of a set of files at a succession of revisions.
 ///
-/// One parse of the file yields all of them, so asking about a whole file
+/// One parse of a file yields all of them, so asking about a whole file
 /// costs what asking about one symbol in it costs — which is why `exact` on
-/// a path is an answer rather than a refusal.
+/// a path is an answer rather than a refusal. A set rather than one file for
+/// the same reason one level up: the routing underneath buckets by plugin
+/// and hands each its whole bucket, so the nine files a commit touched cost
+/// the invocation that one file costs, and `exact` under a directory becomes
+/// sayable too.
 ///
 /// No parse cache, unlike [`Declarations`]: that one was measured at ~1.5%
 /// because a file's commits are usually not parent and child, and here the
-/// cached value is every declaration in the file rather than one, so the
-/// copy would cost more than the parse it saved.
-pub struct FileDeclarations<'a> {
+/// cached value is every declaration of every file read rather than one, so
+/// the copy would cost more than the parse it saved.
+pub struct DirDeclarations<'a> {
     root: &'a Path,
     parsers: &'a dyn Parsers,
-    path: String,
 }
 
-impl<'a> FileDeclarations<'a> {
-    /// A reader of one file over one checkout.
-    pub fn new(root: &'a Path, parsers: &'a dyn Parsers, path: String) -> FileDeclarations<'a> {
-        FileDeclarations {
-            root,
-            parsers,
-            path,
-        }
+impl<'a> DirDeclarations<'a> {
+    /// A reader over one checkout.
+    pub fn new(root: &'a Path, parsers: &'a dyn Parsers) -> DirDeclarations<'a> {
+        DirDeclarations { root, parsers }
     }
 
-    /// Which declarations `newer` moved, against `older`.
+    /// Which declarations `newer` moved in each of `files`, against `older`.
     ///
     /// `older` is `None` for a root commit, where nothing existed before, so
-    /// every declaration the file holds was added by it.
-    pub fn moved(&self, newer: &str, older: Option<&str>) -> Moves {
-        let new = self.at(newer);
+    /// every declaration those files hold was added by it.
+    ///
+    /// Every path asked about is answered, so a caller writing one line per
+    /// file never has to decide what a missing key meant.
+    pub fn moved(
+        &self,
+        files: &[String],
+        newer: &str,
+        older: Option<&str>,
+    ) -> BTreeMap<String, Moves> {
+        let new = self.at(newer, files);
         // A root commit has no parent, which is the same thing to this
-        // comparison as a revision where the file is not there yet.
+        // comparison as a revision where the files are not there yet.
         let old = match older {
-            Some(older) => self.at(older),
-            None => Ok(AtRev::Absent),
+            Some(older) => self.at(older, files),
+            None => Ok(files
+                .iter()
+                .map(|path| (path.clone(), AtRev::Absent))
+                .collect()),
         };
         let (new, old) = match (new, old) {
-            (Ok(AtRev::Parsed(new)), Ok(AtRev::Parsed(old))) => (new, old),
-            // The file arrived or left here, so every declaration on the
-            // side that has it moved — which is the most interesting row in
-            // the listing, not a comparison that failed.
-            (Ok(AtRev::Parsed(new)), Ok(AtRev::Absent)) => (new, BTreeMap::new()),
-            (Ok(AtRev::Absent), Ok(AtRev::Parsed(old))) => (BTreeMap::new(), old),
-            (Ok(AtRev::Absent), Ok(AtRev::Absent)) => {
-                return Moves::unsettled(format!(
-                    "{} is in the tree at neither revision",
-                    self.path
-                ));
+            (Ok(new), Ok(old)) => (new, old),
+            // One revision that could not be opened is one verdict, repeated:
+            // it is the same failure for every file read out of it.
+            (Err(e), _) | (_, Err(e)) => {
+                let why = first_line(&e);
+                return files
+                    .iter()
+                    .map(|path| (path.clone(), Moves::unsettled(why.clone())))
+                    .collect();
             }
-            (Ok(AtRev::Opaque(why)), _) | (_, Ok(AtRev::Opaque(why))) => {
-                return Moves::unsettled(why);
-            }
-            (Err(e), _) | (_, Err(e)) => return Moves::unsettled(first_line(&e)),
         };
-        if new.is_empty() && old.is_empty() {
-            return Moves::unsettled(format!(
-                "the installed parsers place no declaration in {}",
-                self.path
-            ));
-        }
-        let mut moves = Moves {
-            changed: Vec::new(),
-            added: Vec::new(),
-            removed: Vec::new(),
-            unsettled: None,
-        };
-        for (key, body) in &new {
-            match old.get(key) {
-                Some(before) if before == body => {}
-                Some(_) => moves.changed.push(key.clone()),
-                None => moves.added.push(key.clone()),
-            }
-        }
-        for key in old.keys() {
-            if !new.contains_key(key) {
-                moves.removed.push(key.clone());
-            }
-        }
-        moves
+        files
+            .iter()
+            .map(|path| (path.clone(), compare(path, new.get(path), old.get(path))))
+            .collect()
     }
 
-    /// Every declaration in the file at one revision, by key.
-    fn at(&self, rev: &str) -> AnyResult<AtRev> {
+    /// The same, for the listing that is headed by one file.
+    pub fn moved_one(&self, path: &str, newer: &str, older: Option<&str>) -> Moves {
+        let files = [path.to_string()];
+        self.moved(&files, newer, older)
+            .remove(path)
+            .unwrap_or_else(|| Moves::unsettled(format!("{path} was not read at {newer}")))
+    }
+
+    /// Every declaration of each file at one revision, by file and then key.
+    fn at(&self, rev: &str, files: &[String]) -> AnyResult<BTreeMap<String, AtRev>> {
         let sha = Sha::parse(rev).ok_or_else(|| anyhow!("`{rev}` is no full object name"))?;
         let tree = GitTree::open(self.root, sha)?;
-        // Read before parse, because a read that fails at a revision is the
-        // file not being there — which is an answer — while a parse that
-        // fails is one that cannot be given.
-        let text = match text_at(&tree, &self.path) {
-            Ok(Text::Shown(text)) => text,
-            Ok(Text::Withheld(why)) => return Ok(AtRev::Opaque(why.trim_end().to_string())),
-            Err(_) => return Ok(AtRev::Absent),
-        };
-        let Ok(parsed) = self.parsers.parse(&tree, &self.path) else {
-            return Ok(AtRev::Opaque(format!(
-                "no installed parser claims {} at {}",
-                self.path,
-                tree.sha().short()
-            )));
-        };
-        let lines: Vec<&str> = text.lines().collect();
+        let at = tree.sha().short();
         let mut out = BTreeMap::new();
+        let mut text = BTreeMap::new();
+        for path in files {
+            // Read before parse, because a read that fails at a revision is
+            // the file not being there — which is an answer — while a parse
+            // that fails is one that cannot be given.
+            match text_at(&tree, path) {
+                Ok(Text::Shown(body)) => {
+                    text.insert(path.clone(), body);
+                }
+                Ok(Text::Withheld(why)) => {
+                    out.insert(path.clone(), AtRev::Opaque(why.trim_end().to_string()));
+                }
+                Err(_) => {
+                    out.insert(path.clone(), AtRev::Absent);
+                }
+            }
+        }
+        if text.is_empty() {
+            return Ok(out);
+        }
+        let readable: Vec<String> = text.keys().cloned().collect();
+        let Ok(parsed) = self.parsers.parse(&tree, &readable) else {
+            for path in readable {
+                out.insert(
+                    path.clone(),
+                    AtRev::Opaque(format!("no installed parser claims {path} at {at}")),
+                );
+            }
+            return Ok(out);
+        };
+        let numbered: BTreeMap<String, Vec<&str>> = text
+            .iter()
+            .map(|(path, body)| (path.clone(), body.lines().collect()))
+            .collect();
+        let mut placed: BTreeMap<String, BTreeMap<String, Vec<String>>> = readable
+            .iter()
+            .map(|p| (p.clone(), BTreeMap::new()))
+            .collect();
+        // One file in the batch leaves nothing to attribute, so a node is
+        // that file's whatever it names itself; several, and a node that
+        // names no file cannot be placed in one of them.
+        let only = (readable.len() == 1).then(|| readable[0].clone());
+        let mut attributed = 0;
         for node in &parsed.nodes {
+            let file = match &only {
+                Some(only) => only.clone(),
+                None => {
+                    match str_prop(&node.props, "file").or_else(|| str_prop(&node.props, "path")) {
+                        Some(file) => file,
+                        None => continue,
+                    }
+                }
+            };
+            let (Some(decls), Some(lines)) = (placed.get_mut(&file), numbered.get(&file)) else {
+                continue;
+            };
+            attributed += 1;
+            // A fact the parser places in the file without a line is not a
+            // declaration of it — an import, a re-export, a reference it
+            // could not bind — and there is nothing of it to compare. It
+            // still counts as attributed: the file was read, and what it
+            // declares is separately a question with an answer.
             let Some(first) = int_prop(&node.props, "line") else {
                 continue;
             };
@@ -911,10 +952,94 @@ impl<'a> FileDeclarations<'a> {
                 .take(last + 1 - first)
                 .map(|line| (*line).to_string())
                 .collect();
-            out.insert(node.key.clone(), body);
+            decls.insert(node.key.clone(), body);
         }
-        Ok(AtRev::Parsed(out))
+        // Facts the parse placed in none of the files asked about would
+        // otherwise read as files holding none of their own, which is a
+        // different answer about each of them.
+        if attributed == 0 && !parsed.nodes.is_empty() {
+            for path in readable {
+                out.insert(
+                    path.clone(),
+                    AtRev::Opaque(format!(
+                        "the parser placed {} declaration(s) at {at} and named no file for \
+                         any of them",
+                        parsed.nodes.len()
+                    )),
+                );
+            }
+            return Ok(out);
+        }
+        // Two files declaring one key is a plugin bug, which the routing
+        // reports as a collision having kept one of them. A file left empty
+        // by that is not a file that declares nothing, and the two cannot be
+        // told apart from here — so a batch says which, where parsing the
+        // file alone would never have met the other declaration.
+        let collisions = parsed.report.collisions.len();
+        for (path, decls) in placed {
+            let read = match decls.is_empty() && collisions > 0 {
+                true => AtRev::Opaque(format!(
+                    "{path} came back empty from a parse of {at} that dropped \
+                     {collisions} colliding key(s)"
+                )),
+                false => AtRev::Parsed(decls),
+            };
+            out.insert(path, read);
+        }
+        Ok(out)
     }
+}
+
+/// What `newer` did to one file's declarations, against `older`.
+///
+/// Three readings kept apart rather than collapsed into "nothing moved": a
+/// file absent at one side means everything on the other arrived or left
+/// with it; a file the parsers place no declaration in says that; and a file
+/// that could not be read says which. An empty parse and an unchanged file
+/// look identical otherwise, and only one of them is an answer.
+fn compare(path: &str, new: Option<&AtRev>, old: Option<&AtRev>) -> Moves {
+    let nothing = BTreeMap::new();
+    let (new, old) = match (new, old) {
+        (Some(AtRev::Parsed(new)), Some(AtRev::Parsed(old))) => (new, old),
+        // The file arrived or left here, so every declaration on the side
+        // that has it moved — which is the most interesting row in the
+        // listing, not a comparison that failed.
+        (Some(AtRev::Parsed(new)), Some(AtRev::Absent)) => (new, &nothing),
+        (Some(AtRev::Absent), Some(AtRev::Parsed(old))) => (&nothing, old),
+        (Some(AtRev::Absent), Some(AtRev::Absent)) => {
+            return Moves::unsettled(format!("{path} is in the tree at neither revision"));
+        }
+        (Some(AtRev::Opaque(why)), _) | (_, Some(AtRev::Opaque(why))) => {
+            return Moves::unsettled(why.clone());
+        }
+        (None, _) | (_, None) => {
+            return Moves::unsettled(format!("{path} was not read at both revisions"));
+        }
+    };
+    if new.is_empty() && old.is_empty() {
+        return Moves::unsettled(format!(
+            "the installed parsers place no declaration in {path}"
+        ));
+    }
+    let mut moves = Moves {
+        changed: Vec::new(),
+        added: Vec::new(),
+        removed: Vec::new(),
+        unsettled: None,
+    };
+    for (key, body) in new {
+        match old.get(key) {
+            Some(before) if before == body => {}
+            Some(_) => moves.changed.push(key.clone()),
+            None => moves.added.push(key.clone()),
+        }
+    }
+    for key in old.keys() {
+        if !new.contains_key(key) {
+            moves.removed.push(key.clone());
+        }
+    }
+    moves
 }
 
 /// What reading one file at one revision found.

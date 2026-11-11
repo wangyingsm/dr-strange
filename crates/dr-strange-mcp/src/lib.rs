@@ -2212,6 +2212,16 @@ struct ExactPass<'a> {
     symbol: Option<&'a str>,
 }
 
+/// What one commit was found to have done.
+struct Verdict {
+    /// The mark on the commit's own line.
+    mark: String,
+    /// Lines written beneath it, where the mark cannot hold the answer.
+    under: Vec<String>,
+    /// Whether the comparison reached an answer at all.
+    settled: bool,
+}
+
 /// Each commit's verdict, from a reader that can compare one against its
 /// parent.
 ///
@@ -2221,19 +2231,22 @@ struct ExactPass<'a> {
 fn walk_commits(
     history: &dr_strange_core::PlaneHandle<'_>,
     rows: &[dr_strange_core::touched::Row],
-    verdict: impl Fn(&str, Option<&str>) -> (String, bool),
-) -> (std::collections::BTreeMap<String, String>, usize) {
-    let mut per_commit = std::collections::BTreeMap::new();
+    verdict: impl Fn(&dr_strange_core::touched::Row, Option<&str>) -> Verdict,
+) -> (dr_strange_core::touched::Marks, usize) {
+    let mut marks = dr_strange_core::touched::Marks::default();
     let mut unsettled = 0;
     for row in rows.iter().take(EXACT_COMMITS) {
         let parent = first_parent(history, &row.sha);
-        let (mark, settled) = verdict(&row.sha, parent.as_deref());
-        if !settled {
+        let found = verdict(row, parent.as_deref());
+        if !found.settled {
             unsettled += 1;
         }
-        per_commit.insert(row.short.clone(), mark);
+        marks.per_commit.insert(row.short.clone(), found.mark);
+        if !found.under.is_empty() {
+            marks.detail.insert(row.short.clone(), found.under);
+        }
     }
-    (per_commit, unsettled)
+    (marks, unsettled)
 }
 
 /// Read the symbol's declaration at each listed commit and at its first
@@ -2256,29 +2269,33 @@ fn exact_marks(
         });
     };
     let rows = found.rows();
-    let (per_commit, unsettled) = match pass.symbol {
+    let reader = recall::DirDeclarations::new(&root, pass.parsers);
+    let (mut marks, unsettled) = match pass.symbol {
         Some(symbol) => {
             let sym = recall::resolve_symbol(pass.code, "", symbol, "HEAD")?;
-            let reader = recall::Declarations::new(&root, pass.parsers, sym);
-            walk_commits(pass.history, &rows, |newer, older| {
-                let verdict = reader.moved(newer, older);
-                (verdict.mark(), verdict.settled())
+            let one = recall::Declarations::new(&root, pass.parsers, sym);
+            walk_commits(pass.history, &rows, |row, older| {
+                let verdict = one.moved(&row.sha, older);
+                Verdict {
+                    mark: verdict.mark(),
+                    under: Vec::new(),
+                    settled: verdict.settled(),
+                }
             })
         }
         // A path: one parse of the file yields every declaration in it, so
         // this costs what the single-symbol pass costs and says more.
         None => {
-            let reader =
-                recall::FileDeclarations::new(&root, pass.parsers, found.path().to_string());
-            walk_commits(pass.history, &rows, |newer, older| {
-                let verdict = reader.moved(newer, older);
-                (verdict.mark(), verdict.settled())
+            let path = found.path().to_string();
+            walk_commits(pass.history, &rows, |row, older| {
+                let verdict = reader.moved_one(&path, &row.sha, older);
+                Verdict {
+                    mark: verdict.mark(),
+                    under: Vec::new(),
+                    settled: verdict.settled(),
+                }
             })
         }
-    };
-    let mut marks = dr_strange_core::touched::Marks {
-        per_commit,
-        ..Default::default()
     };
     let read = rows.len().min(EXACT_COMMITS);
     let mut note = format!("`exact` read {read} commit(s)");
