@@ -5124,14 +5124,17 @@ mod tests {
         cap(|o| import(&db, "demo", CODE.as_bytes(), OnConflict::Error, o));
         cap(|o| import(&db, "demo_git", GIT.as_bytes(), OnConflict::Error, o));
 
-        let parsers = dr_strange_llm::Plugins::from_handlers(Vec::new());
+        // `default_parsers`, not the plugin host: this test wants the
+        // listing, and reaching into `dr_strange_llm` would put the test
+        // behind the `digest` feature that the verb it tests is not.
+        let parsers = dr_strange_mcp::default_parsers();
         let asked = |name: Option<&str>| dr_strange_mcp::HistoryReq {
             plane: "demo".to_string(),
             name: name.map(str::to_string),
             exact: None,
             limit: Some(15),
         };
-        let out = cap(|o| history(&db, asked(Some("demo::alpha")), &parsers, o));
+        let out = cap(|o| history(&db, asked(Some("demo::alpha")), &*parsers, o));
         assert!(out.starts_with("plane 'demo_git':\n"), "{out}");
         assert!(
             out.contains("src/a.rs — the file declaring `demo::alpha`"),
@@ -5145,7 +5148,7 @@ mod tests {
         );
 
         // The same arm, no name: the repository at a glance, as before.
-        let glance = cap(|o| history(&db, asked(None), &parsers, o));
+        let glance = cap(|o| history(&db, asked(None), &*parsers, o));
         assert!(glance.contains("2 commit(s)"), "{glance}");
         assert!(
             glance.contains("touch a") && glance.contains("touch b"),

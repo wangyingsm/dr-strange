@@ -2871,6 +2871,7 @@ mod tests {
         /// An invocation and the variant it must land on.
         type Case = (Vec<&'static str>, fn(&Command) -> bool);
         let cases: Vec<Case> = vec![
+            #[cfg(feature = "digest")]
             (vec!["token"], |c| matches!(c, Command::Token { .. })),
             (vec!["import", "in.jsonl"], |c| {
                 matches!(c, Command::Import { .. })
