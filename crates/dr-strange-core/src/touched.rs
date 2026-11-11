@@ -54,6 +54,14 @@ use crate::types::{NodeRecord, PropValue};
 pub struct Marks {
     /// Per commit, by [`Row::short`] — appended to that commit's line.
     pub per_commit: BTreeMap<String, String>,
+    /// Lines written under a commit's own line, by [`Row::short`], indented
+    /// by this module so a caller supplies the content and not the shape.
+    ///
+    /// For a target the mark cannot be said in a phrase: a commit that moved
+    /// thirty declarations across nine files does not fit the one line per
+    /// commit this listing is built on, so the line counts them and these
+    /// name them, one file each.
+    pub detail: BTreeMap<String, Vec<String>>,
     /// One line about the pass itself: how many commits it read, and what it
     /// left unread. The caller owns it because the caller did the work.
     pub note: Option<String>,
@@ -210,7 +218,7 @@ impl Touched {
             return Ok(refused.clone());
         }
         let mut out = head(&self.target, &self.found);
-        out.push_str(&rows(self.shown(), self.limit, &marks.per_commit));
+        out.push_str(&rows(self.shown(), self.limit, marks));
         out.push_str(&notes(&self.target, &self.found, marks));
         out.push_str(&planes_read(asked)?);
         Ok(out)
@@ -500,8 +508,9 @@ fn head(target: &Target, found: &Found) -> String {
 ///
 /// A mark from `marks` is appended to its commit's line, keyed by the short
 /// sha — how a caller that read the declaration at each revision says what
-/// it found without owning a second copy of this format.
-fn rows(commits: Vec<&NodeRecord>, limit: usize, marks: &BTreeMap<String, String>) -> String {
+/// it found without owning a second copy of this format. Where that caller
+/// also left detail, it is indented beneath the line it belongs to.
+fn rows(commits: Vec<&NodeRecord>, limit: usize, marks: &Marks) -> String {
     let mut out = String::new();
     for commit in commits.iter().take(limit) {
         let p = &commit.properties;
@@ -521,11 +530,14 @@ fn rows(commits: Vec<&NodeRecord>, limit: usize, marks: &BTreeMap<String, String
                 (false, true) => "  [left behind]",
                 (false, false) => "",
             },
-            match marks.get(short) {
+            match marks.per_commit.get(short) {
                 Some(mark) => format!("  {mark}"),
                 None => String::new(),
             },
         ));
+        for line in marks.detail.get(short).into_iter().flatten() {
+            out.push_str(&format!("      {line}\n"));
+        }
     }
     if commits.len() > limit {
         out.push_str(&format!(
@@ -1051,5 +1063,46 @@ mod tests {
         let rows = found.rows();
         assert_eq!(rows[0].paths, vec!["src/a.rs", "src/b.rs"], "newest first");
         assert_eq!(rows[1].paths, vec!["src/a.rs"]);
+    }
+
+    /// What a mark cannot say in a phrase goes under the line it belongs to.
+    #[test]
+    fn a_mark_may_carry_lines_beneath_its_commit() {
+        let db = planes();
+        let history = db.plane("repo_git").expect("history");
+        let code = db.plane("repo").expect("code");
+        let asked = Asked {
+            history: &history,
+            code: Some(&code),
+            name: "src",
+            limit: None,
+        };
+        let found = candidates(&asked).expect("candidates");
+        let marks = Marks {
+            per_commit: [("c2".to_string(), "← 1  + 2 in 2 file(s)".to_string())]
+                .into_iter()
+                .collect(),
+            detail: [(
+                "c2".to_string(),
+                vec![
+                    "src/a.rs  ← alpha".to_string(),
+                    "src/b.rs  + beta".to_string(),
+                ],
+            )]
+            .into_iter()
+            .collect(),
+            note: None,
+        };
+        let out = found.stated(&asked, &marks).expect("stated");
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("c2"))
+            .expect("c2 listed");
+        assert!(lines[at].ends_with("← 1  + 2 in 2 file(s)"), "{out}");
+        assert_eq!(lines[at + 1], "      src/a.rs  ← alpha", "{out}");
+        assert_eq!(lines[at + 2], "      src/b.rs  + beta", "{out}");
+        // c1 was given no detail, so its line is followed by the next commit.
+        assert!(lines[at + 3].trim_start().starts_with("c1"), "{out}");
     }
 }
