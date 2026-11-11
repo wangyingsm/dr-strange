@@ -277,7 +277,16 @@ fn resolve(asked: &Asked<'_>) -> Result<Named> {
         return Ok(literal(asked.name));
     };
     match compact::resolve(code, asked.name)? {
+        Resolved::One(node) if compact::is_unresolved(&node) => Ok(literal(asked.name)),
         Resolved::One(node) => Ok(placed(&node)),
+        // An unresolved reference is one end of a call the parser could not
+        // bind, so it declares nothing and cannot say which file declares
+        // the name. Candidates that are all stubs are no candidates at all,
+        // and a path is what such a name usually is — `object.rs` matches
+        // every `?::…/object.rs::<method>` stub in the plane.
+        Resolved::Many(hits) if !hits.iter().any(|n| !compact::is_unresolved(n)) => {
+            Ok(literal(asked.name))
+        }
         Resolved::Many(hits) => Ok(Named::Ambiguous(compact::candidates(asked.name, &hits))),
         Resolved::None => Ok(literal(asked.name)),
     }
