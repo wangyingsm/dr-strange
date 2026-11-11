@@ -786,6 +786,88 @@ impl Moves {
     }
 }
 
+/// How many declarations one commit moved, for a line that counts them
+/// because it cannot name them.
+///
+/// A commit that moved thirty declarations across nine files does not fit a
+/// line that names each: the commit's line carries these counts, and one
+/// [`Moves::mark`] per file goes beneath it.
+#[derive(Default)]
+pub struct Tally {
+    /// Declarations at both revisions, with different lines.
+    pub changed: usize,
+    /// Declared at the commit and not at its parent.
+    pub added: usize,
+    /// Declared at the parent and not at the commit.
+    pub removed: usize,
+    /// Files read at both revisions.
+    pub files: usize,
+    /// Of those, how many hold at least one declaration that moved.
+    pub moved: usize,
+    /// Files whose comparison could not be made, each saying why on its own
+    /// line.
+    pub unsettled: usize,
+    /// Files the pass never opened, having spent its budget.
+    pub unread: usize,
+}
+
+impl Tally {
+    /// Fold one file's verdict in.
+    pub fn with(&mut self, moves: &Moves) {
+        self.files += 1;
+        if moves.unsettled.is_some() {
+            self.unsettled += 1;
+            return;
+        }
+        let (changed, added, removed) =
+            (moves.changed.len(), moves.added.len(), moves.removed.len());
+        if changed + added + removed > 0 {
+            self.moved += 1;
+        }
+        self.changed += changed;
+        self.added += added;
+        self.removed += removed;
+    }
+
+    /// The mark this puts on the commit's line.
+    pub fn mark(&self) -> String {
+        if self.files == 0 {
+            return format!(
+                "? {} path(s) unread — this pass's file budget was spent",
+                self.unread
+            );
+        }
+        if self.unsettled == self.files {
+            return format!("? none of {} file(s) could be settled", self.files);
+        }
+        let counts: Vec<String> = [("←", self.changed), ("+", self.added), ("−", self.removed)]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(sign, n)| format!("{sign} {n}"))
+            .collect();
+        let mut out = match counts.is_empty() {
+            true => format!("— {} file(s) only", self.files),
+            false => format!(
+                "{}  in {} of {} file(s)",
+                counts.join("  "),
+                self.moved,
+                self.files
+            ),
+        };
+        for (n, what) in [(self.unsettled, "unsettled"), (self.unread, "unread")] {
+            if n > 0 {
+                out.push_str(&format!(", {n} {what}"));
+            }
+        }
+        out
+    }
+
+    /// Whether any file of this commit reached an answer.
+    pub fn settled(&self) -> bool {
+        self.files > self.unsettled
+    }
+}
+
 /// A key's last segment, under either language's separator.
 fn leaf(key: &str) -> &str {
     let cut = key
@@ -1777,6 +1859,112 @@ mod tests {
         // The newest is the one kept, and the older is only counted.
         assert!(out.contains(&f.two[..7]), "{out}");
         assert!(!out.contains(&f.one[..7]), "{out}");
+    }
+
+    /// `exact` under a directory: every file a commit touched beneath it is
+    /// read in one parse per revision, the commit's line counts what moved,
+    /// and the lines beneath it name the declarations file by file.
+    #[test]
+    fn exact_under_a_directory_counts_on_the_line_and_names_beneath_it() {
+        let f = fixture(true);
+        let out = history_exact(&f.db, "src").unwrap();
+        assert!(
+            out.contains("src — a directory, 4 path(s) of it changed"),
+            "{out}"
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let at = |sha: &str| {
+            lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&sha[..7]))
+                .unwrap_or_else(|| panic!("{sha} listed\n{out}"))
+        };
+        // `two` rewrote beta, added gamma, dropped alpha, moved `moved` from
+        // one file to another, and left `one` behind in a file of 60 lines.
+        let two = at(&f.two);
+        assert!(
+            lines[two].ends_with("← 1  + 2  − 3  in 4 of 4 file(s)"),
+            "{out}"
+        );
+        let beneath: Vec<&str> = lines[two + 1..two + 5].to_vec();
+        assert_eq!(
+            beneath,
+            vec![
+                "      src/lib.rs  − one() {}",
+                "      src/new.rs  + moved",
+                "      src/old.rs  − moved",
+                "      src/sym.rs  ← beta  + gamma  − alpha",
+            ],
+            "{out}"
+        );
+        // The root commit: three files arrived, with everything in them.
+        let one = at(&f.one);
+        assert!(lines[one].ends_with("+ 4  in 3 of 3 file(s)"), "{out}");
+        assert_eq!(lines[one + 3], "      src/sym.rs  + alpha, beta", "{out}");
+        assert!(
+            out.contains("`exact` read 2 commit(s) and 7 file(s) beneath `src`"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "a commit's line counts the declarations that moved and the lines \
+                          beneath it name them"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The caps are stated, not silent: a commit touching more files than the
+    /// pass opens says which paths it did not read, and the note says why —
+    /// a path marked unread is not a path where nothing moved.
+    #[test]
+    fn exact_under_a_directory_says_which_files_it_did_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, "2026-08-01T10:00:00Z", &["init", "-q", "-b", "main"]);
+        let files: Vec<String> = (1..=crate::EXACT_FILES + 2)
+            .map(|i| format!("wide/f{i:02}.rs"))
+            .collect();
+        for (i, path) in files.iter().enumerate() {
+            write(root, path, format!("fn w{i:02}\n  w1\n").as_bytes());
+        }
+        let sha = commit(root, "wide", "2026-08-01T10:00:00Z");
+
+        let db = Database::in_memory().unwrap();
+        code_plane(&db, root, &sha);
+        let p = db.create_plane("repo_git", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let listed = files.iter().map(|f| PropValue::Str(f.clone())).collect();
+        txn.create_node_with_key(
+            &format!("commit:{sha}"),
+            &["Commit"],
+            props(vec![
+                ("sha", PropValue::Str(sha.clone())),
+                ("summary", PropValue::Str("wide".into())),
+                ("author_name", PropValue::Str("Ada".into())),
+                (
+                    "committed_at",
+                    PropValue::Str("2026-08-01T10:00:00+00:00".into()),
+                ),
+                ("committed_ts", PropValue::Int(1_785_578_400)),
+                ("short", PropValue::Str(sha[..7].to_string())),
+                ("files", PropValue::List(listed)),
+            ]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let out = history_exact(&db, "wide").unwrap();
+        let read = crate::EXACT_FILES;
+        assert!(
+            out.contains(&format!("+ {read}  in {read} of {read} file(s), 2 unread")),
+            "{out}"
+        );
+        assert!(out.contains("      wide/f10.rs  ? unread"), "{out}");
+        assert!(
+            out.contains("2 path(s) marked `? unread` were never opened"),
+            "{out}"
+        );
     }
 
     /// A file renamed between the two commits: `moved` is in `src/new.rs`

@@ -2151,6 +2151,21 @@ fn compact_logic(
 /// makes the common call exact all the way down.
 const EXACT_COMMITS: usize = 15;
 
+/// Files one commit's row reads before the rest are counted unread.
+///
+/// A directory's commit can touch dozens, and a line that names declarations
+/// in thirty files is not a line anyone reads. Eight is what still fits a
+/// screen when each is named beneath the commit.
+const EXACT_FILES: usize = 8;
+
+/// Files the whole pass reads, however it spends them.
+///
+/// The per-commit cap bounds a line; this bounds the wait. Each file is read
+/// at two revisions, so forty is eighty parses — the same order as the
+/// single-symbol pass over its fifteen commits, which is the cost a reader
+/// has already agreed to by asking for `exact`.
+const EXACT_FILES_TOTAL: usize = 40;
+
 /// `history`: a repository at a glance, the commits that changed one name,
 /// or those commits with the declaration read at each.
 ///
@@ -2212,6 +2227,15 @@ struct ExactPass<'a> {
     symbol: Option<&'a str>,
 }
 
+/// What a directory pass has spent of its budget, so the note can say.
+#[derive(Default)]
+struct Spent {
+    /// Files read, at two revisions each.
+    read: std::cell::Cell<usize>,
+    /// Paths a cap kept it from opening at all.
+    unread: std::cell::Cell<usize>,
+}
+
 /// What one commit was found to have done.
 struct Verdict {
     /// The mark on the commit's own line.
@@ -2226,8 +2250,9 @@ struct Verdict {
 /// parent.
 ///
 /// Taken as a closure so the cap, the tally and the note are written once:
-/// a file pass and a symbol pass differ in what they read, not in how much
-/// of the listing they get through or how they report stopping.
+/// a symbol pass, a file pass and a directory pass differ in what they read,
+/// not in how much of the listing they get through or how they report
+/// stopping.
 fn walk_commits(
     history: &dr_strange_core::PlaneHandle<'_>,
     rows: &[dr_strange_core::touched::Row],
@@ -2269,9 +2294,10 @@ fn exact_marks(
         });
     };
     let rows = found.rows();
+    let spent = Spent::default();
     let reader = recall::DirDeclarations::new(&root, pass.parsers);
-    let (mut marks, unsettled) = match pass.symbol {
-        Some(symbol) => {
+    let (mut marks, unsettled) = match (pass.symbol, found.dir()) {
+        (Some(symbol), _) => {
             let sym = recall::resolve_symbol(pass.code, "", symbol, "HEAD")?;
             let one = recall::Declarations::new(&root, pass.parsers, sym);
             walk_commits(pass.history, &rows, |row, older| {
@@ -2285,7 +2311,7 @@ fn exact_marks(
         }
         // A path: one parse of the file yields every declaration in it, so
         // this costs what the single-symbol pass costs and says more.
-        None => {
+        (None, false) => {
             let path = found.path().to_string();
             walk_commits(pass.history, &rows, |row, older| {
                 let verdict = reader.moved_one(&path, &row.sha, older);
@@ -2296,13 +2322,60 @@ fn exact_marks(
                 }
             })
         }
+        // A directory: the files one commit touched under it are read in one
+        // parse per revision, so what the listing costs is a budget of files
+        // rather than a multiple of the single-file pass.
+        (None, true) => walk_commits(pass.history, &rows, |row, older| {
+            let budget = EXACT_FILES_TOTAL.saturating_sub(spent.read.get());
+            let take = budget.min(EXACT_FILES).min(row.paths.len());
+            let (read, unread) = row.paths.split_at(take);
+            spent.read.set(spent.read.get() + read.len());
+            spent.unread.set(spent.unread.get() + unread.len());
+            let mut tally = recall::Tally {
+                unread: unread.len(),
+                ..Default::default()
+            };
+            let mut under = Vec::new();
+            for (path, moves) in reader.moved(read, &row.sha, older) {
+                tally.with(&moves);
+                under.push(format!("{path}  {}", moves.mark()));
+            }
+            for path in unread {
+                under.push(format!("{path}  ? unread"));
+            }
+            Verdict {
+                mark: tally.mark(),
+                // A commit that read nothing says so on its own line; the
+                // paths beneath it would be a list of what was not done.
+                under: match read.is_empty() {
+                    true => Vec::new(),
+                    false => under,
+                },
+                settled: tally.settled(),
+            }
+        }),
     };
     let read = rows.len().min(EXACT_COMMITS);
     let mut note = format!("`exact` read {read} commit(s)");
+    if found.dir() {
+        note.push_str(&format!(
+            " and {} file(s) beneath `{}`, each at the commit and at its first parent",
+            spent.read.get(),
+            found.path()
+        ));
+    }
     if rows.len() > EXACT_COMMITS {
         note.push_str(&format!(
             ", leaving {} older unread — narrow with `limit`",
             rows.len() - EXACT_COMMITS
+        ));
+    }
+    if spent.unread.get() > 0 {
+        note.push_str(&format!(
+            "; {} path(s) marked `? unread` were never opened — the pass stops at \
+             {EXACT_FILES_TOTAL} file(s) and {EXACT_FILES} per commit, so narrow with \
+             `limit` or name a directory further down",
+            spent.unread.get()
         ));
     }
     if unsettled > 0 {
