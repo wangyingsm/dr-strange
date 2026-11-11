@@ -4,13 +4,19 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.29.0] - 2026-11-11
 
 An edge's own facts, readable from a query (ROADMAP §15). `_confidence` and
 `_resolved_by` on a `CALLS` edge say whether a call was written or inferred,
 `role` on `USES_TYPE` says whether a type is a field, a parameter or a return
 — and until now a query could reach none of them, so an agent asking *which of
 these calls were inferred* had to read every edge through `context` instead.
+
+The other half of the release is history that answers for a *name* (ROADMAP
+§11). `history` takes a symbol, a path or a directory, lists the commits that
+changed it, and with `--exact` reads the declarations at each commit and at its
+first parent — so *when did this change, and did my function itself move* is
+one call rather than a `git log` and a pile of `git show`.
 
 ### Added
 
@@ -138,6 +144,14 @@ these calls were inferred* had to read every edge through `context` instead.
   The same mismatch still affects a *projection* across such a hop, which
   needs the executor to learn the per-row mapping — recorded in ROADMAP's
   low-priority section rather than papered over.
+
+### Security
+
+- **rmcp 3.9.0 is now the floor** (RUSTSEC-2026-0462). Before it, the
+  streamable-HTTP client this workspace enables read a response body with no
+  size limit, so a declared MCP server could exhaust the host's memory during
+  `initialize`. It is the client side that was exposed: a `drsg` talking to a
+  server someone else declared, not a `drsg serve` answering requests.
 
 ## [2.28.0] - 2026-11-08
 
