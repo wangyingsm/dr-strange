@@ -1062,11 +1062,45 @@ it; a file the parsers place no declaration in says that; and a file that
 could not be read says which. An empty parse and an unchanged file look
 identical otherwise, and only one of them is an answer.
 
-*Open.* Several files at once — "what moved anywhere under this directory,
-by commit" — is still one pass per file. The tree walk is already shared per
-revision, so the saving is real but the output shape is the open question: a
-commit that moved thirty declarations across nine files does not fit the one
-line per commit this listing is built on.
+*And the directory form, which was the last open question here.* `history
+<dir> --exact` answers "what moved anywhere under this directory, by
+commit": `history crates --exact` marks a commit `← 9  + 17  − 1  in 4 of 4
+file(s)` and names the declarations beneath it, one line per file. Three
+things had to be settled for it.
+
+**One parse, not one per file.** The routing already took a *list* of paths
+and buckets them by plugin, handing each its whole bucket — so the nine files
+a commit touched cost the invocation one file costs, and the saving is the
+wasm instantiation rather than the parse. `Parsers::parse` therefore takes a
+set, and the single-file and single-symbol passes are the same reader asked
+for one path. Measured over fifteen commits of `crates` (1054 of them match):
+24 files read at two revisions each, and the pass itself is the same order as
+the single-symbol pass over its own fifteen.
+
+**What a name is, is measured, not guessed.** A plane holds files and
+symbols, never the directories above them, so nothing can be *asked* whether
+a name is a directory — and a directory the tree no longer has could not be
+probed for either. So the scan collects both readings in its one pass: a path
+the commits record itself is a file, and a path only ever recorded with
+something beneath it is a directory. Git has no commit where both are true.
+This also had to survive resolution: `src` fuzzy-matches `src/b.rs`, and a
+name the code plane answered with *some other file's* path is not an answer
+about that name — the directory above those files is.
+
+**The output shape, which was the open question.** The commit's line counts
+(`← 9  + 17  − 1  in 4 of 4 file(s)`) and the lines beneath it name, one per
+file, through the same `Moves::mark` the single-file form renders. Two caps,
+each bounding a different thing and both stated: eight files per commit
+bounds the row, forty for the whole pass bounds the wait, and a path neither
+opened is marked `? unread` rather than left to read as a path where nothing
+moved.
+
+One correctness note the real repository turned up, kept because it is not
+obvious: a batch merges facts by key, so two files declaring one key — a
+plugin bug by the digest's own rule — would leave one of them looking empty.
+A file that comes back empty from a parse that *reported* a collision says
+so, which a single-file parse could never have detected, because it never
+meets the other declaration.
 
 *Open, and the honest reading of that 383ms.* It is per **fold**, and it
 grows with the length of the history, because the reader diffs every commit

@@ -94,6 +94,33 @@ these calls were inferred* had to read every edge through `context` instead.
   could not be read says which. An empty parse is otherwise indistinguishable
   from an unchanged one, and only one of them is an answer.
 
+- **`--exact` on a directory: what moved anywhere beneath it, by commit.**
+  `history crates --exact` marks a commit `← 9  + 17  − 1  in 4 of 4 file(s)`
+  and names the declarations beneath it, one line per file. Every file a
+  commit touched under the directory is read in **one parse per revision**,
+  not one per file: the routing already took a list of paths and hands each
+  plugin its whole bucket, so nine files cost the invocation one file costs.
+
+  What a name is, is measured rather than guessed. A plane holds files and
+  symbols, never the directories above them, so a path the commits record
+  itself is read as a file and a path only ever recorded with something
+  beneath it as a directory — which also answers for a directory the tree no
+  longer has. A name the code plane answered with some *other* file's path
+  (`src` matches `src/b.rs`) is likewise not an answer about that name.
+
+  Two caps, each bounding a different thing and both stated: eight files per
+  commit bounds the row, forty for the whole pass bounds the wait, and a path
+  neither opened is marked `? unread` rather than left to read as a path
+  where nothing moved.
+
+### Changed
+
+- **`dr_strange_mcp::Parsers::parse` takes a set of paths** rather than one,
+  which is what lets a commit's files be parsed together. `FileDeclarations`
+  is replaced by `DirDeclarations`, which reads any number of files at a
+  revision and answers per file; the single-file and single-symbol passes are
+  that same reader asked for one path, so all three cannot drift.
+
 - A name that matched only unresolved references — every `?::…/object.rs::<method>`
   stub in a plane, for `history plugins/.../object.rs` — was reported as an
   ambiguous symbol. An unresolved reference is one end of a call the parser
