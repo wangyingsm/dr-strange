@@ -1,0 +1,27 @@
+name: impact
+
+# The repository's own pull requests, reported on by the action in ci/github —
+# the one published for other projects. A template nobody runs is a template
+# that rots, so this one runs here first.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: impact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./ci/github
+        with:
+          plugins: rust py ts
+          # This repository is its own largest test: name the plane after it,
+          # so a failure here reads like a failure anywhere else.
+          plane: dr-strange
