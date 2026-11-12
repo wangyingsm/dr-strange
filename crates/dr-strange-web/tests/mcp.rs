@@ -260,6 +260,29 @@ async fn tools_answer_in_the_shape_the_question_asked_for() {
     let text = routes.as_str().expect("wire answers with text");
     assert!(text.contains("no routes recorded in this plane"), "{text}");
 
+    // `report` reaches the verb over MCP, and carries its own contract with
+    // it: nothing reaches `alice` and nothing may, so a report of that radius
+    // is empty where the compact answer is a paragraph saying so.
+    let compact = call(&client, "impact", json!({ "name": "alice" })).await;
+    assert!(
+        compact
+            .as_str()
+            .expect("impact answers with text")
+            .contains("total affected within depth"),
+        "{compact}"
+    );
+    let report = call(
+        &client,
+        "impact",
+        json!({ "name": "alice", "report": true }),
+    )
+    .await;
+    assert_eq!(
+        report.as_str(),
+        Some(""),
+        "a radius with nothing to report is empty"
+    );
+
     client.cancel().await.unwrap();
 }
 
