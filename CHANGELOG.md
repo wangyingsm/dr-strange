@@ -4,6 +4,37 @@ All notable changes to Dr Strange are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`affected` — the tests a change reaches.** A new agent verb, on the CLI
+  and over MCP. With nothing given, the change is what is uncommitted in the
+  working tree; `--vs <rev>` asks about `<rev>..HEAD` instead, which is the
+  shape a PR has. Each changed declaration is walked back through the same
+  incoming structural edges `impact` uses, to the declarations the plugins
+  marked test code, grouped by the file that holds them.
+
+  It is a composition rather than an engine: the walk is `impact`'s, the
+  revision reading is `history --exact`'s, and the test marks are the
+  `test_flag` the rust, go, python, typescript, java and c# plugins already
+  write. What is new is the seam — a diff turned into keys, and keys turned
+  into a set small enough to run.
+
+  **It is a lower bound and every answer says so.** A test reaching the change
+  only through dynamic dispatch or an untyped receiver has no edge to be found
+  by, and a test wrongly left out is a regression shipped. `--safe` is the
+  answer to that: every test under the packages the change touched joins the
+  set, reached or not. On this repository a one-file edit is 87 tests precise,
+  1161 safe, against 2242 for the suite.
+
+  Two more things the answer states rather than leaves to be noticed: a
+  `test_flag` the plugin itself ranked below `definitive` — a C file flagged
+  by the framework header it includes — is counted and named as such; and a
+  plane parsed before the edit is a plane whose line numbers predate it, so a
+  changed line can land on the declaration that used to be there. That one is
+  a warning, because nothing else in the answer would look wrong.
+
 ## [2.29.0] - 2026-11-11
 
 An edge's own facts, readable from a query (ROADMAP §15). `_confidence` and
