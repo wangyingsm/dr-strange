@@ -59,6 +59,31 @@ pub struct AffectedReq {
     /// Hops of incoming structural edges to walk, clamped to 1..=6.
     #[serde(default)]
     pub depth: Option<usize>,
+    /// Render the answer as Markdown instead, and return nothing at all where
+    /// the change named no declaration. For pasting somewhere a person reads
+    /// it — a pull request, an issue — never for reading here: the compact
+    /// form says the same thing in fewer tokens.
+    #[serde(default)]
+    pub report: bool,
+    /// Only the keys of the declarations the change touched, one per line and
+    /// nothing else.
+    ///
+    /// `serde(skip)` keeps it out of the schema an agent reads: a stream of
+    /// bare keys is a loop's input, not an answer, and the CLI's `--seeds` is
+    /// the caller that wants one.
+    #[serde(skip)]
+    pub seeds: bool,
+}
+
+impl AffectedReq {
+    /// What this request asks to be given back.
+    fn output(&self) -> Output {
+        match (self.seeds, self.report) {
+            (true, _) => Output::Seeds,
+            (_, true) => Output::Report,
+            _ => Output::Compact,
+        }
+    }
 }
 
 /// What a change is, before the graph is asked anything: the declarations it
@@ -70,11 +95,9 @@ struct Change {
     note: String,
 }
 
-/// What a caller wants back. Not a field of [`AffectedReq`]: the MCP tool
-/// answers an agent, which wants the compact text and nothing else, and these
-/// two exist for a CI template.
+/// What a caller wants back, as [`AffectedReq`] spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Output {
+enum Output {
     /// The compact answer — one fact per line.
     Compact,
     /// Markdown for a pull request, the change's own note quoted above it.
@@ -91,9 +114,8 @@ pub fn affected_logic(
     fallback_root: Option<&Path>,
     parsers: &dyn Parsers,
     req: AffectedReq,
-    out: Output,
 ) -> AnyResult<String> {
-    affected_logic_in(db, TreeAccess::local(fallback_root), parsers, req, out)
+    affected_logic_in(db, TreeAccess::local(fallback_root), parsers, req)
 }
 
 /// [`affected_logic`] under an explicit tree policy — what the served `/mcp`
@@ -103,8 +125,8 @@ pub fn affected_logic_in(
     access: TreeAccess<'_>,
     parsers: &dyn Parsers,
     req: AffectedReq,
-    out: Output,
 ) -> AnyResult<String> {
+    let out = req.output();
     let plane = db.plane(&req.plane)?;
     let Some(root) = access.plane_root(recorded_root(&plane).as_deref())? else {
         bail!(

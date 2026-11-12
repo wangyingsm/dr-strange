@@ -214,8 +214,9 @@ fn an_uncommitted_edit_names_the_test_that_reaches_it() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: false,
         },
-        Output::Compact,
     )
     .unwrap();
     assert!(out.contains("the working tree against HEAD"), "{out}");
@@ -250,8 +251,9 @@ fn a_plane_behind_the_working_tree_warns_that_a_seed_may_be_stale() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: false,
         },
-        Output::Compact,
     )
     .unwrap();
     assert!(
@@ -294,8 +296,9 @@ fn a_plane_that_holds_the_edit_is_quiet_about_being_behind() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: false,
         },
-        Output::Compact,
     )
     .unwrap();
     assert!(!out.contains("behind this working tree"), "{out}");
@@ -323,8 +326,9 @@ fn a_clean_tree_says_there_is_no_change_to_start_from() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: false,
         },
-        Output::Compact,
     )
     .unwrap();
     assert!(
@@ -356,8 +360,9 @@ fn an_untracked_file_is_read_whole_and_said_to_be() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: false,
         },
-        Output::Compact,
     )
     .unwrap();
     assert!(out.contains("1 untracked file(s) are read whole"), "{out}");
@@ -394,8 +399,9 @@ fn the_seeds_are_the_keys_and_nothing_else() {
             vs: None,
             safe: false,
             depth: None,
+            report: false,
+            seeds: true,
         },
-        Output::Seeds,
     )
     .unwrap();
     assert_eq!(out, "m::one\n");
@@ -430,8 +436,9 @@ fn a_report_quotes_the_change_above_the_set() {
             vs: None,
             safe: false,
             depth: None,
+            report: true,
+            seeds: false,
         },
-        Output::Report,
     )
     .unwrap();
     assert!(
@@ -465,8 +472,9 @@ fn a_clean_tree_reports_nothing_at_all() {
                 vs: None,
                 safe: false,
                 depth: None,
+                report: want == Output::Report,
+                seeds: want == Output::Seeds,
             },
-            want,
         )
         .unwrap();
         assert_eq!(out, "", "{want:?}");

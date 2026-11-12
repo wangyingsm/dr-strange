@@ -22,7 +22,7 @@ mod error;
 mod recall;
 pub mod relay;
 
-pub use affected::{AffectedReq, Output as AffectedOutput, affected_logic, affected_logic_in};
+pub use affected::{AffectedReq, affected_logic, affected_logic_in};
 pub use error::McpError;
 pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
@@ -1407,6 +1407,12 @@ struct ImpactReq {
     /// answer is this plane alone.
     #[serde(default)]
     across: Option<String>,
+    /// Render the answer as Markdown instead, and return nothing at all
+    /// where there is nothing to report. For pasting somewhere a person
+    /// reads it — a pull request, an issue — never for reading here: the
+    /// compact form says the same thing in fewer tokens.
+    #[serde(default)]
+    report: bool,
 }
 
 /// `mount`'s request: the database directory, and a prefix for its planes.
@@ -1441,6 +1447,12 @@ struct WireReq {
     /// verb still answers, because it matches every one.
     #[serde(default)]
     verb: Option<String>,
+    /// Render the answer as Markdown instead, and return nothing at all
+    /// where there is nothing to report. For pasting somewhere a person
+    /// reads it — a pull request, an issue — never for reading here: the
+    /// compact form says the same thing in fewer tokens.
+    #[serde(default)]
+    report: bool,
 }
 
 /// `attach`'s request: a plane to reach, and where it is.
@@ -3644,17 +3656,18 @@ impl DrStrange {
         let remote = self.remote.clone();
         let instance = self.instance.clone();
         self.run_in("impact", req, move |db, req| {
-            Ok(Value::String(dr_strange_core::compact::impact(
-                db,
-                dr_strange_core::compact::Impact {
-                    plane: &req.plane,
-                    name: &req.name,
-                    depth: req.depth.unwrap_or(3),
-                    across: across_scope(req.across.as_deref())?,
-                    instance: instance.as_deref(),
-                    remote: remote.as_deref(),
-                },
-            )?))
+            let ask = dr_strange_core::compact::Impact {
+                plane: &req.plane,
+                name: &req.name,
+                depth: req.depth.unwrap_or(3),
+                across: across_scope(req.across.as_deref())?,
+                instance: instance.as_deref(),
+                remote: remote.as_deref(),
+            };
+            Ok(Value::String(match req.report {
+                true => dr_strange_core::compact::impact_report(db, ask)?,
+                false => dr_strange_core::compact::impact(db, ask)?,
+            }))
         })
         .await
     }
@@ -3875,16 +3888,17 @@ impl DrStrange {
         let remote = self.remote.clone();
         let instance = self.instance.clone();
         self.run_in("wire", req, move |db, req| {
-            Ok(Value::String(dr_strange_core::compact::wire(
-                db,
-                dr_strange_core::compact::Wire {
-                    plane: &req.plane,
-                    name: &req.name,
-                    verb: req.verb.as_deref(),
-                    instance: instance.as_deref(),
-                    remote: remote.as_deref(),
-                },
-            )?))
+            let ask = dr_strange_core::compact::Wire {
+                plane: &req.plane,
+                name: &req.name,
+                verb: req.verb.as_deref(),
+                instance: instance.as_deref(),
+                remote: remote.as_deref(),
+            };
+            Ok(Value::String(match req.report {
+                true => dr_strange_core::compact::wire_report(db, ask)?,
+                false => dr_strange_core::compact::wire(db, ask)?,
+            }))
         })
         .await
     }
@@ -4052,11 +4066,7 @@ impl DrStrange {
                 plane_roots,
             };
             Ok(Value::String(affected::affected_logic_in(
-                db,
-                access,
-                &*parsers,
-                req,
-                affected::Output::Compact,
+                db, access, &*parsers, req,
             )?))
         })
         .await

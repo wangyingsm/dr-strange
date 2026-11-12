@@ -1248,27 +1248,17 @@ struct AffectedArgs {
 }
 
 impl AffectedArgs {
-    /// The tool's request these flags spell, the output asked for, and the
-    /// fallback checkout.
-    fn into_req(
-        self,
-    ) -> (
-        dr_strange_mcp::AffectedReq,
-        dr_strange_mcp::AffectedOutput,
-        Option<PathBuf>,
-    ) {
-        let out = match (self.report, self.seeds) {
-            (_, true) => dr_strange_mcp::AffectedOutput::Seeds,
-            (true, _) => dr_strange_mcp::AffectedOutput::Report,
-            _ => dr_strange_mcp::AffectedOutput::Compact,
-        };
+    /// The tool's request these flags spell, and the fallback checkout.
+    fn into_req(self) -> (dr_strange_mcp::AffectedReq, Option<PathBuf>) {
         let req = dr_strange_mcp::AffectedReq {
             plane: self.plane,
             vs: self.vs,
             safe: self.safe,
             depth: self.depth,
+            report: self.report,
+            seeds: self.seeds,
         };
-        (req, out, self.root)
+        (req, self.root)
     }
 }
 
@@ -1280,12 +1270,12 @@ fn run_affected(
     out: &mut dyn Write,
 ) -> Result<()> {
     let db = commands::open(db_path, config::retain_commits(cfg))?;
-    let (req, want, root) = args.into_req();
+    let (req, root) = args.into_req();
     let parsers = recall_parsers(cfg)?;
     write!(
         out,
         "{}",
-        dr_strange_mcp::affected_logic(&db, root.as_deref(), &*parsers, req, want)?
+        dr_strange_mcp::affected_logic(&db, root.as_deref(), &*parsers, req)?
     )?;
     Ok(())
 }
@@ -2790,28 +2780,22 @@ mod tests {
     /// Markdown report, and clap should say so rather than pick one.
     #[test]
     fn a_report_and_a_seed_list_are_each_asked_for_once() {
-        let plain = Cli::try_parse_from(["drsg", "affected"]).unwrap();
-        let Command::Affected(args) = plain.command else {
-            panic!("should parse as Affected")
-        };
-        assert_eq!(args.into_req().1, dr_strange_mcp::AffectedOutput::Compact);
-
-        for (argv, want) in [
-            (
-                ["drsg", "affected", "--report"],
-                dr_strange_mcp::AffectedOutput::Report,
-            ),
-            (
-                ["drsg", "affected", "--seeds"],
-                dr_strange_mcp::AffectedOutput::Seeds,
-            ),
-        ] {
+        let flags = |argv: [&str; 3]| {
             let cli = Cli::try_parse_from(argv).unwrap();
             let Command::Affected(args) = cli.command else {
                 panic!("should parse as Affected")
             };
-            assert_eq!(args.into_req().1, want, "{argv:?}");
-        }
+            let req = args.into_req().0;
+            (req.report, req.seeds)
+        };
+        let plain = Cli::try_parse_from(["drsg", "affected"]).unwrap();
+        let Command::Affected(args) = plain.command else {
+            panic!("should parse as Affected")
+        };
+        let bare = args.into_req().0;
+        assert_eq!((bare.report, bare.seeds), (false, false));
+        assert_eq!(flags(["drsg", "affected", "--report"]), (true, false));
+        assert_eq!(flags(["drsg", "affected", "--seeds"]), (false, true));
 
         assert!(
             Cli::try_parse_from(["drsg", "affected", "--report", "--seeds"]).is_err(),
