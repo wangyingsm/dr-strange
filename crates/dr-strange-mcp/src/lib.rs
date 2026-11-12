@@ -17,10 +17,12 @@
 //! runs the second one, `drsg-mcp` forwards to it rather than opening the
 //! same database, which one process at a time may do.
 
+mod affected;
 mod error;
 mod recall;
 pub mod relay;
 
+pub use affected::{AffectedReq, affected_logic, affected_logic_in};
 pub use error::McpError;
 pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
@@ -873,6 +875,7 @@ planed!(
     WireReq,
     WriteEdges,
     WriteNodes,
+    crate::affected::AffectedReq,
     crate::recall::RecallReq
 );
 
@@ -4021,6 +4024,36 @@ impl DrStrange {
                 plane_roots,
             };
             recall_logic_in(db, access, &*parsers, req)
+        })
+        .await
+    }
+
+    #[tool(description = "The tests a change reaches — run these instead of the \
+        whole suite. With no `vs`, the change is what is uncommitted in the \
+        working tree right now; `vs` (an older revision) asks about \
+        `<rev>..HEAD` instead, which is the shape a PR has. Each changed \
+        declaration is walked back through incoming structural edges to the \
+        tests that reach it, grouped by the file that holds them. It is a \
+        lower bound and says so: a test reaching the change only through \
+        dynamic dispatch has no edge to be found by, so set `safe` where a \
+        missed test costs more than the time — it adds every test under the \
+        packages the change touched.")]
+    async fn affected(
+        &self,
+        Parameters(req): Parameters<affected::AffectedReq>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (root, parsers) = (self.source_root.clone(), self.parsers.clone());
+        let granted = self.mount_root.clone();
+        let plane_roots = self.local_files;
+        self.run_in("affected", req, move |db, req| {
+            let access = TreeAccess {
+                attached: root.as_deref(),
+                granted: granted.as_deref(),
+                plane_roots,
+            };
+            Ok(Value::String(affected::affected_logic_in(
+                db, access, &*parsers, req,
+            )?))
         })
         .await
     }

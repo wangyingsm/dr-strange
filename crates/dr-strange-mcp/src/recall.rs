@@ -776,6 +776,25 @@ impl Moves {
         self.unsettled.is_none()
     }
 
+    /// The keys still declared at the newer revision — changed and added.
+    ///
+    /// What a reader of the new tree can ask about, which a removal is not:
+    /// it is gone from the tree the question is asked in, and whatever called
+    /// it is in this list already, because it had to change too.
+    pub fn present(&self) -> impl Iterator<Item = &String> {
+        self.changed.iter().chain(self.added.iter())
+    }
+
+    /// How many declarations the comparison found removed.
+    pub fn gone(&self) -> usize {
+        self.removed.len()
+    }
+
+    /// Why the comparison could not be made, where it could not.
+    pub fn why(&self) -> Option<&str> {
+        self.unsettled.as_deref()
+    }
+
     fn unsettled(why: String) -> Moves {
         Moves {
             changed: Vec::new(),
@@ -1473,14 +1492,14 @@ fn human(bytes: u64) -> String {
     }
 }
 
-fn str_prop(props: &Properties, key: &str) -> Option<String> {
+pub(crate) fn str_prop(props: &Properties, key: &str) -> Option<String> {
     match props.get(key).map(|d| &d.value) {
         Some(PropValue::Str(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }
 }
 
-fn int_prop(props: &Properties, key: &str) -> Option<usize> {
+pub(crate) fn int_prop(props: &Properties, key: &str) -> Option<usize> {
     match props.get(key).map(|d| &d.value) {
         Some(PropValue::Int(n)) if *n > 0 => usize::try_from(*n).ok(),
         _ => None,
