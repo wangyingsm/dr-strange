@@ -12,6 +12,8 @@ members = [
     "crates/dr-strange-py",
     "benchmarks/drsg-bench",
 ]
+# The e2e fixture: a crate for the verbs to answer about, never built here.
+exclude = ["tests/e2e/fixture/engine"]
 
 [workspace.package]
 version = "2.29.0"

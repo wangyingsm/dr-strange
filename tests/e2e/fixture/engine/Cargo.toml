@@ -1,0 +1,6 @@
+# A fixture crate, excluded from the workspace: nothing here is built by this
+# repository, and `affected` needs a package whose tests it can name.
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"

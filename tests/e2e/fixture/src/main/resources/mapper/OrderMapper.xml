@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+  "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.acme.OrderMapper">
+  <select id="findById" parameterType="string" resultType="string">
+    SELECT sku FROM orders WHERE id = #{id}
+  </select>
+  <insert id="insert" parameterType="string">
+    INSERT INTO orders (sku, state) VALUES (#{sku}, 'new')
+  </insert>
+</mapper>
