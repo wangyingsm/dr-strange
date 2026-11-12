@@ -239,6 +239,18 @@ gate-publish:
 gate-frontend:
     cd crates/dr-strange-web/frontend && bun install --frozen-lockfile && bun run lint && bun run build && bun test
 
+# The three 2027-Q1 code-intelligence features, end to end: cross-layer edges
+# (Spring MVC routes, a Dubbo provider and consumer, a MyBatis mapper to its
+# table), `affected`, and the `--report` Markdown the CI templates paste into a
+# pull request. Real binary, real wasm parsers, a real git repository — so a
+# plugin release that drops an edge fails here, and in no other recipe.
+#
+# Deliberately outside `gate`: the gate mirrors CI, and this needs the plugin
+# store, which CI does not have. Run it before a release, and after installing
+# a plugin. See tests/e2e/README.md.
+e2e: _drsg-for-sdk
+    DRSG_BIN="{{drsg_bin}}" tests/e2e/run.sh
+
 # Score the parser plugins against the accuracy fixtures: recall, precision,
 # and whether an ambiguous call site is declared or guessed at. The Go key is
 # cross-checked against `callgraph` first, so a wrong key fails before it can
