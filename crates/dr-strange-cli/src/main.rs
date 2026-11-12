@@ -483,6 +483,11 @@ enum Command {
     /// symbol read at `--at`; a search of that tree (`--pattern`); or what
     /// changed since an older revision (`--vs`).
     Recall(RecallArgs),
+    /// The tests a change reaches — run these rather than the whole suite.
+    /// The uncommitted working tree by default, `<rev>..HEAD` with `--vs`.
+    /// A lower bound, and it says so: `--safe` adds every test under the
+    /// packages the change touched.
+    Affected(AffectedArgs),
     /// Print the soft-schema catalog (a plane's, or the whole database's).
     Catalog {
         /// One plane's catalog; every plane in the database otherwise.
@@ -1203,6 +1208,59 @@ impl RecallArgs {
     }
 }
 
+/// `drsg affected`'s arguments: the MCP tool's request, as flags.
+#[derive(clap::Args)]
+struct AffectedArgs {
+    /// An older revision: the change is `<rev>..HEAD` rather than what is
+    /// uncommitted in the working tree.
+    #[arg(long)]
+    vs: Option<String>,
+    /// Plane to read. Defaults to `startup`, which is empty on a normal
+    /// install — name the plane this tree was digested into.
+    #[arg(long, default_value = "startup")]
+    plane: String,
+    /// Add every test under the packages the change touched, reached or not.
+    #[arg(long)]
+    safe: bool,
+    /// Hops of incoming edges to walk (1..=6, default 3).
+    #[arg(long)]
+    depth: Option<usize>,
+    /// The checkout to read, when the plane records none of its own.
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
+impl AffectedArgs {
+    /// The tool's request these flags spell, and the fallback checkout.
+    fn into_req(self) -> (dr_strange_mcp::AffectedReq, Option<PathBuf>) {
+        let req = dr_strange_mcp::AffectedReq {
+            plane: self.plane,
+            vs: self.vs,
+            safe: self.safe,
+            depth: self.depth,
+        };
+        (req, self.root)
+    }
+}
+
+/// `drsg affected`: the MCP tool's body over flags, printed as its text.
+fn run_affected(
+    args: AffectedArgs,
+    db_path: &Path,
+    cfg: &config::Config,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let db = commands::open(db_path, config::retain_commits(cfg))?;
+    let (req, root) = args.into_req();
+    let parsers = recall_parsers(cfg)?;
+    write!(
+        out,
+        "{}",
+        dr_strange_mcp::affected_logic(&db, root.as_deref(), &*parsers, req)?
+    )?;
+    Ok(())
+}
+
 /// The preprocessors `recall` locates a symbol with: the configured plugin store.
 #[cfg(feature = "digest")]
 fn recall_parsers(cfg: &config::Config) -> Result<std::sync::Arc<dyn dr_strange_mcp::Parsers>> {
@@ -1911,6 +1969,7 @@ fn run_tree_verbs(
         Command::History(args) => run_history(args, db_path, cfg, out),
         Command::Deployed(args) => run_deployed(args, db_path, cfg, out),
         Command::Recall(args) => run_recall(args, db_path, cfg, out),
+        Command::Affected(args) => run_affected(args, db_path, cfg, out),
         other => run_analytics(other, db_path, cfg, verbose, out),
     }
 }
