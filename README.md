@@ -257,9 +257,9 @@ byte-identical across restarts. The longer path — digest, serve and query as
 separate steps — is in the [Coding Agent
 chapter](https://wangyingsm.github.io/dr-strange/en/book/coding-agent.html).
 
-Twelve verbs answer an agent's questions, one round trip each, as compact
-one-fact-per-line text. All twelve are MCP tools on `drsg serve`, and all
-twelve are CLI subcommands.
+Thirteen verbs answer an agent's questions, one round trip each, as compact
+one-fact-per-line text. All thirteen are MCP tools on `drsg serve`, and all
+thirteen are CLI subcommands.
 
 | Verb | The question it answers |
 |---|---|
@@ -274,6 +274,7 @@ twelve are CLI subcommands.
 | `history` | the repository behind the code: HEAD, branches, tags, rebases and the newest commits |
 | `deployed` | what commit a running thing was built from, and what runs a commit — the manifests' ops plane joined to the history beside it |
 | `recall` | the same code as it was: a file, a symbol's declaration then, a search of the old tree, or what changed since an older revision |
+| `affected` | the tests a change reaches — the uncommitted working tree, or `<rev>..HEAD` — so a run is scoped to the change; a lower bound that says so, with `--safe` to trade the saving back for certainty |
 | `wire` | what serves an HTTP path and what asks for it — matched across every language in the plane, and across the planes it attaches |
 
 Two disciplines run through every tool. An ambiguous name is never guessed at:

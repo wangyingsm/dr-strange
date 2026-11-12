@@ -153,7 +153,7 @@ open files, read, infer who calls what, repeat. A digested plane has already
 done that work, once, with a parser — so structural questions become **one
 round trip** instead of a search-and-read loop.
 
-Twelve verbs carry the workload, identical over MCP
+Thirteen verbs carry the workload, identical over MCP
 ([Chapter 8](./mcp.md)) and the CLI ([Chapter 7](./embedded-cli.md); `grep`,
 `snippet` and `recall` read the tree the plane was parsed from, which `--root`
 names when the plane records none of its own):
@@ -171,6 +171,7 @@ names when the plane records none of its own):
 | `recall` | the code as it was at a commit — a file, a symbol's declaration then, a search of that tree, or a diff between two revisions — the `git show` and `git log -p` an agent no longer needs |
 | `history` | the repository behind the code: where HEAD is, what the branches and tags point at, what was rebased, and the newest commits |
 | `deployed` | what commit a running thing was built from, and what runs a commit — the manifests' ops plane joined to the history beside it |
+| `affected` | the tests a change reaches — the uncommitted working tree, or `<rev>..HEAD` — so a run is scoped to the change rather than the suite; says that it is a lower bound, and `--safe` trades the saving back for certainty |
 | `wire` | what serves an HTTP path and what asks for it, matched across every language in the plane — and across the planes it attaches |
 
 `grep` and `snippet` open files only inside the tree they belong to — the
