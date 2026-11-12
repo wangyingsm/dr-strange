@@ -38,9 +38,15 @@ All notable changes to Dr Strange are documented here. The format is based on
 - **The pull-request impact report: a GitHub Action and a GitLab CI
   template**, published in [`ci/`](ci/README.md). One comment on a pull
   request says what the change reaches: the tests to run, what calls the
-  declarations it touched, and the HTTP routes they are on. The action writes
-  the job summary and keeps a single comment up to date; the template writes
-  an artifact and a merge-request note.
+  declarations it touched, and the routes they are on. The action writes the
+  job summary and keeps a single comment up to date; the template writes an
+  artifact and a merge-request note.
+
+  Routes are asked of each changed declaration **and of the type that contains
+  it**. Frameworks disagree about which of the two states a route — Spring MVC
+  marks the handler method, Dubbo marks the type that exports the service — and
+  a changed declaration is almost always a method, so asking only about the
+  seed would show HTTP routes and silently never an RPC service.
 
   Nothing is cached, because nothing needs to be. A digest of this repository
   — 111k lines, eight languages — takes 2.9s, calls no model and needs no API
@@ -67,6 +73,13 @@ All notable changes to Dr Strange are documented here. The format is based on
   says the same thing. `--seeds` stays CLI-only — a stream of bare keys is a
   loop's input rather than an answer. No `openrpc.json` method is added, so no
   SDK goes stale.
+
+### Fixed
+
+- **`git` in the release image.** `affected`, `recall` and `history` run the
+  `git` CLI, and `ghcr.io/wangyingsm/drsg` carried only `ca-certificates` — so
+  three verbs failed inside the image while working everywhere else, and
+  `digest` recorded no history. The image now installs `git`.
 
 ## [2.29.0] - 2026-11-11
 
