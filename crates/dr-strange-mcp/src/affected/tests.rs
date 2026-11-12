@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use dr_strange_core::{Database, PropDesc, PropValue, Properties};
-use dr_strange_llm::{Host, Preprocessed};
+use dr_strange_llm::{DigestNode, Host, Preprocessed};
 
 use super::*;
 
@@ -479,4 +479,271 @@ fn a_clean_tree_reports_nothing_at_all() {
         .unwrap();
         assert_eq!(out, "", "{want:?}");
     }
+}
+
+/// A parser that calls every `fn <name>` line a declaration running to the
+/// next one, reading the text the host hands it. Enough for a range, where
+/// what matters is which keys each revision holds and whether their bodies
+/// differ — not how a language is really parsed.
+struct Lines;
+
+impl Parsers for Lines {
+    fn parse(&self, host: &dyn Host, files: &[String]) -> AnyResult<Preprocessed> {
+        let mut out = Preprocessed::default();
+        for path in files {
+            let text = String::from_utf8(host.read(path)?)?;
+            let lines: Vec<&str> = text.lines().collect();
+            let starts: Vec<usize> = (0..lines.len())
+                .filter(|i| lines[*i].starts_with("fn "))
+                .collect();
+            for (n, &i) in starts.iter().enumerate() {
+                let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+                out.nodes.push(DigestNode {
+                    key: format!("m::{}", lines[i][3..].trim()),
+                    label: "Function".into(),
+                    props: at(path, i as i64 + 1, end as i64),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A parser that claims nothing, so no revision can be read and every file
+/// is one the comparison cannot settle.
+struct Blind;
+
+impl Parsers for Blind {
+    fn parse(&self, _host: &dyn Host, _files: &[String]) -> AnyResult<Preprocessed> {
+        Err(anyhow::anyhow!("no installed parser claims these"))
+    }
+}
+
+/// A checkout with `one` and `two` declared the way `Lines` reads them.
+fn checkout() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    dir
+}
+
+fn write(root: &Path, one: &str, two: &str) {
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!("fn one\n{one}\nfn two\n{two}\n"),
+    )
+    .unwrap();
+}
+
+fn committed(root: &Path, message: &str) {
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", message]);
+}
+
+fn asked(db: &Database, root: Option<&Path>, parsers: &dyn Parsers, vs: Option<&str>) -> String {
+    affected_logic(
+        db,
+        root,
+        parsers,
+        AffectedReq {
+            plane: "code".into(),
+            vs: vs.map(str::to_string),
+            safe: false,
+            depth: None,
+            report: false,
+            seeds: false,
+        },
+    )
+    .unwrap()
+}
+
+/// The path every CI run takes: two revisions, both parsed, and only the
+/// declaration whose body differs is a seed. The working tree is clean, so
+/// nothing here could have come from reading it.
+#[test]
+fn a_range_seeds_the_declaration_whose_body_changed() {
+    let dir = checkout();
+    let root = dir.path();
+    write(root, "x", "y");
+    committed(root, "one");
+    write(root, "edited", "y");
+    committed(root, "two");
+
+    let db = planed();
+    let out = asked(&db, Some(root), &Lines, Some("HEAD~1"));
+    assert!(out.contains("1 file(s), 1 declaration(s)"), "{out}");
+    assert!(out.contains("affected tests: 1"), "{out}");
+    assert!(out.contains("m::tests::one_works"), "{out}");
+    // Both revisions are named, abbreviated, so the answer says what it compared.
+    let head = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+    assert!(out.contains(&head[..12]), "{out}");
+}
+
+/// A range where nothing differs says which two revisions agreed, rather
+/// than only that there was nothing.
+#[test]
+fn a_range_with_no_difference_names_the_revisions_it_compared() {
+    let dir = checkout();
+    let root = dir.path();
+    write(root, "x", "y");
+    committed(root, "one");
+
+    let db = planed();
+    let out = asked(&db, Some(root), &Lines, Some("HEAD"));
+    assert!(out.contains("no file differs"), "{out}");
+    assert!(
+        out.contains("no changed declaration to start from"),
+        "{out}"
+    );
+}
+
+/// A declaration the range deleted is counted and not seeded: it is not in
+/// the tree the tests would run against.
+#[test]
+fn a_declaration_the_range_removed_is_counted_rather_than_seeded() {
+    let dir = checkout();
+    let root = dir.path();
+    write(root, "x", "y");
+    committed(root, "one");
+    std::fs::write(root.join("src/lib.rs"), "fn one\nx\n").unwrap();
+    committed(root, "two");
+
+    let db = planed();
+    let out = asked(&db, Some(root), &Lines, Some("HEAD~1"));
+    assert!(
+        out.contains("1 declaration(s) the range removed are not seeds"),
+        "{out}"
+    );
+    assert!(!out.contains("m::two  "), "{out}");
+}
+
+/// Files the comparison cannot settle are one note per reason rather than
+/// one per file, and past six the rest are counted instead of listed.
+#[test]
+fn files_no_parser_claims_are_one_note_that_names_six() {
+    let dir = checkout();
+    let root = dir.path();
+    for n in 0..8 {
+        std::fs::write(root.join(format!("src/f{n}.rs")), "first\n").unwrap();
+    }
+    committed(root, "one");
+    for n in 0..8 {
+        std::fs::write(root.join(format!("src/f{n}.rs")), "second\n").unwrap();
+    }
+    committed(root, "two");
+
+    let db = planed();
+    let out = asked(&db, Some(root), &Blind, Some("HEAD~1"));
+    assert_eq!(
+        out.matches("no installed parser claims").count(),
+        1,
+        "one reason, not eight: {out}"
+    );
+    assert!(
+        out.contains("8 file(s), so what they declare is not"),
+        "{out}"
+    );
+    assert!(
+        out.contains("and 2 more"),
+        "six named, the rest counted: {out}"
+    );
+}
+
+/// A range does not see uncommitted work. Saying so is the difference
+/// between an answer about the range and an answer about the edit in hand.
+#[test]
+fn a_range_says_it_cannot_see_the_uncommitted_edit() {
+    let dir = checkout();
+    let root = dir.path();
+    write(root, "x", "y");
+    committed(root, "one");
+    write(root, "edited", "y");
+    committed(root, "two");
+    write(root, "edited again", "y");
+
+    let db = planed();
+    let out = asked(&db, Some(root), &Lines, Some("HEAD~1"));
+    assert!(
+        out.contains("this working tree has uncommitted changes"),
+        "{out}"
+    );
+    assert!(
+        out.contains("drop `vs` to ask about those instead"),
+        "{out}"
+    );
+}
+
+/// `--safe` widens to the package above each changed file, which is how a
+/// test that reaches the change only from inside a macro is recovered.
+#[test]
+fn safe_widens_to_the_package_the_change_touched() {
+    let dir = checkout();
+    let root = dir.path();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+    write(root, "x", "y");
+    committed(root, "one");
+    write(root, "edited", "y");
+    committed(root, "two");
+
+    let db = planed();
+    let out = affected_logic(
+        &db,
+        Some(root),
+        &Lines,
+        AffectedReq {
+            plane: "code".into(),
+            vs: Some("HEAD~1".into()),
+            safe: true,
+            depth: None,
+            report: false,
+            seeds: false,
+        },
+    )
+    .unwrap();
+    assert!(out.contains("widened:"), "{out}");
+    assert!(out.contains("m::tests::one_works"), "{out}");
+}
+
+/// A plane parsed at another commit is behind in a way no file count can
+/// show, so the warning names the two commits instead of counting files.
+#[test]
+fn a_plane_parsed_at_another_commit_names_both_commits() {
+    let dir = checkout();
+    let root = dir.path();
+    write(root, "x", "y");
+    committed(root, "one");
+    let first = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+    write(root, "edited", "y");
+    committed(root, "two");
+
+    let db = planed_at(synced(&first, 0));
+    let out = asked(&db, Some(root), &Unasked, None);
+    assert!(out.contains("it was parsed at"), "{out}");
+    assert!(out.contains(&first[..12]), "{out}");
+}
+
+/// `affected` reads what changed from git, so a plane with no tree to read
+/// is an error that says what to do — never an empty set, which would read
+/// as "this change reaches no test".
+#[test]
+fn a_plane_with_no_source_tree_refuses_rather_than_answering_nothing() {
+    let db = planed();
+    let err = affected_logic(
+        &db,
+        None,
+        &Unasked,
+        AffectedReq {
+            plane: "code".into(),
+            vs: None,
+            safe: false,
+            depth: None,
+            report: false,
+            seeds: false,
+        },
+    )
+    .expect_err("no tree, no answer");
+    let said = err.to_string();
+    assert!(said.contains("no source tree for plane `code`"), "{said}");
+    assert!(said.contains("serve watch"), "{said}");
 }
