@@ -85,13 +85,24 @@ drsg-impact:
 
       drsg --db drsg.graph affected --plane "$DRSG_PLANE" --vs "$base" --seeds \
         | head -n "$DRSG_MAX_SYMBOLS" > seeds
+      # A route is stated by whatever declares it, and that differs by
+      # framework: Spring MVC marks the handler method, Dubbo the type that
+      # exports the service. A seed is a changed declaration — usually a
+      # method — so asking about it alone would never show an RPC service.
+      # What contains it is asked too, by dropping the key's last segment; a
+      # key nothing declares prints nothing, which is already the answer for
+      # most of them.
+      sed -E 's/(::|\.)[^:.]+$//' seeds | cat - seeds | sed '/^$/d' | sort -u > routed
       : > radius.md
       : > routes.md
       while read -r seed; do
         [ -n "$seed" ] || continue
         drsg --db drsg.graph impact "$seed" --plane "$DRSG_PLANE" --depth "$DRSG_DEPTH" --report >> radius.md
-        drsg --db drsg.graph wire "$seed" --plane "$DRSG_PLANE" --report >> routes.md
       done < seeds
+      while read -r key; do
+        [ -n "$key" ] || continue
+        drsg --db drsg.graph wire "$key" --plane "$DRSG_PLANE" --report >> routes.md
+      done < routed
       if [ -s radius.md ]; then
         { echo; echo "### What reaches the change"; echo; cat radius.md; } >> drsg-report.md
       fi
