@@ -4337,8 +4337,10 @@ impl ServerHandler for DrStrange {
              whether its tree is attached, and a verb that cannot answer \
              (no tree, no such symbol) says so and what to do instead.\n\
              A digested repository has two planes. `<name>` holds the code as \
-             it is now — ask `context`, `trace`, `impact`, `fathom`, \
-             `snippet`, `grep`. `recall` reads the same code as it was at \
+             it is now — ask `context`, `trace`, `impact`, `affected`, \
+             `fathom`, `snippet`, `grep`; `affected` names the tests a change \
+             reaches, so a run is scoped to the change and not the suite. \
+             `recall` reads the same code as it was at \
              any commit of that history — a file, a directory, a symbol's \
              declaration then, a search of the old tree (`pattern`), or what \
              changed since an older revision (`vs`) — in place of `git show \
