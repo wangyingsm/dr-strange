@@ -59,9 +59,14 @@ All notable changes to Dr Strange are documented here. The format is based on
   is what the loop over `impact` reads.
 
   The notes are the compact ones, quoted: the bound is worded once, and a
-  reviewer is owed the caveat an agent gets. Both are CLI-only — the MCP tools
-  are unchanged, because an agent wants the compact answer, and `openrpc.json`
-  gains no method, so no SDK goes stale.
+  reviewer is owed the caveat an agent gets.
+
+  `--report` is also a `report` parameter on all three MCP tools, so an agent
+  asked to write the comment itself produces the same Markdown; its schema
+  says to prefer the compact form for reading, which costs fewer tokens and
+  says the same thing. `--seeds` stays CLI-only — a stream of bare keys is a
+  loop's input rather than an answer. No `openrpc.json` method is added, so no
+  SDK goes stale.
 
 ## [2.29.0] - 2026-11-11
 
