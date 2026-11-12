@@ -27,15 +27,15 @@
 | `digest <文件\|目录\|url> --plane [--mode]` | 导入一篇文档、一个代码仓库，或一个页面及其链接 |
 | `search <查询> --plane` | 语义查找：嵌入查询文本，返回最近的节点 |
 | `context \| describe \| trace \| impact \| fathom <名称> --plane` | 已图化代码平面上的智能体动词 |
-| `impact <名称> --plane [--depth] [--across [attached\|all]]` | `--across` 把半径扩到本仓库之外：本平面所附着的那些平面，或本实例持有的每一个平面 |
+| `impact <名称> --plane [--depth] [--across [attached\|all]] [--report]` | `--across` 把半径扩到本仓库之外：本平面所附着的那些平面，或本实例持有的每一个平面。`--report` 渲染为可直接贴进合并请求的 Markdown；没有任何东西到达该符号时，什么都不输出 |
 | `snippet <名称 \| path:start-end> --plane` | 一个符号的源码文本，或被解析树中任一文件的某个行区间 |
 | `grep <模式> --plane [--regex] [--path] [--all-files]` | 在该树上做文本检索，被 ignore 的文件除非指定 `--all-files` 否则不在范围内；每个命中都标出所在的符号 |
 | `traverse <键> --plane [--edge-type]` | 一跳（或数跳）之外的邻居 |
 | `history [<名称>] --plane [--exact] [--limit]` | 平面背后的代码仓库：HEAD、分支与标签指向、变基、最新的提交。给出符号、路径或目录时，则是改动过它所辖范围的那些提交——通过每次提交所记录的路径，把代码平面连到它旁边的历史平面。加上 `--exact`，则在这些提交各自的修订版本及其第一父提交处读取声明：给出符号时，说明这次提交动的是符号本身还是只动了它周围的文件；给出路径时，则列出该文件中有哪些声明发生了变动；给出目录时，则统计其下共有多少声明发生变动，并按每个文件一行列出这些声明 |
 | `deployed [<目标>] --plane [--ops] [--history]` | 某个运行中的东西是由哪次提交构建的，以及哪些东西在跑某次提交：通过镜像标签所携带的修订号，把运维平面连到它旁边的历史平面 |
 | `recall <名称> --at <修订> --plane [--vs <修订>] [--pattern]` | 某个修订版本时的代码：文件、行区间、目录或符号；在那棵树上检索；或相对更早修订版本的差异 |
-| `affected --plane [--vs <修订>] [--safe] [--depth]` | 一次改动所波及的测试，按所在文件分组：默认是工作区中尚未提交的改动，给出 `--vs` 则是 `<修订>..HEAD`。这是一个下界——加上 `--safe`，会把改动所触及的包之下的每一个测试都纳入 |
-| `wire <路径 \| 名称> --plane [--verb]` | 什么在提供某个 HTTP 路径、什么在请求它；跨平面内的每种语言，也跨它所附着的平面 |
+| `affected --plane [--vs <修订>] [--safe] [--depth] [--report\|--seeds]` | 一次改动所波及的测试，按所在文件分组：默认是工作区中尚未提交的改动，给出 `--vs` 则是 `<修订>..HEAD`。这是一个下界——加上 `--safe`，会把改动所触及的包之下的每一个测试都纳入。`--report` 输出可贴进合并请求的 Markdown，`--seeds` 只输出改动所触及的声明键名（见 [`ci/`](https://github.com/wangyingsm/dr-strange/tree/master/ci)） |
+| `wire <路径 \| 名称> --plane [--verb] [--report]` | 什么在提供某个 HTTP 路径、什么在请求它；跨平面内的每种语言，也跨它所附着的平面。`--report` 渲染为 Markdown；该名称不声明任何路由时，什么都不输出 |
 | `attach <名称> --plane [--url] [--as] [--both]` | 记录本平面可以询问的平面：本实例上的，或由另一个 drsg 提供服务的 |
 | `detach <名称> --plane` | 移除一条附着（名称不存在时只做报告，不算错误） |
 | `attachments --plane [--probe]` | 本平面附着了什么；`--probe` 会逐个询问远端的附着现在是否应答 |

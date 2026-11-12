@@ -31,15 +31,15 @@ access, and the CLI for offline operations.
 | `digest <file\|dir\|url> --plane [--mode]` | ingest a document, a repository, or a page and its links |
 | `search <query> --plane` | semantic lookup: embeds the query, returns the nearest nodes |
 | `context \| describe \| trace \| impact \| fathom <name> --plane` | the agent verbs over a digested code plane |
-| `impact <name> --plane [--depth] [--across [attached\|all]]` | `--across` widens the radius past this repository: the planes this one attaches, or every plane this instance holds |
+| `impact <name> --plane [--depth] [--across [attached\|all]] [--report]` | `--across` widens the radius past this repository: the planes this one attaches, or every plane this instance holds. `--report` renders it as Markdown for a pull request, and prints nothing where nothing reaches the symbol |
 | `snippet <name \| path:start-end> --plane` | a symbol's source text, or a range of any file in the parsed tree |
 | `grep <pattern> --plane [--regex] [--path] [--all-files]` | text search over that tree, ignored files excluded unless `--all-files`; each hit names the symbol it falls in |
 | `traverse <key> --plane [--edge-type]` | the neighbours a hop (or several) away |
 | `history [<name>] --plane [--exact] [--limit]` | the repository behind a plane: HEAD, branch and tag tips, rebases, newest commits. With a symbol, a path or a directory, the commits that changed what it holds — the code plane joined to the history beside it through the paths each commit records. `--exact` reads the declarations at each of those commits and its first parent: for a symbol, whether that commit moved it or only the file around it; for a path, which of the file's declarations moved; for a directory, how many moved beneath it, with the declarations named one line per file |
 | `deployed [<target>] --plane [--ops] [--history]` | what commit a running thing was built from, and what runs a commit: the ops plane joined to the history beside it through the revision an image's tag carries |
 | `recall <name> --at <rev> --plane [--vs <rev>] [--pattern]` | code as it was at a revision: a file, a range, a directory or a symbol; a search of that tree; or a diff from an older revision |
-| `affected --plane [--vs <rev>] [--safe] [--depth]` | the tests a change reaches, grouped by the file that holds them: what is uncommitted in the working tree, or `<rev>..HEAD` with `--vs`. A lower bound — `--safe` adds every test under the packages the change touched |
-| `wire <path \| name> --plane [--verb]` | what serves an HTTP path and what asks for it, across every language in the plane and across the planes it attaches |
+| `affected --plane [--vs <rev>] [--safe] [--depth] [--report\|--seeds]` | the tests a change reaches, grouped by the file that holds them: what is uncommitted in the working tree, or `<rev>..HEAD` with `--vs`. A lower bound — `--safe` adds every test under the packages the change touched. `--report` is Markdown for a pull request, `--seeds` the changed declarations' keys alone ([`ci/`](https://github.com/wangyingsm/dr-strange/tree/master/ci)) |
+| `wire <path \| name> --plane [--verb] [--report]` | what serves an HTTP path and what asks for it, across every language in the plane and across the planes it attaches. `--report` renders it as Markdown, and prints nothing where the name states no route |
 | `attach <name> --plane [--url] [--as] [--both]` | record a plane this one may ask: one here, or one another drsg serves |
 | `detach <name> --plane` | forget an attachment (an absent name is reported, not an error) |
 | `attachments --plane [--probe]` | what a plane attaches; `--probe` asks each remote one whether it answers now |

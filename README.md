@@ -327,6 +327,15 @@ rather than compiled in, so a plugin release needs no drsg release. The same
 repository carries the plugin SDK: the parser contract is a public WIT
 interface, and a community parser is a first-class citizen of the catalog.
 
+**In CI.** A GitHub Action and a GitLab CI template in
+[`ci/`](ci/README.md) report what a pull request reaches: the tests to run,
+what calls the declarations it touched, and the HTTP routes they are on. The
+graph is rebuilt at the head commit of every run — a digest of this repository
+is under three seconds and calls no model — so nothing is cached and the
+answer cannot be stale. `--report` renders a verb's answer as Markdown and
+prints nothing at all when it has nothing to report, which is what keeps the
+template a few lines of shell.
+
 **Agent-side tooling.** The Claude Code hooks, the shared long-term memory
 daemon, and the router that puts several repositories behind one MCP surface
 live in

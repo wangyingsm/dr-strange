@@ -335,6 +335,43 @@ One more distinction it keeps: a graph holding a key *without* `External` is
 not a dependent but the same code again — vendored, or digested twice — and is
 reported as `holds its own` rather than counted as a user.
 
+## In CI: the pull-request impact report
+
+The same verbs answer for a reviewer, who has a diff and no graph. A pull
+request gets one comment: the tests the change reaches, what calls the
+declarations it touched, and the HTTP routes they are on.
+
+Nothing is cached, because nothing needs to be. A digest of this repository —
+111k lines of eight languages — takes under three seconds, builds no index an
+answer here needs, and calls no model, so the graph is rebuilt at the head
+commit of every run. That is cheaper than keeping one warm, and it is the
+reason the answer cannot be stale.
+
+```console
+$ drsg digest . --apply --code-only --no-embed --no-git --plane ci
+$ drsg affected --plane ci --vs "$BASE" --report
+$ drsg affected --plane ci --vs "$BASE" --seeds |
+    while read -r sym; do drsg impact "$sym" --plane ci --report; done
+```
+
+`--report` renders a verb's answer as Markdown, and prints **nothing at all**
+when it has nothing to report: a symbol nothing reaches, a declaration on no
+route, a change that named no declaration at all. A template then decides
+whether a section belongs by testing a file for emptiness, instead of matching
+prose that may be reworded. `--seeds` prints the changed declarations' keys,
+one per line and nothing else, which is what the loop above reads.
+
+The notes are the compact ones, quoted. A reviewer is owed the caveat an agent
+gets — that a recorded edge is a lower bound, and that a test reaching the
+change through dynamic dispatch has no edge to be found by — so the report
+carries the same sentence rather than a softer one.
+
+A GitHub Action and a GitLab CI template are published with drsg, in
+[`ci/`](https://github.com/wangyingsm/dr-strange/tree/master/ci): the action
+writes the job summary and keeps one comment up to date, the template writes an
+artifact and a merge-request note. Both are a few lines of shell around the
+calls above, and `ci/README.md` documents every input.
+
 ## Honesty is the load-bearing feature
 
 An agent acts on what a tool tells it, so the family rule — *a wrong edge is

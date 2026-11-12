@@ -298,6 +298,12 @@ Go、Java、Python、Rust 与 TypeScript 插件会记录一个符号所*声明*�
 仓库而非编译进二进制，因此插件发布不需要 drsg 发布。同一仓库也承载插件 SDK：解析器
 契约是一份公开的 WIT 接口，社区解析器与官方插件在目录中地位相同。
 
+**在 CI 中。** [`ci/`](ci/README.md) 下提供了一个 GitHub Action 与一个 GitLab CI
+模板，用于报告一个合并请求波及了什么：该跑哪些测试、哪些代码在调用它改过的声明、
+这些声明位于哪些 HTTP 路由之下。每次运行都在 head 提交上重新建图——图化本仓库不到
+三秒，且不调用任何模型——所以什么都不缓存，回答也不可能过期。`--report` 把一个动词
+的回答渲染为 Markdown，无事可报时则一个字都不输出，这正是模板只需几行 shell 的原因。
+
 **智能体侧工具。** Claude Code 钩子、共享的长期记忆 daemon，以及把多个仓库的图放到
 同一个 MCP 界面之后的路由器，都维护在
 [`drsg-harness-kit`](https://github.com/maidol/drsg-harness-kit)（仅限 Linux 与
