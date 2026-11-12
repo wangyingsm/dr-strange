@@ -210,26 +210,61 @@ void unreached "a symbol nothing reaches earns no section at all"
 void routeless "a symbol on no route earns no section at all"
 "$drsg" --db "$db" wire com.acme.OrderServiceImpl.find --plane e2e --report > "$out/method.f" 2>/dev/null
 void method "a Dubbo route is stated by the type, so a method seed finds none"
+# Which is why the templates ask about what contains a seed as well. The same
+# key, one segment shorter, is the type that states the service.
+verb held.md wire com.acme.OrderServiceImpl --report
+want "and the type that contains it states one" '^\| DUBBO \| `com\.acme\.OrderService:orders:1\.0\.0`' held.md
 git stash -q
 "$drsg" --db "$db" affected --plane e2e --report > "$out/nochange.f" 2>/dev/null
 void nochange "and a change naming no declaration earns no report"
 git stash pop -q 2>/dev/null || true
 
-# The loop both templates run: seeds out, a section per seed back.
-"$drsg" --db "$db" affected --plane e2e --vs HEAD~1 --seeds > "$out/loop-seeds.txt"
-: > "$out/loop-radius.md"
-: > "$out/loop-routes.f"
-while read -r seed; do
-    [ -n "$seed" ] || continue
-    "$drsg" --db "$db" impact "$seed" --plane e2e --depth 3 --report >> "$out/loop-radius.md" 2>/dev/null
-    "$drsg" --db "$db" wire "$seed" --plane e2e --report >> "$out/loop-routes.f" 2>/dev/null
-done < "$out/loop-seeds.txt"
+# The loop both templates run: seeds out, a radius per seed back, and routes
+# for each seed *and what contains it* — the fallback above, written here the
+# way ci/github/action.yml and ci/gitlab/drsg-impact.yml write it.
+loop() { # loop <rev> <prefix>
+    "$drsg" --db "$db" affected --plane e2e --vs "$1" --seeds > "$out/$2-seeds.txt" 2>/dev/null
+    sed -E 's/(::|\.)[^:.]+$//' "$out/$2-seeds.txt" | cat - "$out/$2-seeds.txt" |
+        sed '/^$/d' | sort -u > "$out/$2-routed.txt"
+    : > "$out/$2-radius.md"
+    : > "$out/$2-routes.f"
+    while read -r seed; do
+        [ -n "$seed" ] || continue
+        "$drsg" --db "$db" impact "$seed" --plane e2e --depth 3 --report >> "$out/$2-radius.md" 2>/dev/null
+    done < "$out/$2-seeds.txt"
+    while read -r key; do
+        [ -n "$key" ] || continue
+        "$drsg" --db "$db" wire "$key" --plane e2e --report >> "$out/$2-routes.f" 2>/dev/null
+    done < "$out/$2-routed.txt"
+}
+
+loop HEAD~1 loop
 want "the seed loop renders a radius for each changed declaration" '^#### `engine::total`' loop-radius.md
-void loop-routes "and leaves the routes file empty when none is on a route"
+want "and asks about what contains each seed as well" '^engine$' loop-routed.txt
+void loop-routes "while a Rust change on no route still adds nothing"
 
 cat "$out/set.md" "$out/loop-radius.md" > "$out/report.md"
 order "the sections compose: the set's ### above the radius' ####" \
     '^### Tests this change reaches' '^#### `engine::total`' report.md
+
+# A changed Java method: the seed states no route, its type states the Dubbo
+# service, and the report is supposed to carry it. This is the whole reason
+# the container is asked about.
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("src/main/java/com/acme/OrderServiceImpl.java")
+s = p.read_text()
+old, new = "return mapper.findById(id);", "return mapper.findById(id.trim());"
+assert s.count(old) == 1, "the fixture moved under the e2e"
+p.write_text(s.replace(old, new))
+PY
+commit "edit the dubbo provider"
+digest
+loop HEAD~1 java
+want "a changed Java method is the seed" '^com\.acme\.OrderServiceImpl\.find$' java-seeds.txt
+want "and the type it sits in is asked about too" '^com\.acme\.OrderServiceImpl$' java-routed.txt
+want "so the Dubbo service reaches the report after all" '^\| DUBBO \| `com\.acme\.OrderService:orders:1\.0\.0`' java-routes.f
+want "with the provider and the consumer either side of it" '\| `com\.acme\.OrderServiceImpl` \| `com\.acme\.Checkout` \|' java-routes.f
 
 # ---------------------------------------------------------------------------
 printf '\n%d check(s), %d failed\n' "$checks" "$failed"
