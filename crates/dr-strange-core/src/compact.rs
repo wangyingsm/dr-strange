@@ -1248,23 +1248,7 @@ pub fn impact(db: &Database, req: Impact<'_>) -> Result<String> {
 /// number and not the same answer, and nothing in a bare `0` lets a reader
 /// tell them apart — so a zero with either of these non-zero says which it is.
 fn unproven(plane: &PlaneHandle<'_>, node: &NodeRecord, total: usize) -> Result<String> {
-    // One hop only. A candidate is already unproven; a chain of candidates
-    // would be a guess about a guess, and counting it would say more than the
-    // parse knows.
-    let candidates = walk(
-        plane,
-        node.id,
-        Bounds {
-            dirs: INWARD,
-            ty: Some(MAY_CALL),
-            depth: 1,
-            budget: usize::MAX,
-        },
-        |_| Ok(Step::Take),
-    )?
-    .levels
-    .first()
-    .map_or(0, Vec::len);
+    let candidates = may_call(plane, node)?;
 
     // Scanned by label, not over the plane: the unresolved refs are a slice of
     // it, and this runs on every radius.
@@ -1296,6 +1280,292 @@ fn unproven(plane: &PlaneHandle<'_>, node: &NodeRecord, total: usize) -> Result<
         );
     }
     Ok(out)
+}
+
+/// The property a plugin writes on a declaration it has evidence is test
+/// code; the value names *what was written down* — `attribute` (`#[test]`,
+/// `@Test`), `build-rule` (`_test.go`, `#[cfg(test)]`), `filename`,
+/// `annotation`, `build-layout`, `framework-include`.
+///
+/// A verb reads the key to find tests and never branches on the value: the
+/// value is provenance for a reader weighing the mark, not a vocabulary to
+/// switch over, and a plugin added tomorrow may write a word nothing here
+/// knows.
+pub const TEST_FLAG_PROP: &str = "test_flag";
+
+/// How much [`TEST_FLAG_PROP`]'s evidence is worth: `definitive`, `strong`
+/// or `circumstantial`. The `_` keeps it out of the compact renderers, and
+/// [`affected`] is the reader it was written for.
+const TEST_CONFIDENCE_PROP: &str = "_test_flag_confidence";
+
+/// The confidence that needs no saying. Anything else is reported, because a
+/// test named on circumstantial evidence may not be a test.
+const DEFINITIVE: &str = "definitive";
+
+/// What one `affected` call is asked.
+pub struct Affected<'a> {
+    /// The plane the question is asked in.
+    pub plane: &'a str,
+    /// Keys of the declarations a change touched, as a caller that read a
+    /// diff names them.
+    pub seeds: &'a [String],
+    /// Hops of incoming structural edges to walk, clamped to 1..=6.
+    pub depth: usize,
+    /// Path prefixes whose every test joins the set however the walk ran —
+    /// the packages the change touched.
+    ///
+    /// Naming those needs the build manifests, which this layer does not
+    /// read: a caller holding them passes them, one that does not passes
+    /// nothing and gets the reached set alone.
+    pub widen: &'a [String],
+    /// Every database this process serves.
+    pub instance: Option<&'a crate::Instance>,
+}
+
+/// Why a test is in the set — the three are not equally strong, so they are
+/// said rather than merged.
+enum Why {
+    /// The change touched the test itself.
+    Changed,
+    /// The test reaches a changed symbol, along this edge type.
+    Reaches(String),
+    /// A package the change touched holds it, and nothing recorded says it
+    /// reaches anything that changed.
+    Package,
+}
+
+impl Why {
+    fn as_str(&self) -> &str {
+        match self {
+            Why::Changed => "changed",
+            Why::Reaches(ty) => ty,
+            Why::Package => "in a changed package",
+        }
+    }
+}
+
+/// `affected` — the tests a change reaches: every declaration carrying
+/// [`TEST_FLAG_PROP`] that reaches one of `seeds` through incoming structural
+/// edges, grouped by the file that holds it.
+///
+/// The composition of [`impact`] and what the plugins already mark, which is
+/// why it is a verb rather than a query: the walk is the same one, the seeds
+/// come from a diff instead of a name, and the answer is filtered to test
+/// code and grouped by what a runner takes.
+///
+/// **It is a lower bound, and says so.** A call the parse could not bind is
+/// not an edge, so a test that reaches the change only through dynamic
+/// dispatch is missing from the set — the failure that matters here, since a
+/// test wrongly left out is a regression shipped. [`Affected::widen`] is the
+/// answer to that: the caller names the packages the change touched and every
+/// test under them joins, reached or not.
+pub fn affected(db: &Database, req: Affected<'_>) -> Result<String> {
+    let held = Held::of(db, req.plane, None, req.instance)?;
+    let graphs = Graphs::open(db, req.plane, &held, None)?;
+    let plane = &graphs.here;
+    let depth = req.depth.clamp(1, 6);
+    let mut set = reaching(plane, req.seeds, depth)?;
+    let reached = set.found.len();
+    if !req.widen.is_empty() {
+        for n in plane.query().scan_all().nodes()? {
+            if !is_test(&n) || set.found.contains_key(&n.id) {
+                continue;
+            }
+            let Some(file) = file_of(&n) else { continue };
+            if req.widen.iter().any(|p| file.starts_with(p.as_str())) {
+                set.found.insert(n.id, (n, Why::Package));
+            }
+        }
+    }
+    render(plane, &req, &set, depth, reached)
+}
+
+/// What a walk from each seed found: the tests, and what it could not settle.
+struct Reaching {
+    found: std::collections::BTreeMap<crate::NodeId, (NodeRecord, Why)>,
+    /// Seeds that named no one declaration, each saying why.
+    unsettled: Vec<String>,
+    /// Seeds that resolved and were walked.
+    read: usize,
+    /// Sites naming a seed without proving they reach it.
+    candidates: usize,
+}
+
+/// Every test reaching one of `seeds` through incoming structural edges.
+fn reaching(plane: &PlaneHandle<'_>, seeds: &[String], depth: usize) -> Result<Reaching> {
+    let mut found: std::collections::BTreeMap<crate::NodeId, (NodeRecord, Why)> =
+        std::collections::BTreeMap::new();
+    let mut unsettled: Vec<String> = Vec::new();
+    let mut read = 0usize;
+    let mut candidates = 0usize;
+
+    for name in seeds {
+        let node = match resolve(plane, name)? {
+            Resolved::One(n) => n,
+            Resolved::Many(hits) => {
+                unsettled.push(format!(
+                    "`{name}` names {} declarations here — nothing was walked from it",
+                    hits.len()
+                ));
+                continue;
+            }
+            Resolved::None => {
+                unsettled.push(format!("`{name}` is no declaration this plane holds"));
+                continue;
+            }
+        };
+        read += 1;
+        // A test the change edited is a test to run. Nothing needs to reach
+        // it, and nothing would: a test is a leaf of this walk.
+        if is_test(&node) {
+            found.insert(node.id, (node.clone(), Why::Changed));
+        }
+        walk(
+            plane,
+            node.id,
+            Bounds {
+                dirs: INWARD,
+                ty: None,
+                depth,
+                budget: usize::MAX,
+            },
+            |hop| {
+                if !hop.fresh {
+                    return Ok(Step::Skip);
+                }
+                let (Some(edge), Some(n)) = (plane.edge(hop.edge)?, plane.node(hop.node)?) else {
+                    return Ok(Step::Skip);
+                };
+                if !IMPACT_EDGES.contains(&edge.ty.as_str()) {
+                    return Ok(Step::Skip);
+                }
+                if is_test(&n) {
+                    found
+                        .entry(hop.node)
+                        .or_insert_with(|| (n, Why::Reaches(edge.ty.clone())));
+                }
+                Ok(Step::Take)
+            },
+        )?;
+        candidates += may_call(plane, &node)?;
+    }
+    Ok(Reaching {
+        found,
+        unsettled,
+        read,
+        candidates,
+    })
+}
+
+/// The set as a reader takes it: grouped by file, and followed by everything
+/// the walk could not see.
+fn render(
+    plane: &PlaneHandle<'_>,
+    req: &Affected<'_>,
+    set: &Reaching,
+    depth: usize,
+    reached: usize,
+) -> Result<String> {
+    const FILE_CAP: usize = 12;
+    let (found, unsettled) = (&set.found, &set.unsettled);
+    let (read, candidates) = (set.read, set.candidates);
+    let mut by_file: std::collections::BTreeMap<String, Vec<(&NodeRecord, &Why)>> =
+        std::collections::BTreeMap::new();
+    let mut weak = 0usize;
+    for (node, why) in found.values() {
+        if prop_str(&node.properties, TEST_CONFIDENCE_PROP).is_some_and(|c| c != DEFINITIVE) {
+            weak += 1;
+        }
+        by_file
+            .entry(file_of(node).unwrap_or("<no file recorded>").to_string())
+            .or_default()
+            .push((node, why));
+    }
+
+    let mut out = format!(
+        "affected tests: {} in {} file(s) — from {} of {} changed symbol(s), depth {depth}\n",
+        found.len(),
+        by_file.len(),
+        read,
+        req.seeds.len()
+    );
+    if let Some(note) = synced_note(plane)? {
+        out.push_str(&note);
+    }
+    for (file, tests) in &by_file {
+        out.push_str(&format!("{file}  ({})\n", tests.len()));
+        for (node, why) in tests.iter().take(FILE_CAP) {
+            let key = node.external_key.as_deref().unwrap_or("<keyless>");
+            out.push_str(&format!("  {key}  [{}]\n", why.as_str()));
+        }
+        if tests.len() > FILE_CAP {
+            out.push_str(&format!("  … and {} more\n", tests.len() - FILE_CAP));
+        }
+    }
+    if !req.widen.is_empty() {
+        out.push_str(&format!(
+            "widened: {} reached a change, {} more are in a package it touched\n",
+            reached,
+            found.len() - reached
+        ));
+    }
+    if !unsettled.is_empty() {
+        out.push_str(&format!("unsettled ({}):\n", unsettled.len()));
+        for line in unsettled {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    if weak > 0 {
+        out.push_str(&format!(
+            "note: {weak} of these are marked test code on evidence the plugin ranked below \
+             `{DEFINITIVE}` — a framework header a file includes, a filename convention. \
+             `get_node` reads `{TEST_CONFIDENCE_PROP}` where that matters.\n"
+        ));
+    }
+    if candidates > 0 {
+        out.push_str(&format!(
+            "note: {candidates} site(s) name a changed symbol without proving they call it \
+             (`{MAY_CALL}`), and are not in the count above.\n"
+        ));
+    }
+    out.push_str(
+        "note: recorded edges only — a test reaching the change through dynamic dispatch or an \
+         untyped receiver has no edge to be found by, so this is a lower bound. Widen to the \
+         packages the change touched where a miss would cost more than the time.\n",
+    );
+    Ok(out)
+}
+
+/// Whether a plugin marked this declaration test code.
+fn is_test(n: &NodeRecord) -> bool {
+    prop_str(&n.properties, TEST_FLAG_PROP).is_some()
+}
+
+/// The file a node was declared in, under either spelling.
+fn file_of(n: &NodeRecord) -> Option<&str> {
+    prop_str(&n.properties, "file").or_else(|| prop_str(&n.properties, "path"))
+}
+
+/// How many sites name this symbol without proving they reach it.
+///
+/// One hop only. A candidate is already unproven; a chain of candidates would
+/// be a guess about a guess, and counting it would say more than the parse
+/// knows.
+fn may_call(plane: &PlaneHandle<'_>, node: &NodeRecord) -> Result<usize> {
+    Ok(walk(
+        plane,
+        node.id,
+        Bounds {
+            dirs: INWARD,
+            ty: Some(MAY_CALL),
+            depth: 1,
+            budget: usize::MAX,
+        },
+        |_| Ok(Step::Take),
+    )?
+    .levels
+    .first()
+    .map_or(0, Vec::len))
 }
 
 /// The label a plugin puts on a node standing in for something outside its
@@ -3080,6 +3350,184 @@ mod tests {
         let _ = g;
         txn.commit().unwrap();
         db
+    }
+
+    /// A plane with production code and the tests that reach it: one test
+    /// beside the code it tests, one a hop further out in a file of its own,
+    /// and one that reaches neither.
+    fn with_tests() -> Database {
+        let db = Database::in_memory().unwrap();
+        let p = db.create_plane("code", Properties::new()).unwrap();
+        let mut txn = p.write().unwrap();
+        let at = |file: &str, line: i64| {
+            let mut props = Properties::new();
+            props.insert(
+                "file".into(),
+                PropDesc::described("file", PropValue::Str(file.into())),
+            );
+            props.insert("line".into(), PropDesc::new(PropValue::Int(line)));
+            props
+        };
+        let test_at = |file: &str, line: i64, flag: &str, confidence: &str| {
+            let mut props = at(file, line);
+            props.insert(
+                TEST_FLAG_PROP.into(),
+                PropDesc::described(
+                    "how this was known to be test code",
+                    PropValue::Str(flag.into()),
+                ),
+            );
+            props.insert(
+                TEST_CONFIDENCE_PROP.into(),
+                PropDesc::new(PropValue::Str(confidence.into())),
+            );
+            props
+        };
+        let go = txn
+            .create_node_with_key("m::api::go", &["Function"], at("src/api.rs", 10))
+            .unwrap();
+        let run = txn
+            .create_node_with_key("m::api::run", &["Function"], at("src/api.rs", 40))
+            .unwrap();
+        let other = txn
+            .create_node_with_key("m::util::trim", &["Function"], at("src/util.rs", 7))
+            .unwrap();
+        let near = txn
+            .create_node_with_key(
+                "m::api::tests::go_returns_a_value",
+                &["Function"],
+                test_at("src/api.rs", 200, "attribute", DEFINITIVE),
+            )
+            .unwrap();
+        let far = txn
+            .create_node_with_key(
+                "cli::end_to_end",
+                &["Function"],
+                test_at("tests/cli.rs", 12, "framework-include", "circumstantial"),
+            )
+            .unwrap();
+        let elsewhere = txn
+            .create_node_with_key(
+                "cli::trims_whitespace",
+                &["Function"],
+                test_at("tests/cli.rs", 60, "attribute", DEFINITIVE),
+            )
+            .unwrap();
+        txn.create_edge(run, go, "CALLS", Properties::new())
+            .unwrap();
+        txn.create_edge(near, go, "CALLS", Properties::new())
+            .unwrap();
+        txn.create_edge(far, run, "CALLS", Properties::new())
+            .unwrap();
+        txn.create_edge(elsewhere, other, "CALLS", Properties::new())
+            .unwrap();
+        txn.commit().unwrap();
+        db
+    }
+
+    fn reached(db: &Database, seeds: &[&str], widen: &[&str], depth: usize) -> String {
+        let seeds: Vec<String> = seeds.iter().map(|s| (*s).to_string()).collect();
+        let widen: Vec<String> = widen.iter().map(|s| (*s).to_string()).collect();
+        affected(
+            db,
+            Affected {
+                plane: "code",
+                seeds: &seeds,
+                depth,
+                widen: &widen,
+                instance: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The whole point: a changed symbol names the tests that reach it, and
+    /// not the ones that do not.
+    #[test]
+    fn a_change_names_the_tests_that_reach_it_and_no_others() {
+        let out = reached(&with_tests(), &["m::api::go"], &[], 3);
+        assert!(out.contains("affected tests: 2 in 2 file(s)"), "{out}");
+        assert!(
+            out.contains("m::api::tests::go_returns_a_value  [CALLS]"),
+            "{out}"
+        );
+        assert!(out.contains("cli::end_to_end  [CALLS]"), "{out}");
+        assert!(!out.contains("trims_whitespace"), "{out}");
+    }
+
+    /// A test is reached through the production code it tests, which is more
+    /// than one hop in any real tree. A depth that stops short says so by
+    /// returning fewer, not by failing.
+    #[test]
+    fn depth_bounds_how_far_a_test_may_sit_from_the_change() {
+        let db = with_tests();
+        let near = reached(&db, &["m::api::go"], &[], 1);
+        assert!(near.contains("affected tests: 1 in 1 file(s)"), "{near}");
+        assert!(near.contains("go_returns_a_value"), "{near}");
+        assert!(!near.contains("end_to_end"), "{near}");
+    }
+
+    /// A change that edits a test is a change to run that test, and nothing
+    /// reaches a test to find it that way.
+    #[test]
+    fn a_test_the_change_edited_is_in_the_set_itself() {
+        let out = reached(&with_tests(), &["cli::trims_whitespace"], &[], 3);
+        assert!(out.contains("cli::trims_whitespace  [changed]"), "{out}");
+    }
+
+    /// `--safe`: every test under a package the change touched, reached or
+    /// not, and the line says how many of each so the widening is visible.
+    #[test]
+    fn widening_adds_every_test_under_a_touched_package() {
+        let out = reached(&with_tests(), &["m::api::go"], &["tests/"], 3);
+        assert!(
+            out.contains("cli::trims_whitespace  [in a changed package]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("widened: 2 reached a change, 1 more are in a package it touched"),
+            "{out}"
+        );
+    }
+
+    /// Evidence the plugin itself ranked below definitive is said, because a
+    /// file flagged by the header it includes may hold no test at all.
+    #[test]
+    fn evidence_weaker_than_definitive_is_reported() {
+        let out = reached(&with_tests(), &["m::api::go"], &[], 3);
+        assert!(
+            out.contains("1 of these are marked test code on evidence"),
+            "{out}"
+        );
+        assert!(out.contains("below `definitive`"), "{out}");
+    }
+
+    /// A seed the plane does not hold is named and the others still answered:
+    /// a diff naming a deleted symbol must not cost the rest of the set.
+    #[test]
+    fn a_seed_this_plane_does_not_hold_is_named_not_dropped() {
+        let out = reached(
+            &with_tests(),
+            &["m::api::go", "zzz::deleted_last_week"],
+            &[],
+            3,
+        );
+        assert!(out.contains("from 1 of 2 changed symbol(s)"), "{out}");
+        assert!(out.contains("unsettled (1):"), "{out}");
+        assert!(
+            out.contains("`zzz::deleted_last_week` is no declaration this plane holds"),
+            "{out}"
+        );
+        assert!(out.contains("affected tests: 2"), "{out}");
+    }
+
+    /// The set is a lower bound and every answer says so — the one failure a
+    /// reader of this verb cannot see for themselves.
+    #[test]
+    fn every_answer_states_that_it_is_a_lower_bound() {
+        let out = reached(&with_tests(), &["m::api::go"], &[], 3);
+        assert!(out.contains("recorded edges only"), "{out}");
+        assert!(out.contains("lower bound"), "{out}");
     }
 
     #[test]
