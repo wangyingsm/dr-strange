@@ -280,6 +280,10 @@ enum Command {
         /// `all` — every plane this instance holds.
         #[arg(long, value_name = "SCOPE", num_args = 0..=1, default_missing_value = "attached")]
         across: Option<AcrossScope>,
+        /// Markdown for a pull request instead of the compact answer, and
+        /// nothing at all where nothing reaches the symbol (`ci/README.md`).
+        #[arg(long)]
+        report: bool,
     },
     /// Record a plane this one may ask — a plane on this instance, or one
     /// served by another drsg.
@@ -380,6 +384,10 @@ enum Command {
         /// Narrow a path to one method — `GET`, `post`.
         #[arg(long)]
         verb: Option<String>,
+        /// Markdown for a pull request instead of the compact answer, and
+        /// nothing at all where this states no route (`ci/README.md`).
+        #[arg(long)]
+        report: bool,
     },
     /// Source text: a symbol read to its end, or a range of a file.
     ///
@@ -1225,21 +1233,42 @@ struct AffectedArgs {
     /// Hops of incoming edges to walk (1..=6, default 3).
     #[arg(long)]
     depth: Option<usize>,
+    /// Markdown for a pull request instead of the compact answer, and nothing
+    /// at all when the change names no declaration — so a CI template can test
+    /// the output for emptiness (`ci/README.md`).
+    #[arg(long, conflicts_with = "seeds")]
+    report: bool,
+    /// Print only the keys of the declarations the change touched, one per
+    /// line: what to ask `impact` and `wire` about, one at a time.
+    #[arg(long)]
+    seeds: bool,
     /// The checkout to read, when the plane records none of its own.
     #[arg(long)]
     root: Option<PathBuf>,
 }
 
 impl AffectedArgs {
-    /// The tool's request these flags spell, and the fallback checkout.
-    fn into_req(self) -> (dr_strange_mcp::AffectedReq, Option<PathBuf>) {
+    /// The tool's request these flags spell, the output asked for, and the
+    /// fallback checkout.
+    fn into_req(
+        self,
+    ) -> (
+        dr_strange_mcp::AffectedReq,
+        dr_strange_mcp::AffectedOutput,
+        Option<PathBuf>,
+    ) {
+        let out = match (self.report, self.seeds) {
+            (_, true) => dr_strange_mcp::AffectedOutput::Seeds,
+            (true, _) => dr_strange_mcp::AffectedOutput::Report,
+            _ => dr_strange_mcp::AffectedOutput::Compact,
+        };
         let req = dr_strange_mcp::AffectedReq {
             plane: self.plane,
             vs: self.vs,
             safe: self.safe,
             depth: self.depth,
         };
-        (req, self.root)
+        (req, out, self.root)
     }
 }
 
@@ -1251,12 +1280,12 @@ fn run_affected(
     out: &mut dyn Write,
 ) -> Result<()> {
     let db = commands::open(db_path, config::retain_commits(cfg))?;
-    let (req, root) = args.into_req();
+    let (req, want, root) = args.into_req();
     let parsers = recall_parsers(cfg)?;
     write!(
         out,
         "{}",
-        dr_strange_mcp::affected_logic(&db, root.as_deref(), &*parsers, req)?
+        dr_strange_mcp::affected_logic(&db, root.as_deref(), &*parsers, req, want)?
     )?;
     Ok(())
 }
@@ -1534,26 +1563,25 @@ fn run_agent_verbs(
             plane,
             depth,
             across,
+            report,
         } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             // Reading a graph the operator attached themselves is proxied
             // like their other commands, as `wire` reads one.
             let remote = dr_strange_web::attach::Reader::from_env(config::network(cfg)?);
-            write!(
-                out,
-                "{}",
-                compact::impact(
-                    &db,
-                    compact::Impact {
-                        plane: &plane,
-                        name: &name,
-                        depth,
-                        across: across.map(Into::into),
-                        instance: None,
-                        remote: Some(&remote),
-                    },
-                )?
-            )?;
+            let ask = compact::Impact {
+                plane: &plane,
+                name: &name,
+                depth,
+                across: across.map(Into::into),
+                instance: None,
+                remote: Some(&remote),
+            };
+            let answer = match report {
+                true => compact::impact_report(&db, ask)?,
+                false => compact::impact(&db, ask)?,
+            };
+            write!(out, "{answer}")?;
             Ok(())
         }
         at @ (Command::Attach { .. } | Command::Detach { .. } | Command::Attachments { .. }) => {
@@ -1562,26 +1590,29 @@ fn run_agent_verbs(
         m @ (Command::Mount { .. } | Command::Unmount { .. } | Command::Mounts { .. }) => {
             run_mount_verbs(m, cfg, out)
         }
-        Command::Wire { name, plane, verb } => {
+        Command::Wire {
+            name,
+            plane,
+            verb,
+            report,
+        } => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
             // The operator attached these planes themselves, so reading one is
             // proxied like their other commands — the same reading
             // `serve --follow` takes of the primary it was pointed at.
             let remote = dr_strange_web::attach::Reader::from_env(config::network(cfg)?);
-            write!(
-                out,
-                "{}",
-                dr_strange_core::compact::wire(
-                    &db,
-                    dr_strange_core::compact::Wire {
-                        plane: &plane,
-                        name: &name,
-                        verb: verb.as_deref(),
-                        instance: None,
-                        remote: Some(&remote),
-                    },
-                )?
-            )?;
+            let ask = dr_strange_core::compact::Wire {
+                plane: &plane,
+                name: &name,
+                verb: verb.as_deref(),
+                instance: None,
+                remote: Some(&remote),
+            };
+            let answer = match report {
+                true => dr_strange_core::compact::wire_report(&db, ask)?,
+                false => dr_strange_core::compact::wire(&db, ask)?,
+            };
+            write!(out, "{answer}")?;
             Ok(())
         }
         // `snippet`, `grep` and `traverse` are the MCP surface's, called here
@@ -2751,6 +2782,61 @@ mod tests {
         assert!(
             Cli::try_parse_from(["drsg", "recall", "src/lib.rs"]).is_err(),
             "`--at` is required"
+        );
+    }
+
+    /// The two flags a CI template drives `affected` with, and the one
+    /// combination that has no meaning: a stream of keys cannot also be a
+    /// Markdown report, and clap should say so rather than pick one.
+    #[test]
+    fn a_report_and_a_seed_list_are_each_asked_for_once() {
+        let plain = Cli::try_parse_from(["drsg", "affected"]).unwrap();
+        let Command::Affected(args) = plain.command else {
+            panic!("should parse as Affected")
+        };
+        assert_eq!(args.into_req().1, dr_strange_mcp::AffectedOutput::Compact);
+
+        for (argv, want) in [
+            (
+                ["drsg", "affected", "--report"],
+                dr_strange_mcp::AffectedOutput::Report,
+            ),
+            (
+                ["drsg", "affected", "--seeds"],
+                dr_strange_mcp::AffectedOutput::Seeds,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::Affected(args) = cli.command else {
+                panic!("should parse as Affected")
+            };
+            assert_eq!(args.into_req().1, want, "{argv:?}");
+        }
+
+        assert!(
+            Cli::try_parse_from(["drsg", "affected", "--report", "--seeds"]).is_err(),
+            "a report and a seed list are different answers"
+        );
+    }
+
+    /// `--report` is the pull-request rendering of the two verbs a template
+    /// asks about each changed declaration.
+    #[test]
+    fn impact_and_wire_each_take_a_report_flag() {
+        let radius = Cli::try_parse_from(["drsg", "impact", "k::go", "--report"]).unwrap();
+        assert!(
+            matches!(radius.command, Command::Impact { report: true, .. }),
+            "impact takes --report"
+        );
+        let routes = Cli::try_parse_from(["drsg", "wire", "/api", "--report"]).unwrap();
+        assert!(
+            matches!(routes.command, Command::Wire { report: true, .. }),
+            "wire takes --report"
+        );
+        let compact = Cli::try_parse_from(["drsg", "impact", "k::go"]).unwrap();
+        assert!(
+            matches!(compact.command, Command::Impact { report: false, .. }),
+            "and neither reports unasked"
         );
     }
 
