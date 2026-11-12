@@ -35,6 +35,34 @@ All notable changes to Dr Strange are documented here. The format is based on
   changed line can land on the declaration that used to be there. That one is
   a warning, because nothing else in the answer would look wrong.
 
+- **The pull-request impact report: a GitHub Action and a GitLab CI
+  template**, published in [`ci/`](ci/README.md). One comment on a pull
+  request says what the change reaches: the tests to run, what calls the
+  declarations it touched, and the HTTP routes they are on. The action writes
+  the job summary and keeps a single comment up to date; the template writes
+  an artifact and a merge-request note.
+
+  Nothing is cached, because nothing needs to be. A digest of this repository
+  — 111k lines, eight languages — takes 2.9s, calls no model and needs no API
+  key (`--code-only --no-embed --no-git`), so the graph is rebuilt at the head
+  commit of every run. That is cheaper than keeping one warm, and it is why
+  the report cannot be stale. Only the parser plugins are cached, because they
+  are downloaded rather than computed.
+
+- **`--report` on `impact`, `affected` and `wire`**, and `--seeds` on
+  `affected`. `--report` renders the verb's own answer as Markdown and prints
+  **nothing at all** when there is nothing to report — a symbol nothing
+  reaches, a declaration on no route, a change that named no declaration — so
+  a CI template decides whether a section belongs by testing a file for
+  emptiness rather than by matching prose that may be reworded. `--seeds`
+  prints the changed declarations' keys, one per line and nothing else, which
+  is what the loop over `impact` reads.
+
+  The notes are the compact ones, quoted: the bound is worded once, and a
+  reviewer is owed the caveat an agent gets. Both are CLI-only — the MCP tools
+  are unchanged, because an agent wants the compact answer, and `openrpc.json`
+  gains no method, so no SDK goes stale.
+
 ## [2.29.0] - 2026-11-11
 
 An edge's own facts, readable from a query (ROADMAP §15). `_confidence` and
