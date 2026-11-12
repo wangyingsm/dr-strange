@@ -1,0 +1,226 @@
+name: drsg impact report
+description: >-
+  Digest this checkout into a code graph and report what the pull request
+  reaches: the tests to run, what calls the changed declarations, and the HTTP
+  routes they are on. Writes the job summary, and keeps one pull-request
+  comment up to date.
+author: dr-strange
+
+inputs:
+  plane:
+    description: >-
+      The plane this checkout is digested into. Only this job reads it, so the
+      name matters no more than a temporary file's.
+    required: false
+    default: ci
+  plugins:
+    description: >-
+      Space-separated parser plugins to install. Naming only the languages
+      this repository holds is faster on a cold cache — `rust`, or `go py`.
+    required: false
+    default: rust go py ts java csharp c kotlin
+  base:
+    description: >-
+      The revision the change is measured from. Defaults to the pull request's
+      base commit; on a push, set it to what you want compared.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  depth:
+    description: Hops of incoming edges walked from each changed declaration (1..=6).
+    required: false
+    default: "3"
+  safe:
+    description: >-
+      Add every test under the packages the change touched, reached or not.
+      Slower to run and it cannot miss a test whose edge the parser could not
+      resolve.
+    required: false
+    default: "false"
+  max-symbols:
+    description: >-
+      How many changed declarations get a radius and a route section of their
+      own. The test set is always complete; this bounds only the per-symbol
+      detail, so a 400-file pull request still produces a comment someone
+      reads.
+    required: false
+    default: "10"
+  comment:
+    description: >-
+      Post the report as a pull-request comment, editing the same comment on
+      every push. The job summary is written either way.
+    required: false
+    default: "true"
+  token:
+    description: "A token with `pull-requests: write`, for the comment."
+    required: false
+    default: ${{ github.token }}
+  version:
+    description: The drsg release to install, or `latest`.
+    required: false
+    default: latest
+
+outputs:
+  report:
+    description: Path to the Markdown report, empty when the change named no declaration.
+    value: ${{ steps.report.outputs.path }}
+  tests:
+    description: How many tests the change reaches, or empty when there was nothing to report.
+    value: ${{ steps.report.outputs.tests }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install drsg
+      id: install
+      shell: bash
+      env:
+        DRSG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh |
+          sh -s -- --version "$DRSG_VERSION" --dir "$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        # The plugin store holds artifacts precompiled by this binary's own
+        # wasmtime, so the cache is keyed on the version that wrote them.
+        echo "version=$("$HOME/.local/bin/drsg" --version | awk '{ print $2 }')" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the plugin store
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/share/drsg/plugins
+        key: drsg-plugins-${{ runner.os }}-${{ steps.install.outputs.version }}-${{ inputs.plugins }}
+        restore-keys: |
+          drsg-plugins-${{ runner.os }}-${{ steps.install.outputs.version }}-
+
+    - name: Install the parser plugins
+      shell: bash
+      env:
+        PLUGINS: ${{ inputs.plugins }}
+      run: |
+        set -euo pipefail
+        for plugin in $PLUGINS; do
+          drsg plugin install "$plugin"
+        done
+
+    - name: Fetch the base commit
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+      run: |
+        set -euo pipefail
+        if [ -z "$BASE" ]; then
+          echo 'drsg: no base revision — pass the `base` input on a push event' >&2
+          exit 1
+        fi
+        # `actions/checkout` is shallow by default and the report compares two
+        # revisions, so the base commit's trees must be here.
+        git cat-file -e "$BASE^{commit}" 2>/dev/null ||
+          git fetch --no-tags --depth=1 origin "$BASE"
+
+    - name: Digest this checkout
+      shell: bash
+      env:
+        PLANE: ${{ inputs.plane }}
+      run: |
+        set -euo pipefail
+        # No model is involved and no key is needed: the parsers are wasm
+        # components, `--code-only` leaves documents out, and a graph of a
+        # hundred thousand lines takes a few seconds.
+        drsg --db "$RUNNER_TEMP/drsg.graph" digest . \
+          --apply --code-only --no-embed --no-git --plane "$PLANE"
+
+    - name: Write the report
+      id: report
+      shell: bash
+      env:
+        PLANE: ${{ inputs.plane }}
+        BASE: ${{ inputs.base }}
+        DEPTH: ${{ inputs.depth }}
+        SAFE: ${{ inputs.safe }}
+        MAX_SYMBOLS: ${{ inputs.max-symbols }}
+      run: |
+        set -euo pipefail
+        db="$RUNNER_TEMP/drsg.graph"
+        work="$RUNNER_TEMP/drsg-report"
+        mkdir -p "$work"
+        report="$work/report.md"
+        safe=()
+        if [ "$SAFE" = "true" ]; then safe=(--safe); fi
+
+        # Every verb prints Markdown with `--report`, and prints nothing at
+        # all when it has nothing to say — so each section is included by
+        # testing a file for emptiness rather than by parsing prose.
+        drsg --db "$db" affected --plane "$PLANE" --vs "$BASE" \
+          --depth "$DEPTH" "${safe[@]}" --report > "$work/tests.md"
+        if [ ! -s "$work/tests.md" ]; then
+          echo "drsg: this change names no declaration the plane holds — nothing to report"
+          echo "path=" >> "$GITHUB_OUTPUT"
+          echo "tests=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        {
+          echo "## What this change reaches"
+          echo
+          cat "$work/tests.md"
+        } > "$report"
+
+        drsg --db "$db" affected --plane "$PLANE" --vs "$BASE" --seeds |
+          head -n "$MAX_SYMBOLS" > "$work/seeds"
+
+        : > "$work/radius.md"
+        : > "$work/routes.md"
+        while read -r seed; do
+          [ -n "$seed" ] || continue
+          drsg --db "$db" impact "$seed" --plane "$PLANE" --depth "$DEPTH" --report >> "$work/radius.md"
+          drsg --db "$db" wire "$seed" --plane "$PLANE" --report >> "$work/routes.md"
+        done < "$work/seeds"
+
+        if [ -s "$work/radius.md" ]; then
+          { echo; echo "### What reaches the change"; echo; cat "$work/radius.md"; } >> "$report"
+        fi
+        if [ -s "$work/routes.md" ]; then
+          { echo; echo "### Routes the change is on"; echo; cat "$work/routes.md"; } >> "$report"
+        fi
+        {
+          echo
+          echo "<sub>drsg $("$HOME/.local/bin/drsg" --version | awk '{ print $2 }') ·"
+          echo "the declarations the change touched, walked back through the graph ·"
+          echo "every count is a lower bound, as each section says</sub>"
+        } >> "$report"
+
+        tests="$(sed -n 's/^\*\*\([0-9]*\)\*\* in .*/\1/p' "$work/tests.md" | head -1)"
+        echo "path=$report" >> "$GITHUB_OUTPUT"
+        echo "tests=$tests" >> "$GITHUB_OUTPUT"
+
+    - name: Job summary
+      if: steps.report.outputs.path != ''
+      shell: bash
+      env:
+        REPORT: ${{ steps.report.outputs.path }}
+      run: cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on the pull request
+      if: ${{ steps.report.outputs.path != '' && inputs.comment == 'true' && github.event.pull_request.number }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPORT: ${{ steps.report.outputs.path }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        marker='<!-- drsg-impact-report -->'
+        # A comment caps at 65536 characters, and a report that long is one
+        # nobody reads anyway: the summary keeps the whole of it.
+        body="$(printf '%s\n%s\n' "$marker" "$(head -c 60000 "$REPORT")")"
+        existing="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+          --jq "map(select(.body | startswith(\"$marker\"))) | .[0].id // empty")"
+        # A fork's token is read-only. Saying so beats a red step: the report
+        # is in the job summary either way.
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body" --silent ||
+            echo "drsg: could not edit the comment — the report is in the job summary"
+        else
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" --silent ||
+            echo "drsg: could not comment (a fork's token is read-only) — the report is in the job summary"
+        fi
