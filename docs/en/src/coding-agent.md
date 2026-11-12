@@ -339,7 +339,10 @@ reported as `holds its own` rather than counted as a user.
 
 The same verbs answer for a reviewer, who has a diff and no graph. A pull
 request gets one comment: the tests the change reaches, what calls the
-declarations it touched, and the HTTP routes they are on.
+declarations it touched, and the routes they are on — each seed's own, and
+those of the type that contains it, because Spring MVC states a route on the
+handler method while Dubbo states one on the type, and a changed declaration
+is usually a method.
 
 Nothing is cached, because nothing needs to be. A digest of this repository —
 111k lines of eight languages — takes under three seconds, builds no index an

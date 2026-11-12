@@ -1,8 +1,14 @@
 # The pull-request impact report
 
 What a diff does not show: which tests reach the change, what calls the
-declarations it touched, and which HTTP routes sit above them. Both templates
+declarations it touched, and which routes sit above them. Both templates
 digest the checkout into a code graph and ask the same three verbs for it.
+
+A route is asked about twice: once for each changed declaration, once for what
+contains it. Frameworks disagree about which of the two states a route — Spring
+MVC marks the handler method, Dubbo the type that exports the service — and a
+changed declaration is usually a method, so asking only about the seed would
+show HTTP routes and silently never an RPC service.
 
 A digest is seconds, not minutes — 111k lines of this repository take 2.9s on
 one core — so neither template caches a graph. The graph is built at the head
@@ -39,7 +45,7 @@ jobs:
 | `base` | the pull request's base commit | the revision the change is measured from — required on a `push` event |
 | `depth` | `3` | hops of incoming edges walked from each changed declaration (1..=6) |
 | `safe` | `false` | add every test under the packages the change touched, reached or not |
-| `max-symbols` | `10` | how many changed declarations get a radius and a route section of their own; the test set is always complete |
+| `max-symbols` | `10` | how many changed declarations get a radius and a route section of their own (their containing types are asked about too); the test set is always complete |
 | `comment` | `true` | keep one pull-request comment up to date, editing it on every push |
 | `token` | `github.token` | needs `pull-requests: write` for that comment |
 | `version` | `latest` | the drsg release to install |
