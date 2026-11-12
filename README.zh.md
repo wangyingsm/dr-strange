@@ -129,7 +129,7 @@ JSON-RPC 2.0 接口、浏览器控制台以及 WebSocket 变更流，并配有�
 | **变更流** | 订阅某个平面并实时接收其变更 |
 | **代码图化** | 沙箱化的 wasm 解析器插件将代码仓库转化为已解析的调用图——官方共十三个插件，并提供社区解析器 SDK |
 | **提交同步监视** | `serve watch` 将每次提交折叠进平面，结果与全量重新消化收敛一致 |
-| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `fathom` · `snippet` · `history` · `deployed` · `recall` · `wire`——每个问题一次往返 |
+| **智能体工具** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `affected` · `fathom` · `snippet` · `history` · `deployed` · `recall` · `wire`——每个问题一次往返 |
 | **平面附着** | `drsg attach` 记录「本平面可以询问那一个」——对象可以在本实例上，也可以是另一个 drsg 的 URL——于是 `impact --across` 与 `wire` 能够跨仓库作答 |
 | **数据库挂载** | `drsg mount` 把另一个数据库的平面挂到**正在运行的**服务上，各自保留自己的名字、写入者与生命周期；没有任何东西被复制或重新消化 |
 | **备份 / 恢复** | 一致且保留 id 的全库快照 |
@@ -239,8 +239,8 @@ drsg is already serving . at http://127.0.0.1:51900/mcp — reusing it, the plan
 节一致。更长的那条路径——digest、serve 与查询分作三步——见[编码智能体
 章节](https://wangyingsm.github.io/dr-strange/zh/book/coding-agent.html)。
 
-十二个动词回答智能体的问题，每个一次往返，以紧凑的「一行一个事实」文本给出。这
-十二个既是 `drsg serve` 上的 MCP 工具，也都是命令行子命令。
+十三个动词回答智能体的问题，每个一次往返，以紧凑的「一行一个事实」文本给出。这
+十三个既是 `drsg serve` 上的 MCP 工具，也都是命令行子命令。
 
 | 动词 | 它回答的问题 |
 |---|---|
@@ -255,6 +255,7 @@ drsg is already serving . at http://127.0.0.1:51900/mcp — reusing it, the plan
 | `history` | 代码背后的仓库：HEAD、分支、标签、变基与最新的提交 |
 | `deployed` | 某个运行中的东西是由哪次提交构建的，以及哪些东西在跑某次提交——把清单构成的运维平面连到它旁边的历史平面 |
 | `recall` | 同一份代码当时的样子：一个文件、一个目录、某个符号那时的声明、在旧树上的一次检索，或自某个较旧修订以来的变化 |
+| `affected` | 一次改动所波及的测试——工作区中尚未提交的改动，或 `<修订>..HEAD`——于是一次运行的范围由改动决定，而不是整个测试套件；它会自陈这是一个下界，而 `--safe` 把省下的时间换回确定性 |
 | `wire` | 什么在提供某个 HTTP 路径、什么在请求它——跨平面内的每种语言匹配，也跨它所附着的平面 |
 
 两条纪律贯穿整套工具。歧义的名字从不猜测：回答是一份候选清单，由调用方挑选。调用
