@@ -6,6 +6,26 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+## [2.30.0] - 2026-11-12
+
+Which tests to run, and which pull request to blame. `affected` turns a change
+into the set of tests that reach it — each changed declaration walked back
+through the same incoming edges `impact` uses, to the code the parsers marked
+as tests — so a run is scoped to the change rather than to the suite. On this
+repository a one-file edit is 87 tests where the suite is 2242.
+
+The second half is that answer leaving the terminal. `--report` renders
+`impact`, `affected` and `wire` as Markdown and prints *nothing at all* when
+there is nothing to report, which is what a CI template needs: a published
+GitHub Action and GitLab CI template digest a pull request's head commit —
+2.9s, no model, no API key — and post one comment saying what the change
+reaches. The same thing is a `report` parameter on the three MCP tools, so an
+agent asked to write that comment produces the same document.
+
+Both are lower bounds and say so in every answer. A test that reaches the
+change only through dynamic dispatch has no edge to be found by, and `--safe`
+is the answer when a miss would cost more than the time.
+
 ### Added
 
 - **`affected` — the tests a change reaches.** A new agent verb, on the CLI
@@ -3317,7 +3337,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.30.0...HEAD
+[2.30.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.30.0
 [1.7.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.7.0
 [1.6.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.6.0
 [1.5.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.5.0
