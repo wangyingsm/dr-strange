@@ -361,6 +361,10 @@ whether a section belongs by testing a file for emptiness, instead of matching
 prose that may be reworded. `--seeds` prints the changed declarations' keys,
 one per line and nothing else, which is what the loop above reads.
 
+The three verbs take the same thing as a `report` parameter over MCP, so an
+agent asked to write the comment itself produces the same Markdown. `--seeds`
+stays on the CLI: a stream of bare keys is a loop's input, not an answer.
+
 The notes are the compact ones, quoted. A reviewer is owed the caveat an agent
 gets — that a recorded edge is a lower bound, and that a test reaching the
 change through dynamic dispatch has no edge to be found by — so the report
