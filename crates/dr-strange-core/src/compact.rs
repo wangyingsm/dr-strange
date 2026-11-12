@@ -1164,29 +1164,151 @@ pub struct Impact<'a> {
 /// reaches — the question a shared library asks, where a change is local to
 /// one repository and its consequences are not.
 pub fn impact(db: &Database, req: Impact<'_>) -> Result<String> {
-    const LEVEL_CAP: usize = 20;
     // Taken before the graphs are opened and held for the whole answer: a
     // mounted database is owned by the instance, and a handle borrows it.
     let held = Held::of(db, req.plane, req.across, req.instance)?;
     let mut graphs = Graphs::open(db, req.plane, &held, req.remote)?;
-    let plane = &graphs.here;
-    let node = match resolve(plane, req.name)? {
-        Resolved::One(n) => n,
-        Resolved::Many(hits) => return Ok(candidates(req.name, &hits)),
-        Resolved::None => return no_match(plane, req.name),
-    };
     let depth = req.depth.clamp(1, 6);
-    let mut out = one_line(&node);
+    let walked = match radius(&graphs.here, req.name, depth)? {
+        Radius::Walked(w) => w,
+        Radius::Said(answer) => return Ok(answer),
+    };
+    let plane = &graphs.here;
+    let mut out = one_line(&walked.node);
     out.push('\n');
     if let Some(note) = synced_note(plane)? {
         out.push_str(&note);
     }
-    // A node is named for the edge that first reached it — the shortest way
-    // in, since the walk arrives breadth-first.
-    let mut lines: std::collections::BTreeMap<crate::NodeId, String> =
+    for (i, level) in walked.levels.iter().enumerate() {
+        out.push_str(&format!("depth {} ({}):\n", i + 1, level.len()));
+        for id in level.iter().take(LEVEL_CAP) {
+            if let Some((n, ty)) = walked.reached.get(id) {
+                out.push_str(&format!("  {}  [{ty}]\n", one_line(n)));
+            }
+        }
+        if level.len() > LEVEL_CAP {
+            out.push_str(&format!("  … and {} more\n", level.len() - LEVEL_CAP));
+        }
+    }
+    out.push_str(&format!(
+        "total affected within depth {depth}: {}\n",
+        walked.total
+    ));
+    out.push_str(&unproven(plane, &walked.node, walked.total)?);
+    out.push_str(CALLS_NOTE);
+    if req.across.is_some() {
+        let offered = Offered::new(plane, walked.offered)?;
+        let found = crossed(&mut graphs, &offered)?;
+        out.push_str(&render_across(&graphs, &offered, &found));
+    }
+    Ok(out)
+}
+
+/// `impact` as a pull request reads it: the same radius as Markdown, and
+/// **nothing at all** when there is nothing to report — so a CI template can
+/// test the answer for emptiness rather than parse prose for a zero.
+///
+/// The notes are the compact ones, quoted: a bound is worded once, and a
+/// reviewer is owed the same caveat an agent gets.
+pub fn impact_report(db: &Database, req: Impact<'_>) -> Result<String> {
+    let held = Held::of(db, req.plane, req.across, req.instance)?;
+    let mut graphs = Graphs::open(db, req.plane, &held, req.remote)?;
+    let depth = req.depth.clamp(1, 6);
+    let walked = match radius(&graphs.here, req.name, depth)? {
+        Radius::Walked(w) => w,
+        // Prose rather than a heading, and never silence: a name that settled
+        // on nothing would otherwise read as a symbol nothing reaches.
+        Radius::Said(_) => {
+            return Ok(format!(
+                "_`{}` is no one declaration in `{}` — nothing was walked from it._\n",
+                req.name, req.plane
+            ));
+        }
+    };
+    let plane = &graphs.here;
+    let unproven = unproven(plane, &walked.node, walked.total)?;
+    let crossing = match req.across.is_some() {
+        true => {
+            let offered = Offered::new(plane, walked.offered.clone())?;
+            let found = crossed(&mut graphs, &offered)?;
+            report_across(&found)
+        }
+        false => String::new(),
+    };
+    // A changed symbol nothing reaches, that nothing may reach either, and
+    // that no other repository holds, is the ordinary case in a pull request.
+    // It earns no heading.
+    if walked.total == 0 && unproven.is_empty() && crossing.is_empty() {
+        return Ok(String::new());
+    }
+    let key = walked.node.external_key.as_deref().unwrap_or(req.name);
+    let mut out = format!(
+        "#### `{key}` — {} reached within depth {depth}\n\n",
+        walked.total
+    );
+    if walked.total > 0 {
+        out.push_str("| depth | reaching | nearest |\n|---|---|---|\n");
+        for (i, level) in walked.levels.iter().enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} |\n",
+                i + 1,
+                level.len(),
+                nearest(&walked, level)
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str(&crossing);
+    out.push_str(&quoted(&unproven));
+    out.push_str(&quoted(CALLS_NOTE));
+    // Blank: the section a template appends next opens with a heading, and a
+    // heading against a block quote is a heading inside it in some readers.
+    out.push('\n');
+    Ok(out)
+}
+
+/// How many of one level a radius lists before it counts the rest.
+const LEVEL_CAP: usize = 20;
+
+/// How many of one level a *report* names. A pull-request comment is read
+/// rather than scanned, and the twenty a compact answer carries is a wall.
+const REPORT_CAP: usize = 3;
+
+/// What one `impact` call found, before anything is rendered.
+enum Radius {
+    /// The radius itself.
+    Walked(Walked),
+    /// The name settled on no one declaration, and the answer is the text
+    /// saying which — the same in both renderings, because an ambiguous name
+    /// is not a radius to summarise.
+    Said(String),
+}
+
+/// A walked radius: what both renderings read.
+struct Walked {
+    /// The symbol the walk started from.
+    node: NodeRecord,
+    /// Node ids by distance, nearest level first.
+    levels: Vec<Vec<crate::NodeId>>,
+    /// Each node reached, and the edge type that first reached it — the
+    /// shortest way in, since the walk arrives breadth-first.
+    reached: std::collections::BTreeMap<crate::NodeId, (NodeRecord, String)>,
+    /// Every external key in the radius, nearest first, the changed symbol
+    /// leading. Another graph holding one as a stand-in references this code.
+    offered: Vec<String>,
+    /// How many were reached in all, however many a renderer lists.
+    total: usize,
+}
+
+/// The walk both renderings read: inward over [`IMPACT_EDGES`], `depth` hops.
+fn radius(plane: &PlaneHandle<'_>, name: &str, depth: usize) -> Result<Radius> {
+    let node = match resolve(plane, name)? {
+        Resolved::One(n) => n,
+        Resolved::Many(hits) => return Ok(Radius::Said(candidates(name, &hits))),
+        Resolved::None => return Ok(Radius::Said(no_match(plane, name)?)),
+    };
+    let mut reached: std::collections::BTreeMap<crate::NodeId, (NodeRecord, String)> =
         std::collections::BTreeMap::new();
-    // Breadth-first order, so a radius too large to carry whole is truncated
-    // to the keys nearest the change.
     let mut offered: Vec<String> = node.external_key.iter().cloned().collect();
     let region = walk(
         plane,
@@ -1210,34 +1332,80 @@ pub fn impact(db: &Database, req: Impact<'_>) -> Result<String> {
             if let Some(key) = &n.external_key {
                 offered.push(key.clone());
             }
-            lines.insert(hop.node, format!("{}  [{}]", one_line(&n), edge.ty));
+            reached.insert(hop.node, (n, edge.ty.clone()));
             Ok(Step::Take)
         },
     )?;
+    let total = region.levels.iter().map(Vec::len).sum();
+    Ok(Radius::Walked(Walked {
+        node,
+        levels: region.levels,
+        reached,
+        offered,
+        total,
+    }))
+}
 
-    let mut total = 0usize;
-    for (i, level) in region.levels.iter().enumerate() {
-        total += level.len();
-        out.push_str(&format!("depth {} ({}):\n", i + 1, level.len()));
-        for id in level.iter().take(LEVEL_CAP) {
-            if let Some(line) = lines.get(id) {
-                out.push_str("  ");
-                out.push_str(line);
-                out.push('\n');
+/// The first few of a level, for a report's `nearest` column.
+fn nearest(walked: &Walked, level: &[crate::NodeId]) -> String {
+    let mut out = String::new();
+    for id in level.iter().take(REPORT_CAP) {
+        let Some((n, ty)) = walked.reached.get(id) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        out.push_str(&format!(
+            "`{}` {ty}",
+            n.external_key.as_deref().unwrap_or(&n.labels.join("/"))
+        ));
+    }
+    if level.len() > REPORT_CAP {
+        out.push_str(&format!(" · +{} more", level.len() - REPORT_CAP));
+    }
+    out
+}
+
+/// The cross-repository half of a report: which other graphs hold any of the
+/// radius, and how much of it.
+///
+/// Per-key detail stays in the compact answer. What a reviewer needs is that
+/// the change leaves this repository at all; `impact --across` is where they
+/// read what it touches there.
+fn report_across(found: &[Dependent]) -> String {
+    let mut rows = String::new();
+    for d in found.iter().filter(|d| d.holds()) {
+        rows.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            d.at,
+            d.uses.len(),
+            match d.declares.is_empty() {
+                true => "—",
+                false => "yes",
             }
-        }
-        if level.len() > LEVEL_CAP {
-            out.push_str(&format!("  … and {} more\n", level.len() - LEVEL_CAP));
-        }
+        ));
     }
-    out.push_str(&format!("total affected within depth {depth}: {total}\n"));
-    out.push_str(&unproven(plane, &node, total)?);
-    out.push_str(CALLS_NOTE);
-    if req.across.is_some() {
-        let offered = Offered::new(plane, offered)?;
-        out.push_str(&across(&mut graphs, &offered)?);
+    if rows.is_empty() {
+        return String::new();
     }
-    Ok(out)
+    format!("| also reached | keys used | declares the dependency |\n|---|---|---|\n{rows}\n")
+}
+
+/// Compact prose as a Markdown block quote, so a note written for an agent
+/// reads as an aside beside a table instead of a paragraph of its own.
+///
+/// Public because the layer that reads the diff writes notes of its own —
+/// what it could not read, and whether the plane is behind the tree — and one
+/// convention for both is one fewer thing to keep in step.
+pub fn quoted(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// What names this symbol without proving it does: the `MAY_CALL` candidates
@@ -1364,6 +1532,36 @@ pub fn affected(db: &Database, req: Affected<'_>) -> Result<String> {
     let graphs = Graphs::open(db, req.plane, &held, None)?;
     let plane = &graphs.here;
     let depth = req.depth.clamp(1, 6);
+    let (set, reached) = reached_and_widened(plane, &req, depth)?;
+    render(plane, &req, &set, depth, reached)
+}
+
+/// `affected` as a pull request reads it: the same set as Markdown, one
+/// collapsed section per file, and **nothing at all** when the caller named no
+/// changed declaration — a pull request that touched no code has no tests to
+/// name, and a template tests the answer for emptiness.
+pub fn affected_report(db: &Database, req: Affected<'_>) -> Result<String> {
+    if req.seeds.is_empty() {
+        return Ok(String::new());
+    }
+    let held = Held::of(db, req.plane, None, req.instance)?;
+    let graphs = Graphs::open(db, req.plane, &held, None)?;
+    let plane = &graphs.here;
+    let depth = req.depth.clamp(1, 6);
+    let (set, reached) = reached_and_widened(plane, &req, depth)?;
+    report_affected(plane, &req, &set, depth, reached)
+}
+
+/// The set both renderings read: what the walk reached, then every test under
+/// a touched package where the caller named one.
+///
+/// Returns the set and how much of it the walk itself reached, which is what
+/// the widened count is measured against.
+fn reached_and_widened(
+    plane: &PlaneHandle<'_>,
+    req: &Affected<'_>,
+    depth: usize,
+) -> Result<(Reaching, usize)> {
     let mut set = reaching(plane, req.seeds, depth)?;
     let reached = set.found.len();
     if !req.widen.is_empty() {
@@ -1377,7 +1575,7 @@ pub fn affected(db: &Database, req: Affected<'_>) -> Result<String> {
             }
         }
     }
-    render(plane, &req, &set, depth, reached)
+    Ok((set, reached))
 }
 
 /// What a walk from each seed found: the tests, and what it could not settle.
@@ -1466,7 +1664,6 @@ fn render(
     depth: usize,
     reached: usize,
 ) -> Result<String> {
-    const FILE_CAP: usize = 12;
     let (found, unsettled) = (&set.found, &set.unsettled);
     let (read, candidates) = (set.read, set.candidates);
     let mut by_file: std::collections::BTreeMap<String, Vec<(&NodeRecord, &Why)>> =
@@ -1516,23 +1713,117 @@ fn render(
         }
     }
     if weak > 0 {
-        out.push_str(&format!(
-            "note: {weak} of these are marked test code on evidence the plugin ranked below \
-             `{DEFINITIVE}` — a framework header a file includes, a filename convention. \
-             `get_node` reads `{TEST_CONFIDENCE_PROP}` where that matters.\n"
-        ));
+        out.push_str(&weak_evidence(weak));
     }
     if candidates > 0 {
+        out.push_str(&unbound(candidates));
+    }
+    out.push_str(LOWER_BOUND_NOTE);
+    Ok(out)
+}
+
+/// How many of one file's tests an answer lists before it counts the rest.
+const FILE_CAP: usize = 12;
+
+/// What `affected` ends with, in both renderings. The property that makes the
+/// verb usable is the one a reader must not have to infer.
+const LOWER_BOUND_NOTE: &str = "note: recorded edges only — a test reaching the change through dynamic dispatch or an \
+     untyped receiver has no edge to be found by, so this is a lower bound. Widen to the \
+     packages the change touched where a miss would cost more than the time.\n";
+
+/// Tests named on evidence the plugin itself ranked below [`DEFINITIVE`].
+fn weak_evidence(weak: usize) -> String {
+    format!(
+        "note: {weak} of these are marked test code on evidence the plugin ranked below \
+         `{DEFINITIVE}` — a framework header a file includes, a filename convention. \
+         `get_node` reads `{TEST_CONFIDENCE_PROP}` where that matters.\n"
+    )
+}
+
+/// Sites naming a changed symbol without proving they call it.
+fn unbound(candidates: usize) -> String {
+    format!(
+        "note: {candidates} site(s) name a changed symbol without proving they call it \
+         (`{MAY_CALL}`), and are not in the count above.\n"
+    )
+}
+
+/// The set as a reviewer takes it: a collapsed section per file, so a comment
+/// that names a thousand tests is still a comment someone reads.
+fn report_affected(
+    plane: &PlaneHandle<'_>,
+    req: &Affected<'_>,
+    set: &Reaching,
+    depth: usize,
+    reached: usize,
+) -> Result<String> {
+    /// How many files a report lists before it counts the rest. Past this the
+    /// answer is a number, not a list — `drsg affected` prints them all.
+    const FILES_CAP: usize = 20;
+    let (found, unsettled) = (&set.found, &set.unsettled);
+    let mut by_file: std::collections::BTreeMap<String, Vec<(&NodeRecord, &Why)>> =
+        std::collections::BTreeMap::new();
+    let mut weak = 0usize;
+    for (node, why) in found.values() {
+        if prop_str(&node.properties, TEST_CONFIDENCE_PROP).is_some_and(|c| c != DEFINITIVE) {
+            weak += 1;
+        }
+        by_file
+            .entry(file_of(node).unwrap_or("<no file recorded>").to_string())
+            .or_default()
+            .push((node, why));
+    }
+
+    let mut out = format!(
+        "### Tests this change reaches\n\n**{}** in {} file(s), from {} of {} changed \
+         declaration(s), depth {depth}.\n\n",
+        found.len(),
+        by_file.len(),
+        set.read,
+        req.seeds.len()
+    );
+    for (file, tests) in by_file.iter().take(FILES_CAP) {
         out.push_str(&format!(
-            "note: {candidates} site(s) name a changed symbol without proving they call it \
-             (`{MAY_CALL}`), and are not in the count above.\n"
+            "<details><summary><code>{file}</code> — {}</summary>\n\n| test | why |\n|---|---|\n",
+            tests.len()
+        ));
+        for (node, why) in tests.iter().take(FILE_CAP) {
+            let key = node.external_key.as_deref().unwrap_or("<keyless>");
+            out.push_str(&format!("| `{key}` | {} |\n", why.as_str()));
+        }
+        if tests.len() > FILE_CAP {
+            out.push_str(&format!("| … and {} more | |\n", tests.len() - FILE_CAP));
+        }
+        out.push_str("\n</details>\n\n");
+    }
+    if by_file.len() > FILES_CAP {
+        out.push_str(&format!(
+            "…and {} more file(s) — `drsg affected` names them all.\n\n",
+            by_file.len() - FILES_CAP
         ));
     }
-    out.push_str(
-        "note: recorded edges only — a test reaching the change through dynamic dispatch or an \
-         untyped receiver has no edge to be found by, so this is a lower bound. Widen to the \
-         packages the change touched where a miss would cost more than the time.\n",
-    );
+    let mut notes = String::new();
+    if !req.widen.is_empty() {
+        notes.push_str(&format!(
+            "widened: {reached} reached a change, {} more are in a package it touched\n",
+            found.len() - reached
+        ));
+    }
+    for line in unsettled {
+        notes.push_str(&format!("unsettled: {line}\n"));
+    }
+    if weak > 0 {
+        notes.push_str(&weak_evidence(weak));
+    }
+    if set.candidates > 0 {
+        notes.push_str(&unbound(set.candidates));
+    }
+    notes.push_str(LOWER_BOUND_NOTE);
+    if let Some(note) = synced_note(plane)? {
+        notes.push_str(&note);
+    }
+    out.push_str(&quoted(&notes));
+    out.push('\n');
     Ok(out)
 }
 
@@ -1711,7 +2002,7 @@ struct Used {
 }
 
 /// What a radius reaches beyond the plane it was walked in.
-fn across(graphs: &mut Graphs<'_>, offered: &Offered) -> Result<String> {
+fn crossed(graphs: &mut Graphs<'_>, offered: &Offered) -> Result<Vec<Dependent>> {
     graphs.fetch(&offered.plan());
     let mut found: Vec<Dependent> = Vec::new();
     for (at, p) in graphs.attached.iter() {
@@ -1722,7 +2013,7 @@ fn across(graphs: &mut Graphs<'_>, offered: &Offered) -> Result<String> {
         d.served = graphs.served_by(at).cloned();
         found.push(d);
     }
-    Ok(render_across(graphs, offered, &found))
+    Ok(found)
 }
 
 /// What a plane on this instance holds of a radius, read from its edges.
@@ -2807,33 +3098,11 @@ pub fn wire(db: &Database, req: Wire<'_>) -> Result<String> {
         None => return Ok(out),
     };
 
-    let mut matched = 0usize;
-    let mut unanswered = 0usize;
-    let mut unasked = 0usize;
-    for path in &paths {
-        let on_path = |side: &[Stated]| -> Vec<Stated> {
-            side.iter()
-                .filter(|s| &s.path == path)
-                .filter(|s| {
-                    want.as_deref()
-                        .is_none_or(|w| s.verb == w || s.verb == ANY_VERB)
-                })
-                .map(|s| Stated {
-                    verb: s.verb.clone(),
-                    path: s.path.clone(),
-                    node: s.node.clone(),
-                    from: s.from.clone(),
-                })
-                .collect()
-        };
-        let here_serves = on_path(&serves);
-        let here_requests = on_path(&requests);
-        if here_serves.is_empty() && here_requests.is_empty() {
-            continue;
-        }
-        out.push_str(&format!("path  {path}\n"));
-        wire_rows("serves  ", &here_serves, &mut out);
-        wire_rows("requests", &here_requests, &mut out);
+    let routes = routes(&paths, &serves, &requests, want.as_deref());
+    for route in &routes {
+        out.push_str(&format!("path  {}\n", route.path));
+        wire_rows("serves  ", &route.serves, &mut out);
+        wire_rows("requests", &route.requests, &mut out);
         // With a verb named, "nothing" means nothing *under that verb* — a
         // declaration this call filtered out is not a declaration missing.
         let under = match want.as_deref() {
@@ -2844,25 +3113,14 @@ pub fn wire(db: &Database, req: Wire<'_>) -> Result<String> {
             true => "this plane",
             false => "the graphs read",
         };
-        if here_serves.is_empty() {
+        if route.serves.is_empty() {
             out.push_str(&format!("  nothing in {read} serves it{under}\n"));
         }
-        if here_requests.is_empty() {
+        if route.requests.is_empty() {
             out.push_str(&format!("  nothing in {read} asks for it{under}\n"));
         }
-        for r in &here_requests {
-            if here_serves.iter().any(|s| s.answers(r)) {
-                matched += 1;
-            } else {
-                unanswered += 1;
-            }
-        }
-        for s in &here_serves {
-            if !here_requests.iter().any(|r| r.answers(s)) {
-                unasked += 1;
-            }
-        }
     }
+    let (matched, unanswered, unasked) = tally(&routes);
     out.push_str(&format!(
         "{} path(s); {matched} request(s) matched a declaration, {unanswered} reached none; \
          {unasked} declaration(s) nothing asks for\n",
@@ -2870,6 +3128,164 @@ pub fn wire(db: &Database, req: Wire<'_>) -> Result<String> {
     ));
     out.push_str(WIRE_NOTE);
     Ok(out)
+}
+
+/// `wire` as a pull request reads it: the routes this change is on, as
+/// Markdown, and **nothing at all** when it is on none — which is most of a
+/// repository, and why a CI template can call this per changed declaration.
+pub fn wire_report(db: &Database, req: Wire<'_>) -> Result<String> {
+    let held = Held::of(db, req.plane, Some(Scope::Attached), req.instance)?;
+    let mut graphs = Graphs::open(db, req.plane, &held, req.remote)?;
+    graphs.fetch(&route_plan());
+    let (serves, requests) = graphs.stated()?;
+    if serves.is_empty() && requests.is_empty() {
+        return Ok(String::new());
+    }
+    let want = req.verb.map(|v| v.trim().to_uppercase());
+    // The answers `wire_paths` writes are about the name, not about a route:
+    // an ambiguous symbol, one nothing matches, one stating no route of its
+    // own. None of the three is a route to report.
+    let mut said = String::new();
+    let Some(paths) = wire_paths(&graphs, req.name, &serves, &requests, &mut said)? else {
+        return Ok(String::new());
+    };
+    let routes = routes(&paths, &serves, &requests, want.as_deref());
+    if routes.is_empty() {
+        return Ok(String::new());
+    }
+    // A heading per call, not per report: a template asks this about each
+    // changed declaration in turn and concatenates what comes back, so the
+    // section's own heading belongs to the template.
+    let mut out = format!(
+        "#### `{}` — {} route(s)\n\n| method | path | serves | asked by |\n|---|---|---|---|\n",
+        req.name,
+        routes.len()
+    );
+    for route in &routes {
+        out.push_str(&format!(
+            "| {} | `{}` | {} | {} |\n",
+            verbs_of(route),
+            route.path,
+            side(&route.serves),
+            side(&route.requests)
+        ));
+    }
+    out.push('\n');
+    let (matched, unanswered, unasked) = tally(&routes);
+    out.push_str(&quoted(&format!(
+        "{} path(s); {matched} request(s) matched a declaration, {unanswered} reached none; \
+         {unasked} declaration(s) nothing asks for\n{WIRE_NOTE}",
+        routes.len()
+    )));
+    out.push('\n');
+    Ok(out)
+}
+
+/// One path, and what each side of it declares.
+struct Route {
+    path: String,
+    /// What answers it.
+    serves: Vec<Stated>,
+    /// What asks for it.
+    requests: Vec<Stated>,
+}
+
+/// The routes a call is about: one per path either side declares, under the
+/// verb the caller narrowed to. A path neither side declares under that verb
+/// is left out — a declaration filtered out is not a declaration missing, and
+/// the count of paths asked about is kept by the caller.
+fn routes(
+    paths: &BTreeSet<String>,
+    serves: &[Stated],
+    requests: &[Stated],
+    want: Option<&str>,
+) -> Vec<Route> {
+    let mut out = Vec::new();
+    for path in paths {
+        let on_path = |side: &[Stated]| -> Vec<Stated> {
+            side.iter()
+                .filter(|s| &s.path == path)
+                .filter(|s| want.is_none_or(|w| s.verb == w || s.verb == ANY_VERB))
+                .map(|s| Stated {
+                    verb: s.verb.clone(),
+                    path: s.path.clone(),
+                    node: s.node.clone(),
+                    from: s.from.clone(),
+                })
+                .collect()
+        };
+        let route = Route {
+            path: path.clone(),
+            serves: on_path(serves),
+            requests: on_path(requests),
+        };
+        if route.serves.is_empty() && route.requests.is_empty() {
+            continue;
+        }
+        out.push(route);
+    }
+    out
+}
+
+/// What a set of routes amounts to: requests an declaration answers, requests
+/// reaching none, and declarations nothing asks for.
+fn tally(routes: &[Route]) -> (usize, usize, usize) {
+    let (mut matched, mut unanswered, mut unasked) = (0usize, 0usize, 0usize);
+    for route in routes {
+        for r in &route.requests {
+            match route.serves.iter().any(|s| s.answers(r)) {
+                true => matched += 1,
+                false => unanswered += 1,
+            }
+        }
+        for s in &route.serves {
+            if !route.requests.iter().any(|r| r.answers(s)) {
+                unasked += 1;
+            }
+        }
+    }
+    (matched, unanswered, unasked)
+}
+
+/// The methods a route's two sides state, deduplicated — `GET`, or `GET, PUT`.
+fn verbs_of(route: &Route) -> String {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for s in route.serves.iter().chain(&route.requests) {
+        seen.insert(s.verb.as_str());
+    }
+    seen.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+/// One side of a route in a report cell: the keys, or an em dash where the
+/// side is empty — which is the finding, not a gap in the table.
+fn side(stated: &[Stated]) -> String {
+    if stated.is_empty() {
+        return String::from("—");
+    }
+    // One declaration, once: a handler stating two methods for one path is
+    // two facts in the compact answer and one cell here, and naming it twice
+    // would read as two handlers.
+    let mut named: Vec<String> = Vec::new();
+    for s in stated {
+        let key = s.node.external_key.as_deref().unwrap_or("<keyless>");
+        let cell = match &s.from {
+            Some(from) => format!("`{key}` _in {from}_"),
+            None => format!("`{key}`"),
+        };
+        if !named.contains(&cell) {
+            named.push(cell);
+        }
+    }
+    let mut out = named
+        .iter()
+        .take(REPORT_CAP)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if named.len() > REPORT_CAP {
+        out.push_str(&format!(" · +{} more", named.len() - REPORT_CAP));
+    }
+    out
 }
 
 /// The paths `wire` answers about: those on the path a caller named, or those
@@ -3528,6 +3944,124 @@ mod tests {
         let out = reached(&with_tests(), &["m::api::go"], &[], 3);
         assert!(out.contains("recorded edges only"), "{out}");
         assert!(out.contains("lower bound"), "{out}");
+    }
+
+    /// `--report` is the same set, as Markdown a pull request can carry: a
+    /// collapsed section per file, a table inside it, and the bound quoted
+    /// rather than dropped — a reviewer is owed the caveat an agent gets.
+    #[test]
+    fn a_report_groups_the_set_by_file_and_keeps_the_bound() {
+        let seeds = vec![String::from("m::api::go")];
+        let out = affected_report(
+            &with_tests(),
+            Affected {
+                plane: "code",
+                seeds: &seeds,
+                depth: 3,
+                widen: &[],
+                instance: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("### Tests this change reaches"), "{out}");
+        assert!(out.contains("**2** in 2 file(s)"), "{out}");
+        assert!(
+            out.contains("<details><summary><code>src/api.rs</code> — 1</summary>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("| `m::api::tests::go_returns_a_value` | CALLS |"),
+            "{out}"
+        );
+        assert!(out.contains("> note: recorded edges only"), "{out}");
+        assert!(!out.contains("affected tests:"), "{out}");
+    }
+
+    /// A pull request that touched no declaration has nothing to report, and
+    /// says it with an empty answer — what a CI template tests for, instead
+    /// of matching prose that might change.
+    #[test]
+    fn a_report_of_no_change_is_empty() {
+        let out = affected_report(
+            &with_tests(),
+            Affected {
+                plane: "code",
+                seeds: &[],
+                depth: 3,
+                widen: &[],
+                instance: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "");
+    }
+
+    /// The radius as a report: one row per depth, the nearest named, and the
+    /// total in the heading where a reader looks first.
+    #[test]
+    fn a_radius_report_counts_every_depth_and_names_the_nearest() {
+        let out = impact_report(
+            &with_tests(),
+            Impact {
+                plane: "code",
+                name: "m::api::go",
+                depth: 3,
+                across: None,
+                remote: None,
+                instance: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains("#### `m::api::go` — 3 reached within depth 3"),
+            "{out}"
+        );
+        assert!(out.contains("| depth | reaching | nearest |"), "{out}");
+        assert!(out.contains("| 1 | 2 |"), "{out}");
+        assert!(out.contains("`m::api::run` CALLS"), "{out}");
+        assert!(out.contains("> note: recorded call edges only"), "{out}");
+    }
+
+    /// Most of a change reaches nothing, and a comment that says so forty
+    /// times is a comment nobody reads. Nothing reached, nothing unproven and
+    /// nothing across is no section at all.
+    #[test]
+    fn a_symbol_nothing_reaches_earns_no_section() {
+        let out = impact_report(
+            &with_tests(),
+            Impact {
+                plane: "code",
+                name: "cli::trims_whitespace",
+                depth: 3,
+                across: None,
+                remote: None,
+                instance: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "");
+    }
+
+    /// A name that settles on nothing is said in prose, not dropped: an empty
+    /// answer here would read as a symbol nothing reaches.
+    #[test]
+    fn a_seed_the_report_cannot_resolve_is_said_not_dropped() {
+        let out = impact_report(
+            &with_tests(),
+            Impact {
+                plane: "code",
+                name: "m::api::nope",
+                depth: 3,
+                across: None,
+                remote: None,
+                instance: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("_`m::api::nope` is no one declaration"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -4980,6 +5514,55 @@ mod tests {
     }
 
     /// A verb narrows a path, and a side that names no verb still answers.
+    #[test]
+    fn a_route_report_names_each_side_once_under_the_methods_they_state() {
+        let out = wire_report(
+            &routed(),
+            Wire {
+                plane: "code",
+                name: "/bridge/check",
+                verb: None,
+                instance: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("#### `/bridge/check` — 1 route(s)"), "{out}");
+        assert!(
+            out.contains("| method | path | serves | asked by |"),
+            "{out}"
+        );
+        assert!(out.contains("| *, GET | `/bridge/check/{}` |"), "{out}");
+        assert!(
+            out.contains("`com.acme.BridgeController.check`"),
+            "a route's handler belongs in the serves cell: {out}"
+        );
+        assert!(out.contains("`web/src/page.load`"), "{out}");
+        assert_eq!(
+            out.matches("`com.acme.BridgeController.check`").count(),
+            1,
+            "a handler stating one path is named once: {out}"
+        );
+    }
+
+    /// Most declarations are on no route at all, which is why a template may
+    /// call this per changed symbol: one that states none reports nothing.
+    #[test]
+    fn a_symbol_on_no_route_reports_nothing() {
+        let out = wire_report(
+            &routed(),
+            Wire {
+                plane: "code",
+                name: "com.acme.BridgeController.helper",
+                verb: None,
+                instance: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "");
+    }
+
     #[test]
     fn wire_narrows_a_path_to_one_verb() {
         let db = routed();
