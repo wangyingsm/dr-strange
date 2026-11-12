@@ -1,0 +1,128 @@
+# drsg impact report — a GitLab CI template.
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.30.0/ci/gitlab/drsg-impact.yml'
+#
+# Digests the merge request's head into a code graph and reports what the
+# change reaches: the tests to run, what calls the changed declarations, and
+# the HTTP routes they are on. The report is a job artifact and a note on the
+# merge request when `DRSG_MR_TOKEN` is set — `CI_JOB_TOKEN` cannot post one.
+#
+# Override any of the variables in your own `.gitlab-ci.yml`:
+#
+#   drsg-impact:
+#     variables:
+#       DRSG_PLUGINS: go py
+#       DRSG_SAFE: "true"
+#
+# See ci/README.md for what each one does.
+
+drsg-impact:
+  stage: test
+  image: debian:bookworm-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    # The whole history is not needed, but the base commit's trees are: the
+    # report compares two revisions, and GitLab clones 20 commits deep.
+    GIT_DEPTH: "0"
+    # Inside the project directory, because that is all GitLab's cache can
+    # hold — the store itself is wherever XDG_DATA_HOME says.
+    XDG_DATA_HOME: "$CI_PROJECT_DIR/.drsg-store"
+    DRSG_VERSION: latest
+    DRSG_PLANE: ci
+    DRSG_PLUGINS: rust go py ts java csharp c kotlin
+    DRSG_DEPTH: "3"
+    DRSG_SAFE: "false"
+    DRSG_MAX_SYMBOLS: "10"
+  cache:
+    key: "drsg-plugins-$DRSG_VERSION-$CI_RUNNER_EXECUTABLE_ARCH"
+    paths:
+      - .drsg-store/drsg/plugins
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - drsg-report.md
+  script:
+    - set -eu
+    # `affected` runs the git CLI, the installer downloads over TLS, and the
+    # note is found by parsing the API's JSON rather than by grepping it.
+    - |
+      if ! command -v git >/dev/null || ! command -v curl >/dev/null || ! command -v jq >/dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends git curl ca-certificates jq
+      fi
+    - curl -fsSL https://raw.githubusercontent.com/wangyingsm/dr-strange/master/scripts/install.sh
+      | sh -s -- --version "$DRSG_VERSION" --dir /usr/local/bin
+    - |
+      for plugin in $DRSG_PLUGINS; do
+        drsg plugin install "$plugin"
+      done
+    # No model is involved and no key is needed: the parsers are wasm
+    # components and `--code-only` leaves the documents out.
+    - drsg --db drsg.graph digest . --apply --code-only --no-embed --no-git --plane "$DRSG_PLANE"
+    - |
+      base="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      safe=""
+      if [ "$DRSG_SAFE" = "true" ]; then safe="--safe"; fi
+
+      # Every verb prints Markdown with `--report` and prints nothing at all
+      # when it has nothing to say, so each section is included by testing a
+      # file for emptiness rather than by reading prose.
+      drsg --db drsg.graph affected --plane "$DRSG_PLANE" --vs "$base" \
+        --depth "$DRSG_DEPTH" $safe --report > tests.md
+      if [ ! -s tests.md ]; then
+        echo "drsg: this change names no declaration the plane holds — nothing to report"
+        : > drsg-report.md
+        exit 0
+      fi
+      {
+        echo "## What this change reaches"
+        echo
+        cat tests.md
+      } > drsg-report.md
+
+      drsg --db drsg.graph affected --plane "$DRSG_PLANE" --vs "$base" --seeds \
+        | head -n "$DRSG_MAX_SYMBOLS" > seeds
+      : > radius.md
+      : > routes.md
+      while read -r seed; do
+        [ -n "$seed" ] || continue
+        drsg --db drsg.graph impact "$seed" --plane "$DRSG_PLANE" --depth "$DRSG_DEPTH" --report >> radius.md
+        drsg --db drsg.graph wire "$seed" --plane "$DRSG_PLANE" --report >> routes.md
+      done < seeds
+      if [ -s radius.md ]; then
+        { echo; echo "### What reaches the change"; echo; cat radius.md; } >> drsg-report.md
+      fi
+      if [ -s routes.md ]; then
+        { echo; echo "### Routes the change is on"; echo; cat routes.md; } >> drsg-report.md
+      fi
+      {
+        echo
+        echo "<sub>drsg $(drsg --version | awk '{ print $2 }') ·"
+        echo "every count is a lower bound, as each section says</sub>"
+      } >> drsg-report.md
+      cat drsg-report.md
+    # One note, edited on every push rather than a new one each time. A token
+    # with `api` scope is needed: `CI_JOB_TOKEN` cannot write notes.
+    - |
+      if [ -z "${DRSG_MR_TOKEN:-}" ]; then
+        echo "drsg: DRSG_MR_TOKEN is unset — the report is this job's artifact, not a note"
+        exit 0
+      fi
+      marker='<!-- drsg-impact-report -->'
+      notes="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+      body="$(printf '%s\n%s\n' "$marker" "$(head -c 60000 drsg-report.md)")"
+      # Ours is the note whose body carries the marker. Matched on the parsed
+      # body and nothing else: editing a note by position would eventually
+      # edit a reviewer's.
+      existing="$(curl -fsS --header "PRIVATE-TOKEN: $DRSG_MR_TOKEN" "$notes?per_page=100" |
+        jq -r --arg m "$marker" 'map(select(.body | startswith($m))) | .[0].id // empty')"
+      if [ -n "$existing" ]; then
+        curl -fsS --request PUT --header "PRIVATE-TOKEN: $DRSG_MR_TOKEN" \
+          --data-urlencode "body=$body" "$notes/$existing" > /dev/null
+      else
+        curl -fsS --request POST --header "PRIVATE-TOKEN: $DRSG_MR_TOKEN" \
+          --data-urlencode "body=$body" "$notes" > /dev/null
+      fi
