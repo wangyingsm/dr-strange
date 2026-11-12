@@ -10,9 +10,12 @@
 # has the dashboard SPA embedded (build.rs), and links TLS via rustls/ring.
 FROM debian:bookworm-slim
 ARG TARGETARCH
+# `git` is not optional: `affected`, `recall` and `history` shell out to the
+# `git` CLI, so without it three verbs fail inside the image while working
+# everywhere else — and `digest` quietly records no history.
 # hadolint ignore=DL3008
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates git && \
     rm -rf /var/lib/apt/lists/*
 COPY bin/${TARGETARCH}/drsg /usr/local/bin/drsg
 
