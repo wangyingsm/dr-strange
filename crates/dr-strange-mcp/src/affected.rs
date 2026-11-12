@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Result as AnyResult, anyhow, bail};
-use dr_strange_core::compact::{self, Affected};
+use dr_strange_core::compact::{self, Affected, quoted};
 use dr_strange_core::{Database, PlaneHandle};
 use dr_strange_llm::git::Git;
 
@@ -70,6 +70,20 @@ struct Change {
     note: String,
 }
 
+/// What a caller wants back. Not a field of [`AffectedReq`]: the MCP tool
+/// answers an agent, which wants the compact text and nothing else, and these
+/// two exist for a CI template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// The compact answer — one fact per line.
+    Compact,
+    /// Markdown for a pull request, the change's own note quoted above it.
+    Report,
+    /// The changed declarations' keys, one per line and nothing else, so a
+    /// template can ask another verb about each in turn.
+    Seeds,
+}
+
 /// `affected`'s body. `fallback_root` is the tree the process was started
 /// with, used only when the plane does not record one of its own.
 pub fn affected_logic(
@@ -77,8 +91,9 @@ pub fn affected_logic(
     fallback_root: Option<&Path>,
     parsers: &dyn Parsers,
     req: AffectedReq,
+    out: Output,
 ) -> AnyResult<String> {
-    affected_logic_in(db, TreeAccess::local(fallback_root), parsers, req)
+    affected_logic_in(db, TreeAccess::local(fallback_root), parsers, req, out)
 }
 
 /// [`affected_logic`] under an explicit tree policy — what the served `/mcp`
@@ -88,6 +103,7 @@ pub fn affected_logic_in(
     access: TreeAccess<'_>,
     parsers: &dyn Parsers,
     req: AffectedReq,
+    out: Output,
 ) -> AnyResult<String> {
     let plane = db.plane(&req.plane)?;
     let Some(root) = access.plane_root(recorded_root(&plane).as_deref())? else {
@@ -103,26 +119,41 @@ pub fn affected_logic_in(
         None => from_worktree(&git, &plane)?,
     };
     if change.seeds.is_empty() {
-        return Ok(format!(
-            "{}no changed declaration to start from — nothing to run on this change's account\n",
-            change.note
-        ));
+        // A report of nothing is not a report: a template tests for an empty
+        // answer and leaves the pull request alone.
+        return match out {
+            Output::Compact => Ok(format!(
+                "{}no changed declaration to start from — nothing to run on this change's \
+                 account\n",
+                change.note
+            )),
+            Output::Report | Output::Seeds => Ok(String::new()),
+        };
+    }
+    if out == Output::Seeds {
+        let mut keys = change.seeds.join("\n");
+        keys.push('\n');
+        return Ok(keys);
     }
     let widen = match req.safe {
         true => packages(&root, &change.files),
         false => Vec::new(),
     };
-    let body = compact::affected(
-        db,
-        Affected {
-            plane: &req.plane,
-            seeds: &change.seeds,
-            depth: req.depth.unwrap_or(DEFAULT_DEPTH),
-            widen: &widen,
-            instance: None,
-        },
-    )?;
-    Ok(format!("{}{body}", change.note))
+    let ask = Affected {
+        plane: &req.plane,
+        seeds: &change.seeds,
+        depth: req.depth.unwrap_or(DEFAULT_DEPTH),
+        widen: &widen,
+        instance: None,
+    };
+    match out {
+        Output::Report => Ok(format!(
+            "{}\n{}",
+            quoted(&change.note),
+            compact::affected_report(db, ask)?
+        )),
+        _ => Ok(format!("{}{}", change.note, compact::affected(db, ask)?)),
+    }
 }
 
 /// The working tree against `HEAD`: what is uncommitted.

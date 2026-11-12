@@ -22,7 +22,7 @@ mod error;
 mod recall;
 pub mod relay;
 
-pub use affected::{AffectedReq, affected_logic, affected_logic_in};
+pub use affected::{AffectedReq, Output as AffectedOutput, affected_logic, affected_logic_in};
 pub use error::McpError;
 pub use recall::{Parsers, RecallReq, recall_logic, recall_logic_in};
 
@@ -4052,7 +4052,11 @@ impl DrStrange {
                 plane_roots,
             };
             Ok(Value::String(affected::affected_logic_in(
-                db, access, &*parsers, req,
+                db,
+                access,
+                &*parsers,
+                req,
+                affected::Output::Compact,
             )?))
         })
         .await

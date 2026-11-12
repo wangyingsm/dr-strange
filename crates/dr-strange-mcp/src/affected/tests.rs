@@ -215,6 +215,7 @@ fn an_uncommitted_edit_names_the_test_that_reaches_it() {
             safe: false,
             depth: None,
         },
+        Output::Compact,
     )
     .unwrap();
     assert!(out.contains("the working tree against HEAD"), "{out}");
@@ -250,6 +251,7 @@ fn a_plane_behind_the_working_tree_warns_that_a_seed_may_be_stale() {
             safe: false,
             depth: None,
         },
+        Output::Compact,
     )
     .unwrap();
     assert!(
@@ -293,6 +295,7 @@ fn a_plane_that_holds_the_edit_is_quiet_about_being_behind() {
             safe: false,
             depth: None,
         },
+        Output::Compact,
     )
     .unwrap();
     assert!(!out.contains("behind this working tree"), "{out}");
@@ -321,6 +324,7 @@ fn a_clean_tree_says_there_is_no_change_to_start_from() {
             safe: false,
             depth: None,
         },
+        Output::Compact,
     )
     .unwrap();
     assert!(
@@ -353,8 +357,118 @@ fn an_untracked_file_is_read_whole_and_said_to_be() {
             safe: false,
             depth: None,
         },
+        Output::Compact,
     )
     .unwrap();
     assert!(out.contains("1 untracked file(s) are read whole"), "{out}");
     assert!(out.contains("m::tests::one_works"), "{out}");
+}
+
+/// What a CI template loops over: the changed declarations' keys, one per
+/// line, and not one word of prose — a note in this stream would become a
+/// symbol the next verb is asked about.
+#[test]
+fn the_seeds_are_the_keys_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "x\n".repeat(100)).unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "one"]);
+    let mut lines: Vec<String> = std::fs::read_to_string(root.join("src/lib.rs"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines[11] = "edited".into();
+    std::fs::write(root.join("src/lib.rs"), lines.join("\n")).unwrap();
+
+    let db = planed();
+    let out = affected_logic(
+        &db,
+        Some(root),
+        &Unasked,
+        AffectedReq {
+            plane: "code".into(),
+            vs: None,
+            safe: false,
+            depth: None,
+        },
+        Output::Seeds,
+    )
+    .unwrap();
+    assert_eq!(out, "m::one\n");
+}
+
+/// The report carries the change's own note as a quote above the set: what
+/// was read, what could not be, and whether the plane is behind the tree.
+#[test]
+fn a_report_quotes_the_change_above_the_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "x\n".repeat(100)).unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "one"]);
+    let mut lines: Vec<String> = std::fs::read_to_string(root.join("src/lib.rs"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines[11] = "edited".into();
+    std::fs::write(root.join("src/lib.rs"), lines.join("\n")).unwrap();
+
+    let db = planed();
+    let out = affected_logic(
+        &db,
+        Some(root),
+        &Unasked,
+        AffectedReq {
+            plane: "code".into(),
+            vs: None,
+            safe: false,
+            depth: None,
+        },
+        Output::Report,
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("> change: the working tree against HEAD"),
+        "{out}"
+    );
+    assert!(out.contains("### Tests this change reaches"), "{out}");
+    assert!(out.contains("| `m::tests::one_works` | CALLS |"), "{out}");
+}
+
+/// A clean tree is the case a template must not post a comment for, so the
+/// report of one is empty — the sentence the compact answer gives would
+/// otherwise be a pull-request comment saying nothing.
+#[test]
+fn a_clean_tree_reports_nothing_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("src.rs"), "x\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "one"]);
+
+    let db = planed();
+    for want in [Output::Report, Output::Seeds] {
+        let out = affected_logic(
+            &db,
+            Some(root),
+            &Unasked,
+            AffectedReq {
+                plane: "code".into(),
+                vs: None,
+                safe: false,
+                depth: None,
+            },
+            want,
+        )
+        .unwrap();
+        assert_eq!(out, "", "{want:?}");
+    }
 }
