@@ -239,25 +239,32 @@ impl Expr {
             rhs: Box::new(rhs.into()),
         }
     }
+    /// `p("year").eq(2020)`.
     pub fn eq(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Eq, rhs)
     }
+    /// `p("state").ne("done")`.
     pub fn ne(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Ne, rhs)
     }
+    /// `p("n").lt(10)`.
     pub fn lt(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Lt, rhs)
     }
+    /// `p("n").le(10)`.
     pub fn le(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Le, rhs)
     }
+    /// `p("score").gt(0.5)`.
     pub fn gt(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Gt, rhs)
     }
+    /// `p("year").ge(2020)`.
     pub fn ge(self, rhs: impl Into<Expr>) -> Expr {
         self.cmp(CmpOp::Ge, rhs)
     }
 
+    /// `a.and(b)` — both terms must hold.
     pub fn and(self, rhs: impl Into<Expr>) -> Expr {
         Expr::Logic {
             op: LogicOp::And,
@@ -265,6 +272,7 @@ impl Expr {
             rhs: Box::new(rhs.into()),
         }
     }
+    /// `a.or(b)` — either term may hold.
     pub fn or(self, rhs: impl Into<Expr>) -> Expr {
         Expr::Logic {
             op: LogicOp::Or,
@@ -272,9 +280,11 @@ impl Expr {
             rhs: Box::new(rhs.into()),
         }
     }
+    /// `a.not()` — the term must not hold.
     pub fn not(self) -> Expr {
         Expr::Not(Box::new(self))
     }
+    /// `p("tag").is_null()` — the property is absent on this row.
     pub fn is_null(self) -> Expr {
         Expr::IsNull(Box::new(self))
     }
@@ -286,15 +296,20 @@ impl Expr {
             rhs: Box::new(rhs.into()),
         }
     }
+    /// `p("n").add(1)`.
     pub fn add(self, rhs: impl Into<Expr>) -> Expr {
         self.arith(ArithOp::Add, rhs)
     }
+    /// `p("n").sub(1)`.
     pub fn sub(self, rhs: impl Into<Expr>) -> Expr {
         self.arith(ArithOp::Sub, rhs)
     }
+    /// `p("n").mul(2)`.
     pub fn mul(self, rhs: impl Into<Expr>) -> Expr {
         self.arith(ArithOp::Mul, rhs)
     }
+    /// `p("n").div(2)` — two integers divide truncating, and by zero is
+    /// `Null` rather than an error.
     pub fn div(self, rhs: impl Into<Expr>) -> Expr {
         self.arith(ArithOp::Div, rhs)
     }
