@@ -179,16 +179,15 @@ pub fn connected_components<R: GraphReader + ?Sized>(
     let frame = Frame::build(reader, label, None)?;
     let n = frame.len();
     let mut uf = UnionFind::new(n);
-    for i in 0..n {
-        for &(j, _) in &frame.out[i] {
+    for (i, out) in frame.out.iter().enumerate() {
+        for &(j, _) in out {
             uf.union(i, j);
         }
     }
     // Representative = smallest original id in the set.
     let mut rep_id: Vec<Option<NodeId>> = vec![None; n];
-    for i in 0..n {
+    for (i, &cur) in frame.nodes.iter().enumerate() {
         let r = uf.find(i);
-        let cur = frame.nodes[i];
         rep_id[r] = Some(match rep_id[r] {
             Some(existing) if existing.0 <= cur.0 => existing,
             _ => cur,

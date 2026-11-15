@@ -10,10 +10,10 @@ $ npx @yingge/drsg init   # digest, serve, and write the MCP config
 ```
 
 Your agent then has `context`, `impact`, `trace`, `wire`, `grep` and the rest.
-On this project — 97k lines, 13 parser plugins — the digest takes about three
-seconds, and answering "who calls this and what would a change reach" costs a
-median 925 tokens against 53,720 for grepping the name and reading the files
-that matched.
+On this project — 97k lines — the digest takes about three seconds, and
+answering "who calls this and what would a change reach" costs a median 925
+tokens against 53,720 for grepping the name and reading the files that
+matched.
 
 The installed command is `drsg`. Installing the package pulls exactly one
 prebuilt binary, chosen by your platform:

@@ -191,8 +191,9 @@ installed plugins.
 
 ## The official catalog
 
-Thirteen official plugins cover the common languages and two cross-cutting
-sources, each wrapping a mature parser rather than reinventing one:
+Seventeen official plugins cover the common languages, the cross-cutting
+sources, and what a deployment declares it runs — each wrapping a mature
+parser rather than reinventing one:
 
 | Plugin | Claims | Parser underneath |
 |---|---|---|
@@ -206,9 +207,13 @@ sources, each wrapping a mature parser rather than reinventing one:
 | `c` | `.c .h` | [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) |
 | `web` | `.html .htm .css` | tree-sitter html/css/js — one plugin, so `class="btn"` binds to the stylesheet defining `.btn` |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) |
+| `sql` | `.sql` | [sqlparser](https://crates.io/crates/sqlparser) — the schema a migration tree declares it keeps |
 | `xml` | `.xml` | [quick-xml](https://crates.io/crates/quick-xml) — by the dialect the file declares |
 | `git` | *(a git checkout)* | git's own object database, read directly — [flate2](https://crates.io/crates/flate2) for the zlib streams. Dispatched by the source being a checkout rather than by extension, and writes the history plane beside the code one |
 | `deps` | *(manifests, by name)* | [toml_edit](https://crates.io/crates/toml_edit) and [quick-xml](https://crates.io/crates/quick-xml): `package.json`, `go.mod`, `pyproject.toml`, `requirements.txt`, `pom.xml`. A manifest is a *filename*, not an extension — `Cargo.toml` stays with the `toml` plugin |
+| `compose` | *(`compose.yaml` and its aliases, by name)* | [yaml-rust2](https://crates.io/crates/yaml-rust2) — a project's services, the images they run, their config and the links between them. It declares no extension on purpose: claiming `.yml` would take every manifest, workflow and chart in the tree from whatever reads them |
+| `k8s` | *(a manifest tree, routed explicitly with `--handler k8s`)* | [yaml-rust2](https://crates.io/crates/yaml-rust2) — workloads, services, routes and config, with a workload's pods reached by label selector. Routed by hand because a manifest may be called anything, and a document without both `apiVersion` and `kind` is counted and named rather than half-read |
+| `terraform` | `.tf .tfvars .tfstate` | [hcl-rs](https://crates.io/crates/hcl-rs) — resources, modules, and the references between them |
 
 Each releases at its own pace as a `<plugin>-vX.Y.Z` tag; CI builds the
 component and publishes `<plugin>.wasm` with its SHA-256 on the
