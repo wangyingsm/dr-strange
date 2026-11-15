@@ -153,7 +153,8 @@ hostcall_mb = 1024
 
 ## 官方目录
 
-十三个官方插件覆盖常用语言与两类横切来源，每个都包装一个成熟的解析器而非重新发明：
+十七个官方插件覆盖常用语言、各类横切来源，以及一次部署所声明要运行的东西，每个都
+包装一个成熟的解析器而非重新发明：
 
 | 插件 | 处理的扩展名 | 底层解析器 |
 |---|---|---|
@@ -167,9 +168,13 @@ hostcall_mb = 1024
 | `c` | `.c .h` | [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) |
 | `web` | `.html .htm .css` | tree-sitter html/css/js——一个插件同时处理，`class="btn"` 才能绑定到定义 `.btn` 的样式表 |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) |
+| `sql` | `.sql` | [sqlparser](https://crates.io/crates/sqlparser)——一棵迁移目录声明自己维护的那套表结构 |
 | `xml` | `.xml` | [quick-xml](https://crates.io/crates/quick-xml)——按文件自己声明的方言 |
 | `git` | *（一个 git 检出目录）* | 直接读取 git 自己的对象库，用 [flate2](https://crates.io/crates/flate2) 解 zlib 流。它按“来源是一个检出目录”分发，而非按扩展名；写出的历史平面就放在代码平面旁边 |
 | `deps` | *（清单文件，按文件名）* | [toml_edit](https://crates.io/crates/toml_edit) 与 [quick-xml](https://crates.io/crates/quick-xml)：`package.json`、`go.mod`、`pyproject.toml`、`requirements.txt`、`pom.xml`。清单是一个*文件名*而非扩展名——`Cargo.toml` 仍归 `toml` 插件 |
+| `compose` | *（`compose.yaml` 及其别名，按文件名）* | [yaml-rust2](https://crates.io/crates/yaml-rust2)——一个项目的各个服务、它们运行的镜像、配置，以及彼此之间的连接。它有意不声明任何扩展名：若声明 `.yml`，树中每一份 Kubernetes 清单、CI 工作流与 chart 都会被它从本该读取它们的那一方手里夺走 |
+| `k8s` | *（一棵清单目录，用 `--handler k8s` 显式指定）* | [yaml-rust2](https://crates.io/crates/yaml-rust2)——工作负载、服务、路由与配置，其中一个工作负载的 Pod 是按标签选择器找到的。之所以需要显式指定，是因为清单文件可以叫任何名字；而同时缺少 `apiVersion` 与 `kind` 的文档会被计数并列出，而不是读一半 |
+| `terraform` | `.tf .tfvars .tfstate` | [hcl-rs](https://crates.io/crates/hcl-rs)——资源、模块，以及它们之间的引用 |
 
 每个插件以 `<plugin>-vX.Y.Z` 标签按自己的节奏发布；CI 构建组件并在
 [发布页](https://github.com/wangyingsm/dr-strange-extension/releases)发布
