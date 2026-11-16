@@ -94,8 +94,8 @@ pub fn plugin_memory_bytes() -> usize {
     }
 }
 pub use ops::{
-    OPS_PLUGINS, PLANE_SUFFIX as OPS_PLANE_SUFFIX, from_ops_reader, ops_facts,
-    plane_name as ops_plane_name, take_ops, take_ops_facts,
+    OPS_PLUGINS, PLANE_SUFFIX as OPS_PLANE_SUFFIX, drop_dangling as drop_dangling_ops,
+    from_ops_reader, ops_facts, plane_name as ops_plane_name, take_ops, take_ops_facts,
 };
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, PluginStore, StoreStamp};

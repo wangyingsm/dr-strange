@@ -11,7 +11,9 @@
 //! because it is there, and the split is made on the one thing every fact
 //! already carries: the plugin that produced it.
 
-use dr_strange_core::{PropValue, Properties};
+use std::collections::BTreeSet;
+
+use dr_strange_core::{PlaneHandle, PropValue, Properties, Result};
 
 use super::Preprocessed;
 use crate::digest::DigestResult;
@@ -79,6 +81,33 @@ pub fn take_ops(result: &mut DigestResult) -> DigestResult {
         edges,
         ..Default::default()
     }
+}
+
+/// Drop the ops edges whose endpoints this plane will not hold, and say how
+/// many.
+///
+/// A fold already does this (`sync::loadable_edges`): an edge naming a key
+/// that resolved to nothing is counted, not written. The digest path instead
+/// hands every edge to `bulk_load`, which refuses an unknown endpoint and
+/// takes the whole ingest down with it — so one ops reader naming another's
+/// key would make a digest fail on a tree that is merely incomplete. That is
+/// the ordinary case here, not an error: a scrape target names the service it
+/// scrapes, and whether this tree declares that service is exactly what the
+/// edge was asking.
+pub fn drop_dangling(ops: &mut DigestResult, plane: &PlaneHandle<'_>) -> Result<usize> {
+    let minted: BTreeSet<&str> = ops.nodes.iter().map(|n| n.key.as_str()).collect();
+    let holds = |key: &str| -> Result<bool> {
+        Ok(minted.contains(key) || plane.node_by_key(key)?.is_some())
+    };
+    let before = ops.edges.len();
+    let mut keep = Vec::with_capacity(before);
+    for edge in std::mem::take(&mut ops.edges) {
+        if holds(&edge.src)? && holds(&edge.dst)? {
+            keep.push(edge);
+        }
+    }
+    ops.edges = keep;
+    Ok(before - ops.edges.len())
 }
 
 /// The same split over a fold's routed facts, which carry prose and a report
@@ -189,5 +218,40 @@ mod tests {
     fn the_plane_sits_beside_the_code_plane() {
         assert_eq!(plane_name("myrepo"), "myrepo_ops");
         assert_eq!(PLANE_SUFFIX, "_ops");
+    }
+
+    /// One reader naming another's key is the ordinary case, and a tree that
+    /// declares only half of it must still digest — the end-to-end run that
+    /// did not: `bulk edge endpoint 'prod/Service/api' not found`.
+    #[test]
+    fn an_edge_onto_a_key_the_tree_lacks_is_dropped_not_fatal() {
+        use dr_strange_core::Database;
+
+        let db = Database::in_memory().unwrap();
+        db.create_plane("ops", Properties::new()).unwrap();
+        let plane = db.plane("ops").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            txn.create_node_with_key("already/here", &["Service"], Properties::new())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        let mut ops = DigestResult {
+            nodes: vec![node("cfg/job/api", "prometheus@1+abc")],
+            edges: vec![
+                // Both ends in hand.
+                edge("cfg/job/api", "cfg/job/api", "prometheus@1+abc"),
+                // One end already in the plane.
+                edge("cfg/job/api", "already/here", "prometheus@1+abc"),
+                // And one end nowhere at all.
+                edge("cfg/job/api", "prod/Service/api", "prometheus@1+abc"),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(drop_dangling(&mut ops, &plane).unwrap(), 1);
+        assert_eq!(ops.edges.len(), 2);
+        assert!(ops.edges.iter().all(|e| e.dst != "prod/Service/api"));
     }
 }

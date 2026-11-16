@@ -54,7 +54,8 @@ pub use preprocess::{
 };
 /// Writing a tree's ops facts beside its code — see [`preprocess::ops`].
 pub use preprocess::{
-    OPS_PLANE_SUFFIX, OPS_PLUGINS, ops_facts, ops_plane_name, take_ops, take_ops_facts,
+    OPS_PLANE_SUFFIX, OPS_PLUGINS, drop_dangling_ops, ops_facts, ops_plane_name, take_ops,
+    take_ops_facts,
 };
 /// Reading a repository's history beside its code — see [`preprocess::repo`].
 pub use preprocess::{PLANE_SUFFIX as GIT_PLANE_SUFFIX, REPO_PLUGIN, plane_name as git_plane_name};

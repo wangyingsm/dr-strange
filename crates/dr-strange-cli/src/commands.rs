@@ -4421,6 +4421,15 @@ fn apply_ops(
             joined.matched, joined.ambiguous, joined.unmatched
         )?;
     }
+    // What one reader named and no other declared, dropped the way a fold
+    // drops it rather than failing the ingest over it.
+    let dangling = dr_strange_llm::drop_dangling_ops(ops, &plane)?;
+    if dangling > 0 {
+        writeln!(
+            out,
+            "  {dangling} ops edge(s) named a key this tree does not declare, and were not written"
+        )?;
+    }
     let mut txn = plane.write()?;
     let stats = ops.apply(&plane, &mut txn)?;
     txn.commit()?;
