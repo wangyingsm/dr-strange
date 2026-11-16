@@ -113,7 +113,7 @@ fn an_unmatched_host_is_counted_and_left_alone() {
 
     assert_eq!(found.unmatched, 1);
     assert!(scrapes(&edges).is_empty());
-    assert!(nodes[1].props.get("candidates").is_none());
+    assert!(!nodes[1].props.contains_key("candidates"));
 }
 
 /// An address that names a key is joined to it exactly, and said to be exact.
