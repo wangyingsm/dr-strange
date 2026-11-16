@@ -48,6 +48,7 @@ mod ops;
 #[cfg(feature = "plugins")]
 mod registry;
 mod repo;
+mod scrape;
 mod sync;
 #[cfg(feature = "plugins")]
 mod wasm;
@@ -102,6 +103,7 @@ pub use repo::{
     GitDir, PLANE_SUFFIX, REPO_PLUGIN, WriteStats, git_dir, plane_name, route_repository,
     write_history,
 };
+pub use scrape::{Joined as ScrapeJoin, join as join_scrape_targets};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};

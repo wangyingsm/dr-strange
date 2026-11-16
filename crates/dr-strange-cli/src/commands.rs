@@ -4346,7 +4346,7 @@ fn apply_digest(
     // The ops readers' facts leave first: a workload belongs beside the code,
     // not in it.
     let mut result = result;
-    let ops = dr_strange_llm::take_ops(&mut result);
+    let mut ops = dr_strange_llm::take_ops(&mut result);
     let mut txn = p.write()?;
     let stats = result.apply(p, &mut txn)?;
     txn.commit()?;
@@ -4364,7 +4364,7 @@ fn apply_digest(
             stats.skipped.join(", ")
         )?;
     }
-    apply_ops(db, args.plane, &ops, out)?;
+    apply_ops(db, args.plane, &mut ops, out)?;
     // Only when something was actually embedded: a facts-only digest calls no
     // provider at all, and pointing at an `embedding` property nothing wrote
     // would send a reader to build an index over empty vectors.
@@ -4400,7 +4400,7 @@ fn apply_digest(
 fn apply_ops(
     db: &Database,
     code_plane: &str,
-    ops: &dr_strange_llm::DigestResult,
+    ops: &mut dr_strange_llm::DigestResult,
     out: &mut dyn Write,
 ) -> Result<()> {
     if ops.nodes.is_empty() && ops.edges.is_empty() {
@@ -4411,6 +4411,16 @@ fn apply_ops(
         db.create_plane(&name, Properties::new())?;
     }
     let plane = db.plane(&name)?;
+    // An address that named no key is matched against what the plane holds —
+    // before the write, so the edge it draws is written with the rest.
+    let joined = dr_strange_llm::join_scrape_targets(&mut ops.nodes, &mut ops.edges, Some(&plane))?;
+    if joined.any() {
+        writeln!(
+            out,
+            "ops: {} scrape target(s) joined, {} ambiguous, {} unmatched",
+            joined.matched, joined.ambiguous, joined.unmatched
+        )?;
+    }
     let mut txn = plane.write()?;
     let stats = ops.apply(&plane, &mut txn)?;
     txn.commit()?;
