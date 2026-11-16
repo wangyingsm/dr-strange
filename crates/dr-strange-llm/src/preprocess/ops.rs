@@ -21,7 +21,7 @@ use crate::digest::DigestResult;
 /// Plugin names rather than labels: a plugin owns its vocabulary, and
 /// `Namespace` means one thing from the Kubernetes reader and another from a
 /// language parser that borrows the word.
-pub const OPS_PLUGINS: &[&str] = &["compose", "k8s", "terraform"];
+pub const OPS_PLUGINS: &[&str] = &["compose", "k8s", "terraform", "prometheus"];
 
 /// The suffix an ops plane takes, beside the code plane it belongs to.
 ///

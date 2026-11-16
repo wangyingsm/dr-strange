@@ -1025,6 +1025,11 @@ const MANIFEST_PLUGINS: &[(&str, &[&str])] = &[
             "docker-compose.override.yml",
         ],
     ),
+    // A Prometheus configuration is a filename for the same reason. Its rule
+    // files are not listed, and cannot be: they have no fixed name, and the
+    // configuration declares its own under `rule_files:` for the plugin to
+    // follow.
+    ("prometheus", &["prometheus.yaml", "prometheus.yml"]),
 ];
 
 /// The reserved plugin name that claims this path by filename, whether or

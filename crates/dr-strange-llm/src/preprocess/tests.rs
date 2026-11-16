@@ -2328,14 +2328,25 @@ fn a_filename_claims_one_plugin_and_only_one() {
         );
     }
     assert_eq!(manifest_plugin_for("package.json"), Some("deps"));
+    for name in ["prometheus.yml", "prometheus.yaml", "PROMETHEUS.YML"] {
+        assert_eq!(
+            manifest_plugin_for(&format!("deploy/{name}")),
+            Some("prometheus"),
+            "{name}"
+        );
+    }
 
     // A YAML file that is not a Compose file is claimed by nobody, which is
-    // the whole reason this routes by name instead of by extension.
+    // the whole reason this routes by name instead of by extension. A
+    // Prometheus *rule* file is in that set on purpose: it has no fixed name,
+    // and the configuration that loads it names it instead.
     for name in [
         "k8s/deployment.yaml",
         ".github/workflows/ci.yml",
         "chart/values.yaml",
         "compose.yaml.bak",
+        "deploy/rules/api.yml",
+        "deploy/alerts.yaml",
     ] {
         assert_eq!(manifest_plugin_for(name), None, "{name}");
     }
