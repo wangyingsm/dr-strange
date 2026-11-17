@@ -27,10 +27,20 @@ And because sampling drops spans and a file exporter flushes per batch, spans
 whose parent is in no document read are counted and reported — the dependency
 set is a stated lower bound, not a claim.
 
+The same fold reads a second source: `--url` pulls a window of spans from an
+OpenObserve instance instead of a file. A file holds whatever the exporter
+flushed; a window holds what a stated interval held, so the interval is
+reported, a pull that fills its row ceiling says the window held more than was
+folded, and a stream whose rows carry no `reference_parent_span_id` is named
+as such rather than returned as a graph with no edges. The credential is read
+from an environment variable and never taken as an argument.
+
 ### Added
 
-- `drsg ops traces --from <export> --plane [--apply]`, dry-run by default as
-  `digest` is. The `ops` group is for facts no file in the tree declares.
+- `drsg ops traces --from <export> | --url <instance> --plane [--apply]`,
+  dry-run by default as `digest` is. The `ops` group is for facts no file in
+  the tree declares. The pull takes `--org`, `--stream`, `--since` (one count
+  and one unit: `30s`, `15m`, `6h`, `7d`), `--limit` and `--token-env`.
 - `epoch_ms_to_rfc3339` in core, the inverse of the parser already there, so a
   timestamp written by a fold reads back through `AS OF` and `history`.
 

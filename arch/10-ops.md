@@ -3,8 +3,8 @@
 **Status**: begun 2026-10-17 as design. Shipped since: the `<name>_ops` plane
 (§2), the Compose, Kubernetes, Terraform and Prometheus readers, the image
 join and the `deployed` verb over it (§5, §9), and the observed `CALLS` edge
-a trace export folds into (§4, §6). Still design: cluster runtime (`Pod`,
-`Node`), deploy events and incidents (§8).
+traces fold into, from a file or from OpenObserve (§4, §6). Still design:
+cluster runtime (`Pod`, `Node`), deploy events and incidents (§8).
 
 The year's thesis is that a code commit and a production incident are two
 ends of one graph. This doc fixes the half that does not exist yet: what an
@@ -296,9 +296,15 @@ of the input forces:
   — the same note `affected` carries, for the same reason.
 
 Where it comes from is the host's business, not a parser's: §1 keeps runtime
-state out of a plugin because it needs credentials and is stale when read.
-`drsg ops traces --from <export>` reads a file today; a pull from a trace
-store is the same fold behind a different reader.
+state out of a plugin because it needs credentials and is stale when read. Two
+readers reach the same fold — `drsg ops traces --from <export>` for the OTLP
+file a collector writes, and `--url` for a window of an OpenObserve instance —
+and the difference between them is worth naming. A file holds whatever the
+exporter flushed. A query holds what a stated interval held, which is the
+stronger claim, so the interval is reported and a pull that fills its row
+ceiling says the window held more than was folded. The credential is read
+from the environment and never taken as an argument, since an argument is
+visible to every process on the machine.
 
 ## 7. Config and secrets
 
@@ -338,12 +344,15 @@ The model is shaped so these extend rather than rewrite it:
   rule. `prometheus.yml` is routed by name like a Compose file, and rule
   files are followed from the `rule_files:` the configuration declares, since
   they have no name a router could claim.
-- **Q1 — OpenTelemetry**: **shipped in part**. `CALLS` between services, folded
-  from an OTLP/JSON export by `drsg ops traces` (§6), carrying
-  `origin: observed` and the spans behind it — the first edge in this plane
-  that nothing declared. Still to come: the pull from a trace store, so the
-  input is a query over a window rather than a file, and the plugin that reads
-  an export committed to the tree.
+- **Q1 — OpenTelemetry**: **shipped**. `CALLS` between services, folded by
+  `drsg ops traces` from an OTLP/JSON export or from a window of an
+  OpenObserve instance (§6), carrying `origin: observed` and the spans behind
+  it — the first edge in this plane that nothing declared. Not shipped, and on
+  the evidence should not be: a wasm plugin for an export committed to the
+  tree. It would need the OTLP parser and the fold a second time, in wasm,
+  plus a host step to re-point its edges onto declared keys — three copies for
+  the single gain of `digest` noticing a file that §1 says does not belong in
+  the tree anyway.
 - **Q1 — deploy events**: `DeployEvent` nodes joined to the image digest and
   so, through §5, to a commit. This is where the image-to-commit join stops
   being a query and starts being recorded.

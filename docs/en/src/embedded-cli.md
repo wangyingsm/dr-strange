@@ -29,7 +29,7 @@ access, and the CLI for offline operations.
 | `index ensure \| keyword` | declare a vector or keyword index |
 | `ask <question> --plane` | natural-language query |
 | `digest <file\|dir\|url> --plane [--mode]` | ingest a document, a repository, or a page and its links |
-| `ops traces --from <export> --plane [--apply]` | fold an OpenTelemetry trace export into the service dependencies its spans witness: `CALLS` in `<plane>_ops`, marked `origin: observed`. Dry-run by default, as `digest` is |
+| `ops traces --from <export> \| --url <instance> --plane [--apply]` | fold OpenTelemetry spans into the service dependencies they witness: `CALLS` in `<plane>_ops`, marked `origin: observed`. `--from` reads an OTLP/JSON export, `--url` pulls a window from OpenObserve (`--org`, `--stream`, `--since 1h`, `--limit`, credential from `--token-env`, default `DRSG_OTEL_TOKEN`). Dry-run by default, as `digest` is |
 | `search <query> --plane` | semantic lookup: embeds the query, returns the nearest nodes |
 | `context \| describe \| trace \| impact \| fathom <name> --plane` | the agent verbs over a digested code plane |
 | `impact <name> --plane [--depth] [--across [attached\|all]] [--report]` | `--across` widens the radius past this repository: the planes this one attaches, or every plane this instance holds. `--report` renders it as Markdown for a pull request, and prints nothing where nothing reaches the symbol |
