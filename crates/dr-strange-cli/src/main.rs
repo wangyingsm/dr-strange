@@ -672,6 +672,11 @@ enum Command {
     #[cfg(feature = "digest")]
     #[command(subcommand)]
     Plugin(PluginCmd),
+    /// Operations facts that no file in the tree declares (`arch/10-ops.md`
+    /// §1): what a collector observed, rather than what a manifest states.
+    #[cfg(feature = "digest")]
+    #[command(subcommand)]
+    Ops(OpsCmd),
     /// Digest a document into a plane via an LLM (arch/07). Dry-run by default.
     #[cfg(feature = "digest")]
     Digest {
@@ -871,6 +876,30 @@ enum PluginCmd {
     },
     /// Remove an installed plugin by name.
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+#[cfg(feature = "digest")]
+enum OpsCmd {
+    /// Fold an OpenTelemetry trace export into the service dependencies its
+    /// spans witness: `CALLS` between services in `<plane>_ops`, each edge
+    /// marked `origin: observed` and counting the spans behind it.
+    ///
+    /// Dry-run by default, as `digest` is.
+    Traces {
+        /// The OTLP/JSON export to read: one document, or JSON Lines as a
+        /// collector's file exporter writes it.
+        #[arg(long)]
+        from: String,
+        /// The code plane whose ops plane to write. Defaults to `startup`,
+        /// which is empty on a normal install — name the plane this tree was
+        /// digested into.
+        #[arg(long, default_value = "startup")]
+        plane: String,
+        /// Write the result (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1995,6 +2024,45 @@ fn run_tree_verbs(
     }
 }
 
+/// The plugin store: every arm of it needs the same fetch route, built once.
+#[cfg(feature = "digest")]
+fn run_plugin(cmd: PluginCmd, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
+    let plugin_config = config::plugin_config(cfg)?;
+    let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
+        .fetch
+        .allow_private
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| dr_strange_web::fetch::Prefix::parse(s))
+        .collect::<Result<_>>()?;
+    let net = config::network(cfg)?;
+    let route = dr_strange_web::fetch::Route {
+        net: &net,
+        allow: &allow,
+    };
+    match cmd {
+        PluginCmd::Install { source } => {
+            commands::plugin_install(&plugin_config, route, source.as_deref(), out)
+        }
+        PluginCmd::List { available, json } => {
+            commands::plugin_list(&plugin_config, route, available, json, out)
+        }
+        PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
+    }
+}
+
+/// Operations facts a collector observed, which no file in the tree declares.
+#[cfg(feature = "digest")]
+fn run_ops(cmd: OpsCmd, db_path: &Path, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
+    let db = commands::open(db_path, config::retain_commits(cfg))?;
+    match cmd {
+        OpsCmd::Traces { from, plane, apply } => {
+            commands::ops_traces(&db, &from, &plane, apply, out)
+        }
+    }
+}
+
 /// The soft schema, the graph algorithms, and the retrieval surface.
 fn run_analytics(
     cmd: Command,
@@ -2414,31 +2482,9 @@ fn run_plugins_and_ingest(
 ) -> Result<()> {
     match cmd {
         #[cfg(feature = "digest")]
-        Command::Plugin(cmd) => {
-            let plugin_config = config::plugin_config(cfg)?;
-            let allow: Vec<dr_strange_web::fetch::Prefix> = cfg
-                .fetch
-                .allow_private
-                .clone()
-                .unwrap_or_default()
-                .iter()
-                .map(|s| dr_strange_web::fetch::Prefix::parse(s))
-                .collect::<Result<_>>()?;
-            let net = config::network(cfg)?;
-            let route = dr_strange_web::fetch::Route {
-                net: &net,
-                allow: &allow,
-            };
-            match cmd {
-                PluginCmd::Install { source } => {
-                    commands::plugin_install(&plugin_config, route, source.as_deref(), out)
-                }
-                PluginCmd::List { available, json } => {
-                    commands::plugin_list(&plugin_config, route, available, json, out)
-                }
-                PluginCmd::Remove { name } => commands::plugin_remove(&plugin_config, &name, out),
-            }
-        }
+        Command::Plugin(cmd) => run_plugin(cmd, cfg, out),
+        #[cfg(feature = "digest")]
+        Command::Ops(cmd) => run_ops(cmd, db_path, cfg, out),
         #[cfg(feature = "digest")]
         Command::Digest {
             source,
@@ -3051,6 +3097,10 @@ mod tests {
             (vec!["serve"], |c| matches!(c, Command::Serve { .. })),
             (vec!["update"], |c| matches!(c, Command::Update { .. })),
             (vec!["plane", "list"], |c| matches!(c, Command::Plane(_))),
+            #[cfg(feature = "digest")]
+            (vec!["ops", "traces", "--from", "t.json"], |c| {
+                matches!(c, Command::Ops(_))
+            }),
             (vec!["algo", "pagerank"], |c| matches!(c, Command::Algo(_))),
             (vec!["index", "keyword", "body"], |c| {
                 matches!(c, Command::Index(_))

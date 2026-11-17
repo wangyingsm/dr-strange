@@ -4392,6 +4392,74 @@ fn apply_digest(
     Ok(())
 }
 
+/// Fold a trace export into the service dependencies its spans witness.
+///
+/// The ops plane is read before the fold and written after it: what the
+/// manifests declare is what names a traced service, so the join needs the
+/// plane in hand before any key is chosen. A plane that does not exist yet
+/// declares nothing, and everything the export names stays observed.
+#[cfg(feature = "digest")]
+pub fn ops_traces(
+    db: &Database,
+    from: &str,
+    code_plane: &str,
+    apply: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let text = std::fs::read_to_string(from).with_context(|| format!("reading {from}"))?;
+    let read = dr_strange_llm::otlp::read(&text)?;
+    writeln!(
+        out,
+        "traces: {} span(s) in {} document(s)",
+        read.spans.len(),
+        read.documents
+    )?;
+    if read.anonymous > 0 {
+        writeln!(
+            out,
+            "  {} span(s) named no service and were dropped",
+            read.anonymous
+        )?;
+    }
+    let name = dr_strange_llm::ops_plane_name(code_plane);
+    let plane = db.plane(&name).ok();
+    let declared = dr_strange_llm::declared_services(plane.as_ref())?;
+    let folded = dr_strange_llm::fold_traces(&read.spans, &declared);
+    let report = &folded.report;
+    writeln!(
+        out,
+        "ops: {} service(s) — {} declared by this tree, {} ambiguous, {} observed only",
+        report.services,
+        report.joined,
+        report.ambiguous,
+        report.services - report.joined - report.ambiguous
+    )?;
+    writeln!(
+        out,
+        "  {} CALLS edge(s), {} span(s) inside one service",
+        folded.edges.len(),
+        report.internal
+    )?;
+    if report.orphans > 0 {
+        writeln!(
+            out,
+            "note: {} span(s) had no parent in what was read — sampling and per-batch \
+             export both cause it, so these edges are a lower bound",
+            report.orphans
+        )?;
+    }
+    if !apply {
+        writeln!(out, "dry run — pass --apply to write plane '{name}'")?;
+        return Ok(());
+    }
+    let mut result = dr_strange_llm::DigestResult {
+        nodes: folded.nodes,
+        edges: folded.edges,
+        ..Default::default()
+    };
+    apply_ops(db, code_plane, &mut result, out)
+}
+
 /// The ops readers' facts, into the plane beside the code one.
 ///
 /// Nothing asked for this plane, so it is created only when there is something
@@ -5018,6 +5086,91 @@ mod tests {
         let mut buf = Vec::new();
         f(&mut buf).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    /// One OTLP/JSON document: a gateway span, a checkout span under it, and
+    /// a span whose parent was exported in some other batch.
+    #[cfg(feature = "digest")]
+    const TRACES: &str = r#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name",
+        "value":{"stringValue":"gateway"}}]},"scopeSpans":[{"spans":[
+        {"traceId":"AA","spanId":"01","startTimeUnixNano":"1763366400000000000"}]}]},
+        {"resource":{"attributes":[{"key":"service.name",
+        "value":{"stringValue":"checkout"}}]},"scopeSpans":[{"spans":[
+        {"traceId":"AA","spanId":"02","parentSpanId":"01",
+         "startTimeUnixNano":"1763366400010000000","status":{"code":2}},
+        {"traceId":"BB","spanId":"03","parentSpanId":"ff",
+         "startTimeUnixNano":"1763366400020000000"}]}]}]}"#;
+
+    /// A file holding `text`, in a path nothing else in this run will use.
+    #[cfg(feature = "digest")]
+    fn temp_file(name: &str, text: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("drsg-{name}-{}-{nanos}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The whole verb over a plane that declares one of the two services: the
+    /// declared one is named as the topology names it, the other stays
+    /// observed, and the unparented span is reported rather than dropped in
+    /// silence.
+    #[cfg(feature = "digest")]
+    #[test]
+    fn ops_traces_folds_an_export_into_the_plane_beside_the_code() {
+        let db = Database::in_memory().unwrap();
+        db.create_plane("code_ops", Properties::new()).unwrap();
+        {
+            let plane = db.plane("code_ops").unwrap();
+            let mut txn = plane.write().unwrap();
+            let mut props = Properties::new();
+            props.insert(
+                "name".into(),
+                PropDesc::new(PropValue::Str("gateway".into())),
+            );
+            txn.create_node_with_key("prod/Service/gateway", &["Service"], props)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let export = temp_file("traces", TRACES);
+
+        let dry = cap(|o| ops_traces(&db, export.to_str().unwrap(), "code", false, o));
+        assert!(dry.contains("3 span(s) in 1 document(s)"), "{dry}");
+        assert!(
+            dry.contains("2 service(s) — 1 declared by this tree, 0 ambiguous, 1 observed only"),
+            "{dry}"
+        );
+        assert!(dry.contains("1 CALLS edge(s)"), "{dry}");
+        assert!(dry.contains("1 span(s) had no parent"), "{dry}");
+        assert!(dry.contains("dry run"), "{dry}");
+        assert_eq!(
+            db.plane("code_ops")
+                .unwrap()
+                .query()
+                .scan_label("Service")
+                .nodes()
+                .unwrap()
+                .len(),
+            1,
+            "a dry run wrote to the plane"
+        );
+
+        let applied = cap(|o| ops_traces(&db, export.to_str().unwrap(), "code", true, o));
+        assert!(applied.contains("wrote 1 node(s), 1 edge(s)"), "{applied}");
+
+        let plane = db.plane("code_ops").unwrap();
+        let keys: Vec<String> = plane
+            .query()
+            .scan_label("Service")
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .filter_map(|n| n.external_key)
+            .collect();
+        assert!(keys.contains(&"prod/Service/gateway".to_string()));
+        assert!(keys.contains(&"observed/checkout".to_string()));
+        let _ = std::fs::remove_file(&export);
     }
 
     const SAMPLE: &str = concat!(
