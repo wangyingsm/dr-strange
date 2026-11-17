@@ -4392,39 +4392,140 @@ fn apply_digest(
     Ok(())
 }
 
+/// Where a trace fold reads its spans.
+#[cfg(feature = "digest")]
+pub enum TraceSource {
+    /// An OTLP/JSON export on disk: whatever the exporter flushed.
+    File(String),
+    /// A window of an OpenObserve instance, which is a different claim — what
+    /// a stated interval held, rather than what a file happens to contain.
+    OpenObserve {
+        /// What to ask for.
+        query: dr_strange_llm::openobserve::Query,
+        /// The environment variable holding the credential. The variable's
+        /// *name*, because an argument is visible to every process on the
+        /// machine and lands in the shell's history.
+        token_env: String,
+        /// The proxy policy for the request.
+        net: dr_strange_net::Network,
+    },
+}
+
+/// The window `--since` names, ending now.
+#[cfg(feature = "digest")]
+pub fn trace_window(
+    base_url: String,
+    org: String,
+    stream: String,
+    since: &str,
+    limit: usize,
+) -> Result<dr_strange_llm::openobserve::Query> {
+    let window = dr_strange_llm::openobserve::window(since)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64);
+    Ok(dr_strange_llm::openobserve::Query {
+        base_url,
+        org,
+        stream,
+        start_us: now - window.as_micros() as i64,
+        end_us: now,
+        limit,
+    })
+}
+
+/// Read the spans a source holds, saying what was read and what was dropped.
+#[cfg(feature = "digest")]
+fn trace_spans(source: &TraceSource, out: &mut dyn Write) -> Result<Vec<dr_strange_llm::Span>> {
+    match source {
+        TraceSource::File(from) => {
+            let text = std::fs::read_to_string(from).with_context(|| format!("reading {from}"))?;
+            let read = dr_strange_llm::otlp::read(&text)?;
+            writeln!(
+                out,
+                "traces: {} span(s) in {} document(s)",
+                read.spans.len(),
+                read.documents
+            )?;
+            if read.anonymous > 0 {
+                writeln!(
+                    out,
+                    "  {} span(s) named no service and were dropped",
+                    read.anonymous
+                )?;
+            }
+            Ok(read.spans)
+        }
+        TraceSource::OpenObserve {
+            query,
+            token_env,
+            net,
+        } => {
+            let secret = std::env::var(token_env).map_err(|_| {
+                anyhow!(
+                    "{token_env} is not set — put the instance's token, or `user:password`, \
+                     in it rather than on the command line"
+                )
+            })?;
+            let pulled = dr_strange_llm::openobserve::pull(
+                query,
+                &secret,
+                net,
+                std::time::Duration::from_secs(TRACE_PULL_TIMEOUT_SECS),
+            )?;
+            writeln!(
+                out,
+                "traces: {} span(s) in {} row(s) over the last {}s of stream '{}'",
+                pulled.spans.len(),
+                pulled.rows,
+                (query.end_us - query.start_us) / 1_000_000,
+                query.stream
+            )?;
+            if pulled.capped {
+                writeln!(
+                    out,
+                    "  the {} row ceiling was reached: the window holds more than this \
+                     — narrow --since or raise --limit",
+                    query.limit
+                )?;
+            }
+            if pulled.no_parent_column && pulled.rows > 0 {
+                writeln!(
+                    out,
+                    "  no row carried `reference_parent_span_id` — either every span read \
+                     is a root, or this stream's schema predates that column, in which case \
+                     no edge can be drawn from it"
+                )?;
+            }
+            Ok(pulled.spans)
+        }
+    }
+}
+
+/// How long one pull may take, connect through read. A window of a busy
+/// stream is a scan, not a point lookup.
+#[cfg(feature = "digest")]
+const TRACE_PULL_TIMEOUT_SECS: u64 = 120;
+
 /// Fold a trace export into the service dependencies its spans witness.
 ///
 /// The ops plane is read before the fold and written after it: what the
 /// manifests declare is what names a traced service, so the join needs the
 /// plane in hand before any key is chosen. A plane that does not exist yet
-/// declares nothing, and everything the export names stays observed.
+/// declares nothing, and everything the spans name stays observed.
 #[cfg(feature = "digest")]
 pub fn ops_traces(
     db: &Database,
-    from: &str,
+    source: TraceSource,
     code_plane: &str,
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let text = std::fs::read_to_string(from).with_context(|| format!("reading {from}"))?;
-    let read = dr_strange_llm::otlp::read(&text)?;
-    writeln!(
-        out,
-        "traces: {} span(s) in {} document(s)",
-        read.spans.len(),
-        read.documents
-    )?;
-    if read.anonymous > 0 {
-        writeln!(
-            out,
-            "  {} span(s) named no service and were dropped",
-            read.anonymous
-        )?;
-    }
+    let spans = trace_spans(&source, out)?;
     let name = dr_strange_llm::ops_plane_name(code_plane);
     let plane = db.plane(&name).ok();
     let declared = dr_strange_llm::declared_services(plane.as_ref())?;
-    let folded = dr_strange_llm::fold_traces(&read.spans, &declared);
+    let folded = dr_strange_llm::fold_traces(&spans, &declared);
     let report = &folded.report;
     writeln!(
         out,
@@ -5135,7 +5236,15 @@ mod tests {
         }
         let export = temp_file("traces", TRACES);
 
-        let dry = cap(|o| ops_traces(&db, export.to_str().unwrap(), "code", false, o));
+        let dry = cap(|o| {
+            ops_traces(
+                &db,
+                TraceSource::File(export.display().to_string()),
+                "code",
+                false,
+                o,
+            )
+        });
         assert!(dry.contains("3 span(s) in 1 document(s)"), "{dry}");
         assert!(
             dry.contains("2 service(s) — 1 declared by this tree, 0 ambiguous, 1 observed only"),
@@ -5156,7 +5265,15 @@ mod tests {
             "a dry run wrote to the plane"
         );
 
-        let applied = cap(|o| ops_traces(&db, export.to_str().unwrap(), "code", true, o));
+        let applied = cap(|o| {
+            ops_traces(
+                &db,
+                TraceSource::File(export.display().to_string()),
+                "code",
+                true,
+                o,
+            )
+        });
         assert!(applied.contains("wrote 1 node(s), 1 edge(s)"), "{applied}");
 
         let plane = db.plane("code_ops").unwrap();

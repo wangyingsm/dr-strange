@@ -886,11 +886,35 @@ enum OpsCmd {
     /// marked `origin: observed` and counting the spans behind it.
     ///
     /// Dry-run by default, as `digest` is.
+    #[command(group(clap::ArgGroup::new("spans").required(true).args(["from", "url"])))]
     Traces {
         /// The OTLP/JSON export to read: one document, or JSON Lines as a
         /// collector's file exporter writes it.
         #[arg(long)]
-        from: String,
+        from: Option<String>,
+        /// An OpenObserve instance to pull a window of spans from instead of
+        /// reading a file, e.g. `http://observe.internal:5080`. The credential
+        /// is read from the environment (`--token-env`), never from a flag.
+        #[arg(long)]
+        url: Option<String>,
+        /// `--url` only: the organization.
+        #[arg(long, default_value = "default")]
+        org: String,
+        /// `--url` only: the traces stream.
+        #[arg(long, default_value = "default")]
+        stream: String,
+        /// `--url` only: how far back to ask, as one count and one unit —
+        /// `30s`, `15m`, `6h`, `7d`.
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// `--url` only: ceiling on rows read. A pull that reaches it says so,
+        /// because the window then held more than was folded.
+        #[arg(long, default_value_t = 50_000)]
+        limit: usize,
+        /// `--url` only: the environment variable holding the credential —
+        /// either the token the instance issues, or `user:password`.
+        #[arg(long, default_value = "DRSG_OTEL_TOKEN")]
+        token_env: String,
         /// The code plane whose ops plane to write. Defaults to `startup`,
         /// which is empty on a normal install — name the plane this tree was
         /// digested into.
@@ -2057,8 +2081,28 @@ fn run_plugin(cmd: PluginCmd, cfg: &config::Config, out: &mut dyn Write) -> Resu
 fn run_ops(cmd: OpsCmd, db_path: &Path, cfg: &config::Config, out: &mut dyn Write) -> Result<()> {
     let db = commands::open(db_path, config::retain_commits(cfg))?;
     match cmd {
-        OpsCmd::Traces { from, plane, apply } => {
-            commands::ops_traces(&db, &from, &plane, apply, out)
+        OpsCmd::Traces {
+            from,
+            url,
+            org,
+            stream,
+            since,
+            limit,
+            token_env,
+            plane,
+            apply,
+        } => {
+            let source = match (from, url) {
+                (Some(path), _) => commands::TraceSource::File(path),
+                (None, Some(url)) => commands::TraceSource::OpenObserve {
+                    query: commands::trace_window(url, org, stream, &since, limit)?,
+                    token_env,
+                    net: config::network(cfg)?,
+                },
+                // clap's group has already refused neither.
+                (None, None) => unreachable!("--from or --url"),
+            };
+            commands::ops_traces(&db, source, &plane, apply, out)
         }
     }
 }
