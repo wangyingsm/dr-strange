@@ -6,6 +6,34 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+Who calls whom, from the traces rather than from a file. `drsg ops traces
+--from <export>` reads an OpenTelemetry OTLP/JSON export — one document, or
+the JSON Lines a collector's file exporter writes — and folds it into the
+service dependencies its spans witness: a span and its parent in another
+service are one `CALLS` edge in `<plane>_ops`, carrying the spans and the
+errors behind it and the window they fall in. It is the first edge in that
+plane marked `origin: observed`, because it is the first that no file in the
+tree declared.
+
+A span is an input, not a node: 10⁵ spans are not 10⁵ nodes nobody queries,
+and the edge's own property descriptions say the counts are of the sample
+rather than of the traffic. A service the manifests declare is named as they
+name it, by the same lookup a bare scrape host uses, and nothing is written
+onto that node — its properties belong to the reader that read the file. A
+service the traces show and no file declares gets a node under `observed/`,
+so *what is running here that nothing declares* is a query. Where two declared
+nodes answer to one name, the candidates are recorded and no edge is drawn.
+And because sampling drops spans and a file exporter flushes per batch, spans
+whose parent is in no document read are counted and reported — the dependency
+set is a stated lower bound, not a claim.
+
+### Added
+
+- `drsg ops traces --from <export> --plane [--apply]`, dry-run by default as
+  `digest` is. The `ops` group is for facts no file in the tree declares.
+- `epoch_ms_to_rfc3339` in core, the inverse of the parser already there, so a
+  timestamp written by a fold reads back through `AS OF` and `history`.
+
 ## [2.31.0] - 2026-11-17
 
 What a deployment watches, beside what it runs. The ops plane gains a

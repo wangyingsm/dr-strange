@@ -212,6 +212,18 @@ all three with nothing would leave a reader unable to tell a gap from a fact.
 Planes are hard namespaces, so this is a read of two of them rather than an
 edge between them.
 
+What the manifests cannot say is who actually calls whom. `ops traces` folds
+an OpenTelemetry export into that: a span and its parent in another service
+are one `CALLS` edge, carrying the spans that witnessed it and marked
+`origin: observed`, because it is the one edge in the plane that no file
+declared. A service the manifests declare is named as they name it — the edge
+lands on the key the Kubernetes or Compose reader minted — and a service
+traces show that nothing here declares gets a node of its own under
+`observed/`, which is how *"what is running that we never wrote down"*
+becomes a query. Spans whose parent fell outside what was read are counted
+and said, so the dependency set is a stated lower bound rather than a claim
+of completeness.
+
 ## Routes: where the graph stops being one repository
 
 A call edge needs a callee the parser can see. An HTTP request has none: a page

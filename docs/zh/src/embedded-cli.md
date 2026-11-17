@@ -25,6 +25,7 @@
 | `index ensure \| keyword` | 声明一个向量或关键词索引 |
 | `ask <问题> --plane` | 自然语言查询 |
 | `digest <文件\|目录\|url> --plane [--mode]` | 导入一篇文档、一个代码仓库，或一个页面及其链接 |
+| `ops traces --from <导出文件> --plane [--apply]` | 把一份 OpenTelemetry 调用链导出折叠成其 span 所见证的服务依赖：写入 `<plane>_ops` 中的 `CALLS`，并标注 `origin: observed`。与 `digest` 一样，默认只做预演 |
 | `search <查询> --plane` | 语义查找：嵌入查询文本，返回最近的节点 |
 | `context \| describe \| trace \| impact \| fathom <名称> --plane` | 已图化代码平面上的智能体动词 |
 | `impact <名称> --plane [--depth] [--across [attached\|all]] [--report]` | `--across` 把半径扩到本仓库之外：本平面所附着的那些平面，或本实例持有的每一个平面。`--report` 渲染为可直接贴进合并请求的 Markdown；没有任何东西到达该符号时，什么都不输出 |

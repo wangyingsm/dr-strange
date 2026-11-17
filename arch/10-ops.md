@@ -2,8 +2,9 @@
 
 **Status**: begun 2026-10-17 as design. Shipped since: the `<name>_ops` plane
 (§2), the Compose, Kubernetes, Terraform and Prometheus readers, the image
-join and the `deployed` verb over it (§5, §9). Still design: cluster runtime
-(`Pod`, `Node`), OpenTelemetry's `CALLS`, deploy events and incidents (§8).
+join and the `deployed` verb over it (§5, §9), and the observed `CALLS` edge
+a trace export folds into (§4, §6). Still design: cluster runtime (`Pod`,
+`Node`), deploy events and incidents (§8).
 
 The year's thesis is that a code commit and a production incident are two
 ends of one graph. This doc fixes the half that does not exist yet: what an
@@ -120,6 +121,15 @@ scraping, whereas what a job *declares* it scrapes is in the file. The edge
 therefore runs from the target, and the reserved `Metric` label keeps its
 meaning — what an alert watches.
 
+A trace export adds no label of its own. A service the spans name is the same
+kind of thing a manifest declares, so it is a `Service` — keyed as the
+topology keys it where the topology declares it, and under `observed/<name>`
+where nothing does:
+
+| Label | Key | What it is |
+|---|---|---|
+| `Service` | `observed/<service.name>` | A service seen in traces that no file in this tree declares. `origin: observed` on the node says which it is, and the prefix is a namespace: a name the topology does not hold cannot collide with one it does. Asking the plane for these is asking *what is running here that nothing declares* |
+
 Reserved, so that later work does not rename these:
 
 `Pod`, `Node` (cluster runtime, Q1) · `DeployEvent` (a rollout, Q1 — *not*
@@ -165,9 +175,15 @@ Prometheus draws:
 | `ALERTS_ON` | `Alert` → `Metric` \| `ScrapeJob` | — |
 | `DERIVES_FROM` | `Metric` → `Metric` | A recording rule's metric, to the metrics it is computed over |
 
-Reserved: `SCHEDULED_ON` (Pod → Node) · `CALLS` (Service → Service, from
-traces) · `DEPLOYED` (DeployEvent → Workload) · `CAUSED_BY` (Incident →
-DeployEvent).
+A trace export draws one edge, and it is the only one here that nothing
+declared:
+
+| Edge | From → to | Carries |
+|---|---|---|
+| `CALLS` | `Service` → `Service` | `origin: observed`, `calls` and `errors` (the spans behind it, a count of the sample and not of the traffic), `first_seen` / `last_seen` / `last_seen_ts` — see §6 |
+
+Reserved: `SCHEDULED_ON` (Pod → Node) · `DEPLOYED` (DeployEvent → Workload) ·
+`CAUSED_BY` (Incident → DeployEvent).
 
 `SELECTS` is the one edge with real work behind it. A k8s Service names pods
 by label selector, and the pods come from a workload's pod template — so the
@@ -251,6 +267,39 @@ where both sides are visible — except that it is computed once at write time
 rather than per question, because an ops plane is small and a target's
 address does not change between questions.
 
+### A traced service, and the service it is declared as
+
+The third case comes from outside the tree. A span carries a `service.name`
+and nothing else about the topology: no namespace, no file, no key. So a
+traced service is matched by the same lookup the bare scrape host uses — one
+match is the key to draw on, several keep the service observed with the
+candidates recorded — and the rest of the arrangement is what the direction
+of the input forces:
+
+- **A span is an input, not a node.** A trace export is a sample of requests,
+  and 10⁵ spans would be 10⁵ nodes nobody queries. What is written is the
+  dependency they witness, with the count of the spans that witnessed it, and
+  the edge says in its own property description that the count is of the
+  sample rather than of the traffic.
+- **A declared service is not rewritten.** The edge is drawn onto the key the
+  k8s or Compose reader minted, and nothing is added to that node. Writing
+  `last_seen` onto it would also overwrite `_generated_by`, and the plane
+  would then name the wrong reader for everything on it.
+- **The fold's own nodes are not a declaration.** `observed/<name>` answers to
+  the same name as the service it stands for, so the second import would
+  match the first import's node and count it as declared. Keys under
+  `observed/` are excluded from the lookup for that reason.
+- **A span whose parent is missing is counted and reported.** Sampling drops
+  spans and the file exporter flushes per batch, so a child's parent is
+  routinely in a line, a file or a window this read does not hold. Those spans
+  are counted and the edge set is stated as a lower bound by exactly that many
+  — the same note `affected` carries, for the same reason.
+
+Where it comes from is the host's business, not a parser's: §1 keeps runtime
+state out of a plugin because it needs credentials and is stale when read.
+`drsg ops traces --from <export>` reads a file today; a pull from a trace
+store is the same fold behind a different reader.
+
 ## 7. Config and secrets
 
 **ConfigMap values are recorded.** A query can then see what a service is
@@ -289,9 +338,12 @@ The model is shaped so these extend rather than rewrite it:
   rule. `prometheus.yml` is routed by name like a Compose file, and rule
   files are followed from the `rule_files:` the configuration declares, since
   they have no name a router could claim.
-- **Q1 — OpenTelemetry**: `CALLS` between services, from traces. This is the
-  first edge in the ops plane that is observed rather than declared, and it
-  should carry that distinction on the edge.
+- **Q1 — OpenTelemetry**: **shipped in part**. `CALLS` between services, folded
+  from an OTLP/JSON export by `drsg ops traces` (§6), carrying
+  `origin: observed` and the spans behind it — the first edge in this plane
+  that nothing declared. Still to come: the pull from a trace store, so the
+  input is a query over a window rather than a file, and the plugin that reads
+  an export committed to the tree.
 - **Q1 — deploy events**: `DeployEvent` nodes joined to the image digest and
   so, through §5, to a commit. This is where the image-to-commit join stops
   being a query and starts being recorded.

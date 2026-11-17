@@ -5114,7 +5114,7 @@ mod tests {
 
     /// The whole verb over a plane that declares one of the two services: the
     /// declared one is named as the topology names it, the other stays
-    /// observed, and the unparented span is reported rather than dropped in
+    /// observed, and the parentless span is reported rather than dropped in
     /// silence.
     #[cfg(feature = "digest")]
     #[test]
