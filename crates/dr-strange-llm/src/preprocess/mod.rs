@@ -48,6 +48,7 @@ mod ops;
 #[cfg(feature = "plugins")]
 mod registry;
 mod repo;
+mod scrape;
 mod sync;
 #[cfg(feature = "plugins")]
 mod wasm;
@@ -93,8 +94,8 @@ pub fn plugin_memory_bytes() -> usize {
     }
 }
 pub use ops::{
-    OPS_PLUGINS, PLANE_SUFFIX as OPS_PLANE_SUFFIX, from_ops_reader, ops_facts,
-    plane_name as ops_plane_name, take_ops, take_ops_facts,
+    OPS_PLUGINS, PLANE_SUFFIX as OPS_PLANE_SUFFIX, drop_dangling as drop_dangling_ops,
+    from_ops_reader, ops_facts, plane_name as ops_plane_name, take_ops, take_ops_facts,
 };
 #[cfg(feature = "plugins")]
 pub use registry::{InstalledPlugin, PluginStore, StoreStamp};
@@ -102,6 +103,7 @@ pub use repo::{
     GitDir, PLANE_SUFFIX, REPO_PLUGIN, WriteStats, git_dir, plane_name, route_repository,
     write_history,
 };
+pub use scrape::{Joined as ScrapeJoin, join as join_scrape_targets};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
@@ -1025,6 +1027,11 @@ const MANIFEST_PLUGINS: &[(&str, &[&str])] = &[
             "docker-compose.override.yml",
         ],
     ),
+    // A Prometheus configuration is a filename for the same reason. Its rule
+    // files are not listed, and cannot be: they have no fixed name, and the
+    // configuration declares its own under `rule_files:` for the plugin to
+    // follow.
+    ("prometheus", &["prometheus.yaml", "prometheus.yml"]),
 ];
 
 /// The reserved plugin name that claims this path by filename, whether or

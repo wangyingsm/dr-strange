@@ -134,11 +134,25 @@ fn apply_with_ops(
     plugins: &Plugins,
     mut routed: Routed,
 ) -> Result<SyncStats> {
-    let ops = super::ops::take_ops_facts(&mut routed.facts);
+    let mut ops = super::ops::take_ops_facts(&mut routed.facts);
     let mut stats = apply_routed(db, plane_name, plugins, routed)?;
 
     let ops_plane = super::ops::plane_name(plane_name);
     let held = db.plane(&ops_plane).is_ok();
+    // Before the write, because the join reads the plane as it stands and the
+    // facts it is about to gain — and because the edges it draws are reconciled
+    // with the rest rather than appended behind them.
+    let joined = super::scrape::join(
+        &mut ops.nodes,
+        &mut ops.edges,
+        db.plane(&ops_plane).ok().as_ref(),
+    )?;
+    if joined.any() {
+        stats.notes.push(format!(
+            "ops: {} scrape target(s) joined by name, {} ambiguous, {} unmatched",
+            joined.matched, joined.ambiguous, joined.unmatched
+        ));
+    }
     // A tree with no manifests leaves no empty plane behind; one that had them
     // before is still reconciled, so the last manifest leaving empties it.
     if !held && ops.nodes.is_empty() && ops.edges.is_empty() {

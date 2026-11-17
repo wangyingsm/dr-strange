@@ -1,6 +1,9 @@
 # Ops graph
 
-**Status**: design · begun 2026-10-17 · nothing implemented yet
+**Status**: begun 2026-10-17 as design. Shipped since: the `<name>_ops` plane
+(§2), the Compose, Kubernetes, Terraform and Prometheus readers, the image
+join and the `deployed` verb over it (§5, §9). Still design: cluster runtime
+(`Pod`, `Node`), OpenTelemetry's `CALLS`, deploy events and incidents (§8).
 
 The year's thesis is that a code commit and a production incident are two
 ends of one graph. This doc fixes the half that does not exist yet: what an
@@ -100,11 +103,28 @@ uses `Resource` as its catch-all for a kind it does not model, and one label
 meaning both "an unmodelled Kubernetes object" and "a managed cloud resource"
 would make every query over either one wrong.
 
+The Prometheus reader adds four, which were reserved here before it was
+written (`Metric` and `Alert`) or added when it was:
+
+| Label | Key | What it is |
+|---|---|---|
+| `ScrapeJob` | `<config>/job/<name>` | One `scrape_configs` entry. `<config>` is the directory holding the file, the rule the Compose reader uses for projects |
+| `ScrapeTarget` | `<config>/job/<name>/target/<address>` | One declared address. A node rather than a property on the job, because it carries the join to the service — and, where nothing answers to it, the fact that there was none |
+| `Alert` | `<config>/alert/<group>/<name>` | One alerting rule, with its expression as written |
+| `Metric` | `metric/<name>` | A metric a rule names. Keyed globally, not per configuration: a metric name means the same thing wherever it is written, so two configurations watching one metric meet on it |
+
+`ScrapeTarget` and `ScrapeJob` were not in the reserved list, and `SCRAPES`
+was reserved as `Metric → Workload`. That direction was written before the
+input was: which metrics a job yields is runtime, discoverable only by
+scraping, whereas what a job *declares* it scrapes is in the file. The edge
+therefore runs from the target, and the reserved `Metric` label keeps its
+meaning — what an alert watches.
+
 Reserved, so that later work does not rename these:
 
-`Pod`, `Node` (cluster runtime, Q1) · `Metric`, `Alert` (Prometheus, Q1) ·
-`DeployEvent` (a rollout, Q1 — *not* called `Deployment`, which is a
-workload kind here and would collide) · `Incident` (Q2).
+`Pod`, `Node` (cluster runtime, Q1) · `DeployEvent` (a rollout, Q1 — *not*
+called `Deployment`, which is a workload kind here and would collide) ·
+`Incident` (Q2).
 
 ## 4. Edges
 
@@ -136,9 +156,18 @@ image named in Terraform — an ECS task definition, a Cloud Run service, a
 would mint, under the same key, with the same `revision` parsed by the same
 SDK code.
 
-Reserved: `SCHEDULED_ON` (Pod → Node) · `SCRAPES` (Metric → Workload) ·
-`ALERTS_ON` (Alert → anything) · `CALLS` (Service → Service, from traces) ·
-`DEPLOYED` (DeployEvent → Workload) · `CAUSED_BY` (Incident → DeployEvent).
+Prometheus draws:
+
+| Edge | From → to | Carries |
+|---|---|---|
+| `HAS_TARGET` | `ScrapeJob` → `ScrapeTarget` | — |
+| `SCRAPES` | `ScrapeTarget` → `Service` \| `Workload` | `matched_by` and `confidence` — see §6 |
+| `ALERTS_ON` | `Alert` → `Metric` \| `ScrapeJob` | — |
+| `DERIVES_FROM` | `Metric` → `Metric` | A recording rule's metric, to the metrics it is computed over |
+
+Reserved: `SCHEDULED_ON` (Pod → Node) · `CALLS` (Service → Service, from
+traces) · `DEPLOYED` (DeployEvent → Workload) · `CAUSED_BY` (Incident →
+DeployEvent).
 
 `SELECTS` is the one edge with real work behind it. A k8s Service names pods
 by label selector, and the pods come from a workload's pod template — so the
@@ -192,6 +221,36 @@ like.
 The rule, same as `deps`: record what the manifest says, join only where the
 join is exact, and state the gap where it is not.
 
+### A scrape target, and the service it scrapes
+
+The same rule meets its second case with Prometheus, where it cannot be kept
+whole: a scrape target is an *address*, and only one address form is also a
+key. `api.prod.svc.cluster.local` is `prod/Service/api` and admits no other
+reading. A bare `api:9090` — a Compose service, a short-name Kubernetes
+target — names no namespace, and the reader holding one configuration file
+cannot invent one.
+
+So the join is split in two, and the halves are never written to look alike:
+
+- **The reader states, the host joins.** A target records `names` where its
+  address is a key. Whether this tree *declares* that service is not a
+  parser's question — and an edge onto a key nothing mints fails the whole
+  digest — so the host draws the edge, as `matched_by: dns`,
+  `confidence: exact`, or leaves the target unmatched.
+- **A bare host is matched by name, and said to be.** The host sees every ops
+  node in the plane, so it can match `api` against what the Compose and
+  Kubernetes readers minted. One match is an edge marked `matched_by: name`,
+  `confidence: low`. It is a weaker claim than an address, and a reader must
+  be able to tell which it has.
+- **Two matches are candidates, not a choice.** Where `api` names a Compose
+  service *and* a Kubernetes Service, no edge is drawn and both keys are
+  recorded on the target. The ambiguity is the answer.
+
+This is `wire`'s shape — a correspondence neither side declares, computed
+where both sides are visible — except that it is computed once at write time
+rather than per question, because an ops plane is small and a target's
+address does not change between questions.
+
 ## 7. Config and secrets
 
 **ConfigMap values are recorded.** A query can then see what a service is
@@ -224,8 +283,12 @@ read it would put real credentials in a graph that gets copied around.
 
 The model is shaped so these extend rather than rewrite it:
 
-- **Q1 — Prometheus**: `Metric` nodes, `SCRAPES` to the workload a target
-  resolves to, `ALERTS_ON` from an alerting rule.
+- **Q1 — Prometheus**: **shipped**. `ScrapeJob`, `ScrapeTarget`, `Alert` and
+  `Metric` nodes from the `prometheus` plugin; `SCRAPES` to the service a
+  target resolves to, drawn by the host (§6); `ALERTS_ON` from an alerting
+  rule. `prometheus.yml` is routed by name like a Compose file, and rule
+  files are followed from the `rule_files:` the configuration declares, since
+  they have no name a router could claim.
 - **Q1 — OpenTelemetry**: `CALLS` between services, from traces. This is the
   first edge in the ops plane that is observed rather than declared, and it
   should carry that distinction on the edge.
