@@ -120,7 +120,10 @@ eval:
 # mirror-CI rule below intact. The cap also stays well above any GitHub
 # runner's core count, so it cannot hide a concurrency bug CI would find.
 # Raise or drop it per machine: `just gate_jobs=8 gate` (or DRSG_GATE_JOBS).
-gate_jobs := env_var_or_default("DRSG_GATE_JOBS", "20")
+#
+# 16, not 20: at 20 the full gate took the machine down twice on 2026-11-17,
+# mid-release. Half the threads is the cap that has held.
+gate_jobs := env_var_or_default("DRSG_GATE_JOBS", "16")
 
 # Compilation and the test harness are separate pools, so capping one alone
 # leaves the other at every core. Exported, so every recipe in this file
