@@ -69,6 +69,36 @@ pub fn rfc3339_to_epoch_ms(s: &str) -> Option<i64> {
     Some(((days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60) * 1000) + millis)
 }
 
+/// The proleptic Gregorian date of days since 1970-01-01 (Hinnant's civil-from-days).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// The RFC-3339 instant in UTC, to the second, of unix-epoch milliseconds.
+///
+/// The inverse of [`rfc3339_to_epoch_ms`] for whole seconds, so a timestamp this
+/// writes can be read back by the `AS OF` clause and by `history`.
+pub fn epoch_ms_to_rfc3339(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let since_midnight = secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        since_midnight / 3600,
+        (since_midnight % 3600) / 60,
+        since_midnight % 60
+    )
+}
+
 /// The last millisecond of a `YYYY-MM-DD` day in UTC, or `None` if `s` is not one.
 pub fn date_end_of_day(s: &str) -> Option<i64> {
     if s.len() != 10 {
@@ -109,6 +139,27 @@ mod tests {
         ] {
             assert_eq!(rfc3339_to_epoch_ms(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn an_instant_written_back_reads_the_same() {
+        for s in [
+            "1970-01-01T00:00:00Z",
+            "2026-11-17T08:20:59Z",
+            "2024-02-29T23:59:59Z",
+            "2000-03-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "1900-01-01T12:00:00Z",
+        ] {
+            let ms = rfc3339_to_epoch_ms(s).unwrap();
+            assert_eq!(epoch_ms_to_rfc3339(ms), s, "{s}");
+        }
+    }
+
+    #[test]
+    fn sub_second_milliseconds_round_down_to_the_second() {
+        assert_eq!(epoch_ms_to_rfc3339(1_999), "1970-01-01T00:00:01Z");
+        assert_eq!(epoch_ms_to_rfc3339(-1), "1969-12-31T23:59:59Z");
     }
 
     #[test]
