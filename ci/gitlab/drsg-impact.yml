@@ -1,7 +1,7 @@
 # drsg impact report — a GitLab CI template.
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.30.0/ci/gitlab/drsg-impact.yml'
+#     - remote: 'https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.31.0/ci/gitlab/drsg-impact.yml'
 #
 # Digests the merge request's head into a code graph and reports what the
 # change reaches: the tests to run, what calls the changed declarations, and

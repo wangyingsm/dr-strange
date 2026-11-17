@@ -6,6 +6,68 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+## [2.31.0] - 2026-11-17
+
+What a deployment watches, beside what it runs. The ops plane gains a
+Prometheus reader: `prometheus.yml` is routed by name, and a scrape job, the
+addresses it writes down, the alerting rules in the files it declares and the
+metrics those rules read all land in `<name>_ops` next to the Compose,
+Kubernetes and Terraform facts already there. It is the eighteenth official
+plugin, released from the extensions repository as `prometheus-v1.0.0`.
+
+The part worth reading twice is the join. A scrape address is a string in a
+configuration file, and what answers at it is declared somewhere else
+entirely — so the reader states what the address *names* and the host draws
+the edge, grading it: an address that derives a key is an exact match, a bare
+host matched against the name a service answers to is a weak one and says so,
+and two matches draw no edge at all. The alternative was a plugin minting an
+endpoint nothing else declares, which failed the whole digest; that failure
+mode is gone too — an ops edge whose endpoints resolve in neither the facts in
+hand nor the plane is now dropped and counted, the way a fold has always
+dropped one.
+
+### Added
+
+- **The Prometheus reader.** `prometheus.yml`, claimed by name rather than by
+  extension — a plugin claiming `.yml` would take every CI workflow and Helm
+  chart in the tree from whatever reads them. It mints `ScrapeJob`,
+  `ScrapeTarget`, `Alert` and `Metric`, joined by `HAS_TARGET`, `ALERTS_ON`
+  and `DERIVES_FROM`, and follows the rule files from the `rule_files:` the
+  configuration itself declares, because those have no fixed name to claim.
+  One metric named by three rules is one node, and a recording rule's own
+  metric replaces the bare node a mention minted. Install it with
+  `drsg plugin install` as any other: the catalog pins the published hash and
+  drsg re-checks it at every load.
+
+- **A scrape target joined to the service it scrapes.** The reader records
+  what a target's host names and the host draws `SCRAPES`, because an edge
+  onto a key nothing mints fails the digest rather than the edge. The join is
+  graded in the edge's own properties: an address that *is* a key — a
+  Kubernetes service DNS name, a Compose service — carries
+  `matched_by: dns` and `confidence: exact`; a bare host matched against the
+  name an ops node answers to carries `matched_by: name` and
+  `confidence: low`; where two nodes answer to one name, the target gains a
+  `candidates` list and no edge is drawn, because choosing between them would
+  be a guess. `digest` and `apply ops` print how many targets joined, how many
+  were ambiguous and how many matched nothing.
+
+### Changed
+
+- **A dangling ops edge is dropped, not fatal.** Two readers see one
+  deployment from different files, so one of them routinely names an endpoint
+  the other does not declare — a scrape address for a service this tree holds
+  no manifest for. Every such edge used to reach `bulk_load` and fail the
+  ingest with `bulk edge endpoint … not found`, discarding the facts that did
+  resolve. Ops edges are now checked against the facts in hand and the plane
+  before the write, dropped where an endpoint resolves in neither, and
+  reported in the digest output.
+
+### Fixed
+
+- **The connected-component loops iterate instead of indexing.** A
+  bounds-checked index per step in `compute/algo.rs`, where the iterator says
+  the same thing and cannot be off by one.
+
 ## [2.30.0] - 2026-11-12
 
 Which tests to run, and which pull request to blame. `affected` turns a change
@@ -3337,7 +3399,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.30.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.31.0...HEAD
+[2.31.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.31.0
 [2.30.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.30.0
 [1.7.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.7.0
 [1.6.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.6.0
