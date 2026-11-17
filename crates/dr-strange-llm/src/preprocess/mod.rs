@@ -108,7 +108,7 @@ pub use scrape::{Joined as ScrapeJoin, join as join_scrape_targets};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
 pub use traces::{
     Folded as TracedServices, Named as DeclaredAs, Span, declared as declared_services,
-    fold as fold_traces, otlp,
+    fold as fold_traces, openobserve, otlp,
 };
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};

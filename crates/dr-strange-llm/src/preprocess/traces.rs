@@ -7,6 +7,7 @@
 //! is an input here, never a node. The graph records the dependency the spans
 //! witness, and says how many spans it read to find it.
 
+pub mod openobserve;
 pub mod otlp;
 
 use std::collections::{BTreeMap, BTreeSet};
