@@ -323,17 +323,22 @@ _rust-matches-ci:
         echo "gate: 'rustup check' reported no stable toolchain — is rustup managing this one?" >&2
         exit 1
     fi
+    # A re-released channel manifest also reads "update available", with the
+    # same compiler on both sides of the arrow — the channel moved, rustc did
+    # not, and the lint set this guard protects is unchanged. So compare what
+    # CI would install rather than trusting the word: on 2026-11-17 the word
+    # alone failed a release gate against an identical 1.100.0.
     case "$line" in
-        *"update available"*)
-            echo "gate: this stable is behind the one CI installs — run 'rustup update stable'" >&2
-            echo "  $line" >&2
+        *"up to date: "*)       latest=${line#*up to date: } ;;
+        *"update available: "*) latest=${line##* -> } ;;
+        *)
+            echo "gate: no stable version in 'rustup check' output — $line" >&2
             exit 1
             ;;
     esac
-    latest=${line#*up to date: }
     have=$(rustc --version | cut -d' ' -f2-)
     if [ "$latest" != "$have" ]; then
-        echo "gate: cargo runs rustc $have, CI runs stable $latest — 'rustup default stable'" >&2
+        echo "gate: cargo runs rustc $have, CI installs stable $latest — 'rustup update stable', then 'rustup default stable'" >&2
         exit 1
     fi
 
