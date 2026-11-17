@@ -50,6 +50,7 @@ mod registry;
 mod repo;
 mod scrape;
 mod sync;
+mod traces;
 #[cfg(feature = "plugins")]
 mod wasm;
 
@@ -105,6 +106,7 @@ pub use repo::{
 };
 pub use scrape::{Joined as ScrapeJoin, join as join_scrape_targets};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
+pub use traces::{Span, otlp};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
 
