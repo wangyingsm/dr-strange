@@ -191,7 +191,7 @@ installed plugins.
 
 ## The official catalog
 
-Seventeen official plugins cover the common languages, the cross-cutting
+Eighteen official plugins cover the common languages, the cross-cutting
 sources, and what a deployment declares it runs — each wrapping a mature
 parser rather than reinventing one:
 
@@ -214,6 +214,7 @@ parser rather than reinventing one:
 | `compose` | *(`compose.yaml` and its aliases, by name)* | [yaml-rust2](https://crates.io/crates/yaml-rust2) — a project's services, the images they run, their config and the links between them. It declares no extension on purpose: claiming `.yml` would take every manifest, workflow and chart in the tree from whatever reads them |
 | `k8s` | *(a manifest tree, routed explicitly with `--handler k8s`)* | [yaml-rust2](https://crates.io/crates/yaml-rust2) — workloads, services, routes and config, with a workload's pods reached by label selector. Routed by hand because a manifest may be called anything, and a document without both `apiVersion` and `kind` is counted and named rather than half-read |
 | `terraform` | `.tf .tfvars .tfstate` | [hcl-rs](https://crates.io/crates/hcl-rs) — resources, modules, and the references between them |
+| `prometheus` | *(`prometheus.yml`, by name)* | [yaml-rust2](https://crates.io/crates/yaml-rust2) — scrape jobs and the addresses they name, alerting rules and the metrics those watch. Rule files have no fixed name, so they are followed from the `rule_files:` the configuration declares rather than claimed by a router |
 
 Each releases at its own pace as a `<plugin>-vX.Y.Z` tag; CI builds the
 component and publishes `<plugin>.wasm` with its SHA-256 on the

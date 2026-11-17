@@ -93,7 +93,7 @@ WebSocket change feed, with client SDKs in six languages.
 
 The code intelligence above is built on the same engine. Sandboxed wasm parser
 plugins digest a repository into a graph of symbols and resolved relationships
-— seventeen official plugins, eight of them languages, no model in the loop. `drsg serve watch` keeps that graph synced to
+— eighteen official plugins, eight of them languages, no model in the loop. `drsg serve watch` keeps that graph synced to
 every commit, and a compact set of agent tools answers structural questions —
 who calls this, what breaks if it changes, how does X reach Y — in one round
 trip. See [For coding agents](#for-coding-agents).
@@ -133,7 +133,7 @@ chapter](https://wangyingsm.github.io/dr-strange/en/book/web-ui.html).
 | **Natural-language query** | ask in plain language → plan → run |
 | **Time-travel** | read the graph *as of* a past commit or timestamp |
 | **Change feed** | subscribe to a plane and receive mutations live |
-| **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — seventeen official plugins (eight languages, the rest manifests and deployment descriptors), an SDK for community parsers |
+| **Code digestion** | sandboxed wasm parser plugins turn a repository into a resolved call graph — eighteen official plugins (eight languages, the rest manifests and deployment descriptors), an SDK for community parsers |
 | **Commit-synced watch** | `serve watch` folds every commit into the plane, convergent with a full re-digest |
 | **Agent tools** | `context` · `search` · `describe` · `grep` · `trace` · `impact` · `affected` · `fathom` · `snippet` · `history` · `deployed` · `recall` · `wire` — one round trip each |
 | **Attached planes** | `drsg attach` records that one plane may ask another — on this instance, or another drsg at a URL — so `impact --across` and `wire` answer across repositories |

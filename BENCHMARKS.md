@@ -46,9 +46,10 @@ Cross-engine comparison of dr-strange against an embedded graph DB (Kùzu), the 
 What it costs to turn a working tree into a graph, measured on this repository
 (97,308 lines of code, 355 files read after `.gitignore` withheld 377 of 732),
 with every plugin the catalog then held — thirteen — installed. The catalog
-now holds seventeen; the four added since (`sql`, `compose`, `k8s`,
-`terraform`) claim files this tree has almost none of — one
-`docker-compose.yml`, and no `.sql`, `.tf` or Kubernetes manifest at all — so
+now holds eighteen; the five added since (`sql`, `compose`, `k8s`,
+`terraform`, `prometheus`) claim files this tree has almost none of — one
+`docker-compose.yml`, and no `.sql`, `.tf`, `prometheus.yml` or Kubernetes
+manifest at all — so
 the figures below are the measured ones and have not been re-run against the
 larger set:
 
