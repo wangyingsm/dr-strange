@@ -376,6 +376,10 @@ bump-version old new:
     # lists an old binary under a current name.
     sed -i 's/"version": "{{old}}",/"version": "{{new}}",/' packaging/mcp-registry/server.json
     sed -i 's/drsg {{old}} is the latest release/drsg {{new}} is the latest release/' README.md README.zh.md
+    # The CI templates are consumed by tag, so the examples pin one. Left
+    # behind, they tell a reader to run the previous release's action.
+    sed -i 's|/ci/github@v{{old}}|/ci/github@v{{new}}|; s|/dr-strange/v{{old}}/ci/|/dr-strange/v{{new}}/ci/|' \
+        ci/README.md ci/gitlab/drsg-impact.yml
     # The book's `drsg update` transcript: the example moves one release on.
     for f in docs/en/src/getting-started.md docs/zh/src/getting-started.md; do
         sed -i "s/drsg {{old}} is the latest release/drsg {{new}} is the latest release/; \
