@@ -168,7 +168,10 @@ fn by_address_props() -> Properties {
 
 /// Every addressable ops node, by the name it answers to — the facts in hand
 /// first, then the plane they are being written into.
-fn addressable(
+///
+/// Shared with the trace fold, which asks the same question of the same two
+/// labels: a name a service answers to is one lookup, not one per reader.
+pub(super) fn addressable(
     nodes: &[DigestNode],
     plane: Option<&PlaneHandle<'_>>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {

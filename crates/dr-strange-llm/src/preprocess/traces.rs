@@ -11,7 +11,9 @@ pub mod otlp;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dr_strange_core::{PropDesc, PropValue, Properties, time::epoch_ms_to_rfc3339};
+use dr_strange_core::{
+    PlaneHandle, PropDesc, PropValue, Properties, Result, time::epoch_ms_to_rfc3339,
+};
 
 use crate::digest::{DigestEdge, DigestNode};
 
@@ -119,6 +121,36 @@ impl Pair {
             self.last_ms = Some(self.last_ms.unwrap_or(span.start_ms).max(span.start_ms));
         }
     }
+}
+
+/// What the ops plane declares, by the name a service answers to — the map
+/// [`fold`] needs to name a traced service as the topology names it.
+///
+/// `None` before the plane exists, which is every tree whose manifests have
+/// not been read: everything then stays observed, and says so.
+///
+/// The nodes a previous fold minted are left out. A service matching the
+/// `observed/` node its own last import wrote is not one the topology
+/// declares, and counting it as joined would have the report claim this tree
+/// declares what it does not.
+pub fn declared(plane: Option<&PlaneHandle<'_>>) -> Result<BTreeMap<String, Named>> {
+    let mut out = BTreeMap::new();
+    for (name, keys) in super::scrape::addressable(&[], plane)? {
+        let keys: Vec<String> = keys
+            .into_iter()
+            .filter(|key| !key.starts_with(OBSERVED))
+            .collect();
+        match keys.as_slice() {
+            [] => {}
+            [one] => {
+                out.insert(name, Named::One(one.clone()));
+            }
+            _ => {
+                out.insert(name, Named::Many(keys));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Fold spans into the service dependencies they witness.

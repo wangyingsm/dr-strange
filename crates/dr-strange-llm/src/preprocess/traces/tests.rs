@@ -1,4 +1,23 @@
+use dr_strange_core::Database;
+
 use super::*;
+
+/// An ops plane holding `(key, label, name)` for each declared node.
+fn ops_plane(nodes: &[(&str, &str, &str)]) -> Database {
+    let db = Database::in_memory().unwrap();
+    db.create_plane("code_ops", Properties::new()).unwrap();
+    let plane = db.plane("code_ops").unwrap();
+    {
+        let mut txn = plane.write().unwrap();
+        for (key, label, name) in nodes {
+            let mut props = Properties::new();
+            props.insert("name".into(), PropDesc::new(PropValue::Str((*name).into())));
+            txn.create_node_with_key(key, &[*label], props).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    db
+}
 
 /// A span in `service`, called by `parent`, at `start_ms`.
 fn span(id: &str, parent: Option<&str>, service: &str, start_ms: i64) -> Span {
@@ -209,4 +228,77 @@ fn nothing_read_is_nothing_said() {
     let folded = fold(&[], &BTreeMap::new());
     assert!(!folded.report.any());
     assert!(folded.nodes.is_empty() && folded.edges.is_empty());
+}
+
+#[test]
+fn the_plane_says_which_names_the_topology_declares() {
+    let db = ops_plane(&[
+        ("prod/Service/api", "Service", "api"),
+        ("shop/service/worker", "Workload", "worker"),
+    ]);
+    let plane = db.plane("code_ops").unwrap();
+
+    let declared = declared(Some(&plane)).unwrap();
+
+    assert_eq!(
+        declared.get("api"),
+        Some(&Named::One("prod/Service/api".into()))
+    );
+    assert_eq!(
+        declared.get("worker"),
+        Some(&Named::One("shop/service/worker".into()))
+    );
+    assert_eq!(declared.get("nothing"), None);
+}
+
+#[test]
+fn one_name_two_declared_nodes_answer_to_is_many() {
+    let db = ops_plane(&[
+        ("prod/Service/api", "Service", "api"),
+        ("staging/Service/api", "Service", "api"),
+    ]);
+    let plane = db.plane("code_ops").unwrap();
+
+    match declared(Some(&plane)).unwrap().get("api") {
+        Some(Named::Many(keys)) => assert_eq!(keys.len(), 2),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The trap of a second import: the fold's own `observed/` node answers to the
+/// same name, and must not be read back as a declaration.
+#[test]
+fn a_service_matched_only_by_its_own_observed_node_stays_observed() {
+    let db = ops_plane(&[("observed/api", "Service", "api")]);
+    let plane = db.plane("code_ops").unwrap();
+
+    assert_eq!(declared(Some(&plane)).unwrap().get("api"), None);
+
+    let spans = [
+        span("1", None, "gateway", 1_000),
+        span("2", Some("1"), "api", 1_010),
+    ];
+    let folded = fold(&spans, &declared(Some(&plane)).unwrap());
+    assert_eq!(folded.edges[0].dst, "observed/api");
+    assert_eq!(folded.report.joined, 0);
+}
+
+#[test]
+fn an_observed_node_beside_a_declared_one_is_not_a_second_candidate() {
+    let db = ops_plane(&[
+        ("prod/Service/api", "Service", "api"),
+        ("observed/api", "Service", "api"),
+    ]);
+    let plane = db.plane("code_ops").unwrap();
+
+    assert_eq!(
+        declared(Some(&plane)).unwrap().get("api"),
+        Some(&Named::One("prod/Service/api".into())),
+        "the observed node is the fold's own, not a rival declaration"
+    );
+}
+
+#[test]
+fn no_plane_declares_nothing() {
+    assert!(declared(None).unwrap().is_empty());
 }

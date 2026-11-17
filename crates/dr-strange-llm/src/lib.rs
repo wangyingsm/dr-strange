@@ -48,7 +48,7 @@ pub use preprocess::{
     refresh_cache,
 };
 /// Folding traced spans into service dependencies — see [`preprocess::traces`].
-pub use preprocess::{DeclaredAs, Span, TracedServices, fold_traces, otlp};
+pub use preprocess::{DeclaredAs, Span, TracedServices, declared_services, fold_traces, otlp};
 #[cfg(feature = "plugins")]
 pub use preprocess::{
     ENV_PLUGIN_DEADLINE_SECS, ENV_PLUGIN_TOTAL_MEMORY_MB, InstalledPlugin, Limits, LivePlugins,

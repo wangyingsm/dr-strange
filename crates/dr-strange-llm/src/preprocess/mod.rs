@@ -106,7 +106,10 @@ pub use repo::{
 };
 pub use scrape::{Joined as ScrapeJoin, join as join_scrape_targets};
 pub use sync::{CommitDelta, SyncStats, resync, sync_paths};
-pub use traces::{Folded as TracedServices, Named as DeclaredAs, Span, fold as fold_traces, otlp};
+pub use traces::{
+    Folded as TracedServices, Named as DeclaredAs, Span, declared as declared_services,
+    fold as fold_traces, otlp,
+};
 #[cfg(feature = "plugins")]
 pub use wasm::{Limits, WasmPlugin};
 
