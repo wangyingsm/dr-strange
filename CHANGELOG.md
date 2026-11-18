@@ -6,6 +6,8 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+## [2.32.0] - 2026-11-18
+
 Who calls whom, from the traces rather than from a file. `drsg ops traces
 --from <export>` reads an OpenTelemetry OTLP/JSON export — one document, or
 the JSON Lines a collector's file exporter writes — and folds it into the
@@ -3437,7 +3439,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.31.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.32.0...HEAD
+[2.32.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.32.0
 [2.31.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.31.0
 [2.30.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.30.0
 [1.7.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v1.7.0
