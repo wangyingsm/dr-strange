@@ -6,8 +6,9 @@
 
 [advisories]
 # An advisory with a fix is an upgrade, not an entry here. None of the entries
-# below has one: each is transitive, none is reachable from a dependency this
-# workspace names, and all are noise until their own upstreams move.
+# below has one: every ID is transitive, and each is either a function this tree
+# never reaches or a crate with no maintained successor to move to. They stay
+# noise until their own upstreams move.
 ignore = [
     # heapless 0.7 → postcard → cranelift → wasmtime. Only compiled for targets
     # that need the polyfill at all, which does not include any we ship. Gone
@@ -17,6 +18,12 @@ ignore = [
     # Reached only when a digest is handed a PDF, and unmaintained is not the
     # same as vulnerable.
     "RUSTSEC-2026-0192",
+    # chrono, unmaintained as of 2026-11-18 with no successor release to move
+    # to. Three of this tree's dependencies pull it — lopdf → pdf-inspector →
+    # anydoc, and `rmcp` and `schemars`, which the MCP crate names directly —
+    # so it cannot be dropped from here. Unmaintained is not vulnerable: the
+    # advisory reports an absent maintainer, no defect.
+    "RUSTSEC-2026-0543",
     # zip 8.6.0 → anydoc, the document reader (the only crate left in this
     # graph that pulls zip). One crate, eight IDs, and nothing here reaches
     # any of them.
