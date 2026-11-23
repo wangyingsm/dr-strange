@@ -99,10 +99,11 @@ impl ReadTransaction for RedbReadTxn {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + '_>> {
-        // ReadOnlyTable::range returns Range<'static>: the iterator owns
-        // everything it needs, so this streams without collecting.
+        // ReadOnlyTable::range_owned returns OwnedRange: the iterator owns
+        // everything it needs, so this streams without collecting. Plain
+        // `range` borrows the table, which is local to this call.
         let t = self.txn.open_table(def(table)).map_err(backend)?;
-        let iter = t.range::<&[u8]>(bounds(start, end)).map_err(backend)?;
+        let iter = t.range_owned(bounds(start, end)).map_err(backend)?;
         Ok(Box::new(iter.map(|item| {
             item.map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
                 .map_err(backend)
@@ -132,7 +133,7 @@ impl ReadTransaction for RedbWriteTxn {
         // call — collect instead. Write-side scans in graph ops are small
         // (adjacency checks); revisit if M1 profiling says otherwise.
         let t = self.txn.open_table(def(table)).map_err(backend)?;
-        let iter = t.range::<&[u8]>(bounds(start, end)).map_err(backend)?;
+        let iter = t.range(bounds(start, end)).map_err(backend)?;
         let items: Vec<Result<KvPair>> = iter
             .map(|item| {
                 item.map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
@@ -171,7 +172,7 @@ impl WriteTransaction for RedbWriteTxn {
         use crate::storage::engine::prefix_successor;
         let mut t = self.txn.open_table(def(table)).map_err(backend)?;
         let end = prefix_successor(prefix);
-        t.retain_in::<&[u8], _>(bounds(prefix, end.as_deref()), |_, _| false)
+        t.retain_in(bounds(prefix, end.as_deref()), |_, _| false)
             .map_err(backend)?;
         Ok(())
     }
