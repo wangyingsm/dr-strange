@@ -316,11 +316,26 @@ type DigestWriteResult struct {
 	UpdatedKeys  []string `json:"updated_keys,omitempty"`
 }
 
+type DigestWriteParamsNodesItem struct {
+	ExtraLabels []string       `json:"extra_labels,omitempty"`
+	Key         string         `json:"key"`
+	Label       *string        `json:"label,omitempty"`
+	Labels      []string       `json:"labels,omitempty"`
+	Properties  map[string]any `json:"properties,omitempty"`
+}
+
+type DigestWriteParamsEdgesItem struct {
+	Dst        string         `json:"dst"`
+	Properties map[string]any `json:"properties,omitempty"`
+	Src        string         `json:"src"`
+	Type       string         `json:"type"`
+}
+
 type DigestWriteParams struct {
-	Plane      string           `json:"plane"`
-	Nodes      []map[string]any `json:"nodes"`
-	Edges      []map[string]any `json:"edges,omitempty"`
-	OnConflict *string          `json:"on_conflict,omitempty"`
+	Plane      string                       `json:"plane"`
+	Nodes      []DigestWriteParamsNodesItem `json:"nodes"`
+	Edges      []DigestWriteParamsEdgesItem `json:"edges,omitempty"`
+	OnConflict *string                      `json:"on_conflict,omitempty"`
 }
 
 type NodeCreateParams struct {

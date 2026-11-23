@@ -738,17 +738,32 @@ public class Drsg extends Client {
             List<String> updatedKeys) {
     }
 
+    public record DigestWriteParamsNodesItem(
+            String key,
+            String label,
+            List<String> labels,
+            List<String> extraLabels,
+            Map<String, Object> properties) {
+    }
+
+    public record DigestWriteParamsEdgesItem(
+            String src,
+            String type,
+            String dst,
+            Map<String, Object> properties) {
+    }
+
     public record DigestWriteParams(
             String plane,
-            List<Map<String, Object>> nodes,
-            List<Map<String, Object>> edges,
+            List<DigestWriteParamsNodesItem> nodes,
+            List<DigestWriteParamsEdgesItem> edges,
             String onConflict) {
 
-        public static DigestWriteParams of(String plane, List<Map<String, Object>> nodes) {
+        public static DigestWriteParams of(String plane, List<DigestWriteParamsNodesItem> nodes) {
             return new DigestWriteParams(plane, nodes, null, null);
         }
 
-        public DigestWriteParams withEdges(List<Map<String, Object>> edges) {
+        public DigestWriteParams withEdges(List<DigestWriteParamsEdgesItem> edges) {
             return new DigestWriteParams(plane, nodes, edges, onConflict);
         }
 
