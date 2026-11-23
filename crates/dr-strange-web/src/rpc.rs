@@ -1518,6 +1518,90 @@ mod tests {
         assert_eq!(r["vector"][0]["mixed"], false);
     }
 
+    /// Builds a plane with one "Doc" node carrying a `width`-wide `emb`, and
+    /// declares an L2 vector index over it when `declare`.
+    fn plane_with_embedding(width: usize, declare: bool) -> Database {
+        use dr_strange_core::{Metric, PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            let props: Properties = [(
+                "emb".to_string(),
+                PropDesc::new(PropValue::Vector(vec![0.5; width])),
+            )]
+            .into_iter()
+            .collect();
+            txn.create_node(&["Doc"], props).unwrap();
+            txn.commit().unwrap();
+        }
+        if declare {
+            plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        }
+        db
+    }
+
+    fn search_body(label: Option<&str>, query: &[f32]) -> String {
+        let label = match label {
+            Some(l) => format!(r#","label":"{l}""#),
+            None => String::new(),
+        };
+        let q: Vec<String> = query.iter().map(|v| v.to_string()).collect();
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"plane.search","params":{{"plane":"startup","property":"emb","query":[{}]{label}}},"id":1}}"#,
+            q.join(",")
+        )
+    }
+
+    /// A query of the wrong width cannot rank against anything in the index,
+    /// so it is refused by name instead of answering empty — the silence
+    /// issue #112 reported. Both widths appear in the message.
+    #[test]
+    fn plane_search_refuses_a_query_the_index_width_contradicts() {
+        let db = plane_with_embedding(4, true);
+
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("2-wide"), "{msg}");
+        assert!(msg.contains("4-wide"), "{msg}");
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // The same refusal without a label: one index names the property, so
+        // the width is still knowable.
+        let resp = call(&db, &search_body(None, &[0.1, 0.2])).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // The right width is answered, not refused.
+        let resp = call(&db, &search_body(Some("Doc"), &[0.5; 4])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(resp["result"].as_array().unwrap().len(), 1);
+    }
+
+    /// No index on the property means no width to contradict: the search runs
+    /// on the exact fallback and answers (here: nothing ranks, because the
+    /// engine stays total over mixed widths rather than erroring).
+    #[test]
+    fn plane_search_without_an_index_still_answers() {
+        let db = plane_with_embedding(4, false);
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert!(resp["result"].is_array(), "{resp}");
+    }
+
+    /// A declared index with nothing in it holds no width either, so a query
+    /// of any width proceeds.
+    #[test]
+    fn plane_search_with_an_empty_index_is_not_refused() {
+        use dr_strange_core::Metric;
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+    }
+
     #[test]
     fn index_ensure_declares_then_appears_in_plane_indexes() {
         use dr_strange_core::{PropDesc, PropValue};

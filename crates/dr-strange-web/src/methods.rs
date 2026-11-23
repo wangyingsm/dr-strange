@@ -1226,10 +1226,65 @@ pub struct Search {
     metric: Option<String>,
 }
 
+/// Refuses a query whose width the declared indexes contradict: nothing of a
+/// different width can rank above `-inf`, so an answer would be empty (or
+/// scored `null`) with no way for the caller to tell that from a cold plane.
+///
+/// Only when the width is knowable. A query is refused when every declared
+/// index that could answer it — the one on `(label, property)`, or all those
+/// on `property` when no label narrows the search — holds vectors of one
+/// width, and it is not this query's. An empty index, indexes that disagree
+/// with each other, and a property with no index at all are all cases where
+/// the store cannot know, so the search proceeds and answers from the exact
+/// fallback.
+fn check_query_width(
+    plane: &PlaneHandle<'_>,
+    label: Option<&str>,
+    property: &str,
+    query_len: usize,
+) -> Result<(), RpcError> {
+    let mut widths = plane
+        .vector_index_widths()
+        .into_iter()
+        .filter(|i| i.property == property && label.is_none_or(|l| i.label == l))
+        .peekable();
+    if widths.peek().is_none() {
+        return Ok(());
+    }
+    let mut indexed = Vec::new();
+    for i in widths {
+        match i.width.uniform() {
+            Some(d) if d == query_len => return Ok(()),
+            Some(d) => indexed.push((i.label, d)),
+            // Empty or mixed: no width to contradict the query with.
+            None => return Ok(()),
+        }
+    }
+    let held = match indexed.as_slice() {
+        [(label, d)] => format!("the index on ({label}, {property}) holds {d}-wide vectors"),
+        many => format!(
+            "no index on {property} holds vectors that wide ({})",
+            many.iter()
+                .map(|(l, d)| format!("{l}: {d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Err(RpcError::invalid_params(format!(
+        "query is {query_len}-wide but {held} — a vector of a different width can never rank, \
+         so this search would answer nothing. Embed the query with the model the index was \
+         built with, or index this property for {query_len}-wide vectors."
+    )))
+}
+
 /// `plane.search` — vector top-k, returning scored node records.
+///
+/// Refuses a query whose width no index on `property` holds (see
+/// [`check_query_width`]) rather than answering empty.
 pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
     let plane = ctx.plane(&req.plane)?;
+    check_query_width(&plane, req.label.as_deref(), &req.property, req.query.len())?;
     let hits = app(plane
         .query()
         .vector_top_k(
@@ -2207,6 +2262,7 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             .into_iter()
             .next()
             .ok_or_else(|| RpcError::server("embedder returned no vector"))?;
+        check_query_width(&plane, req.label.as_deref(), prop, query.len())?;
         builder = builder.vector(prop.clone(), query, parse_metric(req.metric.as_deref()));
     }
     if let Some(prop) = &req.keyword_prop {
@@ -2442,9 +2498,10 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
 /// Semantic search: embed the query with the requested provider (key from the
 /// server env) and return the plane's most vector-similar nodes, each carrying
-/// a `score` and a `match` hint. Errors (no key, provider down, no embed model)
-/// and an empty result (a plane with no embeddings, or embeddings of a
-/// different dimension) let the caller fall back to text.
+/// a `score` and a `match` hint. Errors (no key, provider down, no embed
+/// model, a query the declared index's width contradicts) and an empty result
+/// (a plane with no embeddings) let the caller fall back to text — with the
+/// width now named in the note rather than reported as "no embedded nodes".
 fn semantic_find(
     plane: &dr_strange_core::PlaneHandle<'_>,
     req: &Find,
@@ -2459,6 +2516,8 @@ fn semantic_find(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+    check_query_width(plane, None, "embedding", query.len())
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
     let hits = plane
         .query()
