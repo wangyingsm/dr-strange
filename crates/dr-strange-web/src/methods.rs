@@ -10,9 +10,9 @@ use std::path::Path;
 
 use dr_strange_core::{
     AlgoBuilder, BulkEdge, BulkNode, Change, ChangeKind, ChangeOp, ChangeSet, CyclesOptions,
-    Database, Dir, EdgeId, EdgeRecord, HybridWeights, Language, LogicalPlan, LouvainOptions,
-    Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
-    TopoOrder, TopoSortOptions, json,
+    Database, Dir, EdgeId, EdgeRecord, HybridWeights, IndexWidth, Language, LogicalPlan,
+    LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
+    ShortestPathOptions, TopoOrder, TopoSortOptions, json,
 };
 // Time-travel address type — ships only with the native backend (ROADMAP §4).
 #[cfg(feature = "native-backend")]
@@ -2409,14 +2409,25 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// only the channels that actually exist (ROADMAP §2). Returns the vector and
 /// keyword indexes as `{label, property, …}`; the keyword channel can only
 /// search a `(label, property)` that appears under `keyword`.
+///
+/// A vector index also reports `dim`, the width of the vectors it holds: a
+/// number when they agree, `null` when the index is empty or holds more than
+/// one width. It is what a client compares its own embeddings against —
+/// without it, a width disagreement is only visible as an empty answer.
 pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneIndexes = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     let vector: Vec<Value> = plane
-        .vector_indexes()
+        .vector_index_widths()
         .into_iter()
-        .map(|(label, property, metric)| {
-            jval!({ "label": label, "property": property, "metric": metric_name(metric) })
+        .map(|i| {
+            jval!({
+                "label": i.label,
+                "property": i.property,
+                "metric": metric_name(i.metric),
+                "dim": i.width.uniform(),
+                "mixed": i.width == IndexWidth::Mixed,
+            })
         })
         .collect();
     let keyword: Vec<Value> = plane

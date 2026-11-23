@@ -1513,6 +1513,9 @@ mod tests {
         assert_eq!(r["keyword"][0]["language"], "english");
         assert_eq!(r["vector"][0]["property"], "emb");
         assert_eq!(r["vector"][0]["metric"], "l2");
+        // The width a client compares its own embeddings against (#112).
+        assert_eq!(r["vector"][0]["dim"], 2);
+        assert_eq!(r["vector"][0]["mixed"], false);
     }
 
     #[test]

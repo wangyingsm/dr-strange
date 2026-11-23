@@ -30,7 +30,7 @@ use crate::error::{Result, backend};
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
 use crate::storage::hnsw::HnswIndex;
-use crate::storage::vector::{Hit, Metric, VectorIndex};
+use crate::storage::vector::{Hit, IndexWidth, Metric, VectorIndex};
 use crate::types::{NodeId, PlaneId};
 
 type IndexKey = (PlaneId, String, String);
@@ -46,6 +46,9 @@ const SIDECAR_VERSION: u32 = 1;
 struct Entry {
     metric: Metric,
     index: HnswIndex,
+    /// Folded width of everything indexed here. Derived, never serialized: the
+    /// sidecar recomputes it on load, so adding it costs no format version.
+    width: IndexWidth,
 }
 
 /// Live set of vector indexes. Not internally locked — the owning
@@ -105,9 +108,14 @@ impl VectorRegistry {
         }
         let mut index = HnswIndex::new(metric);
         index.build_parallel(&items)?;
+        let width = index.width();
         self.entries.insert(
             (plane, label.to_string(), property.to_string()),
-            Entry { metric, index },
+            Entry {
+                metric,
+                index,
+                width,
+            },
         );
         Ok(())
     }
@@ -180,11 +188,13 @@ impl VectorRegistry {
             }
             // id_to_idx is #[serde(skip)] — rebuild it before the index is used.
             index.reindex();
+            let width = index.width();
             entries.insert(
                 (entry.plane, entry.label, entry.property),
                 Entry {
                     metric: entry.metric,
                     index,
+                    width,
                 },
             );
         }
@@ -202,6 +212,26 @@ impl VectorRegistry {
             .iter()
             .filter(|((p, _, _), _)| *p == plane)
             .map(|((_, l, prop), e)| (l.clone(), prop.clone(), e.metric))
+            .collect()
+    }
+
+    /// The width of the vectors one declared index holds, or `None` if that
+    /// `(plane, label, property)` has no index. Removing a vector never
+    /// narrows [`IndexWidth::Mixed`] back to `Uniform`, so this claims less
+    /// than it might rather than more.
+    pub fn width(&self, plane: PlaneId, label: &str, property: &str) -> Option<IndexWidth> {
+        self.entries
+            .get(&(plane, label.to_string(), property.to_string()))
+            .map(|e| e.width)
+    }
+
+    /// [`Self::declared`] plus each index's width — what a caller needs to see
+    /// whether its own vectors are the shape the index holds.
+    pub fn declared_widths(&self, plane: PlaneId) -> Vec<(String, String, Metric, IndexWidth)> {
+        self.entries
+            .iter()
+            .filter(|((p, _, _), _)| *p == plane)
+            .map(|((_, l, prop), e)| (l.clone(), prop.clone(), e.metric, e.width))
             .collect()
     }
 
@@ -248,6 +278,7 @@ impl VectorRegistry {
             .get_mut(&(plane, label.to_string(), property.to_string()))
         {
             entry.index.insert(node.0, vector)?;
+            entry.width = entry.width.with(vector.len());
         }
         Ok(())
     }
@@ -378,6 +409,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hits[0].id, a.0);
+    }
+
+    /// The width is observed, not declared: uniform while every indexed
+    /// vector agrees, `Mixed` once one does not, and `None` for a pair that
+    /// has no index at all. This is what tells a client its 384-wide query
+    /// cannot match a 1-wide index, instead of an empty answer.
+    #[test]
+    fn width_is_uniform_until_a_vector_disagrees() {
+        let (_eng, mut reg, _) = setup();
+        assert_eq!(
+            reg.width(PlaneId::STARTUP, "Doc", "emb"),
+            Some(IndexWidth::Uniform(1))
+        );
+        assert_eq!(reg.width(PlaneId::STARTUP, "Ghost", "emb"), None);
+        assert_eq!(
+            reg.declared_widths(PlaneId::STARTUP),
+            vec![(
+                "Doc".to_string(),
+                "emb".to_string(),
+                Metric::L2,
+                IndexWidth::Uniform(1)
+            )]
+        );
+
+        reg.upsert(PlaneId::STARTUP, "Doc", "emb", NodeId(99), &[1.0, 2.0])
+            .unwrap();
+        assert_eq!(
+            reg.width(PlaneId::STARTUP, "Doc", "emb"),
+            Some(IndexWidth::Mixed)
+        );
+    }
+
+    /// A declared index with nothing in it has no width to disagree with —
+    /// the case in which no refusal is possible and a search just answers
+    /// empty.
+    #[test]
+    fn width_of_an_empty_index_is_empty() {
+        let eng = MemoryEngine::new();
+        {
+            let mut txn = eng.begin_write().unwrap();
+            graph::init(&mut txn).unwrap();
+            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let mut reg = VectorRegistry::new();
+        reg.rebuild_from(&eng.begin_read().unwrap()).unwrap();
+        assert_eq!(
+            reg.width(PlaneId::STARTUP, "Doc", "emb"),
+            Some(IndexWidth::Empty)
+        );
+    }
+
+    /// The width is derived, so it survives a sidecar round trip without the
+    /// serialized shape — and therefore `SIDECAR_VERSION` — having to change.
+    #[test]
+    fn width_is_recomputed_from_a_sidecar() {
+        let (_eng, reg, _) = setup();
+        let bytes = reg.to_bytes(7).unwrap();
+        let loaded = VectorRegistry::from_bytes(&bytes, 7).expect("fresh sidecar loads");
+        assert_eq!(
+            loaded.width(PlaneId::STARTUP, "Doc", "emb"),
+            Some(IndexWidth::Uniform(1))
+        );
     }
 
     #[test]

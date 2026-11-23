@@ -38,7 +38,7 @@ pub mod types;
 pub use api::AsOf;
 pub use api::{
     AlgoBuilder, Change, ChangeKind, ChangeOp, ChangeSet, Database, HybridBuilder, PlaneHandle,
-    QueryBuilder, SnapshotStats, WriteTxn,
+    QueryBuilder, SnapshotStats, VectorIndexInfo, WriteTxn,
 };
 pub use compute::{
     Agg, AggFunc, Algo, Binding, BindingNeed, CatalogSnapshot, Connection, CyclesOptions,
@@ -52,7 +52,7 @@ pub use compute::{
 pub use error::{Error, Result};
 pub use instance::{Instance, Mount, Mounted, Mounting, Served, Serving, Unmounted};
 pub use storage::graph::{BulkEdge, BulkEdgeById, BulkNode, BulkStats, OnConflict};
-pub use storage::vector::Metric;
+pub use storage::vector::{IndexWidth, Metric};
 /// Replication wire types (`serve --follow`, arch/01 §9) — ship regardless of
 /// backend feature; only [`Database::apply_replicated`]/[`Database::on_wal_commit`]
 /// (native-only) actually produce or consume them.

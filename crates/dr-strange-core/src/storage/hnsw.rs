@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, backend};
-use crate::storage::vector::{Hit, IdFilter, Metric, VectorIndex, dot, top_k};
+use crate::storage::vector::{Hit, IdFilter, IndexWidth, Metric, VectorIndex, dot, top_k};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HnswParams {
@@ -436,6 +436,14 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.id_to_idx.is_empty()
+    }
+
+    /// The width of the vectors held, folded over all of them. `O(n)`: called
+    /// when an index is built or loaded, not per search.
+    pub fn width(&self) -> IndexWidth {
+        self.nodes
+            .iter()
+            .fold(IndexWidth::Empty, |w, n| w.with(n.vector.len()))
     }
 
     fn next_rand(&mut self) -> u64 {

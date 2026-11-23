@@ -53,7 +53,7 @@ use crate::storage::memory::{MemoryEngine, MemoryWriteTxn};
 use crate::storage::native::{NativeEngine, NativeWriteTxn};
 #[cfg(all(feature = "redb-backend", not(feature = "native-backend")))]
 use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
-use crate::storage::vector::Metric;
+use crate::storage::vector::{IndexWidth, Metric};
 use crate::text::Language;
 use crate::types::{
     Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue,
@@ -301,6 +301,15 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// One declared vector index, with the width of the vectors it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexInfo {
+    pub label: String,
+    pub property: String,
+    pub metric: Metric,
+    pub width: IndexWidth,
 }
 
 /// A past point to read the graph at — the address for a time-travel (AS OF)
@@ -1516,6 +1525,30 @@ impl<'db> PlaneHandle<'db> {
     /// metric)` — what a hybrid/vector search can accelerate against.
     pub fn vector_indexes(&self) -> Vec<(String, String, Metric)> {
         self.db.indexes().declared(self.id)
+    }
+
+    /// [`Self::vector_indexes`] with each index's vector width, so a caller can
+    /// compare its own embeddings against what is indexed instead of inferring
+    /// it from an empty answer.
+    pub fn vector_index_widths(&self) -> Vec<VectorIndexInfo> {
+        self.db
+            .indexes()
+            .declared_widths(self.id)
+            .into_iter()
+            .map(|(label, property, metric, width)| VectorIndexInfo {
+                label,
+                property,
+                metric,
+                width,
+            })
+            .collect()
+    }
+
+    /// The width of one declared vector index, or `None` when `(label,
+    /// property)` has no index — in which case a search still answers, from
+    /// the exact fallback, and no width is knowable in advance.
+    pub fn vector_index_width(&self, label: &str, property: &str) -> Option<IndexWidth> {
+        self.db.indexes().width(self.id, label, property)
     }
 
     /// The keyword indexes declared on this plane, as `(label, property,
