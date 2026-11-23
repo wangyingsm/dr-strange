@@ -32,6 +32,14 @@ updates:
     groups:
       frontend:
         patterns: ["*"]
+    ignore:
+      # sigma 4 dropped the `EdgeProgram` and `DEFAULT_EDGE_ARROW_HEAD_PROGRAM_OPTIONS`
+      # exports that `@sigma/edge-curve` imports from `sigma/rendering`, and 3.1.0 is
+      # the newest that plugin has — `plot.js` needs its `EdgeCurvedArrowProgram` to
+      # draw parallel edges apart. Hold sigma at 3 until the plugin builds against 4,
+      # and drop this entry then; it is a blocked upgrade, not an unwanted one.
+      - dependency-name: sigma
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: bun
     directory: /sdk/typescript
