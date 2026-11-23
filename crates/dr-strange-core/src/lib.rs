@@ -59,6 +59,6 @@ pub use storage::vector::{IndexWidth, Metric};
 pub use storage::{ReplicatedBatch, ReplicatedOp};
 pub use text::{Analyzer, Language};
 pub use types::{
-    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue,
-    Properties, QueryRecord,
+    Dir, EXPIRES_AT, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc,
+    PropValue, Properties, QueryRecord,
 };

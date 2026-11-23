@@ -46,6 +46,24 @@ pub fn counters_key(plane: PlaneId) -> Vec<u8> {
     k
 }
 
+/// Set (to one byte) the first time a node carrying
+/// [`EXPIRES_AT`](crate::types::EXPIRES_AT) is written to a plane, and never
+/// cleared.
+///
+/// Expiry has to be applied on read — a node is hidden the moment its
+/// timestamp passes, with no write to mark it — and that means filtering
+/// what a scan returns, which costs a record read per id. This key is how a
+/// plane that never uses expiry pays none of it: absent, and every read path
+/// skips the whole mechanism. Never cleared because reclaiming the last
+/// expiring node does not make the plane's past reads cheaper to reason
+/// about, and a stale `true` only costs filtering.
+pub fn expiry_key(plane: PlaneId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(7 + 4);
+    k.extend_from_slice(b"expiry/");
+    k.extend_from_slice(&plane.0.to_be_bytes());
+    k
+}
+
 /// Wall-clock time (unix-epoch milliseconds, i64 BE) of the latest commit,
 /// stamped inside every write txn. The time index for time-addressed
 /// time-travel (ROADMAP §4): `AS OF <timestamp>` resolves against it.

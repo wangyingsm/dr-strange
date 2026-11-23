@@ -1686,6 +1686,67 @@ mod tests {
         assert_eq!(idx["result"]["vector"][0]["property"], "emb");
     }
 
+    /// The whole of #114 over the wire: a cache entry written with
+    /// `$expires_at` in the properties — no new parameter, no SDK change —
+    /// is gone from `node.get`, from a query, and from `plane.search` with
+    /// `k = 1` where it is the nearest match. Nothing ran a sweeper.
+    #[test]
+    fn an_expired_node_is_invisible_over_the_rpc() {
+        use dr_strange_core::Metric;
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let past = 1_000_000_000_000i64; // 2001, comfortably expired
+
+        // The exact write a semantic cache makes: the entry, its embedding,
+        // and when it stops being usable.
+        let resp = call(
+            &db,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"node.create","params":{{"plane":"startup","key":"stale","labels":["Doc"],"properties":{{"emb":{{"$vector":[1.0,0.0]}},"$expires_at":{past}}}}},"id":1}}"#
+            ),
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        // A live entry that is a worse match for the query below.
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"live","labels":["Doc"],"properties":{"emb":{"$vector":[0.0,1.0]}}},"id":1}"#,
+        )
+        .unwrap();
+
+        // Gone from a direct read, by key.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.get","params":{"plane":"startup","key":"stale"},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"].is_null(), "node.get by key: {resp}");
+
+        // Gone from `plane.search`, with k = 1 and the expired node nearest:
+        // the live one is answered, not an empty list.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","label":"Doc","property":"emb","query":[1.0,0.0],"k":1},"id":1}"#,
+        )
+        .unwrap();
+        let hits = resp["result"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{resp}");
+        assert_eq!(hits[0]["external_key"], "live");
+
+        // And gone from a query over the plane.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.query","params":{"plane":"startup",
+                 "plan":{"source":{"ScanLabel":"Doc"},"steps":[]}},"id":1}"#,
+        )
+        .unwrap();
+        let nodes = resp["result"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1, "{resp}");
+        assert_eq!(nodes[0]["external_key"], "live");
+    }
+
     /// `digest.write` takes the labels it is given, however they are spelled.
     /// It shipped with a single `label`, so a proposal that knew a thing was
     /// both a `Trait` and `External` landed as one or the other — or, if the

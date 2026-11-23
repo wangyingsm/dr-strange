@@ -56,8 +56,8 @@ use crate::storage::redb_backend::{RedbEngine, RedbWriteTxn};
 use crate::storage::vector::{IndexWidth, Metric};
 use crate::text::Language;
 use crate::types::{
-    Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc, PropValue,
-    Properties, QueryRecord,
+    Dir, EXPIRES_AT, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId, PropDesc,
+    PropValue, Properties, QueryRecord,
 };
 
 mod snapshot;
@@ -1400,13 +1400,50 @@ impl<'db> PlaneHandle<'db> {
     /// Fetches one node with decoded labels and properties; `None` if the id
     /// does not exist in this plane.
     pub fn node(&self, id: NodeId) -> Result<Option<NodeRecord>> {
-        self.with_read(|txn| graph::get_node(txn, self.id, id))
+        self.with_read(|txn| self.unexpired(txn, graph::get_node(txn, self.id, id)?))
     }
 
     /// Fetches the node bound to a caller-supplied external key (arch/01 §2);
     /// `None` if no node in this plane carries that key.
     pub fn node_by_key(&self, external_key: &str) -> Result<Option<NodeRecord>> {
-        self.with_read(|txn| graph::get_node_by_external_key(txn, self.id, external_key))
+        self.with_read(|txn| {
+            let found = graph::get_node_by_external_key(txn, self.id, external_key)?;
+            self.unexpired(txn, found)
+        })
+    }
+
+    /// Drops a record whose [`EXPIRES_AT`] has passed, so these direct reads
+    /// hide exactly what a query would (`api::cache::Expiry`). The clock is
+    /// read per call here — each is its own read, with no plan to stay
+    /// consistent across.
+    fn unexpired(
+        &self,
+        txn: &dyn ReadTransaction,
+        found: Option<NodeRecord>,
+    ) -> Result<Option<NodeRecord>> {
+        match found {
+            Some(n) if graph::expiry_used(txn, self.id)? && n.expired_at(now_millis()) => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    /// 1-hop expansion, dropping any neighbour whose node has expired.
+    fn unexpired_neighbors(
+        &self,
+        txn: &dyn ReadTransaction,
+        all: Vec<Neighbor>,
+    ) -> Result<Vec<Neighbor>> {
+        if !graph::expiry_used(txn, self.id)? {
+            return Ok(all);
+        }
+        let now = now_millis();
+        let mut live = Vec::with_capacity(all.len());
+        for n in all {
+            if graph::get_node(txn, self.id, n.node)?.is_some_and(|rec| !rec.expired_at(now)) {
+                live.push(n);
+            }
+        }
+        Ok(live)
     }
 
     /// Fetches one edge with its resolved type name and properties; `None`
@@ -1417,7 +1454,10 @@ impl<'db> PlaneHandle<'db> {
 
     /// 1-hop expansion; `ty = None` means any edge type.
     pub fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Vec<Neighbor>> {
-        self.with_read(|txn| graph::neighbors(txn, self.id, id, dir, ty))
+        self.with_read(|txn| {
+            let all = graph::neighbors(txn, self.id, id, dir, ty)?;
+            self.unexpired_neighbors(txn, all)
+        })
     }
 
     /// This plane's soft-schema catalog (arch/03 §5) — the descriptive shape
@@ -1835,7 +1875,7 @@ impl WriteTxn<'_> {
     /// guess at a list's meaning.
     fn coerce_declared_vectors(&self, labels: &[&str], props: &mut Properties) {
         for i in &self.decls {
-            if !labels.iter().any(|l| *l == &i.label) {
+            if !labels.iter().any(|l| i.label == *l) {
                 continue;
             }
             if let Some(desc) = props.get_mut(&i.property)
@@ -1860,7 +1900,7 @@ impl WriteTxn<'_> {
         };
         for i in &self.decls {
             if i.property == key
-                && node.labels.iter().any(|l| *l == i.label)
+                && node.labels.contains(&i.label)
                 && let Some(v) = as_embedding(&prop.value, i.width)
             {
                 prop.value = PropValue::Vector(v);
@@ -1868,6 +1908,18 @@ impl WriteTxn<'_> {
             }
         }
         Ok(prop)
+    }
+
+    /// Notes on the plane that a node carrying [`EXPIRES_AT`] has been
+    /// written, so reads know they must filter expired nodes (see
+    /// `keys::expiry_key`). One meta write, and only when such a property is
+    /// actually present.
+    fn note_expiry(&mut self, props: &Properties) -> Result<()> {
+        if props.contains_key(EXPIRES_AT) {
+            let plane = self.plane;
+            graph::mark_expiry_used(self.txn(), plane)?;
+        }
+        Ok(())
     }
 
     /// Note a node/edge mutation for the change feed (ROADMAP §5). Cheap — just
@@ -1880,6 +1932,7 @@ impl WriteTxn<'_> {
     pub fn create_node(&mut self, labels: &[&str], mut props: Properties) -> Result<NodeId> {
         let plane = self.plane;
         self.coerce_declared_vectors(labels, &mut props);
+        self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, None, labels, &props)?;
@@ -1901,6 +1954,7 @@ impl WriteTxn<'_> {
     ) -> Result<NodeId> {
         let plane = self.plane;
         self.coerce_declared_vectors(labels, &mut props);
+        self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
@@ -1969,6 +2023,9 @@ impl WriteTxn<'_> {
                 let labels = node.labels;
                 self.coerce_declared_vectors(labels, &mut node.props);
             }
+        }
+        if nodes.iter().any(|n| n.props.contains_key(EXPIRES_AT)) {
+            graph::mark_expiry_used(self.txn(), plane)?;
         }
         let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges, on_conflict)?;
 
@@ -2134,6 +2191,10 @@ impl WriteTxn<'_> {
     pub fn set_prop(&mut self, id: NodeId, key: &str, prop: PropDesc) -> Result<()> {
         let plane = self.plane;
         let prop = self.coerced_prop(id, key, prop)?;
+        if key == EXPIRES_AT {
+            let plane = self.plane;
+            graph::mark_expiry_used(self.txn(), plane)?;
+        }
         let value = prop.value.clone();
         graph::set_node_prop(self.txn(), plane, id, key, prop)?;
         self.record_prop_event(id, key, Some(value.clone()))?;
