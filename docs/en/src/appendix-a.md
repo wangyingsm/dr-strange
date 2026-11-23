@@ -13,6 +13,14 @@ dialect (`{"$vector":[…]}`, `{"$desc":…,"$value":…}`, `{"$bytes":[…]}`, 
 `{"$map":{…}}` for a nested map whose own keys begin with `$`; integers must fit
 a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
+**A parameter the method does not define is refused**, with `-32602` and the
+offending name, rather than ignored: a misspelling is a mistake the caller can
+see at the call that made it. The exception is the five methods that accept the
+time-travel parameters (`as_of` / `as_of_ms`) — `plane.query`, `plane.neighbors`,
+`plane.find`, `graph.seed` and `graph.expand` — which still ignore what they do
+not know: serde cannot combine a flattened parameter group with rejecting the
+unknown, a limitation of the deserializer rather than a decision.
+
 ## Discovery and database
 
 - **`rpc.discover`** · read — the OpenRPC service description. Params: none.
@@ -26,7 +34,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
 - **`plane.list`** · read — every plane with id, name, counts, properties. Params: none.
 - **`plane.catalog`** · read — one plane's soft schema. Params: `plane` string!.
-- **`plane.indexes`** · read — the search indexes declared on a plane. Params: `plane` string!.
+- **`plane.indexes`** · read — the search indexes declared on a plane; each vector row carries the width of the vectors it holds as `dim` (`null` with `"mixed": true` where they differ). Params: `plane` string!.
 - **`plane.history`** · read — the time-travel window (native backend only). Params: none.
 - **`plane.create`** · admin — create an empty plane. Params: `name` string!, `properties` Properties.
 - **`plane.rename`** · admin — rename a plane. Params: `plane` string!, `to` string!.
@@ -39,7 +47,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 ## Nodes and edges
 
 - **`node.get`** · read — one node by id or external key. Params: `plane` string!, `id` integer, `key` string.
-- **`node.create`** · write — add a node with optional key and labels. Params: `plane` string!, `key` string, `labels` array, `properties` Properties.
+- **`node.create`** · write — add a node with optional key and labels. A reserved property `$expires_at` (epoch milliseconds) hides the node from every read past that instant (see [Chapter 3](./ai-native.md#a-plane-as-a-cache-expires_at)). Params: `plane` string!, `key` string, `labels` array, `properties` Properties.
 - **`node.update`** · write — patch properties (`set`/`unset`) and labels. Params: `plane` string!, `id` integer, `key` string, `set` Properties, `unset` array, `labels` array.
 - **`node.delete`** · write — delete a node, cascading its edges. Params: `plane` string!, `id` integer, `key` string.
 - **`edge.create`** · write — add a directed edge between two nodes. Params: `plane` string!, `src` NodeRef!, `dst` NodeRef!, `type` string!, `properties` Properties.
@@ -52,7 +60,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 - **`plane.query`** · read — run a serialized logical plan. Params: `plane` string!, `plan` object!, `as_of` integer, `as_of_ms` integer.
 - **`plane.cypher`** · write — run an openCypher-subset statement (write-gated). Params: `plane` string!, `query` string!, `embed` string, `params` object.
 - **`plane.find`** · read — text or semantic search over a plane. Params: `plane` string!, `q` string!, `limit` integer, `semantic` boolean, `provider` string, `embed_model` string, `as_of` integer, `as_of_ms` integer.
-- **`plane.search`** · read — vector top-*k* over a property. Params: `plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string.
+- **`plane.search`** · read — vector top-*k* over a property; a query the declared index's own width contradicts is refused with `-32602` naming both widths (see [Chapter 3](./ai-native.md#the-indexs-own-width)). Params: `plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string.
 - **`plane.hybrid`** · read — fused vector + keyword + graph-proximity search. Params: `plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string.
 - **`plane.algo`** · read — a graph algorithm (`pagerank` \| `components` \| `shortest_path` \| `louvain` \| `toposort` \| `cycles`) over a plane or label subset. Params: `plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number, `edge_type` string.
 - **`plane.ask`** · read — natural-language query → plan → run. Params: `plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string.
@@ -63,7 +71,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
 - **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
 - **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string (`coarse` \| `fine` \| `super`, default `fine` — see [Chapter 3](./ai-native.md#extraction-precision); `super` costs ~15× the input tokens).
-- **`digest.write`** · write — write a previously-computed proposal (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. Params: `plane` string!, `nodes` array!, `edges` array, `on_conflict` string (`error` / `skip` / `update`; default `skip`).
+- **`digest.write`** · write — write a previously-computed proposal (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. Params: `plane` string!, `nodes` array!, `edges` array, `on_conflict` string (`error` / `skip` / `update`; default `skip`). Each node is `{key string!, label string, labels array, extra_labels array, properties Properties}` — **all three label spellings are accepted and unioned**, so a proposal reviewed from `digest.run` keeps the labels it was given; a node naming none lands under `Entity`. Each edge is `{src string!, dst string!, type string!, properties Properties}`.
 - **`plane.vectorize`** · write — embed every node in a plane (unchanged texts are skipped) and ensure a vector index on `embedding` per label; the provider key comes from the server's environment. Params: `plane` string!, `embed` string, `embed_model` string, `metric` string.
 
 ## Plugins
