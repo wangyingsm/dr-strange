@@ -1518,6 +1518,43 @@ mod tests {
         assert_eq!(r["vector"][0]["mixed"], false);
     }
 
+    /// A parameter the server does not know is a mistake, not a default: it
+    /// is rejected by name instead of being dropped, so a client that
+    /// misspells `properties` or sends a field for the wrong method hears
+    /// about it (#113). The five request shapes that flatten `AsOfParams`
+    /// cannot be strict — serde forbids the combination — and `plane.query`
+    /// below is one of them.
+    #[test]
+    fn an_unknown_parameter_is_refused_by_name() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","propertys":{"a":1}},"id":1}"#,
+        )
+        .unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        assert!(msg.contains("propertys"), "the field is named: {msg}");
+
+        // The same spelling the issue reported: `label` where the method
+        // takes `labels`.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","label":"Doc"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+        // What the method does take is still accepted.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"a":1}},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+    }
+
     /// Builds a plane with one "Doc" node carrying a `width`-wide `emb`, and
     /// declares an L2 vector index over it when `declare`.
     fn plane_with_embedding(width: usize, declare: bool) -> Database {

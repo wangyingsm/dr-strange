@@ -186,6 +186,14 @@ pub(crate) fn opaque(kind: &str, detail: impl std::fmt::Display) -> RpcError {
 /// Optional time-travel address on a read request (ROADMAP §4): pin the read to
 /// a past commit `as_of` (sequence) or `as_of_ms` (unix-epoch milliseconds). At
 /// most one; `#[serde(flatten)]` this into a request struct.
+///
+/// No `deny_unknown_fields` here or on the five structs that flatten it
+/// (`Neighbors`, `RunPlan`, `Seed`, `Find`, `Expand`), deliberately: serde
+/// cannot combine the two. On the inner struct it would reject the outer
+/// struct's own fields, and on the outer one it would reject these. Every
+/// other request shape is strict, so a misspelled parameter is an error
+/// rather than a default — these five are the gap, and it is serde's, not a
+/// decision to be lax.
 #[derive(Deserialize, Default)]
 pub struct AsOfParams {
     #[serde(default)]
@@ -664,6 +672,7 @@ fn catalog_value(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneVectorize {
     plane: String,
     /// Embedding provider preset or base URL; the key comes from the
@@ -706,6 +715,7 @@ pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginInstall {
     /// A URL to download the component from. Server-local file paths are
     /// deliberately not accepted over RPC: a remote caller naming paths on
@@ -732,6 +742,7 @@ pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginRemove {
     name: String,
 }
@@ -754,6 +765,7 @@ fn plug(e: anyhow::Error) -> RpcError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MountDb {
     path: String,
     #[serde(rename = "as", default)]
@@ -808,6 +820,7 @@ pub fn db_mount(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnmountDb {
     name: String,
 }
@@ -939,6 +952,7 @@ pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneOnly {
     plane: String,
 }
@@ -1100,6 +1114,7 @@ pub fn plane_catalog(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetNode {
     plane: String,
     #[serde(default)]
@@ -1214,6 +1229,7 @@ pub fn plane_neighbors(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Search {
     plane: String,
     property: String,
@@ -1359,6 +1375,7 @@ fn make_embedder(ctx: &Ctx<'_>, provider: Option<&str>) -> Result<Option<LlmEmbe
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CypherReq {
     plane: String,
     query: String,
@@ -2028,6 +2045,7 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 const ALGO_LIMIT: usize = 100;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Algo {
     plane: String,
     /// Which algorithm: `pagerank` | `components` | `shortest_path` |
@@ -2197,6 +2215,7 @@ fn cycles(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> Result<Value, 
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hybrid {
     plane: String,
     /// The query text: embedded for the vector channel, tokenized for keyword.
@@ -2304,6 +2323,7 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ask {
     plane: String,
     /// The natural-language question.
@@ -2401,6 +2421,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneIndexes {
     plane: String,
 }
@@ -2414,6 +2435,7 @@ fn metric_name(m: Metric) -> &'static str {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnsureIndex {
     plane: String,
     label: String,
@@ -2673,6 +2695,7 @@ fn build_err(e: anyhow::Error) -> RpcError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestRun {
     /// Target plane — only read here, to retrieve existing entities as reuse
     /// candidates for linking (the write happens in `digest.write`).
@@ -2826,6 +2849,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestWrite {
     plane: String,
     nodes: Vec<WriteNode>,
@@ -2865,6 +2889,7 @@ impl From<ConflictArg> for dr_strange_core::OnConflict {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteNode {
     key: String,
     #[serde(default)]
@@ -2874,6 +2899,7 @@ struct WriteNode {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteEdge {
     src: String,
     #[serde(rename = "type")]
@@ -3041,6 +3067,7 @@ fn resolve_node(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateNode {
     plane: String,
     #[serde(default)]
@@ -3073,6 +3100,7 @@ pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNode {
     plane: String,
     #[serde(default)]
@@ -3170,6 +3198,7 @@ impl PlaneExport<'_> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNode {
     plane: String,
     #[serde(default)]
@@ -3200,6 +3229,7 @@ pub fn node_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEdge {
     plane: String,
     src: NodeRef,
@@ -3230,6 +3260,7 @@ pub fn edge_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateEdge {
     plane: String,
     edge: u64,
@@ -3268,6 +3299,7 @@ pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteEdge {
     plane: String,
     edge: u64,
@@ -3292,6 +3324,7 @@ pub fn edge_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 // ---- plane administration (arch/09 §3) ------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePlane {
     name: String,
     #[serde(default)]
@@ -3307,6 +3340,7 @@ pub fn plane_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenamePlane {
     plane: String,
     to: String,
@@ -3322,6 +3356,7 @@ pub fn plane_rename(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPlaneProps {
     plane: String,
     #[serde(default)]
@@ -3344,6 +3379,7 @@ pub fn plane_set_props(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeletePlane {
     plane: String,
 }
@@ -3372,6 +3408,7 @@ fn attachment_json(a: &dr_strange_core::attach::Attachment) -> Value {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachPlane {
     plane: String,
     name: String,
@@ -3416,6 +3453,7 @@ pub fn plane_attach(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetachPlane {
     plane: String,
     name: String,
@@ -3437,6 +3475,7 @@ pub fn plane_detach(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneAttachments {
     plane: String,
 }
