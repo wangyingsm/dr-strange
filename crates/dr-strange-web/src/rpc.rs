@@ -1686,6 +1686,63 @@ mod tests {
         assert_eq!(idx["result"]["vector"][0]["property"], "emb");
     }
 
+    /// `digest.write` takes the labels it is given, however they are spelled.
+    /// It shipped with a single `label`, so a proposal that knew a thing was
+    /// both a `Trait` and `External` landed as one or the other — or, if the
+    /// caller spelled it `labels` the way `node.create` does, as `Entity`
+    /// with no complaint at all (#113). Now `label`, `labels` and
+    /// `extra_labels` are unioned in order, and a misspelling is an error.
+    #[test]
+    fn digest_write_takes_every_spelling_of_a_label() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[
+                {"key":"a","labels":["Question"]},
+                {"key":"b","label":"Trait","extra_labels":["External"]},
+                {"key":"c","label":"Doc","labels":["Doc","Paper"]},
+                {"key":"d"}
+            ],"edges":[]},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(resp["result"]["nodes_written"], 4);
+
+        let labels = |key: &str| {
+            let resp = call(
+                &db,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"node.get","params":{{"plane":"startup","key":"{key}"}},"id":1}}"#
+                ),
+            )
+            .unwrap();
+            resp["result"]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // `labels` alone is honoured — it used to land as "Entity".
+        assert_eq!(labels("a"), ["Question"]);
+        // Asserted labels survive beside the chosen one, in that order.
+        assert_eq!(labels("b"), ["Trait", "External"]);
+        // The union keeps order and drops the repeat.
+        assert_eq!(labels("c"), ["Doc", "Paper"]);
+        // No label at all is still "Entity".
+        assert_eq!(labels("d"), ["Entity"]);
+
+        // And a near-miss spelling is refused rather than defaulted.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[{"key":"e","lables":["Typo"]}],"edges":[]},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    }
+
     // ---- auth gate --------------------------------------------------------
 
     use crate::auth::{Credentials, SharedToken};

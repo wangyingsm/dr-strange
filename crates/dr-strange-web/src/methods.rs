@@ -2834,9 +2834,18 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             "output_tokens": r.output_tokens,
             "embed_tokens": r.embed_tokens,
         },
+        // `labels` carries what the node is actually written with — the
+        // reconciled label plus anything a preprocessor asserted. `label`
+        // stays beside it for callers that only ever read that, but a reply
+        // handed straight back to `digest.write` now keeps every label it
+        // came with instead of silently losing the asserted ones (#113).
         "nodes": result.nodes.iter().map(|n| jval!({
             "key": n.key,
             "label": n.label,
+            "labels": std::iter::once(n.label.as_str())
+                .chain(n.extra_labels.iter().map(String::as_str))
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
             "properties": json::properties_to_json(&n.props),
         })).collect::<Vec<_>>(),
         "edges": result.edges.iter().map(|e| jval!({
@@ -2892,10 +2901,44 @@ impl From<ConflictArg> for dr_strange_core::OnConflict {
 #[serde(deny_unknown_fields)]
 struct WriteNode {
     key: String,
+    /// The single-label spelling, kept because this method shipped with it.
     #[serde(default)]
     label: String,
+    /// Several labels, as `node.create` spells it. A node written here is a
+    /// node like any other, and the soft schema has always allowed it more
+    /// than one (#113) — a proposal that knows a thing is both a `Trait` and
+    /// `External` should not have to pick.
+    #[serde(default)]
+    labels: Vec<String>,
+    /// Labels a preprocessor asserted rather than chose, as `digest.run`
+    /// reports them — accepted under their own name so its reply can be
+    /// handed back verbatim after review.
+    #[serde(default)]
+    extra_labels: Vec<String>,
     #[serde(default)]
     properties: Value,
+}
+
+impl WriteNode {
+    /// Every label to write this node with, in the order given and without
+    /// repeats: `label`, then `labels`, then `extra_labels`. `Entity` when
+    /// none was given at all, which is what an unlabelled proposal has always
+    /// landed as.
+    fn label_set(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        let named = std::iter::once(self.label.as_str())
+            .chain(self.labels.iter().map(String::as_str))
+            .chain(self.extra_labels.iter().map(String::as_str));
+        for label in named {
+            if !label.is_empty() && !out.contains(&label) {
+                out.push(label);
+            }
+        }
+        if out.is_empty() {
+            out.push("Entity");
+        }
+        out
+    }
 }
 
 #[derive(Deserialize)]
@@ -2953,16 +2996,7 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     for n in &fresh {
         node_props.push(props_of(&n.properties)?);
     }
-    let label_slots: Vec<[&str; 1]> = fresh
-        .iter()
-        .map(|n| {
-            [if n.label.is_empty() {
-                "Entity"
-            } else {
-                n.label.as_str()
-            }]
-        })
-        .collect();
+    let label_slots: Vec<Vec<&str>> = fresh.iter().map(|n| n.label_set()).collect();
     let bnodes: Vec<BulkNode> = fresh
         .iter()
         .zip(&label_slots)
