@@ -23,7 +23,9 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
-  - package-ecosystem: npm
+  # Both JS trees are bun-only — a `bun.lock` and no `package-lock.json` — and
+  # the npm_and_yarn updater refuses to touch that, so it must be `bun` here.
+  - package-ecosystem: bun
     directory: /crates/dr-strange-web/frontend
     schedule:
       interval: weekly
@@ -31,7 +33,7 @@ updates:
       frontend:
         patterns: ["*"]
 
-  - package-ecosystem: npm
+  - package-ecosystem: bun
     directory: /sdk/typescript
     schedule:
       interval: weekly
