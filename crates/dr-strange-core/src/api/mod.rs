@@ -303,6 +303,52 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Shortest array taken for an embedding on width alone. Real models do not
+/// produce anything narrower — the smallest published widths, Matryoshka
+/// truncations, are 32 and 64 — while arrays of two to a dozen numbers are
+/// ordinary data: scores, coordinates, a week of counts. Below this a numeric
+/// array is only read as an embedding when it is exactly as wide as the
+/// index's own vectors, and `{"$vector": [...]}` always says it outright.
+const MIN_INFERRED_DIM: usize = 16;
+
+/// The numbers in a numeric array, or `None` if the value is not one. An
+/// empty array is not: a 0-wide vector indexes nothing, so a caller sending
+/// `[]` more likely means an empty list.
+fn numeric_array(value: &PropValue) -> Option<Vec<f32>> {
+    let PropValue::List(items) = value else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .map(|i| match i {
+            PropValue::Int(n) => Some(*n as f32),
+            PropValue::Float(f) => Some(*f as f32),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A numeric array read as the embedding it is meant to be, given what the
+/// index it would land in already holds.
+///
+/// Width is the only evidence available, so it decides: an array as wide as
+/// the index's own vectors is one of them, whatever that width is, and
+/// otherwise only something at least [`MIN_INFERRED_DIM`] wide is read as an
+/// embedding. A shorter array that matches nothing stays the list it was
+/// written as — guessing there would turn a handful of scores into a vector
+/// and wrong-size the index for every real embedding after it.
+fn as_embedding(value: &PropValue, index: IndexWidth) -> Option<Vec<f32>> {
+    let numbers = numeric_array(value)?;
+    let fits = match index {
+        IndexWidth::Uniform(d) => numbers.len() == d,
+        IndexWidth::Empty | IndexWidth::Mixed => false,
+    };
+    (fits || numbers.len() >= MIN_INFERRED_DIM).then_some(numbers)
+}
+
 /// One declared vector index, with the width of the vectors it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndexInfo {
@@ -1569,7 +1615,7 @@ impl<'db> PlaneHandle<'db> {
         };
         // Snapshot this plane's declared indexes so mutations can mirror into
         // them at commit without re-locking per operation.
-        let decls = self.db.indexes().declared(self.id);
+        let decls = self.vector_index_widths();
         let kw_decls = self.db.keywords().declared(self.id);
         Ok(WriteTxn {
             db: self.db,
@@ -1707,7 +1753,7 @@ pub struct WriteTxn<'db> {
     ids: IdAllocator,
     /// This plane's declared vector indexes, snapshotted at `write()` (see
     /// `record_node_events`).
-    decls: Vec<(String, String, Metric)>,
+    decls: Vec<VectorIndexInfo>,
     /// Buffered vector-index coherence events, applied at commit.
     events: Vec<IndexEvent>,
     /// This plane's declared keyword indexes, snapshotted at `write()`.
@@ -1758,8 +1804,9 @@ impl WriteTxn<'_> {
     /// `Remove` where it is absent or non-vector. No-op unless some index is
     /// declared for one of the node's labels.
     fn record_node_events(&mut self, node: NodeId, labels: &[&str], props: &Properties) {
-        for (label, property, _metric) in &self.decls {
-            if !labels.iter().any(|l| l == label) {
+        for i in &self.decls {
+            let (label, property) = (&i.label, &i.property);
+            if !labels.iter().any(|l| *l == label) {
                 continue;
             }
             match props.get(property).map(|p| &p.value) {
@@ -1778,6 +1825,51 @@ impl WriteTxn<'_> {
         }
     }
 
+    /// Promotes a bare numeric array to [`PropValue::Vector`] wherever a
+    /// declared vector index names that property on one of `labels`.
+    ///
+    /// A client that sends `[0.1, 0.2]` for an indexed property means an
+    /// embedding; stored as a list it is indexed as nothing, and every search
+    /// over it answers empty with no error to say why. Properties no index
+    /// names are left exactly as given — the soft schema does not otherwise
+    /// guess at a list's meaning.
+    fn coerce_declared_vectors(&self, labels: &[&str], props: &mut Properties) {
+        for i in &self.decls {
+            if !labels.iter().any(|l| *l == &i.label) {
+                continue;
+            }
+            if let Some(desc) = props.get_mut(&i.property)
+                && let Some(v) = as_embedding(&desc.value, i.width)
+            {
+                desc.value = PropValue::Vector(v);
+            }
+        }
+    }
+
+    /// [`Self::coerce_declared_vectors`] for a single property, whose node's
+    /// labels have to be read to know whether an index names it. Reads
+    /// nothing unless the value is a numeric array and some index names the
+    /// property.
+    fn coerced_prop(&mut self, id: NodeId, key: &str, mut prop: PropDesc) -> Result<PropDesc> {
+        if !self.decls.iter().any(|i| i.property == key) || numeric_array(&prop.value).is_none() {
+            return Ok(prop);
+        }
+        let plane = self.plane;
+        let Some(node) = graph::get_node(self.txn(), plane, id)? else {
+            return Ok(prop);
+        };
+        for i in &self.decls {
+            if i.property == key
+                && node.labels.iter().any(|l| *l == i.label)
+                && let Some(v) = as_embedding(&prop.value, i.width)
+            {
+                prop.value = PropValue::Vector(v);
+                break;
+            }
+        }
+        Ok(prop)
+    }
+
     /// Note a node/edge mutation for the change feed (ROADMAP §5). Cheap — just
     /// buffers `(kind, id, op)`; the full record is resolved at commit, and only
     /// if a change observer is registered.
@@ -1785,8 +1877,9 @@ impl WriteTxn<'_> {
         self.changes.push(kind, id, op);
     }
 
-    pub fn create_node(&mut self, labels: &[&str], props: Properties) -> Result<NodeId> {
+    pub fn create_node(&mut self, labels: &[&str], mut props: Properties) -> Result<NodeId> {
         let plane = self.plane;
+        self.coerce_declared_vectors(labels, &mut props);
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, None, labels, &props)?;
@@ -1804,9 +1897,10 @@ impl WriteTxn<'_> {
         &mut self,
         external_key: &str,
         labels: &[&str],
-        props: Properties,
+        mut props: Properties,
     ) -> Result<NodeId> {
         let plane = self.plane;
+        self.coerce_declared_vectors(labels, &mut props);
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
         graph::insert_node(txn, plane, id, Some(external_key), labels, &props)?;
@@ -1865,11 +1959,17 @@ impl WriteTxn<'_> {
     /// carries any — absence is not a deletion, the soft schema's rule.
     pub fn bulk_upsert(
         &mut self,
-        nodes: Vec<BulkNode<'_>>,
+        mut nodes: Vec<BulkNode<'_>>,
         edges: Vec<BulkEdge<'_>>,
         on_conflict: OnConflict,
     ) -> Result<BulkStats> {
         let plane = self.plane;
+        if !self.decls.is_empty() {
+            for node in &mut nodes {
+                let labels = node.labels;
+                self.coerce_declared_vectors(labels, &mut node.props);
+            }
+        }
         let stats = graph::bulk_load(self.txn(), plane, &nodes, &edges, on_conflict)?;
 
         // The merge runs here rather than in the loader because properties and
@@ -1936,7 +2036,8 @@ impl WriteTxn<'_> {
             // (`Skip`) or went through `set_prop`, which emits its own event.
             for (i, node) in nodes.iter().enumerate().filter(|(i, _)| !kept.contains(i)) {
                 let node_id = stats.node_ids[i];
-                for (label, property, _metric) in &self.decls {
+                for i in &self.decls {
+                    let (label, property) = (&i.label, &i.property);
                     if node.labels.contains(&label.as_str())
                         && let Some(PropValue::Vector(v)) =
                             node.props.get(property).map(|p| &p.value)
@@ -2032,6 +2133,7 @@ impl WriteTxn<'_> {
     /// Errors with `NotFound` if the node does not exist.
     pub fn set_prop(&mut self, id: NodeId, key: &str, prop: PropDesc) -> Result<()> {
         let plane = self.plane;
+        let prop = self.coerced_prop(id, key, prop)?;
         let value = prop.value.clone();
         graph::set_node_prop(self.txn(), plane, id, key, prop)?;
         self.record_prop_event(id, key, Some(value.clone()))?;
@@ -2093,7 +2195,8 @@ impl WriteTxn<'_> {
         props: &Properties,
     ) {
         let mut events = Vec::new();
-        for (label, property, _metric) in &self.decls {
+        for i in &self.decls {
+            let (label, property) = (&i.label, &i.property);
             let had = old.iter().any(|l| l == label);
             let has = new.iter().any(|l| l == label);
             if had == has {
@@ -2126,7 +2229,7 @@ impl WriteTxn<'_> {
         key: &str,
         new_value: Option<PropValue>,
     ) -> Result<()> {
-        if !self.decls.iter().any(|(_, prop, _)| prop == key) {
+        if !self.decls.iter().any(|i| i.property == key) {
             return Ok(());
         }
         let plane = self.plane;
@@ -2135,7 +2238,8 @@ impl WriteTxn<'_> {
             None => return Ok(()), // node gone; nothing to mirror
         };
         let mut new_events = Vec::new();
-        for (label, property, _metric) in &self.decls {
+        for i in &self.decls {
+            let (label, property) = (&i.label, &i.property);
             if property == key && labels.iter().any(|l| l == label) {
                 new_events.push(match &new_value {
                     Some(PropValue::Vector(v)) => IndexEvent::Upsert {
@@ -4181,5 +4285,235 @@ mod index_divergence_tests {
             assert!(!db.indexes_diverged(), "a fresh open starts clean");
         }
         assert!(sidecar_path(&path).exists(), "a clean handle saves again");
+    }
+}
+
+#[cfg(test)]
+mod vector_coercion_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    /// A realistic embedding width: wide enough to be read as one on width
+    /// alone (see [`MIN_INFERRED_DIM`]).
+    const DIM: usize = 16;
+
+    fn list(len: usize, first: f64) -> PropDesc {
+        let mut vals: Vec<PropValue> = vec![PropValue::Float(first)];
+        vals.extend((1..len).map(|i| PropValue::Float(i as f64 / 100.0)));
+        PropDesc::new(PropValue::List(vals))
+    }
+
+    fn props(key: &str, desc: PropDesc) -> Properties {
+        [(key.to_string(), desc)].into_iter().collect()
+    }
+
+    fn vector_of(plane: &PlaneHandle<'_>, id: NodeId, key: &str) -> Option<Vec<f32>> {
+        match plane.node(id).unwrap()?.properties.get(key)?.value.clone() {
+            PropValue::Vector(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn indexed_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.plane("startup")
+            .unwrap()
+            .ensure_vector_index("Doc", "emb", Metric::L2)
+            .unwrap();
+        db
+    }
+
+    /// A client that sends a JSON array for an indexed property means an
+    /// embedding. Stored as a list it would be indexed as nothing and every
+    /// search over it would answer empty (#112), so it is promoted — and the
+    /// node is then findable by vector search, which is the whole point.
+    #[test]
+    fn a_numeric_array_becomes_a_vector_where_an_index_names_it() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let (created, with_key) = {
+            let mut w = plane.write().unwrap();
+            let a = w
+                .create_node(&["Doc"], props("emb", list(DIM, 1.0)))
+                .unwrap();
+            let b = w
+                .create_node_with_key("doc-2", &["Doc"], props("emb", list(DIM, 9.0)))
+                .unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+
+        let first = vector_of(&plane, created, "emb").expect("promoted");
+        assert_eq!(first.len(), DIM);
+        assert_eq!(first[0], 1.0);
+        assert_eq!(vector_of(&plane, with_key, "emb").map(|v| v[0]), Some(9.0));
+        let hits = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", first, Metric::L2, 1)
+            .ids()
+            .unwrap();
+        assert_eq!(hits, vec![created], "the promoted vector is indexed");
+    }
+
+    /// Only where an index names it: another property, and another label,
+    /// keep the list the caller sent. The soft schema does not otherwise
+    /// guess what a list means.
+    #[test]
+    fn an_array_no_index_names_is_left_alone() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let (other_prop, other_label) = {
+            let mut w = plane.write().unwrap();
+            let a = w
+                .create_node(&["Doc"], props("scores", list(DIM, 1.0)))
+                .unwrap();
+            let b = w
+                .create_node(&["Note"], props("emb", list(DIM, 1.0)))
+                .unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+
+        assert_eq!(vector_of(&plane, other_prop, "scores"), None);
+        assert_eq!(vector_of(&plane, other_label, "emb"), None);
+    }
+
+    /// Width is the only evidence there is, so a short array is not read as
+    /// an embedding — no model emits three dimensions, while three numbers
+    /// under a property is ordinary data. It stays a list, and the index it
+    /// would have mis-sized stays empty.
+    #[test]
+    fn a_short_array_is_data_not_an_embedding() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let short = {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], props("emb", list(3, 1.0))).unwrap();
+            w.commit().unwrap();
+            id
+        };
+
+        assert_eq!(vector_of(&plane, short, "emb"), None, "left as a list");
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Empty),
+            "and the index was not sized by it"
+        );
+    }
+
+    /// Except when it is exactly the width the index already holds: a plane
+    /// whose embeddings really are 3-wide (a test fixture, a toy model) keeps
+    /// working, because then the array matches what is there rather than
+    /// being guessed at.
+    #[test]
+    fn a_short_array_matching_the_index_is_an_embedding() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        // Seeded with an explicit vector — `{"$vector": [...]}` on the wire —
+        // which is always taken at its word, whatever its width.
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(
+                &["Doc"],
+                props("emb", PropDesc::new(PropValue::Vector(vec![1.0, 0.0, 0.0]))),
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(3))
+        );
+
+        let matching = {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], props("emb", list(3, 0.0))).unwrap();
+            w.commit().unwrap();
+            id
+        };
+        assert_eq!(
+            vector_of(&plane, matching, "emb").map(|v| v.len()),
+            Some(3),
+            "it is one of the vectors this index holds"
+        );
+    }
+
+    /// An empty array is not an embedding: a 0-wide vector indexes nothing,
+    /// so `[]` stays the empty list the caller wrote, and a list with a
+    /// string in it is not numeric at all.
+    #[test]
+    fn an_empty_or_non_numeric_array_is_not_an_embedding() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let mut mixed: Vec<PropValue> = (0..DIM).map(|i| PropValue::Float(i as f64)).collect();
+        mixed.push(PropValue::Str("two".into()));
+        let (empty, not_numeric) = {
+            let mut w = plane.write().unwrap();
+            let a = w
+                .create_node(
+                    &["Doc"],
+                    props("emb", PropDesc::new(PropValue::List(Vec::new()))),
+                )
+                .unwrap();
+            let b = w
+                .create_node(
+                    &["Doc"],
+                    props("emb", PropDesc::new(PropValue::List(mixed))),
+                )
+                .unwrap();
+            w.commit().unwrap();
+            (a, b)
+        };
+
+        assert_eq!(vector_of(&plane, empty, "emb"), None);
+        assert_eq!(vector_of(&plane, not_numeric, "emb"), None);
+    }
+
+    /// The same promotion on the update paths: one property at a time, and
+    /// the bulk path a `digest.write` takes.
+    #[test]
+    fn set_prop_and_bulk_upsert_promote_too() {
+        let db = indexed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let updated = {
+            let mut w = plane.write().unwrap();
+            let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+            w.set_prop(id, "emb", list(DIM, 0.25)).unwrap();
+            // A property no index names stays a list here as well.
+            w.set_prop(id, "scores", list(DIM, 9.0)).unwrap();
+            w.commit().unwrap();
+            id
+        };
+        assert_eq!(vector_of(&plane, updated, "emb").map(|v| v[0]), Some(0.25));
+        assert_eq!(vector_of(&plane, updated, "scores"), None);
+
+        {
+            let mut w = plane.write().unwrap();
+            w.bulk_load(
+                vec![BulkNode {
+                    external_key: Some("bulk-1"),
+                    labels: &["Doc"],
+                    props: props("emb", list(DIM, 0.5)),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        let bulk = plane.node_by_key("bulk-1").unwrap().unwrap().id;
+        let v = vector_of(&plane, bulk, "emb").expect("promoted");
+        assert_eq!(v[0], 0.5);
+        let hits = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", v, Metric::L2, 1)
+            .ids()
+            .unwrap();
+        assert_eq!(hits, vec![bulk], "the bulk-promoted vector is indexed");
     }
 }
