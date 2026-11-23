@@ -57,8 +57,9 @@ resets the expiry, which is what a cache refreshing an entry wants.
 - `dim` on each vector row of `plane.indexes`, with `"mixed": true` where one
   index holds vectors of differing widths.
 - `labels` and `extra_labels` on `digest.write`'s nodes, unioned with `label`,
-  so a `digest.run` proposal keeps the labels it was reviewed with. The reply
-  reports the labels it wrote.
+  so a `digest.run` proposal keeps the labels it was reviewed with — and
+  `digest.run`'s own reply now carries a `labels` array per node, which is the
+  half of the round trip that was dropping them.
 - `digest.write`'s per-node and per-edge shapes are spelled out in
   `openrpc.json`, which gives the generated Go, Java and TypeScript SDKs typed
   parameters where they took an untyped object list before.
