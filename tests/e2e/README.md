@@ -1,16 +1,44 @@
 # End-to-end checks
 
-`just e2e` — or `tests/e2e/run.sh` with `DRSG_BIN` pointing at a built binary.
+`just e2e` — or either script directly, with `DRSG_BIN` pointing at a built
+binary.
 
-One script, 44 checks, against the real binary, the real wasm parsers and a
-real git repository. It covers the three code-intelligence features of the
-2027-Q1 plan, in the order a change meets them:
+Two scripts against the real binary, 85 checks in all.
+
+## `run.sh` — code intelligence
+
+50 checks against the real wasm parsers and a real git repository. It covers
+the three code-intelligence features of the 2027-Q1 plan, in the order a
+change meets them:
 
 | Section | What it pins |
 |---|---|
 | cross-layer edges | Spring MVC routes reach their handlers; a Dubbo provider and consumer are matched on one address; a MyBatis mapper method is implemented by the XML statement beside it, which reads a table and its columns; `trace` crosses all three in one answer |
 | `affected` | the tests a change reaches, by `CALLS` and at two hops; what `--safe` widens to; `--seeds` as a loop's input; a clean tree; `--vs` as CI reads a committed change; the staleness warning, present when the plane is behind and absent when it is not |
 | `--report` | the section headings, the fold, the per-test reason, the honesty note as a block quote; the radius table; the route table; and the empty-output contract, four times over |
+
+## `store.sh` — what the store says about itself
+
+35 checks over HTTP against a real `drsg serve`, for the three reports that
+became 2.33.0 (#112, #113, #114). No plugins and no git: it writes nodes and
+asks questions.
+
+| Section | What it pins |
+|---|---|
+| #112 | `plane.indexes` reports an index's width as `dim`; a query that width contradicts is refused with `-32602` naming both widths and the pair; a search on an *undeclared* property is **not** refused, because there the width is unknown; a bare 16-number array under a declared index is promoted and answers its own query; a two-number array under the same index stays a list |
+| #113 | a misspelled parameter is refused by name and writes nothing; the five methods that flatten the time-travel params still ignore the unknown, as documented; `digest.write` takes `labels`, `label` + `extra_labels`, and neither, landing each node under the right labels rather than `Entity` |
+| #114 | an expired entry is gone from `node.get`, from a scan, and from Cypher; a search for **one** neighbour answers the live entry when the expired one is nearest; rewriting the expired key lands on the same row and makes it findable again |
+
+It needs a token, and that is the server's own rule rather than a workaround:
+with no token set, a loopback bind trusts only its same-origin browser UI, so
+curl is refused even for a read. The script exports a throwaway one on a port
+nobody else holds, and replaces whatever the environment has rather than
+reading it.
+
+Each check is a Python expression over the parsed reply, so an assertion says
+what it means (`r['error']['code'] == -32602`) rather than grepping a shape.
+The server is killed by pid, never by pattern — a `pkill -f drsg` here would
+take this repository's own watch server with it.
 
 ## Why a script and not a `#[test]`
 
@@ -27,9 +55,9 @@ person would read.
 
 ## What it is not
 
-Not part of `just gate`. The gate mirrors CI, and CI has no plugin store; this
-needs one, and a few seconds of digesting. Run it before a release, and after
-`drsg plugin install`.
+Not part of `just gate`. The gate mirrors CI, and CI has no plugin store;
+`run.sh` needs one, and a few seconds of digesting. Run both before a release,
+and `run.sh` again after `drsg plugin install`.
 
 It does not run the CI templates themselves — `ci/github/action.yml` and
 `ci/gitlab/drsg-impact.yml` are platform glue, and their own platform runs
