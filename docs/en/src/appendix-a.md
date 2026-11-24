@@ -13,6 +13,15 @@ dialect (`{"$vector":[…]}`, `{"$desc":…,"$value":…}`, `{"$bytes":[…]}`, 
 `{"$map":{…}}` for a nested map whose own keys begin with `$`; integers must fit
 a signed 64-bit value), and `NodeRef` is a node id or an external key.
 
+**An argument a method cannot act on reads as `-32602`, not `-32000`**, on the
+write methods as on the read ones: a vector whose width the index contradicts,
+a declared width the property's own vectors contradict, a re-declaration at a
+different metric, language or width, an unparseable `$expires_at`, and a plane
+that has exhausted its label dictionary or its plane ids. Previously those
+answered `-32000`, which is the code for a condition of the store rather than
+of the call. A duplicate external key is unchanged: a conflict *is* a condition
+of the store.
+
 **A parameter the method does not define is refused**, with `-32602` and the
 offending name, rather than ignored: a misspelling is a mistake the caller can
 see at the call that made it. The exception is the five methods that accept the
@@ -34,7 +43,7 @@ unknown, a limitation of the deserializer rather than a decision.
 
 - **`plane.list`** · read — every plane with id, name, counts, properties. Params: none.
 - **`plane.catalog`** · read — one plane's soft schema. Params: `plane` string!.
-- **`plane.indexes`** · read — the search indexes declared on a plane; each vector row carries the width of the vectors it holds as `dim` (`null` with `"mixed": true` where they differ). Params: `plane` string!.
+- **`plane.indexes`** · read — the search indexes declared on a plane; each vector row carries the width of the vectors it holds as `dim` (`null` with `"mixed": true` where they differ) and the width its declaration fixed as `declared_dim` (`null` where none did). Params: `plane` string!.
 - **`plane.history`** · read — the time-travel window (native backend only). Params: none.
 - **`plane.create`** · admin — create an empty plane. Params: `name` string!, `properties` Properties.
 - **`plane.rename`** · admin — rename a plane. Params: `plane` string!, `to` string!.
@@ -60,8 +69,8 @@ unknown, a limitation of the deserializer rather than a decision.
 - **`plane.query`** · read — run a serialized logical plan. Params: `plane` string!, `plan` object!, `as_of` integer, `as_of_ms` integer.
 - **`plane.cypher`** · write — run an openCypher-subset statement (write-gated). Params: `plane` string!, `query` string!, `embed` string, `params` object.
 - **`plane.find`** · read — text or semantic search over a plane. Params: `plane` string!, `q` string!, `limit` integer, `semantic` boolean, `provider` string, `embed_model` string, `as_of` integer, `as_of_ms` integer.
-- **`plane.search`** · read — vector top-*k* over a property; a query the declared index's own width contradicts is refused with `-32602` naming both widths (see [Chapter 3](./ai-native.md#the-indexs-own-width)). Params: `plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string.
-- **`plane.hybrid`** · read — fused vector + keyword + graph-proximity search. Params: `plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string.
+- **`plane.search`** · read — vector top-*k* over a property; a query the declared index's own width contradicts is refused with `-32602` naming both widths (see [Chapter 3](./ai-native.md#the-indexs-own-width)). An omitted `metric` means the metric the indexes on the property were declared with, cosine only where none says otherwise, and an unknown name is refused; `min_score` answers only hits scoring at least that much, on the same scale as each hit's `score`, applied before `k` is filled (see [Chapter 3](./ai-native.md#a-threshold-not-just-a-rank-min_score)). Params: `plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string, `min_score` number.
+- **`plane.hybrid`** · read — fused vector + keyword + graph-proximity search. Its `metric` follows the same rule as `plane.search`'s; it takes no `min_score`, because the channels fuse normalised scores. Params: `plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string.
 - **`plane.algo`** · read — a graph algorithm (`pagerank` \| `components` \| `shortest_path` \| `louvain` \| `toposort` \| `cycles`) over a plane or label subset. Params: `plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number, `edge_type` string.
 - **`plane.ask`** · read — natural-language query → plan → run. Params: `plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string.
 - **`graph.seed`** · read — an initial canvas of nodes plus induced edges. Params: `plane` string!, `label` string, `limit` integer, `order` string (`scan` \| `degree` \| `pagerank`, default `scan`), `as_of` integer, `as_of_ms` integer. A ranked `order` returns the highest-scoring nodes rather than the first the scan reaches, and includes their `scores` — prefer `degree` for a skeleton, since PageRank pools rank in sinks.
@@ -69,7 +78,7 @@ unknown, a limitation of the deserializer rather than a decision.
 
 ## Indexes and ingestion
 
-- **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string.
+- **`index.ensure`** · admin — declare a vector or keyword index on `(label, property)`. A vector index may fix `dim`, the width every vector in it must be, which is then enforced from the first write and reported as `declared_dim` by `plane.indexes`; a width the property's existing vectors contradict is refused, as is an unknown `metric`. Params: `plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string, `dim` integer.
 - **`digest.run`** · write — extract a node/edge proposal from text via the LLM (dry run). Params: `plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string (`coarse` \| `fine` \| `super`, default `fine` — see [Chapter 3](./ai-native.md#extraction-precision); `super` costs ~15× the input tokens).
 - **`digest.write`** · write — write a previously-computed proposal (no LLM call). A proposed key the plane already owns is skipped by default, since a distillation proposes every entity as new. Params: `plane` string!, `nodes` array!, `edges` array, `on_conflict` string (`error` / `skip` / `update`; default `skip`). Each node is `{key string!, label string, labels array, extra_labels array, properties Properties}` — **all three label spellings are accepted and unioned**, so a proposal reviewed from `digest.run` keeps the labels it was given; a node naming none lands under `Entity`. Each edge is `{src string!, dst string!, type string!, properties Properties}`.
 - **`plane.vectorize`** · write — embed every node in a plane (unchanged texts are skipped) and ensure a vector index on `embedding` per label; the provider key comes from the server's environment. Params: `plane` string!, `embed` string, `embed_model` string, `metric` string.

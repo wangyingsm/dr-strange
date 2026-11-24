@@ -10,6 +10,12 @@
 `{"$desc":…,"$value":…}`、`{"$bytes":[…]}`，以及用于自身键以 `$` 开头的嵌套映射的
 `{"$map":{…}}`；整数必须能放进有符号 64 位），`NodeRef` 则指一个节点 id 或一个外部键。
 
+**方法无从处理的参数值读作 `-32602`，而不是 `-32000`**，写方法与读方法一视同仁：
+宽度与索引矛盾的向量、与该属性已有向量矛盾的声明宽度、以不同度量/语言/宽度做的重
+复声明、无法解析的 `$expires_at`，以及标签字典或平面 id 已耗尽的平面。此前这些返回
+`-32000`，而那个码表示的是存储的状态，而非这次调用本身的问题。外部键重复不在其列：
+冲突**正是**存储的一种状态。
+
 **方法未定义的参数会被拒绝**，返回 `-32602` 并指明该参数名，而不是默默忽略：拼错
 是一个错误，调用方应当在犯下它的那一次调用上就看到。例外是接受时间旅行参数
 （`as_of` / `as_of_ms`）的五个方法 —— `plane.query`、`plane.neighbors`、`plane.find`、
@@ -29,7 +35,7 @@
 
 - **`plane.list`** · read —— 每个平面及其 id、名称、计数、属性。参数：无。
 - **`plane.catalog`** · read —— 单个平面的软 schema。参数：`plane` string!。
-- **`plane.indexes`** · read —— 某个平面上已声明的检索索引；每个向量索引行以 `dim` 给出它所持有向量的宽度（宽度不一时为 `null` 并附 `"mixed": true`）。参数：`plane` string!。
+- **`plane.indexes`** · read —— 某个平面上已声明的检索索引；每个向量索引行以 `dim` 给出它所持有向量的宽度（宽度不一时为 `null` 并附 `"mixed": true`），并以 `declared_dim` 给出其声明所固定的宽度（没有声明宽度时为 `null`）。参数：`plane` string!。
 - **`plane.history`** · read —— 时间旅行窗口（仅原生后端）。参数：无。
 - **`plane.create`** · admin —— 创建一个空平面。参数：`name` string!, `properties` Properties。
 - **`plane.rename`** · admin —— 重命名一个平面。参数：`plane` string!, `to` string!。
@@ -55,8 +61,8 @@
 - **`plane.query`** · read —— 运行一个序列化的逻辑计划。参数：`plane` string!, `plan` object!, `as_of` integer, `as_of_ms` integer。
 - **`plane.cypher`** · write —— 运行一条 openCypher 子集语句（写门控）。参数：`plane` string!, `query` string!, `embed` string, `params` object。
 - **`plane.find`** · read —— 对一个平面的文本或语义搜索。参数：`plane` string!, `q` string!, `limit` integer, `semantic` boolean, `provider` string, `embed_model` string, `as_of` integer, `as_of_ms` integer。
-- **`plane.search`** · read —— 在某个属性上的向量 top-*k*；若查询向量的宽度与已声明索引自身的宽度矛盾，会以 `-32602` 拒绝并同时说明两个宽度（见[第 3 章](./ai-native.md#索引自身的宽度)）。参数：`plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string。
-- **`plane.hybrid`** · read —— 融合的向量 + 关键词 + 图邻近度检索。参数：`plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string。
+- **`plane.search`** · read —— 在某个属性上的向量 top-*k*；若查询向量的宽度与已声明索引自身的宽度矛盾，会以 `-32602` 拒绝并同时说明两个宽度（见[第 3 章](./ai-native.md#索引自身的宽度)）。省略 `metric` 时采用该属性上各索引声明的度量，只有在没有任何声明可依据时才取 cosine，服务端不认识的名字会被拒绝；`min_score` 只作答分值不低于该值的命中，与每个命中自身的 `score` 同标度比较，且在凑满 `k` 之前就已剔除（见[第 3 章](./ai-native.md#不只是排序还有阈值min_score)）。参数：`plane` string!, `property` string!, `query` array!, `label` string, `k` integer, `metric` string, `min_score` number。
+- **`plane.hybrid`** · read —— 融合的向量 + 关键词 + 图邻近度检索。其 `metric` 遵循与 `plane.search` 相同的规则；它不接受 `min_score`，因为各通道融合的是归一化后的分值。参数：`plane` string!, `q` string!, `label` string, `vector_prop` string, `keyword_prop` string, `metric` string, `graph_hops` integer, `graph_decay` number, `w_vector` number, `w_keyword` number, `w_graph` number, `k` integer, `candidates` integer, `provider` string, `embed_model` string。
 - **`plane.algo`** · read —— 作用于一个平面或某个标签子集的图算法（`pagerank` \| `components` \| `shortest_path` \| `louvain` \| `toposort` \| `cycles`）。参数：`plane` string!, `algo` string!, `label` string, `limit` integer, `damping` number, `max_iters` integer, `tolerance` number, `src` integer, `dst` integer, `dir` string, `weight` string, `max_levels` integer, `min_gain` number, `edge_type` string。
 - **`plane.ask`** · read —— 自然语言查询 → 计划 → 执行。参数：`plane` string!, `question` string!, `dry_run` boolean, `max_attempts` integer, `limit` integer, `provider` string, `model` string, `embed_provider` string, `embed_model` string。
 - **`graph.seed`** · read —— 一块由若干节点及其诱导边构成的初始画布。参数：`plane` string!, `label` string, `limit` integer, `order` string（`scan` \| `degree` \| `pagerank`，默认 `scan`）, `as_of` integer, `as_of_ms` integer。指定排序时，返回的是得分最高的节点而非扫描时最先遇到的那些，并附带其 `scores`。若要取骨架，建议用 `degree`：PageRank 会把权重汇聚到汇点，不适合这个用途。
@@ -64,7 +70,7 @@
 
 ## 索引与导入
 
-- **`index.ensure`** · admin —— 在 `(标签, 属性)` 上声明一个向量或关键词索引。参数：`plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string。
+- **`index.ensure`** · admin —— 在 `(标签, 属性)` 上声明一个向量或关键词索引。向量索引可以固定 `dim`，即其中每个向量必须具有的宽度；该宽度自第一次写入起即被强制执行，并由 `plane.indexes` 以 `declared_dim` 报告。与该属性上已有向量相矛盾的宽度会被拒绝，不认识的 `metric` 同样会被拒绝。参数：`plane` string!, `label` string!, `property` string!, `kind` string, `metric` string, `language` string, `dim` integer。
 - **`digest.run`** · write —— 经由 LLM 从文本抽取节点/边方案（dry-run）。参数：`plane` string!, `text` string!, `chat` string, `embed` string, `model` string, `embed_model` string, `source` string, `no_embed` boolean, `link` boolean, `concurrency` integer, `chunk_chars` integer, `mode` string（`coarse` \| `fine` \| `super`，默认 `fine`——见[第 3 章](./ai-native.md#抽取精度)；`super` 的输入 token 用量约为 15 倍）。
 - **`digest.write`** · write —— 写入一个先前算得的方案（不调用 LLM）。方案中已被本平面占用的键默认跳过——蒸馏把每个实体都当作新的提出，因此提到已知的东西是常态。参数：`plane` string!, `nodes` array!, `edges` array, `on_conflict` string（`error` / `skip` / `update`，默认 `skip`）。每个节点形如 `{key string!, label string, labels array, extra_labels array, properties Properties}` —— **三种标签写法都接受，并取并集**，因此从 `digest.run` 评审而来的方案能保留它原有的标签；一个没有指明任何标签的节点落在 `Entity` 下。每条边形如 `{src string!, dst string!, type string!, properties Properties}`。
 - **`plane.vectorize`** · write —— 为平面中的每个节点生成向量嵌入（文本未变的节点会跳过），并按标签确保 `embedding` 上的向量索引。提供方密钥来自服务端环境。参数：`plane` string!, `embed` string, `embed_model` string, `metric` string。

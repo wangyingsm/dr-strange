@@ -26,15 +26,54 @@ $ drsg --db graph.drsg index ensure Doc embedding --plane social --metric dot
 查询通过 `SEARCH … NEAR … TOPK` 形式使用索引。如果没有声明索引，引擎会回退到
 精确的暴力扫描，这也正好用作校验索引结果的基准（oracle）。
 
-### 索引自身的宽度
+### 检索所用的度量
 
-索引会记录它所持有向量的宽度，`plane.indexes` 以 `dim` 字段报告这一宽度（若某个
-平面曾向同一索引写入宽度不一的向量，则为 `null` 并附 `"mixed": true` —— 存储如实
-记录现状，并不拒绝这种写入）：
+度量决定了分值所处的标度 —— cosine 的分值是 `1 - distance`，`dot` 与 `l2` 的分值
+是 `-distance` —— 因此它不是调用方可以放任的细节。检索中显式指定的 `metric` 会被
+采用，即便索引并未声明该度量：那会有意走精确暴力路径。
+
+**省略 `metric` 时，采用该属性上各索引声明的度量**，于是声明为 `l2` 的索引就按
+`l2` 检索。只有在没有任何声明可依据时才以 cosine 为默认：该属性上没有索引，或者
+多个索引彼此不一致。服务端不认识的度量名会以 `-32602` 拒绝，而不是悄悄当作
+cosine。
+
+### 不只是排序，还有阈值：`min_score`
+
+`plane.search` 可以问出*最近的那个，前提是它足够近* —— 这正是缓存自己的问题：
+低于阈值的命中是错误答案，而不是差一点的答案：
 
 ```json
-{"label": "Doc", "property": "embedding", "metric": "cosine", "dim": 384}
+{"plane": "cache", "label": "Answer", "property": "embedding",
+ "query": [0.1, 0.2], "k": 1, "min_score": 0.86}
 ```
+
+`min_score` 与每个命中自身携带的 `score` 在同一标度上比较，因此无需按度量去猜测
+距离的标度。剔除发生在**凑满 `k` 之前**，所以一个足够近的命中不会被另一个更近、
+但随后未过阈值的命中挤出窗口 —— 而当没有任何命中足够近时，答案就是 `[]`，这正是
+调用方想要的答案。
+
+该阈值只属于 `plane.search`。`plane.hybrid` 融合的是各通道**归一化后**的分值，
+在那里一个原始阈值并不等于融合分值的含义。
+
+### 索引自身的宽度
+
+索引会记录它所持有向量的宽度，`plane.indexes` 以 `dim` 字段报告这一宽度，并一并
+给出 `declared_dim` —— 即其声明所固定的宽度，这让客户端能够区分*已声明 384 宽但
+尚为空*与*为空且宽度未知*：
+
+```json
+{"label": "Doc", "property": "embedding", "metric": "cosine",
+ "dim": 384, "declared_dim": 384}
+```
+
+宽度也可以预先声明，此后从第一次写入起即被强制执行：
+
+```console
+$ drsg --db graph.drsg index ensure Doc embedding --plane social --dim 384
+```
+
+若声明的宽度与该属性上已有向量相矛盾，则拒绝该声明：声明并不会重新嵌入它们，
+那样做只意味着从此拒绝每一次与已入索引内容相符的写入。
 
 **与索引自身宽度矛盾的检索会被拒绝**，并同时说明两个宽度，而不是按无穷远排序、
 再回一个空列表：
@@ -44,9 +83,26 @@ $ drsg --db graph.drsg index ensure Doc embedding --plane social --metric dot
  "message": "query is 128-wide but the index on (Doc, embedding) holds 384-wide vectors"}
 ```
 
-只有在宽度可知时才谈得上拒绝：即已声明、且至少持有一个向量的索引。对未声明的
-`(标签, 属性)` 对做检索会走精确暴力路径，在那里宽度不符的距离为无穷远，于是什么
-也匹配不到 —— 这是对"存储事先无从得知"的如实表述。
+只有在宽度可知时才谈得上拒绝：即已声明、且至少持有一个向量的索引，或者声明时带了
+`dim` 的索引。对未声明的 `(标签, 属性)` 对做检索会走精确暴力路径，在那里宽度不符
+的距离为无穷远，于是什么也匹配不到 —— 这是对"存储事先无从得知"的如实表述。
+
+**与索引宽度矛盾的写入同样会被拒绝**，正是这一点让宽度得以保持可知：
+
+```json
+{"code": -32602,
+ "message": "embedding is 8-wide but the vector index on (Doc, embedding) holds 384-wide vectors — a vector of a different width can never rank, so indexing it would leave the index holding two widths and every search over it answering less than it should."}
+```
+
+这一拒绝在单个批次之内与跨事务之间同样成立：`bulk_upsert` 或 `digest.write` 的第
+一个向量确定了其余向量必须匹配的宽度，因此宽度混杂的批次在第二个节点上即被拒绝，
+而不是到第五百个。声明时带了 `dim` 的索引会拒绝**第一次**错误写入，于是向量到达的
+先后顺序不再决定索引所认定的宽度。
+
+因此，索引报告 `"mixed": true` 只会有一种来由：这些向量在索引被声明时就已存在于该
+属性之下 —— 或者是更早的版本放进来的 —— 而绝不会来自对已声明索引的写入。这一点很
+要紧，因为宽度混杂的索引并不知道自己的宽度，从而无从拒绝任何东西：针对它的宽度
+不符的查询会被作答，而不是被拒绝。
 
 **写入时，裸的数字数组会被提升为向量**：只要已声明的索引点名了该属性，客户端发送
 `"embedding": [0.1, 0.2, …]` 而非 `{"$vector": [...]}`，落库的也是一个可检索的
