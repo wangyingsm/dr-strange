@@ -1553,6 +1553,7 @@ mod tests {
         let msg = resp["error"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("2-wide"), "{resp}");
         assert!(msg.contains("declared 384-wide"), "{resp}");
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
     }
 
     /// A caller that omits `dim` is every caller written before this release:
@@ -1679,6 +1680,47 @@ mod tests {
         let resp = call(&db, &search_body(Some("Doc"), &[0.5; 4])).unwrap();
         assert!(resp["error"].is_null(), "{resp}");
         assert_eq!(resp["result"].as_array().unwrap().len(), 1);
+    }
+
+    /// The write side of the same mistake answers the same code. A width the
+    /// index contradicts is the request's own fault wherever it arrives, and
+    /// `core_err` maps every core error to -32000, so without the narrower
+    /// mapping a client would see -32602 from `plane.search` and -32000 from
+    /// `node.create` for one misconfigured embedding model (#123).
+    #[test]
+    fn a_wrong_width_write_answers_the_same_code_as_a_wrong_width_query() {
+        let db = plane_with_embedding(4, true);
+
+        let create = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(create["error"]["code"], -32602, "{create}");
+
+        // The bulk path `digest.write` takes, where the reporter hit it.
+        let bulk = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[{"key":"d1","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}}]},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(bulk["error"]["code"], -32602, "{bulk}");
+
+        // `node.update` reaches it through `set_prop`.
+        let update = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.update","params":{"plane":"startup","id":1,"set":{"emb":{"$vector":[0.1,0.2]}}},"id":3}"#,
+        )
+        .unwrap();
+        assert_eq!(update["error"]["code"], -32602, "{update}");
+
+        // And an index declared with a width it already contradicts.
+        let ensure = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb","metric":"l2","dim":8},"id":4}"#,
+        )
+        .unwrap();
+        assert_eq!(ensure["error"]["code"], -32602, "{ensure}");
     }
 
     /// No index on the property means no width to contradict: the search runs

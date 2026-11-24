@@ -127,6 +127,23 @@ pub(crate) fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
     r.map_err(core_err)
 }
 
+/// [`app`] for a call whose failure is the request's own fault: an
+/// `InvalidArgument` from it answers `-32602 invalid params` instead of the
+/// server-error code [`core_err`] gives every core error.
+///
+/// Scoped to the calls that take the caller's own properties or index
+/// declaration, where that variant can only mean "you asked wrong" — the
+/// query-side width refusal (#112) already answers -32602, and the write-side
+/// one (#123) has to agree with it or the same mistake carries two codes.
+/// Everything else keeps [`app`]: a timeout, a storage fault or an
+/// external-key conflict is not a bad parameter.
+pub(crate) fn arg<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
+    r.map_err(|e| match e {
+        dr_strange_core::Error::InvalidArgument(msg) => RpcError::invalid_params(msg),
+        other => core_err(other),
+    })
+}
+
 /// The client-facing form of a core error. Client-fault variants (unknown
 /// plane, bad plan, conflict) name the caller's own inputs and go through
 /// verbatim; the storage-side ones carry an `io::Error` with the database's
@@ -2471,9 +2488,9 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             let metric = parse_metric(req.metric.as_deref());
             match req.dim {
                 Some(dim) => {
-                    app(plane.ensure_vector_index_of_width(&req.label, &req.property, metric, dim))?
+                    arg(plane.ensure_vector_index_of_width(&req.label, &req.property, metric, dim))?
                 }
-                None => app(plane.ensure_vector_index(&req.label, &req.property, metric))?,
+                None => arg(plane.ensure_vector_index(&req.label, &req.property, metric))?,
             }
             Ok(jval!({
                 "kind": "vector",
@@ -2489,7 +2506,7 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 .unwrap_or("english")
                 .parse()
                 .map_err(|e: dr_strange_core::Error| RpcError::invalid_params(e.to_string()))?;
-            app(plane.ensure_keyword_index(&req.label, &req.property, language))?;
+            arg(plane.ensure_keyword_index(&req.label, &req.property, language))?;
             Ok(jval!({ "kind": "keyword", "label": req.label, "property": req.property }))
         }
         other => Err(RpcError::invalid_params(format!(
@@ -3046,7 +3063,7 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         .collect();
 
     let mut txn = app(plane.write())?;
-    let stats = app(txn.bulk_upsert(bnodes, bedges, req.on_conflict.into()))?;
+    let stats = arg(txn.bulk_upsert(bnodes, bedges, req.on_conflict.into()))?;
     app(txn.commit())?;
 
     // Keys the plane already owned, split by what was done with them. Under
@@ -3144,8 +3161,8 @@ pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let mut txn = app(plane.write())?;
     let id = match &req.key {
-        Some(k) => app(txn.create_node_with_key(k, &labels, props))?,
-        None => app(txn.create_node(&labels, props))?,
+        Some(k) => arg(txn.create_node_with_key(k, &labels, props))?,
+        None => arg(txn.create_node(&labels, props))?,
     };
     app(txn.commit())?;
 
@@ -3183,14 +3200,14 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let mut txn = app(plane.write())?;
     for (k, pd) in set {
-        app(txn.set_prop(id, &k, pd))?;
+        arg(txn.set_prop(id, &k, pd))?;
     }
     for k in &req.unset {
         app(txn.remove_prop(id, k))?;
     }
     if let Some(labels) = &req.labels {
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        app(txn.set_labels(id, &refs))?;
+        arg(txn.set_labels(id, &refs))?;
     }
     app(txn.commit())?;
 
