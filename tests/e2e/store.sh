@@ -10,6 +10,11 @@
 #            takes every spelling of a label
 #   3. #114  a node past its `$expires_at` is invisible to every read, with
 #            `k = 1` and the expired entry nearest
+#   4. #123  a write whose width the index contradicts is refused, so the
+#            width #112 reports — and refuses queries against — stays knowable
+#            whichever order the vectors arrive in
+#   5. #124  an omitted metric means the one the index declares, an unknown
+#            one is refused, and `min_score` answers "nothing was near enough"
 #
 # Driven over HTTP against a real `drsg serve`, because that is the surface all
 # three were reported on: the in-process tests beside the code cannot see a
@@ -327,6 +332,242 @@ rpc <<JSON
 JSON
 want "the cache plane is one the server lists like any other" \
     "any(p['name'] == 'cache' for p in r['result'])"
+
+# ---------------------------------------------------------------------------
+say "4. #123 — the width survives a stray write"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.create","params":{"name":"w123"}}
+JSON
+want "a plane of its own" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123","label":"Doc","property":"emb","kind":"vector"}}
+JSON
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"w123","key":"good","labels":["Doc"],
+           "properties":{"emb":{"\$vector":$near}}}}
+JSON
+want "the index takes its width from the first write" "r.get('error') is None"
+
+# The write the reporter's pipeline made, which 2.33.0 accepted.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"w123","key":"stray","labels":["Doc"],
+           "properties":{"emb":{"\$vector":[1.0,0.0,0.0,0.0]}}}}
+JSON
+want "a stray 4-wide write into a 16-wide index is refused" "r.get('error') is not None"
+want "with invalid-params, as the query-side refusal answers" "r['error']['code'] == -32602"
+want "naming both widths" \
+    "'4-wide' in r['error']['message'] and '16-wide' in r['error']['message']"
+want "and the pair" "'(Doc, emb)' in r['error']['message']"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.get","params":{"plane":"w123","key":"stray"}}
+JSON
+want "so the node it would have written does not exist" "r['result'] is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.indexes","params":{"plane":"w123"}}
+JSON
+want "the index still knows its width" \
+    "[i['dim'] for i in r['result']['vector'] if i['property'] == 'emb'] == [16]"
+want "and is not mixed" \
+    "[i['mixed'] for i in r['result']['vector'] if i['property'] == 'emb'] == [False]"
+
+# The whole point of #123: #112's refusal still fires after the stray write.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"w123","label":"Doc","property":"emb","query":[1.0,0.0,0.0,0.0],"k":5}}
+JSON
+want "and a query of the stray's width is still refused, not answered" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+
+# A batch is folded as it is written, so the first vector sets the width the
+# rest must match and the second node is refused rather than the
+# five-hundredth. The index is declared and empty, which is the only way to
+# see the fold rather than the width already held.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123","label":"Batch","property":"vec","kind":"vector"}}
+JSON
+want "an index declared over a property nothing has written yet" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"digest.write",
+ "params":{"plane":"w123","on_conflict":"update",
+           "nodes":[{"key":"b-1","labels":["Batch"],"properties":{"vec":{"\$vector":$near}}},
+                    {"key":"b-2","labels":["Batch"],"properties":{"vec":{"\$vector":[0.5,0.5]}}}]}}
+JSON
+want "a mixed-width batch is refused" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.get","params":{"plane":"w123","key":"b-1"}}
+JSON
+want "and the node before the bad one is not left behind" "r['result'] is None"
+
+# The ordering case: the stray arrives first, and a declared width is the only
+# thing that can refuse it — otherwise the index believes the stray and the
+# production query is what gets refused.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.create","params":{"name":"w123b"}}
+JSON
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123b","label":"Doc","property":"emb","kind":"vector","dim":16}}
+JSON
+want "an index may declare its width up front" "r.get('error') is None"
+want "and echoes it back" "r['result']['dim'] == 16"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.indexes","params":{"plane":"w123b"}}
+JSON
+want "plane.indexes separates the declared width from what is held" \
+    "[(i['dim'], i['declared_dim']) for i in r['result']['vector']
+      if i['property'] == 'emb'] == [(None, 16)]"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"w123b","key":"stray-first","labels":["Doc"],
+           "properties":{"emb":{"\$vector":[1.0,0.0,0.0,0.0]}}}}
+JSON
+want "the very first write is refused when it contradicts the declaration" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+want "and the message says the width was declared, not merely held" \
+    "'declared 16-wide' in r['error']['message']"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"w123b","key":"good","labels":["Doc"],
+           "properties":{"emb":{"\$vector":$near}}}}
+JSON
+want "the write that matches the declaration lands" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"w123b","label":"Doc","property":"emb","query":$near,"k":1}}
+JSON
+want "so the production query is answered, not refused" \
+    "r.get('error') is None and r['result'][0]['external_key'] == 'good'"
+
+# An empty declared index, so the refusal is about the declaration rather
+# than about the vectors under it — the two arms read differently.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123b","label":"Doc","property":"untouched","kind":"vector","dim":16}}
+JSON
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123b","label":"Doc","property":"untouched","kind":"vector","dim":8}}
+JSON
+want "re-declaring at another width is refused like another metric" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+want "and says which width it is already declared" \
+    "'already declared 16-wide, not 8-wide' in r['error']['message']"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"w123","label":"Doc","property":"emb","kind":"vector","dim":8}}
+JSON
+want "and so is declaring a width the vectors already there contradict" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+want "saying that declaring does not re-embed what is already indexed" \
+    "'does not re-embed' in r['error']['message']"
+
+# ---------------------------------------------------------------------------
+say "5. #124 — the score's own scale, and a threshold"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.create","params":{"name":"s124"}}
+JSON
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"s124","label":"Doc","property":"emb","kind":"vector","metric":"l2"}}
+JSON
+want "an index declared l2" "r.get('error') is None"
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"s124","key":"exact","labels":["Doc"],
+           "properties":{"emb":{"\$vector":$near}}}}
+JSON
+want "with one vector in it" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Doc","property":"emb","query":$near,"k":1}}
+JSON
+want "an omitted metric scores on the declared l2 scale, where an exact match is 0" \
+    "abs(r['result'][0]['score']) < 1e-6"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Doc","property":"emb","query":$near,"k":1,
+           "metric":"cosine"}}
+JSON
+want "and a named metric is still honoured, where it is 1" \
+    "abs(r['result'][0]['score'] - 1.0) < 1e-6"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Doc","property":"emb","query":$near,"k":1,
+           "metric":"nonsense"}}
+JSON
+want "a metric the server does not know is refused rather than read as cosine" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+want "and the message names the ones it does" "'cosine|dot|l2' in r['error']['message']"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"s124","label":"Doc","property":"emb2","kind":"vector",
+           "metric":"nonsense"}}
+JSON
+want "a declaration does not silently take one either" \
+    "r.get('error') is not None and r['error']['code'] == -32602"
+
+# The cache's own question, on a cosine index: the nearest, if anything is
+# near enough. `near` and `far` are orthogonal, so the floor excludes it.
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"index.ensure",
+ "params":{"plane":"s124","label":"Answer","property":"emb","kind":"vector"}}
+JSON
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"s124","key":"far","labels":["Answer"],
+           "properties":{"emb":{"\$vector":$far}}}}
+JSON
+want "a cosine index holding one far entry" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Answer","property":"emb","query":$near,"k":1}}
+JSON
+want "without a threshold the far entry is the answer, as it always was" \
+    "len(r['result']) == 1"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Answer","property":"emb","query":$near,"k":1,
+           "min_score":0.5}}
+JSON
+want "with one, nothing was near enough and the answer is empty" \
+    "r.get('error') is None and r['result'] == []"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"node.create",
+ "params":{"plane":"s124","key":"near-answer","labels":["Answer"],
+           "properties":{"emb":{"\$vector":$near}}}}
+JSON
+want "a near entry beside it" "r.get('error') is None"
+
+rpc <<JSON
+{"jsonrpc":"2.0","id":1,"method":"plane.search",
+ "params":{"plane":"s124","label":"Answer","property":"emb","query":$near,"k":1,
+           "min_score":0.5}}
+JSON
+want "and the near one is what the threshold keeps" \
+    "[h['external_key'] for h in r['result']] == ['near-answer']"
 
 # ---------------------------------------------------------------------------
 printf '\n%d check(s), %d failed\n' "$checks" "$failed"
