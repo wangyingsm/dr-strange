@@ -5029,3 +5029,117 @@ mod vector_width_tests {
         assert!(err.to_string().contains("more than one width"), "{err}");
     }
 }
+
+/// A hit the metric cannot score is not an answer (#124). An index holding
+/// two widths ranks the disagreeing vectors at infinity rather than erroring,
+/// and those rows reached the caller as `score: null` — occupying slots under
+/// `k` that scorable nodes should have had.
+#[cfg(test)]
+mod vector_score_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    fn emb(values: &[f32]) -> Properties {
+        [(
+            "emb".to_string(),
+            PropDesc::new(PropValue::Vector(values.to_vec())),
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// A plane whose `(Doc, emb)` index holds both widths: the only way to
+    /// reach that state now is to declare the index over data that already
+    /// disagreed, which is how every reporter reached it.
+    fn mixed_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("near", &["Doc"], emb(&[0.0, 0.1]))
+                .unwrap();
+            w.create_node_with_key("far", &["Doc"], emb(&[0.9, 0.9]))
+                .unwrap();
+            w.create_node_with_key("wrong", &["Doc"], emb(&[0.0, 0.0, 0.0, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Mixed)
+        );
+        db
+    }
+
+    #[test]
+    fn a_hit_the_metric_cannot_score_is_not_returned() {
+        let db = mixed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 3)
+            .scored_nodes()
+            .unwrap();
+        assert_eq!(
+            scored.len(),
+            2,
+            "the 4-wide node cannot rank against a 2-wide query"
+        );
+        for (_, score) in &scored {
+            assert!(
+                score.is_some_and(f32::is_finite),
+                "every row carries a score a caller can compare: {score:?}"
+            );
+        }
+    }
+
+    /// And it does not cost a slot: asked for two, a caller gets the two
+    /// scorable nodes, not one of them beside a row it cannot read.
+    #[test]
+    fn an_unscorable_hit_takes_no_slot_under_k() {
+        let db = mixed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let ids = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 2)
+            .ids()
+            .unwrap();
+        let keys: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                plane
+                    .node(*id)
+                    .unwrap()
+                    .unwrap()
+                    .external_key
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(keys, vec!["near".to_string(), "far".to_string()]);
+    }
+
+    /// The brute-force path has always dropped them, and still does — the
+    /// two paths have to agree, which is the whole point of the change.
+    #[test]
+    fn the_unindexed_path_drops_them_too() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], emb(&[0.0, 0.1])).unwrap();
+            w.create_node(&["Doc"], emb(&[0.0, 0.0, 0.0, 0.0])).unwrap();
+            w.commit().unwrap();
+        }
+        // No index declared: the exact fallback answers.
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 3)
+            .scored_nodes()
+            .unwrap();
+        assert_eq!(scored.len(), 1);
+        assert!(scored[0].1.is_some_and(f32::is_finite));
+    }
+}

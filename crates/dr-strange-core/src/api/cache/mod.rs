@@ -34,7 +34,7 @@ use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
-use crate::storage::vector::{Hit, Metric, top_k};
+use crate::storage::vector::{Hit, IndexWidth, Metric, top_k};
 use crate::types::{Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId};
 
 /// Monotonic commit sequence number — the version-stamping and invalidation
@@ -146,6 +146,38 @@ fn indexed_or_brute<R: GraphReader + ?Sized>(
         return result;
     }
     brute_force_search(reader, label, property, query, metric, k)
+}
+
+/// The hits whose distance the metric actually produced a number for.
+///
+/// A vector of a width the query disagrees with ranks at infinity rather than
+/// erroring — the engine stays total (arch/01 §5) — and an infinite distance
+/// becomes `score: null` on the wire: a row a caller cannot compare against
+/// anything, let alone threshold. [`brute_force_search`] has always dropped
+/// them; the indexed path has not, so the same plane answered differently
+/// depending on whether an index was declared (#124).
+fn scorable_hits(hits: Vec<Hit>) -> Vec<Hit> {
+    hits.into_iter()
+        .filter(|h| h.distance.is_finite())
+        .collect()
+}
+
+/// Whether a search over this pair can return hits the metric cannot score.
+///
+/// Only an index holding more than one width can: everything in a uniform
+/// index either ranks or is not in it. Knowing this is what keeps the
+/// over-fetch off every ordinary query — a dropped hit must not cost a slot
+/// under `k`, but paying for that possibility always would.
+fn unscorable_possible(
+    registry: Option<&VectorRegistry>,
+    plane: PlaneId,
+    label: Option<&str>,
+    property: &str,
+) -> bool {
+    let (Some(reg), Some(l)) = (registry, label) else {
+        return false;
+    };
+    reg.width(plane, l, property) == Some(IndexWidth::Mixed)
 }
 
 /// Ranks with `search`, then drops what the reader cannot see, keeping `k`.
@@ -414,7 +446,8 @@ impl GraphReader for UncachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        let overfetch = self.expiry.used(self.txn, self.plane)?
+            || unscorable_possible(self.registry, self.plane, label, property);
         ranked_live(
             k,
             overfetch,
@@ -430,7 +463,7 @@ impl GraphReader for UncachedReader<'_> {
                     want,
                 )
             },
-            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+            |hits| visible_hits(self, scorable_hits(hits), label, |hit| NodeId(hit.id)),
         )
     }
 
@@ -664,7 +697,8 @@ impl GraphReader for CachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        let overfetch = self.expiry.used(self.txn, self.plane)?
+            || unscorable_possible(self.registry, self.plane, label, property);
         ranked_live(
             k,
             overfetch,
@@ -680,7 +714,7 @@ impl GraphReader for CachedReader<'_> {
                     want,
                 )
             },
-            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+            |hits| visible_hits(self, scorable_hits(hits), label, |hit| NodeId(hit.id)),
         )
     }
 
