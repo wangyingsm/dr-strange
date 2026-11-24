@@ -282,12 +282,57 @@ fn pin(
     Ok(p)
 }
 
-fn parse_metric(s: Option<&str>) -> Metric {
+/// The metric a request named, by name.
+///
+/// A name the server does not know is a mistake, not a default: `"nonsense"`
+/// used to score as cosine in silence, so a typo looked like a working search
+/// against a metric nobody chose (#124).
+fn parse_metric(s: &str) -> Result<Metric, RpcError> {
     match s {
-        Some("dot") | Some("Dot") => Metric::Dot,
-        Some("l2") | Some("L2") => Metric::L2,
-        _ => Metric::Cosine,
+        "cosine" | "Cosine" => Ok(Metric::Cosine),
+        "dot" | "Dot" => Ok(Metric::Dot),
+        "l2" | "L2" => Ok(Metric::L2),
+        other => Err(RpcError::invalid_params(format!(
+            "unknown metric `{other}` (expected cosine|dot|l2)"
+        ))),
     }
+}
+
+/// The metric a *search* runs under: the one it named, or the one the indexes
+/// it would use were declared with.
+///
+/// The argument decides the score's scale, and an omitted argument used to
+/// mean cosine whatever the index said — so an index declared `l2` and
+/// searched with no `metric` scored like cosine, and the metric
+/// `plane.indexes` reported described nothing observable (#124). Now the
+/// declaration answers, which also makes the search index-backed rather than
+/// a brute-force fallback under a metric the index cannot serve.
+///
+/// Cosine remains the default exactly where no declaration says otherwise:
+/// no index on the property, or several that disagree. An explicit `metric`
+/// is still honoured against any index, since exact brute force under
+/// another metric is a legitimate ask.
+fn metric_for_search(
+    plane: &PlaneHandle<'_>,
+    label: Option<&str>,
+    property: &str,
+    requested: Option<&str>,
+) -> Result<Metric, RpcError> {
+    if let Some(name) = requested {
+        return parse_metric(name);
+    }
+    let mut declared = plane
+        .vector_index_widths()
+        .into_iter()
+        .filter(|i| i.property == property && label.is_none_or(|l| i.label == l))
+        .map(|i| i.metric);
+    let Some(first) = declared.next() else {
+        return Ok(Metric::Cosine);
+    };
+    Ok(match declared.all(|m| m == first) {
+        true => first,
+        false => Metric::Cosine,
+    })
 }
 
 fn parse_dir(s: Option<&str>) -> Dir {
@@ -1330,11 +1375,17 @@ pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     check_query_width(&plane, req.label.as_deref(), &req.property, req.query.len())?;
+    let metric = metric_for_search(
+        &plane,
+        req.label.as_deref(),
+        &req.property,
+        req.metric.as_deref(),
+    )?;
     let mut q = plane.query().vector_top_k(
         req.label.as_deref(),
         &req.property,
         req.query,
-        parse_metric(req.metric.as_deref()),
+        metric,
         req.k.unwrap_or(10),
     );
     if let Some(floor) = req.min_score {
@@ -2312,7 +2363,8 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             .next()
             .ok_or_else(|| RpcError::server("embedder returned no vector"))?;
         check_query_width(&plane, req.label.as_deref(), prop, query.len())?;
-        builder = builder.vector(prop.clone(), query, parse_metric(req.metric.as_deref()));
+        let metric = metric_for_search(&plane, req.label.as_deref(), prop, req.metric.as_deref())?;
+        builder = builder.vector(prop.clone(), query, metric);
     }
     if let Some(prop) = &req.keyword_prop {
         builder = builder.keyword(prop.clone(), req.q.clone());
@@ -2498,7 +2550,13 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let plane = ctx.plane(&req.plane)?;
     match req.kind.as_deref().unwrap_or("keyword") {
         "vector" => {
-            let metric = parse_metric(req.metric.as_deref());
+            // A declaration is the one place the name is not a search
+            // parameter but the index's own property, so it is parsed
+            // strictly and defaults to cosine only when nothing was sent.
+            let metric = match req.metric.as_deref() {
+                Some(name) => parse_metric(name)?,
+                None => Metric::Cosine,
+            };
             match req.dim {
                 Some(dim) => {
                     arg(plane.ensure_vector_index_of_width(&req.label, &req.property, metric, dim))?
