@@ -185,6 +185,7 @@ type PlaneSearchParams struct {
 	Label    *string   `json:"label,omitempty"`
 	K        *int64    `json:"k,omitempty"`
 	Metric   *string   `json:"metric,omitempty"`
+	MinScore *float64  `json:"min_score,omitempty"`
 }
 
 type PlaneQueryParams struct {
@@ -271,6 +272,7 @@ type IndexEnsureParams struct {
 	Kind     *string `json:"kind,omitempty"`
 	Metric   *string `json:"metric,omitempty"`
 	Language *string `json:"language,omitempty"`
+	Dim      *int64  `json:"dim,omitempty"`
 }
 
 type GraphSeedParams struct {
@@ -529,7 +531,7 @@ func (c *Client) PlaneHistory(ctx context.Context) (*PlaneHistoryResult, error) 
 	return out, err
 }
 
-// PlaneSearch Vector top-k over a property; returns scored node records. (access: read)
+// PlaneSearch Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers []. (access: read)
 func (c *Client) PlaneSearch(ctx context.Context, p PlaneSearchParams) ([]NodeRecord, error) {
 	var out []NodeRecord
 	err := c.call(ctx, "plane.search", p, &out)
@@ -585,7 +587,7 @@ func (c *Client) PlaneIndexes(ctx context.Context, p PlaneIndexesParams) (map[st
 	return out, err
 }
 
-// IndexEnsure Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin)
+// IndexEnsure Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be. (access: admin)
 func (c *Client) IndexEnsure(ctx context.Context, p IndexEnsureParams) (map[string]any, error) {
 	var out map[string]any
 	err := c.call(ctx, "index.ensure", p, &out)

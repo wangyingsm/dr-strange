@@ -568,7 +568,7 @@
     },
     {
       "name": "plane.search",
-      "summary": "Vector top-k over a property; returns scored node records.",
+      "summary": "Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so \"the nearest, if anything is near enough\" answers [].",
       "x-access": "read",
       "params": [
         {
@@ -620,7 +620,15 @@
               "dot",
               "l2"
             ],
-            "default": "cosine"
+            "description": "How similarity is measured. Omitted, the declared metric of the indexes on this property is used — cosine only where no declaration says otherwise. The score's scale follows from it: cosine scores 1 - distance, dot and l2 score -distance."
+          }
+        },
+        {
+          "name": "min_score",
+          "required": false,
+          "schema": {
+            "type": "number",
+            "description": "Answer only with hits scoring at least this much, on the same scale as each hit's own `score`. Applied before `k` is filled, so a near-enough hit is never displaced by a nearer one that then fails the floor. Omitted, the k nearest are answered whatever they score."
           }
         }
       ],
@@ -989,7 +997,7 @@
               "dot",
               "l2"
             ],
-            "default": "cosine"
+            "description": "How the vector channel measures similarity. Omitted, the declared metric of the indexes on `vector_prop` is used (cosine only where no declaration says otherwise); an unknown name is refused. The channels fuse normalised scores, so there is no `min_score` here — a raw floor would not mean what the fused score means."
           }
         },
         {
@@ -1174,13 +1182,13 @@
         "name": "result",
         "schema": {
           "type": "object",
-          "description": "{vector:[{label,property,metric,dim,mixed}], keyword:[{label,property,language}]}. `dim` is the width of the vectors a vector index holds, or null when it is empty or holds more than one width (`mixed`) — what a client compares its own embeddings against before searching."
+          "description": "{vector:[{label,property,metric,dim,declared_dim,mixed}], keyword:[{label,property,language}]}. `dim` is the width of the vectors a vector index holds, or null when it is empty or holds more than one width (`mixed`) — what a client compares its own embeddings against before searching. `declared_dim` is the width its declaration fixed, or null when none did: an index declared 384-wide with nothing in it yet reads dim: null, declared_dim: 384."
         }
       }
     },
     {
       "name": "index.ensure",
-      "summary": "Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent.",
+      "summary": "Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be.",
       "x-access": "admin",
       "params": [
         {
@@ -1226,7 +1234,8 @@
               "dot",
               "l2"
             ],
-            "default": "cosine"
+            "default": "cosine",
+            "description": "How similarity is measured at query time. An unknown name is refused rather than defaulted."
           }
         },
         {
@@ -1236,13 +1245,21 @@
             "type": "string",
             "default": "english"
           }
+        },
+        {
+          "name": "dim",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "description": "The width every vector in the index must be. A write of any other width is then refused from the first one on, and the width is reported as `declared_dim` by plane.indexes. Omitted, the first vector written decides the width, and a write contradicting it is refused from then on. Declaring a width the property's existing vectors contradict is refused."
+          }
         }
       ],
       "result": {
         "name": "result",
         "schema": {
           "type": "object",
-          "description": "{kind, label, property}."
+          "description": "{kind, label, property, dim}."
         }
       }
     },

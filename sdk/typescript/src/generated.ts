@@ -159,8 +159,8 @@ export class Drsg extends Client {
     return this._call("plane.history") as Promise<{ oldest?: number; latest?: number }>;
   }
 
-  /** Vector top-k over a property; returns scored node records. (access: read) */
-  planeSearch(params: { plane: string; property: string; query: Array<number>; label?: string; k?: number; metric?: "cosine" | "dot" | "l2" }): Promise<Array<NodeRecord>> {
+  /** Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers []. (access: read) */
+  planeSearch(params: { plane: string; property: string; query: Array<number>; label?: string; k?: number; metric?: "cosine" | "dot" | "l2"; min_score?: number }): Promise<Array<NodeRecord>> {
     return this._call("plane.search", params) as Promise<Array<NodeRecord>>;
   }
 
@@ -199,8 +199,8 @@ export class Drsg extends Client {
     return this._call("plane.indexes", params) as Promise<Record<string, unknown>>;
   }
 
-  /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
-  indexEnsure(params: { plane: string; label: string; property: string; kind?: "keyword" | "vector"; metric?: "cosine" | "dot" | "l2"; language?: string }): Promise<Record<string, unknown>> {
+  /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be. (access: admin) */
+  indexEnsure(params: { plane: string; label: string; property: string; kind?: "keyword" | "vector"; metric?: "cosine" | "dot" | "l2"; language?: string; dim?: number }): Promise<Record<string, unknown>> {
     return this._call("index.ensure", params) as Promise<Record<string, unknown>>;
   }
 

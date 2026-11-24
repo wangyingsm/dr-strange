@@ -155,8 +155,8 @@ class Drsg(_Client):
         Access: read."""
         return self._call("plane.history")
 
-    def plane_search(self, plane, property, query, label=None, k=None, metric=None) -> Any:
-        """Vector top-k over a property; returns scored node records.
+    def plane_search(self, plane, property, query, label=None, k=None, metric=None, min_score=None) -> Any:
+        """Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers [].
 
         Access: read."""
         _p: dict = {}
@@ -169,6 +169,8 @@ class Drsg(_Client):
             _p["k"] = k
         if metric is not None:
             _p["metric"] = metric
+        if min_score is not None:
+            _p["min_score"] = min_score
         return self._call("plane.search", _p)
 
     def plane_query(self, plane, plan, as_of=None, as_of_ms=None) -> Any:
@@ -319,8 +321,8 @@ class Drsg(_Client):
         _p["plane"] = plane
         return self._call("plane.indexes", _p)
 
-    def index_ensure(self, plane, label, property, kind=None, metric=None, language=None) -> Any:
-        """Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent.
+    def index_ensure(self, plane, label, property, kind=None, metric=None, language=None, dim=None) -> Any:
+        """Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be.
 
         Access: admin."""
         _p: dict = {}
@@ -333,6 +335,8 @@ class Drsg(_Client):
             _p["metric"] = metric
         if language is not None:
             _p["language"] = language
+        if dim is not None:
+            _p["dim"] = dim
         return self._call("index.ensure", _p)
 
     def graph_seed(self, plane, label=None, limit=None, order=None, as_of=None, as_of_ms=None) -> Any:
