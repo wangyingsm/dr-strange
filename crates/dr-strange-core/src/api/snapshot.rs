@@ -121,6 +121,49 @@ fn read_frame(r: &mut impl Read) -> Result<Option<Frame>> {
     ))
 }
 
+/// Dump every index declaration: each vector index, its declared width where
+/// one was fixed, and each keyword index.
+///
+/// A width rides a frame of its own rather than a field on `VectorIndex`, so a
+/// bundle a reader of the older format meets still decodes every frame it
+/// knows (see [`MIN_SNAPSHOT_FORMAT`]).
+fn write_index_frames(mut out: impl Write, txn: &dyn ReadTransaction) -> Result<()> {
+    for decl in graph::list_vector_indexes(txn)? {
+        write_frame(
+            &mut out,
+            &Frame::VectorIndex {
+                plane: decl.plane.0,
+                label: decl.label.clone(),
+                property: decl.property.clone(),
+                metric: decl.metric,
+            },
+        )?;
+        if let Some(dim) = decl.dim {
+            write_frame(
+                &mut out,
+                &Frame::VectorWidth {
+                    plane: decl.plane.0,
+                    label: decl.label,
+                    property: decl.property,
+                    dim,
+                },
+            )?;
+        }
+    }
+    for (pid, label, property, language) in graph::list_keyword_indexes(txn)? {
+        write_frame(
+            &mut out,
+            &Frame::KeywordIndex {
+                plane: pid.0,
+                label,
+                property,
+                language,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl Database {
     /// Write a consistent, whole-database snapshot (ROADMAP §6) to `out`: every
     /// plane's nodes and edges, the index declarations, and the built
@@ -200,39 +243,7 @@ impl Database {
                 }
             }
 
-            for decl in graph::list_vector_indexes(txn)? {
-                write_frame(
-                    &mut out,
-                    &Frame::VectorIndex {
-                        plane: decl.plane.0,
-                        label: decl.label.clone(),
-                        property: decl.property.clone(),
-                        metric: decl.metric,
-                    },
-                )?;
-                if let Some(dim) = decl.dim {
-                    write_frame(
-                        &mut out,
-                        &Frame::VectorWidth {
-                            plane: decl.plane.0,
-                            label: decl.label,
-                            property: decl.property,
-                            dim,
-                        },
-                    )?;
-                }
-            }
-            for (pid, label, property, language) in graph::list_keyword_indexes(txn)? {
-                write_frame(
-                    &mut out,
-                    &Frame::KeywordIndex {
-                        plane: pid.0,
-                        label,
-                        property,
-                        language,
-                    },
-                )?;
-            }
+            write_index_frames(&mut out, txn)?;
             Ok::<(), Error>(())
         })?;
 
