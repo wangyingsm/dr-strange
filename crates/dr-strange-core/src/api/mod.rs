@@ -348,6 +348,34 @@ fn as_embedding(value: &PropValue, required: Option<usize>) -> Option<Vec<f32>> 
     (fits || numbers.len() >= MIN_INFERRED_DIM).then_some(numbers)
 }
 
+/// Refuses a declared width the vectors already under `(label, property)`
+/// contradict (#123).
+///
+/// Declaring a width does not re-embed anything, so a width the stored
+/// vectors disagree with would refuse every write that matches what is
+/// already indexed — the index's own content would be unwritable. An empty
+/// pair has nothing to contradict and takes any width.
+fn refuse_width_against_store(
+    held: IndexWidth,
+    dim: usize,
+    label: &str,
+    property: &str,
+) -> Result<()> {
+    let complaint = match held {
+        IndexWidth::Uniform(d) if d != dim => {
+            format!("it already holds {d}-wide vectors")
+        }
+        IndexWidth::Mixed => "it already holds vectors of more than one width".to_string(),
+        _ => return Ok(()),
+    };
+    Err(Error::InvalidArgument(format!(
+        "cannot declare the vector index on ({label}, {property}) {dim}-wide: {complaint}, and \
+         declaring a width does not re-embed them — every write matching what is already \
+         indexed would be refused instead. Re-embed those nodes at {dim}, or declare the index \
+         without a width."
+    )))
+}
+
 /// A past point to read the graph at — the address for a time-travel (AS OF)
 /// query (ROADMAP §4). Resolved to a storage snapshot by the native backend,
 /// the only engine that keeps the history AS OF needs — hence gated to it. Both
@@ -1586,6 +1614,13 @@ impl<'db> PlaneHandle<'db> {
         dim: Option<usize>,
     ) -> Result<()> {
         let plane = self.id;
+        if let Some(dim) = dim {
+            let held = self
+                .db
+                .engine
+                .with_read(|txn| crate::index::stored_width(txn, plane, label, property))?;
+            refuse_width_against_store(held, dim, label, property)?;
+        }
         self.db.engine.with_write(|txn| {
             graph::declare_vector_index(txn, plane, label, property, metric, dim).map(|_| ())
         })?;
@@ -4937,5 +4972,60 @@ mod vector_width_tests {
         assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
         let mut w = plane.write().unwrap();
         assert_names_both_widths(w.create_node(&["Doc"], vector(8)).unwrap_err(), 8, 16);
+    }
+
+    /// Declaring a width the index's own vectors contradict would make its
+    /// content unwritable: every write matching what is already indexed
+    /// would be refused, which is #123's trap re-created through the
+    /// declaration instead of through a stray write.
+    #[test]
+    fn a_declared_width_the_store_contradicts_is_refused() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let err = plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 8)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{msg}");
+        assert!(msg.contains("16-wide"), "{msg}");
+        assert!(msg.contains("8-wide"), "{msg}");
+
+        // Nothing was declared, so the index is exactly as it was and the
+        // writes that match its content still land.
+        assert_eq!(plane.vector_index_widths()[0].declared, None);
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(16)).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// The width the store already has is the one a declaration may name —
+    /// how a plane vectorized before this release gets its gate.
+    #[test]
+    fn the_width_the_store_already_holds_can_be_declared() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap();
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
+    }
+
+    /// A pair holding two widths already can hold no declared width at all:
+    /// whichever is named, the other half of the data contradicts it.
+    #[test]
+    fn a_mixed_pair_takes_no_declared_width() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(16)).unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap();
+            w.commit().unwrap();
+        }
+        let err = plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap_err();
+        assert!(err.to_string().contains("more than one width"), "{err}");
     }
 }

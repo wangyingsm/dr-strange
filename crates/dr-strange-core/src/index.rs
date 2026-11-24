@@ -91,6 +91,28 @@ impl VectorIndexInfo {
     }
 }
 
+/// The width the store's own vectors already have for `(label, property)`,
+/// folded the way an index folds them — what a declaration has to agree with,
+/// read without building anything (#123).
+///
+/// A declaration cannot re-embed what is already written, so declaring a
+/// width the stored vectors contradict would only refuse every write that
+/// matches what is already indexed.
+pub fn stored_width(
+    txn: &dyn ReadTransaction,
+    plane: PlaneId,
+    label: &str,
+    property: &str,
+) -> Result<IndexWidth> {
+    let mut width = IndexWidth::Empty;
+    for id in graph::scan_label(txn, plane, label)? {
+        if let Some(v) = graph::node_vector(txn, plane, id, property)? {
+            width = width.with(v.len());
+        }
+    }
+    Ok(width)
+}
+
 /// Magic bytes prefixing a sidecar file; a cheap guard against handing a
 /// wrong/foreign file to the decoder. Followed by the postcard payload.
 const SIDECAR_MAGIC: &[u8; 4] = b"DRSH";
