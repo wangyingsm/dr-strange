@@ -1,12 +1,13 @@
-//! Property-based test for the write-time vector coercion (#112), using
-//! `proptest`.
+//! Property-based test for the write-time vector coercion (#112) and the
+//! width the index holds a write to (#123), using `proptest`.
 //!
-//! The three example tests beside the implementation show that promotion
-//! happens; what needs proving is that it happens *exactly* where it should.
-//! The oracle here is [`expected`] — the rule restated independently of the
-//! code that implements it — checked against what the store actually holds
-//! over generated values, labels and property names. A failure shrinks to the
-//! smallest value that breaks the characterization and is persisted under
+//! The example tests beside the implementation show that promotion happens
+//! and that a contradicting width is refused; what needs proving is that both
+//! happen *exactly* where they should. The oracle here is [`outcome`] — the
+//! rule restated independently of the code that implements it — checked
+//! against what the store actually holds, or refuses, over generated values,
+//! labels and property names. A failure shrinks to the smallest value that
+//! breaks the characterization and is persisted under
 //! `proptest-regressions/`.
 //!
 //! Floats are generated in a modest finite range on purpose: `f64 -> f32`
@@ -18,7 +19,9 @@
 //! the rule — wide enough to be read as an embedding, or exactly as wide as
 //! the index already is — are both exercised.
 
-use dr_strange_core::{Database, IndexWidth, Metric, NodeId, PropDesc, PropValue, Properties};
+use dr_strange_core::{
+    Database, Error, IndexWidth, Metric, NodeId, PropDesc, PropValue, Properties,
+};
 use proptest::prelude::*;
 
 /// Only `(Doc, emb)` is indexed below; `Note` and `other` are the controls.
@@ -54,6 +57,26 @@ fn value() -> impl Strategy<Value = PropValue> {
 /// own constant.
 const MIN_INFERRED_DIM: usize = 16;
 
+/// The numbers an array would become, or `None` if it is not an array of
+/// numbers — the promotable shape, independent of whether it is promoted.
+fn as_numbers(value: &PropValue) -> Option<Vec<f32>> {
+    let PropValue::List(items) = value else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            PropValue::Int(n) => out.push(*n as f32),
+            PropValue::Float(f) => out.push(*f as f32),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// The rule, stated without reference to its implementation: under a
 /// `(label, property)` some vector index names, a non-empty array of numbers
 /// becomes a vector of exactly those numbers as `f32` — if it is at least
@@ -61,28 +84,28 @@ const MIN_INFERRED_DIM: usize = 16;
 /// (`seeded`). Every other value — any other label, any other property, an
 /// empty array, an array holding anything that is not a number, a short array
 /// matching nothing — is stored as it was given.
-fn expected(label: &str, name: &str, seeded: usize, value: &PropValue) -> PropValue {
+///
+/// And whatever is stored as a vector has to be a width the index can hold:
+/// against an index already `seeded` wide, a vector of any other width is
+/// refused (`Err`) rather than stored, whether it arrived as one or was
+/// promoted into one (#123).
+fn outcome(label: &str, name: &str, seeded: usize, value: &PropValue) -> Result<PropValue, ()> {
     if !(label == "Doc" && name == "emb") {
-        return value.clone();
+        return Ok(value.clone());
     }
-    let PropValue::List(items) = value else {
-        return value.clone();
+    let stored = match (value, as_numbers(value)) {
+        // `{"$vector": [...]}` is taken at its word, whatever its width.
+        (PropValue::Vector(v), _) => PropValue::Vector(v.clone()),
+        (_, Some(n)) if n.len() >= MIN_INFERRED_DIM || n.len() == seeded => PropValue::Vector(n),
+        _ => return Ok(value.clone()),
     };
-    if items.is_empty() {
-        return value.clone();
-    }
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            PropValue::Int(n) => out.push(*n as f32),
-            PropValue::Float(f) => out.push(*f as f32),
-            _ => return value.clone(),
-        }
-    }
-    if out.len() >= MIN_INFERRED_DIM || out.len() == seeded {
-        PropValue::Vector(out)
-    } else {
-        value.clone()
+    let PropValue::Vector(v) = &stored else {
+        unreachable!("the match above stores a vector or returns");
+    };
+    match seeded {
+        0 => Ok(stored),
+        held if held == v.len() => Ok(stored),
+        _ => Err(()),
     }
 }
 
@@ -90,13 +113,13 @@ fn expected(label: &str, name: &str, seeded: usize, value: &PropValue) -> PropVa
 /// explicit vector of that width — the `{"$vector": [...]}` spelling, which
 /// is taken at its word — so the index has a width for the rule to match
 /// against. Then writes the node under test and returns what the store holds
-/// for `name`.
+/// for `name` — or the error it refused the write with.
 fn write_and_read(
     label: &str,
     name: &str,
     seeded: usize,
     value: PropValue,
-) -> (Database, NodeId, PropValue) {
+) -> Result<(Database, NodeId, PropValue), Error> {
     let db = Database::in_memory().unwrap();
     let id;
     {
@@ -117,7 +140,7 @@ fn write_and_read(
             .into_iter()
             .collect();
         let mut w = plane.write().unwrap();
-        id = w.create_node(&[label], props).unwrap();
+        id = w.create_node(&[label], props)?;
         w.commit().unwrap();
     }
     let plane = db.plane("startup").unwrap();
@@ -130,12 +153,19 @@ fn write_and_read(
         .unwrap()
         .value
         .clone();
-    (db, id, stored)
+    Ok((db, id, stored))
+}
+
+/// What a property asserts against: the stored value, or the refusal, with
+/// the database dropped so the pair is printable when it disagrees.
+fn judged(got: Result<(Database, NodeId, PropValue), Error>) -> Result<PropValue, Error> {
+    got.map(|(_db, _id, stored)| stored)
 }
 
 proptest! {
-    /// What is stored is what [`expected`] says, for every generated shape,
-    /// against an index that is empty or already a generated width wide.
+    /// What is stored — or refused — is what [`outcome`] says, for every
+    /// generated shape, against an index that is empty or already a generated
+    /// width wide.
     #[test]
     fn exactly_the_numeric_arrays_an_index_names_are_promoted(
         label in prop::sample::select(LABELS),
@@ -143,8 +173,14 @@ proptest! {
         seeded in prop::sample::select(&[0usize, 3, 8, 16, 24][..]),
         v in value(),
     ) {
-        let (_db, _id, stored) = write_and_read(label, name, seeded, v.clone());
-        prop_assert_eq!(stored, expected(label, name, seeded, &v));
+        let got = judged(write_and_read(label, name, seeded, v.clone()));
+        match (outcome(label, name, seeded, &v), &got) {
+            (Ok(want), Ok(stored)) => prop_assert_eq!(stored, &want),
+            (Err(()), Err(Error::InvalidArgument(_))) => {},
+            (want, _) => return Err(TestCaseError::fail(
+                format!("expected {want:?}, store answered {got:?}")
+            )),
+        }
     }
 
     /// An array at least the floor wide is promoted into an index that was
@@ -155,7 +191,7 @@ proptest! {
     fn a_promoted_vector_is_indexed_at_its_own_width(
         v in prop::collection::vec(number(), MIN_INFERRED_DIM..24),
     ) {
-        let (db, id, stored) = write_and_read("Doc", "emb", 0, PropValue::List(v));
+        let (db, id, stored) = write_and_read("Doc", "emb", 0, PropValue::List(v)).unwrap();
         let PropValue::Vector(vec) = stored else {
             return Err(TestCaseError::fail("a wide numeric array under (Doc, emb) must promote"));
         };
@@ -182,7 +218,7 @@ proptest! {
         len in 1usize..MIN_INFERRED_DIM,
     ) {
         let v = PropValue::List(vec![PropValue::Float(0.5); len]);
-        let (_db, _id, stored) = write_and_read("Doc", "emb", seeded, v);
+        let (_db, _id, stored) = write_and_read("Doc", "emb", seeded, v).unwrap();
         prop_assert_eq!(
             matches!(stored, PropValue::Vector(_)),
             len == seeded,
@@ -191,8 +227,9 @@ proptest! {
     }
 
     /// Coercion is a fixed point: writing back what the store holds changes
-    /// nothing. A promoted vector stays a vector, and a value left alone is
-    /// not promoted on a second pass through `set_prop`.
+    /// nothing, and is never refused — what it accepted once it accepts
+    /// again. A promoted vector stays a vector, and a value left alone is not
+    /// promoted on a second pass through `set_prop`.
     #[test]
     fn writing_back_what_is_stored_is_idempotent(
         label in prop::sample::select(LABELS),
@@ -200,7 +237,10 @@ proptest! {
         seeded in prop::sample::select(&[0usize, 3, 16][..]),
         v in value(),
     ) {
-        let (db, id, stored) = write_and_read(label, name, seeded, v);
+        // A write the store refused holds nothing to write back.
+        let Ok((db, id, stored)) = write_and_read(label, name, seeded, v) else {
+            return Ok(());
+        };
         let plane = db.plane("startup").unwrap();
         {
             let mut w = plane.write().unwrap();

@@ -358,6 +358,39 @@ pub struct VectorIndexInfo {
     pub width: IndexWidth,
 }
 
+impl VectorIndexInfo {
+    /// The width a vector written into this index has to be, when the store
+    /// knows of one. An empty index has no width yet and a mixed one has no
+    /// single width, so neither constrains a write.
+    fn required_width(&self) -> Option<usize> {
+        self.width.uniform()
+    }
+
+    /// Folds one more vector of `len` into the width this index holds — or
+    /// refuses, when the width it already holds says a vector that wide
+    /// cannot be one of its own (#123).
+    ///
+    /// Left unrefused, such a write makes the index hold two widths, and a
+    /// two-width index is what switches the query-side width refusal (#112)
+    /// off for the pair: the mistake disables the guard built to catch it.
+    fn accept(&mut self, len: usize) -> Result<()> {
+        let (label, property) = (&self.label, &self.property);
+        if let Some(held) = self.required_width()
+            && held != len
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{property} is {len}-wide but the vector index on ({label}, {property}) holds \
+                 {held}-wide vectors — a vector of a different width can never rank, so \
+                 indexing it would leave the index holding two widths and every search over it \
+                 answering less than it should. Embed with the model the index was built with, \
+                 or keep {len}-wide vectors under a property of their own."
+            )));
+        }
+        self.width = self.width.with(len);
+        Ok(())
+    }
+}
+
 /// A past point to read the graph at — the address for a time-travel (AS OF)
 /// query (ROADMAP §4). Resolved to a storage snapshot by the native backend,
 /// the only engine that keeps the history AS OF needs — hence gated to it. Both
@@ -1866,45 +1899,61 @@ impl WriteTxn<'_> {
     }
 
     /// Promotes a bare numeric array to [`PropValue::Vector`] wherever a
-    /// declared vector index names that property on one of `labels`.
+    /// declared vector index names that property on one of `labels`, and
+    /// refuses a vector whose width that index contradicts
+    /// ([`VectorIndexInfo::accept`]).
     ///
     /// A client that sends `[0.1, 0.2]` for an indexed property means an
     /// embedding; stored as a list it is indexed as nothing, and every search
     /// over it answers empty with no error to say why. Properties no index
     /// names are left exactly as given — the soft schema does not otherwise
     /// guess at a list's meaning.
-    fn coerce_declared_vectors(&self, labels: &[&str], props: &mut Properties) {
-        for i in &self.decls {
+    ///
+    /// Each accepted width folds into `decls`, this transaction's own snapshot,
+    /// so one write is internally consistent: the first vector of a batch sets
+    /// the width the rest of the batch is held to, rather than five hundred
+    /// nodes at two widths all landing and leaving the index mixed.
+    fn coerce_declared_vectors(&mut self, labels: &[&str], props: &mut Properties) -> Result<()> {
+        for i in &mut self.decls {
             if !labels.iter().any(|l| i.label == *l) {
                 continue;
             }
-            if let Some(desc) = props.get_mut(&i.property)
-                && let Some(v) = as_embedding(&desc.value, i.width)
-            {
+            let Some(desc) = props.get_mut(&i.property) else {
+                continue;
+            };
+            if let Some(v) = as_embedding(&desc.value, i.width) {
                 desc.value = PropValue::Vector(v);
             }
+            if let PropValue::Vector(v) = &desc.value {
+                i.accept(v.len())?;
+            }
         }
+        Ok(())
     }
 
     /// [`Self::coerce_declared_vectors`] for a single property, whose node's
     /// labels have to be read to know whether an index names it. Reads
-    /// nothing unless the value is a numeric array and some index names the
-    /// property.
+    /// nothing unless some index names the property and the value is a vector
+    /// already or a numeric array that may become one.
     fn coerced_prop(&mut self, id: NodeId, key: &str, mut prop: PropDesc) -> Result<PropDesc> {
-        if !self.decls.iter().any(|i| i.property == key) || numeric_array(&prop.value).is_none() {
+        let indexable =
+            matches!(prop.value, PropValue::Vector(_)) || numeric_array(&prop.value).is_some();
+        if !indexable || !self.decls.iter().any(|i| i.property == key) {
             return Ok(prop);
         }
         let plane = self.plane;
         let Some(node) = graph::get_node(self.txn(), plane, id)? else {
             return Ok(prop);
         };
-        for i in &self.decls {
-            if i.property == key
-                && node.labels.contains(&i.label)
-                && let Some(v) = as_embedding(&prop.value, i.width)
-            {
+        for i in &mut self.decls {
+            if i.property != key || !node.labels.contains(&i.label) {
+                continue;
+            }
+            if let Some(v) = as_embedding(&prop.value, i.width) {
                 prop.value = PropValue::Vector(v);
-                break;
+            }
+            if let PropValue::Vector(v) = &prop.value {
+                i.accept(v.len())?;
             }
         }
         Ok(prop)
@@ -1931,7 +1980,7 @@ impl WriteTxn<'_> {
 
     pub fn create_node(&mut self, labels: &[&str], mut props: Properties) -> Result<NodeId> {
         let plane = self.plane;
-        self.coerce_declared_vectors(labels, &mut props);
+        self.coerce_declared_vectors(labels, &mut props)?;
         self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
@@ -1953,7 +2002,7 @@ impl WriteTxn<'_> {
         mut props: Properties,
     ) -> Result<NodeId> {
         let plane = self.plane;
-        self.coerce_declared_vectors(labels, &mut props);
+        self.coerce_declared_vectors(labels, &mut props)?;
         self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
@@ -2021,7 +2070,7 @@ impl WriteTxn<'_> {
         if !self.decls.is_empty() {
             for node in &mut nodes {
                 let labels = node.labels;
-                self.coerce_declared_vectors(labels, &mut node.props);
+                self.coerce_declared_vectors(labels, &mut node.props)?;
             }
         }
         if nodes.iter().any(|n| n.props.contains_key(EXPIRES_AT)) {
@@ -4576,5 +4625,209 @@ mod vector_coercion_tests {
             .ids()
             .unwrap();
         assert_eq!(hits, vec![bulk], "the bulk-promoted vector is indexed");
+    }
+}
+
+/// The width an index holds is enforced at the write (#123). Accepting a
+/// vector the index contradicts left it holding two widths, and a two-width
+/// index is exactly what turns the query-side refusal (#112) off for that
+/// pair — so the mistake disabled the guard built to catch it.
+#[cfg(test)]
+mod vector_width_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    fn vector(len: usize) -> Properties {
+        let v = (0..len).map(|i| i as f32 / 10.0).collect();
+        [("emb".to_string(), PropDesc::new(PropValue::Vector(v)))]
+            .into_iter()
+            .collect()
+    }
+
+    fn numbers(len: usize) -> Properties {
+        let items = (0..len)
+            .map(|i| PropValue::Float(i as f64 / 10.0))
+            .collect();
+        [("emb".to_string(), PropDesc::new(PropValue::List(items)))]
+            .into_iter()
+            .collect()
+    }
+
+    /// A plane whose `(Doc, emb)` index holds 16-wide vectors.
+    fn sized_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(16)).unwrap();
+        w.commit().unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(16))
+        );
+        db
+    }
+
+    /// The message has to carry both widths and the pair: a caller who sent
+    /// the wrong embedding cannot otherwise tell which end is wrong.
+    fn assert_names_both_widths(err: Error, wrote: usize, held: usize) {
+        let msg = err.to_string();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{msg}");
+        for expected in [
+            format!("{wrote}-wide"),
+            format!("{held}-wide"),
+            "(Doc, emb)".to_string(),
+        ] {
+            assert!(msg.contains(&expected), "{expected:?} missing from {msg:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_vector_of_the_wrong_width_is_refused() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let err = {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap_err()
+        };
+        assert_names_both_widths(err, 8, 16);
+
+        // Refused, so nothing landed and the index still knows its width —
+        // the state the old behaviour destroyed.
+        assert_eq!(plane.query().scan_label("Doc").count().unwrap(), 1);
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(16))
+        );
+    }
+
+    /// Every write path that reaches an index, not only `node.create`: the
+    /// keyed create, the bulk path `digest.write` takes, and `set_prop`.
+    #[test]
+    fn every_write_path_is_refused_at_the_wrong_width() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        let mut w = plane.write().unwrap();
+
+        assert_names_both_widths(
+            w.create_node_with_key("keyed", &["Doc"], vector(8))
+                .unwrap_err(),
+            8,
+            16,
+        );
+        let Err(bulk) = w.bulk_upsert(
+            vec![BulkNode {
+                external_key: Some("bulk"),
+                labels: &["Doc"],
+                props: vector(8),
+            }],
+            Vec::new(),
+            OnConflict::Error,
+        ) else {
+            panic!("the bulk path takes the same vectors `node.create` does");
+        };
+        assert_names_both_widths(bulk, 8, 16);
+
+        let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+        let eight = PropDesc::new(PropValue::Vector((0..8).map(|i| i as f32).collect()));
+        assert_names_both_widths(w.set_prop(id, "emb", eight).unwrap_err(), 8, 16);
+    }
+
+    /// A bare array wide enough to be read as an embedding is promoted and
+    /// then refused, naming the width it was promoted to — the honest answer,
+    /// since promoting it silently is what sized the index wrong.
+    #[test]
+    fn a_promoted_array_is_refused_at_the_wrong_width() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        let mut w = plane.write().unwrap();
+
+        assert_names_both_widths(w.create_node(&["Doc"], numbers(20)).unwrap_err(), 20, 16);
+
+        // A handful of numbers never claimed to be an embedding, so it is
+        // stored as the list it is rather than refused.
+        w.create_node(&["Doc"], numbers(4)).unwrap();
+    }
+
+    /// One transaction is held to its own first width. `decls` is a snapshot
+    /// taken when the write opened, so without folding each accepted width
+    /// back into it a single batch of five hundred nodes at two widths would
+    /// still land whole and leave the index mixed.
+    #[test]
+    fn a_batch_is_held_to_the_width_of_its_first_vector() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        let mut w = plane.write().unwrap();
+        let Err(err) = w.bulk_upsert(
+            vec![
+                BulkNode {
+                    external_key: Some("a"),
+                    labels: &["Doc"],
+                    props: vector(16),
+                },
+                BulkNode {
+                    external_key: Some("b"),
+                    labels: &["Doc"],
+                    props: vector(8),
+                },
+            ],
+            Vec::new(),
+            OnConflict::Error,
+        ) else {
+            panic!("two widths in one batch is the case this folding exists for");
+        };
+        drop(w);
+        assert_names_both_widths(err, 8, 16);
+        assert_eq!(
+            plane.query().scan_all().count().unwrap(),
+            0,
+            "the batch is refused before anything is written"
+        );
+    }
+
+    /// An index that is already mixed has no one width to contradict, so it
+    /// keeps accepting: a plane written before this release is not frozen by
+    /// the new rule. Mixed is only reachable the way it is reached here —
+    /// declaring the index over data that already disagreed.
+    #[test]
+    fn an_already_mixed_index_still_accepts() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(16)).unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Mixed)
+        );
+
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(4)).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// An empty index has no width yet, so the first vector of any width sets
+    /// it rather than being refused.
+    #[test]
+    fn an_empty_index_takes_the_first_width_it_is_given() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(7)).unwrap();
+            w.commit().unwrap();
+        }
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(7))
+        );
     }
 }

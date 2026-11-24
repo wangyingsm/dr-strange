@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3516d0775a78b12dd9bbe731c4aa93625e051f62efb245d47d9a5c2a93e91a9b # shrinks to label = "Doc", name = "emb", seeded = 3, v = Vector([0.0])
+cc 110a5a6e9234d859b109727b6e4a8365450f892b64cf8941a39dc7d63d3cfe74 # shrinks to label = "Doc", name = "emb", seeded = 3, v = List([Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0), Float(0.0)])
