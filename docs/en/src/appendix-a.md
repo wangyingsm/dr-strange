@@ -16,7 +16,7 @@ a signed 64-bit value), and `NodeRef` is a node id or an external key.
 **An argument a method cannot act on reads as `-32602`, not `-32000`**, on the
 write methods as on the read ones: a vector whose width the index contradicts,
 a declared width the property's own vectors contradict, a re-declaration at a
-different metric, language or width, an unparseable `$expires_at`, and a plane
+different metric, language or width, an unparsable `$expires_at`, and a plane
 that has exhausted its label dictionary or its plane ids. Previously those
 answered `-32000`, which is the code for a condition of the store rather than
 of the call. A duplicate external key is unchanged: a conflict *is* a condition

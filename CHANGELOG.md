@@ -6,6 +6,87 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+## [2.34.0] - 2026-11-25
+
+Two more reports from the same integration, filed hours after 2.33.0 published
+and both follow-ups to it. 2.33.0 taught an index to record the width of the
+vectors it holds and to **refuse a search that width contradicts** — and then
+left the width itself unprotected. A single write of another width was accepted,
+the index reported `dim: null, mixed: true`, and from that moment the refusal
+could never fire for that pair again: a 2-wide query against what had been a
+384-wide index was answered rather than refused. Deleting the offending nodes
+did not restore the index's knowledge, and nothing in any reply said that
+re-declaring the index would. Where the stray write came *first*, the index
+recorded that width as the truth and the correct production query was what got
+refused.
+
+So the width is now something the store holds to. **A write whose width the
+index contradicts is refused**, naming both widths at the call that made the
+mistake, and the refusal holds within one batch as well as across
+transactions: the first vector of a `bulk_upsert` or a `digest.write` sets the
+width the rest must match, so a mixed batch is refused on its second node
+rather than its five-hundredth. An index may also **declare its width up
+front** — `dim` on `index.ensure`, `--dim` on the CLI — which is the only thing
+that can refuse the stray write when the stray arrives first, and which
+`plane.indexes` reports as `declared_dim` so a client can tell *384-wide and
+empty* from *empty, width unknown*. Declaring a width the property's existing
+vectors contradict is itself refused: declaring does not re-embed them, so it
+would only mean refusing every write that matches what is already indexed.
+`"mixed": true` is therefore only ever vectors that were already under the
+property when the index was declared, never a write to a declared index.
+
+The second report is about the score. A plane used as a cache has to ask *the
+nearest, if anything is near enough* — a hit below threshold is the wrong
+answer, not a worse one — and that question had no spelling, so the threshold
+had to be applied by the client against a number whose scale it could not
+discover: the `metric` **argument** decided the scale and the index's own
+declared metric never applied, so an index declared `l2` and searched with no
+`metric` scored like cosine, and the metric `plane.indexes` reported described
+nothing observable. `plane.search` now takes **`min_score`**, compared against
+the same `score` each hit carries and applied **before `k` is filled**, so a
+near-enough hit is never displaced by a nearer one that then fails the floor
+and "nothing was near enough" is answered as `[]`. And **an omitted `metric`
+now means the metric the indexes on that property were declared with**, cosine
+only where no declaration says otherwise.
+
+### Added
+
+- `dim` on `index.ensure` (`--dim` on `drsg index ensure`), the width every
+  vector in the index must be, enforced from the first write on. A snapshot
+  carries it, and a bundle written by an earlier release still restores.
+- `declared_dim` on each vector row of `plane.indexes`.
+- `min_score` on `plane.search`, and on `Source::VectorTopK`, so `plane.query`
+  inherits it and a plan serialized before this release still deserializes.
+  `plane.hybrid` deliberately has no threshold: its channels fuse *normalised*
+  scores, where a raw floor would not mean what the fused score means.
+
+### Changed
+
+- A vector write whose width the index contradicts is refused with `-32602`
+  naming both widths, where it was previously accepted — leaving the index
+  holding two widths, which is a width it cannot refuse anything against.
+- **An omitted `metric` on `plane.search` and `plane.hybrid` now means the
+  metric the candidate indexes declare**, not cosine. This changes scores and
+  ordering for a caller who omits `metric` over an index declared `dot` or
+  `l2`: the scales differ (cosine scores `1 - distance`, the other two score
+  `-distance`), and the search is index-backed rather than falling to exact
+  brute force under a metric the index cannot serve. An explicit `metric` is
+  honoured exactly as before.
+- A metric name the server does not know is refused with `-32602` on
+  `plane.search`, `plane.hybrid` and `index.ensure`, where `"nonsense"`
+  previously scored as cosine in silence — and on `index.ensure` silently
+  *declared* cosine.
+- A hit whose similarity the metric cannot produce is no longer returned. It
+  previously came back scored `null` and occupied a slot under `k`, which is
+  the exact-search path's behaviour now applied to the indexed one too.
+- **An argument a method cannot act on answers `-32602` rather than `-32000`**
+  on the write methods, matching the read side: the width refusal above, a
+  declared width the property's vectors contradict, a re-declaration at a
+  different metric, language or width, an unparsable `$expires_at`, and a
+  plane that has exhausted its label dictionary or its plane ids. A duplicate
+  external key is unchanged at `-32000`: a conflict *is* a condition of the
+  store rather than of the call.
+
 ## [2.33.0] - 2026-11-24
 
 Three reports from one integration, all of the same species: the store did
