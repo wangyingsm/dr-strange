@@ -5214,6 +5214,14 @@ mod tests {
         dr_strange_web::fetch::Route::guarded(&[])
     }
 
+    /// Runs a handler that is expected to fail and returns the error text.
+    fn cap_err(f: impl FnOnce(&mut dyn Write) -> Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf)
+            .expect_err("the handler was expected to fail")
+            .to_string()
+    }
+
     /// Runs a handler and returns its captured stdout as a String.
     fn cap(f: impl FnOnce(&mut dyn Write) -> Result<()>) -> String {
         let mut buf = Vec::new();
@@ -5796,10 +5804,39 @@ mod tests {
     /// A declared width is worth printing: the line is the only confirmation
     /// the command gives, and "ensured vector index on Paper.emb" reads the
     /// same whether the width took or not.
+    ///
+    /// The width is the fixture's own: declaring one the vectors already
+    /// there contradict is refused, so a command that printed `(16-wide)`
+    /// over 2-wide vectors would be reporting a declaration that never
+    /// happened.
     #[test]
     fn index_ensure_reports_and_enforces_a_declared_width() {
         let db = loaded();
         let out = cap(|o| {
+            index_ensure(
+                &db,
+                "startup",
+                "Paper",
+                &VectorIndexSpec {
+                    property: "emb",
+                    metric: Metric::L2,
+                    dim: Some(2),
+                },
+                o,
+            )
+        });
+        assert!(out.contains("Paper.emb (2-wide)"), "{out}");
+
+        let plane = db.plane("startup").unwrap();
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(2));
+    }
+
+    /// And the command surfaces the refusal rather than printing a width it
+    /// did not declare.
+    #[test]
+    fn index_ensure_refuses_a_width_the_vectors_contradict() {
+        let db = loaded();
+        let err = cap_err(|o| {
             index_ensure(
                 &db,
                 "startup",
@@ -5812,10 +5849,7 @@ mod tests {
                 o,
             )
         });
-        assert!(out.contains("Paper.emb (16-wide)"), "{out}");
-
-        let plane = db.plane("startup").unwrap();
-        assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
+        assert!(err.contains("already holds 2-wide vectors"), "{err}");
     }
 
     #[test]
