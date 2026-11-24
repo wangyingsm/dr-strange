@@ -2446,6 +2446,10 @@ pub struct EnsureIndex {
     /// Vector metric (default cosine).
     #[serde(default)]
     metric: Option<String>,
+    /// The width every vector in the index must be. Omitted, the first
+    /// vector written decides it.
+    #[serde(default)]
+    dim: Option<usize>,
     /// Keyword analyzer language (default english).
     #[serde(default)]
     language: Option<String>,
@@ -2455,17 +2459,28 @@ pub struct EnsureIndex {
 /// from the dashboard, so a UI need never send the user to the CLI (ROADMAP §2).
 /// `kind` selects the index type. Idempotent; errors if one already exists with
 /// different settings.
+///
+/// A vector index takes `dim`, the width every vector in it must be: a write
+/// of any other width is then refused from the first one on, rather than the
+/// first write deciding the width for every write after it (#123).
 pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: EnsureIndex = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     match req.kind.as_deref().unwrap_or("keyword") {
         "vector" => {
-            app(plane.ensure_vector_index(
-                &req.label,
-                &req.property,
-                parse_metric(req.metric.as_deref()),
-            ))?;
-            Ok(jval!({ "kind": "vector", "label": req.label, "property": req.property }))
+            let metric = parse_metric(req.metric.as_deref());
+            match req.dim {
+                Some(dim) => {
+                    app(plane.ensure_vector_index_of_width(&req.label, &req.property, metric, dim))?
+                }
+                None => app(plane.ensure_vector_index(&req.label, &req.property, metric))?,
+            }
+            Ok(jval!({
+                "kind": "vector",
+                "label": req.label,
+                "property": req.property,
+                "dim": req.dim,
+            }))
         }
         "keyword" => {
             let language: Language = req
@@ -2492,6 +2507,11 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// number when they agree, `null` when the index is empty or holds more than
 /// one width. It is what a client compares its own embeddings against —
 /// without it, a width disagreement is only visible as an empty answer.
+///
+/// `declared_dim` is the width its declaration fixed, `null` when none did
+/// (#123). The two differ where it matters: an index declared 384-wide with
+/// nothing in it yet reports `dim: null, declared_dim: 384`, which a caller
+/// cannot tell from "empty, width unknown" if only one number is reported.
 pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneIndexes = params(p)?;
     let plane = ctx.plane(&req.plane)?;
@@ -2504,6 +2524,7 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 "property": i.property,
                 "metric": metric_name(i.metric),
                 "dim": i.width.uniform(),
+                "declared_dim": i.declared,
                 "mixed": i.width == IndexWidth::Mixed,
             })
         })

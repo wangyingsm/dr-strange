@@ -1101,6 +1101,11 @@ enum IndexCmd {
         /// How similarity is measured at query time (default cosine).
         #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
         metric: MetricArg,
+        /// The width every vector in the index must be. Given, a write of
+        /// any other width is refused from the first one on; omitted, the
+        /// first vector written decides it.
+        #[arg(long)]
+        dim: Option<usize>,
     },
     /// Declare (and build) a BM25 keyword index. Two arguments
     /// (`LABEL PROPERTY`) index one label; one argument (`PROPERTY`) indexes
@@ -2240,13 +2245,19 @@ fn run_retrieval(
             second,
             plane,
             metric,
+            dim,
         }) => {
             let db = commands::open(db_path, config::retain_commits(cfg))?;
-            match second {
-                Some(property) => {
-                    commands::index_ensure(&db, &plane, &first, &property, metric.into(), out)
-                }
-                None => commands::index_ensure_all(&db, &plane, &first, metric.into(), out),
+            // One positional is the property, swept over every label that
+            // carries it; two name the label and the property.
+            let spec = commands::VectorIndexSpec {
+                property: second.as_deref().unwrap_or(&first),
+                metric: metric.into(),
+                dim,
+            };
+            match &second {
+                Some(_) => commands::index_ensure(&db, &plane, &first, &spec, out),
+                None => commands::index_ensure_all(&db, &plane, &spec, out),
             }
         }
         Command::Index(IndexCmd::Keyword {
@@ -3022,6 +3033,22 @@ mod tests {
                 assert_eq!(first, "embedding");
                 assert_eq!(second, None);
             }
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+    }
+
+    /// `--dim` is what holds the index to a width from its first write
+    /// (#123), and it has to reach the parse as a number, not a string.
+    #[test]
+    fn index_ensure_takes_a_declared_width() {
+        let with = Cli::try_parse_from(["drsg", "index", "ensure", "emb", "--dim", "384"]).unwrap();
+        match with.command {
+            Command::Index(IndexCmd::Ensure { dim, .. }) => assert_eq!(dim, Some(384)),
+            _ => panic!("should parse as Index(Ensure)"),
+        }
+        let without = Cli::try_parse_from(["drsg", "index", "ensure", "emb"]).unwrap();
+        match without.command {
+            Command::Index(IndexCmd::Ensure { dim, .. }) => assert_eq!(dim, None),
             _ => panic!("should parse as Index(Ensure)"),
         }
     }

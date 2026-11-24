@@ -1516,6 +1516,72 @@ mod tests {
         // The width a client compares its own embeddings against (#112).
         assert_eq!(r["vector"][0]["dim"], 2);
         assert_eq!(r["vector"][0]["mixed"], false);
+        // Nothing declared this one's width; the first write set it.
+        assert!(r["vector"][0]["declared_dim"].is_null(), "{r}");
+    }
+
+    /// `index.ensure` takes the width, and the two numbers it reports back
+    /// are not the same question: an index declared 384-wide with nothing in
+    /// it holds no width yet, which is exactly the state a caller could not
+    /// see before (#123).
+    #[test]
+    fn index_ensure_declares_a_width_and_holds_writes_to_it() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb","metric":"l2","dim":384},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["dim"], 384, "{resp}");
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":2}"#,
+        )
+        .unwrap();
+        let idx = &resp["result"]["vector"][0];
+        assert_eq!(idx["declared_dim"], 384, "{idx}");
+        assert!(idx["dim"].is_null(), "nothing is in it yet: {idx}");
+
+        // And the declaration is what the write is held to, from the first.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":3}"#,
+        )
+        .unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("2-wide"), "{resp}");
+        assert!(msg.contains("declared 384-wide"), "{resp}");
+    }
+
+    /// A caller that omits `dim` is every caller written before this release:
+    /// the index is declared with no width and the first write still decides
+    /// it, so the new parameter changes nothing until it is sent.
+    #[test]
+    fn index_ensure_without_a_width_declares_none() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb"},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"]["dim"].is_null(), "{resp}");
+
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":2}"#,
+        )
+        .unwrap();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":3}"#,
+        )
+        .unwrap();
+        let idx = &resp["result"]["vector"][0];
+        assert_eq!(idx["dim"], 2, "{idx}");
+        assert!(idx["declared_dim"].is_null(), "{idx}");
     }
 
     /// A parameter the server does not know is a mistake, not a default: it
