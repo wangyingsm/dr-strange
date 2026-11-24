@@ -20,7 +20,7 @@ use ahash::AHashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cache::GraphReader;
+use crate::cache::{GraphReader, VectorQuery};
 use crate::error::{Error, Result};
 use crate::storage::vector::Metric;
 use crate::types::{Dir, NodeId};
@@ -114,8 +114,17 @@ pub fn run<R: GraphReader + ?Sized>(reader: &R, spec: &HybridSpec) -> Result<Vec
 
     let vector = match &spec.vector {
         Some(v) => {
-            let hits =
-                reader.vector_search(label, &v.property, &v.query, v.metric, spec.candidates)?;
+            // No threshold here: the channels fuse *normalised* scores, so a
+            // raw floor would mean something different from the number this
+            // query returns (#124 reserves the spelling for `plane.search`).
+            let hits = reader.vector_search(&VectorQuery {
+                label,
+                property: &v.property,
+                query: &v.query,
+                metric: v.metric,
+                k: spec.candidates,
+                min_score: None,
+            })?;
             Some(Channel {
                 hits: hits
                     .into_iter()

@@ -1734,6 +1734,44 @@ mod tests {
         assert!(resp["result"].is_array(), "{resp}");
     }
 
+    /// `min_score` over the wire: the cache's question answered as `[]`
+    /// rather than as a far hit it would have to re-filter against a scale
+    /// the reply never states (#124).
+    #[test]
+    fn plane_search_thresholds_at_min_score() {
+        let db = plane_with_embedding(2, true);
+
+        // The one node is [0.5, 0.5]; an orthogonal query cannot clear a
+        // floor of 0.5 under the default cosine scale.
+        let refused = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[1.0,-1.0],"k":1,"min_score":0.5},"id":1}"#,
+        )
+        .unwrap();
+        assert!(refused["error"].is_null(), "{refused}");
+        assert_eq!(
+            refused["result"].as_array().map(Vec::len),
+            Some(0),
+            "nothing was near enough: {refused}"
+        );
+
+        // The same query without the floor answers the far hit, as before.
+        let answered = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[1.0,-1.0],"k":1},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(answered["result"].as_array().map(Vec::len), Some(1));
+
+        // And a floor the hit clears keeps it.
+        let kept = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"k":1,"min_score":0.9},"id":3}"#,
+        )
+        .unwrap();
+        assert_eq!(kept["result"].as_array().map(Vec::len), Some(1), "{kept}");
+    }
+
     /// A declared index with nothing in it holds no width either, so a query
     /// of any width proceeds.
     #[test]

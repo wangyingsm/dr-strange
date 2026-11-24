@@ -39,12 +39,19 @@ pub enum Source {
     /// Global similarity search: the `k` nodes (optionally restricted to
     /// `label`) whose `property` vector is closest to `query` under `metric`.
     /// Seed rows carry their similarity in the score channel (arch/03 §4.1).
+    ///
+    /// `min_score` drops anything scoring below it before `k` is filled, so
+    /// "the nearest, if anything is near enough" is a question the store can
+    /// answer (#124). Absent in a plan written before it existed, and left
+    /// out of the serialized form when unset, so old plans still round-trip.
     VectorTopK {
         label: Option<String>,
         property: String,
         query: Vec<f32>,
         metric: Metric,
         k: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_score: Option<f32>,
     },
     /// BM25 keyword search (ROADMAP §2): the `k` nodes whose `property` best
     /// matches the text `query`, most-relevant first, each seeded with its BM25
@@ -365,6 +372,7 @@ mod tests {
                 query: vec![0.1, 0.2, 0.3],
                 metric: Metric::Cosine,
                 k: 25,
+                min_score: None,
             },
             steps: vec![
                 Step::Expand {

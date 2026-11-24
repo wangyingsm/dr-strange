@@ -588,6 +588,9 @@ fn compile_source(
             query: resolve(query, embedder)?,
             metric: *metric,
             k: *k,
+            // The dialect has no clause for a score floor yet, so a Cypher
+            // SEARCH asks for the `k` nearest, as it always has.
+            min_score: None,
         },
         SourceKind::Keyword { property, query, k } => Source::KeywordTopK {
             // BM25 indexes are declared per `(label, property)`, so unlike a

@@ -1257,6 +1257,11 @@ pub struct Search {
     k: Option<u64>,
     #[serde(default)]
     metric: Option<String>,
+    /// Answer only with hits scoring at least this much, on the same scale
+    /// as the `score` each hit carries. Omitted, the `k` nearest are
+    /// answered whatever their score.
+    #[serde(default)]
+    min_score: Option<f32>,
 }
 
 /// Refuses a query whose width the declared indexes contradict: nothing of a
@@ -1314,20 +1319,28 @@ fn check_query_width(
 ///
 /// Refuses a query whose width no index on `property` holds (see
 /// [`check_query_width`]) rather than answering empty.
+///
+/// `min_score` asks for "the nearest, if anything is near enough" — a cache's
+/// own question, where a hit below threshold is the wrong answer rather than
+/// a worse one (#124). It is compared against the `score` each hit carries,
+/// and applied before `k` is filled, so the store answers `[]` rather than
+/// handing back a page the caller has to re-filter against a scale it cannot
+/// discover.
 pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     check_query_width(&plane, req.label.as_deref(), &req.property, req.query.len())?;
-    let hits = app(plane
-        .query()
-        .vector_top_k(
-            req.label.as_deref(),
-            &req.property,
-            req.query,
-            parse_metric(req.metric.as_deref()),
-            req.k.unwrap_or(10),
-        )
-        .scored_nodes())?;
+    let mut q = plane.query().vector_top_k(
+        req.label.as_deref(),
+        &req.property,
+        req.query,
+        parse_metric(req.metric.as_deref()),
+        req.k.unwrap_or(10),
+    );
+    if let Some(floor) = req.min_score {
+        q = q.min_score(floor);
+    }
+    let hits = app(q.scored_nodes())?;
     Ok(scored_rows(&hits))
 }
 

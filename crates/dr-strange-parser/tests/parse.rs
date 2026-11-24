@@ -639,6 +639,7 @@ fn search_compiles_to_vector_topk() {
                 query: vec![1.0, 0.0, -0.5],
                 metric: Metric::Cosine,
                 k: 5,
+                min_score: None,
             },
             steps: vec![],
             project: None,
@@ -657,6 +658,7 @@ fn search_defaults_metric_cosine_topk_10_and_no_label() {
                 query: vec![1.0],
                 metric: Metric::Cosine,
                 k: 10,
+                min_score: None,
             },
             steps: vec![],
             project: None,
@@ -678,6 +680,7 @@ fn search_with_where_and_order_by_score() {
             query: vec![1.0, 0.0],
             metric: Metric::Cosine,
             k: 20,
+            min_score: None,
         }
     );
     assert_eq!(
@@ -774,6 +777,7 @@ fn search_by_text_embeds_via_the_embedder() {
             query: vec![2.0, 'h' as u32 as f32],
             metric: Metric::Cosine,
             k: 5,
+            min_score: None,
         }
     );
 }
@@ -871,6 +875,7 @@ fn beam_embeds_text_and_composes_after_search() {
             query: vec![1.0, 0.0],
             metric: Metric::Cosine,
             k: 5,
+            min_score: None,
         }
     );
     assert_eq!(
@@ -1216,6 +1221,7 @@ fn vector_search_chains_a_typed_hop_too() {
                 query: vec![1.0, 2.0],
                 metric: Metric::Cosine,
                 k: 3,
+                min_score: None,
             },
             steps: vec![Step::Expand {
                 dir: Dir::Out,
@@ -1538,6 +1544,7 @@ fn near_defaults_the_property_to_embedding() {
             query: vec![1.0],
             metric: Metric::Cosine,
             k: 10,
+            min_score: None,
         }
     );
 }

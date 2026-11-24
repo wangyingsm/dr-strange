@@ -20,7 +20,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::cache::GraphReader;
+use crate::cache::{GraphReader, VectorQuery};
 use crate::compute::expr::{self, BindingNeed, Expr};
 use crate::compute::plan::{
     Agg, AggFunc, Algo, LogicalPlan, NodeRef, ProjExpr, ProjItem, Projection, SortKey, Source,
@@ -355,12 +355,19 @@ fn source_rows(reader: &dyn GraphReader, source: &Source) -> Result<Vec<Row>> {
             query,
             metric,
             k,
+            min_score,
         } => {
             // Global similarity search — index-accelerated when a matching
             // index is declared, exact brute force otherwise. The reader
             // decides (arch/01 §5); either way the result is `(id, distance)`.
-            let hits =
-                reader.vector_search(label.as_deref(), property, query, *metric, clamp(*k))?;
+            let hits = reader.vector_search(&VectorQuery {
+                label: label.as_deref(),
+                property,
+                query,
+                metric: *metric,
+                k: clamp(*k),
+                min_score: *min_score,
+            })?;
             return Ok(hits
                 .into_iter()
                 .map(|hit| {

@@ -2883,7 +2883,22 @@ impl<'db> QueryBuilder<'db> {
             query: query.into(),
             metric,
             k,
+            min_score: None,
         };
+        self
+    }
+
+    /// Answer with a hit only when it scores at least `floor` (#124).
+    ///
+    /// The threshold is read on the same scale as the score the query
+    /// returns, and the drop happens before `k` is filled, so a near-enough
+    /// hit is never displaced by a nearer one that then fails the floor.
+    /// Applies to a [`vector_top_k`](Self::vector_top_k) source; on any other
+    /// source it is ignored, since there is no such scale to compare on.
+    pub fn min_score(mut self, floor: f32) -> Self {
+        if let Source::VectorTopK { min_score, .. } = &mut self.plan.source {
+            *min_score = Some(floor);
+        }
         self
     }
 
@@ -5141,5 +5156,88 @@ mod vector_score_tests {
             .unwrap();
         assert_eq!(scored.len(), 1);
         assert!(scored[0].1.is_some_and(f32::is_finite));
+    }
+
+    /// The cache's own question: the nearest, *if* anything is near enough.
+    /// At `k = 1` over a plane holding only a far hit, the honest answer is
+    /// nothing — not the far hit, which a cache would then serve as though it
+    /// were a match (#124).
+    #[test]
+    fn a_threshold_answers_nothing_rather_than_the_far_hit() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("far", &["Doc"], emb(&[1.0, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane
+            .ensure_vector_index("Doc", "emb", Metric::Cosine)
+            .unwrap();
+
+        let query = vec![0.0, 1.0];
+        // Orthogonal under cosine: similarity 0, which the floor excludes.
+        let kept = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", query.clone(), Metric::Cosine, 1)
+            .min_score(0.5)
+            .ids()
+            .unwrap();
+        assert!(kept.is_empty(), "nothing was near enough: {kept:?}");
+
+        // Without the floor the same query answers the far hit, as before.
+        let unfiltered = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", query, Metric::Cosine, 1)
+            .ids()
+            .unwrap();
+        assert_eq!(unfiltered.len(), 1);
+    }
+
+    /// The threshold is applied before `k` is filled: a near-enough hit is
+    /// not displaced out of the window by a nearer one that then fails it.
+    /// Asking for one of two, where the nearest is excluded, answers the
+    /// other — not an empty page.
+    #[test]
+    fn a_near_enough_hit_is_not_displaced_by_one_that_fails_the_floor() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            // Under L2, similarity falls with distance: 0.0 is nearest.
+            w.create_node_with_key("nearest", &["Doc"], emb(&[0.0, 0.0]))
+                .unwrap();
+            w.create_node_with_key("next", &["Doc"], emb(&[0.5, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 2)
+            .scored_nodes()
+            .unwrap();
+        let floor = scored[0].1.unwrap();
+        // A floor just above the nearest hit's own score excludes it alone.
+        let kept = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.5, 0.0], Metric::L2, 1)
+            .min_score(floor)
+            .ids()
+            .unwrap();
+        let keys: Vec<String> = kept
+            .iter()
+            .map(|id| {
+                plane
+                    .node(*id)
+                    .unwrap()
+                    .unwrap()
+                    .external_key
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(keys, vec!["next".to_string()], "the exact match survives");
     }
 }
