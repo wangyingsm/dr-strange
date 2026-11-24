@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: wangyingsm/dr-strange/ci/github@v2.32.0
+      - uses: wangyingsm/dr-strange/ci/github@v2.33.0
         with:
           plugins: rust         # only the languages this repository holds
 ```
@@ -61,7 +61,7 @@ and leaves the job green; the report is in the job summary either way.
 
 ```yaml
 include:
-  - remote: 'https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.32.0/ci/gitlab/drsg-impact.yml'
+  - remote: 'https://raw.githubusercontent.com/wangyingsm/dr-strange/v2.33.0/ci/gitlab/drsg-impact.yml'
 
 drsg-impact:
   variables:

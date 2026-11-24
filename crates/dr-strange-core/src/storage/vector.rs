@@ -378,6 +378,39 @@ impl IdFilter for std::collections::HashSet<u64> {
     }
 }
 
+/// The vector width an index holds. Mixed widths are legal here — the metric
+/// is total over them (see [`Metric::distance`]) — so this reports what is
+/// stored rather than constraining what may be: `Uniform` is the only case in
+/// which a query of a different width is certainly wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexWidth {
+    /// Nothing indexed yet, so no width to disagree with.
+    Empty,
+    /// Every indexed vector is this wide.
+    Uniform(usize),
+    /// Two or more widths are present.
+    Mixed,
+}
+
+impl IndexWidth {
+    /// Folds one more vector's width in.
+    pub fn with(self, len: usize) -> Self {
+        match self {
+            Self::Empty => Self::Uniform(len),
+            Self::Uniform(d) if d == len => self,
+            Self::Uniform(_) | Self::Mixed => Self::Mixed,
+        }
+    }
+
+    /// The width every vector shares, if they share one.
+    pub fn uniform(self) -> Option<usize> {
+        match self {
+            Self::Uniform(d) => Some(d),
+            Self::Empty | Self::Mixed => None,
+        }
+    }
+}
+
 /// A vector search accelerator over a set of `(id, vector)` pairs.
 pub trait VectorIndex {
     fn insert(&mut self, id: u64, vector: &[f32]) -> Result<()>;

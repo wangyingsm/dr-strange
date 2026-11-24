@@ -197,6 +197,18 @@ pub fn write_commit_time(txn: &mut dyn WriteTransaction, millis: i64) -> Result<
     txn.put(TableId::Meta, keys::META_COMMIT_TIME, &millis.to_be_bytes())
 }
 
+/// Notes that this plane holds, or has held, a node with an expiry — see
+/// [`keys::expiry_key`]. Idempotent, one meta write.
+pub fn mark_expiry_used(txn: &mut dyn WriteTransaction, plane: PlaneId) -> Result<()> {
+    txn.put(TableId::Meta, &keys::expiry_key(plane), &[1])
+}
+
+/// Whether any node with an expiry has ever been written to this plane. False
+/// means no read of it need consider expiry at all.
+pub fn expiry_used(txn: &dyn ReadTransaction, plane: PlaneId) -> Result<bool> {
+    Ok(txn.get(TableId::Meta, &keys::expiry_key(plane))?.is_some())
+}
+
 /// Allocates the next id from a meta counter, one meta write per call. Used
 /// for planes/labels/edge-types, which are created rarely — no need for
 /// [`IdAllocator`]'s batching there. `pub(super)` for node/edge creation.

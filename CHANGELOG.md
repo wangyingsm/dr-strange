@@ -6,6 +6,77 @@ All notable changes to Dr Strange are documented here. The format is based on
 
 ## [Unreleased]
 
+## [2.33.0] - 2026-11-24
+
+Three reports from one integration, all of the same species: the store did
+something defensible and said nothing, so the caller could not tell a mistake
+from a cold cache. Sixteen thousand vectors were written and every search
+answered zero hits, with no error from any call; five hundred nodes landed
+under `Entity` because `digest.write` spelled a label `label` where
+`node.create` spells it `labels`; and a plane used as a cache had no way to
+expire an entry, so a stale answer outranked the live ones.
+
+None of it is a new feature so much as the store finally saying what it knows.
+An index now records the width of the vectors it holds, reports it as `dim`,
+and **refuses a search that width contradicts** — naming both widths, at the
+call that made the mistake, rather than ranking the mismatch at infinity and
+answering an empty list. The engine itself stays total: a distance between
+vectors of different widths is still `+∞`, and the brute-force path a plane
+with no declared index takes still answers nothing rather than erroring,
+because there the width is genuinely unknown. The refusal is only ever made
+where the index can contradict the query.
+
+The write side gets the same treatment. A **bare array of numbers is promoted
+to a vector** where a declared index names that property, so a client that
+sends `[0.1, 0.2, …]` instead of `{"$vector": […]}` lands something
+searchable; promotion asks the array to be plausible as an embedding — at least
+16 numbers, or exactly the index's own width — so a handful of scores is still
+stored as the list it is. And **a parameter a method does not define is now
+refused by name** instead of ignored, with one documented exception: the five
+methods that flatten the time-travel parameters cannot have both in serde.
+
+Node expiry is the third. A node may carry `$expires_at`, an absolute
+epoch-millisecond instant, as an ordinary reserved property — no new RPC
+parameter, no SDK signature change — and past that instant it is invisible to
+every read: both search channels, `plane.query`, Cypher, `node.get`, neighbour
+expansion, the agent verbs, and a time-travelling read of any of them. Nothing
+sweeps the plane and no write marks the node, so a follower hides the same
+nodes without performing a write of its own. Two details carry the design: the
+exclusion happens **before `k`**, so an expired nearest neighbour does not
+consume the slot a live one wanted; and a plane that has never been written an
+expiry pays nothing for the mechanism, because a per-plane flag decides it in
+one read. Expiry hides a node, it does not free its external key — rewriting
+that key with `on_conflict: update` lands on the same row, edges intact, and
+resets the expiry, which is what a cache refreshing an entry wants.
+
+### Added
+
+- `$expires_at`, a reserved node property holding an absolute epoch-millisecond
+  expiry. Absolute and node-scoped: no sliding window, no touch-on-read, no
+  expiry on edges.
+- `dim` on each vector row of `plane.indexes`, with `"mixed": true` where one
+  index holds vectors of differing widths.
+- `labels` and `extra_labels` on `digest.write`'s nodes, unioned with `label`,
+  so a `digest.run` proposal keeps the labels it was reviewed with — and
+  `digest.run`'s own reply now carries a `labels` array per node, which is the
+  half of the round trip that was dropping them.
+- `digest.write`'s per-node and per-edge shapes are spelled out in
+  `openrpc.json`, which gives the generated Go, Java and TypeScript SDKs typed
+  parameters where they took an untyped object list before.
+
+### Changed
+
+- A vector search whose width the declared index contradicts is refused with
+  `-32602` naming both widths, where it previously answered an empty list or a
+  null-scored hit.
+- The RPC parameter structs reject unknown fields. A caller that was sending a
+  field no method defines — a misspelling, or a parameter from a newer release
+  — now gets `-32602` instead of silence.
+- **Source-breaking for SDK callers of `digest.write`**: the Go, Java and
+  TypeScript signatures now take typed node and edge structures rather than an
+  untyped list. The wire format is unchanged, so a hand-written JSON-RPC client
+  is unaffected.
+
 ## [2.32.0] - 2026-11-18
 
 Who calls whom, from the traces rather than from a file. `drsg ops traces
@@ -3439,7 +3510,8 @@ dashboard, and a WebSocket change feed.
   <https://wangyingsm.github.io/dr-strange/>.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.32.0...HEAD
+[Unreleased]: https://github.com/wangyingsm/dr-strange/compare/v2.33.0...HEAD
+[2.33.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.33.0
 [2.32.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.32.0
 [2.31.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.31.0
 [2.30.0]: https://github.com/wangyingsm/dr-strange/releases/tag/v2.30.0

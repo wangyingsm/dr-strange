@@ -26,7 +26,7 @@ mod store;
 pub(crate) use store::GraphCache;
 
 use ahash::AHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -148,6 +148,31 @@ fn indexed_or_brute<R: GraphReader + ?Sized>(
     brute_force_search(reader, label, property, query, metric, k)
 }
 
+/// Ranks with `search`, then drops what the reader cannot see, keeping `k`.
+///
+/// `search(n)` is asked for ever more candidates while the survivors are
+/// short and it still has more to give, so an expired node cannot take a slot
+/// from a live one — exclusion before `k`, not after (#114). Without expiry in
+/// play this is one call for exactly `k`, as it always was.
+fn ranked_live<T>(
+    k: usize,
+    overfetch: bool,
+    mut search: impl FnMut(usize) -> Result<Vec<T>>,
+    mut keep: impl FnMut(Vec<T>) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let mut want = k;
+    loop {
+        let candidates = search(want)?;
+        let exhausted = candidates.len() < want;
+        let mut live = keep(candidates)?;
+        if live.len() >= k || !overfetch || exhausted {
+            live.truncate(k);
+            return Ok(live);
+        }
+        want = want.saturating_mul(EXPIRY_OVERFETCH);
+    }
+}
+
 /// Keep only the hits whose node this reader's snapshot can see — present,
 /// and carrying `label` when one was asked for (arch/02 §3).
 ///
@@ -179,6 +204,85 @@ fn visible_hits<R: GraphReader + ?Sized, T>(
     }
     Ok(out)
 }
+
+/// How a reader applies node expiry (`$expires_at`, ROADMAP §4): whether this
+/// plane has ever held an expiring node, and the instant every read of this
+/// reader is judged against.
+///
+/// Both are decided once, lazily, and then fixed for the reader's life. Once
+/// because the flag is a KV read and the clock is a syscall; fixed because a
+/// query that re-read the clock could see a node in one step of a plan and
+/// not the next, which no plan is written to survive.
+struct Expiry {
+    /// `None` until the plane's flag has been read.
+    used: Cell<Option<bool>>,
+    /// `None` until the clock has been read.
+    now: Cell<Option<i64>>,
+}
+
+impl Expiry {
+    fn new() -> Self {
+        Self {
+            used: Cell::new(None),
+            now: Cell::new(None),
+        }
+    }
+
+    /// Whether this reader must filter at all. A plane that has never been
+    /// written an expiry answers `false` here and pays nothing further.
+    fn used(&self, txn: &dyn ReadTransaction, plane: PlaneId) -> Result<bool> {
+        if let Some(known) = self.used.get() {
+            return Ok(known);
+        }
+        let used = graph::expiry_used(txn, plane)?;
+        self.used.set(Some(used));
+        Ok(used)
+    }
+
+    /// This reader's instant, read once.
+    fn now(&self) -> i64 {
+        match self.now.get() {
+            Some(now) => now,
+            None => {
+                let now = crate::api::now_millis();
+                self.now.set(Some(now));
+                now
+            }
+        }
+    }
+
+    /// Whether `node` is hidden from this reader.
+    fn hides(&self, node: &NodeRecord) -> bool {
+        node.expired_at(self.now())
+    }
+}
+
+/// Keeps only the ids whose node this reader can still see — the scan-side
+/// counterpart of the `node()` filter.
+///
+/// Reading a record per id is why [`Expiry::used`] is checked first: a plane
+/// with no expiry never reaches this. One that has it pays a record read per
+/// scanned id, which the reader's own caches then serve to the executor
+/// decoding the same nodes next.
+fn live_ids<R: GraphReader + ?Sized>(reader: &R, ids: Vec<NodeId>) -> Result<Vec<NodeId>> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if reader.node(id)?.is_some() {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// How much wider than `k` to search when expired nodes may be in the index.
+///
+/// Expiry is applied after the index ranks, so asking for exactly `k` can
+/// answer fewer — the issue's complaint is the opposite case, an expired node
+/// taking the one slot a live one wanted, so the fix must be to exclude
+/// *before* `k` is decided. Over-fetching is how: ask for more, drop the
+/// expired, keep the first `k`. Doubling each round rather than guessing at a
+/// multiplier, and stopping when the index runs out of candidates.
+const EXPIRY_OVERFETCH: usize = 4;
 
 /// Exact BM25 over the reader's own snapshot — the keyword counterpart of
 /// [`brute_force_search`]: the fallback when the live registry cannot answer
@@ -226,6 +330,8 @@ pub struct UncachedReader<'a> {
     /// Declared vector indexes (a read-locked view for the query's lifetime).
     /// `None` ⇒ every vector search takes the exact brute-force path.
     registry: Option<&'a VectorRegistry>,
+    /// Node-expiry state for this reader (see [`Expiry`]).
+    expiry: Expiry,
 }
 
 impl<'a> UncachedReader<'a> {
@@ -234,6 +340,7 @@ impl<'a> UncachedReader<'a> {
             txn,
             plane,
             registry: None,
+            expiry: Expiry::new(),
         }
     }
 
@@ -247,6 +354,7 @@ impl<'a> UncachedReader<'a> {
             txn,
             plane,
             registry: Some(registry),
+            expiry: Expiry::new(),
         }
     }
 }
@@ -257,7 +365,10 @@ impl GraphReader for UncachedReader<'_> {
     }
 
     fn node(&self, id: NodeId) -> Result<Option<Arc<NodeRecord>>> {
-        Ok(graph::get_node(self.txn, self.plane, id)?.map(Arc::new))
+        match graph::get_node(self.txn, self.plane, id)? {
+            Some(n) if self.expiry.used(self.txn, self.plane)? && self.expiry.hides(&n) => Ok(None),
+            other => Ok(other.map(Arc::new)),
+        }
     }
 
     fn edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
@@ -269,15 +380,30 @@ impl GraphReader for UncachedReader<'_> {
     }
 
     fn scan_all(&self) -> Result<Vec<NodeId>> {
-        graph::scan_all(self.txn, self.plane)
+        let ids = graph::scan_all(self.txn, self.plane)?;
+        if self.expiry.used(self.txn, self.plane)? {
+            return live_ids(self, ids);
+        }
+        Ok(ids)
     }
 
     fn scan_label(&self, label: &str) -> Result<Vec<NodeId>> {
-        graph::scan_label(self.txn, self.plane, label)
+        let ids = graph::scan_label(self.txn, self.plane, label)?;
+        if self.expiry.used(self.txn, self.plane)? {
+            return live_ids(self, ids);
+        }
+        Ok(ids)
     }
 
     fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>> {
-        graph::node_id_by_external_key(self.txn, self.plane, key)
+        let found = graph::node_id_by_external_key(self.txn, self.plane, key)?;
+        // The key stays owned by the expired node until something reclaims
+        // it, so this hides the id a *read* resolves to; a write still sees
+        // the row it has to overwrite (arch/01 §2).
+        match found {
+            Some(id) if self.expiry.used(self.txn, self.plane)? => Ok(self.node(id)?.map(|n| n.id)),
+            other => Ok(other),
+        }
     }
 
     fn vector_search(
@@ -288,17 +414,24 @@ impl GraphReader for UncachedReader<'_> {
         metric: Metric,
         k: usize,
     ) -> Result<Vec<Hit>> {
-        let hits = indexed_or_brute(
-            self,
-            self.registry,
-            self.plane,
-            label,
-            property,
-            query,
-            metric,
+        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        ranked_live(
             k,
-        )?;
-        visible_hits(self, hits, label, |hit| NodeId(hit.id))
+            overfetch,
+            |want| {
+                indexed_or_brute(
+                    self,
+                    self.registry,
+                    self.plane,
+                    label,
+                    property,
+                    query,
+                    metric,
+                    want,
+                )
+            },
+            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+        )
     }
 
     fn keyword_search(
@@ -310,7 +443,15 @@ impl GraphReader for UncachedReader<'_> {
     ) -> Result<Vec<(NodeId, f32)>> {
         // No live registry here, by design: the oracle computes BM25 from the
         // snapshot alone, so the indexed reader has something exact to match.
-        snapshot_keyword_search(self.txn, self.plane, None, label, property, query, k)
+        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        ranked_live(
+            k,
+            overfetch,
+            |want| {
+                snapshot_keyword_search(self.txn, self.plane, None, label, property, query, want)
+            },
+            |hits| visible_hits(self, hits, Some(label), |hit| hit.0),
+        )
     }
 }
 
@@ -357,6 +498,8 @@ pub struct CachedReader<'a> {
     nodes: RefCell<AHashMap<NodeId, Option<Arc<NodeRecord>>>>,
     edges: RefCell<AHashMap<EdgeId, Option<Arc<EdgeRecord>>>>,
     adjacency: RefCell<AHashMap<AdjKey, Arc<[Neighbor]>>>,
+    /// Node-expiry state for this reader (see [`Expiry`]).
+    expiry: Expiry,
 }
 
 impl<'a> CachedReader<'a> {
@@ -449,6 +592,7 @@ impl<'a> CachedReader<'a> {
             nodes: RefCell::new(AHashMap::new()),
             edges: RefCell::new(AHashMap::new()),
             adjacency: RefCell::new(AHashMap::new()),
+            expiry: Expiry::new(),
         }
     }
 }
@@ -459,6 +603,138 @@ impl GraphReader for CachedReader<'_> {
     }
 
     fn node(&self, id: NodeId) -> Result<Option<Arc<NodeRecord>>> {
+        // Expiry is applied to what the caches hand back, never written into
+        // them: the L2 outlives this query, and `now` will have moved on by
+        // the next one. The record stays whole and the judgement is this
+        // reader's (see [`Expiry`]).
+        match self.cached_node(id)? {
+            Some(n) if self.expiry.used(self.txn, self.plane)? && self.expiry.hides(&n) => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    fn edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
+        self.cached_edge(id)
+    }
+
+    fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Arc<[Neighbor]>> {
+        let all = self.cached_neighbors(id, dir, ty)?;
+        if !self.expiry.used(self.txn, self.plane)? {
+            return Ok(all);
+        }
+        // An edge to an expired node is an edge to nothing a read can see.
+        let mut live: Vec<Neighbor> = Vec::with_capacity(all.len());
+        for n in all.iter() {
+            if self.node(n.node)?.is_some() {
+                live.push(*n);
+            }
+        }
+        Ok(live.into())
+    }
+
+    fn scan_all(&self) -> Result<Vec<NodeId>> {
+        let ids = graph::scan_all(self.txn, self.plane)?;
+        if self.expiry.used(self.txn, self.plane)? {
+            return live_ids(self, ids);
+        }
+        Ok(ids)
+    }
+
+    fn scan_label(&self, label: &str) -> Result<Vec<NodeId>> {
+        let ids = graph::scan_label(self.txn, self.plane, label)?;
+        if self.expiry.used(self.txn, self.plane)? {
+            return live_ids(self, ids);
+        }
+        Ok(ids)
+    }
+
+    fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>> {
+        let found = graph::node_id_by_external_key(self.txn, self.plane, key)?;
+        match found {
+            Some(id) if self.expiry.used(self.txn, self.plane)? => Ok(self.node(id)?.map(|n| n.id)),
+            other => Ok(other),
+        }
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        metric: Metric,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
+        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        ranked_live(
+            k,
+            overfetch,
+            |want| {
+                indexed_or_brute(
+                    self,
+                    self.registry,
+                    self.plane,
+                    label,
+                    property,
+                    query,
+                    metric,
+                    want,
+                )
+            },
+            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+        )
+    }
+
+    fn keyword_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        // A pinned past snapshot is not what the live postings describe — a
+        // node re-texted since would match and score on its latest text, one
+        // deleted or relabelled since would be missing — so a historical read
+        // computes BM25 from the snapshot, as vector search brute-forces it.
+        // A live read asks for exactly `k` unless this plane expires nodes:
+        // the only other ids the filter can drop are the skew window's, and a
+        // short page there is the honest answer. An expired node taking a
+        // slot is not — see [`ranked_live`].
+        let overfetch = self.expiry.used(self.txn, self.plane)?;
+        let historical = self.historical;
+        ranked_live(
+            k,
+            overfetch,
+            |want| {
+                if historical {
+                    // A pinned past snapshot is not what the live postings
+                    // describe — a node re-texted since would match and score
+                    // on its latest text, one deleted or relabelled since
+                    // would be missing — so a historical read computes BM25
+                    // from the snapshot, as vector search brute-forces it.
+                    return snapshot_keyword_search(
+                        self.txn,
+                        self.plane,
+                        self.keywords,
+                        label,
+                        property,
+                        query,
+                        want,
+                    );
+                }
+                Ok(self
+                    .keywords
+                    .and_then(|reg| reg.search(self.plane, label, property, query, want))
+                    .unwrap_or_default())
+            },
+            |hits| visible_hits(self, hits, Some(label), |hit| hit.0),
+        )
+    }
+}
+
+impl CachedReader<'_> {
+    /// The cached record read — L1, then L2, then storage — with no expiry
+    /// applied. [`GraphReader::node`] wraps it.
+    fn cached_node(&self, id: NodeId) -> Result<Option<Arc<NodeRecord>>> {
         if let Some(v) = self.nodes.borrow().get(&id) {
             return Ok(v.clone()); // L1 (per-query), including a cached miss
         }
@@ -478,7 +754,10 @@ impl GraphReader for CachedReader<'_> {
         Ok(v)
     }
 
-    fn edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
+    /// As [`Self::cached_node`], for edges. Edges carry no expiry of their
+    /// own (#114 is about nodes); one whose endpoint expired is unreachable
+    /// through `neighbors`, which filters.
+    fn cached_edge(&self, id: EdgeId) -> Result<Option<Arc<EdgeRecord>>> {
         if let Some(v) = self.edges.borrow().get(&id) {
             return Ok(v.clone());
         }
@@ -497,7 +776,9 @@ impl GraphReader for CachedReader<'_> {
         Ok(v)
     }
 
-    fn neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Arc<[Neighbor]>> {
+    /// As [`Self::cached_node`], for adjacency: the snapshot's own list,
+    /// unfiltered, which is what the caches hold.
+    fn cached_neighbors(&self, id: NodeId, dir: Dir, ty: Option<&str>) -> Result<Arc<[Neighbor]>> {
         let key = (id, dir, ty.map(str::to_string));
         if let Some(v) = self.adjacency.borrow().get(&key) {
             return Ok(v.clone());
@@ -515,70 +796,6 @@ impl GraphReader for CachedReader<'_> {
         }
         self.adjacency.borrow_mut().insert(key, a.clone());
         Ok(a)
-    }
-
-    fn scan_all(&self) -> Result<Vec<NodeId>> {
-        graph::scan_all(self.txn, self.plane)
-    }
-
-    fn scan_label(&self, label: &str) -> Result<Vec<NodeId>> {
-        graph::scan_label(self.txn, self.plane, label)
-    }
-
-    fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>> {
-        graph::node_id_by_external_key(self.txn, self.plane, key)
-    }
-
-    fn vector_search(
-        &self,
-        label: Option<&str>,
-        property: &str,
-        query: &[f32],
-        metric: Metric,
-        k: usize,
-    ) -> Result<Vec<Hit>> {
-        let hits = indexed_or_brute(
-            self,
-            self.registry,
-            self.plane,
-            label,
-            property,
-            query,
-            metric,
-            k,
-        )?;
-        visible_hits(self, hits, label, |hit| NodeId(hit.id))
-    }
-
-    fn keyword_search(
-        &self,
-        label: &str,
-        property: &str,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<(NodeId, f32)>> {
-        // A pinned past snapshot is not what the live postings describe — a
-        // node re-texted since would match and score on its latest text, one
-        // deleted or relabelled since would be missing — so a historical read
-        // computes BM25 from the snapshot, as vector search brute-forces it.
-        if self.historical {
-            return snapshot_keyword_search(
-                self.txn,
-                self.plane,
-                self.keywords,
-                label,
-                property,
-                query,
-                k,
-            );
-        }
-        // A live read asks for exactly `k`: the only ids the filter can drop
-        // are the skew window's, and a short page there is the honest answer.
-        let hits = self
-            .keywords
-            .and_then(|reg| reg.search(self.plane, label, property, query, k))
-            .unwrap_or_default();
-        visible_hits(self, hits, Some(label), |hit| hit.0)
     }
 }
 

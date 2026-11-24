@@ -184,6 +184,36 @@ pub struct NodeRecord {
     pub properties: Properties,
 }
 
+/// Reserved property naming a node's own expiry: unix-epoch milliseconds,
+/// absolute, as an `Int` (a `Float` is read too, since JSON has one number
+/// type). Past it the node is invisible to every read — searches, queries,
+/// Cypher, `node.get`, neighbours, and a time-travelling read alike — so a
+/// plane can be used as a cache without a sweeper walking it.
+///
+/// `$`-prefixed because no writer produces such a property name of its own,
+/// in the spirit of the `$vector` escape on the JSON surface. Expiry is not
+/// history: the node is hidden at every revision, not only after the commit
+/// that set it, so naming an older one does not bring it back.
+pub const EXPIRES_AT: &str = "$expires_at";
+
+impl NodeRecord {
+    /// This node's absolute expiry in unix-epoch milliseconds, if it carries
+    /// [`EXPIRES_AT`] as a number.
+    pub fn expires_at(&self) -> Option<i64> {
+        match self.properties.get(EXPIRES_AT).map(|p| &p.value)? {
+            PropValue::Int(ms) => Some(*ms),
+            PropValue::Float(ms) => Some(*ms as i64),
+            _ => None,
+        }
+    }
+
+    /// Whether this node has expired as of `now_ms`. A node with no expiry
+    /// never has.
+    pub fn expired_at(&self, now_ms: i64) -> bool {
+        self.expires_at().is_some_and(|at| at <= now_ms)
+    }
+}
+
 /// One 1-hop expansion result: the neighbor and the edge that reached it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Neighbor {

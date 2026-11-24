@@ -31,6 +31,74 @@ A query consults the index through the `SEARCH … NEAR … TOPK` form; when no 
 is declared, the engine falls back to an exact brute-force scan, which is the
 oracle the index is validated against.
 
+### The index's own width
+
+An index records the width of the vectors it holds, and `plane.indexes`
+reports it as `dim` (`null`, with `"mixed": true`, where a plane has written
+vectors of differing widths to one index — the store records what is there, it
+does not refuse it):
+
+```json
+{"label": "Doc", "property": "embedding", "metric": "cosine", "dim": 384}
+```
+
+**A search the index's own width contradicts is refused**, naming both widths,
+rather than ranked at infinity and answered as an empty list:
+
+```json
+{"code": -32602,
+ "message": "query is 128-wide but the index on (Doc, embedding) holds 384-wide vectors"}
+```
+
+The refusal is possible only where the width is knowable: a declared index
+holding at least one vector. A search on an undeclared pair takes the exact
+brute-force path, where a width mismatch ranks as infinitely far and so
+answers nothing — the honest statement of what the store cannot know in
+advance.
+
+**A bare array of numbers is promoted to a vector at write time** where a
+declared index names that property, so a client that sends
+`"embedding": [0.1, 0.2, …]` rather than `{"$vector": [...]}` lands an indexed
+embedding rather than a list nothing searches. Promotion needs the array to be
+plausible as an embedding: at least 16 numbers, or exactly as wide as the index
+already is. A shorter array under a differently-sized index — a handful of
+scores, say — is stored as the list it is.
+
+## A plane as a cache: `$expires_at`
+
+A node may carry its own expiry, as a reserved property holding an absolute
+unix-epoch timestamp in milliseconds:
+
+```json
+{"plane": "cache", "key": "q:9f21", "labels": ["Answer"],
+ "properties": {"embedding": {"$vector": [0.1, 0.2]},
+                "$expires_at": 1764500000000}}
+```
+
+Past that instant the node is **invisible to every read** — similarity search,
+keyword search, `plane.query`, Cypher, `node.get`, neighbour expansion and the
+agent verbs alike — with no sweeper walking the plane and no write to mark it.
+A replica following the primary hides the same nodes without performing a write
+of its own, because the expiry is data rather than a schedule.
+
+Three properties are worth stating exactly:
+
+- **Exclusion happens before `k`.** An expired node that is the *nearest*
+  match does not consume a slot: a search for one neighbour answers the live
+  node behind it, not an empty list.
+- **Expiry is not history.** A node written with its expiry is hidden at every
+  revision, so naming an older one with `AS OF` does not bring it back. An
+  expiry *added* later applies from the revision that added it; before that,
+  the history holds a node that genuinely had none.
+- **The node keeps its name.** Expiry hides a node; it does not free its
+  external key. Writing that key again with `on_conflict: update` lands on the
+  same row — edges intact — and resets the expiry, which is what a cache
+  refreshing an entry wants. The bytes are reclaimed by compaction, not by the
+  expiry itself, so an expired node still counts in `plane.catalog`.
+
+Expiry is absolute and node-scoped: no sliding window, no touch-on-read, and
+no expiry on edges.
+
 ## Keyword (BM25) indexes
 
 Lexical relevance complements semantic similarity. A keyword index is declared

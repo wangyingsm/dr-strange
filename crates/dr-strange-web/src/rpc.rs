@@ -1513,6 +1513,130 @@ mod tests {
         assert_eq!(r["keyword"][0]["language"], "english");
         assert_eq!(r["vector"][0]["property"], "emb");
         assert_eq!(r["vector"][0]["metric"], "l2");
+        // The width a client compares its own embeddings against (#112).
+        assert_eq!(r["vector"][0]["dim"], 2);
+        assert_eq!(r["vector"][0]["mixed"], false);
+    }
+
+    /// A parameter the server does not know is a mistake, not a default: it
+    /// is rejected by name instead of being dropped, so a client that
+    /// misspells `properties` or sends a field for the wrong method hears
+    /// about it (#113). The five request shapes that flatten `AsOfParams`
+    /// cannot be strict — serde forbids the combination — and `plane.query`
+    /// below is one of them.
+    #[test]
+    fn an_unknown_parameter_is_refused_by_name() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","propertys":{"a":1}},"id":1}"#,
+        )
+        .unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        assert!(msg.contains("propertys"), "the field is named: {msg}");
+
+        // The same spelling the issue reported: `label` where the method
+        // takes `labels`.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","label":"Doc"},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+        // What the method does take is still accepted.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"a":1}},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+    }
+
+    /// Builds a plane with one "Doc" node carrying a `width`-wide `emb`, and
+    /// declares an L2 vector index over it when `declare`.
+    fn plane_with_embedding(width: usize, declare: bool) -> Database {
+        use dr_strange_core::{Metric, PropDesc, PropValue};
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut txn = plane.write().unwrap();
+            let props: Properties = [(
+                "emb".to_string(),
+                PropDesc::new(PropValue::Vector(vec![0.5; width])),
+            )]
+            .into_iter()
+            .collect();
+            txn.create_node(&["Doc"], props).unwrap();
+            txn.commit().unwrap();
+        }
+        if declare {
+            plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        }
+        db
+    }
+
+    fn search_body(label: Option<&str>, query: &[f32]) -> String {
+        let label = match label {
+            Some(l) => format!(r#","label":"{l}""#),
+            None => String::new(),
+        };
+        let q: Vec<String> = query.iter().map(|v| v.to_string()).collect();
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"plane.search","params":{{"plane":"startup","property":"emb","query":[{}]{label}}},"id":1}}"#,
+            q.join(",")
+        )
+    }
+
+    /// A query of the wrong width cannot rank against anything in the index,
+    /// so it is refused by name instead of answering empty — the silence
+    /// issue #112 reported. Both widths appear in the message.
+    #[test]
+    fn plane_search_refuses_a_query_the_index_width_contradicts() {
+        let db = plane_with_embedding(4, true);
+
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("2-wide"), "{msg}");
+        assert!(msg.contains("4-wide"), "{msg}");
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // The same refusal without a label: one index names the property, so
+        // the width is still knowable.
+        let resp = call(&db, &search_body(None, &[0.1, 0.2])).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // The right width is answered, not refused.
+        let resp = call(&db, &search_body(Some("Doc"), &[0.5; 4])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(resp["result"].as_array().unwrap().len(), 1);
+    }
+
+    /// No index on the property means no width to contradict: the search runs
+    /// on the exact fallback and answers (here: nothing ranks, because the
+    /// engine stays total over mixed widths rather than erroring).
+    #[test]
+    fn plane_search_without_an_index_still_answers() {
+        let db = plane_with_embedding(4, false);
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert!(resp["result"].is_array(), "{resp}");
+    }
+
+    /// A declared index with nothing in it holds no width either, so a query
+    /// of any width proceeds.
+    #[test]
+    fn plane_search_with_an_empty_index_is_not_refused() {
+        use dr_strange_core::Metric;
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
     }
 
     #[test]
@@ -1560,6 +1684,124 @@ mod tests {
         .unwrap();
         assert_eq!(idx["result"]["keyword"][0]["property"], "body");
         assert_eq!(idx["result"]["vector"][0]["property"], "emb");
+    }
+
+    /// The whole of #114 over the wire: a cache entry written with
+    /// `$expires_at` in the properties — no new parameter, no SDK change —
+    /// is gone from `node.get`, from a query, and from `plane.search` with
+    /// `k = 1` where it is the nearest match. Nothing ran a sweeper.
+    #[test]
+    fn an_expired_node_is_invisible_over_the_rpc() {
+        use dr_strange_core::Metric;
+
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let past = 1_000_000_000_000i64; // 2001, comfortably expired
+
+        // The exact write a semantic cache makes: the entry, its embedding,
+        // and when it stops being usable.
+        let resp = call(
+            &db,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"node.create","params":{{"plane":"startup","key":"stale","labels":["Doc"],"properties":{{"emb":{{"$vector":[1.0,0.0]}},"$expires_at":{past}}}}},"id":1}}"#
+            ),
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        // A live entry that is a worse match for the query below.
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","key":"live","labels":["Doc"],"properties":{"emb":{"$vector":[0.0,1.0]}}},"id":1}"#,
+        )
+        .unwrap();
+
+        // Gone from a direct read, by key.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.get","params":{"plane":"startup","key":"stale"},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"].is_null(), "node.get by key: {resp}");
+
+        // Gone from `plane.search`, with k = 1 and the expired node nearest:
+        // the live one is answered, not an empty list.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","label":"Doc","property":"emb","query":[1.0,0.0],"k":1},"id":1}"#,
+        )
+        .unwrap();
+        let hits = resp["result"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{resp}");
+        assert_eq!(hits[0]["external_key"], "live");
+
+        // And gone from a query over the plane.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.query","params":{"plane":"startup",
+                 "plan":{"source":{"ScanLabel":"Doc"},"steps":[]}},"id":1}"#,
+        )
+        .unwrap();
+        let nodes = resp["result"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1, "{resp}");
+        assert_eq!(nodes[0]["external_key"], "live");
+    }
+
+    /// `digest.write` takes the labels it is given, however they are spelled.
+    /// It shipped with a single `label`, so a proposal that knew a thing was
+    /// both a `Trait` and `External` landed as one or the other — or, if the
+    /// caller spelled it `labels` the way `node.create` does, as `Entity`
+    /// with no complaint at all (#113). Now `label`, `labels` and
+    /// `extra_labels` are unioned in order, and a misspelling is an error.
+    #[test]
+    fn digest_write_takes_every_spelling_of_a_label() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[
+                {"key":"a","labels":["Question"]},
+                {"key":"b","label":"Trait","extra_labels":["External"]},
+                {"key":"c","label":"Doc","labels":["Doc","Paper"]},
+                {"key":"d"}
+            ],"edges":[]},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(resp["result"]["nodes_written"], 4);
+
+        let labels = |key: &str| {
+            let resp = call(
+                &db,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"node.get","params":{{"plane":"startup","key":"{key}"}},"id":1}}"#
+                ),
+            )
+            .unwrap();
+            resp["result"]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // `labels` alone is honoured — it used to land as "Entity".
+        assert_eq!(labels("a"), ["Question"]);
+        // Asserted labels survive beside the chosen one, in that order.
+        assert_eq!(labels("b"), ["Trait", "External"]);
+        // The union keeps order and drops the repeat.
+        assert_eq!(labels("c"), ["Doc", "Paper"]);
+        // No label at all is still "Entity".
+        assert_eq!(labels("d"), ["Entity"]);
+
+        // And a near-miss spelling is refused rather than defaulted.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[{"key":"e","lables":["Typo"]}],"edges":[]},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
     }
 
     // ---- auth gate --------------------------------------------------------

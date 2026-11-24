@@ -2,7 +2,7 @@
   "openrpc": "1.2.6",
   "info": {
     "title": "dr-strange JSON-RPC",
-    "version": "2.32.0",
+    "version": "2.33.0",
     "description": "The wire protocol served by `drsg serve` (arch/08). Every method maps 1:1 to the core API. This document is the source of truth for the language SDKs and doubles as the RPC reference; the server returns it verbatim from `rpc.discover`.\n\nAuth: the whole surface is authenticated. Send the shared token as `Authorization: Bearer <DRSG_TOKEN>` over HTTP (or `?token=` on the WebSocket). With no token configured on the server, only the same-origin browser UI may call it. An unauthenticated call fails with error code -32001.\n\nEach method carries an `x-access` tag (read | write | admin): the tier a scoped key would need. Under the single shared token all three tiers require the same token.\n\nA write may fail with -32002 when it waited out `[server] write_timeout_secs` for the single writer slot, which one long import or digest can hold. It is the one error worth retrying unchanged: nothing was attempted and the request was not wrong.",
     "x-error-codes": {
       "-32700": "parse error",
@@ -1174,7 +1174,7 @@
         "name": "result",
         "schema": {
           "type": "object",
-          "description": "{vector:[{label,property,metric}], keyword:[{label,property,language}]}."
+          "description": "{vector:[{label,property,metric,dim,mixed}], keyword:[{label,property,language}]}. `dim` is the width of the vectors a vector index holds, or null when it is empty or holds more than one width (`mixed`) — what a client compares its own embeddings against before searching."
         }
       }
     },
@@ -1490,7 +1490,8 @@
       "result": {
         "name": "proposal",
         "schema": {
-          "type": "object"
+          "type": "object",
+          "description": "{report:{...}, nodes:[{key,label,labels,properties}], edges:[{src,type,dst,properties}]}. `labels` is every label the node is written with — the reconciled `label` plus anything a preprocessor asserted — so this reply can be handed back to `digest.write` after review without losing any of them."
         }
       }
     },
@@ -1512,7 +1513,34 @@
           "schema": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "object",
+              "description": "One proposed node. `key` is its stable external key. Labels may be given as `label` (one), `labels` (several, as `node.create` spells it) or `extra_labels` (labels a preprocessor asserted rather than chose, the spelling `digest.run` reports); all three are unioned in that order, repeats dropped, and a node named with none lands as `Entity`. `properties` takes the same escaped forms as `node.create`, `{\"$vector\": [...]}` included.",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "labels": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "extra_labels": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "properties": {
+                  "type": "object"
+                }
+              }
             }
           }
         },
@@ -1522,7 +1550,27 @@
           "schema": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "object",
+              "description": "One proposed edge between two external keys, which must resolve within this batch or already exist in the plane.",
+              "required": [
+                "src",
+                "type",
+                "dst"
+              ],
+              "properties": {
+                "src": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "dst": {
+                  "type": "string"
+                },
+                "properties": {
+                  "type": "object"
+                }
+              }
             }
           }
         },

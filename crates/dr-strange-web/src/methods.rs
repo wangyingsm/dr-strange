@@ -10,9 +10,9 @@ use std::path::Path;
 
 use dr_strange_core::{
     AlgoBuilder, BulkEdge, BulkNode, Change, ChangeKind, ChangeOp, ChangeSet, CyclesOptions,
-    Database, Dir, EdgeId, EdgeRecord, HybridWeights, Language, LogicalPlan, LouvainOptions,
-    Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties, ShortestPathOptions,
-    TopoOrder, TopoSortOptions, json,
+    Database, Dir, EdgeId, EdgeRecord, HybridWeights, IndexWidth, Language, LogicalPlan,
+    LouvainOptions, Metric, NodeId, NodeRecord, PageRankOptions, PlaneHandle, Properties,
+    ShortestPathOptions, TopoOrder, TopoSortOptions, json,
 };
 // Time-travel address type — ships only with the native backend (ROADMAP §4).
 #[cfg(feature = "native-backend")]
@@ -186,6 +186,14 @@ pub(crate) fn opaque(kind: &str, detail: impl std::fmt::Display) -> RpcError {
 /// Optional time-travel address on a read request (ROADMAP §4): pin the read to
 /// a past commit `as_of` (sequence) or `as_of_ms` (unix-epoch milliseconds). At
 /// most one; `#[serde(flatten)]` this into a request struct.
+///
+/// No `deny_unknown_fields` here or on the five structs that flatten it
+/// (`Neighbors`, `RunPlan`, `Seed`, `Find`, `Expand`), deliberately: serde
+/// cannot combine the two. On the inner struct it would reject the outer
+/// struct's own fields, and on the outer one it would reject these. Every
+/// other request shape is strict, so a misspelled parameter is an error
+/// rather than a default — these five are the gap, and it is serde's, not a
+/// decision to be lax.
 #[derive(Deserialize, Default)]
 pub struct AsOfParams {
     #[serde(default)]
@@ -664,6 +672,7 @@ fn catalog_value(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneVectorize {
     plane: String,
     /// Embedding provider preset or base URL; the key comes from the
@@ -706,6 +715,7 @@ pub fn plane_vectorize(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginInstall {
     /// A URL to download the component from. Server-local file paths are
     /// deliberately not accepted over RPC: a remote caller naming paths on
@@ -732,6 +742,7 @@ pub fn plugin_install(_ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginRemove {
     name: String,
 }
@@ -754,6 +765,7 @@ fn plug(e: anyhow::Error) -> RpcError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MountDb {
     path: String,
     #[serde(rename = "as", default)]
@@ -808,6 +820,7 @@ pub fn db_mount(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnmountDb {
     name: String,
 }
@@ -939,6 +952,7 @@ pub fn plane_list(ctx: &Ctx<'_>) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneOnly {
     plane: String,
 }
@@ -1100,6 +1114,7 @@ pub fn plane_catalog(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetNode {
     plane: String,
     #[serde(default)]
@@ -1214,6 +1229,7 @@ pub fn plane_neighbors(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Search {
     plane: String,
     property: String,
@@ -1226,10 +1242,65 @@ pub struct Search {
     metric: Option<String>,
 }
 
+/// Refuses a query whose width the declared indexes contradict: nothing of a
+/// different width can rank above `-inf`, so an answer would be empty (or
+/// scored `null`) with no way for the caller to tell that from a cold plane.
+///
+/// Only when the width is knowable. A query is refused when every declared
+/// index that could answer it — the one on `(label, property)`, or all those
+/// on `property` when no label narrows the search — holds vectors of one
+/// width, and it is not this query's. An empty index, indexes that disagree
+/// with each other, and a property with no index at all are all cases where
+/// the store cannot know, so the search proceeds and answers from the exact
+/// fallback.
+fn check_query_width(
+    plane: &PlaneHandle<'_>,
+    label: Option<&str>,
+    property: &str,
+    query_len: usize,
+) -> Result<(), RpcError> {
+    let mut widths = plane
+        .vector_index_widths()
+        .into_iter()
+        .filter(|i| i.property == property && label.is_none_or(|l| i.label == l))
+        .peekable();
+    if widths.peek().is_none() {
+        return Ok(());
+    }
+    let mut indexed = Vec::new();
+    for i in widths {
+        match i.width.uniform() {
+            Some(d) if d == query_len => return Ok(()),
+            Some(d) => indexed.push((i.label, d)),
+            // Empty or mixed: no width to contradict the query with.
+            None => return Ok(()),
+        }
+    }
+    let held = match indexed.as_slice() {
+        [(label, d)] => format!("the index on ({label}, {property}) holds {d}-wide vectors"),
+        many => format!(
+            "no index on {property} holds vectors that wide ({})",
+            many.iter()
+                .map(|(l, d)| format!("{l}: {d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Err(RpcError::invalid_params(format!(
+        "query is {query_len}-wide but {held} — a vector of a different width can never rank, \
+         so this search would answer nothing. Embed the query with the model the index was \
+         built with, or index this property for {query_len}-wide vectors."
+    )))
+}
+
 /// `plane.search` — vector top-k, returning scored node records.
+///
+/// Refuses a query whose width no index on `property` holds (see
+/// [`check_query_width`]) rather than answering empty.
 pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
     let plane = ctx.plane(&req.plane)?;
+    check_query_width(&plane, req.label.as_deref(), &req.property, req.query.len())?;
     let hits = app(plane
         .query()
         .vector_top_k(
@@ -1304,6 +1375,7 @@ fn make_embedder(ctx: &Ctx<'_>, provider: Option<&str>) -> Result<Option<LlmEmbe
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CypherReq {
     plane: String,
     query: String,
@@ -1973,6 +2045,7 @@ pub fn plane_find(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 const ALGO_LIMIT: usize = 100;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Algo {
     plane: String,
     /// Which algorithm: `pagerank` | `components` | `shortest_path` |
@@ -2142,6 +2215,7 @@ fn cycles(builder: &AlgoBuilder<'_>, req: &Algo, limit: usize) -> Result<Value, 
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hybrid {
     plane: String,
     /// The query text: embedded for the vector channel, tokenized for keyword.
@@ -2207,6 +2281,7 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             .into_iter()
             .next()
             .ok_or_else(|| RpcError::server("embedder returned no vector"))?;
+        check_query_width(&plane, req.label.as_deref(), prop, query.len())?;
         builder = builder.vector(prop.clone(), query, parse_metric(req.metric.as_deref()));
     }
     if let Some(prop) = &req.keyword_prop {
@@ -2248,6 +2323,7 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ask {
     plane: String,
     /// The natural-language question.
@@ -2345,6 +2421,7 @@ pub fn plane_ask(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneIndexes {
     plane: String,
 }
@@ -2358,6 +2435,7 @@ fn metric_name(m: Metric) -> &'static str {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnsureIndex {
     plane: String,
     label: String,
@@ -2409,14 +2487,25 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// only the channels that actually exist (ROADMAP §2). Returns the vector and
 /// keyword indexes as `{label, property, …}`; the keyword channel can only
 /// search a `(label, property)` that appears under `keyword`.
+///
+/// A vector index also reports `dim`, the width of the vectors it holds: a
+/// number when they agree, `null` when the index is empty or holds more than
+/// one width. It is what a client compares its own embeddings against —
+/// without it, a width disagreement is only visible as an empty answer.
 pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneIndexes = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     let vector: Vec<Value> = plane
-        .vector_indexes()
+        .vector_index_widths()
         .into_iter()
-        .map(|(label, property, metric)| {
-            jval!({ "label": label, "property": property, "metric": metric_name(metric) })
+        .map(|i| {
+            jval!({
+                "label": i.label,
+                "property": i.property,
+                "metric": metric_name(i.metric),
+                "dim": i.width.uniform(),
+                "mixed": i.width == IndexWidth::Mixed,
+            })
         })
         .collect();
     let keyword: Vec<Value> = plane
@@ -2431,9 +2520,10 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
 /// Semantic search: embed the query with the requested provider (key from the
 /// server env) and return the plane's most vector-similar nodes, each carrying
-/// a `score` and a `match` hint. Errors (no key, provider down, no embed model)
-/// and an empty result (a plane with no embeddings, or embeddings of a
-/// different dimension) let the caller fall back to text.
+/// a `score` and a `match` hint. Errors (no key, provider down, no embed
+/// model, a query the declared index's width contradicts) and an empty result
+/// (a plane with no embeddings) let the caller fall back to text — with the
+/// width now named in the note rather than reported as "no embedded nodes".
 fn semantic_find(
     plane: &dr_strange_core::PlaneHandle<'_>,
     req: &Find,
@@ -2448,6 +2538,8 @@ fn semantic_find(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+    check_query_width(plane, None, "embedding", query.len())
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
     let hits = plane
         .query()
@@ -2603,6 +2695,7 @@ fn build_err(e: anyhow::Error) -> RpcError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestRun {
     /// Target plane — only read here, to retrieve existing entities as reuse
     /// candidates for linking (the write happens in `digest.write`).
@@ -2741,9 +2834,18 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             "output_tokens": r.output_tokens,
             "embed_tokens": r.embed_tokens,
         },
+        // `labels` carries what the node is actually written with — the
+        // reconciled label plus anything a preprocessor asserted. `label`
+        // stays beside it for callers that only ever read that, but a reply
+        // handed straight back to `digest.write` now keeps every label it
+        // came with instead of silently losing the asserted ones (#113).
         "nodes": result.nodes.iter().map(|n| jval!({
             "key": n.key,
             "label": n.label,
+            "labels": std::iter::once(n.label.as_str())
+                .chain(n.extra_labels.iter().map(String::as_str))
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
             "properties": json::properties_to_json(&n.props),
         })).collect::<Vec<_>>(),
         "edges": result.edges.iter().map(|e| jval!({
@@ -2756,6 +2858,7 @@ pub fn digest_run(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestWrite {
     plane: String,
     nodes: Vec<WriteNode>,
@@ -2795,15 +2898,51 @@ impl From<ConflictArg> for dr_strange_core::OnConflict {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteNode {
     key: String,
+    /// The single-label spelling, kept because this method shipped with it.
     #[serde(default)]
     label: String,
+    /// Several labels, as `node.create` spells it. A node written here is a
+    /// node like any other, and the soft schema has always allowed it more
+    /// than one (#113) — a proposal that knows a thing is both a `Trait` and
+    /// `External` should not have to pick.
+    #[serde(default)]
+    labels: Vec<String>,
+    /// Labels a preprocessor asserted rather than chose, as `digest.run`
+    /// reports them — accepted under their own name so its reply can be
+    /// handed back verbatim after review.
+    #[serde(default)]
+    extra_labels: Vec<String>,
     #[serde(default)]
     properties: Value,
 }
 
+impl WriteNode {
+    /// Every label to write this node with, in the order given and without
+    /// repeats: `label`, then `labels`, then `extra_labels`. `Entity` when
+    /// none was given at all, which is what an unlabelled proposal has always
+    /// landed as.
+    fn label_set(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        let named = std::iter::once(self.label.as_str())
+            .chain(self.labels.iter().map(String::as_str))
+            .chain(self.extra_labels.iter().map(String::as_str));
+        for label in named {
+            if !label.is_empty() && !out.contains(&label) {
+                out.push(label);
+            }
+        }
+        if out.is_empty() {
+            out.push("Entity");
+        }
+        out
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteEdge {
     src: String,
     #[serde(rename = "type")]
@@ -2857,16 +2996,7 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     for n in &fresh {
         node_props.push(props_of(&n.properties)?);
     }
-    let label_slots: Vec<[&str; 1]> = fresh
-        .iter()
-        .map(|n| {
-            [if n.label.is_empty() {
-                "Entity"
-            } else {
-                n.label.as_str()
-            }]
-        })
-        .collect();
+    let label_slots: Vec<Vec<&str>> = fresh.iter().map(|n| n.label_set()).collect();
     let bnodes: Vec<BulkNode> = fresh
         .iter()
         .zip(&label_slots)
@@ -2971,6 +3101,7 @@ fn resolve_node(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateNode {
     plane: String,
     #[serde(default)]
@@ -3003,6 +3134,7 @@ pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNode {
     plane: String,
     #[serde(default)]
@@ -3100,6 +3232,7 @@ impl PlaneExport<'_> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNode {
     plane: String,
     #[serde(default)]
@@ -3130,6 +3263,7 @@ pub fn node_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEdge {
     plane: String,
     src: NodeRef,
@@ -3160,6 +3294,7 @@ pub fn edge_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateEdge {
     plane: String,
     edge: u64,
@@ -3198,6 +3333,7 @@ pub fn edge_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteEdge {
     plane: String,
     edge: u64,
@@ -3222,6 +3358,7 @@ pub fn edge_delete(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 // ---- plane administration (arch/09 §3) ------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePlane {
     name: String,
     #[serde(default)]
@@ -3237,6 +3374,7 @@ pub fn plane_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenamePlane {
     plane: String,
     to: String,
@@ -3252,6 +3390,7 @@ pub fn plane_rename(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPlaneProps {
     plane: String,
     #[serde(default)]
@@ -3274,6 +3413,7 @@ pub fn plane_set_props(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeletePlane {
     plane: String,
 }
@@ -3302,6 +3442,7 @@ fn attachment_json(a: &dr_strange_core::attach::Attachment) -> Value {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachPlane {
     plane: String,
     name: String,
@@ -3346,6 +3487,7 @@ pub fn plane_attach(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetachPlane {
     plane: String,
     name: String,
@@ -3367,6 +3509,7 @@ pub fn plane_detach(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneAttachments {
     plane: String,
 }
