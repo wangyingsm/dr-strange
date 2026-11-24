@@ -31,16 +31,61 @@ A query consults the index through the `SEARCH … NEAR … TOPK` form; when no 
 is declared, the engine falls back to an exact brute-force scan, which is the
 oracle the index is validated against.
 
+### The metric a search runs under
+
+The metric decides the scale a score is on — cosine scores `1 - distance`,
+`dot` and `l2` score `-distance` — so it is not a detail a caller can leave to
+chance. A `metric` named on the search is honoured, including one the index
+does not declare, which takes the exact brute-force path deliberately.
+
+**An omitted `metric` means the metric the indexes on that property were
+declared with**, so an index declared `l2` is searched as `l2`. Cosine is the
+default only where no declaration says otherwise: no index on the property, or
+several that disagree. A metric name the server does not know is refused with
+`-32602` rather than quietly read as cosine.
+
+### A threshold, not just a rank: `min_score`
+
+`plane.search` can be asked for *the nearest, if anything is near enough* —
+a cache's own question, where a hit below threshold is the wrong answer rather
+than a worse one:
+
+```json
+{"plane": "cache", "label": "Answer", "property": "embedding",
+ "query": [0.1, 0.2], "k": 1, "min_score": 0.86}
+```
+
+`min_score` is compared against the same `score` each hit carries, so no
+distance scale has to be guessed per metric. The drop happens **before `k` is
+filled**, so a near-enough hit is never displaced out of the window by a
+nearer one that then fails the floor — and when nothing is near enough the
+answer is `[]`, which is the answer the caller wanted.
+
+The threshold is `plane.search`'s alone. `plane.hybrid` fuses *normalised*
+channel scores, where a raw floor would not mean what the fused score means.
+
 ### The index's own width
 
 An index records the width of the vectors it holds, and `plane.indexes`
-reports it as `dim` (`null`, with `"mixed": true`, where a plane has written
-vectors of differing widths to one index — the store records what is there, it
-does not refuse it):
+reports it as `dim` — alongside `declared_dim`, the width its declaration
+fixed, which lets a client tell *384-wide and empty* from *empty, width
+unknown*:
 
 ```json
-{"label": "Doc", "property": "embedding", "metric": "cosine", "dim": 384}
+{"label": "Doc", "property": "embedding", "metric": "cosine",
+ "dim": 384, "declared_dim": 384}
 ```
+
+A width may be declared up front, and is then enforced from the first write
+on:
+
+```console
+$ drsg --db graph.drsg index ensure Doc embedding --plane social --dim 384
+```
+
+Declaring a width the property's existing vectors contradict is refused:
+declaring does not re-embed them, so it would only mean refusing every write
+that matches what is already indexed.
 
 **A search the index's own width contradicts is refused**, naming both widths,
 rather than ranked at infinity and answered as an empty list:
@@ -51,10 +96,31 @@ rather than ranked at infinity and answered as an empty list:
 ```
 
 The refusal is possible only where the width is knowable: a declared index
-holding at least one vector. A search on an undeclared pair takes the exact
-brute-force path, where a width mismatch ranks as infinitely far and so
-answers nothing — the honest statement of what the store cannot know in
-advance.
+holding at least one vector, or one declared with a `dim`. A search on an
+undeclared pair takes the exact brute-force path, where a width mismatch ranks
+as infinitely far and so answers nothing — the honest statement of what the
+store cannot know in advance.
+
+**A write the index's width contradicts is refused too**, which is what keeps
+the width knowable:
+
+```json
+{"code": -32602,
+ "message": "embedding is 8-wide but the vector index on (Doc, embedding) holds 384-wide vectors — a vector of a different width can never rank, so indexing it would leave the index holding two widths and every search over it answering less than it should."}
+```
+
+The refusal holds within one batch as well as across transactions: the first
+vector of a `bulk_upsert` or a `digest.write` sets the width the rest must
+match, so a mixed batch is refused on its second node rather than its five
+hundredth. An index declared with a `dim` refuses the *first* wrong write, so
+the order the vectors arrive in no longer decides which width the index
+believes in.
+
+An index therefore reports `"mixed": true` only for vectors that were already
+under the property when it was declared — or that an older release let in —
+never for a write to a declared index. That matters because an index of two
+widths knows no width, and so can refuse nothing: a mismatched query against
+one is answered rather than refused.
 
 **A bare array of numbers is promoted to a vector at write time** where a
 declared index names that property, so a client that sends

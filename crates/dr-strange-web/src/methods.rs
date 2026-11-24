@@ -127,6 +127,23 @@ pub(crate) fn app<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
     r.map_err(core_err)
 }
 
+/// [`app`] for a call whose failure is the request's own fault: an
+/// `InvalidArgument` from it answers `-32602 invalid params` instead of the
+/// server-error code [`core_err`] gives every core error.
+///
+/// Scoped to the calls that take the caller's own properties or index
+/// declaration, where that variant can only mean "you asked wrong" — the
+/// query-side width refusal (#112) already answers -32602, and the write-side
+/// one (#123) has to agree with it or the same mistake carries two codes.
+/// Everything else keeps [`app`]: a timeout, a storage fault or an
+/// external-key conflict is not a bad parameter.
+pub(crate) fn arg<T>(r: dr_strange_core::Result<T>) -> Result<T, RpcError> {
+    r.map_err(|e| match e {
+        dr_strange_core::Error::InvalidArgument(msg) => RpcError::invalid_params(msg),
+        other => core_err(other),
+    })
+}
+
 /// The client-facing form of a core error. Client-fault variants (unknown
 /// plane, bad plan, conflict) name the caller's own inputs and go through
 /// verbatim; the storage-side ones carry an `io::Error` with the database's
@@ -265,12 +282,57 @@ fn pin(
     Ok(p)
 }
 
-fn parse_metric(s: Option<&str>) -> Metric {
+/// The metric a request named, by name.
+///
+/// A name the server does not know is a mistake, not a default: `"nonsense"`
+/// used to score as cosine in silence, so a typo looked like a working search
+/// against a metric nobody chose (#124).
+fn parse_metric(s: &str) -> Result<Metric, RpcError> {
     match s {
-        Some("dot") | Some("Dot") => Metric::Dot,
-        Some("l2") | Some("L2") => Metric::L2,
-        _ => Metric::Cosine,
+        "cosine" | "Cosine" => Ok(Metric::Cosine),
+        "dot" | "Dot" => Ok(Metric::Dot),
+        "l2" | "L2" => Ok(Metric::L2),
+        other => Err(RpcError::invalid_params(format!(
+            "unknown metric `{other}` (expected cosine|dot|l2)"
+        ))),
     }
+}
+
+/// The metric a *search* runs under: the one it named, or the one the indexes
+/// it would use were declared with.
+///
+/// The argument decides the score's scale, and an omitted argument used to
+/// mean cosine whatever the index said — so an index declared `l2` and
+/// searched with no `metric` scored like cosine, and the metric
+/// `plane.indexes` reported described nothing observable (#124). Now the
+/// declaration answers, which also makes the search index-backed rather than
+/// a brute-force fallback under a metric the index cannot serve.
+///
+/// Cosine remains the default exactly where no declaration says otherwise:
+/// no index on the property, or several that disagree. An explicit `metric`
+/// is still honoured against any index, since exact brute force under
+/// another metric is a legitimate ask.
+fn metric_for_search(
+    plane: &PlaneHandle<'_>,
+    label: Option<&str>,
+    property: &str,
+    requested: Option<&str>,
+) -> Result<Metric, RpcError> {
+    if let Some(name) = requested {
+        return parse_metric(name);
+    }
+    let mut declared = plane
+        .vector_index_widths()
+        .into_iter()
+        .filter(|i| i.property == property && label.is_none_or(|l| i.label == l))
+        .map(|i| i.metric);
+    let Some(first) = declared.next() else {
+        return Ok(Metric::Cosine);
+    };
+    Ok(match declared.all(|m| m == first) {
+        true => first,
+        false => Metric::Cosine,
+    })
 }
 
 fn parse_dir(s: Option<&str>) -> Dir {
@@ -1240,6 +1302,11 @@ pub struct Search {
     k: Option<u64>,
     #[serde(default)]
     metric: Option<String>,
+    /// Answer only with hits scoring at least this much, on the same scale
+    /// as the `score` each hit carries. Omitted, the `k` nearest are
+    /// answered whatever their score.
+    #[serde(default)]
+    min_score: Option<f32>,
 }
 
 /// Refuses a query whose width the declared indexes contradict: nothing of a
@@ -1297,20 +1364,34 @@ fn check_query_width(
 ///
 /// Refuses a query whose width no index on `property` holds (see
 /// [`check_query_width`]) rather than answering empty.
+///
+/// `min_score` asks for "the nearest, if anything is near enough" — a cache's
+/// own question, where a hit below threshold is the wrong answer rather than
+/// a worse one (#124). It is compared against the `score` each hit carries,
+/// and applied before `k` is filled, so the store answers `[]` rather than
+/// handing back a page the caller has to re-filter against a scale it cannot
+/// discover.
 pub fn plane_search(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: Search = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     check_query_width(&plane, req.label.as_deref(), &req.property, req.query.len())?;
-    let hits = app(plane
-        .query()
-        .vector_top_k(
-            req.label.as_deref(),
-            &req.property,
-            req.query,
-            parse_metric(req.metric.as_deref()),
-            req.k.unwrap_or(10),
-        )
-        .scored_nodes())?;
+    let metric = metric_for_search(
+        &plane,
+        req.label.as_deref(),
+        &req.property,
+        req.metric.as_deref(),
+    )?;
+    let mut q = plane.query().vector_top_k(
+        req.label.as_deref(),
+        &req.property,
+        req.query,
+        metric,
+        req.k.unwrap_or(10),
+    );
+    if let Some(floor) = req.min_score {
+        q = q.min_score(floor);
+    }
+    let hits = app(q.scored_nodes())?;
     Ok(scored_rows(&hits))
 }
 
@@ -2282,7 +2363,8 @@ pub fn plane_hybrid(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
             .next()
             .ok_or_else(|| RpcError::server("embedder returned no vector"))?;
         check_query_width(&plane, req.label.as_deref(), prop, query.len())?;
-        builder = builder.vector(prop.clone(), query, parse_metric(req.metric.as_deref()));
+        let metric = metric_for_search(&plane, req.label.as_deref(), prop, req.metric.as_deref())?;
+        builder = builder.vector(prop.clone(), query, metric);
     }
     if let Some(prop) = &req.keyword_prop {
         builder = builder.keyword(prop.clone(), req.q.clone());
@@ -2446,6 +2528,10 @@ pub struct EnsureIndex {
     /// Vector metric (default cosine).
     #[serde(default)]
     metric: Option<String>,
+    /// The width every vector in the index must be. Omitted, the first
+    /// vector written decides it.
+    #[serde(default)]
+    dim: Option<usize>,
     /// Keyword analyzer language (default english).
     #[serde(default)]
     language: Option<String>,
@@ -2455,17 +2541,34 @@ pub struct EnsureIndex {
 /// from the dashboard, so a UI need never send the user to the CLI (ROADMAP §2).
 /// `kind` selects the index type. Idempotent; errors if one already exists with
 /// different settings.
+///
+/// A vector index takes `dim`, the width every vector in it must be: a write
+/// of any other width is then refused from the first one on, rather than the
+/// first write deciding the width for every write after it (#123).
 pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: EnsureIndex = params(p)?;
     let plane = ctx.plane(&req.plane)?;
     match req.kind.as_deref().unwrap_or("keyword") {
         "vector" => {
-            app(plane.ensure_vector_index(
-                &req.label,
-                &req.property,
-                parse_metric(req.metric.as_deref()),
-            ))?;
-            Ok(jval!({ "kind": "vector", "label": req.label, "property": req.property }))
+            // A declaration is the one place the name is not a search
+            // parameter but the index's own property, so it is parsed
+            // strictly and defaults to cosine only when nothing was sent.
+            let metric = match req.metric.as_deref() {
+                Some(name) => parse_metric(name)?,
+                None => Metric::Cosine,
+            };
+            match req.dim {
+                Some(dim) => {
+                    arg(plane.ensure_vector_index_of_width(&req.label, &req.property, metric, dim))?
+                }
+                None => arg(plane.ensure_vector_index(&req.label, &req.property, metric))?,
+            }
+            Ok(jval!({
+                "kind": "vector",
+                "label": req.label,
+                "property": req.property,
+                "dim": req.dim,
+            }))
         }
         "keyword" => {
             let language: Language = req
@@ -2474,7 +2577,7 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 .unwrap_or("english")
                 .parse()
                 .map_err(|e: dr_strange_core::Error| RpcError::invalid_params(e.to_string()))?;
-            app(plane.ensure_keyword_index(&req.label, &req.property, language))?;
+            arg(plane.ensure_keyword_index(&req.label, &req.property, language))?;
             Ok(jval!({ "kind": "keyword", "label": req.label, "property": req.property }))
         }
         other => Err(RpcError::invalid_params(format!(
@@ -2492,6 +2595,11 @@ pub fn index_ensure(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 /// number when they agree, `null` when the index is empty or holds more than
 /// one width. It is what a client compares its own embeddings against —
 /// without it, a width disagreement is only visible as an empty answer.
+///
+/// `declared_dim` is the width its declaration fixed, `null` when none did
+/// (#123). The two differ where it matters: an index declared 384-wide with
+/// nothing in it yet reports `dim: null, declared_dim: 384`, which a caller
+/// cannot tell from "empty, width unknown" if only one number is reported.
 pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
     let req: PlaneIndexes = params(p)?;
     let plane = ctx.plane(&req.plane)?;
@@ -2504,6 +2612,7 @@ pub fn plane_indexes(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
                 "property": i.property,
                 "metric": metric_name(i.metric),
                 "dim": i.width.uniform(),
+                "declared_dim": i.declared,
                 "mixed": i.width == IndexWidth::Mixed,
             })
         })
@@ -3025,7 +3134,7 @@ pub fn digest_write(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
         .collect();
 
     let mut txn = app(plane.write())?;
-    let stats = app(txn.bulk_upsert(bnodes, bedges, req.on_conflict.into()))?;
+    let stats = arg(txn.bulk_upsert(bnodes, bedges, req.on_conflict.into()))?;
     app(txn.commit())?;
 
     // Keys the plane already owned, split by what was done with them. Under
@@ -3123,8 +3232,8 @@ pub fn node_create(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let mut txn = app(plane.write())?;
     let id = match &req.key {
-        Some(k) => app(txn.create_node_with_key(k, &labels, props))?,
-        None => app(txn.create_node(&labels, props))?,
+        Some(k) => arg(txn.create_node_with_key(k, &labels, props))?,
+        None => arg(txn.create_node(&labels, props))?,
     };
     app(txn.commit())?;
 
@@ -3162,14 +3271,14 @@ pub fn node_update(ctx: &Ctx<'_>, p: Value) -> Result<Value, RpcError> {
 
     let mut txn = app(plane.write())?;
     for (k, pd) in set {
-        app(txn.set_prop(id, &k, pd))?;
+        arg(txn.set_prop(id, &k, pd))?;
     }
     for k in &req.unset {
         app(txn.remove_prop(id, k))?;
     }
     if let Some(labels) = &req.labels {
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        app(txn.set_labels(id, &refs))?;
+        arg(txn.set_labels(id, &refs))?;
     }
     app(txn.commit())?;
 

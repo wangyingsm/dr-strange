@@ -40,6 +40,7 @@ use crate::compute::plan::{
     Algo, LogicalPlan, ProjItem, Projection, SortKey, Source, Step, TupleSortKey,
 };
 use crate::error::{Error, Result};
+pub use crate::index::VectorIndexInfo;
 use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
 use crate::storage::engine::{ReadTransaction, StorageEngine, TableId, WriteTransaction};
@@ -331,31 +332,48 @@ fn numeric_array(value: &PropValue) -> Option<Vec<f32>> {
         .collect()
 }
 
-/// A numeric array read as the embedding it is meant to be, given what the
-/// index it would land in already holds.
+/// A numeric array read as the embedding it is meant to be, given the width
+/// the index it would land in is held to — what its declaration fixed, or
+/// what it already holds ([`VectorIndexInfo::required_width`]).
 ///
 /// Width is the only evidence available, so it decides: an array as wide as
-/// the index's own vectors is one of them, whatever that width is, and
-/// otherwise only something at least [`MIN_INFERRED_DIM`] wide is read as an
-/// embedding. A shorter array that matches nothing stays the list it was
-/// written as — guessing there would turn a handful of scores into a vector
-/// and wrong-size the index for every real embedding after it.
-fn as_embedding(value: &PropValue, index: IndexWidth) -> Option<Vec<f32>> {
+/// that is one of them, whatever that width is, and otherwise only something
+/// at least [`MIN_INFERRED_DIM`] wide is read as an embedding. A shorter
+/// array that matches nothing stays the list it was written as — guessing
+/// there would turn a handful of scores into a vector and wrong-size the
+/// index for every real embedding after it.
+fn as_embedding(value: &PropValue, required: Option<usize>) -> Option<Vec<f32>> {
     let numbers = numeric_array(value)?;
-    let fits = match index {
-        IndexWidth::Uniform(d) => numbers.len() == d,
-        IndexWidth::Empty | IndexWidth::Mixed => false,
-    };
+    let fits = required == Some(numbers.len());
     (fits || numbers.len() >= MIN_INFERRED_DIM).then_some(numbers)
 }
 
-/// One declared vector index, with the width of the vectors it holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VectorIndexInfo {
-    pub label: String,
-    pub property: String,
-    pub metric: Metric,
-    pub width: IndexWidth,
+/// Refuses a declared width the vectors already under `(label, property)`
+/// contradict (#123).
+///
+/// Declaring a width does not re-embed anything, so a width the stored
+/// vectors disagree with would refuse every write that matches what is
+/// already indexed — the index's own content would be unwritable. An empty
+/// pair has nothing to contradict and takes any width.
+fn refuse_width_against_store(
+    held: IndexWidth,
+    dim: usize,
+    label: &str,
+    property: &str,
+) -> Result<()> {
+    let complaint = match held {
+        IndexWidth::Uniform(d) if d != dim => {
+            format!("it already holds {d}-wide vectors")
+        }
+        IndexWidth::Mixed => "it already holds vectors of more than one width".to_string(),
+        _ => return Ok(()),
+    };
+    Err(Error::InvalidArgument(format!(
+        "cannot declare the vector index on ({label}, {property}) {dim}-wide: {complaint}, and \
+         declaring a width does not re-embed them — every write matching what is already \
+         indexed would be refused instead. Re-embed those nodes at {dim}, or declare the index \
+         without a width."
+    )))
 }
 
 /// A past point to read the graph at — the address for a time-travel (AS OF)
@@ -782,7 +800,7 @@ impl Database {
         // (its stamped commit sequence equals the data's), else rebuild from
         // the KV — the KV is always the source of truth, the sidecar only a
         // cache.
-        let registry = match sidecar.as_deref().zip(prior_seq).and_then(|(p, seq)| {
+        let mut registry = match sidecar.as_deref().zip(prior_seq).and_then(|(p, seq)| {
             let reg = VectorRegistry::load_sidecar(p, seq);
             if reg.is_some() {
                 tracing::info!(path = %p.display(), "loaded HNSW sidecar");
@@ -801,6 +819,9 @@ impl Database {
                 reg
             }
         };
+        // A sidecar carries the built graphs, not the declarations — the
+        // declared widths come from the KV either way.
+        engine.with_read(|txn| registry.adopt_declared_widths(txn))?;
         // Keyword indexes (ROADMAP §2): same fresh-sidecar-else-rebuild dance.
         let keywords = match keyword_sidecar
             .as_deref()
@@ -1172,9 +1193,12 @@ impl Database {
             // open — rebuilt over nothing, forever — and an id that is never
             // reused would still be "indexed" in every catalog.
             txn.delete(TableId::Meta, &keys::counters_key(id))?;
-            for (plane, label, property, _) in graph::list_vector_indexes(txn)? {
-                if plane == id {
-                    txn.delete(TableId::Meta, &keys::vindex_decl_key(id, &label, &property))?;
+            for decl in graph::list_vector_indexes(txn)? {
+                if decl.plane == id {
+                    txn.delete(
+                        TableId::Meta,
+                        &keys::vindex_decl_key(id, &decl.label, &decl.property),
+                    )?;
                 }
             }
             for (plane, label, property, _) in graph::list_keyword_indexes(txn)? {
@@ -1557,16 +1581,63 @@ impl<'db> PlaneHandle<'db> {
     /// `metric` (arch/01 §5). Idempotent; errors if an index already exists
     /// on the same pair with a different metric. Existing matching nodes are
     /// indexed immediately, and later writes keep it coherent.
+    ///
+    /// The width is left to the first vector written. Name it with
+    /// [`Self::ensure_vector_index_of_width`] to have every write held to it
+    /// from the start, including the first.
     pub fn ensure_vector_index(&self, label: &str, property: &str, metric: Metric) -> Result<()> {
+        self.declare_vector_index(label, property, metric, None)
+    }
+
+    /// [`Self::ensure_vector_index`], declaring the width every vector in the
+    /// index must be (#123).
+    ///
+    /// A write of any other width is refused from then on, so a caller that
+    /// knows its model's width can say so before the first embedding arrives
+    /// — the one case an index cannot work out for itself, because the first
+    /// vector written is what it would otherwise believe.
+    pub fn ensure_vector_index_of_width(
+        &self,
+        label: &str,
+        property: &str,
+        metric: Metric,
+        dim: usize,
+    ) -> Result<()> {
+        self.declare_vector_index(label, property, metric, Some(dim))
+    }
+
+    fn declare_vector_index(
+        &self,
+        label: &str,
+        property: &str,
+        metric: Metric,
+        dim: Option<usize>,
+    ) -> Result<()> {
         let plane = self.id;
+        if let Some(dim) = dim {
+            let held = self
+                .db
+                .engine
+                .with_read(|txn| crate::index::stored_width(txn, plane, label, property))?;
+            refuse_width_against_store(held, dim, label, property)?;
+        }
         self.db.engine.with_write(|txn| {
-            graph::declare_vector_index(txn, plane, label, property, metric).map(|_| ())
+            graph::declare_vector_index(txn, plane, label, property, metric, dim).map(|_| ())
         })?;
-        // Build the in-memory index from committed data.
+        // Build the in-memory index from committed data. The declaration is
+        // read back rather than passed through, so the entry carries the width
+        // the store now holds — which is the one already declared when this
+        // call named none.
         self.db.engine.with_read(|txn| {
-            self.db
-                .indexes_mut()
-                .build_entry(txn, plane, label, property, metric)
+            let decl = graph::list_vector_indexes(txn)?
+                .into_iter()
+                .find(|d| d.plane == plane && d.label == label && d.property == property)
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "the vector index just declared on {label}.{property} is not there"
+                    ))
+                })?;
+            self.db.indexes_mut().build_entry(txn, &decl)
         })
     }
 
@@ -1617,17 +1688,7 @@ impl<'db> PlaneHandle<'db> {
     /// compare its own embeddings against what is indexed instead of inferring
     /// it from an empty answer.
     pub fn vector_index_widths(&self) -> Vec<VectorIndexInfo> {
-        self.db
-            .indexes()
-            .declared_widths(self.id)
-            .into_iter()
-            .map(|(label, property, metric, width)| VectorIndexInfo {
-                label,
-                property,
-                metric,
-                width,
-            })
-            .collect()
+        self.db.indexes().declared_widths(self.id)
     }
 
     /// The width of one declared vector index, or `None` when `(label,
@@ -1866,45 +1927,61 @@ impl WriteTxn<'_> {
     }
 
     /// Promotes a bare numeric array to [`PropValue::Vector`] wherever a
-    /// declared vector index names that property on one of `labels`.
+    /// declared vector index names that property on one of `labels`, and
+    /// refuses a vector whose width that index contradicts
+    /// ([`VectorIndexInfo::accept`]).
     ///
     /// A client that sends `[0.1, 0.2]` for an indexed property means an
     /// embedding; stored as a list it is indexed as nothing, and every search
     /// over it answers empty with no error to say why. Properties no index
     /// names are left exactly as given — the soft schema does not otherwise
     /// guess at a list's meaning.
-    fn coerce_declared_vectors(&self, labels: &[&str], props: &mut Properties) {
-        for i in &self.decls {
+    ///
+    /// Each accepted width folds into `decls`, this transaction's own snapshot,
+    /// so one write is internally consistent: the first vector of a batch sets
+    /// the width the rest of the batch is held to, rather than five hundred
+    /// nodes at two widths all landing and leaving the index mixed.
+    fn coerce_declared_vectors(&mut self, labels: &[&str], props: &mut Properties) -> Result<()> {
+        for i in &mut self.decls {
             if !labels.iter().any(|l| i.label == *l) {
                 continue;
             }
-            if let Some(desc) = props.get_mut(&i.property)
-                && let Some(v) = as_embedding(&desc.value, i.width)
-            {
+            let Some(desc) = props.get_mut(&i.property) else {
+                continue;
+            };
+            if let Some(v) = as_embedding(&desc.value, i.required_width()) {
                 desc.value = PropValue::Vector(v);
             }
+            if let PropValue::Vector(v) = &desc.value {
+                i.accept(v.len())?;
+            }
         }
+        Ok(())
     }
 
     /// [`Self::coerce_declared_vectors`] for a single property, whose node's
     /// labels have to be read to know whether an index names it. Reads
-    /// nothing unless the value is a numeric array and some index names the
-    /// property.
+    /// nothing unless some index names the property and the value is a vector
+    /// already or a numeric array that may become one.
     fn coerced_prop(&mut self, id: NodeId, key: &str, mut prop: PropDesc) -> Result<PropDesc> {
-        if !self.decls.iter().any(|i| i.property == key) || numeric_array(&prop.value).is_none() {
+        let indexable =
+            matches!(prop.value, PropValue::Vector(_)) || numeric_array(&prop.value).is_some();
+        if !indexable || !self.decls.iter().any(|i| i.property == key) {
             return Ok(prop);
         }
         let plane = self.plane;
         let Some(node) = graph::get_node(self.txn(), plane, id)? else {
             return Ok(prop);
         };
-        for i in &self.decls {
-            if i.property == key
-                && node.labels.contains(&i.label)
-                && let Some(v) = as_embedding(&prop.value, i.width)
-            {
+        for i in &mut self.decls {
+            if i.property != key || !node.labels.contains(&i.label) {
+                continue;
+            }
+            if let Some(v) = as_embedding(&prop.value, i.required_width()) {
                 prop.value = PropValue::Vector(v);
-                break;
+            }
+            if let PropValue::Vector(v) = &prop.value {
+                i.accept(v.len())?;
             }
         }
         Ok(prop)
@@ -1931,7 +2008,7 @@ impl WriteTxn<'_> {
 
     pub fn create_node(&mut self, labels: &[&str], mut props: Properties) -> Result<NodeId> {
         let plane = self.plane;
-        self.coerce_declared_vectors(labels, &mut props);
+        self.coerce_declared_vectors(labels, &mut props)?;
         self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
@@ -1953,7 +2030,7 @@ impl WriteTxn<'_> {
         mut props: Properties,
     ) -> Result<NodeId> {
         let plane = self.plane;
-        self.coerce_declared_vectors(labels, &mut props);
+        self.coerce_declared_vectors(labels, &mut props)?;
         self.note_expiry(&props)?;
         let (txn, ids) = self.txn_and_ids();
         let id = ids.next_node_id(txn)?;
@@ -2021,7 +2098,7 @@ impl WriteTxn<'_> {
         if !self.decls.is_empty() {
             for node in &mut nodes {
                 let labels = node.labels;
-                self.coerce_declared_vectors(labels, &mut node.props);
+                self.coerce_declared_vectors(labels, &mut node.props)?;
             }
         }
         if nodes.iter().any(|n| n.props.contains_key(EXPIRES_AT)) {
@@ -2806,7 +2883,22 @@ impl<'db> QueryBuilder<'db> {
             query: query.into(),
             metric,
             k,
+            min_score: None,
         };
+        self
+    }
+
+    /// Answer with a hit only when it scores at least `floor` (#124).
+    ///
+    /// The threshold is read on the same scale as the score the query
+    /// returns, and the drop happens before `k` is filled, so a near-enough
+    /// hit is never displaced by a nearer one that then fails the floor.
+    /// Applies to a [`vector_top_k`](Self::vector_top_k) source; on any other
+    /// source it is ignored, since there is no such scale to compare on.
+    pub fn min_score(mut self, floor: f32) -> Self {
+        if let Source::VectorTopK { min_score, .. } = &mut self.plan.source {
+            *min_score = Some(floor);
+        }
         self
     }
 
@@ -4576,5 +4668,576 @@ mod vector_coercion_tests {
             .ids()
             .unwrap();
         assert_eq!(hits, vec![bulk], "the bulk-promoted vector is indexed");
+    }
+}
+
+/// The width an index holds is enforced at the write (#123). Accepting a
+/// vector the index contradicts left it holding two widths, and a two-width
+/// index is exactly what turns the query-side refusal (#112) off for that
+/// pair — so the mistake disabled the guard built to catch it.
+#[cfg(test)]
+mod vector_width_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    fn vector(len: usize) -> Properties {
+        let v = (0..len).map(|i| i as f32 / 10.0).collect();
+        [("emb".to_string(), PropDesc::new(PropValue::Vector(v)))]
+            .into_iter()
+            .collect()
+    }
+
+    fn numbers(len: usize) -> Properties {
+        let items = (0..len)
+            .map(|i| PropValue::Float(i as f64 / 10.0))
+            .collect();
+        [("emb".to_string(), PropDesc::new(PropValue::List(items)))]
+            .into_iter()
+            .collect()
+    }
+
+    /// A plane whose `(Doc, emb)` index holds 16-wide vectors.
+    fn sized_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(16)).unwrap();
+        w.commit().unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(16))
+        );
+        db
+    }
+
+    /// The message has to carry both widths and the pair: a caller who sent
+    /// the wrong embedding cannot otherwise tell which end is wrong.
+    fn assert_names_both_widths(err: Error, wrote: usize, held: usize) {
+        let msg = err.to_string();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{msg}");
+        for expected in [
+            format!("{wrote}-wide"),
+            format!("{held}-wide"),
+            "(Doc, emb)".to_string(),
+        ] {
+            assert!(msg.contains(&expected), "{expected:?} missing from {msg:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_vector_of_the_wrong_width_is_refused() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let err = {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap_err()
+        };
+        assert_names_both_widths(err, 8, 16);
+
+        // Refused, so nothing landed and the index still knows its width —
+        // the state the old behaviour destroyed.
+        assert_eq!(plane.query().scan_label("Doc").count().unwrap(), 1);
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(16))
+        );
+    }
+
+    /// Every write path that reaches an index, not only `node.create`: the
+    /// keyed create, the bulk path `digest.write` takes, and `set_prop`.
+    #[test]
+    fn every_write_path_is_refused_at_the_wrong_width() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        let mut w = plane.write().unwrap();
+
+        assert_names_both_widths(
+            w.create_node_with_key("keyed", &["Doc"], vector(8))
+                .unwrap_err(),
+            8,
+            16,
+        );
+        let Err(bulk) = w.bulk_upsert(
+            vec![BulkNode {
+                external_key: Some("bulk"),
+                labels: &["Doc"],
+                props: vector(8),
+            }],
+            Vec::new(),
+            OnConflict::Error,
+        ) else {
+            panic!("the bulk path takes the same vectors `node.create` does");
+        };
+        assert_names_both_widths(bulk, 8, 16);
+
+        let id = w.create_node(&["Doc"], Properties::new()).unwrap();
+        let eight = PropDesc::new(PropValue::Vector((0..8).map(|i| i as f32).collect()));
+        assert_names_both_widths(w.set_prop(id, "emb", eight).unwrap_err(), 8, 16);
+    }
+
+    /// A bare array wide enough to be read as an embedding is promoted and
+    /// then refused, naming the width it was promoted to — the honest answer,
+    /// since promoting it silently is what sized the index wrong.
+    #[test]
+    fn a_promoted_array_is_refused_at_the_wrong_width() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        let mut w = plane.write().unwrap();
+
+        assert_names_both_widths(w.create_node(&["Doc"], numbers(20)).unwrap_err(), 20, 16);
+
+        // A handful of numbers never claimed to be an embedding, so it is
+        // stored as the list it is rather than refused.
+        w.create_node(&["Doc"], numbers(4)).unwrap();
+    }
+
+    /// One transaction is held to its own first width. `decls` is a snapshot
+    /// taken when the write opened, so without folding each accepted width
+    /// back into it a single batch of five hundred nodes at two widths would
+    /// still land whole and leave the index mixed.
+    #[test]
+    fn a_batch_is_held_to_the_width_of_its_first_vector() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        let mut w = plane.write().unwrap();
+        let Err(err) = w.bulk_upsert(
+            vec![
+                BulkNode {
+                    external_key: Some("a"),
+                    labels: &["Doc"],
+                    props: vector(16),
+                },
+                BulkNode {
+                    external_key: Some("b"),
+                    labels: &["Doc"],
+                    props: vector(8),
+                },
+            ],
+            Vec::new(),
+            OnConflict::Error,
+        ) else {
+            panic!("two widths in one batch is the case this folding exists for");
+        };
+        drop(w);
+        assert_names_both_widths(err, 8, 16);
+        assert_eq!(
+            plane.query().scan_all().count().unwrap(),
+            0,
+            "the batch is refused before anything is written"
+        );
+    }
+
+    /// An index that is already mixed has no one width to contradict, so it
+    /// keeps accepting: a plane written before this release is not frozen by
+    /// the new rule. Mixed is only reachable the way it is reached here —
+    /// declaring the index over data that already disagreed.
+    #[test]
+    fn an_already_mixed_index_still_accepts() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(16)).unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Mixed)
+        );
+
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(4)).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// An empty index has no width yet, so the first vector of any width sets
+    /// it rather than being refused.
+    #[test]
+    fn an_empty_index_takes_the_first_width_it_is_given() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(7)).unwrap();
+            w.commit().unwrap();
+        }
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(7))
+        );
+    }
+
+    /// The ordering case from #123: the stray write arrives *first*, so there
+    /// is no held width to contradict it — and the index then takes 8 as its
+    /// truth and refuses the 384-wide production write ever after. A declared
+    /// width is the only thing that can be right before the first vector, so
+    /// it is the first write that gets refused here.
+    #[test]
+    fn a_declared_width_refuses_the_very_first_wrong_write() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap();
+
+        let mut w = plane.write().unwrap();
+        let err = w.create_node(&["Doc"], vector(8)).unwrap_err();
+        assert_names_both_widths(err, 8, 16);
+        drop(w);
+
+        // And the right one still lands, into an index that never went mixed.
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(16)).unwrap();
+        w.commit().unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(16))
+        );
+    }
+
+    /// `plane.indexes` has to separate the two widths: "declared 16-wide and
+    /// empty" is what a caller cannot tell from "empty, width unknown" when
+    /// only one number is reported.
+    #[test]
+    fn an_empty_declared_index_reports_the_width_it_will_hold() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap();
+
+        let info = plane.vector_index_widths();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].width, IndexWidth::Empty);
+        assert_eq!(info[0].declared, Some(16));
+    }
+
+    /// Under the promotion floor a bare array is read as an embedding only
+    /// when it is the width the index is held to — and a declaration is that
+    /// width before any vector is in it, so the first 4-number array promotes
+    /// instead of staying a list until some wider one has set the width.
+    #[test]
+    fn a_declaration_promotes_a_short_array_of_its_own_width() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 4)
+            .unwrap();
+
+        let mut w = plane.write().unwrap();
+        let id = w.create_node(&["Doc"], numbers(4)).unwrap();
+        w.commit().unwrap();
+
+        let stored = plane.node(id).unwrap().unwrap();
+        assert!(
+            matches!(stored.properties["emb"].value, PropValue::Vector(_)),
+            "4 numbers under a 4-wide declaration are that vector"
+        );
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Uniform(4))
+        );
+    }
+
+    /// A re-`ensure` without a width is what every pre-2.34.0 caller sends,
+    /// and the width has to survive it — otherwise the first such call
+    /// silently disarms the gate.
+    #[test]
+    fn re_ensuring_without_a_width_keeps_the_declared_one() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap();
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
+        let mut w = plane.write().unwrap();
+        assert_names_both_widths(w.create_node(&["Doc"], vector(8)).unwrap_err(), 8, 16);
+    }
+
+    /// Reopening a database loads the built index from its sidecar, which
+    /// carries the vectors and not the declarations — so the declared width
+    /// has to be read back from the KV, or the gate would hold only until
+    /// the first restart.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_reopened_database_still_knows_its_declared_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Database::open(&path).unwrap();
+            let plane = db.plane("startup").unwrap();
+            plane
+                .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+                .unwrap();
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(16)).unwrap();
+            w.commit().unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let plane = db.plane("startup").unwrap();
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
+        let mut w = plane.write().unwrap();
+        assert_names_both_widths(w.create_node(&["Doc"], vector(8)).unwrap_err(), 8, 16);
+    }
+
+    /// Declaring a width the index's own vectors contradict would make its
+    /// content unwritable: every write matching what is already indexed
+    /// would be refused, which is #123's trap re-created through the
+    /// declaration instead of through a stray write.
+    #[test]
+    fn a_declared_width_the_store_contradicts_is_refused() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let err = plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 8)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{msg}");
+        assert!(msg.contains("16-wide"), "{msg}");
+        assert!(msg.contains("8-wide"), "{msg}");
+
+        // Nothing was declared, so the index is exactly as it was and the
+        // writes that match its content still land.
+        assert_eq!(plane.vector_index_widths()[0].declared, None);
+        let mut w = plane.write().unwrap();
+        w.create_node(&["Doc"], vector(16)).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// The width the store already has is the one a declaration may name —
+    /// how a plane vectorized before this release gets its gate.
+    #[test]
+    fn the_width_the_store_already_holds_can_be_declared() {
+        let db = sized_plane();
+        let plane = db.plane("startup").unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap();
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(16));
+    }
+
+    /// A pair holding two widths already can hold no declared width at all:
+    /// whichever is named, the other half of the data contradicts it.
+    #[test]
+    fn a_mixed_pair_takes_no_declared_width() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], vector(16)).unwrap();
+            w.create_node(&["Doc"], vector(8)).unwrap();
+            w.commit().unwrap();
+        }
+        let err = plane
+            .ensure_vector_index_of_width("Doc", "emb", Metric::L2, 16)
+            .unwrap_err();
+        assert!(err.to_string().contains("more than one width"), "{err}");
+    }
+}
+
+/// A hit the metric cannot score is not an answer (#124). An index holding
+/// two widths ranks the disagreeing vectors at infinity rather than erroring,
+/// and those rows reached the caller as `score: null` — occupying slots under
+/// `k` that scorable nodes should have had.
+#[cfg(test)]
+mod vector_score_tests {
+    use super::*;
+    use crate::types::{PropDesc, PropValue};
+
+    fn emb(values: &[f32]) -> Properties {
+        [(
+            "emb".to_string(),
+            PropDesc::new(PropValue::Vector(values.to_vec())),
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// A plane whose `(Doc, emb)` index holds both widths: the only way to
+    /// reach that state now is to declare the index over data that already
+    /// disagreed, which is how every reporter reached it.
+    fn mixed_plane() -> Database {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("near", &["Doc"], emb(&[0.0, 0.1]))
+                .unwrap();
+            w.create_node_with_key("far", &["Doc"], emb(&[0.9, 0.9]))
+                .unwrap();
+            w.create_node_with_key("wrong", &["Doc"], emb(&[0.0, 0.0, 0.0, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+        assert_eq!(
+            plane.vector_index_width("Doc", "emb"),
+            Some(IndexWidth::Mixed)
+        );
+        db
+    }
+
+    #[test]
+    fn a_hit_the_metric_cannot_score_is_not_returned() {
+        let db = mixed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 3)
+            .scored_nodes()
+            .unwrap();
+        assert_eq!(
+            scored.len(),
+            2,
+            "the 4-wide node cannot rank against a 2-wide query"
+        );
+        for (_, score) in &scored {
+            assert!(
+                score.is_some_and(f32::is_finite),
+                "every row carries a score a caller can compare: {score:?}"
+            );
+        }
+    }
+
+    /// And it does not cost a slot: asked for two, a caller gets the two
+    /// scorable nodes, not one of them beside a row it cannot read.
+    #[test]
+    fn an_unscorable_hit_takes_no_slot_under_k() {
+        let db = mixed_plane();
+        let plane = db.plane("startup").unwrap();
+
+        let ids = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 2)
+            .ids()
+            .unwrap();
+        let keys: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                plane
+                    .node(*id)
+                    .unwrap()
+                    .unwrap()
+                    .external_key
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(keys, vec!["near".to_string(), "far".to_string()]);
+    }
+
+    /// The brute-force path has always dropped them, and still does — the
+    /// two paths have to agree, which is the whole point of the change.
+    #[test]
+    fn the_unindexed_path_drops_them_too() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node(&["Doc"], emb(&[0.0, 0.1])).unwrap();
+            w.create_node(&["Doc"], emb(&[0.0, 0.0, 0.0, 0.0])).unwrap();
+            w.commit().unwrap();
+        }
+        // No index declared: the exact fallback answers.
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 3)
+            .scored_nodes()
+            .unwrap();
+        assert_eq!(scored.len(), 1);
+        assert!(scored[0].1.is_some_and(f32::is_finite));
+    }
+
+    /// The cache's own question: the nearest, *if* anything is near enough.
+    /// At `k = 1` over a plane holding only a far hit, the honest answer is
+    /// nothing — not the far hit, which a cache would then serve as though it
+    /// were a match (#124).
+    #[test]
+    fn a_threshold_answers_nothing_rather_than_the_far_hit() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            w.create_node_with_key("far", &["Doc"], emb(&[1.0, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane
+            .ensure_vector_index("Doc", "emb", Metric::Cosine)
+            .unwrap();
+
+        let query = vec![0.0, 1.0];
+        // Orthogonal under cosine: similarity 0, which the floor excludes.
+        let kept = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", query.clone(), Metric::Cosine, 1)
+            .min_score(0.5)
+            .ids()
+            .unwrap();
+        assert!(kept.is_empty(), "nothing was near enough: {kept:?}");
+
+        // Without the floor the same query answers the far hit, as before.
+        let unfiltered = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", query, Metric::Cosine, 1)
+            .ids()
+            .unwrap();
+        assert_eq!(unfiltered.len(), 1);
+    }
+
+    /// The threshold is applied before `k` is filled: a near-enough hit is
+    /// not displaced out of the window by a nearer one that then fails it.
+    /// Asking for one of two, where the nearest is excluded, answers the
+    /// other — not an empty page.
+    #[test]
+    fn a_near_enough_hit_is_not_displaced_by_one_that_fails_the_floor() {
+        let db = Database::in_memory().unwrap();
+        let plane = db.plane("startup").unwrap();
+        {
+            let mut w = plane.write().unwrap();
+            // Under L2, similarity falls with distance: 0.0 is nearest.
+            w.create_node_with_key("nearest", &["Doc"], emb(&[0.0, 0.0]))
+                .unwrap();
+            w.create_node_with_key("next", &["Doc"], emb(&[0.5, 0.0]))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        plane.ensure_vector_index("Doc", "emb", Metric::L2).unwrap();
+
+        let scored = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.0, 0.0], Metric::L2, 2)
+            .scored_nodes()
+            .unwrap();
+        let floor = scored[0].1.unwrap();
+        // A floor just above the nearest hit's own score excludes it alone.
+        let kept = plane
+            .query()
+            .vector_top_k(Some("Doc"), "emb", vec![0.5, 0.0], Metric::L2, 1)
+            .min_score(floor)
+            .ids()
+            .unwrap();
+        let keys: Vec<String> = kept
+            .iter()
+            .map(|id| {
+                plane
+                    .node(*id)
+                    .unwrap()
+                    .unwrap()
+                    .external_key
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(keys, vec!["next".to_string()], "the exact match survives");
     }
 }

@@ -26,6 +26,7 @@ pub use bulk::{
     BulkEdge, BulkEdgeById, BulkNode, BulkStats, OnConflict, bulk_load, bulk_load_edges,
 };
 
+pub use meta::VectorDecl;
 pub use meta::{
     DEFAULT_PLANE_NAME, FORMAT_VERSION, MIN_SUPPORTED_VERSION, bump_commit_seq, create_plane,
     declare_keyword_index, declare_vector_index, drop_plane, expiry_used, get_history, init,

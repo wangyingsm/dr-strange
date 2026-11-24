@@ -512,52 +512,116 @@ pub fn list_planes(txn: &dyn ReadTransaction) -> Result<Vec<(PlaneId, String)>> 
 }
 
 // ---- vector index declarations (arch/01 §5) -------------------------------
-// Only the *declaration* (which (plane,label,property) is indexed, and its
-// metric) is durable, in `meta`. The index structure itself is rebuilt from
-// the KV — the KV is the source of truth (see `crate::index`).
+// Only the *declaration* (which (plane,label,property) is indexed, its metric,
+// and the width it was declared at) is durable, in `meta`. The index structure
+// itself is rebuilt from the KV — the KV is the source of truth (see
+// `crate::index`).
 
-/// Records that `(plane, label, property)` is vector-indexed with `metric`.
+/// One durable vector-index declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorDecl {
+    pub plane: PlaneId,
+    pub label: String,
+    pub property: String,
+    pub metric: Metric,
+    /// The width every vector in this index must be, as the declaration fixed
+    /// it — `None` when the declaration named none and the first write sets it
+    /// instead (#123).
+    pub dim: Option<usize>,
+}
+
+/// The declaration row's value: the metric tag, followed by the declared
+/// width as four big-endian bytes when there is one.
+///
+/// A row written before widths could be declared is one byte long, and the
+/// reader below takes the width from byte four onwards — so every existing
+/// declaration keeps decoding exactly as it did, with no format version to
+/// bump and no migration to run.
+fn encode_vindex(metric: Metric, dim: Option<usize>) -> Vec<u8> {
+    let mut value = vec![metric.tag()];
+    if let Some(d) = dim {
+        value.extend_from_slice(&(d as u32).to_be_bytes());
+    }
+    value
+}
+
+fn decode_vindex(value: &[u8]) -> Result<(Metric, Option<usize>)> {
+    let metric = value
+        .first()
+        .and_then(|&t| Metric::from_tag(t))
+        .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
+    let dim = match value.get(1..5) {
+        Some(bytes) => Some(
+            <[u8; 4]>::try_from(bytes)
+                .map(|b| u32::from_be_bytes(b) as usize)
+                .map_err(|_| Error::Corrupt("bad vindex declared width".into()))?,
+        ),
+        None => None,
+    };
+    Ok((metric, dim))
+}
+
+/// Records that `(plane, label, property)` is vector-indexed with `metric`,
+/// and — when `dim` is given — that every vector in it is that wide.
 /// Returns whether this was a new declaration. Errors if it already exists
-/// with a different metric.
+/// with a different metric or a different declared width.
+///
+/// `dim: None` is no opinion, not a retraction: it leaves a width already
+/// declared in place, so an `index.ensure` that omits it (the spelling every
+/// caller used before this release) cannot quietly un-declare one.
 pub fn declare_vector_index(
     txn: &mut dyn WriteTransaction,
     plane: PlaneId,
     label: &str,
     property: &str,
     metric: Metric,
+    dim: Option<usize>,
 ) -> Result<bool> {
     let key = keys::vindex_decl_key(plane, label, property);
     if let Some(existing) = txn.get(TableId::Meta, &key)? {
-        let current = existing
-            .first()
-            .and_then(|&t| Metric::from_tag(t))
-            .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
+        let (current, declared) = decode_vindex(&existing)?;
         if current != metric {
             return Err(Error::InvalidArgument(format!(
                 "vector index on {label}.{property} already exists with a different metric"
             )));
         }
+        match (declared, dim) {
+            (Some(held), Some(want)) if held != want => {
+                return Err(Error::InvalidArgument(format!(
+                    "vector index on {label}.{property} is already declared {held}-wide, not \
+                     {want}-wide — the width an index holds its writes to cannot change under \
+                     the vectors already in it. Drop the index and declare it again."
+                )));
+            }
+            // A width named for the first time is recorded; everything else
+            // leaves the row as it is.
+            (None, Some(_)) => {
+                txn.put(TableId::Meta, &key, &encode_vindex(metric, dim))?;
+            }
+            _ => {}
+        }
         return Ok(false);
     }
-    txn.put(TableId::Meta, &key, &[metric.tag()])?;
+    txn.put(TableId::Meta, &key, &encode_vindex(metric, dim))?;
     Ok(true)
 }
 
-/// All declared vector indexes, `(plane, label, property, metric)`.
-pub fn list_vector_indexes(
-    txn: &dyn ReadTransaction,
-) -> Result<Vec<(PlaneId, String, String, Metric)>> {
+/// Every declared vector index.
+pub fn list_vector_indexes(txn: &dyn ReadTransaction) -> Result<Vec<VectorDecl>> {
     let prefix = keys::VINDEX_PREFIX;
     let end = prefix_successor(prefix);
     let mut out = Vec::new();
     for item in txn.range(TableId::Meta, prefix, end.as_deref())? {
         let (key, value) = item?;
         let (plane, label, property) = keys::parse_vindex_decl_key(&key)?;
-        let metric = value
-            .first()
-            .and_then(|&t| Metric::from_tag(t))
-            .ok_or_else(|| Error::Corrupt("bad vindex metric tag".into()))?;
-        out.push((plane, label, property, metric));
+        let (metric, dim) = decode_vindex(&value)?;
+        out.push(VectorDecl {
+            plane,
+            label,
+            property,
+            metric,
+            dim,
+        });
     }
     Ok(out)
 }
@@ -724,4 +788,138 @@ pub fn list_keyword_indexes(
         out.push((plane, label, property, language));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::engine::StorageEngine;
+    use crate::storage::memory::MemoryEngine;
+
+    fn declared(txn: &dyn ReadTransaction) -> Vec<(String, Option<usize>)> {
+        list_vector_indexes(txn)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.property, d.dim))
+            .collect()
+    }
+
+    /// The row 2.33.0 wrote is one byte wide, and this build has to read it
+    /// as what it meant: an index with no declared width. Written by hand on
+    /// purpose — the encoder under test can no longer produce it.
+    #[test]
+    fn a_one_byte_declaration_reads_as_no_declared_width() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        txn.put(
+            TableId::Meta,
+            &keys::vindex_decl_key(PlaneId::STARTUP, "Doc", "emb"),
+            &[Metric::Cosine.tag()],
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let txn = eng.begin_read().unwrap();
+        let decls = list_vector_indexes(&txn).unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].metric, Metric::Cosine);
+        assert_eq!(decls[0].dim, None);
+    }
+
+    #[test]
+    fn a_declared_width_round_trips() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        assert!(
+            declare_vector_index(
+                &mut txn,
+                PlaneId::STARTUP,
+                "Doc",
+                "emb",
+                Metric::L2,
+                Some(384)
+            )
+            .unwrap()
+        );
+        txn.commit().unwrap();
+
+        let txn = eng.begin_read().unwrap();
+        let decls = list_vector_indexes(&txn).unwrap();
+        assert_eq!(decls[0].metric, Metric::L2);
+        assert_eq!(decls[0].dim, Some(384));
+    }
+
+    /// Re-declaring at another width is refused the way another metric is:
+    /// the width is what the vectors already in the index were accepted
+    /// against, so it cannot be changed under them.
+    #[test]
+    fn redeclaring_at_a_different_width_is_refused() {
+        let eng = MemoryEngine::new();
+        let mut txn = eng.begin_write().unwrap();
+        init(&mut txn).unwrap();
+        declare_vector_index(
+            &mut txn,
+            PlaneId::STARTUP,
+            "Doc",
+            "emb",
+            Metric::L2,
+            Some(384),
+        )
+        .unwrap();
+        let err = declare_vector_index(
+            &mut txn,
+            PlaneId::STARTUP,
+            "Doc",
+            "emb",
+            Metric::L2,
+            Some(8),
+        )
+        .unwrap_err();
+        let Error::InvalidArgument(msg) = &err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains("384-wide"), "{msg}");
+        assert!(msg.contains("8-wide"), "{msg}");
+        assert_eq!(declared(&eng.begin_read().unwrap()), vec![]);
+    }
+
+    /// `index.ensure` without a width is how every caller before this release
+    /// spelled it, and it must not un-declare a width a later call named.
+    #[test]
+    fn omitting_the_width_neither_declares_nor_retracts_one() {
+        let eng = MemoryEngine::new();
+        {
+            let mut txn = eng.begin_write().unwrap();
+            init(&mut txn).unwrap();
+            declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2, None)
+                .unwrap();
+            // Naming it for the first time records it.
+            declare_vector_index(
+                &mut txn,
+                PlaneId::STARTUP,
+                "Doc",
+                "emb",
+                Metric::L2,
+                Some(16),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            declared(&eng.begin_read().unwrap()),
+            vec![("emb".to_string(), Some(16))]
+        );
+        {
+            let mut txn = eng.begin_write().unwrap();
+            declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2, None)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            declared(&eng.begin_read().unwrap()),
+            vec![("emb".to_string(), Some(16))]
+        );
+    }
 }

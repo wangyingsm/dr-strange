@@ -282,22 +282,27 @@ public class Drsg extends Client {
             List<Double> query,
             String label,
             Long k,
-            String metric) {
+            String metric,
+            Double minScore) {
 
         public static PlaneSearchParams of(String plane, String property, List<Double> query) {
-            return new PlaneSearchParams(plane, property, query, null, null, null);
+            return new PlaneSearchParams(plane, property, query, null, null, null, null);
         }
 
         public PlaneSearchParams withLabel(String label) {
-            return new PlaneSearchParams(plane, property, query, label, k, metric);
+            return new PlaneSearchParams(plane, property, query, label, k, metric, minScore);
         }
 
         public PlaneSearchParams withK(Long k) {
-            return new PlaneSearchParams(plane, property, query, label, k, metric);
+            return new PlaneSearchParams(plane, property, query, label, k, metric, minScore);
         }
 
         public PlaneSearchParams withMetric(String metric) {
-            return new PlaneSearchParams(plane, property, query, label, k, metric);
+            return new PlaneSearchParams(plane, property, query, label, k, metric, minScore);
+        }
+
+        public PlaneSearchParams withMinScore(Double minScore) {
+            return new PlaneSearchParams(plane, property, query, label, k, metric, minScore);
         }
     }
 
@@ -584,22 +589,27 @@ public class Drsg extends Client {
             String property,
             String kind,
             String metric,
-            String language) {
+            String language,
+            Long dim) {
 
         public static IndexEnsureParams of(String plane, String label, String property) {
-            return new IndexEnsureParams(plane, label, property, null, null, null);
+            return new IndexEnsureParams(plane, label, property, null, null, null, null);
         }
 
         public IndexEnsureParams withKind(String kind) {
-            return new IndexEnsureParams(plane, label, property, kind, metric, language);
+            return new IndexEnsureParams(plane, label, property, kind, metric, language, dim);
         }
 
         public IndexEnsureParams withMetric(String metric) {
-            return new IndexEnsureParams(plane, label, property, kind, metric, language);
+            return new IndexEnsureParams(plane, label, property, kind, metric, language, dim);
         }
 
         public IndexEnsureParams withLanguage(String language) {
-            return new IndexEnsureParams(plane, label, property, kind, metric, language);
+            return new IndexEnsureParams(plane, label, property, kind, metric, language, dim);
+        }
+
+        public IndexEnsureParams withDim(Long dim) {
+            return new IndexEnsureParams(plane, label, property, kind, metric, language, dim);
         }
     }
 
@@ -1055,7 +1065,7 @@ public class Drsg extends Client {
         return call("plane.history", null, new TypeReference<PlaneHistoryResult>() {});
     }
 
-    /** Vector top-k over a property; returns scored node records. (access: read) */
+    /** Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers []. (access: read) */
     public List<NodeRecord> planeSearch(PlaneSearchParams params) throws DrsgException {
         return call("plane.search", params, new TypeReference<List<NodeRecord>>() {});
     }
@@ -1095,7 +1105,7 @@ public class Drsg extends Client {
         return call("plane.indexes", params, new TypeReference<Map<String, Object>>() {});
     }
 
-    /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+    /** Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be. (access: admin) */
     public Map<String, Object> indexEnsure(IndexEnsureParams params) throws DrsgException {
         return call("index.ensure", params, new TypeReference<Map<String, Object>>() {});
     }

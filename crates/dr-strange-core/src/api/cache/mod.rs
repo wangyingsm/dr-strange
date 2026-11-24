@@ -34,7 +34,7 @@ use crate::index::VectorRegistry;
 use crate::keyword::KeywordRegistry;
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
-use crate::storage::vector::{Hit, Metric, top_k};
+use crate::storage::vector::{Hit, IndexWidth, Metric, top_k};
 use crate::types::{Dir, EdgeId, EdgeRecord, Neighbor, NodeId, NodeRecord, PlaneId};
 
 /// Monotonic commit sequence number — the version-stamping and invalidation
@@ -63,18 +63,12 @@ pub trait GraphReader {
     fn node_id_by_key(&self, key: &str) -> Result<Option<NodeId>>;
 
     /// Global similarity search for `VectorTopK`: the `k` nodes (optionally
-    /// restricted to `label`) closest to `query` by their `property` vector,
-    /// as `(id, distance)`. Uses a declared HNSW index when one matches;
-    /// otherwise exact brute force. The default is the brute-force path.
-    fn vector_search(
-        &self,
-        label: Option<&str>,
-        property: &str,
-        query: &[f32],
-        metric: Metric,
-        k: usize,
-    ) -> Result<Vec<Hit>> {
-        brute_force_search(self, label, property, query, metric, k)
+    /// restricted to `label`) closest to `q.query` by their `property`
+    /// vector, as `(id, distance)`. Uses a declared HNSW index when one
+    /// matches; otherwise exact brute force. The default is the brute-force
+    /// path.
+    fn vector_search(&self, q: &VectorQuery<'_>) -> Result<Vec<Hit>> {
+        brute_force_search(self, q.label, q.property, q.query, q.metric, q.k)
     }
 
     /// BM25 keyword search for `KeywordTopK` and the hybrid keyword channel:
@@ -92,6 +86,36 @@ pub trait GraphReader {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeId, f32)>>;
+}
+
+/// One similarity search, as the reader is asked for it.
+///
+/// A params object rather than six arguments: `min_score` is the sixth thing
+/// a vector search needs to know, and threading it through two readers and
+/// two callers as a positional would put four of them one comma away from a
+/// silent mistake.
+pub struct VectorQuery<'a> {
+    /// Restrict to one label, or search the whole plane.
+    pub label: Option<&'a str>,
+    pub property: &'a str,
+    pub query: &'a [f32],
+    pub metric: Metric,
+    pub k: usize,
+    /// Drop a hit scoring below this, before `k` is filled (#124).
+    ///
+    /// The comparison is against the score the caller is handed —
+    /// [`Metric::similarity_from_distance`] of the hit's distance — so a
+    /// threshold means the same thing as the number in the answer, and no
+    /// distance scale has to be invented per metric.
+    pub min_score: Option<f32>,
+}
+
+impl VectorQuery<'_> {
+    /// Whether a hit at this distance is near enough to answer with.
+    fn near_enough(&self, distance: f32) -> bool {
+        self.min_score
+            .is_none_or(|floor| self.metric.similarity_from_distance(distance) >= floor)
+    }
 }
 
 /// Exact similarity search by scanning candidate records — the fallback when
@@ -146,6 +170,51 @@ fn indexed_or_brute<R: GraphReader + ?Sized>(
         return result;
     }
     brute_force_search(reader, label, property, query, metric, k)
+}
+
+/// The hits whose distance the metric actually produced a number for.
+///
+/// A vector of a width the query disagrees with ranks at infinity rather than
+/// erroring — the engine stays total (arch/01 §5) — and an infinite distance
+/// becomes `score: null` on the wire: a row a caller cannot compare against
+/// anything, let alone threshold. [`brute_force_search`] has always dropped
+/// them; the indexed path has not, so the same plane answered differently
+/// depending on whether an index was declared (#124).
+fn scorable_hits(hits: Vec<Hit>) -> Vec<Hit> {
+    hits.into_iter()
+        .filter(|h| h.distance.is_finite())
+        .collect()
+}
+
+/// [`scorable_hits`], then the hits `q`'s own threshold keeps (#124).
+///
+/// Both exclusions belong here, inside the `keep` of [`ranked_live`]: a hit
+/// that is not an answer must not occupy a slot under `k` — which is the
+/// whole difference between a threshold the store applies and one a client
+/// applies to the page it was already handed.
+fn near_enough_hits(q: &VectorQuery<'_>, hits: Vec<Hit>) -> Vec<Hit> {
+    scorable_hits(hits)
+        .into_iter()
+        .filter(|h| q.near_enough(h.distance))
+        .collect()
+}
+
+/// Whether a search over this pair can return hits the metric cannot score.
+///
+/// Only an index holding more than one width can: everything in a uniform
+/// index either ranks or is not in it. Knowing this is what keeps the
+/// over-fetch off every ordinary query — a dropped hit must not cost a slot
+/// under `k`, but paying for that possibility always would.
+fn unscorable_possible(
+    registry: Option<&VectorRegistry>,
+    plane: PlaneId,
+    label: Option<&str>,
+    property: &str,
+) -> bool {
+    let (Some(reg), Some(l)) = (registry, label) else {
+        return false;
+    };
+    reg.width(plane, l, property) == Some(IndexWidth::Mixed)
 }
 
 /// Ranks with `search`, then drops what the reader cannot see, keeping `k`.
@@ -406,31 +475,30 @@ impl GraphReader for UncachedReader<'_> {
         }
     }
 
-    fn vector_search(
-        &self,
-        label: Option<&str>,
-        property: &str,
-        query: &[f32],
-        metric: Metric,
-        k: usize,
-    ) -> Result<Vec<Hit>> {
-        let overfetch = self.expiry.used(self.txn, self.plane)?;
+    fn vector_search(&self, q: &VectorQuery<'_>) -> Result<Vec<Hit>> {
+        let overfetch = self.expiry.used(self.txn, self.plane)?
+            || unscorable_possible(self.registry, self.plane, q.label, q.property)
+            || q.min_score.is_some();
         ranked_live(
-            k,
+            q.k,
             overfetch,
             |want| {
                 indexed_or_brute(
                     self,
                     self.registry,
                     self.plane,
-                    label,
-                    property,
-                    query,
-                    metric,
+                    q.label,
+                    q.property,
+                    q.query,
+                    q.metric,
                     want,
                 )
             },
-            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+            |hits| {
+                visible_hits(self, near_enough_hits(q, hits), q.label, |hit| {
+                    NodeId(hit.id)
+                })
+            },
         )
     }
 
@@ -656,31 +724,30 @@ impl GraphReader for CachedReader<'_> {
         }
     }
 
-    fn vector_search(
-        &self,
-        label: Option<&str>,
-        property: &str,
-        query: &[f32],
-        metric: Metric,
-        k: usize,
-    ) -> Result<Vec<Hit>> {
-        let overfetch = self.expiry.used(self.txn, self.plane)?;
+    fn vector_search(&self, q: &VectorQuery<'_>) -> Result<Vec<Hit>> {
+        let overfetch = self.expiry.used(self.txn, self.plane)?
+            || unscorable_possible(self.registry, self.plane, q.label, q.property)
+            || q.min_score.is_some();
         ranked_live(
-            k,
+            q.k,
             overfetch,
             |want| {
                 indexed_or_brute(
                     self,
                     self.registry,
                     self.plane,
-                    label,
-                    property,
-                    query,
-                    metric,
+                    q.label,
+                    q.property,
+                    q.query,
+                    q.metric,
                     want,
                 )
             },
-            |hits| visible_hits(self, hits, label, |hit| NodeId(hit.id)),
+            |hits| {
+                visible_hits(self, near_enough_hits(q, hits), q.label, |hit| {
+                    NodeId(hit.id)
+                })
+            },
         )
     }
 
@@ -1057,7 +1124,16 @@ mod tests {
         {
             let txn = eng.begin_read().unwrap();
             vectors
-                .build_entry(&txn, PlaneId::STARTUP, "Doc", "emb", Metric::Cosine)
+                .build_entry(
+                    &txn,
+                    &graph::VectorDecl {
+                        plane: PlaneId::STARTUP,
+                        label: "Doc".into(),
+                        property: "emb".into(),
+                        metric: Metric::Cosine,
+                        dim: None,
+                    },
+                )
                 .unwrap();
             keywords
                 .build_entry(&txn, PlaneId::STARTUP, "Doc", "body", Language::English)
@@ -1073,7 +1149,14 @@ mod tests {
         let cached =
             CachedReader::with_registry(&txn, PlaneId::STARTUP, &vectors).with_keywords(&keywords);
         let ids: Vec<u64> = cached
-            .vector_search(Some("Doc"), "emb", &[1.0, 0.0], Metric::Cosine, 10)
+            .vector_search(&VectorQuery {
+                label: Some("Doc"),
+                property: "emb",
+                query: &[1.0, 0.0],
+                metric: Metric::Cosine,
+                k: 10,
+                min_score: None,
+            })
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1093,7 +1176,14 @@ mod tests {
 
         let uncached = UncachedReader::with_registry(&txn, PlaneId::STARTUP, &vectors);
         let ids: Vec<u64> = uncached
-            .vector_search(Some("Doc"), "emb", &[1.0, 0.0], Metric::Cosine, 10)
+            .vector_search(&VectorQuery {
+                label: Some("Doc"),
+                property: "emb",
+                query: &[1.0, 0.0],
+                metric: Metric::Cosine,
+                k: 10,
+                min_score: None,
+            })
             .unwrap()
             .into_iter()
             .map(|h| h.id)

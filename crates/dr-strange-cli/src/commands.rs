@@ -3045,16 +3045,48 @@ pub fn algo_cycles(
     Ok(())
 }
 
+/// What a vector index is declared on, apart from its label: the property to
+/// index, how similarity is measured, and the width every vector in it must
+/// be when the caller knows it (#123).
+///
+/// The label is passed separately because `index ensure` derives it — one
+/// index per label carrying the property — while `index vector` is told it.
+pub struct VectorIndexSpec<'a> {
+    pub property: &'a str,
+    pub metric: Metric,
+    pub dim: Option<usize>,
+}
+
+impl VectorIndexSpec<'_> {
+    /// Declares the index on `label`, holding it to the declared width when
+    /// one was given.
+    fn declare(&self, plane: &PlaneHandle<'_>, label: &str) -> Result<()> {
+        match self.dim {
+            Some(dim) => plane.ensure_vector_index_of_width(label, self.property, self.metric, dim),
+            None => plane.ensure_vector_index(label, self.property, self.metric),
+        }?;
+        Ok(())
+    }
+
+    /// What the index was declared as, for the line each command prints.
+    fn described(&self, label: &str) -> String {
+        let property = self.property;
+        match self.dim {
+            Some(dim) => format!("{label}.{property} ({dim}-wide)"),
+            None => format!("{label}.{property}"),
+        }
+    }
+}
+
 pub fn index_ensure(
     db: &Database,
     plane_name: &str,
     label: &str,
-    property: &str,
-    metric: Metric,
+    spec: &VectorIndexSpec<'_>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    plane(db, plane_name)?.ensure_vector_index(label, property, metric)?;
-    writeln!(out, "ensured vector index on {label}.{property}")?;
+    spec.declare(&plane(db, plane_name)?, label)?;
+    writeln!(out, "ensured vector index on {}", spec.described(label))?;
     Ok(())
 }
 
@@ -3077,10 +3109,10 @@ fn labels_carrying(db: &Database, plane_name: &str, property: &str) -> Result<Ve
 pub fn index_ensure_all(
     db: &Database,
     plane_name: &str,
-    property: &str,
-    metric: Metric,
+    spec: &VectorIndexSpec<'_>,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let property = spec.property;
     let labels = labels_carrying(db, plane_name, property)?;
     if labels.is_empty() {
         writeln!(
@@ -3091,8 +3123,8 @@ pub fn index_ensure_all(
     }
     let p = plane(db, plane_name)?;
     for label in &labels {
-        p.ensure_vector_index(label, property, metric)?;
-        writeln!(out, "ensured vector index on {label}.{property}")?;
+        spec.declare(&p, label)?;
+        writeln!(out, "ensured vector index on {}", spec.described(label))?;
     }
     writeln!(out, "{} label(s) indexed", labels.len())?;
     Ok(())
@@ -5182,6 +5214,14 @@ mod tests {
         dr_strange_web::fetch::Route::guarded(&[])
     }
 
+    /// Runs a handler that is expected to fail and returns the error text.
+    fn cap_err(f: impl FnOnce(&mut dyn Write) -> Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf)
+            .expect_err("the handler was expected to fail")
+            .to_string()
+    }
+
     /// Runs a handler and returns its captured stdout as a String.
     fn cap(f: impl FnOnce(&mut dyn Write) -> Result<()>) -> String {
         let mut buf = Vec::new();
@@ -5761,10 +5801,73 @@ mod tests {
         assert!(out.contains("\"external_key\":\"p2\""));
     }
 
+    /// A declared width is worth printing: the line is the only confirmation
+    /// the command gives, and "ensured vector index on Paper.emb" reads the
+    /// same whether the width took or not.
+    ///
+    /// The width is the fixture's own: declaring one the vectors already
+    /// there contradict is refused, so a command that printed `(16-wide)`
+    /// over 2-wide vectors would be reporting a declaration that never
+    /// happened.
+    #[test]
+    fn index_ensure_reports_and_enforces_a_declared_width() {
+        let db = loaded();
+        let out = cap(|o| {
+            index_ensure(
+                &db,
+                "startup",
+                "Paper",
+                &VectorIndexSpec {
+                    property: "emb",
+                    metric: Metric::L2,
+                    dim: Some(2),
+                },
+                o,
+            )
+        });
+        assert!(out.contains("Paper.emb (2-wide)"), "{out}");
+
+        let plane = db.plane("startup").unwrap();
+        assert_eq!(plane.vector_index_widths()[0].declared, Some(2));
+    }
+
+    /// And the command surfaces the refusal rather than printing a width it
+    /// did not declare.
+    #[test]
+    fn index_ensure_refuses_a_width_the_vectors_contradict() {
+        let db = loaded();
+        let err = cap_err(|o| {
+            index_ensure(
+                &db,
+                "startup",
+                "Paper",
+                &VectorIndexSpec {
+                    property: "emb",
+                    metric: Metric::L2,
+                    dim: Some(16),
+                },
+                o,
+            )
+        });
+        assert!(err.contains("already holds 2-wide vectors"), "{err}");
+    }
+
     #[test]
     fn vector_query_via_declared_index() {
         let db = loaded();
-        cap(|o| index_ensure(&db, "startup", "Paper", "emb", Metric::L2, o));
+        cap(|o| {
+            index_ensure(
+                &db,
+                "startup",
+                "Paper",
+                &VectorIndexSpec {
+                    property: "emb",
+                    metric: Metric::L2,
+                    dim: None,
+                },
+                o,
+            )
+        });
         let plan = r#"{"source":{"VectorTopK":{"label":"Paper","property":"emb",
             "query":[0.0,0.0],"metric":"L2","k":1}},"steps":[]}"#;
         let out = cap(|o| query(&db, "startup", plan, o));
@@ -5974,7 +6077,18 @@ mod tests {
         txn.create_node(&["Bare"], Properties::new()).unwrap();
         txn.commit().unwrap();
 
-        let out = cap(|o| index_ensure_all(&db, "v", "embedding", Metric::Cosine, o));
+        let out = cap(|o| {
+            index_ensure_all(
+                &db,
+                "v",
+                &VectorIndexSpec {
+                    property: "embedding",
+                    metric: Metric::Cosine,
+                    dim: None,
+                },
+                o,
+            )
+        });
         assert!(out.contains("Function.embedding"), "{out}");
         assert!(out.contains("Paper.embedding"), "{out}");
         assert!(
@@ -5984,7 +6098,18 @@ mod tests {
         assert!(out.contains("2 label(s) indexed"), "{out}");
 
         // No label carries a made-up property: say so, index nothing.
-        let none = cap(|o| index_ensure_all(&db, "v", "nope", Metric::Cosine, o));
+        let none = cap(|o| {
+            index_ensure_all(
+                &db,
+                "v",
+                &VectorIndexSpec {
+                    property: "nope",
+                    metric: Metric::Cosine,
+                    dim: None,
+                },
+                o,
+            )
+        });
         assert!(none.contains("no label"), "{none}");
     }
 

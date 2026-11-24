@@ -1516,6 +1516,73 @@ mod tests {
         // The width a client compares its own embeddings against (#112).
         assert_eq!(r["vector"][0]["dim"], 2);
         assert_eq!(r["vector"][0]["mixed"], false);
+        // Nothing declared this one's width; the first write set it.
+        assert!(r["vector"][0]["declared_dim"].is_null(), "{r}");
+    }
+
+    /// `index.ensure` takes the width, and the two numbers it reports back
+    /// are not the same question: an index declared 384-wide with nothing in
+    /// it holds no width yet, which is exactly the state a caller could not
+    /// see before (#123).
+    #[test]
+    fn index_ensure_declares_a_width_and_holds_writes_to_it() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb","metric":"l2","dim":384},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["dim"], 384, "{resp}");
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":2}"#,
+        )
+        .unwrap();
+        let idx = &resp["result"]["vector"][0];
+        assert_eq!(idx["declared_dim"], 384, "{idx}");
+        assert!(idx["dim"].is_null(), "nothing is in it yet: {idx}");
+
+        // And the declaration is what the write is held to, from the first.
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":3}"#,
+        )
+        .unwrap();
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("2-wide"), "{resp}");
+        assert!(msg.contains("declared 384-wide"), "{resp}");
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    }
+
+    /// A caller that omits `dim` is every caller written before this release:
+    /// the index is declared with no width and the first write still decides
+    /// it, so the new parameter changes nothing until it is sent.
+    #[test]
+    fn index_ensure_without_a_width_declares_none() {
+        let db = Database::in_memory().unwrap();
+
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb"},"id":1}"#,
+        )
+        .unwrap();
+        assert!(resp["result"]["dim"].is_null(), "{resp}");
+
+        call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":2}"#,
+        )
+        .unwrap();
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.indexes","params":{"plane":"startup"},"id":3}"#,
+        )
+        .unwrap();
+        let idx = &resp["result"]["vector"][0];
+        assert_eq!(idx["dim"], 2, "{idx}");
+        assert!(idx["declared_dim"].is_null(), "{idx}");
     }
 
     /// A parameter the server does not know is a mistake, not a default: it
@@ -1615,6 +1682,47 @@ mod tests {
         assert_eq!(resp["result"].as_array().unwrap().len(), 1);
     }
 
+    /// The write side of the same mistake answers the same code. A width the
+    /// index contradicts is the request's own fault wherever it arrives, and
+    /// `core_err` maps every core error to -32000, so without the narrower
+    /// mapping a client would see -32602 from `plane.search` and -32000 from
+    /// `node.create` for one misconfigured embedding model (#123).
+    #[test]
+    fn a_wrong_width_write_answers_the_same_code_as_a_wrong_width_query() {
+        let db = plane_with_embedding(4, true);
+
+        let create = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.create","params":{"plane":"startup","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(create["error"]["code"], -32602, "{create}");
+
+        // The bulk path `digest.write` takes, where the reporter hit it.
+        let bulk = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"digest.write","params":{"plane":"startup","nodes":[{"key":"d1","labels":["Doc"],"properties":{"emb":{"$vector":[0.1,0.2]}}}]},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(bulk["error"]["code"], -32602, "{bulk}");
+
+        // `node.update` reaches it through `set_prop`.
+        let update = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"node.update","params":{"plane":"startup","id":1,"set":{"emb":{"$vector":[0.1,0.2]}}},"id":3}"#,
+        )
+        .unwrap();
+        assert_eq!(update["error"]["code"], -32602, "{update}");
+
+        // And an index declared with a width it already contradicts.
+        let ensure = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb","metric":"l2","dim":8},"id":4}"#,
+        )
+        .unwrap();
+        assert_eq!(ensure["error"]["code"], -32602, "{ensure}");
+    }
+
     /// No index on the property means no width to contradict: the search runs
     /// on the exact fallback and answers (here: nothing ranks, because the
     /// engine stays total over mixed widths rather than erroring).
@@ -1624,6 +1732,115 @@ mod tests {
         let resp = call(&db, &search_body(Some("Doc"), &[0.1, 0.2])).unwrap();
         assert!(resp["error"].is_null(), "{resp}");
         assert!(resp["result"].is_array(), "{resp}");
+    }
+
+    /// `min_score` over the wire: the cache's question answered as `[]`
+    /// rather than as a far hit it would have to re-filter against a scale
+    /// the reply never states (#124).
+    #[test]
+    fn plane_search_thresholds_at_min_score() {
+        let db = plane_with_embedding(2, true);
+
+        // The one node is [0.5, 0.5]; an orthogonal query cannot clear a
+        // floor of 0.5 on the cosine scale. The metric is named because the
+        // index is declared `l2` and an omitted one now means that (#124),
+        // whose scale is `-distance` — a different floor entirely.
+        let refused = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[1.0,-1.0],"k":1,"metric":"cosine","min_score":0.5},"id":1}"#,
+        )
+        .unwrap();
+        assert!(refused["error"].is_null(), "{refused}");
+        assert_eq!(
+            refused["result"].as_array().map(Vec::len),
+            Some(0),
+            "nothing was near enough: {refused}"
+        );
+
+        // The same query without the floor answers the far hit, as before.
+        let answered = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[1.0,-1.0],"k":1},"id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(answered["result"].as_array().map(Vec::len), Some(1));
+
+        // And a floor the hit clears keeps it.
+        let kept = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"k":1,"metric":"cosine","min_score":0.9},"id":3}"#,
+        )
+        .unwrap();
+        assert_eq!(kept["result"].as_array().map(Vec::len), Some(1), "{kept}");
+    }
+
+    /// An omitted `metric` means the metric the index was declared with, not
+    /// cosine (#124). The scales differ — cosine scores `1 - distance`, L2
+    /// scores `-distance` — so the old default made the one metric
+    /// `plane.indexes` reports the one the search did not use.
+    #[test]
+    fn an_omitted_metric_is_the_declared_one() {
+        // `plane_with_embedding` declares L2 over one [0.5, 0.5] node.
+        let db = plane_with_embedding(2, true);
+
+        let l2 = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"k":1},"id":1}"#,
+        )
+        .unwrap();
+        let score = l2["result"][0]["score"].as_f64().unwrap();
+        assert!(
+            score.abs() < 1e-6,
+            "an exact match scores 0 on the L2 scale: {l2}"
+        );
+
+        // Naming cosine still runs cosine, on any index: exact brute force
+        // under another metric is a legitimate ask.
+        let cosine = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"k":1,"metric":"cosine"},"id":2}"#,
+        )
+        .unwrap();
+        let score = cosine["result"][0]["score"].as_f64().unwrap();
+        assert!((score - 1.0).abs() < 1e-6, "cosine scores 1 here: {cosine}");
+    }
+
+    /// With nothing declared there is no declaration to read, so cosine stays
+    /// the default — the only place it still is.
+    #[test]
+    fn an_omitted_metric_without_an_index_is_cosine() {
+        let db = plane_with_embedding(2, false);
+        let resp = call(
+            &db,
+            r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"k":1},"id":1}"#,
+        )
+        .unwrap();
+        let score = resp["result"][0]["score"].as_f64().unwrap();
+        assert!((score - 1.0).abs() < 1e-6, "{resp}");
+    }
+
+    /// A metric name the server does not know is a mistake, not a default.
+    /// It used to score as cosine in silence on all three methods — and on
+    /// `index.ensure` it silently *declared* the wrong metric (#124).
+    #[test]
+    fn an_unknown_metric_is_refused_everywhere_it_is_taken() {
+        let db = plane_with_embedding(2, true);
+
+        for (id, body) in [
+            (
+                1,
+                r#"{"jsonrpc":"2.0","method":"plane.search","params":{"plane":"startup","property":"emb","label":"Doc","query":[0.5,0.5],"metric":"nonsense"},"id":1}"#,
+            ),
+            (
+                2,
+                r#"{"jsonrpc":"2.0","method":"index.ensure","params":{"plane":"startup","kind":"vector","label":"Doc","property":"emb2","metric":"nonsense"},"id":2}"#,
+            ),
+        ] {
+            let resp = call(&db, body).unwrap();
+            assert_eq!(resp["error"]["code"], -32602, "request {id}: {resp}");
+            let msg = resp["error"]["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("cosine|dot|l2"), "request {id}: {msg}");
+        }
     }
 
     /// A declared index with nothing in it holds no width either, so a query

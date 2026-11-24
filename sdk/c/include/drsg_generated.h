@@ -81,9 +81,10 @@ typedef struct {
     const char *label;
     const int64_t *k;
     const char *metric;
+    const double *min_score;
 } drsg_plane_search_opts;
 
-/* Vector top-k over a property; returns scored node records. (access: read) */
+/* Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers []. (access: read) */
 struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const char *property, struct json_object *query, const drsg_plane_search_opts *opts, drsg_error *err);
 
 typedef struct {
@@ -172,9 +173,10 @@ typedef struct {
     const char *kind;
     const char *metric;
     const char *language;
+    const int64_t *dim;
 } drsg_index_ensure_opts;
 
-/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be. (access: admin) */
 struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const char *label, const char *property, const drsg_index_ensure_opts *opts, drsg_error *err);
 
 typedef struct {

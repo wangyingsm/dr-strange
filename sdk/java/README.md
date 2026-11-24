@@ -19,7 +19,7 @@ cd sdk/java && ./mvnw -q -DskipTests install
 <dependency>
   <groupId>io.github.wangyingsm</groupId>
   <artifactId>drsg</artifactId>
-  <version>2.33.0</version>
+  <version>2.34.0</version>
 </dependency>
 ```
 

@@ -175,7 +175,7 @@ struct json_object *drsg_plane_history(drsg_client *c, drsg_error *err) {
     return rc == 0 ? result : NULL;
 }
 
-/* Vector top-k over a property; returns scored node records. (access: read) */
+/* Vector top-k over a property; returns scored node records. An omitted `metric` means the metric the indexes on the property were declared with (cosine only when none declares one, or they disagree); an unknown name is refused. `min_score` drops hits scoring below it before `k` is filled, so "the nearest, if anything is near enough" answers []. (access: read) */
 struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const char *property, struct json_object *query, const drsg_plane_search_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
@@ -185,6 +185,7 @@ struct json_object *drsg_plane_search(drsg_client *c, const char *plane, const c
         if (opts->label) json_object_object_add(p, "label", json_object_new_string(opts->label));
         if (opts->k) json_object_object_add(p, "k", json_object_new_int64(*opts->k));
         if (opts->metric) json_object_object_add(p, "metric", json_object_new_string(opts->metric));
+        if (opts->min_score) json_object_object_add(p, "min_score", json_object_new_double(*opts->min_score));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "plane.search", p, &result, err);
@@ -323,7 +324,7 @@ struct json_object *drsg_plane_indexes(drsg_client *c, const char *plane, drsg_e
     return rc == 0 ? result : NULL;
 }
 
-/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. (access: admin) */
+/* Declare (and build) a search index on (label, property): a keyword (BM25) or vector (embedding) index. Idempotent. A vector index may declare `dim`, the width every vector in it must be. (access: admin) */
 struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const char *label, const char *property, const drsg_index_ensure_opts *opts, drsg_error *err) {
     struct json_object *p = json_object_new_object();
     json_object_object_add(p, "plane", json_object_new_string(plane));
@@ -333,6 +334,7 @@ struct json_object *drsg_index_ensure(drsg_client *c, const char *plane, const c
         if (opts->kind) json_object_object_add(p, "kind", json_object_new_string(opts->kind));
         if (opts->metric) json_object_object_add(p, "metric", json_object_new_string(opts->metric));
         if (opts->language) json_object_object_add(p, "language", json_object_new_string(opts->language));
+        if (opts->dim) json_object_object_add(p, "dim", json_object_new_int64(*opts->dim));
     }
     struct json_object *result = NULL;
     int rc = drsg_call(c, "index.ensure", p, &result, err);

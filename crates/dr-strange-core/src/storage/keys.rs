@@ -90,9 +90,10 @@ pub fn parse_history_key(key: &[u8]) -> Option<u64> {
 }
 
 /// Vector-index declarations live in `meta`, keyed
-/// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag.
-/// The `\0` separates the two variable-length names unambiguously (labels
-/// and property keys can't contain a NUL in practice).
+/// `vidx:` · `plane_id` · `label` · `\0` · `property`, value = metric tag
+/// optionally followed by the declared vector width (4 bytes, big-endian —
+/// see `graph::meta`). The `\0` separates the two variable-length names
+/// unambiguously (labels and property keys can't contain a NUL in practice).
 pub const VINDEX_PREFIX: &[u8] = b"vidx:";
 
 pub fn vindex_decl_key(plane: PlaneId, label: &str, property: &str) -> Vec<u8> {
