@@ -26,6 +26,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::Error;
 use crate::error::{Result, backend};
 use crate::storage::engine::ReadTransaction;
 use crate::storage::graph;
@@ -34,6 +35,61 @@ use crate::storage::vector::{Hit, IndexWidth, Metric, VectorIndex};
 use crate::types::{NodeId, PlaneId};
 
 type IndexKey = (PlaneId, String, String);
+
+/// One declared vector index: its metric, the width of the vectors it holds,
+/// and the width its declaration fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexInfo {
+    pub label: String,
+    pub property: String,
+    pub metric: Metric,
+    /// What the index holds, folded over every vector in it.
+    pub width: IndexWidth,
+    /// What the declaration promised it would hold, if it named a width.
+    pub declared: Option<usize>,
+}
+
+impl VectorIndexInfo {
+    /// The width a vector written into this index has to be, when the store
+    /// knows of one.
+    ///
+    /// The declaration wins: it is what the caller said the index is for, and
+    /// it is the only thing that can be right when the first vector written
+    /// is the wrong one. Failing that, an index already holding one width
+    /// holds its writes to it; an empty index has no width yet and a mixed one
+    /// no single width, so neither constrains a write.
+    pub fn required_width(&self) -> Option<usize> {
+        self.declared.or_else(|| self.width.uniform())
+    }
+
+    /// Folds one more vector of `len` into the width this index holds — or
+    /// refuses, when the width it is held to says a vector that wide cannot
+    /// be one of its own (#123).
+    ///
+    /// Left unrefused, such a write makes the index hold two widths, and a
+    /// two-width index is what switches the query-side width refusal (#112)
+    /// off for the pair: the mistake disables the guard built to catch it.
+    pub fn accept(&mut self, len: usize) -> Result<()> {
+        let (label, property) = (&self.label, &self.property);
+        if let Some(required) = self.required_width()
+            && required != len
+        {
+            let held = match self.declared {
+                Some(d) => format!("is declared {d}-wide"),
+                None => format!("holds {required}-wide vectors"),
+            };
+            return Err(Error::InvalidArgument(format!(
+                "{property} is {len}-wide but the vector index on ({label}, {property}) {held} \
+                 — a vector of a different width can never rank, so indexing it would leave the \
+                 index holding two widths and every search over it answering less than it \
+                 should. Embed with the model the index was built with, or keep {len}-wide \
+                 vectors under a property of their own."
+            )));
+        }
+        self.width = self.width.with(len);
+        Ok(())
+    }
+}
 
 /// Magic bytes prefixing a sidecar file; a cheap guard against handing a
 /// wrong/foreign file to the decoder. Followed by the postcard payload.
@@ -49,6 +105,11 @@ struct Entry {
     /// Folded width of everything indexed here. Derived, never serialized: the
     /// sidecar recomputes it on load, so adding it costs no format version.
     width: IndexWidth,
+    /// The width the declaration fixed, if it named one (#123). Read from the
+    /// declaration, not from the vectors — and like `width` it is not in the
+    /// sidecar, so a sidecar load adopts it with
+    /// [`VectorRegistry::adopt_declared_widths`].
+    declared: Option<usize>,
 }
 
 /// Live set of vector indexes. Not internally locked — the owning
@@ -82,39 +143,58 @@ impl VectorRegistry {
     /// (called on database open).
     pub fn rebuild_from(&mut self, txn: &dyn ReadTransaction) -> Result<()> {
         self.entries.clear();
-        for (plane, label, property, metric) in graph::list_vector_indexes(txn)? {
-            self.build_entry(txn, plane, &label, &property, metric)?;
+        for decl in graph::list_vector_indexes(txn)? {
+            self.build_entry(txn, &decl)?;
         }
         Ok(())
     }
 
-    /// Builds (or replaces) one index by scanning its label and inserting
-    /// every node's vector for `property`. The vectors are collected first and
-    /// handed to [`HnswIndex::build_parallel`], which parallelizes large
-    /// builds across threads (small ones stay on the sequential path).
+    /// Takes each entry's declared width from the declarations in `txn`,
+    /// without touching the indexes themselves.
+    ///
+    /// The sidecar carries the built graphs but not the declarations, so a
+    /// registry loaded from one knows every vector it holds and nothing about
+    /// the width it was promised to hold. Every sidecar load calls this; a
+    /// rebuild does not need it, since it reads the declarations anyway.
+    pub fn adopt_declared_widths(&mut self, txn: &dyn ReadTransaction) -> Result<()> {
+        for decl in graph::list_vector_indexes(txn)? {
+            if let Some(entry) = self
+                .entries
+                .get_mut(&(decl.plane, decl.label, decl.property))
+            {
+                entry.declared = decl.dim;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds (or replaces) one declared index by scanning its label and
+    /// inserting every node's vector for its property. The vectors are
+    /// collected first and handed to [`HnswIndex::build_parallel`], which
+    /// parallelizes large builds across threads (small ones stay on the
+    /// sequential path).
     pub fn build_entry(
         &mut self,
         txn: &dyn ReadTransaction,
-        plane: PlaneId,
-        label: &str,
-        property: &str,
-        metric: Metric,
+        decl: &graph::VectorDecl,
     ) -> Result<()> {
+        let (plane, label, property) = (decl.plane, &decl.label, &decl.property);
         let mut items = Vec::new();
         for id in graph::scan_label(txn, plane, label)? {
             if let Some(v) = graph::node_vector(txn, plane, id, property)? {
                 items.push((id.0, v));
             }
         }
-        let mut index = HnswIndex::new(metric);
+        let mut index = HnswIndex::new(decl.metric);
         index.build_parallel(&items)?;
         let width = index.width();
         self.entries.insert(
             (plane, label.to_string(), property.to_string()),
             Entry {
-                metric,
+                metric: decl.metric,
                 index,
                 width,
+                declared: decl.dim,
             },
         );
         Ok(())
@@ -195,6 +275,9 @@ impl VectorRegistry {
                     metric: entry.metric,
                     index,
                     width,
+                    // Not in the sidecar — adopted from the declarations by
+                    // `adopt_declared_widths`, which every load calls.
+                    declared: None,
                 },
             );
         }
@@ -225,13 +308,20 @@ impl VectorRegistry {
             .map(|e| e.width)
     }
 
-    /// [`Self::declared`] plus each index's width — what a caller needs to see
-    /// whether its own vectors are the shape the index holds.
-    pub fn declared_widths(&self, plane: PlaneId) -> Vec<(String, String, Metric, IndexWidth)> {
+    /// [`Self::declared`] plus each index's widths — what a caller needs to
+    /// see whether its own vectors are the shape the index holds, and what a
+    /// write is held to.
+    pub fn declared_widths(&self, plane: PlaneId) -> Vec<VectorIndexInfo> {
         self.entries
             .iter()
             .filter(|((p, _, _), _)| *p == plane)
-            .map(|((_, l, prop), e)| (l.clone(), prop.clone(), e.metric, e.width))
+            .map(|((_, label, property), e)| VectorIndexInfo {
+                label: label.clone(),
+                property: property.clone(),
+                metric: e.metric,
+                width: e.width,
+                declared: e.declared,
+            })
             .collect()
     }
 
@@ -384,7 +474,7 @@ mod tests {
                 graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &emb(vec![5.0])).unwrap();
             let c =
                 graph::create_node(&mut txn, PlaneId::STARTUP, &["Doc"], &emb(vec![9.0])).unwrap();
-            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2)
+            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2, None)
                 .unwrap();
             ids = [a, b, c];
             txn.commit().unwrap();
@@ -425,12 +515,13 @@ mod tests {
         assert_eq!(reg.width(PlaneId::STARTUP, "Ghost", "emb"), None);
         assert_eq!(
             reg.declared_widths(PlaneId::STARTUP),
-            vec![(
-                "Doc".to_string(),
-                "emb".to_string(),
-                Metric::L2,
-                IndexWidth::Uniform(1)
-            )]
+            vec![VectorIndexInfo {
+                label: "Doc".to_string(),
+                property: "emb".to_string(),
+                metric: Metric::L2,
+                width: IndexWidth::Uniform(1),
+                declared: None,
+            }]
         );
 
         reg.upsert(PlaneId::STARTUP, "Doc", "emb", NodeId(99), &[1.0, 2.0])
@@ -450,7 +541,7 @@ mod tests {
         {
             let mut txn = eng.begin_write().unwrap();
             graph::init(&mut txn).unwrap();
-            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2)
+            graph::declare_vector_index(&mut txn, PlaneId::STARTUP, "Doc", "emb", Metric::L2, None)
                 .unwrap();
             txn.commit().unwrap();
         }

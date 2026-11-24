@@ -1057,7 +1057,16 @@ mod tests {
         {
             let txn = eng.begin_read().unwrap();
             vectors
-                .build_entry(&txn, PlaneId::STARTUP, "Doc", "emb", Metric::Cosine)
+                .build_entry(
+                    &txn,
+                    &graph::VectorDecl {
+                        plane: PlaneId::STARTUP,
+                        label: "Doc".into(),
+                        property: "emb".into(),
+                        metric: Metric::Cosine,
+                        dim: None,
+                    },
+                )
                 .unwrap();
             keywords
                 .build_entry(&txn, PlaneId::STARTUP, "Doc", "body", Language::English)

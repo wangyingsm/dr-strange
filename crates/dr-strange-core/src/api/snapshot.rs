@@ -20,7 +20,13 @@ use serde::{Deserialize, Serialize};
 use super::*;
 
 /// Snapshot bundle format version (bumped on any incompatible frame change).
-const SNAPSHOT_FORMAT: u32 = 1;
+const SNAPSHOT_FORMAT: u32 = 2;
+
+/// The oldest format this build restores. Format 2 only *appends* a frame
+/// variant — a declared vector width (#123) — so a format-1 bundle still
+/// decodes with every variant it was written with, and restores with no width
+/// declared, which is what it meant.
+const MIN_SNAPSHOT_FORMAT: u32 = 1;
 
 /// One record in the snapshot stream.
 #[derive(Serialize, Deserialize)]
@@ -68,6 +74,16 @@ enum Frame {
     Hnsw(Vec<u8>),
     /// The built BM25 keyword-index sidecar bytes (stamped with `seq`).
     Bm25(Vec<u8>),
+    /// The width a vector index was declared at, when it was declared with
+    /// one (#123). Appended in format 2, after the [`Frame::VectorIndex`] it
+    /// belongs to, and emitted only for an index that has a declared width —
+    /// so a bundle of planes without one is byte-identical to format 1's.
+    VectorWidth {
+        plane: u32,
+        label: String,
+        property: String,
+        dim: usize,
+    },
 }
 
 /// Counts a [`Database::snapshot`] / [`Database::restore`] moved.
@@ -184,16 +200,27 @@ impl Database {
                 }
             }
 
-            for (pid, label, property, metric) in graph::list_vector_indexes(txn)? {
+            for decl in graph::list_vector_indexes(txn)? {
                 write_frame(
                     &mut out,
                     &Frame::VectorIndex {
-                        plane: pid.0,
-                        label,
-                        property,
-                        metric,
+                        plane: decl.plane.0,
+                        label: decl.label.clone(),
+                        property: decl.property.clone(),
+                        metric: decl.metric,
                     },
                 )?;
+                if let Some(dim) = decl.dim {
+                    write_frame(
+                        &mut out,
+                        &Frame::VectorWidth {
+                            plane: decl.plane.0,
+                            label: decl.label,
+                            property: decl.property,
+                            dim,
+                        },
+                    )?;
+                }
             }
             for (pid, label, property, language) in graph::list_keyword_indexes(txn)? {
                 write_frame(
@@ -305,7 +332,7 @@ impl Database {
         // the KV instead, so a stale frame is never persisted as a sidecar.
         let mut hnsw = acc.hnsw.as_deref();
         let mut bm25 = acc.bm25.as_deref();
-        let vectors = match hnsw.and_then(|bytes| VectorRegistry::from_bytes(bytes, seq)) {
+        let mut vectors = match hnsw.and_then(|bytes| VectorRegistry::from_bytes(bytes, seq)) {
             Some(reg) => reg,
             None => {
                 hnsw = None;
@@ -315,6 +342,9 @@ impl Database {
                 reg
             }
         };
+        // The sidecar frame holds no declarations; the restored KV does.
+        self.engine
+            .with_read(|txn| vectors.adopt_declared_widths(txn))?;
         let keywords = match bm25.and_then(|bytes| KeywordRegistry::from_bytes(bytes, seq)) {
             Some(reg) => reg,
             None => {
@@ -372,9 +402,9 @@ fn apply_frame(txn: &mut dyn WriteTransaction, frame: Frame, acc: &mut Restoring
             seq,
             counters,
         } => {
-            if format != SNAPSHOT_FORMAT {
+            if !(MIN_SNAPSHOT_FORMAT..=SNAPSHOT_FORMAT).contains(&format) {
                 return Err(Error::InvalidArgument(format!(
-                    "unsupported snapshot format {format} (expected {SNAPSHOT_FORMAT})"
+                    "unsupported snapshot format {format} (this build restores {MIN_SNAPSHOT_FORMAT}..={SNAPSHOT_FORMAT})"
                 )));
             }
             acc.manifest = Some((seq, counters));
@@ -429,7 +459,28 @@ fn apply_frame(txn: &mut dyn WriteTransaction, frame: Frame, acc: &mut Restoring
             property,
             metric,
         } => {
-            graph::declare_vector_index(txn, PlaneId(plane), &label, &property, metric)?;
+            graph::declare_vector_index(txn, PlaneId(plane), &label, &property, metric, None)?;
+        }
+        // Always after the declaration it belongs to, so this records the
+        // width on a row that is already there.
+        Frame::VectorWidth {
+            plane,
+            label,
+            property,
+            dim,
+        } => {
+            let plane = PlaneId(plane);
+            let metric = graph::list_vector_indexes(txn)?
+                .into_iter()
+                .find(|d| d.plane == plane && d.label == label && d.property == property)
+                .map(|d| d.metric)
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "snapshot declares a width for {label}.{property}, which it never \
+                         declared an index on"
+                    ))
+                })?;
+            graph::declare_vector_index(txn, plane, &label, &property, metric, Some(dim))?;
         }
         Frame::KeywordIndex {
             plane,
@@ -627,6 +678,59 @@ mod tests {
         let on_disk = Database::open(dir.path().join("db")).unwrap();
         on_disk.restore(&mut stripped.as_slice()).unwrap();
         assert_indexes_serve(&on_disk, a, b);
+    }
+
+    /// A declared width is part of the declaration, so it has to cross a
+    /// snapshot — and it cannot ride the sidecar, which holds only the built
+    /// graphs. A restore that dropped it would leave the gate of #123 armed
+    /// on the source and disarmed on the copy.
+    #[test]
+    fn a_restore_keeps_the_declared_width() {
+        let src = Database::in_memory().unwrap();
+        let plane = src.create_plane("p", Properties::new()).unwrap();
+        plane
+            .ensure_vector_index_of_width("Doc", "embedding", Metric::Cosine, 2)
+            .unwrap();
+        let mut buf = Vec::new();
+        src.snapshot(&mut buf).unwrap();
+
+        for dst in [
+            Database::in_memory().unwrap(),
+            Database::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
+        ] {
+            dst.restore(&mut buf.as_slice()).unwrap();
+            let info = dst.plane("p").unwrap().vector_index_widths();
+            assert_eq!(info[0].declared, Some(2), "declared width after restore");
+        }
+    }
+
+    /// A bundle written by 2.33.0 declares format 1 and has no width frame.
+    /// This build has to restore it rather than refuse it, which is the whole
+    /// reason the width went into a frame of its own.
+    #[test]
+    fn a_format_1_bundle_still_restores() {
+        let (buf, a, b) = indexed_snapshot();
+        let mut old = Vec::new();
+        let mut input = buf.as_slice();
+        while let Some(frame) = read_frame(&mut input).unwrap() {
+            let frame = match frame {
+                Frame::Manifest {
+                    format: _,
+                    seq,
+                    counters,
+                } => Frame::Manifest {
+                    format: 1,
+                    seq,
+                    counters,
+                },
+                other => other,
+            };
+            write_frame(&mut old, &frame).unwrap();
+        }
+
+        let dst = Database::in_memory().unwrap();
+        dst.restore(&mut old.as_slice()).unwrap();
+        assert_indexes_serve(&dst, a, b);
     }
 
     /// The sidecar files are caches of the registries, and the KV restore is

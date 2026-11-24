@@ -584,7 +584,7 @@ fn drop_plane_does_not_resurrect_indexes_on_reopen() {
     let vidx = graph::list_vector_indexes(&txn).unwrap();
     let kidx = graph::list_keyword_indexes(&txn).unwrap();
     assert!(
-        vidx.iter().all(|(p, ..)| *p != plane_id),
+        vidx.iter().all(|d| d.plane != plane_id),
         "vector declaration leaked: {vidx:?}"
     );
     assert!(
